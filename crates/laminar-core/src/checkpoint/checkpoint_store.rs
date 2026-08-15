@@ -53,7 +53,10 @@ pub fn validate_max_checkpoint_node_data_bytes(limit: u64) -> Result<(), Checkpo
             "checkpoint node-data limit must be greater than zero".into(),
         ));
     }
-    if usize::try_from(limit).is_err() {
+    // Rust allocations are limited to `isize::MAX` bytes even when `usize`
+    // can represent a larger value. This budget ultimately bounds owned
+    // checkpoint buffers, so reject limits that no single buffer can address.
+    if limit > isize::MAX as u64 {
         return Err(CheckpointStoreError::Invalid(format!(
             "checkpoint node-data limit {limit} exceeds this process address space"
         )));

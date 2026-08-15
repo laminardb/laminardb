@@ -16,15 +16,15 @@ use laminar_connectors::connector::{
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 #[cfg(feature = "cluster")]
-use laminar_core::checkpoint::{channel_progress_frontier, CheckpointAttemptRelation};
+use laminar_core::checkpoint::CheckpointAttemptRelation;
 use laminar_core::checkpoint::{
-    checkpoint_artifact_identity_sha256, checkpoint_descriptor_sha256, checkpoint_manifest_bytes,
-    checkpoint_sha256, classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt,
-    CheckpointManifest, CheckpointScope, CheckpointStore, CheckpointWatermark,
-    CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint,
-    LeaderProof, PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId,
-    StateFrame, StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
-    PREPARED_SINK_DESCRIPTOR_VERSION,
+    channel_progress_frontiers_by_source, checkpoint_artifact_identity_sha256,
+    checkpoint_descriptor_sha256, checkpoint_manifest_bytes, checkpoint_sha256,
+    classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt, CheckpointManifest,
+    CheckpointScope, CheckpointStore, CheckpointWatermark, CommittedCheckpointIndex,
+    CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint, LeaderProof,
+    PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame,
+    StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 use laminar_core::checkpoint_decision::{
     CheckpointArtifactInventory, CheckpointArtifactInventoryUpdateResult,
@@ -44,6 +44,225 @@ const REFERENCED_CHUNK_REBASE_THRESHOLD: usize = 64;
 const RETENTION_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(feature = "cluster")]
 const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
+const PARTICIPANT_MANIFEST_POLL_INITIAL: Duration = Duration::from_millis(10);
+const PARTICIPANT_MANIFEST_POLL_MAX: Duration = Duration::from_millis(250);
+
+async fn await_participant_manifest_until<F, Fut>(
+    participant_id: u64,
+    attempt: CheckpointAttempt,
+    deadline: tokio::time::Instant,
+    mut load: F,
+) -> Result<CheckpointManifest, DbError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<CheckpointManifest>, DbError>>,
+{
+    let mut backoff = PARTICIPANT_MANIFEST_POLL_INITIAL;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(format!(
+                "participant {participant_id} checkpoint {} epoch {} manifest readiness timed out",
+                attempt.checkpoint_id, attempt.epoch
+            )));
+        }
+        match tokio::time::timeout_at(deadline, load()).await {
+            Ok(Ok(Some(manifest))) => {
+                if manifest.participant_id != participant_id
+                    || manifest.checkpoint_id != attempt.checkpoint_id
+                    || manifest.epoch != attempt.epoch
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "participant {participant_id} published an invalid manifest readiness marker for checkpoint {} epoch {}",
+                        attempt.checkpoint_id, attempt.epoch
+                    )));
+                }
+                return Ok(manifest);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(DbError::Checkpoint(format!(
+                    "participant {participant_id} checkpoint {} epoch {} manifest read timed out",
+                    attempt.checkpoint_id, attempt.epoch
+                )));
+            }
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(DbError::Checkpoint(format!(
+                "participant {participant_id} checkpoint {} epoch {} manifest readiness timed out",
+                attempt.checkpoint_id, attempt.epoch
+            )));
+        }
+        tokio::time::sleep_until((now + backoff).min(deadline)).await;
+        backoff = backoff.saturating_mul(2).min(PARTICIPANT_MANIFEST_POLL_MAX);
+    }
+}
+
+#[cfg(test)]
+mod participant_manifest_readiness_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_manifest_is_retried_until_it_becomes_ready() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut manifest = CheckpointManifest::new(7, 7);
+        manifest.bind_participant(2);
+        let loaded = await_participant_manifest_until(
+            2,
+            CheckpointAttempt::canonical(7),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            {
+                let attempts = Arc::clone(&attempts);
+                let manifest = manifest.clone();
+                move || {
+                    let attempts = Arc::clone(&attempts);
+                    let manifest = manifest.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                            Ok(None)
+                        } else {
+                            Ok(Some(manifest))
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(loaded.checkpoint_id, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wrong_manifest_identity_fails_without_polling() {
+        for (manifest, field) in [
+            (CheckpointManifest::new(7, 7), "participant"),
+            (
+                {
+                    let mut manifest = CheckpointManifest::new(8, 7);
+                    manifest.bind_participant(2);
+                    manifest
+                },
+                "checkpoint",
+            ),
+            (
+                {
+                    let mut manifest = CheckpointManifest::new(7, 8);
+                    manifest.bind_participant(2);
+                    manifest
+                },
+                "epoch",
+            ),
+        ] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let started = tokio::time::Instant::now();
+            let error = await_participant_manifest_until(
+                2,
+                CheckpointAttempt::canonical(7),
+                started + Duration::from_secs(1),
+                {
+                    let attempts = Arc::clone(&attempts);
+                    move || {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        let manifest = manifest.clone();
+                        async move { Ok(Some(manifest)) }
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid manifest readiness marker"),
+                "wrong {field} returned {error}"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(tokio::time::Instant::now(), started);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_manifest_read_fails_without_polling() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let started = tokio::time::Instant::now();
+        let error = await_participant_manifest_until(
+            2,
+            CheckpointAttempt::canonical(7),
+            started + Duration::from_secs(1),
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Err(DbError::Checkpoint(
+                            "invalid participant manifest readiness marker".into(),
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("invalid participant manifest"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(tokio::time::Instant::now(), started);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_missing_and_blocked_reads_share_the_exact_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let missing = await_participant_manifest_until(
+            2,
+            CheckpointAttempt::canonical(7),
+            deadline,
+            || async { Ok(None) },
+        );
+        let blocked =
+            await_participant_manifest_until(3, CheckpointAttempt::canonical(7), deadline, || {
+                std::future::pending::<Result<Option<CheckpointManifest>, DbError>>()
+            });
+
+        let (missing, blocked) = tokio::join!(missing, blocked);
+
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("readiness timed out"));
+        assert!(blocked.unwrap_err().to_string().contains("read timed out"));
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn publish_terminal_hint_until<F>(deadline: tokio::time::Instant, hint: F)
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    // Terminal hints accelerate observation but do not own the already-immutable durable verdict.
+    let _ = tokio::time::timeout_at(deadline, hint).await;
+}
+
+#[cfg(all(test, feature = "cluster"))]
+#[tokio::test]
+async fn terminal_checkpoint_hint_cannot_outlive_its_cleanup_deadline() {
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        publish_terminal_hint_until(
+            tokio::time::Instant::now(),
+            std::future::pending::<Result<(), String>>(),
+        ),
+    )
+    .await
+    .expect("an unresponsive terminal hint must be released at its private cleanup deadline");
+}
 
 #[cfg(all(debug_assertions, feature = "cluster"))]
 async fn checkpoint_kill_gate(
@@ -112,6 +331,8 @@ impl Default for CheckpointConfig {
 pub struct CheckpointRequest {
     pub flags: u64,
     pub handoff_replay_pending: bool,
+    /// Capture-time proof that this cut can be restored under a different vnode assignment.
+    pub reassignment_portable: bool,
     pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
     pub state_frames: Vec<CapturedStateFrame>,
     pub(crate) managed_vnode_operators: Vec<ManagedVnodeOperator>,
@@ -418,11 +639,22 @@ pub(crate) type QuorumPeer = laminar_core::cluster::discovery::NodeId;
 pub(crate) enum QuorumStage {
     RunInline,
     #[cfg(feature = "cluster")]
-    Done {
+    Captured {
         cluster_watermark: laminar_core::checkpoint::CheckpointWatermark,
         participants: Vec<QuorumPeer>,
         leader_proof: LeaderProof,
     },
+}
+
+/// Follower-local durability state after immutable capture ownership has been acknowledged.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FollowerPrepareOutcome {
+    /// Manifest persistence completed with an acknowledgement.
+    Prepared,
+    /// Manifest Create may be visible even though its acknowledgement was lost. The captured
+    /// phase-one state must remain intact until an authoritative Commit or Abort is observed.
+    InDoubt,
 }
 
 #[cfg(feature = "cluster")]
@@ -999,12 +1231,168 @@ mod artifact_tests {
     };
     #[cfg(feature = "cluster")]
     use laminar_core::cluster::control::{
-        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome,
+        BarrierAck, BarrierAckDisposition, ClusterController, ClusterKv, InMemoryKv,
+        LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome, ACK_KEY,
     };
     #[cfg(feature = "cluster")]
-    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use laminar_core::state::KeyGroupCount;
     use object_store::memory::InMemory;
+
+    #[cfg(feature = "cluster")]
+    struct ManifestCommitThenIoStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        fail_manifest_create: std::sync::atomic::AtomicBool,
+        block_get: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "cluster")]
+    impl std::fmt::Debug for ManifestCommitThenIoStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ManifestCommitThenIoStore")
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    impl std::fmt::Display for ManifestCommitThenIoStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ManifestCommitThenIoStore")
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for ManifestCommitThenIoStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            options: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            let lose_ack = location.to_string().ends_with("/manifest.json")
+                && matches!(&options.mode, object_store::PutMode::Create)
+                && self
+                    .fail_manifest_create
+                    .swap(false, std::sync::atomic::Ordering::AcqRel);
+            let result = self.inner.put_opts(location, payload, options).await?;
+            if lose_ack {
+                return Err(object_store::Error::Generic {
+                    store: "ManifestCommitThenIoStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected manifest acknowledgement loss after create",
+                    )),
+                });
+            }
+            Ok(result)
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.block_get.load(std::sync::atomic::Ordering::Acquire) {
+                return std::future::pending().await;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct AmbiguousFollowerSink {
+        rollbacks: Arc<std::sync::atomic::AtomicU64>,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait::async_trait]
+    impl laminar_connectors::connector::SinkConnector for AmbiguousFollowerSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &arrow::record_batch::RecordBatch,
+        ) -> Result<
+            laminar_connectors::connector::WriteResult,
+            laminar_connectors::error::ConnectorError,
+        > {
+            Ok(laminar_connectors::connector::WriteResult {
+                records_written: 0,
+                bytes_written: 0,
+            })
+        }
+
+        async fn rollback_epoch(
+            &mut self,
+            _epoch: u64,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            self.rollbacks
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
 
     fn manifest(
         checkpoint_id: u64,
@@ -1065,6 +1453,7 @@ mod artifact_tests {
         manifest.bind_participant(participant_id);
         manifest.deployment_id = deployment_id.into();
         manifest.assignment_fence = Some(fence.clone());
+        manifest.reassignment_portable = true;
         manifest.owned_vnodes = vec![vnode];
         manifest.state_frames.push(StateFrame {
             key: StateFrameKey::Vnode {
@@ -1206,11 +1595,13 @@ mod artifact_tests {
                 scope: CheckpointScope::Local,
                 vnode_count: 1,
                 assignment_fence: None,
+                reassignment_portable: false,
                 predecessor,
                 participants: vec![participant],
                 source_names: Vec::new(),
                 source_offsets: BTreeMap::new(),
                 channel_progress: Vec::new(),
+                source_watermarks: BTreeMap::new(),
                 checkpoint_watermark: None,
             };
             let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
@@ -1315,11 +1706,13 @@ mod artifact_tests {
             scope: CheckpointScope::Local,
             vnode_count: 1,
             assignment_fence: None,
+            reassignment_portable: false,
             predecessor,
             participants: vec![CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()],
             source_names: Vec::new(),
             source_offsets: BTreeMap::new(),
             channel_progress: Vec::new(),
+            source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
         };
         let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
@@ -1427,6 +1820,125 @@ mod artifact_tests {
             .unwrap();
         let deployment_id = coordinator.expected_deployment_id().unwrap().to_owned();
         (coordinator, decisions, deployment_id)
+    }
+
+    #[tokio::test]
+    async fn initial_committed_index_derives_an_empty_inventory_source_cut_from_its_marker() {
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let (coordinator, decisions, deployment_id) = coordinator_with_store(objects).await;
+        let (mut manifest, _) = manifest(1, &deployment_id, None);
+        manifest.source_names = vec!["orders".into()];
+        manifest.source_offsets.insert(
+            "orders".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(Vec::new()),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        manifest.channel_progress = vec![ChannelProgress {
+            participant_id: laminar_core::state::LOCAL_NODE_ID.0,
+            source_name: "orders".into(),
+            input_channel: laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec(),
+            watermark: Some(900),
+            idle: true,
+        }];
+        let encoded = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+
+        let index = coordinator
+            .build_committed_index(
+                CheckpointAttempt::canonical(1),
+                CheckpointScope::Local,
+                None,
+                None,
+                &BTreeMap::new(),
+                &[(manifest, encoded)],
+                None,
+            )
+            .unwrap();
+        assert_eq!(index.version, COMMITTED_CHECKPOINT_INDEX_VERSION);
+        assert!(index.predecessor.is_none());
+        assert_eq!(index.source_watermarks.get("orders"), Some(&900));
+        assert_eq!(index.checkpoint_watermark, None);
+        assert!(index.source_offsets["orders"]
+            .input_channels
+            .as_ref()
+            .is_some_and(Vec::is_empty));
+        index.validate().unwrap();
+
+        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+        let restored = decisions
+            .load_committed_checkpoint(&reference)
+            .await
+            .unwrap();
+        assert_eq!(restored.source_watermarks.get("orders"), Some(&900));
+        assert_eq!(restored, index);
+    }
+
+    #[tokio::test]
+    async fn committed_index_retains_a_predecessor_cut_for_an_empty_source_inventory() {
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let (coordinator, decisions, deployment_id) = coordinator_with_store(objects).await;
+        let (mut predecessor_manifest, _) = manifest(1, &deployment_id, None);
+        predecessor_manifest.source_names = vec!["orders".into()];
+        predecessor_manifest.channel_progress = vec![ChannelProgress {
+            participant_id: laminar_core::state::LOCAL_NODE_ID.0,
+            source_name: "orders".into(),
+            input_channel: laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec(),
+            watermark: Some(900),
+            idle: false,
+        }];
+        predecessor_manifest.checkpoint_watermark = Some(900);
+        let predecessor_bytes =
+            Bytes::from(checkpoint_manifest_bytes(&predecessor_manifest).unwrap());
+        let predecessor_index = coordinator
+            .build_committed_index(
+                CheckpointAttempt::canonical(1),
+                CheckpointScope::Local,
+                None,
+                None,
+                &BTreeMap::new(),
+                &[(predecessor_manifest, predecessor_bytes)],
+                None,
+            )
+            .unwrap();
+        let predecessor = decisions
+            .create_committed_checkpoint(&predecessor_index)
+            .await
+            .unwrap();
+        let retained = coordinator
+            .predecessor_source_watermarks_until(
+                Some(&predecessor),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        let (mut manifest, _) = manifest(2, &deployment_id, None);
+        manifest.source_names = vec!["orders".into()];
+        let encoded = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+
+        let index = coordinator
+            .build_committed_index(
+                CheckpointAttempt::canonical(2),
+                CheckpointScope::Local,
+                None,
+                Some(predecessor),
+                &retained,
+                &[(manifest, encoded)],
+                None,
+            )
+            .unwrap();
+        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+        let restored = decisions
+            .load_committed_checkpoint(&reference)
+            .await
+            .unwrap();
+
+        assert!(restored.channel_progress.is_empty());
+        assert_eq!(restored.source_watermarks.get("orders"), Some(&900));
+        restored
+            .validate_predecessor_index(&predecessor_index)
+            .unwrap();
     }
 
     async fn save_prepared(
@@ -1539,11 +2051,13 @@ mod artifact_tests {
             scope: CheckpointScope::Local,
             vnode_count: 1,
             assignment_fence: None,
+            reassignment_portable: false,
             predecessor: Some(predecessor.clone()),
             participants: vec![CommittedParticipantRef::from_manifest(&manifest, &encoded).unwrap()],
             source_names: Vec::new(),
             source_offsets: BTreeMap::new(),
             channel_progress: Vec::new(),
+            source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
         };
         let candidate = decisions.create_committed_checkpoint(&index).await.unwrap();
@@ -1597,11 +2111,13 @@ mod artifact_tests {
             scope: CheckpointScope::Local,
             vnode_count: 1,
             assignment_fence: None,
+            reassignment_portable: false,
             predecessor: None,
             participants: vec![participant],
             source_names: Vec::new(),
             source_offsets: BTreeMap::new(),
             channel_progress: Vec::new(),
+            source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
         };
         let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
@@ -1644,8 +2160,354 @@ mod artifact_tests {
     }
 
     #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn follower_assignment_authority_validation_is_bounded_by_attempt_deadline() {
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let blocked = Arc::new(ManifestCommitThenIoStore {
+            inner,
+            fail_manifest_create: std::sync::atomic::AtomicBool::new(false),
+            block_get: std::sync::atomic::AtomicBool::new(false),
+        });
+        let authority_objects: Arc<dyn object_store::ObjectStore> = blocked.clone();
+        let authority = Arc::new(LeaderLeaseStore::new(authority_objects, 1_000));
+        let leader_boot = uuid::Uuid::from_u128(1);
+        let follower_boot = uuid::Uuid::from_u128(2);
+        let owner = LeaderLeaseOwner {
+            node: NodeId(1),
+            boot: leader_boot,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty checkpoint authority must grant its first leader term");
+        };
+        let proof = lease.proof();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: leader_boot,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: follower_boot,
+                },
+            ],
+        )
+        .unwrap();
+        let local_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+        let control_kv: Arc<dyn ClusterKv> = local_kv;
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+            id: NodeId(1),
+            name: "leader".into(),
+            rpc_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        }]);
+        let controller = ClusterController::new_with_recovery_incarnation(
+            NodeId(2),
+            Arc::clone(&control_kv),
+            control_kv,
+            None,
+            members_rx,
+            follower_boot,
+        );
+        controller.set_leader_lease_store(authority);
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        blocked
+            .block_get
+            .store(true, std::sync::atomic::Ordering::Release);
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        let validation = CheckpointCoordinator::certify_follower_assignment_until(
+            &controller,
+            &fence,
+            &proof,
+            deadline,
+            "follower Prepare",
+        );
+        tokio::pin!(validation);
+        tokio::select! {
+            result = &mut validation => panic!("authority validation completed before its deadline: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let error = validation
+            .await
+            .expect_err("a stalled authority read must expire at the attempt deadline");
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        assert!(error
+            .to_string()
+            .contains("follower Prepare authority validation timed out"));
+    }
+
+    #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn cluster_settlement_resumes_exact_seals_before_genesis_reset() {
+    async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_commit() {
+        use laminar_connectors::connector::{
+            SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+        };
+
+        let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(ManifestCommitThenIoStore {
+            inner: Arc::clone(&objects),
+            fail_manifest_create: std::sync::atomic::AtomicBool::new(false),
+            block_get: std::sync::atomic::AtomicBool::new(false),
+        });
+        let checkpoint_objects: Arc<dyn object_store::ObjectStore> = flaky.clone();
+        let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 1_000));
+        let leader_boot = uuid::Uuid::from_u128(1);
+        let follower_boot = uuid::Uuid::from_u128(2);
+        let owner = LeaderLeaseOwner {
+            node: NodeId(1),
+            boot: leader_boot,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty checkpoint authority must grant its first leader term");
+        };
+        let proof = lease.proof();
+        let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: leader_boot,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: follower_boot,
+                },
+            ],
+        )
+        .unwrap();
+
+        let local_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+        let control_kv: Arc<dyn ClusterKv> = local_kv.clone();
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+            id: NodeId(1),
+            name: "leader".into(),
+            rpc_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        }]);
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            NodeId(2),
+            Arc::clone(&control_kv),
+            control_kv,
+            None,
+            members_rx,
+            follower_boot,
+        ));
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        assert_eq!(
+            controller
+                .checkpoint_assignment_fence_for_leader(fence.assignment_version, &proof)
+                .await,
+            Some(fence.clone()),
+            "fixture must certify the follower's exact leader and assignment fence"
+        );
+
+        let prefix = "follower-manifest-ack-loss";
+        let store = ObjectStoreCheckpointStore::new(checkpoint_objects, prefix)
+            .with_key_group_count(key_groups)
+            .with_participant_id(2);
+        let mut coordinator =
+            CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+        coordinator
+            .bind_durable_decision_store(Arc::clone(&decisions))
+            .await
+            .unwrap();
+        coordinator
+            .bind_pipeline_identity(PipelineIdentity::empty())
+            .unwrap();
+        coordinator.set_assignment_version(fence.assignment_version);
+        coordinator.set_vnode_set(vec![1]);
+        coordinator.set_cluster_controller(Arc::clone(&controller));
+
+        let rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sink = AmbiguousFollowerSink {
+            rollbacks: Arc::clone(&rollbacks),
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
+        };
+        let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        let sink_handle =
+            crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+                name: "probe".into(),
+                sink_id: Arc::from("probe"),
+                connector: Box::new(sink),
+                contract: SinkContract::new(
+                    SinkConsistency::CheckpointCommittable,
+                    SinkTopology::MultiWriter,
+                    SinkInputMode::AppendOnly,
+                ),
+                requires_recovery_on_error: true,
+                channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+                flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+                write_timeout: Duration::from_secs(1),
+                event_tx,
+                terminal_tasks: None,
+                process_authority: None,
+            });
+        coordinator.register_sink("probe", sink_handle.clone());
+
+        let attempt = CheckpointAttempt::canonical(7);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        coordinator
+            .begin_checkpoint_artifacts_until(attempt, Some(fence.clone()), Some(&proof), deadline)
+            .await
+            .unwrap();
+        sink_handle
+            .begin_epoch_until(attempt.epoch, deadline)
+            .await
+            .unwrap();
+        let admission = sink_handle
+            .begun_epoch_admission(attempt.epoch)
+            .expect("sink epoch must be begun before publication");
+        sink_handle.publish_open_epoch(admission).unwrap();
+        sink_handle
+            .seal_epoch_for_protocol_until(attempt.epoch, deadline)
+            .await
+            .unwrap();
+        controller
+            .ack_barrier(&BarrierAck {
+                epoch: attempt.epoch,
+                checkpoint_id: attempt.checkpoint_id,
+                assignment_digest: Some(fence.digest()),
+                flags: 0,
+                disposition: BarrierAckDisposition::Captured,
+                error: None,
+                watermark: CheckpointWatermark::Uninitialized,
+            })
+            .await
+            .unwrap();
+
+        flaky
+            .fail_manifest_create
+            .store(true, std::sync::atomic::Ordering::Release);
+        let outcome = coordinator
+            .follower_prepare_acked_until(
+                CheckpointRequest {
+                    assignment_fence: Some(fence.clone()),
+                    reassignment_portable: true,
+                    ..CheckpointRequest::default()
+                },
+                proof.clone(),
+                attempt.epoch,
+                attempt.checkpoint_id,
+                deadline,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, FollowerPrepareOutcome::InDoubt);
+        assert_eq!(coordinator.phase, CheckpointPhase::Idle);
+        assert_eq!(rollbacks.load(std::sync::atomic::Ordering::Acquire), 0);
+
+        let cached_ack = local_kv
+            .read_from_checked(NodeId(2), ACK_KEY)
+            .await
+            .unwrap()
+            .expect("captured acknowledgement must remain cached");
+        let cached_ack: BarrierAck = serde_json::from_str(&cached_ack).unwrap();
+        assert_eq!(cached_ack.disposition, BarrierAckDisposition::Captured);
+        assert!(cached_ack.error.is_none());
+
+        let (follower_manifest, follower_manifest_bytes) = coordinator
+            .prepared
+            .get(&attempt)
+            .cloned()
+            .expect("acknowledgement loss must retain the exact prepared candidate");
+        assert_eq!(
+            coordinator
+                .store
+                .load_manifest_for_participant(2, attempt.checkpoint_id)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(follower_manifest.as_ref()),
+            "the manifest Create succeeded even though its acknowledgement was lost"
+        );
+
+        let leader_store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
+            .with_key_group_count(key_groups)
+            .with_participant_id(1);
+        let (mut leader_manifest, leader_payload) = cluster_manifest(
+            attempt.checkpoint_id,
+            1,
+            0,
+            &deployment_id,
+            &fence,
+            key_groups,
+        );
+        leader_manifest.sink_names = vec!["probe".into()];
+        leader_manifest.prepared_sinks = vec![PreparedSinkDescriptor {
+            sink_name: "probe".into(),
+            format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+            payload: None,
+            sha256: checkpoint_descriptor_sha256(None),
+        }];
+        let leader_manifest_bytes = leader_store
+            .save_checkpoint(&leader_manifest, std::slice::from_ref(&leader_payload))
+            .await
+            .unwrap();
+        let manifests = vec![
+            (leader_manifest, leader_manifest_bytes),
+            ((*follower_manifest).clone(), follower_manifest_bytes),
+        ];
+        let index = coordinator
+            .build_committed_index(
+                attempt,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                None,
+                &BTreeMap::new(),
+                &manifests,
+                None,
+            )
+            .unwrap();
+        let reference = decisions.create_committed_checkpoint(&index).await.unwrap();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                attempt.epoch,
+                attempt.checkpoint_id,
+                fence,
+                laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+                Some(reference.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert!(coordinator
+            .follower_finish_deferred(attempt.epoch, attempt.checkpoint_id, true, Instant::now(),)
+            .await
+            .unwrap());
+        assert!(!coordinator.prepared.contains_key(&attempt));
+        assert_eq!(coordinator.last_committed_ref(), Some(&reference));
+        assert_eq!(
+            rollbacks.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a durable Commit must never follow unilateral follower rollback"
+        );
+        sink_handle.close().await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
@@ -1701,7 +2563,21 @@ mod artifact_tests {
         coordinator
             .bind_pipeline_identity(PipelineIdentity::empty())
             .unwrap();
-        coordinator.set_cluster_controller(controller);
+        coordinator.set_cluster_controller(Arc::clone(&controller));
+
+        let nonportable_request = CheckpointRequest {
+            assignment_fence: Some(fence.clone()),
+            ..CheckpointRequest::default()
+        };
+        let error = coordinator
+            .validate_request(&nonportable_request)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cluster checkpoint requires a vnode-reassignment-portable capture"),
+            "{error}"
+        );
 
         let predecessor_attempt = CheckpointAttempt::canonical(1);
         let predecessor_inventory = CheckpointArtifactInventory {
@@ -1723,16 +2599,39 @@ mod artifact_tests {
             key_groups,
         )
         .await;
+        let mut nonportable_manifests = predecessor_manifests.clone();
+        nonportable_manifests[1].0.reassignment_portable = false;
+        nonportable_manifests[1].1 =
+            Bytes::from(checkpoint_manifest_bytes(&nonportable_manifests[1].0).unwrap());
+        let error = coordinator
+            .build_committed_index(
+                predecessor_attempt,
+                CheckpointScope::Cluster,
+                Some(fence.clone()),
+                None,
+                &BTreeMap::new(),
+                &nonportable_manifests,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be proven portable across vnode reassignment"),
+            "{error}"
+        );
         let predecessor_index = coordinator
             .build_committed_index(
                 predecessor_attempt,
                 CheckpointScope::Cluster,
                 Some(fence.clone()),
                 None,
+                &BTreeMap::new(),
                 &predecessor_manifests,
                 None,
             )
             .unwrap();
+        assert!(predecessor_index.reassignment_portable);
         let predecessor = decisions
             .create_committed_checkpoint(&predecessor_index)
             .await
@@ -1786,6 +2685,7 @@ mod artifact_tests {
                 CheckpointScope::Cluster,
                 Some(fence.clone()),
                 Some(predecessor.clone()),
+                &predecessor_index.source_watermarks,
                 &manifests,
                 None,
             )
@@ -1892,15 +2792,18 @@ mod artifact_tests {
         coordinator.last_committed_ref = Some(predecessor);
         coordinator.failure_requires_recovery = true;
         coordinator.local_watermark = CheckpointWatermark::Active(42);
-        assert!(coordinator.recover_to_epoch(0).await.unwrap().is_none());
-        assert!(coordinator.prepared.is_empty());
-        assert!(coordinator.last_committed_manifest.is_none());
-        assert!(coordinator.last_committed_ref.is_none());
-        assert!(!coordinator.failure_requires_recovery);
-        assert_eq!(
-            coordinator.local_watermark,
-            CheckpointWatermark::Uninitialized
+        let genesis_error = coordinator.recover_to_epoch(0).await.unwrap_err();
+        assert!(
+            genesis_error
+                .to_string()
+                .contains("cannot replace authoritative committed checkpoint"),
+            "{genesis_error}"
         );
+        assert!(coordinator.prepared.contains_key(&attempt));
+        assert!(coordinator.last_committed_manifest.is_some());
+        assert!(coordinator.last_committed_ref.is_some());
+        assert!(coordinator.failure_requires_recovery);
+        assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
         assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
     }
 }
@@ -1950,6 +2853,28 @@ mod sparse_capture_tests {
     use laminar_core::checkpoint::{checkpoint_sha256, ObjectStoreCheckpointStore};
     use laminar_core::state::KeyGroupCount;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn local_request_cannot_claim_cluster_reassignment_portability() {
+        let store = ObjectStoreCheckpointStore::new(
+            Arc::new(InMemory::new()),
+            "local-portability-validation",
+        );
+        let coordinator =
+            CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+        let request = CheckpointRequest {
+            reassignment_portable: true,
+            ..CheckpointRequest::default()
+        };
+
+        let error = coordinator.validate_request(&request).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local checkpoint cannot claim vnode reassignment portability"),
+            "{error}"
+        );
+    }
 
     #[tokio::test]
     async fn sparse_capture_carries_only_live_owned_frames_and_refcounts_chunks() {
@@ -2039,7 +2964,12 @@ mod sparse_capture_tests {
 
         coordinator.set_vnode_set(vec![0, 1, 2]);
         let packed = coordinator
-            .pack_checkpoint(CheckpointAttempt::canonical(2), request(), BTreeMap::new())
+            .pack_checkpoint(
+                CheckpointAttempt::canonical(2),
+                request(),
+                BTreeMap::new(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
             .await
             .unwrap();
 
@@ -2073,6 +3003,7 @@ mod sparse_capture_tests {
         assert_eq!(packed.manifest.referenced_chunks.len(), 1);
         assert_eq!(packed.manifest.referenced_chunks[0].ref_count.get(), 3);
         assert_eq!(packed.node_data, vec![Bytes::from_static(b"new-two")]);
+        assert!(!packed.manifest.reassignment_portable);
     }
 
     #[tokio::test]
@@ -2191,6 +3122,7 @@ pub struct CheckpointCoordinator {
     prepared: HashMap<CheckpointAttempt, (Arc<CheckpointManifest>, Bytes)>,
     last_committed_manifest: Option<Arc<CheckpointManifest>>,
     last_committed_ref: Option<CommittedCheckpointRef>,
+    last_committed_source_watermarks: Option<(CommittedCheckpointRef, BTreeMap<String, i64>)>,
     failure_requires_recovery: bool,
     local_watermark: laminar_core::checkpoint::CheckpointWatermark,
     #[cfg(feature = "cluster")]
@@ -2248,6 +3180,7 @@ impl CheckpointCoordinator {
             prepared: HashMap::new(),
             last_committed_manifest: None,
             last_committed_ref: None,
+            last_committed_source_watermarks: None,
             failure_requires_recovery: false,
             local_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             #[cfg(feature = "cluster")]
@@ -2431,6 +3364,44 @@ impl CheckpointCoordinator {
                 })
             })
             .transpose()
+    }
+
+    async fn predecessor_source_watermarks_until(
+        &self,
+        predecessor: Option<&CommittedCheckpointRef>,
+        deadline: tokio::time::Instant,
+    ) -> Result<BTreeMap<String, i64>, DbError> {
+        let Some(predecessor) = predecessor else {
+            return Ok(BTreeMap::new());
+        };
+        if let Some((cached_reference, source_watermarks)) =
+            self.last_committed_source_watermarks.as_ref()
+        {
+            if cached_reference == predecessor {
+                return Ok(source_watermarks.clone());
+            }
+        }
+        let store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "committed predecessor source-watermark read requires a decision store".into(),
+            )
+        })?;
+        let committed =
+            tokio::time::timeout_at(deadline, store.load_committed_checkpoint(predecessor))
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "committed predecessor source-watermark read timed out".into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "committed predecessor source-watermark read failed: {error}"
+                    ))
+                })?;
+        committed
+            .effective_source_watermarks()
+            .map_err(DbError::Checkpoint)
     }
 
     pub(crate) async fn begin_checkpoint_artifacts_until(
@@ -2838,11 +3809,12 @@ impl CheckpointCoordinator {
                 "vnode handoff requires a cluster-scoped committed checkpoint",
             ));
         }
-        if committed.assignment_fence.as_ref() != Some(predecessor)
+        if !committed.reassignment_portable
+            || committed.assignment_fence.as_ref() != Some(predecessor)
             || u32::from(committed.vnode_count) != predecessor.vnode_count
         {
             return Err(handoff_error(
-                "handoff checkpoint does not cover the exact predecessor assignment",
+                "handoff checkpoint is not portable or does not cover the exact predecessor assignment",
             ));
         }
 
@@ -3094,11 +4066,14 @@ impl CheckpointCoordinator {
                 DbError::Checkpoint("cluster recovery checkpoint has no assignment fence".into())
             })?;
             if predecessor != &target.assignment {
-                if predecessor.assignment_version.checked_add(1)
-                    != Some(target.assignment.assignment_version)
+                if predecessor.assignment_version >= target.assignment.assignment_version
+                    || predecessor.vnode_count != target.assignment.vnode_count
+                    || predecessor.partitioning_abi_version
+                        != target.assignment.partitioning_abi_version
+                    || !committed.reassignment_portable
                 {
                     return Err(DbError::Checkpoint(format!(
-                        "recovery target assignment {} is not adjacent to committed assignment {}",
+                        "recovery target assignment {} is not a compatible newer bootstrap target for committed assignment {}",
                         target.assignment.assignment_version, predecessor.assignment_version
                     )));
                 }
@@ -3191,6 +4166,9 @@ impl CheckpointCoordinator {
         let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
             DbError::Checkpoint("Commit outcome has no committed checkpoint reference".into())
         })?;
+        let committed_source_watermarks = committed
+            .effective_source_watermarks()
+            .map_err(DbError::Checkpoint)?;
         let local_manifest = (!recovered.reassigned)
             .then(|| {
                 recovered
@@ -3203,7 +4181,9 @@ impl CheckpointCoordinator {
             .flatten();
         self.local_watermark = Self::manifest_watermark(local_manifest.as_deref())?;
         self.last_committed_manifest = local_manifest;
-        self.last_committed_ref = Some(reference);
+        self.last_committed_ref = Some(reference.clone());
+        self.last_committed_source_watermarks =
+            Some((reference, committed_source_watermarks.clone()));
         self.prepared.clear();
         self.allocator.advance_epoch_to(checked_successor_epoch(
             committed.epoch,
@@ -3213,11 +4193,12 @@ impl CheckpointCoordinator {
         self.phase = CheckpointPhase::Idle;
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
-            if let Some(watermark) = channel_progress_frontier(&committed.channel_progress)
-                .map_err(DbError::Checkpoint)?
-            {
-                controller.publish_cluster_min_watermark(watermark);
-            }
+            controller
+                .replace_recovered_checkpoint_progress(
+                    &committed.channel_progress,
+                    &committed_source_watermarks,
+                )
+                .map_err(DbError::Checkpoint)?;
         }
         Ok(recovered)
     }
@@ -3377,13 +4358,40 @@ impl CheckpointCoordinator {
                     "genesis recovery cannot install while checkpoint artifacts remain".into(),
                 ));
             }
+            if let Some(reference) = self
+                .authoritative_committed_predecessor_until(CheckpointScope::Cluster, deadline)
+                .await?
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "genesis recovery cannot replace authoritative committed checkpoint {}",
+                    reference.checkpoint_id
+                )));
+            }
             self.prepared.clear();
             self.last_committed_manifest = None;
             self.last_committed_ref = None;
+            self.last_committed_source_watermarks = None;
             self.local_watermark = CheckpointWatermark::Uninitialized;
             self.failure_requires_recovery = false;
             self.phase = CheckpointPhase::Idle;
+            controller
+                .replace_recovered_checkpoint_progress(&[], &BTreeMap::new())
+                .map_err(DbError::Checkpoint)?;
             return Ok(None);
+        }
+        let authoritative = self
+            .authoritative_committed_predecessor_until(CheckpointScope::Cluster, deadline)
+            .await?;
+        let authoritative = authoritative.ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "cluster epoch {epoch} cannot be recovered because no authoritative Commit exists"
+            ))
+        })?;
+        if authoritative.epoch != epoch || authoritative.checkpoint_id != epoch {
+            return Err(DbError::Checkpoint(format!(
+                "cluster epoch {epoch} is not the authoritative committed recovery head {}",
+                authoritative.checkpoint_id
+            )));
         }
         if let Some(controller) = self.cluster_controller.as_ref() {
             let authority = controller.checkpoint_authority().map_err(|error| {
@@ -3400,6 +4408,12 @@ impl CheckpointCoordinator {
             let committed = committed.ok_or_else(|| {
                 DbError::Checkpoint(format!("cluster epoch {epoch} is not committed"))
             })?;
+            if outcome.committed_checkpoint.as_ref() != Some(&authoritative) {
+                return Err(DbError::Checkpoint(
+                    "cluster recovery outcome does not match the authoritative committed head"
+                        .into(),
+                ));
+            }
             return self
                 .install_recovered_cut(outcome, committed, deadline)
                 .await
@@ -3882,6 +4896,12 @@ impl CheckpointCoordinator {
                 "aligned replay may only qualify an assignment handoff checkpoint".into(),
             ));
         }
+        if request.handoff_replay_pending && request.reassignment_portable {
+            return Err(DbError::Checkpoint(
+                "a checkpoint with aligned replay pending cannot claim vnode reassignment portability"
+                    .into(),
+            ));
+        }
         #[cfg(feature = "cluster")]
         if request.flags & laminar_core::checkpoint::flags::HANDOFF != 0
             && self.cluster_controller.is_none()
@@ -3904,7 +4924,12 @@ impl CheckpointCoordinator {
             self.cluster_controller.as_ref(),
             request.assignment_fence.as_ref(),
         ) {
-            (None, None) => {}
+            (None, None) if !request.reassignment_portable => {}
+            (None, None) => {
+                return Err(DbError::Checkpoint(
+                    "local checkpoint cannot claim vnode reassignment portability".into(),
+                ));
+            }
             (None, Some(_)) => {
                 return Err(DbError::Checkpoint(
                     "local checkpoint received an assignment fence".into(),
@@ -3916,6 +4941,11 @@ impl CheckpointCoordinator {
                 ));
             }
             (Some(controller), Some(fence)) => {
+                if !request.reassignment_portable {
+                    return Err(DbError::Checkpoint(
+                        "cluster checkpoint requires a vnode-reassignment-portable capture".into(),
+                    ));
+                }
                 if !fence.is_canonical()
                     || !fence.contains(self.store.participant_id())
                     || fence.vnode_count != vnode_count
@@ -3935,6 +4965,12 @@ impl CheckpointCoordinator {
         if request.assignment_fence.is_some() {
             return Err(DbError::Checkpoint(
                 "local checkpoint received an assignment fence".into(),
+            ));
+        }
+        #[cfg(not(feature = "cluster"))]
+        if request.reassignment_portable {
+            return Err(DbError::Checkpoint(
+                "local checkpoint cannot claim vnode reassignment portability".into(),
             ));
         }
 
@@ -4177,7 +5213,13 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         mut request: CheckpointRequest,
         sink_payloads: BTreeMap<String, Option<Vec<u8>>>,
+        deadline: tokio::time::Instant,
     ) -> Result<PackedCheckpoint, DbError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(
+                "checkpoint packing exceeded its end-to-end deadline".into(),
+            ));
+        }
         self.validate_request(&request)?;
         request
             .state_frames
@@ -4341,7 +5383,7 @@ impl CheckpointCoordinator {
             )));
         }
         let digest_chunks = node_data.clone();
-        let (object_sha256, frame_digests, sink_digests) = tokio::task::spawn_blocking(move || {
+        let digest_task = tokio::task::spawn_blocking(move || {
             let mut object_digest = Sha256::new();
             for bytes in &digest_chunks {
                 object_digest.update(bytes);
@@ -4364,9 +5406,18 @@ impl CheckpointCoordinator {
                 frame_digests,
                 sink_digests,
             )
-        })
-        .await
-        .map_err(|error| DbError::Checkpoint(format!("checkpoint digest task failed: {error}")))?;
+        });
+        let (object_sha256, frame_digests, sink_digests) =
+            tokio::time::timeout_at(deadline, digest_task)
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "checkpoint digest task exceeded its end-to-end deadline".into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("checkpoint digest task failed: {error}"))
+                })?;
         for (frame, digest) in frame_digests {
             frames[frame].sha256 = digest;
         }
@@ -4384,6 +5435,7 @@ impl CheckpointCoordinator {
         self.expected_deployment_id()?
             .clone_into(&mut manifest.deployment_id);
         manifest.assignment_fence = request.assignment_fence;
+        manifest.reassignment_portable = request.reassignment_portable;
         manifest.owned_vnodes = self
             .owned_vnodes
             .iter()
@@ -4443,6 +5495,7 @@ impl CheckpointCoordinator {
     ) -> Result<Bytes, DbError> {
         self.phase = CheckpointPhase::Persisting;
         if tokio::time::Instant::now() >= deadline {
+            self.retain_ambiguous_prepared(packed)?;
             return Err(DbError::Checkpoint(
                 "checkpoint persistence timed out".into(),
             ));
@@ -4554,11 +5607,15 @@ impl CheckpointCoordinator {
             } else {
                 CheckpointScope::Local
             };
+            let predecessor_source_watermarks = self
+                .predecessor_source_watermarks_until(predecessor.as_ref(), deadline)
+                .await?;
             let candidate = self.build_committed_index(
                 inventory.attempt,
                 scope,
                 inventory.assignment_fence.clone(),
                 predecessor,
+                &predecessor_source_watermarks,
                 &manifests,
                 None,
             )?;
@@ -4771,7 +5828,7 @@ impl CheckpointCoordinator {
         Ok(true)
     }
 
-    async fn load_prepared_participant_manifests(
+    async fn await_prepared_participant_manifests(
         &self,
         attempt: CheckpointAttempt,
         assignment_fence: Option<&laminar_core::checkpoint::CheckpointAssignmentFence>,
@@ -4782,12 +5839,21 @@ impl CheckpointCoordinator {
             || vec![self.store.participant_id()],
             laminar_core::checkpoint::CheckpointAssignmentFence::participant_ids,
         );
+        let expected_assignment_fence = assignment_fence.cloned();
+        let expected_deployment_id = self.expected_deployment_id()?.to_owned();
+        let expected_pipeline_identity = self.expected_pipeline_identity()?;
         if local.0.participant_id != self.store.participant_id()
             || !participant_ids.contains(&local.0.participant_id)
+            || local.0.checkpoint_id != attempt.checkpoint_id
+            || local.0.epoch != attempt.epoch
+            || local.0.assignment_fence != expected_assignment_fence
+            || local.0.deployment_id != expected_deployment_id
+            || local.0.pipeline_identity != expected_pipeline_identity
         {
-            return Err(DbError::Checkpoint(
-                "local participant is absent from the checkpoint assignment".into(),
-            ));
+            return Err(DbError::Checkpoint(format!(
+                "local participant published an invalid manifest readiness marker for checkpoint {} epoch {}",
+                attempt.checkpoint_id, attempt.epoch
+            )));
         }
         let mut loaded = BTreeMap::from([(local.0.participant_id, local)]);
         let mut reads = participant_ids
@@ -4795,23 +5861,38 @@ impl CheckpointCoordinator {
             .filter(|participant_id| *participant_id != self.store.participant_id())
             .map(|participant_id| {
                 let store = Arc::clone(&self.store);
+                let expected_assignment_fence = expected_assignment_fence.clone();
+                let expected_deployment_id = expected_deployment_id.clone();
+                let expected_pipeline_identity = expected_pipeline_identity.clone();
                 async move {
-                    let manifest = tokio::time::timeout_at(
+                    let manifest = await_participant_manifest_until(
+                        participant_id,
+                        attempt,
                         deadline,
-                        store.load_manifest_for_participant(participant_id, attempt.checkpoint_id),
+                        || {
+                            let store = Arc::clone(&store);
+                            async move {
+                                store
+                                    .load_manifest_for_participant(
+                                        participant_id,
+                                        attempt.checkpoint_id,
+                                    )
+                                    .await
+                                    .map_err(DbError::from)
+                            }
+                        },
                     )
-                    .await
-                    .map_err(|_| {
-                        DbError::Checkpoint(format!(
-                            "participant {participant_id} manifest read timed out"
-                        ))
-                    })?
-                    .map_err(DbError::from)?
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "durably prepared participant {participant_id} manifest is missing"
-                        ))
-                    })?;
+                    .await?;
+                    if manifest.epoch != attempt.epoch
+                        || manifest.assignment_fence != expected_assignment_fence
+                        || manifest.deployment_id != expected_deployment_id
+                        || manifest.pipeline_identity != expected_pipeline_identity
+                    {
+                        return Err(DbError::Checkpoint(format!(
+                            "participant {participant_id} published an invalid manifest readiness marker for checkpoint {} epoch {}",
+                            attempt.checkpoint_id, attempt.epoch
+                        )));
+                    }
                     let encoded =
                         Bytes::from(checkpoint_manifest_bytes(&manifest).map_err(|error| {
                             DbError::Checkpoint(format!(
@@ -4897,6 +5978,7 @@ impl CheckpointCoordinator {
         scope: CheckpointScope,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         predecessor: Option<CommittedCheckpointRef>,
+        predecessor_source_watermarks: &BTreeMap<String, i64>,
         manifests: &[(CheckpointManifest, Bytes)],
         quorum_watermark: Option<CheckpointWatermark>,
     ) -> Result<CommittedCheckpointIndex, DbError> {
@@ -4949,6 +6031,33 @@ impl CheckpointCoordinator {
             }
         }
         let checkpoint_watermark = classification.active_value();
+        let source_names = manifests
+            .first()
+            .map_or_else(Vec::new, |(manifest, _)| manifest.source_names.clone());
+        let mut source_watermarks = predecessor_source_watermarks
+            .iter()
+            .filter(|(source, _)| source_names.binary_search(source).is_ok())
+            .map(|(source, watermark)| (source.clone(), *watermark))
+            .collect::<BTreeMap<_, _>>();
+        for (source, frontier) in
+            channel_progress_frontiers_by_source(&channel_progress).map_err(DbError::Checkpoint)?
+        {
+            let Some(frontier) = frontier else {
+                continue;
+            };
+            if source_watermarks
+                .get(source)
+                .is_some_and(|predecessor| *predecessor > frontier)
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "source '{source}' decision watermark regressed below its committed predecessor"
+                )));
+            }
+            source_watermarks.insert(source.to_owned(), frontier);
+        }
+        let reassignment_portable = manifests
+            .first()
+            .is_some_and(|(manifest, _)| manifest.reassignment_portable);
         let index = CommittedCheckpointIndex {
             version: COMMITTED_CHECKPOINT_INDEX_VERSION,
             deployment_id: self.expected_deployment_id()?.to_owned(),
@@ -4958,13 +6067,13 @@ impl CheckpointCoordinator {
             scope,
             vnode_count: self.store.key_group_count().get(),
             assignment_fence,
+            reassignment_portable,
             predecessor,
             participants,
-            source_names: manifests
-                .first()
-                .map_or_else(Vec::new, |(manifest, _)| manifest.source_names.clone()),
+            source_names,
             source_offsets,
             channel_progress,
+            source_watermarks,
             checkpoint_watermark,
         };
         let manifest_views = manifests
@@ -5312,13 +6421,20 @@ impl CheckpointCoordinator {
         flags: u64,
         assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
-        deadline: tokio::time::Instant,
+        _attempt_deadline: tokio::time::Instant,
         sink_epoch_publication: SinkEpochPublication,
     ) -> CheckpointResult {
         #[cfg(not(feature = "cluster"))]
         let _ = flags;
+        // Once an exact attempt has been reserved, failure settlement owns a private cleanup
+        // budget. The attempt deadline fences new capture/durable work, but must not cancel the
+        // durable Abort and rollback that make the attempt terminal.
+        let cleanup_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
         let mut message = error.to_string();
-        if let Err(seal) = self.seal_sink_epoch_until(attempt.epoch, deadline).await {
+        if let Err(seal) = self
+            .seal_sink_epoch_until(attempt.epoch, cleanup_deadline)
+            .await
+        {
             self.failure_requires_recovery = true;
             message = format!("{message}; {seal}");
         }
@@ -5327,28 +6443,39 @@ impl CheckpointCoordinator {
                 attempt,
                 assignment_fence.clone(),
                 leader_proof.clone(),
-                deadline,
+                cleanup_deadline,
             )
             .await
         {
             Ok(()) => {
+                // Durable Abort is already terminal. Bound its best-effort cluster hint under a
+                // fresh, explicit cleanup window rather than reviving the expired attempt deadline
+                // or allowing notification I/O to hang.
                 #[cfg(feature = "cluster")]
                 if let Some(controller) = self.cluster_controller.as_ref() {
                     use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
-                    let _ = controller
-                        .announce_barrier(&BarrierAnnouncement {
+                    let notification_deadline =
+                        tokio::time::Instant::now() + self.config.cleanup_timeout;
+                    publish_terminal_hint_until(
+                        notification_deadline,
+                        controller.announce_barrier(&BarrierAnnouncement {
                             epoch: attempt.epoch,
                             checkpoint_id: attempt.checkpoint_id,
                             assignment_fence,
                             leader_proof,
                             phase: Phase::Abort,
                             flags,
-                        })
-                        .await;
+                        }),
+                    )
+                    .await;
                 }
+                // A slow best-effort hint must not consume the local successor epoch's required
+                // continuation budget.
+                let continuation_deadline =
+                    tokio::time::Instant::now() + self.config.cleanup_timeout;
                 let requires_recovery = self.failure_requires_recovery;
                 let successor = if !requires_recovery && self.has_checkpoint_committable_sinks() {
-                    self.begin_sink_epoch_until(deadline, sink_epoch_publication)
+                    self.begin_sink_epoch_until(continuation_deadline, sink_epoch_publication)
                         .await
                         .err()
                 } else {
@@ -5379,31 +6506,15 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         quorum: QuorumStage,
         started: Instant,
+        deadline: tokio::time::Instant,
         sink_epoch_publication: SinkEpochPublication,
     ) -> Result<CheckpointResult, DbError> {
         require_canonical_attempt(attempt, "checkpoint admission")?;
         let flags = request.flags;
-        if self.failure_requires_recovery {
-            return Ok(self.failed_result(
-                attempt,
-                started,
-                "a prior checkpoint has unresolved durable or sink state".into(),
-                CheckpointFailureDisposition::RequiresRecovery,
-            ));
-        }
-        let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(self.failed_result(
-                attempt,
-                started,
-                "checkpoint deadline expired before durable work".into(),
-                CheckpointFailureDisposition::Retryable,
-            ));
-        }
         let assignment_fence = request.assignment_fence.clone();
         #[cfg(feature = "cluster")]
         let validation_proof = match &quorum {
-            QuorumStage::Done { leader_proof, .. } => Some(leader_proof.clone()),
+            QuorumStage::Captured { leader_proof, .. } => Some(leader_proof.clone()),
             QuorumStage::RunInline => self
                 .cluster_controller
                 .as_ref()
@@ -5411,6 +6522,36 @@ impl CheckpointCoordinator {
         };
         #[cfg(not(feature = "cluster"))]
         let validation_proof = None;
+        if self.failure_requires_recovery {
+            return Ok(self
+                .fail_before_commit(
+                    attempt,
+                    started,
+                    DbError::Checkpoint(
+                        "a prior checkpoint has unresolved durable or sink state".into(),
+                    ),
+                    flags,
+                    assignment_fence,
+                    validation_proof,
+                    deadline,
+                    sink_epoch_publication,
+                )
+                .await);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(self
+                .fail_before_commit(
+                    attempt,
+                    started,
+                    DbError::Checkpoint("checkpoint deadline expired before durable work".into()),
+                    flags,
+                    assignment_fence,
+                    validation_proof,
+                    deadline,
+                    sink_epoch_publication,
+                )
+                .await);
+        }
         let request_validation = self.validate_request(&request);
         if let Err(error) = request_validation {
             return Ok(self
@@ -5453,7 +6594,7 @@ impl CheckpointCoordinator {
                             )
                             .await);
                     }
-                    QuorumStage::Done {
+                    QuorumStage::Captured {
                         cluster_watermark,
                         participants,
                         leader_proof,
@@ -5520,7 +6661,10 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
-        let packed = match self.pack_checkpoint(attempt, request, descriptors).await {
+        let packed = match self
+            .pack_checkpoint(attempt, request, descriptors, deadline)
+            .await
+        {
             Ok(packed) => packed,
             Err(error) => {
                 return Ok(self
@@ -5556,7 +6700,7 @@ impl CheckpointCoordinator {
         };
 
         let manifests = match self
-            .load_prepared_participant_manifests(
+            .await_prepared_participant_manifests(
                 attempt,
                 assignment_fence.as_ref(),
                 (packed.manifest.clone(), local_manifest_bytes),
@@ -5600,11 +6744,32 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
+        let predecessor_source_watermarks = match self
+            .predecessor_source_watermarks_until(predecessor.as_ref(), deadline)
+            .await
+        {
+            Ok(source_watermarks) => source_watermarks,
+            Err(error) => {
+                return Ok(self
+                    .fail_before_commit(
+                        attempt,
+                        started,
+                        error,
+                        flags,
+                        assignment_fence,
+                        leader_proof,
+                        deadline,
+                        sink_epoch_publication,
+                    )
+                    .await);
+            }
+        };
         let index = match self.build_committed_index(
             attempt,
             scope,
             assignment_fence.clone(),
             predecessor.clone(),
+            &predecessor_source_watermarks,
             &manifests,
             quorum_watermark,
         ) {
@@ -5675,7 +6840,8 @@ impl CheckpointCoordinator {
             .predecessor
             .as_ref()
             .map_or(0, |reference| reference.checkpoint_id);
-        self.last_committed_ref = Some(reference);
+        self.last_committed_ref = Some(reference.clone());
+        self.last_committed_source_watermarks = Some((reference, index.source_watermarks.clone()));
         self.last_committed_manifest = manifests
             .iter()
             .find(|(manifest, _)| manifest.participant_id == self.store.participant_id())
@@ -5687,25 +6853,31 @@ impl CheckpointCoordinator {
         )?);
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
-            if let Some(watermark) =
-                channel_progress_frontier(&index.channel_progress).map_err(DbError::Checkpoint)?
-            {
-                controller.publish_cluster_min_watermark(watermark);
-            }
+            controller
+                .publish_committed_checkpoint_progress(
+                    &index.channel_progress,
+                    &index.source_watermarks,
+                )
+                .map_err(DbError::Checkpoint)?;
         }
         #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller.as_ref() {
             use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
-            let _ = controller
-                .announce_barrier(&BarrierAnnouncement {
+            // The durable Commit is already immutable. Its cluster hint is best-effort and must
+            // not delay sink continuation or the terminal caller reply without bound.
+            let notification_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
+            publish_terminal_hint_until(
+                notification_deadline,
+                controller.announce_barrier(&BarrierAnnouncement {
                     epoch: attempt.epoch,
                     checkpoint_id: attempt.checkpoint_id,
                     assignment_fence: assignment_fence.clone(),
                     leader_proof: leader_proof.clone(),
                     phase: Phase::Commit,
                     flags,
-                })
-                .await;
+                }),
+            )
+            .await;
         }
 
         let continuation_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
@@ -5801,6 +6973,7 @@ impl CheckpointCoordinator {
             attempt,
             QuorumStage::RunInline,
             started,
+            deadline,
             SinkEpochPublication::Immediate,
         )
         .await
@@ -5819,12 +6992,14 @@ impl CheckpointCoordinator {
         attempt: CheckpointAttempt,
         quorum: QuorumStage,
         started: Instant,
+        deadline: tokio::time::Instant,
     ) -> Result<CheckpointResult, DbError> {
         self.run_checkpoint_attempt(
             request,
             attempt,
             quorum,
             started,
+            deadline,
             SinkEpochPublication::DeferredToTail,
         )
         .await
@@ -5966,10 +7141,33 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "cluster")]
+    async fn certify_follower_assignment_until(
+        controller: &laminar_core::cluster::control::ClusterController,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        proof: &LeaderProof,
+        deadline: tokio::time::Instant,
+        context: &'static str,
+    ) -> Result<(), DbError> {
+        let certified = tokio::time::timeout_at(
+            deadline,
+            controller.checkpoint_assignment_fence_for_leader(fence.assignment_version, proof),
+        )
+        .await
+        .map_err(|_| DbError::Checkpoint(format!("{context} authority validation timed out")))?;
+        if certified.as_ref() != Some(fence) {
+            return Err(DbError::Checkpoint(format!(
+                "{context} authority is no longer current"
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
     async fn validate_follower_prepare_context(
         controller: &laminar_core::cluster::control::ClusterController,
         request: &CheckpointRequest,
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
+        deadline: tokio::time::Instant,
     ) -> Result<
         (
             laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -5999,16 +7197,19 @@ impl CheckpointCoordinator {
             || announcement.flags != request.flags
             || !fence.contains(controller.instance_id().0)
             || fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id)
-            || controller
-                .checkpoint_assignment_fence_for_leader(fence.assignment_version, proof)
-                .await
-                .as_ref()
-                != Some(fence)
         {
             return Err(DbError::Checkpoint(
                 "follower Prepare does not match the certified assignment".into(),
             ));
         }
+        Self::certify_follower_assignment_until(
+            controller,
+            fence,
+            proof,
+            deadline,
+            "follower Prepare",
+        )
+        .await?;
         Ok((fence.clone(), proof.clone()))
     }
 
@@ -6020,7 +7221,7 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
         deadline: tokio::time::Instant,
-    ) -> Result<(), DbError> {
+    ) -> Result<FollowerPrepareOutcome, DbError> {
         use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition};
 
         let attempt = require_canonical_attempt(
@@ -6033,16 +7234,14 @@ impl CheckpointCoordinator {
         let fence = request.assignment_fence.clone().ok_or_else(|| {
             DbError::Checkpoint("follower Prepare has no assignment fence".into())
         })?;
-        if controller
-            .checkpoint_assignment_fence_for_leader(fence.assignment_version, &leader_proof)
-            .await
-            .as_ref()
-            != Some(&fence)
-        {
-            return Err(DbError::Checkpoint(
-                "follower Prepare authority is no longer current".into(),
-            ));
-        }
+        Self::certify_follower_assignment_until(
+            &controller,
+            &fence,
+            &leader_proof,
+            deadline,
+            "follower Prepare",
+        )
+        .await?;
         let authority = controller.checkpoint_authority().map_err(|error| {
             DbError::Checkpoint(format!("follower checkpoint authority: {error}"))
         })?;
@@ -6066,29 +7265,61 @@ impl CheckpointCoordinator {
         self.allocator.advance_epoch_to(epoch);
         self.phase = CheckpointPhase::PreCommitting;
         let descriptors = self.pre_commit_sinks_until(epoch, deadline).await;
-        let prepared = match descriptors {
-            Ok(descriptors) => match self.pack_checkpoint(attempt, request, descriptors).await {
-                Ok(packed) => self
-                    .persist_checkpoint_until(&packed, deadline)
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(error),
+        let (prepared, persistence_in_doubt) = match descriptors {
+            Ok(descriptors) => match self
+                .pack_checkpoint(attempt, request, descriptors, deadline)
+                .await
+            {
+                Ok(packed) => (
+                    self.persist_checkpoint_until(&packed, deadline)
+                        .await
+                        .map(|_| ()),
+                    true,
+                ),
+                Err(error) => (Err(error), false),
             },
-            Err(error) => Err(error),
+            Err(error) => (Err(error), false),
         };
         if let Err(error) = prepared {
-            let _ = controller
-                .ack_barrier(&BarrierAck {
-                    epoch,
+            if persistence_in_doubt {
+                // A timed-out/failed Create may already be visible. After Captured quorum the
+                // leader is permitted to prove Commit from that exact manifest, so rolling back
+                // phase-one sink state or superseding the cached Captured acknowledgement here
+                // could contradict the authoritative outcome. Keep the retained prepared image
+                // and let the normal decision path commit or abort it.
+                tracing::warn!(
                     checkpoint_id,
-                    assignment_digest: Some(fence.digest()),
-                    flags,
-                    disposition: BarrierAckDisposition::Failed,
-                    error: Some(error.to_string()),
-                    watermark: self.local_watermark,
-                })
+                    epoch,
+                    %error,
+                    "follower manifest persistence is in doubt; awaiting authoritative decision"
+                );
+                self.phase = CheckpointPhase::Idle;
+                return Ok(FollowerPrepareOutcome::InDoubt);
+            }
+            let acknowledgement = BarrierAck {
+                epoch,
+                checkpoint_id,
+                assignment_digest: Some(fence.digest()),
+                flags,
+                disposition: BarrierAckDisposition::Failed,
+                error: Some(error.to_string()),
+                watermark: self.local_watermark,
+            };
+            // Once local phase one has failed before persistence starts, rollback is both safe
+            // and required.  A slow best-effort Failed acknowledgement must not consume the
+            // attempt's remaining budget and strand the coordinator in PreCommitting, so give
+            // rollback its private cleanup window and run the notification alongside it.
+            let cleanup_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
+            let notify = async {
+                let _ = tokio::time::timeout_at(
+                    cleanup_deadline,
+                    controller.ack_barrier(&acknowledgement),
+                )
                 .await;
-            let rollback = self.rollback_sinks_until(epoch, deadline).await;
+            };
+            let rollback = self.rollback_sinks_until(epoch, cleanup_deadline);
+            let (_, rollback) = tokio::join!(notify, rollback);
+            self.phase = CheckpointPhase::Idle;
             if let Err(rollback) = rollback {
                 self.failure_requires_recovery = true;
                 return Err(DbError::Checkpoint(format!(
@@ -6098,7 +7329,6 @@ impl CheckpointCoordinator {
             // The durable active inventory owns every ambiguous Create until coordinated Abort
             // replaces the exact paths with permanent seals. Deleting here would reopen a path
             // for a late writer and discard manifest evidence needed to locate a candidate index.
-            self.phase = CheckpointPhase::Idle;
             return Err(error);
         }
         #[cfg(all(debug_assertions, feature = "cluster"))]
@@ -6111,9 +7341,15 @@ impl CheckpointCoordinator {
         )
         .await;
         self.phase = CheckpointPhase::Idle;
-        Ok(())
+        Ok(FollowerPrepareOutcome::Prepared)
     }
 
+    /// Legacy direct follower entry point.
+    ///
+    /// This API owns no callback-supervised immutable capture tail, so it deliberately publishes
+    /// `Captured` only after local phase-one packing/persistence has returned. The streaming
+    /// runtime uses its early-capture path instead and acknowledges immediately after transferring
+    /// the sealed capture into the supervised follower tail.
     #[cfg(feature = "cluster")]
     pub async fn follower_checkpoint(
         &mut self,
@@ -6124,52 +7360,100 @@ impl CheckpointCoordinator {
         use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition};
 
         let started = Instant::now();
+        let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
         let controller = self.cluster_controller.clone().ok_or_else(|| {
             DbError::Checkpoint("follower checkpoint has no cluster controller".into())
         })?;
         let (fence, proof) =
-            Self::validate_follower_prepare_context(&controller, &request, &announcement).await?;
+            Self::validate_follower_prepare_context(&controller, &request, &announcement, deadline)
+                .await?;
         let handoff_replay_pending = request.handoff_replay_pending;
-        let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
-        self.follower_prepare_acked_until(
-            request,
-            proof,
-            announcement.epoch,
-            announcement.checkpoint_id,
+        let prepare_outcome = self
+            .follower_prepare_acked_until(
+                request,
+                proof,
+                announcement.epoch,
+                announcement.checkpoint_id,
+                deadline,
+            )
+            .await?;
+        let captured_ack_error = match tokio::time::timeout_at(
             deadline,
-        )
-        .await?;
-        controller
-            .ack_barrier(&BarrierAck {
+            controller.ack_barrier(&BarrierAck {
                 epoch: announcement.epoch,
                 checkpoint_id: announcement.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
                 flags: announcement.flags,
                 disposition: if handoff_replay_pending {
-                    BarrierAckDisposition::PreparedWithReplay
+                    BarrierAckDisposition::CapturedWithReplay
                 } else {
-                    BarrierAckDisposition::Prepared
+                    BarrierAckDisposition::Captured
                 },
                 error: None,
                 watermark: self.local_watermark,
-            })
-            .await
-            .map_err(|error| DbError::Checkpoint(format!("follower prepared ack: {error}")))?;
-        let committed = Self::await_follower_decision(
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("follower captured ack failed: {error}")),
+            Err(_) => Some("follower captured ack timed out".to_string()),
+        };
+        if let Some(error) = captured_ack_error.as_deref() {
+            // The local prepared image and any phase-one sink state cannot be discarded merely
+            // because the best-effort Captured notification was ambiguous.  The leader may have
+            // observed it and committed, so continue through exact terminal settlement.
+            tracing::warn!(
+                checkpoint_id = announcement.checkpoint_id,
+                epoch = announcement.epoch,
+                %error,
+                "follower Captured acknowledgement was not confirmed; awaiting authority"
+            );
+        }
+        let required_settlement_deadline = deadline
+            .checked_add(self.config.cleanup_timeout)
+            .ok_or_else(|| DbError::Checkpoint("follower settlement deadline overflowed".into()))?;
+        let decision_timeout = decision_timeout.max(
+            required_settlement_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        );
+        if prepare_outcome == FollowerPrepareOutcome::InDoubt {
+            tracing::debug!(
+                checkpoint_id = announcement.checkpoint_id,
+                epoch = announcement.epoch,
+                "preserving in-doubt follower preparation through terminal observation"
+            );
+        }
+        let committed = match Self::await_follower_decision(
             &controller,
             announcement.epoch,
             announcement.checkpoint_id,
             &fence,
             decision_timeout,
         )
-        .await?;
-        self.follower_finish(
-            announcement.epoch,
-            announcement.checkpoint_id,
-            committed,
-            started,
-        )
         .await
+        {
+            Ok(committed) => committed,
+            Err(settlement) => {
+                self.failure_requires_recovery = true;
+                let message = captured_ack_error.map_or_else(
+                    || settlement.to_string(),
+                    |ack| format!("{ack}; terminal settlement failed: {settlement}"),
+                );
+                return Err(DbError::Checkpoint(message));
+            }
+        };
+        let result = self
+            .follower_finish(
+                announcement.epoch,
+                announcement.checkpoint_id,
+                committed,
+                started,
+            )
+            .await;
+        if result.is_err() {
+            self.failure_requires_recovery = true;
+        }
+        result
     }
 
     #[cfg(feature = "cluster")]
@@ -6256,11 +7540,15 @@ impl CheckpointCoordinator {
                             ));
                         }
                         index.validate().map_err(DbError::Checkpoint)?;
-                        if let Some(watermark) = channel_progress_frontier(&index.channel_progress)
-                            .map_err(DbError::Checkpoint)?
-                        {
-                            controller.publish_cluster_min_watermark(watermark);
-                        }
+                        let source_watermarks = index
+                            .effective_source_watermarks()
+                            .map_err(DbError::Checkpoint)?;
+                        controller
+                            .publish_committed_checkpoint_progress(
+                                &index.channel_progress,
+                                &source_watermarks,
+                            )
+                            .map_err(DbError::Checkpoint)?;
                         return Ok(true);
                     }
                     CheckpointAttemptRelation::Newer => return Ok(false),
@@ -6360,6 +7648,9 @@ impl CheckpointCoordinator {
             let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
                 DbError::Checkpoint("follower Commit has no committed checkpoint reference".into())
             })?;
+            let source_watermarks = index
+                .effective_source_watermarks()
+                .map_err(DbError::Checkpoint)?;
             let participant = index
                 .participants
                 .iter()
@@ -6370,7 +7661,8 @@ impl CheckpointCoordinator {
             participant
                 .verify_manifest(manifest.as_ref(), &manifest_bytes)
                 .map_err(DbError::Checkpoint)?;
-            self.last_committed_ref = Some(reference);
+            self.last_committed_ref = Some(reference.clone());
+            self.last_committed_source_watermarks = Some((reference, source_watermarks));
             self.last_committed_manifest = Some(manifest);
             self.prepared.remove(&attempt);
         } else {
@@ -6506,6 +7798,16 @@ pub struct CheckpointStats {
 }
 
 impl CheckpointCoordinator {
+    pub(crate) fn last_committed_ref(&self) -> Option<&CommittedCheckpointRef> {
+        self.last_committed_ref.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_committed_ref_for_test(&mut self, reference: CommittedCheckpointRef) {
+        self.last_committed_source_watermarks = None;
+        self.last_committed_ref = Some(reference);
+    }
+
     pub(crate) fn last_committed_manifest(&self) -> Option<&CheckpointManifest> {
         self.last_committed_manifest.as_deref()
     }

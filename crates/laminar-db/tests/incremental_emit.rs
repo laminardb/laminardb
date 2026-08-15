@@ -28,10 +28,16 @@ fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     }
 }
 
+fn non_recoverable_config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
+    let mut config = config(dir, incremental);
+    config.checkpoint = None;
+    config
+}
+
 fn batch(ks: &[i64], vs: &[i64]) -> RecordBatch {
-    RecordBatch::try_from_iter(vec![
-        ("k", Arc::new(Int64Array::from(ks.to_vec())) as _),
-        ("v", Arc::new(Int64Array::from(vs.to_vec())) as _),
+    RecordBatch::try_from_iter_with_nullable(vec![
+        ("k", Arc::new(Int64Array::from(ks.to_vec())) as _, true),
+        ("v", Arc::new(Int64Array::from(vs.to_vec())) as _, true),
     ])
     .unwrap()
 }
@@ -258,7 +264,7 @@ async fn counted_multiset_survives_coordinator_checkpoint_restart_and_retraction
 #[tokio::test]
 async fn chained_dim_enrich_join_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     // Static dimension table (keyed reference table).
@@ -296,7 +302,7 @@ async fn chained_dim_enrich_join_is_correct_under_updates() {
 #[tokio::test]
 async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE TABLE dim (k BIGINT PRIMARY KEY, label BIGINT)")

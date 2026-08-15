@@ -1,8 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry,
 };
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
@@ -81,6 +81,15 @@ pub struct EngineMetrics {
     pub temporal_filter_dropped: IntCounter,
     /// Per-cycle processing duration.
     pub cycle_duration: Histogram,
+    /// SQL operator-graph execution within successful normal cycles.
+    pub cycle_execute_duration: Histogram,
+    /// Materialized-view and subscription-stream publication within successful normal cycles.
+    pub cycle_output_store_duration: Histogram,
+    /// Sink command admission within successful normal cycles.
+    pub cycle_sink_enqueue_duration: Histogram,
+    /// Per-operator processing duration. Labels: `operator`, `mode` (`normal` or
+    /// `checkpoint_drain`).
+    pub operator_process_duration: HistogramVec,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
     /// Synchronous mutable checkpoint-state capture duration.
@@ -152,7 +161,11 @@ impl EngineMetrics {
             )
             .unwrap()),
             events_dropped: reg!(IntCounter::new("events_dropped_total", "Events dropped").unwrap()),
-            cycles: reg!(IntCounter::new("cycles_total", "Processing cycles completed").unwrap()),
+            cycles: reg!(IntCounter::new(
+                "cycles_total",
+                "Normal processing cycles completed (excludes checkpoint graph drains)"
+            )
+            .unwrap()),
             batches: reg!(IntCounter::new("batches_total", "Batches processed").unwrap()),
             queries_compiled: reg!(IntCounter::new(
                 "queries_compiled_total",
@@ -290,11 +303,57 @@ impl EngineMetrics {
             )
             .unwrap()),
             cycle_duration: reg!(Histogram::with_opts(
-                HistogramOpts::new("cycle_duration_seconds", "Per-cycle processing duration")
-                    .buckets(vec![
+                HistogramOpts::new(
+                    "cycle_duration_seconds",
+                    "Normal processing-cycle duration (excludes checkpoint graph drains)",
+                )
+                .buckets(vec![
                         1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
                         1e-1, 5e-1, 1.0,
                     ]),
+            )
+            .unwrap()),
+            cycle_execute_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_execute_duration_seconds",
+                    "SQL operator-graph execution within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            cycle_output_store_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_output_store_duration_seconds",
+                    "Materialized-view and subscription-stream publication within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            cycle_sink_enqueue_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_sink_enqueue_duration_seconds",
+                    "Sink publication preparation and command admission within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            // Operator names are catalog-bound and mode has exactly two values.
+            operator_process_duration: reg!(HistogramVec::new(
+                HistogramOpts::new(
+                    "operator_process_duration_seconds",
+                    "Operator processing duration by catalog operator and execution mode",
+                )
+                .buckets(prometheus::exponential_buckets(0.0001, 4.0, 10).unwrap()),
+                &["operator", "mode"],
             )
             .unwrap()),
             // Checkpoint: serialization_timeout=120s, so max bucket must cover that.

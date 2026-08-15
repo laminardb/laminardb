@@ -1028,6 +1028,41 @@ async fn exactly_once_task_never_periodically_or_implicitly_flushes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn durable_at_least_once_output_has_no_checkpoint_epoch_gate() {
+    let (sink, writes, _flushes) = CountingSink::new();
+    let (event_tx, _event_rx) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "alo-ungated".into(),
+        sink_id: Arc::from("alo-ungated"),
+        connector: Box::new(sink),
+        contract: at_least_once_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_millis(25),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+
+    let started = Instant::now();
+    assert_eq!(
+        handle
+            .wait_for_write_gate_until(Some(started + Duration::from_secs(5)))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(Instant::now(), started);
+    handle.write_batch(test_batch()).await.unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    handle.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn sealed_write_waits_through_begin_until_successor_group_publication() {
     let (sink, writes, _flushes) = CountingSink::new();
     let (event_tx, _event_rx) =

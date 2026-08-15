@@ -52,7 +52,13 @@ use crate::error::DbError;
 type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
 type SourceMsgTx = MAsyncTx<mpsc::Array<SourceMsg>>;
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
-type ForceCheckpointReply = crate::db::ForceCheckpointReply;
+type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;
+
+#[derive(Clone, Copy, Debug)]
+struct CyclePublicationDurations {
+    output_store_ns: u64,
+    sink_enqueue_ns: u64,
+}
 
 #[cfg(feature = "cluster")]
 struct SourceProcessAuthority {
@@ -345,6 +351,13 @@ enum SourceDrainCommand {
         resolution: SourceDrainResolution,
         deadline: tokio::time::Instant,
     },
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+enum SourceDrainCommandPolicy {
+    Any,
+    ResolveOnly,
 }
 
 #[cfg(feature = "cluster")]
@@ -778,19 +791,26 @@ pub(crate) fn owned_source_drain_resolved(
         let control = task
             .drain_control()
             .ok_or_else(|| format!("source '{}' has no cluster drain control", task.name()))?;
+        // The watch value is the retained terminal proof for this exact task generation. A
+        // pipeline fault can join the source actor after it published Resolved; task liveness must
+        // not erase that proof and make the snapshot watcher try to resolve the same committed
+        // drain on an exited actor. A finished task without the exact retained Commit terminal
+        // remains unresolved below; Abort is already a safe no-op on a retired actor. A replacement
+        // generation therefore still has to reconcile a committed durable cut.
+        if matches!(
+            control.status_tx.borrow().clone(),
+            SourceDrainTaskStatus::Resolved { round, outcome }
+                if round == resolution.round && outcome == resolution.outcome
+        ) {
+            continue;
+        }
         if task.is_finished() {
             if resolution.outcome == SourceDrainOutcome::Abort {
                 continue;
             }
             return Ok(false);
         }
-        if !matches!(
-            control.status_tx.borrow().clone(),
-            SourceDrainTaskStatus::Resolved { round, outcome }
-                if round == resolution.round && outcome == resolution.outcome
-        ) {
-            return Ok(false);
-        }
+        return Ok(false);
     }
     Ok(true)
 }
@@ -1194,6 +1214,9 @@ impl SourceHandle {
 pub enum ExitReason {
     /// Coordinator shutdown was explicitly signaled — a clean stop.
     Shutdown,
+    /// Deterministic runtime error that recovery cannot repair. The lifecycle publishes a
+    /// terminal faulted state but must not restart this deployment automatically.
+    Halt(String),
     /// Fatal runtime error; the lifecycle restarts or coordinates recovery as configured.
     Fault(String),
 }
@@ -1240,7 +1263,7 @@ pub struct StreamingCoordinator {
         Option<crossfire::AsyncRx<crossfire::mpsc::Array<CheckpointCompletion>>>,
     /// Public checkpoint requests waiting for the next newly-admitted exact attempt.
     force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
-    manual_waiting: Vec<ForceCheckpointReply>,
+    manual_waiting: Vec<ForceCheckpointRequest>,
     /// A committed intermediate cut retained replay, so these waiters still require HANDOFF.
     manual_handoff_required: bool,
     /// Requests attached at admission. Later requests remain in `manual_waiting`.
@@ -1261,10 +1284,22 @@ struct CoordinatorRunState {
     shuffle_work_wake: Option<Arc<tokio::sync::Notify>>,
     checkpoint_control_poll_at: tokio::time::Instant,
     checkpoint_control_pending: bool,
+    /// An observed strong intake fence restarts only the periodic checkpoint cadence when it
+    /// reopens. Manual HANDOFF requests remain immediately eligible.
+    intake_was_paused: bool,
     barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
     fault: Option<String>,
     halted: bool,
+    halt_reason: Option<String>,
     source_channel_expected: bool,
+}
+
+impl CoordinatorRunState {
+    fn halt(&mut self, reason: impl Into<String>) {
+        self.halted = true;
+        self.halt_reason.get_or_insert_with(|| reason.into());
+        self.fault = None;
+    }
 }
 
 #[derive(Default)]
@@ -1331,13 +1366,18 @@ impl Drop for StreamingCoordinator {
 struct ManualCheckpointAttempt {
     attempt: CheckpointAttempt,
     flags: u64,
-    replies: Vec<ForceCheckpointReply>,
+    requests: Vec<ForceCheckpointRequest>,
 }
 
 struct CheckpointAdmission {
     manual: bool,
     flags: u64,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+    /// Exact assignment/drain serialization claim returned by the callback. Clustered sourced
+    /// attempts retain it through Prepare and source-barrier installation; source-less attempts
+    /// release it after Prepare so mutable capture may acquire the graph's fair rotation fence.
+    assignment_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    deadline: tokio::time::Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1363,6 +1403,7 @@ struct PendingBarrier {
     sources_aligned: FxHashSet<usize>,
     source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     started_at: Instant,
+    deadline: Option<tokio::time::Instant>,
     active: bool,
     flags: u64,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
@@ -1377,6 +1418,7 @@ impl PendingBarrier {
             sources_aligned: FxHashSet::default(),
             source_checkpoints: FxHashMap::default(),
             started_at: Instant::now(),
+            deadline: None,
             active: false,
             flags: laminar_core::checkpoint::flags::NONE,
             assignment_fence: None,
@@ -1390,6 +1432,7 @@ impl PendingBarrier {
             attempt,
             sources_total,
             laminar_core::checkpoint::flags::NONE,
+            None,
             None,
         );
     }
@@ -1410,6 +1453,7 @@ impl PendingBarrier {
         sources_total: usize,
         flags: u64,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+        deadline: Option<tokio::time::Instant>,
     ) {
         self.reset_inner(
             attempt,
@@ -1418,6 +1462,12 @@ impl PendingBarrier {
             assignment_fence,
             CheckpointCleanupOwner::Originator,
         );
+        self.deadline = deadline;
+    }
+
+    fn attempt_deadline(&self, checkpoint_timeout: Duration) -> tokio::time::Instant {
+        self.deadline
+            .unwrap_or_else(|| tokio::time::Instant::from_std(self.started_at) + checkpoint_timeout)
     }
 
     fn reset_inner(
@@ -1433,6 +1483,7 @@ impl PendingBarrier {
         self.sources_aligned.clear();
         self.source_checkpoints.clear();
         self.started_at = Instant::now();
+        self.deadline = None;
         self.active = true;
         self.flags = flags;
         self.assignment_fence = assignment_fence;
@@ -1451,6 +1502,7 @@ impl PendingBarrier {
         self.source_checkpoints.clear();
         self.flags = laminar_core::checkpoint::flags::NONE;
         self.assignment_fence = None;
+        self.deadline = None;
         self.cleanup_owner = CheckpointCleanupOwner::Originator;
         self.attempt.take().map(|attempt| (attempt, cleanup_owner))
     }
@@ -1463,6 +1515,7 @@ impl PendingBarrier {
         self.source_checkpoints.clear();
         self.flags = laminar_core::checkpoint::flags::NONE;
         self.assignment_fence = None;
+        self.deadline = None;
         self.cleanup_owner = CheckpointCleanupOwner::Originator;
     }
 }
@@ -1601,6 +1654,7 @@ async fn apply_latest_source_drain_command_fenced(
     command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
     status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
     active: &mut Option<ActiveSourceDrain>,
+    policy: SourceDrainCommandPolicy,
     provider_drain: bool,
     source_name: &str,
     cancellation_policy: ConnectorCancellationPolicy,
@@ -1619,6 +1673,16 @@ async fn apply_latest_source_drain_command_fenced(
     let Some(command) = command_rx.borrow_and_update().clone() else {
         return Ok(());
     };
+    if matches!(policy, SourceDrainCommandPolicy::ResolveOnly)
+        && matches!(&command, SourceDrainCommand::Begin { .. })
+    {
+        // A provider Begin may need normal source polling to reach its FIFO cut, which this
+        // earlier barrier forbids. Re-mark the captured generation changed: if Resolve already
+        // overwrote it, that newer generation remains changed; otherwise this Begin remains
+        // pending for the normal loop after barrier release.
+        command_rx.mark_changed();
+        return Ok(());
+    }
     match command {
         SourceDrainCommand::Begin {
             request,
@@ -1964,6 +2028,7 @@ async fn apply_latest_source_drain_command(
         command_rx,
         status_tx,
         active,
+        SourceDrainCommandPolicy::Any,
         provider_drain,
         "test-source",
         ConnectorCancellationPolicy::RetireConnector,
@@ -2534,10 +2599,57 @@ fn source_barrier_release_covers(released: CheckpointAttempt, held: CheckpointAt
     )
 }
 
+#[cfg(feature = "cluster")]
+async fn service_source_drain_resolution_during_barrier_hold(
+    connector: &mut dyn SourceConnector,
+    command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
+    control: &SourceDrainLeaseControl,
+    active: &mut Option<ActiveSourceDrain>,
+    provider_drain: bool,
+    source_name: &str,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    process_authority: Option<&SourceProcessAuthority>,
+) -> Result<(), ConnectorError> {
+    apply_latest_source_drain_command_fenced(
+        connector,
+        command_rx,
+        &control.status_tx,
+        active,
+        SourceDrainCommandPolicy::ResolveOnly,
+        provider_drain,
+        source_name,
+        cancellation_policy,
+        lifecycle,
+        process_authority,
+    )
+    .await?;
+    publish_source_drain_ready_fenced(
+        connector,
+        control,
+        active,
+        source_name,
+        cancellation_policy,
+        lifecycle,
+        process_authority,
+    )?;
+    resolve_pending_source_drain_fenced(
+        connector,
+        &control.status_tx,
+        active,
+        source_name,
+        cancellation_policy,
+        lifecycle,
+        process_authority,
+    )
+    .await
+}
+
 /// Hold a source at an emitted barrier until the coordinator releases that exact attempt.
 ///
 /// The retained watch value closes the release-before-wait race. While held, the source keeps its
-/// connector control plane and durable upstream acknowledgements live, but never polls data.
+/// connector control plane, source-drain control, and durable upstream acknowledgements live, but
+/// never polls data.
 async fn wait_source_barrier_release(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -2549,11 +2661,21 @@ async fn wait_source_barrier_release(
     operation_timeout: Duration,
     cancellation_policy: ConnectorCancellationPolicy,
     lifecycle: &mut SourceConnectorLifecycle,
+    #[cfg(feature = "cluster")] drain_control: Option<&SourceDrainLeaseControl>,
+    #[cfg(feature = "cluster")] mut drain_command_rx: Option<
+        &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
+    >,
+    #[cfg(feature = "cluster")] active_source_drain: &mut Option<ActiveSourceDrain>,
+    #[cfg(feature = "cluster")] provider_drain: bool,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
     barrier: CheckpointBarrier,
 ) -> bool {
     let attempt = CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
+    #[cfg(feature = "cluster")]
+    let drain_wake = drain_control.map(|control| control.wake.as_ref());
+    #[cfg(not(feature = "cluster"))]
+    let drain_wake: Option<&tokio::sync::Notify> = None;
     loop {
         #[cfg(feature = "cluster")]
         if !source_process_authority_is_live(process_authority) {
@@ -2572,6 +2694,33 @@ async fn wait_source_barrier_release(
                 return false;
             }
             _ => {}
+        }
+
+        #[cfg(feature = "cluster")]
+        if let (Some(control), Some(command_rx)) = (drain_control, drain_command_rx.as_deref_mut())
+        {
+            if let Err(error) = service_source_drain_resolution_during_barrier_hold(
+                connector,
+                command_rx,
+                control,
+                active_source_drain,
+                provider_drain,
+                src_name,
+                cancellation_policy,
+                lifecycle,
+                process_authority,
+            )
+            .await
+            {
+                if !lifecycle.process_authority_lost() {
+                    lifecycle.fault_data_plane();
+                    let _ = fault_tx.send(SourceFault {
+                        source: Arc::from(src_name),
+                        error: error.to_string(),
+                    });
+                }
+                return false;
+            }
         }
 
         let control_deadline = tokio::time::Instant::now() + operation_timeout;
@@ -2631,6 +2780,12 @@ async fn wait_source_barrier_release(
                         return false;
                     }
                 },
+                () = async move {
+                    match drain_wake {
+                        Some(notify) => notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {},
                 () = tokio::time::sleep(poll_interval) => {}
             }
             continue;
@@ -2668,6 +2823,12 @@ async fn wait_source_barrier_release(
                     return false;
                 }
             },
+            () = async move {
+                match drain_wake {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {},
             () = tokio::time::sleep(poll_interval) => {}
         }
     }
@@ -3436,6 +3597,7 @@ impl StreamingCoordinator {
                             command_rx,
                             &control.status_tx,
                             &mut active_source_drain,
+                            SourceDrainCommandPolicy::Any,
                             assignment_scoped,
                             &src_name,
                             cancellation_policy,
@@ -3744,6 +3906,14 @@ impl StreamingCoordinator {
                                         cancellation_policy,
                                         &mut lifecycle,
                                         #[cfg(feature = "cluster")]
+                                        task_drain_control.as_ref(),
+                                        #[cfg(feature = "cluster")]
+                                        task_drain_command_rx.as_mut(),
+                                        #[cfg(feature = "cluster")]
+                                        &mut active_source_drain,
+                                        #[cfg(feature = "cluster")]
+                                        assignment_scoped,
+                                        #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
                                         barrier,
@@ -3864,6 +4034,14 @@ impl StreamingCoordinator {
                                         source_operation_timeout,
                                         cancellation_policy,
                                         &mut lifecycle,
+                                        #[cfg(feature = "cluster")]
+                                        task_drain_control.as_ref(),
+                                        #[cfg(feature = "cluster")]
+                                        task_drain_command_rx.as_mut(),
+                                        #[cfg(feature = "cluster")]
+                                        &mut active_source_drain,
+                                        #[cfg(feature = "cluster")]
+                                        assignment_scoped,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -4175,6 +4353,14 @@ impl StreamingCoordinator {
                                         source_operation_timeout,
                                         cancellation_policy,
                                         &mut lifecycle,
+                                        #[cfg(feature = "cluster")]
+                                        task_drain_control.as_ref(),
+                                        #[cfg(feature = "cluster")]
+                                        task_drain_command_rx.as_mut(),
+                                        #[cfg(feature = "cluster")]
+                                        &mut active_source_drain,
+                                        #[cfg(feature = "cluster")]
+                                        assignment_scoped,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -4503,22 +4689,129 @@ impl StreamingCoordinator {
         let Some(rx) = self.force_ckpt_rx.as_ref() else {
             return;
         };
-        while let Ok(reply) = rx.try_recv() {
-            self.manual_waiting.push(reply);
+        while let Ok(request) = rx.try_recv() {
+            self.manual_waiting.push(request);
         }
     }
 
-    fn activate_manual_attempt(&mut self, attempt: CheckpointAttempt, flags: u64) {
+    /// Remove callers that cancelled or exhausted their deadline before exact-attempt ownership.
+    fn prune_manual_requests(&mut self) {
+        let now = tokio::time::Instant::now();
+        let requests = std::mem::take(&mut self.manual_waiting);
+        for request in requests {
+            // A committed intermediate HANDOFF cut can return an already-acknowledged owner to
+            // this queue for its replay-quiescent successor. Its public admission deadline and
+            // receiver lifetime no longer cancel the coordinator-owned handoff sequence.
+            if request.reservation_claim.is_none() {
+                self.manual_waiting.push(request);
+                continue;
+            }
+            if request.reply.is_disconnected() {
+                continue;
+            }
+            if now >= request.deadline {
+                request.reply.send(Err(DbError::Checkpoint(
+                    "manual checkpoint deadline expired before exact attempt reservation".into(),
+                )));
+                continue;
+            }
+            self.manual_waiting.push(request);
+        }
         if self.manual_waiting.is_empty() {
-            return;
+            self.manual_handoff_required = false;
+        }
+    }
+
+    fn manual_deadline(&self, default: tokio::time::Instant) -> tokio::time::Instant {
+        // Once any replay owner has crossed the exact-reservation boundary, the next HANDOFF uses
+        // a fresh coordinator attempt budget. A newly coalesced public caller must not shorten or
+        // cancel the already-owned replay sequence.
+        if self
+            .manual_waiting
+            .iter()
+            .any(|request| request.reservation_claim.is_none())
+        {
+            return default;
+        }
+        self.manual_waiting
+            .iter()
+            .map(|request| request.deadline)
+            .min()
+            .unwrap_or(default)
+            .min(default)
+    }
+
+    /// Claim every still-live public waiter before starting the bounded durable reservation call.
+    /// Already-claimed HANDOFF replay owners have no token and remain attached automatically.
+    fn claim_waiting_manual_requests(&mut self) -> bool {
+        if self
+            .manual_waiting
+            .iter()
+            .any(|request| request.reservation_claim.is_none())
+        {
+            // The replay owner alone authorizes the fresh allocator budget. Newly coalesced public
+            // callers remain independently deadline-cancellable until an exact successor exists.
+            return true;
+        }
+        let requests = std::mem::take(&mut self.manual_waiting);
+        for request in requests {
+            let claimed = request
+                .reservation_claim
+                .as_ref()
+                .is_none_or(crate::db::ForceCheckpointReservationClaim::try_claim);
+            if claimed {
+                self.manual_waiting.push(request);
+            }
+        }
+        if self.manual_waiting.is_empty() {
+            self.manual_handoff_required = false;
+        }
+        !self.manual_waiting.is_empty()
+    }
+
+    /// Attach claimed callers to an exact attempt and notify them that durable reservation won.
+    fn activate_manual_attempt(&mut self, attempt: CheckpointAttempt, flags: u64) -> bool {
+        if self.manual_waiting.is_empty() {
+            return false;
         }
         debug_assert!(self.manual_active.is_none());
         self.manual_active = Some(ManualCheckpointAttempt {
             attempt,
             flags,
-            replies: std::mem::take(&mut self.manual_waiting),
+            requests: std::mem::take(&mut self.manual_waiting),
         });
+        let active = self
+            .manual_active
+            .as_mut()
+            .expect("manual attempt was just installed");
+        let requests = std::mem::take(&mut active.requests);
+        for mut request in requests {
+            let Some(claim) = request.reservation_claim.take() else {
+                active.requests.push(request);
+                continue;
+            };
+            match claim.attach(request.deadline, tokio::time::Instant::now()) {
+                crate::db::ForceCheckpointReservationAttachment::Attached => {
+                    active.requests.push(request);
+                }
+                crate::db::ForceCheckpointReservationAttachment::Expired => {
+                    request.reply.send(Err(DbError::Checkpoint(
+                        "manual checkpoint deadline expired before exact attempt reservation"
+                            .into(),
+                    )));
+                }
+                crate::db::ForceCheckpointReservationAttachment::Cancelled => {}
+            }
+        }
+        let owned = self
+            .manual_active
+            .as_ref()
+            .is_some_and(|active| !active.requests.is_empty());
+        if !owned {
+            self.manual_active = None;
+        }
         self.manual_handoff_required = false;
+        owned
     }
 
     fn retry_manual_handoff(&mut self, attempt: CheckpointAttempt) {
@@ -4530,23 +4823,23 @@ impl StreamingCoordinator {
             return;
         }
         if active.flags & laminar_core::checkpoint::flags::HANDOFF == 0 {
-            for reply in active.replies {
-                reply.send(Err(DbError::Checkpoint(
+            for request in active.requests {
+                request.reply.send(Err(DbError::Checkpoint(
                     "non-handoff checkpoint reported pending handoff replay".into(),
                 )));
             }
             return;
         }
-        let mut replies = active.replies;
-        replies.append(&mut self.manual_waiting);
-        self.manual_waiting = replies;
+        let mut requests = active.requests;
+        requests.append(&mut self.manual_waiting);
+        self.manual_waiting = requests;
         self.manual_handoff_required = true;
     }
 
     fn fail_waiting_manual(&mut self, error: impl Into<String>) {
         let error = error.into();
-        for reply in self.manual_waiting.drain(..) {
-            reply.send(Err(DbError::Checkpoint(error.clone())));
+        for request in self.manual_waiting.drain(..) {
+            request.reply.send(Err(DbError::Checkpoint(error.clone())));
         }
         self.manual_handoff_required = false;
     }
@@ -4574,13 +4867,13 @@ impl StreamingCoordinator {
                 completed.checkpoint_id,
                 result.success,
             );
-            for reply in active.replies {
-                reply.send(Err(DbError::Checkpoint(reason.clone())));
+            for request in active.requests {
+                request.reply.send(Err(DbError::Checkpoint(reason.clone())));
             }
             return;
         }
-        for reply in active.replies {
-            reply.send(Ok(result.clone()));
+        for request in active.requests {
+            request.reply.send(Ok(result.clone()));
         }
     }
 
@@ -4593,16 +4886,18 @@ impl StreamingCoordinator {
             return;
         }
         let error = error.into();
-        for reply in active.replies {
-            reply.send(Err(DbError::Checkpoint(error.clone())));
+        for request in active.requests {
+            request.reply.send(Err(DbError::Checkpoint(error.clone())));
         }
     }
 
     fn fail_all_manual(&mut self, error: &str) {
         self.fail_waiting_manual(error);
         if let Some(active) = self.manual_active.take() {
-            for reply in active.replies {
-                reply.send(Err(DbError::Checkpoint(error.to_owned())));
+            for request in active.requests {
+                request
+                    .reply
+                    .send(Err(DbError::Checkpoint(error.to_owned())));
             }
         }
     }
@@ -4926,7 +5221,7 @@ impl StreamingCoordinator {
                 if let Some(ref mut rx) = self.force_ckpt_rx {
                     rx.recv().await.ok()
                 } else {
-                    futures::future::pending::<Option<ForceCheckpointReply>>().await
+                    futures::future::pending::<Option<ForceCheckpointRequest>>().await
                 }
             } => {
                 self.manual_waiting.push(reply);
@@ -5020,22 +5315,34 @@ impl StreamingCoordinator {
         checkpoint_control_due: bool,
     ) -> bool {
         if self.replay_pending && self.pending_barrier.active {
-            let deadline = tokio::time::Instant::from_std(self.pending_barrier.started_at)
-                + self.config.checkpoint_timeout;
+            let deadline = self
+                .pending_barrier
+                .attempt_deadline(self.config.checkpoint_timeout);
             if let Err(error) = callback.drain_checkpoint_edges_until(deadline).await {
                 let reason = error.to_string();
+                let terminal = matches!(&error, CycleError::Halt(_));
+                if terminal {
+                    state.halt(reason.clone());
+                }
                 tracing::error!(%error, "checkpoint replay drain failed");
                 if let Err(cleanup) = self
                     .cancel_pending_barrier_for_stop(callback, &reason, true)
                     .await
                 {
-                    state.fault = Some(format!(
-                        "{reason}; checkpoint cleanup failed after replay drain: {cleanup}"
-                    ));
+                    if terminal {
+                        tracing::warn!(
+                            %cleanup,
+                            "checkpoint cleanup also failed after a permanent replay-drain halt"
+                        );
+                    } else {
+                        state.fault = Some(format!(
+                            "{reason}; checkpoint cleanup failed after replay drain: {cleanup}"
+                        ));
+                    }
                     return false;
                 }
                 match error {
-                    CycleError::Halt(_) => state.halted = true,
+                    CycleError::Halt(_) => {}
                     CycleError::Fatal(_) | CycleError::Recovery(_) => state.fault = Some(reason),
                 }
                 return false;
@@ -5055,7 +5362,7 @@ impl StreamingCoordinator {
                 Ok(()) => {}
                 Err(CycleError::Halt(reason)) => {
                     tracing::warn!(%reason, "[LDB-3022] checkpoint drain halted the pipeline");
-                    state.halted = true;
+                    state.halt(reason);
                     return false;
                 }
                 Err(CycleError::Fatal(reason) | CycleError::Recovery(reason)) => {
@@ -5065,6 +5372,15 @@ impl StreamingCoordinator {
             }
         }
         if self.terminal_shutdown.is_cancelled() {
+            return false;
+        }
+        if let Some(reason) = callback.take_pipeline_halt() {
+            self.discard_pending_offsets();
+            tracing::warn!(
+                reason = %reason,
+                "[LDB-3022] permanent pipeline error; stopping without recovery"
+            );
+            state.halt(reason);
             return false;
         }
         if let Some(reason) = callback.take_pipeline_fault() {
@@ -5082,7 +5398,18 @@ impl StreamingCoordinator {
         let checkpoint_work_due =
             callback.is_leader() || follower_control_ready || !self.manual_waiting.is_empty();
         if checkpoint_work_due {
-            let control_serviced = self.maybe_checkpoint(callback).await;
+            // Admission can already have reserved an exact attempt and begun its durable artifact
+            // inventory before Prepare publication blocks on external control-plane I/O. A
+            // recovery stop must still reach `finish_run`: already-spawned tails are settled
+            // there, while an interrupted pre-tail attempt remains visible for coordinated
+            // recovery's authoritative artifact reconciliation. Do not synthesize a local
+            // completion for that ambiguous publication.
+            let terminal_shutdown = self.terminal_shutdown.clone();
+            let control_serviced = tokio::select! {
+                biased;
+                () = terminal_shutdown.cancelled() => return false,
+                serviced = self.maybe_checkpoint(callback) => serviced,
+            };
             if follower_control_ready {
                 #[cfg(feature = "cluster")]
                 if let Some(wake) = state.checkpoint_control_wake.as_ref() {
@@ -5106,6 +5433,15 @@ impl StreamingCoordinator {
                     state.checkpoint_control_pending &= !control_serviced;
                 }
             }
+            if let Some(reason) = callback.take_pipeline_halt() {
+                self.discard_pending_offsets();
+                tracing::warn!(
+                    reason = %reason,
+                    "[LDB-3022] checkpoint control observed a permanent pipeline error"
+                );
+                state.halt(reason);
+                return false;
+            }
             if let Some(reason) = callback.take_pipeline_fault() {
                 self.discard_pending_offsets();
                 tracing::error!(
@@ -5127,7 +5463,10 @@ impl StreamingCoordinator {
         }
 
         if self.pending_barrier.active
-            && self.pending_barrier.started_at.elapsed() > self.config.checkpoint_timeout
+            && tokio::time::Instant::now()
+                >= self
+                    .pending_barrier
+                    .attempt_deadline(self.config.checkpoint_timeout)
         {
             if let Err(error) = self
                 .cancel_pending_barrier_for_stop(callback, "source barrier alignment timeout", true)
@@ -5174,15 +5513,18 @@ impl StreamingCoordinator {
             }
         }
 
+        let intake_was_paused = callback.intake_paused();
         let mut state = CoordinatorRunState {
             batch_window: self.config.batch_window,
             checkpoint_control_wake: callback.checkpoint_control_wake(),
             shuffle_work_wake: callback.shuffle_work_wake(),
             checkpoint_control_poll_at: tokio::time::Instant::now(),
             checkpoint_control_pending: false,
+            intake_was_paused,
             barriers: Vec::new(),
             fault: None,
             halted: false,
+            halt_reason: None,
             source_channel_expected: !self.source_names.is_empty(),
         };
 
@@ -5206,7 +5548,9 @@ impl StreamingCoordinator {
             // a message from the source FIFO. Keep that message ahead of later FIFO entries so a
             // transient close/reopen cannot silently lose it. A fenced shutdown still discards
             // all open-epoch data below, where recovery owns the rewind.
-            if intake_paused || callback.intake_paused() {
+            let intake_blocked = intake_paused || callback.intake_paused();
+            self.observe_intake_gate_for_checkpoint_cadence(&mut state, intake_blocked);
+            if intake_blocked {
                 if let Some(message) = msg {
                     if self.parked_source_msg.is_some() {
                         state.fault = Some(
@@ -5217,6 +5561,10 @@ impl StreamingCoordinator {
                     }
                     self.parked_source_msg = Some(message);
                 }
+                // Do not hide public admission deadlines behind assignment-transition control.
+                // Retain the second pass below because requests can arrive while that await runs.
+                self.drain_manual_requests();
+                self.prune_manual_requests();
                 #[cfg(feature = "cluster")]
                 if let Err(error) =
                     self.require_process_authority("fenced vnode transition completion")
@@ -5228,6 +5576,7 @@ impl StreamingCoordinator {
                     Ok(_) => {}
                     Err(CycleError::Halt(reason)) => {
                         tracing::warn!(%reason, "[LDB-3022] fenced vnode transition halted");
+                        state.halt(reason);
                         break;
                     }
                     Err(CycleError::Recovery(reason) | CycleError::Fatal(reason)) => {
@@ -5237,7 +5586,23 @@ impl StreamingCoordinator {
                         break;
                     }
                 }
+                // A generic intake fence also blocks the mixed source FIFO that carries both
+                // predecessor batches and checkpoint barriers. Never reserve or inject a forced
+                // checkpoint here: its barrier could be stranded behind data the coordinator is
+                // deliberately forbidden to consume. Keep only pre-reservation caller lifecycle
+                // live so deadlines are observed and the drain can take its durable Abort path.
+                self.drain_manual_requests();
+                self.prune_manual_requests();
                 continue;
+            }
+
+            if !self.replay_pending {
+                if let Err(error) = callback.pin_source_frontiers_for_new_cycle() {
+                    state.fault = Some(format!(
+                        "decision-bound source frontiers could not be pinned before intake: {error}"
+                    ));
+                    break;
+                }
             }
 
             self.source_batches_buf.clear();
@@ -5257,10 +5622,18 @@ impl StreamingCoordinator {
                     &mut state.barriers,
                     &mut cycle_events,
                 ) {
-                    state.fault = Some(error.to_string());
+                    match error {
+                        CycleError::Halt(reason) => {
+                            tracing::warn!(%reason, "[LDB-3022] source staging halted");
+                            state.halt(reason);
+                        }
+                        CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
+                            state.fault = Some(reason);
+                        }
+                    }
                 }
             }
-            if state.fault.is_some() {
+            if state.halted || state.fault.is_some() {
                 self.discard_pending_offsets();
                 break;
             }
@@ -5286,7 +5659,15 @@ impl StreamingCoordinator {
                             &mut state.barriers,
                             &mut cycle_events,
                         ) {
-                            state.fault = Some(error.to_string());
+                            match error {
+                                CycleError::Halt(reason) => {
+                                    tracing::warn!(%reason, "[LDB-3022] source staging halted");
+                                    state.halt(reason);
+                                }
+                                CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
+                                    state.fault = Some(reason);
+                                }
+                            }
                             break;
                         }
                         drain_count += 1;
@@ -5300,7 +5681,7 @@ impl StreamingCoordinator {
                     source_fault.source, source_fault.error
                 ));
             }
-            if state.fault.is_some() {
+            if state.halted || state.fault.is_some() {
                 self.discard_pending_offsets();
                 break;
             }
@@ -5328,7 +5709,15 @@ impl StreamingCoordinator {
                     });
             if let Err(error) = watermark_result {
                 self.discard_pending_offsets();
-                state.fault = Some(error.to_string());
+                match error {
+                    CycleError::Halt(reason) => {
+                        tracing::warn!(%reason, "[LDB-3022] watermark processing halted");
+                        state.halt(reason);
+                    }
+                    CycleError::Fatal(reason) | CycleError::Recovery(reason) => {
+                        state.fault = Some(reason);
+                    }
+                }
                 break;
             }
 
@@ -5350,7 +5739,11 @@ impl StreamingCoordinator {
                     state.fault = Some(error.to_string());
                     break;
                 }
-                match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                let execute_started = Instant::now();
+                let execute_result = callback.execute_cycle(&self.source_batches_buf, wm).await;
+                let execute_ns =
+                    u64::try_from(execute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                match execute_result {
                     Ok(out) => {
                         // Durable delivery rewinds the whole pipeline, so don't partial-commit
                         // siblings — recover instead.
@@ -5363,15 +5756,31 @@ impl StreamingCoordinator {
                                 Some("isolated domain fault (durable delivery)".to_string());
                             break;
                         }
-                        if let Err(error) = self.publish_cycle_outputs(&mut callback, &out).await {
-                            let reason = error.to_string();
-                            tracing::error!(
-                                error = %reason,
-                                "cycle output publication failed; faulting for recovery"
-                            );
-                            state.fault = Some(reason);
-                            break;
-                        }
+                        let publication =
+                            match self.publish_cycle_outputs(&mut callback, &out).await {
+                                Ok(publication) => publication,
+                                Err(CycleError::Halt(reason)) => {
+                                    tracing::warn!(
+                                        %reason,
+                                        "[LDB-3022] cycle output publication halted"
+                                    );
+                                    state.halt(reason);
+                                    break;
+                                }
+                                Err(CycleError::Recovery(reason) | CycleError::Fatal(reason)) => {
+                                    tracing::error!(
+                                        error = %reason,
+                                        "cycle output publication failed; faulting for recovery"
+                                    );
+                                    state.fault = Some(reason);
+                                    break;
+                                }
+                            };
+                        callback.record_cycle_phases(
+                            execute_ns,
+                            publication.output_store_ns,
+                            publication.sink_enqueue_ns,
+                        );
                         if out.any_failed {
                             callback.note_cycle_error();
                             tracing::warn!(
@@ -5393,6 +5802,7 @@ impl StreamingCoordinator {
                             // Shutdown already signaled; restarting would just re-trip it.
                             CycleError::Halt(msg) => {
                                 tracing::warn!(reason = %msg, "[LDB-3022] cycle halted");
+                                state.halt(msg);
                                 break;
                             }
                             // Continuing would drop drained rows, so durable delivery faults for
@@ -5437,14 +5847,26 @@ impl StreamingCoordinator {
             }
         }
 
-        self.finish_run(&mut callback, state.fault).await
+        self.finish_run(&mut callback, state.fault, state.halted, state.halt_reason)
+            .await
     }
 
     async fn finish_run<C: PipelineCallback>(
         &mut self,
         callback: &mut C,
         mut fault: Option<String>,
+        mut halted: bool,
+        mut halt_reason: Option<String>,
     ) -> ExitReason {
+        if let Some(reason) = callback.take_pipeline_halt() {
+            tracing::warn!(%reason, "[LDB-3022] pipeline stopped after a permanent error");
+            halted = true;
+            halt_reason.get_or_insert(reason);
+        }
+        if halted {
+            halt_reason.get_or_insert_with(|| "pipeline halted after a permanent error".into());
+            fault = None;
+        }
         // Every exit below is coordinator-owned. Mark it before tail settlement so source-task
         // guards cannot turn an intentional teardown into a second runtime fault.
         for handle in &self.source_handles {
@@ -5455,7 +5877,9 @@ impl StreamingCoordinator {
         // unaligned attempt has no tail and therefore cannot make the in-flight counter progress.
         self.drain_manual_requests();
         self.fail_waiting_manual("pipeline is stopping; no new checkpoint can be admitted");
-        let interrupted_reason = if fault.is_some() {
+        let interrupted_reason = if halted {
+            "permanent pipeline halt interrupted source barrier alignment"
+        } else if fault.is_some() {
             "pipeline fault interrupted source barrier alignment"
         } else {
             "pipeline shutdown interrupted source barrier alignment"
@@ -5464,16 +5888,32 @@ impl StreamingCoordinator {
             .cancel_pending_barrier_for_stop(callback, interrupted_reason, false)
             .await
         {
-            fault.get_or_insert(error);
+            if halted {
+                tracing::warn!(%error, "checkpoint cleanup also failed after a permanent halt");
+            } else {
+                fault.get_or_insert(error);
+            }
         }
 
         // Captured tails own durable state and may still need to publish source acknowledgements.
         // Settling them while sources and sinks remain open prevents close from racing commit.
         if let Some(error) = self.settle_checkpoint_tails(callback).await {
-            fault.get_or_insert(error);
+            if halted {
+                tracing::warn!(%error, "checkpoint tail also failed after a permanent halt");
+            } else {
+                fault.get_or_insert(error);
+            }
         }
-        if let Some(reason) = callback.take_pipeline_fault() {
-            fault.get_or_insert(reason);
+        if let Some(reason) = callback.take_pipeline_halt() {
+            tracing::warn!(%reason, "[LDB-3022] checkpoint cleanup retained a permanent halt");
+            halted = true;
+            halt_reason.get_or_insert(reason);
+            fault = None;
+        }
+        if !halted {
+            if let Some(reason) = callback.take_pipeline_fault() {
+                fault.get_or_insert(reason);
+            }
         }
 
         self.stop_source_barrier_holds();
@@ -5492,7 +5932,7 @@ impl StreamingCoordinator {
 
         // A message parked by the intake-gate race is open-epoch data.
         if let Some(msg) = self.parked_source_msg.take() {
-            if fault.is_none() && !intake_fenced {
+            if !halted && fault.is_none() && !intake_fenced {
                 if let Some(reason) = self.process_shutdown_msg(msg, callback, &mut drain_events) {
                     fault = Some(reason);
                     self.source_batches_buf.clear();
@@ -5522,7 +5962,7 @@ impl StreamingCoordinator {
             && tokio::time::Instant::now() < source_deadline
         {
             while let Ok(msg) = self.rx.try_recv() {
-                if fault.is_none() && !intake_fenced {
+                if !halted && fault.is_none() && !intake_fenced {
                     if let Some(reason) =
                         self.process_shutdown_msg(msg, callback, &mut drain_events)
                     {
@@ -5548,7 +5988,7 @@ impl StreamingCoordinator {
                 continue;
             }
             match tokio::time::timeout(tick, self.rx.recv()).await {
-                Ok(Ok(msg)) if fault.is_none() && !intake_fenced => {
+                Ok(Ok(msg)) if !halted && fault.is_none() && !intake_fenced => {
                     if let Some(reason) =
                         self.process_shutdown_msg(msg, callback, &mut drain_events)
                     {
@@ -5569,7 +6009,7 @@ impl StreamingCoordinator {
 
         // Capture messages enqueued immediately before the last source task exited.
         while let Ok(msg) = self.rx.try_recv() {
-            if fault.is_none() && !intake_fenced {
+            if !halted && fault.is_none() && !intake_fenced {
                 if let Some(reason) = self.process_shutdown_msg(msg, callback, &mut drain_events) {
                     fault = Some(reason);
                     self.source_batches_buf.clear();
@@ -5580,7 +6020,7 @@ impl StreamingCoordinator {
         }
 
         #[cfg(feature = "cluster")]
-        if fault.is_none() && !intake_fenced {
+        if !halted && fault.is_none() && !intake_fenced {
             if let Err(error) = self.require_process_authority("folding the shutdown source drain")
             {
                 self.source_batches_buf.clear();
@@ -5590,7 +6030,7 @@ impl StreamingCoordinator {
             }
         }
 
-        if fault.is_none() && !intake_fenced {
+        if !halted && fault.is_none() && !intake_fenced {
             let staged_source_progress = !self.pending_watermark_batches.is_empty();
             let watermark_result =
                 self.pending_watermark_batches
@@ -5633,7 +6073,11 @@ impl StreamingCoordinator {
                     fault = Some(error.to_string());
                 }
                 if fault.is_none() {
-                    match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                    let execute_started = Instant::now();
+                    let execute_result = callback.execute_cycle(&self.source_batches_buf, wm).await;
+                    let execute_ns =
+                        u64::try_from(execute_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    match execute_result {
                         Ok(out) if out.any_failed && callback.fault_on_cycle_error() => {
                             self.discard_pending_offsets();
                             fault = Some(
@@ -5642,19 +6086,37 @@ impl StreamingCoordinator {
                     );
                         }
                         Ok(out) => match self.publish_cycle_outputs(callback, &out).await {
-                            Ok(()) => {
+                            Ok(publication) => {
+                                callback.record_cycle_phases(
+                                    execute_ns,
+                                    publication.output_store_ns,
+                                    publication.sink_enqueue_ns,
+                                );
                                 if out.any_failed {
                                     callback.note_cycle_error();
                                 }
                             }
-                            Err(error) => {
+                            Err(CycleError::Halt(reason)) => {
+                                self.discard_pending_offsets();
+                                halted = true;
+                                halt_reason.get_or_insert(reason.clone());
+                                fault = None;
+                                tracing::warn!(
+                                    %reason,
+                                    "[LDB-3022] output publication halted during shutdown drain"
+                                );
+                            }
+                            Err(CycleError::Recovery(reason) | CycleError::Fatal(reason)) => {
                                 fault = Some(format!(
-                            "cycle output publication failed during shutdown drain: {error}"
+                            "cycle output publication failed during shutdown drain: {reason}"
                         ));
                             }
                         },
                         Err(CycleError::Halt(reason)) => {
                             self.discard_pending_offsets();
+                            halted = true;
+                            halt_reason.get_or_insert(reason.clone());
+                            fault = None;
                             tracing::warn!(%reason, "[LDB-3022] cycle halted during shutdown drain");
                         }
                         Err(CycleError::Recovery(reason)) => {
@@ -5688,12 +6150,19 @@ impl StreamingCoordinator {
         let sink_epoch_settled = match callback.settle_sink_epoch_for_shutdown().await {
             Ok(()) => true,
             Err(error) => {
-                match fault.as_mut() {
-                    Some(existing) => {
-                        existing.push_str("; sink epoch settlement also failed: ");
-                        existing.push_str(&error);
+                if halted {
+                    tracing::warn!(
+                        %error,
+                        "sink epoch settlement also failed after a permanent halt"
+                    );
+                } else {
+                    match fault.as_mut() {
+                        Some(existing) => {
+                            existing.push_str("; sink epoch settlement also failed: ");
+                            existing.push_str(&error);
+                        }
+                        None => fault = Some(format!("sink epoch settlement failed: {error}")),
                     }
-                    None => fault = Some(format!("sink epoch settlement failed: {error}")),
                 }
                 false
             }
@@ -5704,7 +6173,12 @@ impl StreamingCoordinator {
         // after durable epoch ownership is settled.
         if sink_epoch_settled {
             if let Err(close_error) = callback.close_sinks().await {
-                if callback.fault_on_cycle_error() {
+                if halted {
+                    tracing::warn!(
+                        error = %close_error,
+                        "sink shutdown also failed after a permanent halt"
+                    );
+                } else if callback.fault_on_cycle_error() {
                     match fault.as_mut() {
                         Some(existing) => {
                             existing.push_str("; sink shutdown also failed: ");
@@ -5722,12 +6196,26 @@ impl StreamingCoordinator {
             }
         }
 
-        let exit = fault.map_or(ExitReason::Shutdown, ExitReason::Fault);
+        if let Some(reason) = callback.take_pipeline_halt() {
+            tracing::warn!(%reason, "[LDB-3022] shutdown retained a permanent pipeline halt");
+            halted = true;
+            halt_reason.get_or_insert(reason);
+            fault = None;
+        }
+        if halted {
+            halt_reason.get_or_insert_with(|| "pipeline halted after a permanent error".into());
+            fault = None;
+        }
+        let exit = if let Some(reason) = halt_reason {
+            ExitReason::Halt(reason)
+        } else {
+            fault.map_or(ExitReason::Shutdown, ExitReason::Fault)
+        };
         let reason = match &exit {
             ExitReason::Shutdown => {
                 "pipeline stopped; discard subscription rows after the last committed progress frontier"
             }
-            ExitReason::Fault(error) => error,
+            ExitReason::Halt(error) | ExitReason::Fault(error) => error,
         };
         callback.invalidate_subscriptions(reason);
         exit
@@ -6023,12 +6511,13 @@ impl StreamingCoordinator {
         &mut self,
         callback: &mut impl PipelineCallback,
         outcome: &CycleOutcome,
-    ) -> Result<(), CycleError> {
+    ) -> Result<CyclePublicationDurations, CycleError> {
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("materialized-view publication") {
             self.discard_pending_offsets();
             return Err(error);
         }
+        let output_store_started = Instant::now();
         if let Err(error) = callback.update_mv_stores(&outcome.results) {
             self.discard_pending_offsets();
             return Err(CycleError::Recovery(format!(
@@ -6046,16 +6535,21 @@ impl StreamingCoordinator {
                 "stream publication failed: {error}"
             )));
         }
+        let output_store_ns =
+            u64::try_from(output_store_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("sink publication") {
             self.discard_pending_offsets();
             return Err(error);
         }
+        let sink_enqueue_started = Instant::now();
         if let Err(error) = callback.write_to_sinks(&outcome.results, None).await {
             self.discard_pending_offsets();
             return Err(error);
         }
+        let sink_enqueue_ns =
+            u64::try_from(sink_enqueue_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
 
         // A sink command admitted under authority may still be queued when the lease is fenced.
         // Recheck before advancing the in-memory source cursor; the checkpoint path separately
@@ -6067,7 +6561,10 @@ impl StreamingCoordinator {
         }
         self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)?;
         self.replay_pending = outcome.any_deferred;
-        Ok(())
+        Ok(CyclePublicationDurations {
+            output_store_ns,
+            sink_enqueue_ns,
+        })
     }
 
     /// Settle one graph cycle without allowing a cursor to overtake graph-retained input.
@@ -6299,6 +6796,13 @@ impl StreamingCoordinator {
         self.pending_barrier.sources_aligned.insert(source_idx);
 
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
+            tracing::info!(
+                checkpoint_id = barrier_attempt.checkpoint_id,
+                epoch = barrier_attempt.epoch,
+                sources_total = self.pending_barrier.sources_total,
+                elapsed = ?self.pending_barrier.started_at.elapsed(),
+                "checkpoint source barriers fully aligned"
+            );
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
             // Clone for fan-out so each source gets the exact checkpoint that was persisted.
             let fan_out = checkpoints.clone();
@@ -6307,9 +6811,10 @@ impl StreamingCoordinator {
             let flags = self.pending_barrier.flags;
             let assignment_fence = self.pending_barrier.assignment_fence.clone();
             let cleanup_owner = self.pending_barrier.cleanup_owner;
+            let attempt_deadline = self
+                .pending_barrier
+                .attempt_deadline(self.config.checkpoint_timeout);
             self.pending_barrier.clear();
-            let attempt_deadline =
-                tokio::time::Instant::from_std(attempt_started) + self.config.checkpoint_timeout;
             if let Err(error) = callback
                 .drain_checkpoint_edges_until(attempt_deadline)
                 .await
@@ -6321,24 +6826,36 @@ impl StreamingCoordinator {
                     }
                 };
                 let reason = error.to_string();
-                self.handle_aligned_checkpoint_outcome(
-                    callback,
-                    BarrierOutcome::Failed,
-                    AlignedCheckpointContext {
-                        cleanup_owner,
-                        attempt,
-                        started_at: attempt_started,
-                        flags,
-                        assignment_fence,
-                    },
-                    &fan_out,
-                )
-                .await
-                .map_err(|cleanup| {
-                    CycleError::Recovery(format!("{reason}; checkpoint cleanup failed: {cleanup}"))
-                })?;
+                let cleanup = self
+                    .handle_aligned_checkpoint_outcome(
+                        callback,
+                        BarrierOutcome::Failed,
+                        AlignedCheckpointContext {
+                            cleanup_owner,
+                            attempt,
+                            started_at: attempt_started,
+                            flags,
+                            assignment_fence,
+                        },
+                        &fan_out,
+                    )
+                    .await;
+                if let Err(cleanup) = cleanup {
+                    let combined = format!("{reason}; checkpoint cleanup failed: {cleanup}");
+                    return Err(if matches!(&error, CycleError::Halt(_)) {
+                        CycleError::Halt(combined)
+                    } else {
+                        CycleError::Recovery(combined)
+                    });
+                }
                 return Err(error);
             }
+            tracing::info!(
+                checkpoint_id = attempt.checkpoint_id,
+                epoch = attempt.epoch,
+                elapsed = ?attempt_started.elapsed(),
+                "checkpoint pre-capture graph drain completed"
+            );
             #[cfg(feature = "cluster")]
             if let Err(error) = self.require_process_authority("aligned checkpoint capture") {
                 let reason = error.to_string();
@@ -6402,26 +6919,38 @@ impl StreamingCoordinator {
                     checkpoints,
                     attempt,
                     attempt_started,
+                    attempt_deadline,
                     flags,
                     assignment_fence.clone(),
                 )
                 .await;
             let topology_cancelled = matches!(&outcome, BarrierOutcome::CancelledBeforeCapture);
             let durable_tail_pending = matches!(&outcome, BarrierOutcome::Async);
-            self.handle_aligned_checkpoint_outcome(
-                callback,
-                outcome,
-                AlignedCheckpointContext {
-                    cleanup_owner,
-                    attempt,
-                    started_at: attempt_started,
-                    flags,
-                    assignment_fence,
-                },
-                &fan_out,
-            )
-            .await
-            .map_err(CycleError::Recovery)?;
+            let cleanup = self
+                .handle_aligned_checkpoint_outcome(
+                    callback,
+                    outcome,
+                    AlignedCheckpointContext {
+                        cleanup_owner,
+                        attempt,
+                        started_at: attempt_started,
+                        flags,
+                        assignment_fence,
+                    },
+                    &fan_out,
+                )
+                .await;
+            if let Err(cleanup) = cleanup {
+                if let Some(halt) = callback.take_pipeline_halt() {
+                    return Err(CycleError::Halt(format!(
+                        "{halt}; checkpoint cleanup also failed: {cleanup}"
+                    )));
+                }
+                return Err(CycleError::Recovery(cleanup));
+            }
+            if let Some(error) = callback.take_pipeline_halt() {
+                return Err(CycleError::Halt(error));
+            }
             if let Some(error) = callback.take_pipeline_fault() {
                 return Err(CycleError::Recovery(error));
             }
@@ -6447,6 +6976,21 @@ impl StreamingCoordinator {
         self.checkpoint_retry_backoff = Duration::ZERO;
     }
 
+    fn observe_intake_gate_for_checkpoint_cadence(
+        &mut self,
+        state: &mut CoordinatorRunState,
+        intake_paused: bool,
+    ) {
+        if state.intake_was_paused && !intake_paused {
+            // Recovery and terminal HANDOFF holds can outlive the configured periodic interval.
+            // Restart that interval at the reopen boundary so the first ordinary cut does not
+            // immediately absorb the release backlog. Manual requests bypass the interval in
+            // `checkpoint_admission` and therefore remain topology-control responsive.
+            self.advance_checkpoint_cadence();
+        }
+        state.intake_was_paused = intake_paused;
+    }
+
     fn defer_checkpoint_until_topology_ready(&mut self) {
         let backoff = if self.checkpoint_retry_backoff.is_zero() {
             CHECKPOINT_RETRY_BASE
@@ -6463,6 +7007,7 @@ impl StreamingCoordinator {
         &mut self,
         callback: &mut impl PipelineCallback,
     ) -> Option<CheckpointAdmission> {
+        self.prune_manual_requests();
         // Requests arriving after a manual attempt was admitted belong to a later cut. Never let
         // an intervening periodic attempt consume them or attach them to the active attempt.
         if !self.manual_waiting.is_empty() && self.manual_active.is_some() {
@@ -6499,11 +7044,25 @@ impl StreamingCoordinator {
             }
             return None;
         }
-        let (assignment_fence, flags) = match callback.checkpoint_assignment_for_admission().await {
+        let default_deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
+        let deadline = if manual {
+            self.manual_deadline(default_deadline)
+        } else {
+            default_deadline
+        };
+        let assignment_admission = callback.checkpoint_assignment_for_admission(deadline).await;
+        // Durable assignment admission may block. A timed-out or cancelled waiter must not own a
+        // later attempt merely because the readiness result raced its cancellation.
+        self.prune_manual_requests();
+        if tokio::time::Instant::now() >= deadline || (manual && self.manual_waiting.is_empty()) {
+            return None;
+        }
+        let (assignment_fence, flags, assignment_guard) = match assignment_admission {
             CheckpointAssignmentAdmission::Ready {
                 assignment_fence,
                 flags,
-            } => (assignment_fence, flags),
+                assignment_guard,
+            } => (assignment_fence, flags, assignment_guard),
             CheckpointAssignmentAdmission::Deferred(reason) => {
                 tracing::debug!(reason = %reason, "checkpoint admission waits for stable topology");
                 self.defer_checkpoint_until_topology_ready();
@@ -6524,6 +7083,16 @@ impl StreamingCoordinator {
                 return None;
             }
         };
+        // HANDOFF is a topology-control cut owned by the explicit rebalance request. A periodic
+        // attempt that observes the same assignment fence must leave the cadence due and defer;
+        // otherwise it can commit the handoff, fence intake, and leave the manual owner waiting
+        // for a second reservation that can no longer be admitted.
+        if !manual && flags & laminar_core::checkpoint::flags::HANDOFF != 0 {
+            tracing::debug!(
+                "periodic checkpoint admission deferred to the assignment handoff owner"
+            );
+            return None;
+        }
         if manual
             && self.manual_handoff_required
             && flags & laminar_core::checkpoint::flags::HANDOFF == 0
@@ -6540,6 +7109,8 @@ impl StreamingCoordinator {
             manual,
             flags,
             assignment_fence,
+            assignment_guard,
+            deadline,
         })
     }
 
@@ -6549,69 +7120,136 @@ impl StreamingCoordinator {
         admission: &CheckpointAdmission,
         attempt_started: Instant,
     ) -> Result<CheckpointAttempt, String> {
-        let attempt = callback.reserve_checkpoint_attempt(attempt_started).await?;
+        self.prune_manual_requests();
+        if admission.manual && self.manual_waiting.is_empty() {
+            return Err("manual checkpoint was cancelled before exact attempt reservation".into());
+        }
+        if tokio::time::Instant::now() >= admission.deadline {
+            return Err("checkpoint deadline expired before exact attempt reservation".into());
+        }
+        if admission.manual && !self.claim_waiting_manual_requests() {
+            return Err("manual checkpoint was cancelled before exact attempt reservation".into());
+        }
+        // The claim above is the public cancellation boundary. The allocator is hard-bounded by
+        // this admission deadline; whether it returns an exact ID or an error, claimed callers now
+        // wait for the coordinator's terminal reply.
+        let attempt = callback
+            .reserve_checkpoint_attempt(admission.deadline)
+            .await?;
+        // Durable reservation succeeded. Install the exact attempt before notifying claimed
+        // callers; Prepare and every later failure path must publish or abandon it before reply.
+        if admission.manual && !self.activate_manual_attempt(attempt, admission.flags) {
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback,
+                    admission,
+                    attempt,
+                    "manual checkpoint claim disappeared after exact attempt reservation".into(),
+                    "reserved",
+                )
+                .await;
+            return Err(reason);
+        }
         tracing::info!(
             checkpoint_id = attempt.checkpoint_id,
             epoch = attempt.epoch,
             "checkpoint attempt reserved"
         );
+        if tokio::time::Instant::now() >= admission.deadline {
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback,
+                    admission,
+                    attempt,
+                    "checkpoint deadline expired after exact attempt reservation".into(),
+                    "reserved",
+                )
+                .await;
+            return Err(reason);
+        }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint prepare publication") {
-            let reason = error.to_string();
-            callback
-                .abandon_checkpoint_attempt(
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback,
+                    admission,
                     attempt,
-                    &reason,
-                    admission.flags,
-                    admission.assignment_fence.clone(),
+                    error.to_string(),
+                    "reserved",
                 )
-                .await
-                .map_err(|cleanup| {
-                    format!("{reason}; reserved checkpoint cleanup failed: {cleanup}")
-                })?;
+                .await;
             return Err(reason);
         }
         if let Err(error) = callback
             .publish_checkpoint_prepare(
                 attempt,
                 attempt_started,
+                admission.deadline,
                 admission.flags,
                 admission.assignment_fence.clone(),
             )
             .await
         {
-            if let Err(cleanup_error) = callback
-                .abandon_checkpoint_attempt(
-                    attempt,
-                    &error,
-                    admission.flags,
-                    admission.assignment_fence.clone(),
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback, admission, attempt, error, "reserved",
                 )
-                .await
-            {
-                return Err(format!(
-                    "{error}; reserved checkpoint cleanup failed: {cleanup_error}"
-                ));
-            }
-            return Err(error);
+                .await;
+            return Err(reason);
+        }
+        self.prune_manual_requests();
+        if tokio::time::Instant::now() >= admission.deadline {
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback,
+                    admission,
+                    attempt,
+                    "checkpoint deadline expired after Prepare publication".into(),
+                    "prepared",
+                )
+                .await;
+            return Err(reason);
         }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint prepare completion") {
-            let reason = error.to_string();
-            callback
-                .abandon_checkpoint_attempt(
+            let reason = self
+                .abandon_reserved_checkpoint_attempt(
+                    callback,
+                    admission,
                     attempt,
-                    &reason,
-                    admission.flags,
-                    admission.assignment_fence.clone(),
+                    error.to_string(),
+                    "prepared",
                 )
-                .await
-                .map_err(|cleanup| {
-                    format!("{reason}; prepared checkpoint cleanup failed: {cleanup}")
-                })?;
+                .await;
             return Err(reason);
         }
         Ok(attempt)
+    }
+
+    async fn abandon_reserved_checkpoint_attempt(
+        &mut self,
+        callback: &mut impl PipelineCallback,
+        admission: &CheckpointAdmission,
+        attempt: CheckpointAttempt,
+        reason: String,
+        cleanup_phase: &str,
+    ) -> String {
+        let terminal_reason = match callback
+            .abandon_checkpoint_attempt(
+                attempt,
+                &reason,
+                admission.flags,
+                admission.assignment_fence.clone(),
+            )
+            .await
+        {
+            Ok(()) => reason,
+            Err(cleanup) => {
+                format!("{reason}; {cleanup_phase} checkpoint cleanup failed: {cleanup}")
+            }
+        };
+        self.fail_manual_attempt(attempt, &terminal_reason);
+        terminal_reason
     }
 
     async fn handle_source_less_checkpoint_outcome(
@@ -6708,7 +7346,7 @@ impl StreamingCoordinator {
     async fn admit_source_less_checkpoint(
         &mut self,
         callback: &mut impl PipelineCallback,
-        admission: &CheckpointAdmission,
+        admission: &mut CheckpointAdmission,
     ) {
         let attempt_started = Instant::now();
         let attempt = match self
@@ -6726,6 +7364,11 @@ impl StreamingCoordinator {
                 return;
             }
         };
+        // Prepare is the source-less attempt's durable assignment boundary. Release the admission
+        // claim before graph drain/capture: `checkpoint_with_barrier` takes the separate fair
+        // rotation read fence and a queued assignment writer would otherwise create a nested-read
+        // deadlock.
+        drop(admission.assignment_guard.take());
         self.complete_prepared_source_less_checkpoint(
             callback,
             admission,
@@ -6742,11 +7385,22 @@ impl StreamingCoordinator {
         attempt: CheckpointAttempt,
         attempt_started: Instant,
     ) {
-        if admission.manual {
-            self.activate_manual_attempt(attempt, admission.flags);
+        if tokio::time::Instant::now() >= admission.deadline {
+            if let Err(error) = self
+                .handle_source_less_checkpoint_outcome(
+                    callback,
+                    admission,
+                    attempt,
+                    BarrierOutcome::Failed,
+                )
+                .await
+            {
+                callback.record_checkpoint_failure(attempt.checkpoint_id, &error);
+            }
+            self.advance_checkpoint_cadence();
+            return;
         }
-        let attempt_deadline =
-            tokio::time::Instant::from_std(attempt_started) + self.config.checkpoint_timeout;
+        let attempt_deadline = admission.deadline;
         if let Err(error) = callback
             .drain_checkpoint_edges_until(attempt_deadline)
             .await
@@ -6840,6 +7494,7 @@ impl StreamingCoordinator {
                 FxHashMap::default(),
                 attempt,
                 attempt_started,
+                attempt_deadline,
                 admission.flags,
                 admission.assignment_fence.clone(),
             )
@@ -6863,7 +7518,7 @@ impl StreamingCoordinator {
     async fn admit_source_barrier_checkpoint(
         &mut self,
         callback: &mut impl PipelineCallback,
-        admission: &CheckpointAdmission,
+        admission: &mut CheckpointAdmission,
     ) {
         if self
             .source_handles
@@ -6894,6 +7549,10 @@ impl StreamingCoordinator {
         };
         self.inject_prepared_source_barrier_attempt(callback, admission, attempt, attempt_started)
             .await;
+        // Every source has now accepted (or the attempt has synchronously cleaned up) the exact
+        // prepared barrier command. Drain activation may proceed without changing this attempt's
+        // predecessor binding.
+        drop(admission.assignment_guard.take());
     }
 
     async fn inject_prepared_source_barrier_attempt(
@@ -6903,8 +7562,26 @@ impl StreamingCoordinator {
         attempt: CheckpointAttempt,
         attempt_started: Instant,
     ) {
-        if admission.manual {
-            self.activate_manual_attempt(attempt, admission.flags);
+        if tokio::time::Instant::now() >= admission.deadline {
+            let reason = "checkpoint deadline expired before source barrier injection";
+            let cleanup = Self::cleanup_checkpoint_attempt(
+                callback,
+                CheckpointCleanupOwner::Originator,
+                attempt,
+                reason,
+                admission.flags,
+                admission.assignment_fence.clone(),
+            )
+            .await;
+            self.fail_manual_attempt(attempt, reason);
+            callback.record_checkpoint_failure(attempt.checkpoint_id, reason);
+            if let Err(error) = cleanup {
+                callback.record_checkpoint_failure(
+                    attempt.checkpoint_id,
+                    &format!("{reason}; checkpoint cleanup failed: {error}"),
+                );
+            }
+            return;
         }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("source barrier injection") {
@@ -6933,6 +7610,7 @@ impl StreamingCoordinator {
             self.source_handles.len(),
             admission.flags,
             admission.assignment_fence.clone(),
+            Some(admission.deadline),
         );
         // Attempt time includes reservation, alignment, capture, quorum, and publication.
         self.pending_barrier.started_at = attempt_started;
@@ -7073,7 +7751,7 @@ impl StreamingCoordinator {
             }
             return true;
         }
-        let Some(admission) = self.checkpoint_admission(callback).await else {
+        let Some(mut admission) = self.checkpoint_admission(callback).await else {
             return true;
         };
         #[cfg(feature = "cluster")]
@@ -7084,10 +7762,10 @@ impl StreamingCoordinator {
             return true;
         }
         if self.source_handles.is_empty() {
-            self.admit_source_less_checkpoint(callback, &admission)
+            self.admit_source_less_checkpoint(callback, &mut admission)
                 .await;
         } else {
-            self.admit_source_barrier_checkpoint(callback, &admission)
+            self.admit_source_barrier_checkpoint(callback, &mut admission)
                 .await;
         }
         true

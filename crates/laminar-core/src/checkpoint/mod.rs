@@ -94,3 +94,60 @@ pub fn channel_progress_frontier(channels: &[ChannelProgress]) -> Result<Option<
         CheckpointWatermark::Uninitialized => None,
     })
 }
+
+/// Numeric decision frontier retained for each source in an exact channel cut.
+///
+/// Active channels contribute their minimum. An active uninitialized channel withholds only its
+/// own source, while an all-idle source retains the greatest initialized channel watermark. This
+/// is the source-keyed counterpart of [`channel_progress_frontier`]; callers must not use the
+/// pipeline-wide minimum when advancing a source-specific ordered operator.
+///
+/// # Errors
+/// Returns an error when a channel uses the reserved uninitialized watermark value.
+pub fn channel_progress_frontiers_by_source(
+    channels: &[ChannelProgress],
+) -> Result<std::collections::BTreeMap<&str, Option<i64>>, String> {
+    #[derive(Default)]
+    struct SourceProgress {
+        active_minimum: Option<i64>,
+        active_uninitialized: bool,
+        idle_maximum: Option<i64>,
+    }
+
+    let mut progress = std::collections::BTreeMap::<&str, SourceProgress>::new();
+    for channel in channels {
+        if channel.watermark == Some(i64::MIN) {
+            return Err("channel progress uses the reserved uninitialized watermark".into());
+        }
+        let source = progress.entry(channel.source_name.as_str()).or_default();
+        if channel.idle {
+            if let Some(watermark) = channel.watermark {
+                source.idle_maximum = Some(
+                    source
+                        .idle_maximum
+                        .map_or(watermark, |current| current.max(watermark)),
+                );
+            }
+        } else if let Some(watermark) = channel.watermark {
+            source.active_minimum = Some(
+                source
+                    .active_minimum
+                    .map_or(watermark, |current| current.min(watermark)),
+            );
+        } else {
+            source.active_uninitialized = true;
+        }
+    }
+
+    Ok(progress
+        .into_iter()
+        .map(|(source, progress)| {
+            let frontier = if progress.active_uninitialized {
+                None
+            } else {
+                progress.active_minimum.or(progress.idle_maximum)
+            };
+            (source, frontier)
+        })
+        .collect())
+}

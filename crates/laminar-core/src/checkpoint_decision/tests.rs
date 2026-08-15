@@ -28,6 +28,7 @@ async fn local_index(
         scope: CheckpointScope::Local,
         vnode_count: 4,
         assignment_fence: None,
+        reassignment_portable: false,
         predecessor,
         participants: vec![CommittedParticipantRef {
             participant_id: LOCAL_NODE_ID.0,
@@ -39,6 +40,7 @@ async fn local_index(
         source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
+        source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
     }
 }

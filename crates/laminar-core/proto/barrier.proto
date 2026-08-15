@@ -19,10 +19,12 @@ service BarrierSync {
   // never returned by this RPC.
   rpc ConfirmLeaderProof(LeaderProofChallenge) returns (LeaderProofAck);
 
-  // Phase 1. Align, capture, and durably prepare state locally, then report readiness.
+  // Phase 1. Align and capture state locally, transfer the immutable cut to a
+  // supervised durable tail, then report capture readiness.
   // The follower returns its local watermark so the leader can fold a
-  // cluster-wide minimum for the committed checkpoint index. The durable
-  // tail (sink pre-commit, manifest, state uploads) completes before the ack.
+  // cluster-wide minimum for the committed checkpoint index. Sink pre-commit,
+  // serialization, state upload, and manifest publication continue after the
+  // capture acknowledgement.
   rpc Prepare(PrepareRequest) returns (Ack);
 
   // Intermediate (success). Every node has aligned the shuffle and
@@ -147,6 +149,10 @@ enum BarrierAckDisposition {
   BARRIER_ACK_PREPARED = 1;
   BARRIER_ACK_PREPARED_WITH_REPLAY = 2;
   BARRIER_ACK_FAILED = 3;
+  // The follower owns the exact immutable captured cut in a supervised tail.
+  // This does not imply durable preparation or restorable state.
+  BARRIER_ACK_CAPTURED = 4;
+  BARRIER_ACK_CAPTURED_WITH_REPLAY = 5;
 }
 
 enum CheckpointWatermarkStatus {

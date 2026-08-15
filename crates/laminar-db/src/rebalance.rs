@@ -8,13 +8,18 @@ use std::time::Duration;
 
 use laminar_connectors::connector::{SourceDrainOutcome, SourceDrainResolution};
 use laminar_core::checkpoint::{
-    AssignmentDrainId, AssignmentDrainTransition, CommittedCheckpointRef,
+    AssignmentDrainId, AssignmentDrainTransition, CheckpointAttempt, CheckpointAttemptRelation,
+    CheckpointScope, CommittedCheckpointIndex, CommittedCheckpointRef,
+};
+use laminar_core::checkpoint_decision::{
+    CheckpointArtifactInventory, CheckpointOutcome, CheckpointVerdict, RecordOutcomeResult,
 };
 use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
     RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult, RotateOutcome,
+    SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{
@@ -27,7 +32,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::db::LaminarDB;
+use crate::db::{DbState, LaminarDB};
 use crate::engine_metrics::EngineMetrics;
 
 /// Tunables for the rebalance control plane.
@@ -183,6 +188,51 @@ async fn try_suspend_recovery_assignment_authority(
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRecoveryAssignmentScope {
+    Participant,
+    Ownerless,
+}
+
+/// Classify this exact process generation against an authority-audited recovery target.
+///
+/// An ownerless process may follow the target topology, but it has no checkpoint or recovery
+/// authority and must not turn the target's recovery provenance into a new cluster-wide fault.
+fn local_recovery_assignment_scope(
+    snapshot: &AssignmentSnapshot,
+    controller: &ClusterController,
+) -> Result<LocalRecoveryAssignmentScope, String> {
+    let fence = snapshot
+        .assignment_fence()
+        .map_err(|error| error.to_string())?;
+    let owners = snapshot
+        .to_vnode_vec(fence.vnode_count)
+        .map_err(|error| error.to_string())?;
+    let owner_ids = owners.iter().map(|owner| owner.0).collect::<Vec<_>>();
+    if !fence.is_canonical() || !fence.matches_owner_map(&owner_ids) {
+        return Err(format!(
+            "recovery assignment {} has no canonical owner-complete target fence",
+            snapshot.version
+        ));
+    }
+
+    let local_id = controller.instance_id().0;
+    match fence.participant_incarnation(local_id) {
+        Some(incarnation) if incarnation == controller.recovery_incarnation() => {
+            Ok(LocalRecoveryAssignmentScope::Participant)
+        }
+        Some(_) => Err(format!(
+            "recovery assignment {} certifies another incarnation of process {local_id}",
+            snapshot.version
+        )),
+        None if owner_ids.contains(&local_id) => Err(format!(
+            "recovery assignment {} gives process {local_id} ownership without checkpoint authority",
+            snapshot.version
+        )),
+        None => Ok(LocalRecoveryAssignmentScope::Ownerless),
+    }
+}
+
 async fn hold_terminal_source_resolution(
     db: &Arc<LaminarDB>,
     controller: Option<&ClusterController>,
@@ -266,6 +316,46 @@ impl SnapshotWatcher {
             installed_authority_revision: 0,
             assignment_authority_dirty: false,
         }
+    }
+
+    /// Install an observed durable drain at the same local boundary used by checkpoint
+    /// assignment admission. A checkpoint that already owns the mutex may finish publishing its
+    /// predecessor Prepare first; otherwise the re-audit below makes the drain visible before any
+    /// later admission can read assignment flags.
+    async fn install_checkpoint_drain_transition(
+        &self,
+        draining: &AssignmentSnapshot,
+        transition: &AssignmentDrainTransition,
+        predecessor: AssignmentSnapshot,
+        deadline: tokio::time::Instant,
+    ) -> Result<AssignmentSnapshot, String> {
+        let Some(controller) = self.controller.as_deref() else {
+            return Ok(predecessor);
+        };
+        if controller.checkpoint_drain_transition().as_ref() == Some(transition) {
+            return Ok(predecessor);
+        }
+        let _adoption = tokio::time::timeout_at(deadline, self.db.assignment_adoption_lock.lock())
+            .await
+            .map_err(|_| {
+                "snapshot watcher timed out serializing source-drain activation".to_string()
+            })?;
+        let predecessor =
+            audit_exact_drain_head(&self.store, &self.registry, draining, controller, deadline)
+                .await?;
+        self.db
+            .validate_source_drain_snapshot(draining)
+            .map_err(|error| error.to_string())?;
+        match controller.checkpoint_drain_transition() {
+            None => controller.publish_checkpoint_drain_transition(Some(transition.clone())),
+            Some(installed) if installed == *transition => {}
+            Some(_) => {
+                return Err(
+                    "snapshot watcher found a conflicting local source-drain transition".into(),
+                );
+            }
+        }
+        Ok(predecessor)
     }
 
     async fn ensure_current_assignment_authority_cached(
@@ -383,30 +473,35 @@ impl SnapshotWatcher {
                 fence.participant_incarnation(participant.node_id)
                     == Some(participant.boot_incarnation)
             });
-            if let Some(exact_assignment_fence) =
-                exact_assignment_fence.filter(|_| local_is_participant)
-            {
-                let vnode_state_ready = match tokio::time::timeout_at(
-                    head_deadline,
-                    self.db
-                        .local_vnode_state_is_ready(&self.registry, &exact_assignment_fence),
-                )
-                .await
-                {
-                    Ok(Ok(ready)) => ready,
-                    Ok(Err(error)) => {
-                        warn!(%error, version, "could not determine local vnode-state readiness");
-                        drop(adoption_guard);
-                        return;
+            if let Some(exact_assignment_fence) = exact_assignment_fence {
+                let vnode_state_ready = if local_is_participant {
+                    match tokio::time::timeout_at(
+                        head_deadline,
+                        self.db
+                            .local_vnode_state_is_ready(&self.registry, &exact_assignment_fence),
+                    )
+                    .await
+                    {
+                        Ok(Ok(ready)) => ready,
+                        Ok(Err(error)) => {
+                            warn!(%error, version, "could not determine local vnode-state readiness");
+                            drop(adoption_guard);
+                            return;
+                        }
+                        Err(_) => {
+                            warn!(
+                                version,
+                                "local vnode-state readiness exceeded the head deadline"
+                            );
+                            drop(adoption_guard);
+                            return;
+                        }
                     }
-                    Err(_) => {
-                        warn!(
-                            version,
-                            "local vnode-state readiness exceeded the head deadline"
-                        );
-                        drop(adoption_guard);
-                        return;
-                    }
+                } else {
+                    // A stopped owner removed from the target, or an evidence-only reporter, has
+                    // no target vnode state to restore. Its false report is still the durable
+                    // topology-observed acknowledgement that permits a gap-free Prepare handoff.
+                    false
                 };
                 // Do not suppress same-value writes here. Startup, assignment adoption, and
                 // recovery staging also publish this durable slot directly; a watcher-local cache
@@ -603,6 +698,28 @@ impl SnapshotWatcher {
         };
 
         let audited = audited_terminal.filter(|audited| audited.transition == transition);
+        // Recovery may reconcile a drain terminal only after its exact predecessor owner roster is
+        // stopped. Those source tasks are intentionally gone, so neither Commit nor Abort can be
+        // resolved on this generation. Let topology-only adoption publish the terminal; the
+        // replacement source generation consumes it in pre-Release reconciliation.
+        let stopped_terminal_may_defer = match (audited, self.controller.as_deref()) {
+            (Some(audited), Some(controller)) => {
+                let predecessor = audited.transition.predecessor.clone();
+                crate::db::audited_stopped_terminal_round(controller, &predecessor, head_deadline)
+                    .await
+                    .is_ok_and(|round| round.is_some())
+                    && DbState::load(&self.db.state) == DbState::Created
+                    && self.db.runtime_shutdown.read().is_cancelled()
+                    && self.db.cluster_intake_fenced()
+                    && self.db.coordinated_recovery_in_progress()
+            }
+            _ => false,
+        };
+        if stopped_terminal_may_defer {
+            self.active_local_drain = None;
+            self.terminal_resolution_hold = None;
+            return true;
+        }
         let already_resolved = match audited {
             Some(audited) => {
                 let resolution = SourceDrainResolution {
@@ -788,11 +905,32 @@ impl SnapshotWatcher {
                                 .as_ref()
                                 .expect("validated draining snapshot has a transition")
                                 .clone();
+                            let predecessor = match self
+                                .install_checkpoint_drain_transition(
+                                    &snap,
+                                    &transition,
+                                    predecessor,
+                                    head_deadline,
+                                )
+                                .await
+                            {
+                                Ok(predecessor) => predecessor,
+                                Err(error) => {
+                                    self.durable_snapshot = None;
+                                    self.durable_drain_transition = None;
+                                    self.assignment_authority_dirty = true;
+                                    let _ = suspend_local_assignment_authority(
+                                        &self.db,
+                                        self.controller.as_deref(),
+                                        head_deadline,
+                                    )
+                                    .await;
+                                    warn!(%error, version = snap.version, "snapshot watcher: source-drain activation failed; assignment authority suspended");
+                                    continue;
+                                }
+                            };
                             self.durable_drain_transition = Some(transition.clone());
                             self.durable_snapshot = Some(predecessor);
-                            if let Some(ref c) = self.controller {
-                                c.publish_checkpoint_drain_transition(Some(transition.clone()));
-                            }
                             if snap.version != self.last_drained {
                                 match self.db.validate_source_drain_snapshot(&snap) {
                                     Ok(()) => {
@@ -886,55 +1024,97 @@ impl SnapshotWatcher {
                             );
                             continue;
                         };
-                        match try_suspend_recovery_assignment_authority(
-                            &self.db,
-                            controller,
-                            head_deadline,
-                        )
-                        .await
-                        {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                debug!(
-                                    version = snap.version,
-                                    "snapshot watcher: recovery assignment waits for local vnode transition"
-                                );
-                                if let Err(error) = self
-                                    .ensure_current_assignment_authority_cached(
-                                        audited_target.as_ref().expect(
-                                            "stable successor was audited before suspension",
-                                        ),
-                                        head_deadline,
-                                    )
-                                    .await
-                                {
-                                    warn!(%error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
-                                    continue;
-                                }
-                                // The transition may have been staged before its predecessor
-                                // transport certificate became active. Repair that exact audited
-                                // authority before waiting for the newer durable head.
-                                self.publish_authority(authority_revision, head_deadline)
-                                    .await;
-                                continue;
-                            }
+                        let recovery_scope = match local_recovery_assignment_scope(
+                            &snap, controller,
+                        ) {
+                            Ok(scope) => scope,
                             Err(error) => {
                                 self.assignment_authority_dirty = true;
-                                warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
+                                let _ = suspend_local_assignment_authority(
+                                    &self.db,
+                                    Some(controller),
+                                    head_deadline,
+                                )
+                                .await;
+                                warn!(%error, version = snap.version, "snapshot watcher: recovery target does not bind the local process");
                                 continue;
                             }
-                        }
-                        if let Err(error) = ensure_local_recovery_fault(&self.db, controller).await
-                        {
+                        };
+                        if recovery_scope == LocalRecoveryAssignmentScope::Participant {
+                            match try_suspend_recovery_assignment_authority(
+                                &self.db,
+                                controller,
+                                head_deadline,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    debug!(
+                                        version = snap.version,
+                                        "snapshot watcher: recovery assignment waits for local vnode transition"
+                                    );
+                                    if let Err(error) = self
+                                        .ensure_current_assignment_authority_cached(
+                                            audited_target.as_ref().expect(
+                                                "stable successor was audited before suspension",
+                                            ),
+                                            head_deadline,
+                                        )
+                                        .await
+                                    {
+                                        warn!(%error, version = snap.version, "snapshot watcher: could not audit predecessor authority for pending vnode transition");
+                                        continue;
+                                    }
+                                    // The transition may have been staged before its predecessor
+                                    // transport certificate became active. Repair that exact audited
+                                    // authority before waiting for the newer durable head.
+                                    self.publish_authority(authority_revision, head_deadline)
+                                        .await;
+                                    continue;
+                                }
+                                Err(error) => {
+                                    self.assignment_authority_dirty = true;
+                                    warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
+                                    continue;
+                                }
+                            }
+                            // Suspension succeeded with no pending live transition. Do not let the
+                            // watcher recertify the stale local generation while the requested fault
+                            // is still moving the graph to the cold-recovery boundary.
+                            self.durable_snapshot = None;
+                            self.durable_drain_transition = None;
+                            self.installed_fence = None;
+                            if let Err(error) =
+                                ensure_local_recovery_fault(&self.db, controller).await
+                            {
+                                self.assignment_authority_dirty = true;
+                                warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
+                                continue;
+                            }
+                            if let Err(error) = abort_predecessor_checkpoint_for_recovery(
+                                &self.store,
+                                controller,
+                                &snap,
+                                head_deadline,
+                            )
+                            .await
+                            {
+                                self.assignment_authority_dirty = true;
+                                warn!(%error, version = snap.version, "snapshot watcher: could not settle predecessor checkpoint for recovery");
+                                continue;
+                            }
+                            authority_revision = self
+                                .db
+                                .assignment_authority_revision
+                                .load(std::sync::atomic::Ordering::Acquire);
                             self.assignment_authority_dirty = true;
-                            warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
-                            continue;
+                        } else {
+                            debug!(
+                                version = snap.version,
+                                "snapshot watcher: ownerless process follows recovery topology without publishing a fault"
+                            );
                         }
-                        authority_revision = self
-                            .db
-                            .assignment_authority_revision
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        self.assignment_authority_dirty = true;
                     }
                     let resolved_local = self.registry.assignment_version();
                     if snap.version > resolved_local {
@@ -943,18 +1123,52 @@ impl SnapshotWatcher {
                             remote = snap.version,
                             "adopting newer assignment"
                         );
-                        match self
-                            .db
-                            .adopt_assignment_snapshot(snap.clone(), head_deadline)
-                            .await
-                        {
-                            Ok(_) => {
+                        let adoption = if audited_recovery {
+                            self.db
+                                .adopt_recovery_assignment_snapshot(snap.clone(), head_deadline)
+                                .await
+                        } else {
+                            self.db
+                                .adopt_assignment_snapshot(snap.clone(), head_deadline)
+                                .await
+                        };
+                        match adoption {
+                            Ok(adoption) => {
                                 self.durable_drain_transition = None;
                                 self.durable_snapshot = Some(snap.clone());
                                 authority_revision = self
                                     .db
                                     .assignment_authority_revision
                                     .load(std::sync::atomic::Ordering::Acquire);
+                                if adoption.recovery_required {
+                                    let Some(controller) = self.controller.as_deref() else {
+                                        self.assignment_authority_dirty = true;
+                                        warn!(version = snap.version, "snapshot watcher: exact-handoff recovery has no cluster controller");
+                                        continue;
+                                    };
+                                    self.installed_fence = None;
+                                    self.assignment_authority_dirty = true;
+                                    match local_recovery_assignment_scope(&snap, controller) {
+                                        Ok(LocalRecoveryAssignmentScope::Participant) => {
+                                            if let Err(error) =
+                                                ensure_local_recovery_fault(&self.db, controller)
+                                                    .await
+                                            {
+                                                warn!(%error, version = snap.version, "snapshot watcher: could not persist exact-handoff recovery fault");
+                                            }
+                                        }
+                                        Ok(LocalRecoveryAssignmentScope::Ownerless) => {
+                                            debug!(
+                                                version = snap.version,
+                                                "snapshot watcher: ownerless process retains the exact-handoff recovery fence without publishing a fault"
+                                            );
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, version = snap.version, "snapshot watcher: exact-handoff recovery target does not bind the local process");
+                                        }
+                                    }
+                                    continue;
+                                }
                             }
                             Err(error) if error.is_shuffle_not_ready() => {
                                 // The local graph still needs the installed predecessor authority
@@ -1210,7 +1424,66 @@ pub(crate) struct AuditedAssignmentAuthority {
     target_version: u64,
     predecessor: Option<CheckpointAssignmentFence>,
     handoff_checkpoint: Option<CommittedCheckpointRef>,
+    recovery_checkpoint: Option<AuditedRecoveryCheckpoint>,
     terminal: Option<AuditedDrainOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditedRecoveryCheckpoint {
+    /// The unresolved cut is still pinned to this exact recovery target.
+    Active {
+        checkpoint: CommittedCheckpointRef,
+        origin: CheckpointAssignmentFence,
+    },
+    /// The unresolved cut has been carried forward to the exact next recovery target, whose
+    /// immutable authority decision is durable but whose proposal is not materialized yet.
+    Propagated {
+        checkpoint: CommittedCheckpointRef,
+        origin: CheckpointAssignmentFence,
+        successor: CheckpointAssignmentFence,
+    },
+    /// This target has committed its own successor cut and consumed the older handoff pin.
+    Consumed {
+        checkpoint: CommittedCheckpointRef,
+        origin: CheckpointAssignmentFence,
+    },
+}
+
+impl AuditedRecoveryCheckpoint {
+    fn checkpoint(&self) -> &CommittedCheckpointRef {
+        match self {
+            Self::Active { checkpoint, .. }
+            | Self::Propagated { checkpoint, .. }
+            | Self::Consumed { checkpoint, .. } => checkpoint,
+        }
+    }
+
+    fn origin(&self) -> &CheckpointAssignmentFence {
+        match self {
+            Self::Active { origin, .. }
+            | Self::Propagated { origin, .. }
+            | Self::Consumed { origin, .. } => origin,
+        }
+    }
+
+    const fn pin_is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+
+    const fn was_consumed(&self) -> bool {
+        matches!(self, Self::Consumed { .. })
+    }
+
+    const fn was_propagated(&self) -> bool {
+        matches!(self, Self::Propagated { .. })
+    }
+
+    fn propagated_successor(&self) -> Option<&CheckpointAssignmentFence> {
+        match self {
+            Self::Propagated { successor, .. } => Some(successor),
+            Self::Active { .. } | Self::Consumed { .. } => None,
+        }
+    }
 }
 
 impl AuditedAssignmentAuthority {
@@ -1219,6 +1492,7 @@ impl AuditedAssignmentAuthority {
             target_version,
             predecessor: None,
             handoff_checkpoint: None,
+            recovery_checkpoint: None,
             terminal: None,
         }
     }
@@ -1226,12 +1500,14 @@ impl AuditedAssignmentAuthority {
     fn recovery(
         target_version: u64,
         predecessor: CheckpointAssignmentFence,
-        handoff_checkpoint: CommittedCheckpointRef,
+        recovery_checkpoint: AuditedRecoveryCheckpoint,
     ) -> Self {
+        let handoff_checkpoint = recovery_checkpoint.checkpoint().clone();
         Self {
             target_version,
             predecessor: Some(predecessor),
             handoff_checkpoint: Some(handoff_checkpoint),
+            recovery_checkpoint: Some(recovery_checkpoint),
             terminal: None,
         }
     }
@@ -1242,12 +1518,13 @@ impl AuditedAssignmentAuthority {
             target_version,
             predecessor: Some(terminal.transition.predecessor.clone()),
             handoff_checkpoint,
+            recovery_checkpoint: None,
             terminal: Some(terminal),
         }
     }
 
-    fn is_recovery(&self) -> bool {
-        self.predecessor.is_some() && self.terminal.is_none()
+    pub(crate) fn is_recovery(&self) -> bool {
+        self.recovery_checkpoint.is_some()
     }
 
     fn terminal(&self) -> Option<&AuditedDrainOutcome> {
@@ -1260,6 +1537,36 @@ impl AuditedAssignmentAuthority {
 
     pub(crate) fn handoff_checkpoint(&self) -> Option<&CommittedCheckpointRef> {
         self.handoff_checkpoint.as_ref()
+    }
+
+    pub(crate) fn recovery_origin(&self) -> Option<&CheckpointAssignmentFence> {
+        self.recovery_checkpoint
+            .as_ref()
+            .map(AuditedRecoveryCheckpoint::origin)
+    }
+
+    pub(crate) fn recovery_pin_is_active(&self) -> bool {
+        self.recovery_checkpoint
+            .as_ref()
+            .is_some_and(AuditedRecoveryCheckpoint::pin_is_active)
+    }
+
+    pub(crate) fn recovery_checkpoint_was_consumed(&self) -> bool {
+        self.recovery_checkpoint
+            .as_ref()
+            .is_some_and(AuditedRecoveryCheckpoint::was_consumed)
+    }
+
+    pub(crate) fn recovery_checkpoint_was_propagated(&self) -> bool {
+        self.recovery_checkpoint
+            .as_ref()
+            .is_some_and(AuditedRecoveryCheckpoint::was_propagated)
+    }
+
+    pub(crate) fn propagated_recovery_successor(&self) -> Option<&CheckpointAssignmentFence> {
+        self.recovery_checkpoint
+            .as_ref()
+            .and_then(AuditedRecoveryCheckpoint::propagated_successor)
     }
 
     pub(crate) fn into_terminal(self) -> Option<AuditedDrainOutcome> {
@@ -1308,6 +1615,21 @@ impl AuditedCommittedDrainTransition {
 }
 
 impl AuditedDrainOutcome {
+    #[must_use]
+    pub(crate) const fn transition(&self) -> &AssignmentDrainTransition {
+        &self.transition
+    }
+
+    #[must_use]
+    pub(crate) fn is_abort(&self) -> bool {
+        self.outcome == SourceDrainOutcome::Abort
+    }
+
+    #[must_use]
+    pub(crate) fn is_commit(&self) -> bool {
+        self.outcome == SourceDrainOutcome::Commit
+    }
+
     #[must_use]
     pub(crate) fn committed_handoff_checkpoint(&self) -> Option<&CommittedCheckpointRef> {
         if self.outcome == SourceDrainOutcome::Commit {
@@ -1426,46 +1748,48 @@ pub async fn startup_committed_assignment(
     Ok(prior)
 }
 
-pub(crate) async fn audit_assignment_snapshot_authority_outcome(
-    store: &AssignmentSnapshotStore,
-    controller: Option<&ClusterController>,
-    snapshot: &AssignmentSnapshot,
-) -> Result<AuditedAssignmentAuthority, String> {
-    if snapshot.draining {
-        return Ok(AuditedAssignmentAuthority::without_successor_edge(
-            snapshot.version,
-        ));
-    }
-    if snapshot.version == 1 {
-        return Ok(AuditedAssignmentAuthority::without_successor_edge(
-            snapshot.version,
-        ));
-    }
-    let authority = match controller {
-        Some(controller) => Some(
-            controller
-                .checkpoint_authority()
-                .map_err(|error| error.to_string())?,
-        ),
-        None => None,
-    };
-    let Some(transition) = store
-        .load_drain_transition(snapshot.version)
-        .await
-        .map_err(|error| error.to_string())?
-    else {
-        let (predecessor, handoff_checkpoint) =
-            audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
-                .await?;
-        return Ok(AuditedAssignmentAuthority::recovery(
-            snapshot.version,
-            predecessor,
-            handoff_checkpoint,
-        ));
-    };
-    audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
-        .await
-        .map(|terminal| AuditedAssignmentAuthority::drain(snapshot.version, terminal))
+pub(crate) fn audit_assignment_snapshot_authority_outcome<'a>(
+    store: &'a AssignmentSnapshotStore,
+    controller: Option<&'a ClusterController>,
+    snapshot: &'a AssignmentSnapshot,
+) -> futures::future::BoxFuture<'a, Result<AuditedAssignmentAuthority, String>> {
+    Box::pin(async move {
+        if snapshot.draining {
+            return Ok(AuditedAssignmentAuthority::without_successor_edge(
+                snapshot.version,
+            ));
+        }
+        if snapshot.version == 1 {
+            return Ok(AuditedAssignmentAuthority::without_successor_edge(
+                snapshot.version,
+            ));
+        }
+        let authority = match controller {
+            Some(controller) => Some(
+                controller
+                    .checkpoint_authority()
+                    .map_err(|error| error.to_string())?,
+            ),
+            None => None,
+        };
+        let Some(transition) = store
+            .load_drain_transition(snapshot.version)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            let (predecessor, handoff_checkpoint) =
+                audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
+                    .await?;
+            return Ok(AuditedAssignmentAuthority::recovery(
+                snapshot.version,
+                predecessor,
+                handoff_checkpoint,
+            ));
+        };
+        audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
+            .await
+            .map(|terminal| AuditedAssignmentAuthority::drain(snapshot.version, terminal))
+    })
 }
 
 async fn audit_materialized_drain_with_authority(
@@ -1492,68 +1816,613 @@ async fn audit_materialized_drain_with_authority(
         .map(Some)
 }
 
-async fn audit_materialized_recovery_with_authority(
-    store: &AssignmentSnapshotStore,
-    authority: Option<&LeaderLeaseStore>,
-    snapshot: &AssignmentSnapshot,
-) -> Result<(CheckpointAssignmentFence, CommittedCheckpointRef), String> {
-    let authority = authority.ok_or_else(|| {
-        format!(
-            "materialized assignment recovery {} has no cluster authority",
-            snapshot.version
+fn validate_portable_recovery_cut(
+    outcome: &CheckpointOutcome,
+    index: &CommittedCheckpointIndex,
+    reference: &CommittedCheckpointRef,
+    predecessor: &CheckpointAssignmentFence,
+    context: &str,
+) -> Result<CheckpointAssignmentFence, String> {
+    index
+        .validate()
+        .map_err(|error| format!("{context} committed checkpoint index is invalid: {error}"))?;
+    let origin = index
+        .assignment_fence
+        .as_ref()
+        .ok_or_else(|| format!("{context} committed checkpoint has no cluster assignment fence"))?;
+    if !outcome.is_commit()
+        || outcome.scope != CheckpointScope::Cluster
+        || outcome.committed_checkpoint.as_ref() != Some(reference)
+        || outcome.epoch != reference.epoch
+        || outcome.checkpoint_id != reference.checkpoint_id
+        || outcome.epoch != index.epoch
+        || outcome.checkpoint_id != index.checkpoint_id
+        || outcome.deployment_id != index.deployment_id
+        || outcome.assignment_fence.as_ref() != Some(origin)
+        || outcome.leader_proof.is_none()
+        || index.scope != CheckpointScope::Cluster
+        || index.epoch != reference.epoch
+        || index.checkpoint_id != reference.checkpoint_id
+        || !index.reassignment_portable
+    {
+        return Err(format!(
+            "{context} does not bind one exact reassignment-portable cluster Commit"
+        ));
+    }
+    if !origin.is_canonical()
+        || !predecessor.is_canonical()
+        || origin.assignment_version > predecessor.assignment_version
+        || origin.vnode_count != predecessor.vnode_count
+        || origin.partitioning_abi_version != predecessor.partitioning_abi_version
+        || (origin.assignment_version == predecessor.assignment_version && origin != predecessor)
+    {
+        return Err(format!(
+            "{context} origin assignment is newer than or incompatible with the recovery predecessor"
+        ));
+    }
+    Ok(origin.clone())
+}
+
+fn audit_materialized_recovery_with_authority<'a>(
+    store: &'a AssignmentSnapshotStore,
+    authority: Option<&'a LeaderLeaseStore>,
+    snapshot: &'a AssignmentSnapshot,
+) -> futures::future::BoxFuture<
+    'a,
+    Result<(CheckpointAssignmentFence, AuditedRecoveryCheckpoint), String>,
+> {
+    Box::pin(async move {
+        let authority = authority.ok_or_else(|| {
+            format!(
+                "materialized assignment recovery {} has no cluster authority",
+                snapshot.version
+            )
+        })?;
+        let decision = authority
+            .assignment_recovery_decision(snapshot.version)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "assignment {} has no drain transition or recovery authority decision",
+                    snapshot.version
+                )
+            })?;
+        let proposal = store
+            .load_recovery_proposal(&decision.proposal)
+            .await
+            .map_err(|error| error.to_string())?;
+        if proposal != *snapshot
+            || proposal
+                .assignment_fence()
+                .map_err(|error| error.to_string())?
+                != decision.target
+        {
+            return Err(format!(
+                "assignment {} does not match its authorized recovery proposal",
+                snapshot.version
+            ));
+        }
+        let predecessor_version = snapshot
+            .version
+            .checked_sub(1)
+            .ok_or_else(|| "recovery assignment has no predecessor generation".to_string())?;
+        let predecessor = store
+            .load_version(predecessor_version)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "recovery assignment {} lost predecessor {predecessor_version}",
+                    snapshot.version
+                )
+            })?;
+        if predecessor.draining
+            || predecessor
+                .assignment_fence()
+                .map_err(|error| error.to_string())?
+                != decision.predecessor
+        {
+            return Err(format!(
+                "assignment {} recovery decision does not bind its exact committed predecessor",
+                snapshot.version
+            ));
+        }
+        let committed_head = authority
+            .highest_cluster_committed_outcome()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "assignment {} recovery has no committed checkpoint head",
+                    snapshot.version
+                )
+            })?;
+        let head_reference = committed_head.committed_checkpoint.clone().ok_or_else(|| {
+            format!(
+                "assignment {} recovery committed head has no checkpoint reference",
+                snapshot.version
+            )
+        })?;
+        let pinned = authority
+            .assignment_handoff_checkpoint(&decision.target)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let recovery_checkpoint = if let Some(pinned) = pinned {
+            if pinned != decision.recovery_checkpoint || head_reference != pinned {
+                return Err(format!(
+                    "assignment {} recovery does not retain its exact authoritative checkpoint head",
+                    snapshot.version
+                ));
+            }
+            let (observed_outcome, observed_index) = authority
+                .cluster_outcome_with_committed_checkpoint(pinned.epoch)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "assignment {} pinned recovery Commit disappeared",
+                        snapshot.version
+                    )
+                })?;
+            if observed_outcome != committed_head {
+                return Err(format!(
+                    "assignment {} recovery checkpoint head changed during authority audit",
+                    snapshot.version
+                ));
+            }
+            let observed_index = observed_index.ok_or_else(|| {
+                format!(
+                    "assignment {} pinned recovery Commit has no checkpoint index",
+                    snapshot.version
+                )
+            })?;
+            let origin = validate_portable_recovery_cut(
+                &observed_outcome,
+                &observed_index,
+                &pinned,
+                &decision.predecessor,
+                "materialized assignment recovery",
+            )?;
+            AuditedRecoveryCheckpoint::Active {
+                checkpoint: pinned,
+                origin,
+            }
+        } else {
+            if committed_head.assignment_fence.as_ref() == Some(&decision.target) {
+                // A Commit under the recovery target atomically consumes its handoff pin. The older
+                // decision checkpoint may then be garbage-collected; validate and recover from the
+                // exact target-fenced head instead of reopening that retired artifact.
+                let (observed_outcome, observed_index) = authority
+                    .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "assignment {} consumed recovery Commit disappeared",
+                            snapshot.version
+                        )
+                    })?;
+                if observed_outcome != committed_head {
+                    return Err(format!(
+                        "assignment {} recovery checkpoint head changed during authority audit",
+                        snapshot.version
+                    ));
+                }
+                let observed_index = observed_index.ok_or_else(|| {
+                    format!(
+                        "assignment {} consumed recovery Commit has no checkpoint index",
+                        snapshot.version
+                    )
+                })?;
+                let origin = validate_portable_recovery_cut(
+                    &observed_outcome,
+                    &observed_index,
+                    &head_reference,
+                    &decision.target,
+                    "consumed assignment recovery",
+                )?;
+                AuditedRecoveryCheckpoint::Consumed {
+                    checkpoint: head_reference,
+                    origin,
+                }
+            } else {
+                // Recording the exact next recovery decision moves the unresolved pin from this
+                // materialized target to its successor before that successor proposal is installed.
+                // Retain authority for this transient head only when all four immutable edges agree:
+                // D(n), D(n+1), the successor-keyed pin, and the unchanged committed cut.
+                let successor_version = snapshot.version.checked_add(1).ok_or_else(|| {
+                    "assignment version exhausted during recovery audit".to_string()
+                })?;
+                let successor = authority
+                    .assignment_recovery_decision(successor_version)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "assignment {} recovery checkpoint was superseded before the target committed",
+                            snapshot.version
+                        )
+                    })?;
+                if successor.predecessor != decision.target
+                    || successor.recovery_checkpoint != decision.recovery_checkpoint
+                    || successor.recovery_checkpoint != head_reference
+                {
+                    return Err(format!(
+                        "assignment {} recovery checkpoint does not continue through its exact successor decision",
+                        snapshot.version
+                    ));
+                }
+                let successor_pin = authority
+                    .assignment_handoff_checkpoint(&successor.target)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if successor_pin.as_ref() != Some(&head_reference) {
+                    return Err(format!(
+                        "assignment {} recovery checkpoint is not pinned to its exact pending successor",
+                        snapshot.version
+                    ));
+                }
+                let (observed_outcome, observed_index) = authority
+                    .cluster_outcome_with_committed_checkpoint(head_reference.epoch)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!(
+                            "assignment {} propagated recovery Commit disappeared",
+                            snapshot.version
+                        )
+                    })?;
+                if observed_outcome != committed_head {
+                    return Err(format!(
+                        "assignment {} recovery checkpoint head changed during authority audit",
+                        snapshot.version
+                    ));
+                }
+                let observed_index = observed_index.ok_or_else(|| {
+                    format!(
+                        "assignment {} propagated recovery Commit has no checkpoint index",
+                        snapshot.version
+                    )
+                })?;
+                let origin = validate_portable_recovery_cut(
+                    &observed_outcome,
+                    &observed_index,
+                    &head_reference,
+                    &decision.predecessor,
+                    "propagated assignment recovery",
+                )?;
+                AuditedRecoveryCheckpoint::Propagated {
+                    checkpoint: head_reference,
+                    origin,
+                    successor: successor.target,
+                }
+            }
+        };
+        Ok((decision.predecessor, recovery_checkpoint))
+    })
+}
+
+fn outcome_is_exact_abort_for_inventory(
+    outcome: &CheckpointOutcome,
+    inventory: &CheckpointArtifactInventory,
+    predecessor: &CheckpointAssignmentFence,
+) -> bool {
+    outcome.scope == CheckpointScope::Cluster
+        && outcome.epoch == inventory.attempt.epoch
+        && outcome.checkpoint_id == inventory.attempt.checkpoint_id
+        && outcome.deployment_id == inventory.deployment_id
+        && outcome.assignment_fence.as_ref() == Some(predecessor)
+        && outcome.verdict == CheckpointVerdict::Abort
+        && outcome.committed_checkpoint.is_none()
+        && outcome.leader_proof.is_some()
+}
+
+/// Resolve the old assignment's in-flight checkpoint once an immutable recovery decision has
+/// made that attempt abort-only. This publishes only terminal authority: artifact sealing and
+/// deletion remain behind coordinated recovery's stopped quorum because participant writers may
+/// still be unwinding when they observe the Abort.
+fn abort_predecessor_checkpoint_for_recovery<'a>(
+    store: &'a AssignmentSnapshotStore,
+    controller: &'a ClusterController,
+    snapshot: &'a AssignmentSnapshot,
+    deadline: tokio::time::Instant,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    Box::pin(async move {
+        // Followers only consume the shared outcome. A stale local proof also fails atomically in the
+        // authority CAS and is retried after the next leader observation.
+        if controller.capture_leader_proof().is_none() {
+            return Ok(());
+        }
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        let (predecessor, audited_recovery) = tokio::time::timeout_at(
+            deadline,
+            audit_materialized_recovery_with_authority(store, Some(authority.as_ref()), snapshot),
         )
-    })?;
-    let decision = authority
-        .assignment_recovery_decision(snapshot.version)
         .await
+        .map_err(|_| {
+            format!(
+                "assignment {} recovery authority audit timed out while settling its predecessor checkpoint",
+                snapshot.version
+            )
+        })??;
+        settle_audited_recovery_predecessor_checkpoint(
+            controller,
+            authority,
+            snapshot,
+            predecessor,
+            audited_recovery,
+            deadline,
+        )
+        .await
+    })
+}
+
+/// Settle an already-audited predecessor checkpoint in a separate boxed state machine. Keeping the
+/// authority audit and settlement state distinct bounds debug-build stack usage on the recovery
+/// path without weakening any of the post-audit revalidation below.
+fn settle_audited_recovery_predecessor_checkpoint<'a>(
+    controller: &'a ClusterController,
+    authority: Arc<LeaderLeaseStore>,
+    snapshot: &'a AssignmentSnapshot,
+    predecessor: CheckpointAssignmentFence,
+    audited_recovery: AuditedRecoveryCheckpoint,
+    deadline: tokio::time::Instant,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    Box::pin(async move {
+        let recovery_checkpoint = audited_recovery.checkpoint().clone();
+        let target = snapshot
+            .assignment_fence()
+            .map_err(|error| error.to_string())?;
+        let pin_target = audited_recovery
+            .propagated_successor()
+            .cloned()
+            .unwrap_or_else(|| target.clone());
+        let decision = tokio::time::timeout_at(
+            deadline,
+            authority.assignment_recovery_decision(snapshot.version),
+        )
+        .await
+        .map_err(|_| "recovery decision reload timed out before checkpoint settlement".to_string())?
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
             format!(
-                "assignment {} has no drain transition or recovery authority decision",
+                "assignment {} lost its recovery decision before checkpoint settlement",
                 snapshot.version
             )
         })?;
-    let proposal = store
-        .load_recovery_proposal(&decision.proposal)
+        if decision.predecessor != predecessor
+            || decision.target != target
+            || (!audited_recovery.was_consumed()
+                && decision.recovery_checkpoint != recovery_checkpoint)
+        {
+            return Err(format!(
+                "assignment {} recovery decision changed during checkpoint settlement",
+                snapshot.version
+            ));
+        }
+
+        let Some(inventory) =
+            tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+                .await
+                .map_err(|_| "recovery checkpoint artifact inventory read timed out".to_string())?
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        inventory.validate()?;
+        // Once a target-generation inventory exists, single-active-inventory admission proves the
+        // predecessor attempt was already terminal and cleaned. Recovery-origin assignments stay
+        // identifiable after their handoff pin is legitimately cleared by a target Commit.
+        if inventory.assignment_fence.as_ref() == Some(&target) {
+            return Ok(());
+        }
+        if inventory.assignment_fence.as_ref() != Some(&predecessor) {
+            return Err(format!(
+                "assignment {} recovery found checkpoint {} artifacts for an unrelated assignment",
+                snapshot.version, inventory.attempt.checkpoint_id
+            ));
+        }
+
+        if audited_recovery.was_consumed() {
+            return Err(format!(
+                "assignment {} recovery target already consumed its checkpoint pin while predecessor artifacts remain",
+                snapshot.version
+            ));
+        }
+
+        let pinned = tokio::time::timeout_at(
+            deadline,
+            authority.assignment_handoff_checkpoint(&pin_target),
+        )
         .await
+        .map_err(|_| "recovery handoff checkpoint lookup timed out".to_string())?
         .map_err(|error| error.to_string())?;
-    if proposal != *snapshot
-        || proposal
-            .assignment_fence()
-            .map_err(|error| error.to_string())?
-            != decision.target
-    {
-        return Err(format!(
-            "assignment {} does not match its authorized recovery proposal",
-            snapshot.version
-        ));
-    }
-    let predecessor_version = snapshot
-        .version
-        .checked_sub(1)
-        .ok_or_else(|| "recovery assignment has no predecessor generation".to_string())?;
-    let predecessor = store
-        .load_version(predecessor_version)
-        .await
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "recovery assignment {} lost predecessor {predecessor_version}",
+        if pinned.as_ref() != Some(&recovery_checkpoint) {
+            return Err(format!(
+                "assignment {} recovery lost its exact target-keyed checkpoint pin",
                 snapshot.version
-            )
-        })?;
-    if predecessor.draining
-        || predecessor
-            .assignment_fence()
-            .map_err(|error| error.to_string())?
-            != decision.predecessor
-    {
-        return Err(format!(
-            "assignment {} recovery decision does not bind its exact committed predecessor",
+            ));
+        }
+        let committed_head =
+            tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
+                .await
+                .map_err(|_| "recovery committed-head lookup timed out".to_string())?
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "recovery assignment has no committed checkpoint head".to_string()
+                })?;
+        if committed_head.committed_checkpoint.as_ref() != Some(&recovery_checkpoint) {
+            return Err(format!(
+                "assignment {} recovery pin is not the authoritative committed checkpoint head",
+                snapshot.version
+            ));
+        }
+        let (observed_outcome, observed_index) = tokio::time::timeout_at(
+            deadline,
+            authority.cluster_outcome_with_committed_checkpoint(recovery_checkpoint.epoch),
+        )
+        .await
+        .map_err(|_| "recovery checkpoint head load timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "recovery checkpoint head disappeared".to_string())?;
+        if observed_outcome != committed_head {
+            return Err(format!(
+                "assignment {} recovery checkpoint head changed during predecessor settlement",
+                snapshot.version
+            ));
+        }
+        let recovery_index = observed_index
+            .ok_or_else(|| "recovery checkpoint Commit has no committed index".to_string())?;
+        let observed_origin = validate_portable_recovery_cut(
+            &observed_outcome,
+            &recovery_index,
+            &recovery_checkpoint,
+            &predecessor,
+            "predecessor checkpoint settlement",
+        )?;
+        if &observed_origin != audited_recovery.origin() {
+            return Err(format!(
+                "assignment {} recovery checkpoint origin changed during predecessor settlement",
+                snapshot.version
+            ));
+        }
+        if inventory.deployment_id != recovery_index.deployment_id
+            || inventory.pipeline_identity != recovery_index.pipeline_identity
+        {
+            return Err(format!(
+            "assignment {} recovery checkpoint and active predecessor artifacts are not one pipeline cut",
             snapshot.version
         ));
-    }
-    Ok((decision.predecessor, decision.recovery_checkpoint))
+        }
+        let recovery_attempt =
+            CheckpointAttempt::new(recovery_checkpoint.epoch, recovery_checkpoint.checkpoint_id);
+        if inventory.attempt.relation_to(recovery_attempt) != CheckpointAttemptRelation::Newer {
+            return Err(format!(
+            "assignment {} recovery cannot abort checkpoint {} because it does not follow pinned checkpoint {}",
+            snapshot.version,
+            inventory.attempt.checkpoint_id,
+            recovery_checkpoint.checkpoint_id
+        ));
+        }
+
+        let existing = tokio::time::timeout_at(
+            deadline,
+            authority.cluster_attempt_settlement(inventory.attempt),
+        )
+        .await
+        .map_err(|_| "predecessor checkpoint settlement read timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        let winner = if let Some(outcome) = existing {
+            outcome
+        } else {
+            let current_proof = controller.capture_leader_proof().ok_or_else(|| {
+                "leadership changed before predecessor checkpoint Abort publication".to_string()
+            })?;
+            let recorded = tokio::time::timeout_at(
+                deadline,
+                authority.record_cluster_outcome(
+                    &current_proof,
+                    inventory.attempt.epoch,
+                    inventory.attempt.checkpoint_id,
+                    predecessor.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                ),
+            )
+            .await
+            .map_err(|_| "predecessor checkpoint Abort publication timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+            match recorded {
+                RecordOutcomeResult::Created(outcome)
+                | RecordOutcomeResult::Unchanged(outcome)
+                | RecordOutcomeResult::Conflict { winner: outcome } => outcome,
+            }
+        };
+        if !outcome_is_exact_abort_for_inventory(&winner, &inventory, &predecessor) {
+            return Err(format!(
+                "checkpoint {} has incompatible terminal authority after assignment {} recovery",
+                inventory.attempt.checkpoint_id, snapshot.version
+            ));
+        }
+        let settled = tokio::time::timeout_at(
+            deadline,
+            authority.cluster_attempt_settlement(inventory.attempt),
+        )
+        .await
+        .map_err(|_| "predecessor checkpoint Abort verification timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "predecessor checkpoint Abort was not durably visible".to_string())?;
+        if !outcome_is_exact_abort_for_inventory(&settled, &inventory, &predecessor) {
+            return Err(format!(
+                "checkpoint {} Abort verification observed incompatible terminal authority",
+                inventory.attempt.checkpoint_id
+            ));
+        }
+        let final_pin = tokio::time::timeout_at(
+            deadline,
+            authority.assignment_handoff_checkpoint(&pin_target),
+        )
+        .await
+        .map_err(|_| "post-Abort recovery handoff checkpoint lookup timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        if final_pin.as_ref() != Some(&recovery_checkpoint) {
+            return Err(format!(
+                "assignment {} recovery checkpoint pin changed while publishing predecessor Abort",
+                snapshot.version
+            ));
+        }
+        let remaining = tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+            .await
+            .map_err(|_| "post-Abort checkpoint artifact inventory read timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+        if remaining
+            .as_ref()
+            .is_some_and(|current| current != &inventory)
+        {
+            return Err(format!(
+                "checkpoint {} artifact inventory changed while publishing its recovery Abort",
+                inventory.attempt.checkpoint_id
+            ));
+        }
+        info!(
+            checkpoint_id = inventory.attempt.checkpoint_id,
+            predecessor_version = predecessor.assignment_version,
+            target_version = snapshot.version,
+            "recovery assignment published the predecessor checkpoint Abort"
+        );
+        Ok(())
+    })
+}
+
+fn prepare_recovery_assignment_adoption<'a>(
+    db: &'a Arc<LaminarDB>,
+    store: &'a AssignmentSnapshotStore,
+    controller: &'a ClusterController,
+    snapshot: &'a AssignmentSnapshot,
+    deadline: tokio::time::Instant,
+) -> futures::future::BoxFuture<'a, Result<(), String>> {
+    Box::pin(async move {
+        match try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
+            true => {}
+            false => {
+                return Err(format!(
+                    "recovery assignment {} waits for a local vnode transition",
+                    snapshot.version
+                ));
+            }
+        }
+        if local_recovery_assignment_scope(snapshot, controller)?
+            == LocalRecoveryAssignmentScope::Ownerless
+        {
+            return Ok(());
+        }
+        ensure_local_recovery_fault(db, controller).await?;
+        abort_predecessor_checkpoint_for_recovery(store, controller, snapshot, deadline).await
+    })
 }
 
 async fn audit_materialized_drain_transition(
@@ -1865,7 +2734,7 @@ pub(crate) async fn settle_source_drain_before_recovery_release(
     Ok(Some(snapshot.version))
 }
 
-async fn audit_drain_predecessor(
+pub(crate) async fn audit_drain_predecessor(
     store: &AssignmentSnapshotStore,
     registry: &VnodeRegistry,
     draining: &AssignmentSnapshot,
@@ -1993,7 +2862,11 @@ async fn prepare_and_announce_local_drain(
     // Receipt production can block on a connector FIFO. Re-read both the transition and its
     // leader lease before making that receipt visible to the frozen predecessor quorum.
     audit_exact_drain_head(store, registry, draining, controller, deadline).await?;
-    controller.publish_checkpoint_drain_transition(Some(transition.clone()));
+    if controller.checkpoint_drain_transition().as_ref() != Some(transition) {
+        return Err(
+            "source-drain transition changed before durable acknowledgement publication".into(),
+        );
+    }
     tokio::time::timeout_at(deadline, controller.announce_drain_ack(transition))
         .await
         .map_err(|_| "durable drain acknowledgement publication timed out".to_string())?
@@ -2168,80 +3041,89 @@ pub async fn wait_until_drained(
     }
 }
 
-async fn materialize_recovery_decision(
-    db: &Arc<LaminarDB>,
-    store: &Arc<AssignmentSnapshotStore>,
-    controller: &ClusterController,
+fn materialize_recovery_decision<'a>(
+    db: &'a Arc<LaminarDB>,
+    store: &'a Arc<AssignmentSnapshotStore>,
+    controller: &'a ClusterController,
     decision: AssignmentRecoveryDecision,
     operation_timeout: Duration,
-) -> Result<Option<u64>, String> {
-    let deadline = tokio::time::Instant::now() + operation_timeout;
-    close_local_assignment_authority(db, Some(controller), deadline).await?;
-    ensure_local_recovery_fault(db, controller).await?;
-    let proposal =
-        tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
-            .await
-            .map_err(|_| {
-                "recovery proposal load exceeded the materialization deadline".to_string()
-            })?
+) -> futures::future::BoxFuture<'a, Result<Option<u64>, String>> {
+    Box::pin(async move {
+        let deadline = tokio::time::Instant::now() + operation_timeout;
+        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        let proposal =
+            tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
+                .await
+                .map_err(|_| {
+                    "recovery proposal load exceeded the materialization deadline".to_string()
+                })?
+                .map_err(|error| error.to_string())?;
+        if proposal
+            .assignment_fence()
+            .map_err(|error| error.to_string())?
+            != decision.target
+        {
+            return Err("recovery authority winner does not match its staged proposal".into());
+        }
+        if local_recovery_assignment_scope(&proposal, controller)?
+            == LocalRecoveryAssignmentScope::Participant
+        {
+            ensure_local_recovery_fault(db, controller).await?;
+        }
+        let authority = controller
+            .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-    if proposal
-        .assignment_fence()
-        .map_err(|error| error.to_string())?
-        != decision.target
-    {
-        return Err("recovery authority winner does not match its staged proposal".into());
-    }
-    let authority = controller
-        .checkpoint_authority()
-        .map_err(|error| error.to_string())?;
-    let durable = match tokio::time::timeout_at(
-        deadline,
-        authority.materialize_assignment_recovery(decision.target_version()),
-    )
-    .await
-    .map_err(|_| "recovery assignment materialization exceeded its deadline".to_string())?
-    .map_err(|error| error.to_string())?
-    {
-        RotateOutcome::Rotated => proposal.clone(),
-        RotateOutcome::Conflict(winner) => *winner,
-    };
-    if durable != proposal {
-        return Err(format!(
-            "assignment {} materialization conflicts with the authority recovery winner",
-            decision.target_version()
-        ));
-    }
-    tokio::time::timeout_at(
-        deadline,
-        audit_assignment_snapshot_authority(store, Some(controller), &durable),
-    )
-    .await
-    .map_err(|_| "recovery assignment audit exceeded the materialization deadline".to_string())??;
-    let version = durable.version;
-    db.adopt_assignment_snapshot(durable, deadline)
+        let durable = match tokio::time::timeout_at(
+            deadline,
+            authority.materialize_assignment_recovery(decision.target_version()),
+        )
         .await
-        .map_err(|error| error.to_string())?;
-    let oldest_retained = version.saturating_sub(1);
-    let maintenance_store = Arc::clone(store);
-    let maintenance_authority = Arc::clone(&authority);
-    let maintenance_proof = controller.capture_leader_proof();
-    tokio::spawn(async move {
-        match maintenance_store.prune_before(oldest_retained).await {
-            Ok(()) => {
-                if let Some(proof) = maintenance_proof {
-                    if let Err(error) = maintenance_authority
-                        .prune_assignment_drain_decisions_before(&proof, oldest_retained)
-                        .await
-                    {
-                        warn!(%error, "assignment recovery authority prune failed after snapshot prune");
+        .map_err(|_| "recovery assignment materialization exceeded its deadline".to_string())?
+        .map_err(|error| error.to_string())?
+        {
+            RotateOutcome::Rotated => proposal.clone(),
+            RotateOutcome::Conflict(winner) => *winner,
+        };
+        if durable != proposal {
+            return Err(format!(
+                "assignment {} materialization conflicts with the authority recovery winner",
+                decision.target_version()
+            ));
+        }
+        tokio::time::timeout_at(
+            deadline,
+            audit_assignment_snapshot_authority(store, Some(controller), &durable),
+        )
+        .await
+        .map_err(|_| {
+            "recovery assignment audit exceeded the materialization deadline".to_string()
+        })??;
+        prepare_recovery_assignment_adoption(db, store, controller, &durable, deadline).await?;
+        let version = durable.version;
+        db.adopt_recovery_assignment_snapshot(durable, deadline)
+            .await
+            .map_err(|error| error.to_string())?;
+        let oldest_retained = version.saturating_sub(1);
+        let maintenance_store = Arc::clone(store);
+        let maintenance_authority = Arc::clone(&authority);
+        let maintenance_proof = controller.capture_leader_proof();
+        tokio::spawn(async move {
+            match maintenance_store.prune_before(oldest_retained).await {
+                Ok(()) => {
+                    if let Some(proof) = maintenance_proof {
+                        if let Err(error) = maintenance_authority
+                            .prune_assignment_drain_decisions_before(&proof, oldest_retained)
+                            .await
+                        {
+                            warn!(%error, "assignment recovery authority prune failed after snapshot prune");
+                        }
                     }
                 }
+                Err(error) => warn!(%error, "snapshot prune failed after assignment recovery"),
             }
-            Err(error) => warn!(%error, "snapshot prune failed after assignment recovery"),
-        }
-    });
-    Ok(Some(version))
+        });
+        Ok(Some(version))
+    })
 }
 
 async fn reconcile_pending_recovery_decision(
@@ -2295,86 +3177,78 @@ fn replaced_predecessor_processes(
         .collect()
 }
 
-async fn authorize_recovery_successor(
-    db: &Arc<LaminarDB>,
-    store: &Arc<AssignmentSnapshotStore>,
-    controller: &ClusterController,
-    current: &AssignmentSnapshot,
+fn authorize_recovery_successor<'a>(
+    db: &'a Arc<LaminarDB>,
+    store: &'a Arc<AssignmentSnapshotStore>,
+    controller: &'a ClusterController,
+    current: &'a AssignmentSnapshot,
     proposal: AssignmentSnapshot,
     operation_timeout: Duration,
-    reason: &str,
-) -> Result<Option<u64>, String> {
-    let predecessor = current
-        .assignment_fence()
-        .map_err(|error| error.to_string())?;
-    let target = proposal
-        .assignment_fence()
-        .map_err(|error| error.to_string())?;
-    let deadline = controller.process_fencing_deadline(operation_timeout)?;
-    close_local_assignment_authority(db, Some(controller), deadline).await?;
-    let proposal_ref = tokio::time::timeout_at(deadline, store.stage_recovery_proposal(&proposal))
-        .await
-        .map_err(|_| "recovery proposal staging exceeded the fencing deadline".to_string())?
-        .map_err(|error| error.to_string())?;
+    reason: &'a str,
+) -> futures::future::BoxFuture<'a, Result<AssignmentRecoveryDecision, String>> {
+    Box::pin(async move {
+        let predecessor = current
+            .assignment_fence()
+            .map_err(|error| error.to_string())?;
+        let target = proposal
+            .assignment_fence()
+            .map_err(|error| error.to_string())?;
+        let deadline = controller.process_fencing_deadline(operation_timeout)?;
+        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        let proposal_ref =
+            tokio::time::timeout_at(deadline, store.stage_recovery_proposal(&proposal))
+                .await
+                .map_err(|_| "recovery proposal staging exceeded the fencing deadline".to_string())?
+                .map_err(|error| error.to_string())?;
 
-    let removed = replaced_predecessor_processes(&predecessor, &target);
-    let fence_results = futures::future::join_all(
-        removed
-            .iter()
-            .copied()
-            .map(|participant| controller.fence_process_incarnation(participant, deadline)),
-    )
-    .await;
-    let mut process_fences = Vec::with_capacity(fence_results.len());
-    for result in fence_results {
-        process_fences.push(result?);
-    }
+        let removed = replaced_predecessor_processes(&predecessor, &target);
+        let fence_results = futures::future::join_all(
+            removed
+                .iter()
+                .copied()
+                .map(|participant| controller.fence_process_incarnation(participant, deadline)),
+        )
+        .await;
+        let mut process_fences = Vec::with_capacity(fence_results.len());
+        for result in fence_results {
+            process_fences.push(result?);
+        }
 
-    let observed = tokio::time::timeout_at(deadline, store.load())
-        .await
-        .map_err(|_| "assignment head revalidation exceeded the fencing deadline".to_string())?
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "assignment head disappeared during recovery fencing".to_string())?;
-    if observed != *current {
-        return Err(format!(
-            "assignment head advanced from {} while process fencing was in progress",
-            current.version
-        ));
-    }
-    tokio::time::timeout_at(
-        deadline,
-        audit_assignment_snapshot_authority(store, Some(controller), &observed),
-    )
-    .await
-    .map_err(|_| "predecessor authority audit exceeded the fencing deadline".to_string())??;
-
-    let target_checks =
-        futures::future::join_all(target.participants.iter().copied().map(|participant| {
-            controller.verify_current_process_incarnation(participant, deadline)
-        }));
-    for (participant, check) in target.participants.iter().zip(target_checks.await) {
-        if !check? {
+        let observed = tokio::time::timeout_at(deadline, store.load())
+            .await
+            .map_err(|_| "assignment head revalidation exceeded the fencing deadline".to_string())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "assignment head disappeared during recovery fencing".to_string())?;
+        if observed != *current {
             return Err(format!(
-                "successor process {} is not the current durable lease owner",
-                participant.node_id
+                "assignment head advanced from {} while process fencing was in progress",
+                current.version
             ));
         }
-    }
+        tokio::time::timeout_at(
+            deadline,
+            audit_assignment_snapshot_authority(store, Some(controller), &observed),
+        )
+        .await
+        .map_err(|_| "predecessor authority audit exceeded the fencing deadline".to_string())??;
 
-    let authority = controller
-        .checkpoint_authority()
-        .map_err(|error| error.to_string())?;
-    let pinned_checkpoint = tokio::time::timeout_at(
-        deadline,
-        authority.assignment_handoff_checkpoint(&predecessor),
-    )
-    .await
-    .map_err(|_| "recovery handoff lookup exceeded the fencing deadline".to_string())?
-    .map_err(|error| error.to_string())?;
-    let recovery_checkpoint = if let Some(reference) = pinned_checkpoint {
-        reference
-    } else {
-        let outcome =
+        let target_checks =
+            futures::future::join_all(target.participants.iter().copied().map(|participant| {
+                controller.verify_current_process_incarnation(participant, deadline)
+            }));
+        for (participant, check) in target.participants.iter().zip(target_checks.await) {
+            if !check? {
+                return Err(format!(
+                    "successor process {} is not the current durable lease owner",
+                    participant.node_id
+                ));
+            }
+        }
+
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        let committed_head =
             tokio::time::timeout_at(deadline, authority.highest_cluster_committed_outcome())
                 .await
                 .map_err(|_| {
@@ -2382,47 +3256,146 @@ async fn authorize_recovery_successor(
                 })?
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| {
-                    "assignment recovery requires a committed predecessor checkpoint".to_string()
+                    "assignment recovery requires a committed cluster checkpoint".to_string()
                 })?;
-        if outcome.assignment_fence.as_ref() != Some(&predecessor) {
-            return Err(
-                "latest committed cluster checkpoint does not bind the recovery predecessor".into(),
-            );
-        }
-        outcome.committed_checkpoint.ok_or_else(|| {
+        let head_reference = committed_head.committed_checkpoint.clone().ok_or_else(|| {
             "latest committed cluster checkpoint has no committed index reference".to_string()
-        })?
-    };
-    let leader_proof = controller
-        .capture_leader_proof()
-        .ok_or_else(|| "assignment recovery lost the current durable leader proof".to_string())?;
-    let decision = AssignmentRecoveryDecision::new(
-        predecessor,
-        target,
-        proposal_ref,
-        process_fences,
-        recovery_checkpoint,
-        leader_proof.clone(),
-    )?;
-    let decision = match tokio::time::timeout_at(
-        deadline,
-        controller.record_assignment_recovery_decision(&leader_proof, decision, deadline),
-    )
-    .await
-    .map_err(|_| "recovery authority admission exceeded the fencing deadline".to_string())?
-    .map_err(|error| error.clone())?
-    {
-        RecordAssignmentRecoveryDecisionResult::Created(decision)
-        | RecordAssignmentRecoveryDecisionResult::Unchanged(decision) => decision,
-        RecordAssignmentRecoveryDecisionResult::Conflict { winner } => winner,
-    };
-    warn!(
-        predecessor_version = current.version,
-        target_version = decision.target_version(),
-        %reason,
-        "authorized successor assignment from the last committed cluster cut"
-    );
-    materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
+        })?;
+        let pinned_checkpoint = tokio::time::timeout_at(
+            deadline,
+            authority.assignment_handoff_checkpoint(&predecessor),
+        )
+        .await
+        .map_err(|_| "recovery handoff lookup exceeded the fencing deadline".to_string())?
+        .map_err(|error| error.to_string())?;
+        let recovery_checkpoint = if let Some(reference) = pinned_checkpoint {
+            if reference != head_reference {
+                return Err(
+                    "recovery handoff pin is not the exact latest committed checkpoint head".into(),
+                );
+            }
+            reference
+        } else {
+            if committed_head.assignment_fence.as_ref() != Some(&predecessor) {
+                return Err(
+                    "latest committed cluster checkpoint does not bind the recovery predecessor"
+                        .into(),
+                );
+            }
+            head_reference
+        };
+        let (observed_outcome, observed_index) = tokio::time::timeout_at(
+            deadline,
+            authority.cluster_outcome_with_committed_checkpoint(recovery_checkpoint.epoch),
+        )
+        .await
+        .map_err(|_| "recovery checkpoint head load exceeded the fencing deadline".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "recovery checkpoint Commit disappeared during fencing".to_string())?;
+        if observed_outcome != committed_head {
+            return Err("recovery checkpoint head changed during successor authorization".into());
+        }
+        let recovery_index = observed_index
+            .ok_or_else(|| "recovery checkpoint Commit has no committed index".to_string())?;
+        validate_portable_recovery_cut(
+            &observed_outcome,
+            &recovery_index,
+            &recovery_checkpoint,
+            &predecessor,
+            "assignment recovery authorization",
+        )?;
+        let leader_proof = controller.capture_leader_proof().ok_or_else(|| {
+            "assignment recovery lost the current durable leader proof".to_string()
+        })?;
+        let decision = AssignmentRecoveryDecision::new(
+            predecessor,
+            target,
+            proposal_ref,
+            process_fences,
+            recovery_checkpoint,
+            leader_proof.clone(),
+        )?;
+        let decision = match tokio::time::timeout_at(
+            deadline,
+            controller.record_assignment_recovery_decision(&leader_proof, decision, deadline),
+        )
+        .await
+        .map_err(|_| "recovery authority admission exceeded the fencing deadline".to_string())?
+        .map_err(|error| error.clone())?
+        {
+            RecordAssignmentRecoveryDecisionResult::Created(decision)
+            | RecordAssignmentRecoveryDecisionResult::Unchanged(decision) => decision,
+            RecordAssignmentRecoveryDecisionResult::Conflict { winner } => winner,
+        };
+        warn!(
+            predecessor_version = current.version,
+            target_version = decision.target_version(),
+            %reason,
+            "authorized successor assignment from the last committed cluster cut"
+        );
+        Ok(decision)
+    })
+}
+
+enum DrainPublicationReconciliation {
+    Deferred,
+    Resolved {
+        outcome: RotateOutcome,
+        authority_changed: bool,
+    },
+}
+
+async fn reconcile_drain_publication(
+    store: &AssignmentSnapshotStore,
+    controller: &ClusterController,
+    drain: &AssignmentSnapshot,
+    prior_version: u64,
+    retry_delay: Duration,
+) -> Result<DrainPublicationReconciliation, SnapshotError> {
+    let transition = drain.drain_transition.as_ref().ok_or_else(|| {
+        SnapshotError::Invalid("drain publication has no exact transition".into())
+    })?;
+    let mut had_ambiguous_attempt = false;
+    let mut authority_changed = false;
+
+    loop {
+        let changed = controller.is_recovering() || !controller.proof_is_live(&transition.leader);
+        authority_changed |= changed;
+        if changed && !had_ambiguous_attempt {
+            return Ok(DrainPublicationReconciliation::Deferred);
+        }
+
+        match store.save_if_version(drain, prior_version).await {
+            Ok(outcome) => {
+                authority_changed |=
+                    controller.is_recovering() || !controller.proof_is_live(&transition.leader);
+                let outcome = match outcome {
+                    RotateOutcome::Conflict(winner) if winner.as_ref() == drain => {
+                        RotateOutcome::Rotated
+                    }
+                    outcome => outcome,
+                };
+                return Ok(DrainPublicationReconciliation::Resolved {
+                    outcome,
+                    authority_changed,
+                });
+            }
+            Err(SnapshotError::Io(error)) => {
+                had_ambiguous_attempt = true;
+                authority_changed |=
+                    controller.is_recovering() || !controller.proof_is_live(&transition.leader);
+                warn!(
+                    version = drain.version,
+                    %error,
+                    "ambiguous assignment drain publication; reconciling the exact create"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error @ (SnapshotError::Invalid(_) | SnapshotError::Json(_))) => {
+                return Err(error);
+            }
+        }
+    }
 }
 
 fn execute_graceful_rotation_owned(
@@ -2454,8 +3427,11 @@ fn execute_graceful_rotation_owned(
         let rotate_outcome = {
             // Assignment adoption and startup recovery create pending vnode work under this lock.
             // Keep it through the durable CAS so it cannot appear after preflight but
-            // before V+1 is published. The scope must end before conflict adoption or drain
-            // finalization, both of which acquire the same lock.
+            // before V+1 is published. Once the recovery gate below admits publication, the
+            // conditional write must resolve without an outer cancellation deadline: releasing
+            // this lock while an admitted remote write can still commit would let recovery select
+            // the predecessor before V+1 appears. The scope must end before conflict adoption or
+            // drain finalization, both of which acquire the same lock.
             let _adoption = tokio::time::timeout_at(
                 publication_deadline,
                 db.assignment_adoption_lock.lock(),
@@ -2524,33 +3500,66 @@ fn execute_graceful_rotation_owned(
                 );
                 return Ok(None);
             }
-            match tokio::time::timeout_at(
-                publication_deadline,
-                store.save_if_version(&drain, current.version),
+            let outcome = match reconcile_drain_publication(
+                &store,
+                &controller,
+                &drain,
+                current.version,
+                config.retry_delay,
             )
             .await
-            {
-                Ok(Ok(outcome)) => outcome,
-                Ok(Err(error)) => {
+            .map_err(|error| {
+                format!(
+                    "assignment drain {} conditional publication failed deterministically: {error}",
+                    drain.version
+                )
+            })? {
+                DrainPublicationReconciliation::Deferred => {
+                    debug!(
+                        version = current.version,
+                        "graceful rotation deferred after publication authority changed"
+                    );
+                    return Ok(None);
+                }
+                DrainPublicationReconciliation::Resolved {
+                    authority_changed: true,
+                    ..
+                } => {
                     return Err(format!(
-                        "assignment drain {} publication failed with an ambiguous durable outcome: {error}; the durable head must be reconciled on retry",
+                        "assignment drain {} became durable after publication authority changed; yielding to durable drain recovery",
                         drain.version
                     ));
                 }
-                Err(_) => {
-                    return Err(format!(
-                        "assignment drain {} publication timed out with an ambiguous durable outcome; the durable head must be reconciled on retry",
-                        drain.version
-                    ));
+                DrainPublicationReconciliation::Resolved {
+                    outcome,
+                    authority_changed: false,
+                } => outcome,
+            };
+            if matches!(&outcome, RotateOutcome::Rotated) {
+                // The assignment-adoption claim is also checkpoint admission's linearization
+                // boundary. Publish the local transition before releasing it, so either an
+                // ordinary checkpoint durably prepares against the predecessor first or every
+                // later admission observes this exact drain.
+                db.validate_source_drain_snapshot(&drain)
+                    .map_err(|error| error.to_string())?;
+                match controller.checkpoint_drain_transition() {
+                    None => {
+                        controller.publish_checkpoint_drain_transition(Some(transition.clone()))
+                    }
+                    Some(installed) if installed == transition => {}
+                    Some(_) => {
+                        return Err(
+                            "a different source-drain transition is already installed locally"
+                                .into(),
+                        );
+                    }
                 }
             }
+            outcome
         };
         match rotate_outcome {
             RotateOutcome::Rotated => {
                 let drain_deadline = tokio::time::Instant::now() + config.drain_ack_timeout;
-                db.validate_source_drain_snapshot(&drain)
-                    .map_err(|error| error.to_string())?;
-                controller.publish_checkpoint_drain_transition(Some(transition.clone()));
                 // Wait for every process in the snapshot's frozen boot roster to durably ack the
                 // exact source cut. Target-only joiners intentionally do not acknowledge inputs
                 // they never owned under the predecessor.
@@ -2601,6 +3610,7 @@ fn execute_graceful_rotation_owned(
                         AssignmentDrainVerdict::Abort,
                         None,
                         config,
+                        DrainFinalizationMode::Live,
                     )
                     .await
                     {
@@ -2646,6 +3656,7 @@ fn execute_graceful_rotation_owned(
                                 AssignmentDrainVerdict::Abort,
                                 None,
                                 config,
+                                DrainFinalizationMode::Live,
                             )
                             .await
                             {
@@ -2673,6 +3684,7 @@ fn execute_graceful_rotation_owned(
                     AssignmentDrainVerdict::Commit,
                     Some(handoff_checkpoint),
                     config,
+                    DrainFinalizationMode::Live,
                 )
                 .await;
             }
@@ -2706,9 +3718,9 @@ fn try_rebalance_owned(
             .map_err(|_| "durable assignment head audit timed out".to_string())?
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "no snapshot on store — boot seed missing".to_string())?;
-        tokio::time::timeout_at(
+        let current_authority = tokio::time::timeout_at(
             head_deadline,
-            audit_assignment_snapshot_authority_owned(
+            audit_assignment_snapshot_authority_outcome_owned(
                 Arc::clone(&store),
                 Arc::clone(&controller),
                 current.clone(),
@@ -2716,16 +3728,12 @@ fn try_rebalance_owned(
         )
         .await
         .map_err(|_| "durable assignment authority audit timed out".to_string())??;
-        if let Some(version) = reconcile_pending_recovery_decision_owned(
-            Arc::clone(&db),
-            Arc::clone(&store),
-            Arc::clone(&controller),
-            current.clone(),
-            config.checkpoint_timeout,
-        )
-        .await?
-        {
-            return Ok(Some(version));
+        // Materialization and predecessor settlement are separate durable operations. A leader
+        // may fail between them, so every later leader audit of a recovery-origin head retries the
+        // decision-only Abort even when this process has already installed that assignment.
+        if current_authority.is_recovery() {
+            abort_predecessor_checkpoint_for_recovery(&store, &controller, &current, head_deadline)
+                .await?;
         }
         let current_owners = current
             .to_vnode_vec(registry.vnode_count())
@@ -2748,6 +3756,40 @@ fn try_rebalance_owned(
             ));
         }
 
+        // A propagated pin means D(current + 1) is already durable while `current` remains the
+        // materialized assignment head. A faulted graph may cold-bootstrap directly from the
+        // pinned origin, and a process that already installed `current` may advance the decision.
+        // A healthy lagging process must install `current` first: materializing the successor here
+        // would skip its only exact live-transition edge and strand it behind the newer head.
+        let may_reconcile_propagated_successor = local_assignment.version() >= current.version
+            || DbState::load(&db.state) == DbState::Faulted;
+        if let Some(successor) = current_authority
+            .propagated_recovery_successor()
+            .filter(|_| may_reconcile_propagated_successor)
+        {
+            let expected_version = successor.assignment_version;
+            let materialized = reconcile_pending_recovery_decision_owned(
+                Arc::clone(&db),
+                Arc::clone(&store),
+                Arc::clone(&controller),
+                current.clone(),
+                config.checkpoint_timeout,
+            )
+            .await?
+            .ok_or_else(|| {
+                format!(
+                    "assignment {} propagated its checkpoint pin to missing recovery successor {expected_version}",
+                    current.version
+                )
+            })?;
+            if materialized != expected_version {
+                return Err(format!(
+                    "assignment {} propagated recovery materialized {materialized}, expected {expected_version}",
+                    current.version
+                ));
+            }
+            return Ok(Some(materialized));
+        }
         if current.draining {
             let prior_version = current.version.checked_sub(1).ok_or_else(|| {
                 "draining assignment has no prior committed generation".to_string()
@@ -2788,9 +3830,12 @@ fn try_rebalance_owned(
                 .to_vnode_vec(registry.vnode_count())
                 .map_err(|error| error.to_string())?;
             // The retained predecessor may name an owner process that died during the drain. Close
-            // intake before publishing the rollback; if its old roster is no longer live, it remains
-            // uncertified while the next audit rotates that dead stable owner from the committed cut.
-            close_local_assignment_authority(&db, Some(controller.as_ref()), head_deadline).await?;
+            // intake before publishing the rollback, but preserve its exact delivery domain: live
+            // finalization may yield to coordinated recovery, which must be able to recertify this
+            // same predecessor version before it can stop the owner-complete roster. A successful
+            // terminal adoption resets transport under the higher assignment version.
+            suspend_local_assignment_authority(&db, Some(controller.as_ref()), head_deadline)
+                .await?;
             return finalize_drain_snapshot(
                 &db,
                 &store,
@@ -2800,6 +3845,7 @@ fn try_rebalance_owned(
                 AssignmentDrainVerdict::Abort,
                 None,
                 config,
+                DrainFinalizationMode::Live,
             )
             .await;
         }
@@ -2839,6 +3885,24 @@ fn try_rebalance_owned(
         }
         let current_roster_is_live = successor_participants(&current_owners, &successor_processes)
             .is_ok_and(|participants| participants == current.participants);
+        if current.version > local_assignment.version()
+            && current_authority.is_recovery()
+            && assignment_binds_local_process(&current, &controller)?
+        {
+            prepare_recovery_assignment_adoption(&db, &store, &controller, &current, head_deadline)
+                .await?;
+            db.adopt_recovery_assignment_snapshot(current.clone(), head_deadline)
+                .await
+                .map_err(|error| error.to_string())?;
+            let reconciled_version = registry.assignment_version();
+            if reconciled_version < current.version {
+                return Err(format!(
+                    "durable recovery assignment {} was not adopted; local assignment remains {}",
+                    current.version, reconciled_version
+                ));
+            }
+            return Ok(Some(reconciled_version));
+        }
         if current.version > local_assignment.version() && current_roster_is_live {
             // A writer can fail after its durable CAS succeeds but before local adoption. Adopt
             // that exact live-process generation before planning another rotation. A replacement
@@ -2855,6 +3919,20 @@ fn try_rebalance_owned(
                 ));
             }
             return Ok(Some(reconciled_version));
+        }
+        // Reconcile a staged successor only after this process has installed the durable current
+        // generation. Otherwise a lagging v1 process could materialize v3 before adopting v2 and
+        // lose the exact-successor recovery path.
+        if let Some(version) = reconcile_pending_recovery_decision_owned(
+            Arc::clone(&db),
+            Arc::clone(&store),
+            Arc::clone(&controller),
+            current.clone(),
+            config.checkpoint_timeout,
+        )
+        .await?
+        {
+            return Ok(Some(version));
         }
         let mut new_assignment =
             rendezvous_assignment(registry.vnode_count(), &successors).to_vec();
@@ -2941,6 +4019,16 @@ fn audit_assignment_snapshot_authority_owned(
     })
 }
 
+fn audit_assignment_snapshot_authority_outcome_owned(
+    store: Arc<AssignmentSnapshotStore>,
+    controller: Arc<ClusterController>,
+    snapshot: AssignmentSnapshot,
+) -> futures::future::BoxFuture<'static, Result<AuditedAssignmentAuthority, String>> {
+    Box::pin(async move {
+        audit_assignment_snapshot_authority_outcome(&store, Some(&controller), &snapshot).await
+    })
+}
+
 fn reconcile_pending_recovery_decision_owned(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
@@ -2964,7 +4052,7 @@ fn authorize_recovery_successor_owned(
     reason: String,
 ) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
     Box::pin(async move {
-        authorize_recovery_successor(
+        let decision = authorize_recovery_successor(
             &db,
             &store,
             &controller,
@@ -2973,7 +4061,8 @@ fn authorize_recovery_successor_owned(
             operation_timeout,
             &reason,
         )
-        .await
+        .await?;
+        materialize_recovery_decision(&db, &store, &controller, decision, operation_timeout).await
     })
 }
 
@@ -3166,6 +4255,7 @@ pub(crate) async fn record_assignment_checkpoint_for_test(
         scope: CheckpointScope::Cluster,
         vnode_count: u16::try_from(fence.vnode_count).unwrap(),
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor,
         participants: fence
             .participants
@@ -3181,6 +4271,7 @@ pub(crate) async fn record_assignment_checkpoint_for_test(
         source_names: Vec::new(),
         source_offsets: Default::default(),
         channel_progress: Vec::new(),
+        source_watermarks: Default::default(),
         checkpoint_watermark: None,
     };
     admit_cluster_checkpoint_artifacts_for_test(authority, proof, &index).await;
@@ -3206,14 +4297,10 @@ async fn pre_rotation_checkpoint(
     transition: &AssignmentDrainTransition,
     config: RebalanceConfig,
 ) -> Result<CommittedCheckpointRef, String> {
-    let ckpt = tokio::time::timeout(config.checkpoint_timeout, db.checkpoint())
+    let deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+    let ckpt = db
+        .checkpoint_until(deadline)
         .await
-        .map_err(|_| {
-            format!(
-                "pre-rotation checkpoint did not complete within {}s",
-                config.checkpoint_timeout.as_secs()
-            )
-        })?
         .map_err(|e| e.to_string())?;
     if !ckpt.success {
         return Err(ckpt
@@ -3229,14 +4316,21 @@ async fn pre_rotation_checkpoint(
     let authority = controller
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
-    let outcome = tokio::time::timeout(
-        config.checkpoint_timeout,
-        authority.cluster_outcome(ckpt.epoch),
-    )
-    .await
-    .map_err(|_| "pre-rotation checkpoint authority read timed out".to_string())?
-    .map_err(|error| error.to_string())?
-    .ok_or_else(|| "pre-rotation checkpoint disappeared from cluster authority".to_string())?;
+    // The attempt is already terminal when `checkpoint_until` returns. Its private Abort/rollback
+    // or post-Commit continuation budget may legitimately finish after the admission deadline, so
+    // use a fresh bounded read window solely to verify the immutable terminal record. This cannot
+    // admit or mutate checkpoint work.
+    let verification_deadline = tokio::time::Instant::now()
+        .checked_add(config.checkpoint_timeout)
+        .ok_or_else(|| "pre-rotation checkpoint authority-read deadline overflowed".to_string())?;
+    let outcome =
+        tokio::time::timeout_at(verification_deadline, authority.cluster_outcome(ckpt.epoch))
+            .await
+            .map_err(|_| "pre-rotation checkpoint authority read timed out".to_string())?
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "pre-rotation checkpoint disappeared from cluster authority".to_string()
+            })?;
     if !outcome.is_commit()
         || outcome.epoch != ckpt.epoch
         || outcome.checkpoint_id != ckpt.checkpoint_id
@@ -3296,6 +4390,16 @@ fn assignment_binds_local_process(
 /// Settle a draining generation without changing the target version certified by source receipts.
 /// The terminal verdict first enters the shared leader/checkpoint authority sequence; the snapshot
 /// store then publishes that immutable verdict as the assignment materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainFinalizationMode {
+    Live,
+    /// Coordinated recovery has stopped this exact predecessor generation. Publish an Abort
+    /// rollback topology, but leave source resolution to the replacement generation's Release
+    /// reconciliation and topology adoption to the snapshot watcher. The caller holds the
+    /// assignment-adoption lock across this publication and its subsequent recovery decision.
+    StoppedRecovery,
+}
+
 async fn finalize_drain_snapshot(
     db: &Arc<LaminarDB>,
     store: &Arc<AssignmentSnapshotStore>,
@@ -3305,7 +4409,31 @@ async fn finalize_drain_snapshot(
     requested_verdict: AssignmentDrainVerdict,
     handoff_checkpoint: Option<CommittedCheckpointRef>,
     config: RebalanceConfig,
+    mode: DrainFinalizationMode,
 ) -> Result<Option<u64>, String> {
+    if mode == DrainFinalizationMode::StoppedRecovery
+        && (requested_verdict != AssignmentDrainVerdict::Abort || handoff_checkpoint.is_some())
+    {
+        return Err("stopped recovery may only finalize a source drain as Abort".into());
+    }
+    let finalization_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+    let finalization_guard = if mode == DrainFinalizationMode::Live {
+        let guard =
+            tokio::time::timeout_at(finalization_deadline, db.assignment_adoption_lock.lock())
+                .await
+                .map_err(|_| {
+                    "source-drain finalization timed out waiting for assignment serialization"
+                        .to_string()
+                })?;
+        if controller.is_recovering() {
+            return Err(
+                "live source-drain finalization yielded to coordinated recovery authority".into(),
+            );
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let transition = draining
         .drain_transition
         .as_ref()
@@ -3355,6 +4483,14 @@ async fn finalize_drain_snapshot(
             draining.version
         ));
     }
+    if mode == DrainFinalizationMode::StoppedRecovery
+        && decision.verdict != AssignmentDrainVerdict::Abort
+    {
+        return Err(format!(
+            "stopped recovery cannot materialize the {:?} authority winner for assignment {}; the round must yield",
+            decision.verdict, draining.version
+        ));
+    }
     let proposal = match decision.verdict {
         AssignmentDrainVerdict::Commit => draining
             .committed_target()
@@ -3383,9 +4519,14 @@ async fn finalize_drain_snapshot(
             durable.version
         ));
     }
+    // Durable terminalization is the only portion mutually exclusive with recovery target
+    // selection. Ordinary live adoption takes this same lock itself and therefore begins only
+    // after the authority decision and snapshot materialization are indivisible to recovery.
+    drop(finalization_guard);
 
     let version = durable.version;
-    if assignment_binds_local_process(&durable, controller)? {
+    if mode == DrainFinalizationMode::Live && assignment_binds_local_process(&durable, controller)?
+    {
         let adoption_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
         db.adopt_assignment_snapshot(durable, adoption_deadline)
             .await
@@ -3405,7 +4546,7 @@ async fn finalize_drain_snapshot(
             "materialized drain terminal names a predecessor process; local adoption waits for a recovery successor"
         );
     }
-    controller.publish_checkpoint_drain_transition(None);
+    clear_settled_source_drain(controller, transition)?;
     let oldest_retained = version.saturating_sub(1);
     match store.prune_before(oldest_retained).await {
         Ok(()) => {
@@ -3474,6 +4615,274 @@ pub(crate) async fn settle_source_drain_before_recovery(
         AssignmentDrainVerdict::Abort,
         None,
         config,
+        DrainFinalizationMode::Live,
+    )
+    .await
+}
+
+/// Settle an exact draining predecessor only after coordinated recovery has stopped its complete
+/// owner roster and reconciled every checkpoint artifact. A still-draining head is aborted; an
+/// already materialized exact terminal is reconciled idempotently. Its topology is published on
+/// this stopped generation, while source-task resolution is deliberately deferred until the fresh
+/// recovery round has rebuilt the source generation and reaches Release reconciliation.
+pub(crate) async fn settle_stopped_source_drain_after_recovery_quorum(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    expected_predecessor: &CheckpointAssignmentFence,
+    config: RebalanceConfig,
+) -> Result<Option<u64>, String> {
+    if DbState::load(&db.state) != DbState::Created
+        || !db.runtime_shutdown.read().is_cancelled()
+        || !db.cluster_intake_fenced()
+        || !db.coordinated_recovery_in_progress()
+        || !controller.is_recovering()
+        || !controller.process_lease_is_live()
+    {
+        return Err(
+            "stopped source-drain settlement requires the exact fenced Created recovery generation"
+                .into(),
+        );
+    }
+    if !expected_predecessor.is_canonical() {
+        return Err("stopped source-drain predecessor certificate is not canonical".into());
+    }
+    let store = db
+        .assignment_snapshot_store
+        .lock()
+        .clone()
+        .ok_or_else(|| "stopped source-drain settlement has no assignment store".to_string())?;
+    let deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+    let Some(draining) = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "stopped source-drain head read timed out".to_string())?
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("stopped source-drain settlement has no durable assignment head".into());
+    };
+    let target_version = expected_predecessor
+        .assignment_version
+        .checked_add(1)
+        .ok_or_else(|| "stopped source-drain assignment version overflow".to_string())?;
+    if !draining.draining {
+        if draining.version == expected_predecessor.assignment_version {
+            if draining
+                .assignment_fence()
+                .map_err(|error| error.to_string())?
+                != *expected_predecessor
+            {
+                return Err(
+                    "stable source-drain head does not match the stopped recovery predecessor"
+                        .into(),
+                );
+            }
+            tokio::time::timeout_at(
+                deadline,
+                audit_assignment_snapshot_authority_outcome(&store, Some(controller), &draining),
+            )
+            .await
+            .map_err(|_| {
+                "stopped source-drain predecessor authority audit timed out".to_string()
+            })??;
+            let confirmed = tokio::time::timeout_at(deadline, store.load())
+                .await
+                .map_err(|_| "stopped source-drain predecessor recheck timed out".to_string())?
+                .map_err(|error| error.to_string())?;
+            if confirmed.as_ref() != Some(&draining) {
+                return Err("stopped source-drain predecessor changed during audit".into());
+            }
+            return Ok(None);
+        }
+        if draining.version != target_version {
+            return Err(format!(
+                "stable assignment {} superseded stopped source-drain predecessor {}",
+                draining.version, expected_predecessor.assignment_version
+            ));
+        }
+        let audited = tokio::time::timeout_at(
+            deadline,
+            audit_assignment_snapshot_authority_outcome(&store, Some(controller), &draining),
+        )
+        .await
+        .map_err(|_| "stopped source-drain terminal authority audit timed out".to_string())??;
+        let terminal = audited.into_terminal().ok_or_else(|| {
+            format!(
+                "stable assignment {} is not an authority-sequenced drain terminal",
+                draining.version
+            )
+        })?;
+        if terminal.transition.predecessor != *expected_predecessor
+            || terminal.transition.target.assignment_version != target_version
+        {
+            return Err(format!(
+                "stable assignment {} is not an exact terminal for stopped predecessor {}",
+                draining.version, expected_predecessor.assignment_version
+            ));
+        }
+        let target_fence = draining
+            .assignment_fence()
+            .map_err(|error| error.to_string())?;
+        let predecessor = tokio::time::timeout_at(
+            deadline,
+            store.load_version(expected_predecessor.assignment_version),
+        )
+        .await
+        .map_err(|_| "stopped source-drain predecessor read timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "source-drain predecessor assignment {} is unavailable after stop quorum",
+                expected_predecessor.assignment_version
+            )
+        })?;
+        if predecessor.draining
+            || predecessor
+                .assignment_fence()
+                .map_err(|error| error.to_string())?
+                != *expected_predecessor
+        {
+            return Err("stable source-drain terminal lost its frozen predecessor".into());
+        }
+        let commit_pin = if terminal.is_abort() {
+            if draining.vnodes != predecessor.vnodes
+                || draining.participants != predecessor.participants
+                || target_fence.assignment_version != target_version
+                || target_fence.partitioning_abi_version
+                    != expected_predecessor.partitioning_abi_version
+                || target_fence.vnode_count != expected_predecessor.vnode_count
+                || target_fence.assignment_digest != expected_predecessor.assignment_digest
+                || target_fence.participants != expected_predecessor.participants
+            {
+                return Err(
+                    "stable source-drain Abort does not retain the exact stopped predecessor topology"
+                        .into(),
+                );
+            }
+            None
+        } else if terminal.is_commit() {
+            if target_fence != terminal.transition.target {
+                return Err(
+                    "stable source-drain Commit does not materialize its exact target fence".into(),
+                );
+            }
+            let handoff = terminal
+                .committed_handoff_checkpoint()
+                .cloned()
+                .ok_or_else(|| {
+                    "stable source-drain Commit has no exact handoff checkpoint".to_string()
+                })?;
+            let authority = controller
+                .checkpoint_authority()
+                .map_err(|error| error.to_string())?;
+            let pinned = tokio::time::timeout_at(
+                deadline,
+                authority.assignment_handoff_checkpoint(&target_fence),
+            )
+            .await
+            .map_err(|_| "stopped source-drain Commit handoff-pin read timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+            if pinned.as_ref() != Some(&handoff) {
+                return Err(
+                    "stable source-drain Commit no longer retains its exact active handoff checkpoint pin"
+                        .into(),
+                );
+            }
+            Some((authority, handoff))
+        } else {
+            return Err("stable source-drain terminal has no supported verdict".into());
+        };
+        let confirmed = tokio::time::timeout_at(deadline, store.load())
+            .await
+            .map_err(|_| "stopped source-drain terminal recheck timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+        if confirmed.as_ref() != Some(&draining) {
+            return Err("stopped source-drain terminal changed during reconciliation".into());
+        }
+        let confirmed_authority = tokio::time::timeout_at(
+            deadline,
+            audit_assignment_snapshot_authority_outcome(&store, Some(controller), &draining),
+        )
+        .await
+        .map_err(|_| "stopped source-drain terminal authority recheck timed out".to_string())??;
+        if confirmed_authority.into_terminal().as_ref() != Some(&terminal) {
+            return Err(
+                "stopped source-drain terminal authority changed during reconciliation".into(),
+            );
+        }
+        if let Some((authority, handoff)) = commit_pin {
+            let confirmed_pin = tokio::time::timeout_at(
+                deadline,
+                authority.assignment_handoff_checkpoint(&target_fence),
+            )
+            .await
+            .map_err(|_| "stopped source-drain Commit handoff-pin recheck timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+            if confirmed_pin.as_ref() != Some(&handoff) {
+                return Err(
+                    "stable source-drain Commit handoff pin changed during reconciliation".into(),
+                );
+            }
+        }
+        clear_settled_source_drain(controller, &terminal.transition)?;
+        return Ok(Some(target_version));
+    }
+    let transition = draining
+        .drain_transition
+        .as_ref()
+        .ok_or_else(|| "draining assignment has no exact source transition".to_string())?;
+    if transition.predecessor != *expected_predecessor
+        || transition.target.assignment_version != target_version
+        || draining.version != transition.target.assignment_version
+    {
+        return Err(format!(
+            "draining assignment {} does not bind the stopped recovery predecessor {}",
+            draining.version, expected_predecessor.assignment_version
+        ));
+    }
+    if controller
+        .checkpoint_drain_transition()
+        .as_ref()
+        .is_some_and(|published| published != transition)
+    {
+        return Err("durable and locally published source-drain transitions differ".into());
+    }
+    let predecessor = tokio::time::timeout_at(
+        deadline,
+        store.load_version(expected_predecessor.assignment_version),
+    )
+    .await
+    .map_err(|_| "stopped source-drain predecessor read timed out".to_string())?
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| {
+        format!(
+            "source-drain predecessor assignment {} is unavailable after stop quorum",
+            expected_predecessor.assignment_version
+        )
+    })?;
+    if predecessor.draining
+        || predecessor
+            .assignment_fence()
+            .map_err(|error| error.to_string())?
+            != *expected_predecessor
+    {
+        return Err("stopped source-drain predecessor no longer matches the frozen round".into());
+    }
+    let confirmed = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "stopped source-drain head recheck timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    if confirmed.as_ref() != Some(&draining) {
+        return Err("stopped source-drain head changed during settlement".into());
+    }
+    finalize_drain_snapshot(
+        db,
+        &store,
+        controller,
+        &draining,
+        &predecessor,
+        AssignmentDrainVerdict::Abort,
+        None,
+        config,
+        DrainFinalizationMode::StoppedRecovery,
     )
     .await
 }
@@ -3486,14 +4895,19 @@ async fn adopt_any(
     snap: AssignmentSnapshot,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
-    tokio::time::timeout_at(
+    let audited = tokio::time::timeout_at(
         deadline,
-        audit_assignment_snapshot_authority(store, Some(controller), &snap),
+        audit_assignment_snapshot_authority_outcome(store, Some(controller), &snap),
     )
     .await
     .map_err(|_| format!("assignment {} authority audit timed out", snap.version))??;
     if snap.draining {
         db.validate_source_drain_snapshot(&snap)
+            .map_err(|error| error.to_string())?;
+    } else if audited.is_recovery() {
+        prepare_recovery_assignment_adoption(db, store, controller, &snap, deadline).await?;
+        db.adopt_recovery_assignment_snapshot(snap, deadline)
+            .await
             .map_err(|error| error.to_string())?;
     } else {
         db.adopt_assignment_snapshot(snap, deadline)

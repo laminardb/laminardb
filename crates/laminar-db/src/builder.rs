@@ -1041,7 +1041,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_node_data_budget_is_resolved() {
-        for max_node_data_bytes in [17, isize::MAX as u64, (isize::MAX as u64) + 1] {
+        for max_node_data_bytes in [17, isize::MAX as u64] {
             let directory = tempfile::tempdir().unwrap();
             let db = LaminarDbBuilder::new()
                 .storage_dir(directory.path())
@@ -1061,6 +1061,23 @@ mod tests {
                 Some(max_node_data_bytes)
             );
         }
+
+        let directory = tempfile::tempdir().unwrap();
+        let error = LaminarDbBuilder::new()
+            .storage_dir(directory.path())
+            .checkpoint(StreamCheckpointConfig {
+                max_node_data_bytes: Some((isize::MAX as u64) + 1),
+                ..StreamCheckpointConfig::default()
+            })
+            .build()
+            .await
+            .expect_err("an allocation-unrepresentable checkpoint budget must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds this process address space"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -41,12 +41,14 @@ const MAX_DRAIN_ACK_BYTES: usize = 1_024;
 const MAX_RELEASE_READY_ACK_BYTES: usize = 1_024;
 const CONTROL_ROSTER_IO_CONCURRENCY: usize = 32;
 const PENDING_RELEASE_FAULT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(feature = "cluster")]
+const CHECKPOINT_PREPARE_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "cluster")]
 struct LeaderLeaseGate {
     lease: watch::Receiver<Option<super::LeaderLease>>,
     owner: super::LeaderLeaseOwner,
-    deadline: Arc<super::LeaseDeadline>,
+    deadline: watch::Receiver<Arc<super::LeaseDeadline>>,
 }
 
 /// One authority-validated clustered `Prepare` and its local assignment disposition.
@@ -104,6 +106,40 @@ pub struct RecoveryFault {
     pub reporter: NodeId,
     /// Nonzero globally monotonic authority sequence observed by the recovery driver.
     pub sequence: u64,
+    /// Whether automatic recovery may consume this fault.
+    #[serde(
+        default,
+        skip_serializing_if = "RecoveryFaultDisposition::is_recoverable"
+    )]
+    pub disposition: RecoveryFaultDisposition,
+}
+
+/// Durable recovery policy attached to one fault authority slot.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryFaultDisposition {
+    /// A coordinated rewind may consume the fault after a committed Release.
+    #[default]
+    Recoverable,
+    /// The failure is deterministic and must remain fenced until an operator replaces the
+    /// cluster authority namespace. Automatic recovery must never consume or downgrade it.
+    Terminal,
+}
+
+impl RecoveryFaultDisposition {
+    /// Whether the legacy automatic-recovery policy is in effect.
+    #[must_use]
+    pub const fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Recoverable)
+    }
+}
+
+impl RecoveryFault {
+    /// Whether this fault permanently disables automatic recovery.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self.disposition, RecoveryFaultDisposition::Terminal)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -128,6 +164,9 @@ pub enum RecoveryFaultReportOutcome {
     AlreadyCleared,
     /// A newer request from the same process already superseded this request.
     CoveredByNewerRequest,
+    /// A durable terminal fault already owns this stable-node slot. The attempted request was not
+    /// admitted and automatic recovery remains permanently fenced.
+    TerminalFenceActive,
 }
 
 impl RecoveryFaultRequest {
@@ -168,6 +207,12 @@ impl RecoveryFaultInventory {
     #[must_use]
     pub fn faults(&self) -> &[RecoveryFault] {
         &self.faults
+    }
+
+    /// Whether automatic recovery is durably disabled by any active report.
+    #[must_use]
+    pub fn has_terminal_fault(&self) -> bool {
+        self.faults.iter().copied().any(RecoveryFault::is_terminal)
     }
 }
 
@@ -240,6 +285,12 @@ impl RecoveryRound {
             .iter()
             .map(|participant| NodeId(participant.node_id))
             .collect()
+    }
+
+    /// Whether this round carries a fault that automatic recovery must not consume.
+    #[must_use]
+    pub fn has_terminal_fault(&self) -> bool {
+        self.faults.iter().copied().any(RecoveryFault::is_terminal)
     }
 
     /// Frozen assignment-owner boot identity for `node`.
@@ -419,6 +470,9 @@ pub struct RecoveryAnnouncement {
 impl RecoveryAnnouncement {
     pub(crate) fn validate(&self) -> Result<(), String> {
         self.round.validate()?;
+        if self.round.has_terminal_fault() && self.phase != RecoverPhase::Prepare {
+            return Err("a terminal recovery fault may only be retained in Prepare".into());
+        }
         let encoded = serde_json::to_vec(self)
             .map_err(|error| format!("could not encode recovery announcement: {error}"))?;
         validate_recovery_announcement_size(encoded.len())
@@ -860,7 +914,7 @@ fn validate_recovery_announcement_size(encoded_len: usize) -> Result<(), String>
 }
 
 fn encode_recovery_announcement(announcement: &RecoveryAnnouncement) -> Result<String, String> {
-    announcement.round.validate()?;
+    announcement.validate()?;
     let encoded = serde_json::to_string(announcement)
         .map_err(|error| format!("could not encode recovery announcement: {error}"))?;
     validate_recovery_announcement_size(encoded.len())?;
@@ -1035,6 +1089,14 @@ pub struct ClusterController {
     /// Recovery-safe cluster watermark installed after an immutable Commit outcome or from a
     /// validated committed checkpoint. `i64::MIN` = uninitialised.
     cluster_min_watermark: Arc<AtomicI64>,
+    /// Source-keyed decision frontiers installed from the same immutable committed channel cut.
+    /// A temporal operator consumes these instead of the pipeline-wide minimum so an unrelated
+    /// slow source cannot regress restored source-specific progress.
+    committed_source_watermarks: parking_lot::RwLock<Arc<rustc_hash::FxHashMap<String, i64>>>,
+    /// Serialises monotonic live publication with the exact replacement performed while recovery
+    /// owns the pipeline fence. Without this lock, a recovering process could replace a stale cut
+    /// while an in-flight normal publication concurrently reinstalls it.
+    committed_watermark_publication: parking_lot::Mutex<()>,
     /// While draining, the node excludes itself from [`Self::assignable_instances`] so the
     /// next rotation sheds its vnodes before it exits.
     draining: Arc<AtomicBool>,
@@ -1152,6 +1214,10 @@ impl ClusterController {
             recovery_process_term: AtomicU64::new(0),
             recovery_fault_request_sequence: AtomicU64::new(1),
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
+            committed_source_watermarks: parking_lot::RwLock::new(Arc::new(
+                rustc_hash::FxHashMap::default(),
+            )),
+            committed_watermark_publication: parking_lot::Mutex::new(()),
             draining: Arc::new(AtomicBool::new(false)),
             recovering: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
@@ -1218,6 +1284,11 @@ impl ClusterController {
     /// Mirror the leader's computed cluster-min watermark into the atomic so its own operators
     /// match followers. Monotonic — never lowers the published value.
     pub fn publish_cluster_min_watermark(&self, wm: i64) {
+        let _publication = self.committed_watermark_publication.lock();
+        self.publish_cluster_min_watermark_locked(wm);
+    }
+
+    fn publish_cluster_min_watermark_locked(&self, wm: i64) {
         let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
         while wm > cur {
             match self.cluster_min_watermark.compare_exchange(
@@ -1230,6 +1301,126 @@ impl ClusterController {
                 Err(observed) => cur = observed,
             }
         }
+    }
+
+    /// Pin one internally consistent source-frontier snapshot for a compute cycle.
+    #[must_use]
+    pub fn committed_source_watermarks_snapshot(&self) -> Arc<rustc_hash::FxHashMap<String, i64>> {
+        let snapshot = self.committed_source_watermarks.read();
+        Arc::clone(&snapshot)
+    }
+
+    /// Install both scalar and source-keyed frontiers from one immutable committed channel cut.
+    ///
+    /// Publication is monotonic per source, matching [`Self::publish_cluster_min_watermark`]. A
+    /// source withheld by an active uninitialized channel remains unpublished until a later
+    /// committed cut initializes it.
+    ///
+    /// # Errors
+    /// Returns an error when the committed channel cut contains an invalid watermark sentinel.
+    pub fn publish_committed_channel_progress(
+        &self,
+        channels: &[crate::checkpoint::ChannelProgress],
+    ) -> Result<(), String> {
+        let source_watermarks = crate::checkpoint::channel_progress_frontiers_by_source(channels)?
+            .into_iter()
+            .filter_map(|(source, frontier)| frontier.map(|frontier| (source.to_owned(), frontier)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        self.publish_committed_checkpoint_progress(channels, &source_watermarks)
+    }
+
+    /// Install scalar and source-keyed frontiers from one committed checkpoint index.
+    ///
+    /// The explicit source map retains decisions for a source whose physical channel inventory is
+    /// empty in this cut. Publication remains monotonic so an older observer cannot regress a
+    /// newer installed decision.
+    ///
+    /// # Errors
+    /// Returns an error when channel progress or an explicit source watermark is invalid or the
+    /// explicit map disagrees with an initialized channel cut.
+    pub fn publish_committed_checkpoint_progress(
+        &self,
+        channels: &[crate::checkpoint::ChannelProgress],
+        source_watermarks: &std::collections::BTreeMap<String, i64>,
+    ) -> Result<(), String> {
+        let cluster_min = crate::checkpoint::channel_progress_frontier(channels)?;
+        let current = crate::checkpoint::channel_progress_frontiers_by_source(channels)?;
+        if source_watermarks
+            .values()
+            .any(|watermark| *watermark == i64::MIN)
+        {
+            return Err("committed source watermark uses the reserved uninitialized value".into());
+        }
+        for (source, frontier) in current {
+            let Some(frontier) = frontier else {
+                continue;
+            };
+            if source_watermarks.get(source) != Some(&frontier) {
+                return Err(format!(
+                    "committed source watermark '{source}' disagrees with channel progress"
+                ));
+            }
+        }
+        let _publication = self.committed_watermark_publication.lock();
+        {
+            let mut published = self.committed_source_watermarks.write();
+            let published = Arc::make_mut(&mut *published);
+            for (source_name, frontier) in source_watermarks {
+                published
+                    .entry(source_name.clone())
+                    .and_modify(|current| *current = (*current).max(*frontier))
+                    .or_insert(*frontier);
+            }
+        }
+        if let Some(cluster_min) = cluster_min {
+            self.publish_cluster_min_watermark_locked(cluster_min);
+        }
+        Ok(())
+    }
+
+    /// Replace the process-local committed frontier snapshot with one recovered exact cut.
+    ///
+    /// Unlike live publication, recovery may deliberately rewind to an older checkpoint or to
+    /// genesis. The caller must hold the pipeline recovery/intake fence; this method serialises
+    /// against any in-flight live publication and atomically establishes the new logical baseline
+    /// before intake is reopened.
+    ///
+    /// # Errors
+    /// Returns an error when channel progress or an explicit source watermark is invalid or the
+    /// explicit map disagrees with an initialized channel cut.
+    pub fn replace_recovered_checkpoint_progress(
+        &self,
+        channels: &[crate::checkpoint::ChannelProgress],
+        source_watermarks: &std::collections::BTreeMap<String, i64>,
+    ) -> Result<(), String> {
+        let cluster_min = crate::checkpoint::channel_progress_frontier(channels)?;
+        let current = crate::checkpoint::channel_progress_frontiers_by_source(channels)?;
+        if source_watermarks
+            .values()
+            .any(|watermark| *watermark == i64::MIN)
+        {
+            return Err("committed source watermark uses the reserved uninitialized value".into());
+        }
+        for (source, frontier) in current {
+            let Some(frontier) = frontier else {
+                continue;
+            };
+            if source_watermarks.get(source) != Some(&frontier) {
+                return Err(format!(
+                    "committed source watermark '{source}' disagrees with channel progress"
+                ));
+            }
+        }
+
+        let replacement = source_watermarks
+            .iter()
+            .map(|(source, watermark)| (source.clone(), *watermark))
+            .collect::<rustc_hash::FxHashMap<_, _>>();
+        let _publication = self.committed_watermark_publication.lock();
+        *self.committed_source_watermarks.write() = Arc::new(replacement);
+        self.cluster_min_watermark
+            .store(cluster_min.unwrap_or(i64::MIN), Ordering::Release);
+        Ok(())
     }
 
     /// This instance's ID.
@@ -1307,11 +1498,9 @@ impl ClusterController {
         }
         #[cfg(feature = "cluster")]
         if let Some(gate) = self.leader_lease.get() {
-            return super::lease_grants_leadership(
-                &gate.lease.borrow(),
-                &gate.owner,
-                &gate.deadline,
-            );
+            let lease = gate.lease.borrow();
+            let deadline = gate.deadline.borrow().clone();
+            return super::lease_grants_leadership(&lease, &gate.owner, &deadline);
         }
         true
     }
@@ -1349,7 +1538,8 @@ impl ClusterController {
         }
         let gate = self.leader_lease.get()?;
         let lease = gate.lease.borrow();
-        if !super::lease_grants_leadership(&lease, &gate.owner, &gate.deadline) {
+        let deadline = gate.deadline.borrow().clone();
+        if !super::lease_grants_leadership(&lease, &gate.owner, &deadline) {
             return None;
         }
         lease.as_ref().map(super::LeaderLease::proof)
@@ -1365,7 +1555,9 @@ impl ClusterController {
         let Some(gate) = self.leader_lease.get() else {
             return false;
         };
-        super::lease_grants_proof(&gate.lease.borrow(), &gate.owner, &gate.deadline, proof)
+        let lease = gate.lease.borrow();
+        let deadline = gate.deadline.borrow().clone();
+        super::lease_grants_proof(&lease, &gate.owner, &deadline, proof)
     }
 
     /// Capture the durable leader grant while forming a cluster with no active member.
@@ -1381,7 +1573,8 @@ impl ClusterController {
         }
         let gate = self.leader_lease.get()?;
         let lease = gate.lease.borrow();
-        if !super::lease_grants_leadership(&lease, &gate.owner, &gate.deadline) {
+        let deadline = gate.deadline.borrow().clone();
+        if !super::lease_grants_leadership(&lease, &gate.owner, &deadline) {
             return None;
         }
         lease.as_ref().map(super::LeaderLease::proof)
@@ -1397,7 +1590,9 @@ impl ClusterController {
         let Some(gate) = self.leader_lease.get() else {
             return false;
         };
-        super::lease_grants_proof(&gate.lease.borrow(), &gate.owner, &gate.deadline, proof)
+        let lease = gate.lease.borrow();
+        let deadline = gate.deadline.borrow().clone();
+        super::lease_grants_proof(&lease, &gate.owner, &deadline, proof)
     }
 
     /// Subscribe to leader-grant changes for evented proof cancellation.
@@ -1420,7 +1615,11 @@ impl ClusterController {
                 .is_some_and(|deadline| deadline.is_live())
     }
 
-    /// Wire the exact owner and local deadline used to fence leader work.
+    /// Wire the exact owner and one fixed local deadline used to fence leader work.
+    ///
+    /// This compatibility seam is intended for fixed-generation tests and externally managed
+    /// grants. A running [`super::LeaderLeaseManager`] must use
+    /// [`Self::set_leader_lease_runtime_watches`] so deadline rotation remains visible.
     ///
     /// # Errors
     /// Rejects an owner for another node or duplicate installation.
@@ -1430,6 +1629,25 @@ impl ClusterController {
         lease: watch::Receiver<Option<super::LeaderLease>>,
         owner: super::LeaderLeaseOwner,
         deadline: Arc<super::LeaseDeadline>,
+    ) -> Result<(), String> {
+        let (_deadline_tx, deadline) = watch::channel(deadline);
+        self.set_leader_lease_runtime_watches(lease, owner, deadline)
+    }
+
+    /// Wire the exact owner and generation-scoped local deadlines used to fence leader work.
+    ///
+    /// Readers hold the lease observation while sampling its deadline generation. The manager
+    /// fences the old deadline, withdraws the old lease, then publishes the next deadline, so a
+    /// stale lease can never be paired with a later live generation.
+    ///
+    /// # Errors
+    /// Rejects an owner for another node or duplicate installation.
+    #[cfg(feature = "cluster")]
+    pub fn set_leader_lease_runtime_watches(
+        &self,
+        lease: watch::Receiver<Option<super::LeaderLease>>,
+        owner: super::LeaderLeaseOwner,
+        deadline: watch::Receiver<Arc<super::LeaseDeadline>>,
     ) -> Result<(), String> {
         if owner.node != self.instance_id || owner.boot.is_nil() || owner.process_term == 0 {
             return Err("leader lease owner does not match this process".into());
@@ -1800,6 +2018,27 @@ impl ClusterController {
         let mut changed = false;
         for p in peers {
             changed |= map.remove(&p.0).is_some();
+        }
+        drop(map);
+        if changed {
+            self.notify_leader_eligibility_change();
+        }
+    }
+
+    /// Clear capture-quorum quarantine only for exact process boots that acknowledged a validated
+    /// recovery stop round. Entries without a recorded boot, or for a different boot, remain
+    /// quarantined. The caller must supply publishers from one complete, exact stopped quorum.
+    pub fn note_recovery_responsive(&self, participants: &[CheckpointParticipant]) {
+        let mut map = self.unresponsive.lock();
+        let mut changed = false;
+        for participant in participants {
+            let exact = matches!(
+                map.get(&participant.node_id),
+                Some(Some(failed_boot)) if *failed_boot == participant.boot_incarnation
+            );
+            if exact {
+                changed |= map.remove(&participant.node_id).is_some();
+            }
         }
         drop(map);
         if changed {
@@ -2581,6 +2820,30 @@ impl ClusterController {
         &self,
         request: RecoveryFaultRequest,
     ) -> Result<RecoveryFaultReportOutcome, String> {
+        self.report_fault_with_disposition(request, RecoveryFaultDisposition::Recoverable)
+            .await
+    }
+
+    /// Publish a deterministic fault that automatic recovery must never consume.
+    ///
+    /// The durable marker cannot be downgraded by a later process or ordinary fault report. The
+    /// current operational reset boundary is replacement of the cluster authority namespace.
+    ///
+    /// # Errors
+    /// Fails when the process lease is stale or the request cannot be ordered in shared authority.
+    pub async fn report_terminal_fault(
+        &self,
+        request: RecoveryFaultRequest,
+    ) -> Result<RecoveryFaultReportOutcome, String> {
+        self.report_fault_with_disposition(request, RecoveryFaultDisposition::Terminal)
+            .await
+    }
+
+    async fn report_fault_with_disposition(
+        &self,
+        request: RecoveryFaultRequest,
+        disposition: RecoveryFaultDisposition,
+    ) -> Result<RecoveryFaultReportOutcome, String> {
         let seq = request.sequence();
         let _guard = self.recovery_writes.lock().await;
         let publisher = self.recovery_fault_publisher()?;
@@ -2594,9 +2857,10 @@ impl ClusterController {
         let authority = self
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        let result = Box::pin(authority.record_recovery_fault(publisher, seq))
-            .await
-            .map_err(|error| RecoveryControlError::from_authority(error).to_string())?;
+        let result =
+            Box::pin(authority.record_recovery_fault_with_disposition(publisher, seq, disposition))
+                .await
+                .map_err(|error| RecoveryControlError::from_authority(error).to_string())?;
         if !self
             .recovery_fault_publisher_is_current(publisher)
             .await
@@ -2613,6 +2877,9 @@ impl ClusterController {
             }
             super::leader_lease::RecordRecoveryFaultResult::CoveredByNewerRequest => {
                 Ok(RecoveryFaultReportOutcome::CoveredByNewerRequest)
+            }
+            super::leader_lease::RecordRecoveryFaultResult::TerminalFenceActive => {
+                Ok(RecoveryFaultReportOutcome::TerminalFenceActive)
             }
             super::leader_lease::RecordRecoveryFaultResult::Superseded => {
                 Err("recovery fault request was superseded by a newer local process".into())
@@ -2677,12 +2944,24 @@ impl ClusterController {
         &self,
     ) -> Result<Option<u64>, RecoveryControlError> {
         Ok(self
+            .read_local_recovery_fault_control()
+            .await?
+            .map(|fault| fault.sequence))
+    }
+
+    /// This stable node's complete active durable fault, including its terminal disposition.
+    ///
+    /// # Errors
+    /// Returns an error when shared authority is unavailable or malformed.
+    pub async fn read_local_recovery_fault_control(
+        &self,
+    ) -> Result<Option<RecoveryFault>, RecoveryControlError> {
+        Ok(self
             .read_recovery_fault_inventory_control()
             .await?
             .faults
             .into_iter()
-            .find(|fault| fault.reporter == self.instance_id)
-            .map(|fault| fault.sequence))
+            .find(|fault| fault.reporter == self.instance_id))
     }
 
     /// This process's durable nonzero fault report with a display-stable error.
@@ -3024,14 +3303,16 @@ impl ClusterController {
     }
 
     /// Whether every process in the exact frozen assignment roster durably acknowledged the same
-    /// certificate and still owns its certified boot identity.
+    /// certificate and the transition remains the exact unfinalized durable assignment head.
     ///
     /// Records from nodes outside `fence` are ignored because durable per-node slots can outlive
     /// membership. A missing or different-version record never contributes to quorum.
     ///
     /// # Errors
-    /// Fails closed when the certificate, current boot roster, durable scan, or an expected
-    /// participant's record is malformed.
+    /// Fails closed when the certificate, current boot roster, assignment head, terminal decision,
+    /// durable scan, or an expected participant's record is malformed or unavailable. A
+    /// controller without a configured assignment store returns `Ok(false)` while a drain is
+    /// active.
     pub async fn drain_ack_quorum_reached(
         &self,
         transition: &AssignmentDrainTransition,
@@ -3080,15 +3361,54 @@ impl ClusterController {
         if matching != expected {
             return Ok(false);
         }
+        // A complete receipt roster is not itself permission to publish a handoff checkpoint.
+        // The drain may already have been terminalized (or a newer assignment may have become
+        // the durable head) while those immutable per-process receipts remain visible.
+        let Some(snapshot_store) = self.snapshot.as_ref() else {
+            return Ok(false);
+        };
+        let Some(head) = snapshot_store
+            .load()
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        if !head.draining
+            || head.drain_transition.as_ref() != Some(transition)
+            || head.assignment_fence().map_err(|error| error.to_string())? != transition.target
+        {
+            return Ok(false);
+        }
         // Close the read/read race: a process can restart after the first incarnation scan but
-        // before its old acknowledgement is observed. Revalidate after the exact ack cut.
-        Ok(self
+        // before its old acknowledgement is observed. The drain head can likewise be finalized
+        // during the durable reads. Revalidate all process-local authority after the exact cut;
+        // callers retain the transition and perform their own post-I/O check before publication.
+        if self
             .recovery_participant_incarnations(&transition.predecessor.participant_ids())
             .await?
-            == transition.predecessor.participants
-            && self
+            != transition.predecessor.participants
+            || !self
                 .drain_transition_authority_is_current(transition)
-                .await?)
+                .await?
+        {
+            return Ok(false);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        if authority
+            .assignment_drain_decision(transition.target.assignment_version)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        Ok(
+            self.checkpoint_drain_transition.borrow().as_ref() == Some(transition)
+                && self.process_lease_is_live(),
+        )
     }
 
     /// Publish and exactly read back this process's adopted assignment map.
@@ -3499,6 +3819,27 @@ impl ClusterController {
         self.barrier.announce_prepare(ann, quorum_window).await
     }
 
+    /// Leader-side Prepare publication whose fan-out is fenced by the exact attempt deadline.
+    /// The retry window remains independent so a long checkpoint timeout does not create long
+    /// individual RPC attempts.
+    ///
+    /// # Errors
+    /// Propagates process-lease and [`BarrierCoordinator::announce_prepare_until`] errors.
+    #[cfg(feature = "cluster")]
+    pub async fn announce_prepare_barrier_until(
+        &self,
+        ann: &BarrierAnnouncement,
+        attempt_deadline: tokio::time::Instant,
+        retry_window: Duration,
+    ) -> Result<(), String> {
+        if !self.process_lease_is_live() {
+            return Err("stable node process lease is no longer live".into());
+        }
+        self.barrier
+            .announce_prepare_until(ann, attempt_deadline, retry_window)
+            .await
+    }
+
     /// Observe the merged barrier history, validating durable authority only when `predicate`
     /// selects the announcement. Malformed or conflicting histories fail before filtering.
     ///
@@ -3525,8 +3866,7 @@ impl ClusterController {
         Ok(Some(announcement))
     }
 
-    /// Observe a clustered `Prepare`, validate its leader with one durable-authority read, and
-    /// report the local assignment disposition without consulting authority again.
+    /// Observe a clustered `Prepare` with a bounded compatibility timeout.
     ///
     /// # Errors
     /// Rejects missing, stale, or conflicting authority and assignment certificates.
@@ -3534,18 +3874,66 @@ impl ClusterController {
     pub async fn observe_checkpoint_prepare(
         &self,
     ) -> Result<Option<CheckpointPrepareObservation>, String> {
+        self.observe_checkpoint_prepare_until(CHECKPOINT_PREPARE_OBSERVATION_TIMEOUT)
+            .await
+    }
+
+    /// Observe a clustered `Prepare`, validate its leader with one durable-authority read, and
+    /// report the local assignment disposition without consulting authority again. Hint I/O is
+    /// bounded by the caller's budget. Once an exact Prepare is decoded, authority validation uses
+    /// the earlier of its same-identity direct receipt or stable first gossip observation, which
+    /// retries cannot refresh. An unrelated stale direct Prepare never shortens the observation
+    /// window for a newer gossip-only attempt.
+    ///
+    /// # Errors
+    /// Rejects a zero or overflowing timeout, observation/authority timeout, or missing, stale,
+    /// conflicting authority and assignment certificates.
+    #[cfg(feature = "cluster")]
+    pub async fn observe_checkpoint_prepare_until(
+        &self,
+        checkpoint_timeout: Duration,
+    ) -> Result<Option<CheckpointPrepareObservation>, String> {
+        if checkpoint_timeout.is_zero() {
+            return Err("checkpoint Prepare observation timeout must be greater than zero".into());
+        }
         let Some(leader) = self.current_leader() else {
             return Ok(None);
         };
-        let Some(announcement) = self.barrier.observe_hint(leader).await? else {
+        let observation_started = tokio::time::Instant::now();
+        let observation_deadline = observation_started
+            .checked_add(checkpoint_timeout)
+            .ok_or_else(|| "checkpoint Prepare observation deadline overflowed".to_string())?;
+        if tokio::time::Instant::now() >= observation_deadline {
+            return Err("checkpoint Prepare observation deadline already elapsed".into());
+        }
+        let Some(announcement) =
+            tokio::time::timeout_at(observation_deadline, self.barrier.observe_hint(leader))
+                .await
+                .map_err(|_| "checkpoint Prepare hint observation timed out".to_string())??
+        else {
             return Ok(None);
         };
         if announcement.phase != super::Phase::Prepare {
             return Ok(None);
         }
-        self.barrier
-            .validate_checkpoint_prepare(&announcement)
-            .await?;
+        let received_at = self
+            .barrier
+            .prepare_received_at_or_insert(&announcement, observation_started.into_std())
+            .ok_or_else(|| "checkpoint Prepare lost its exact observation clock".to_string())?;
+        let attempt_deadline = tokio::time::Instant::from_std(received_at)
+            .checked_add(checkpoint_timeout)
+            .ok_or_else(|| "checkpoint Prepare attempt deadline overflowed".to_string())?;
+        if tokio::time::Instant::now() >= attempt_deadline {
+            return Err(
+                "checkpoint Prepare attempt deadline elapsed before authority validation".into(),
+            );
+        }
+        tokio::time::timeout_at(
+            attempt_deadline,
+            self.barrier.validate_checkpoint_prepare(&announcement),
+        )
+        .await
+        .map_err(|_| "checkpoint Prepare authority validation timed out".to_string())??;
         let proof = announcement
             .leader_proof
             .as_ref()
@@ -3601,7 +3989,7 @@ impl ClusterController {
         self.barrier.announcement_watch()
     }
 
-    /// Local monotonic receipt time for this exact direct Prepare, if gRPC delivered it.
+    /// Stable local monotonic receipt or first-observation time for this exact Prepare.
     #[must_use]
     pub fn checkpoint_prepare_received_at(
         &self,
@@ -3663,7 +4051,15 @@ impl ClusterController {
         }
     }
 
-    async fn require_recovery_driver_proof_control(
+    /// Audit that this process still owns the recovery round's exact local and durable leader
+    /// proof. A same-node fencing-term rotation is supersession just like a driver transfer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryControlError::Superseded`] when the exact proof is no longer current,
+    /// [`RecoveryControlError::Uncertain`] for retryable authority I/O, and
+    /// [`RecoveryControlError::Conflict`] for unavailable or invalid authority state.
+    pub async fn audit_recovery_driver_proof(
         &self,
         round: &RecoveryRound,
         boundary: &str,
@@ -3683,6 +4079,11 @@ impl ClusterController {
         if !current.is_some_and(|lease| lease.matches_proof(&round.leader_proof)) {
             return Err(RecoveryControlError::Superseded(format!(
                 "durable recovery driver proof changed at {boundary}"
+            )));
+        }
+        if round.id.driver != self.instance_id || !self.proof_is_live(&round.leader_proof) {
+            return Err(RecoveryControlError::Superseded(format!(
+                "recovery driver proof changed while auditing {boundary}"
             )));
         }
         Ok(())
@@ -3734,6 +4135,16 @@ impl ClusterController {
         if !self.recovery_evidence_roster_matches(round).await? {
             return Err("available recovery evidence roster changed during Prepare".into());
         }
+        if let Some(raw) = self
+            .read_recovery_value(self.instance_id, "control:recover")
+            .await?
+        {
+            if let Some(active) = parse_recovery_announcement(&raw)? {
+                if active.round.has_terminal_fault() && active.round != *round {
+                    return Err("active terminal recovery Prepare cannot be superseded".into());
+                }
+            }
+        }
         let announcement = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Prepare,
@@ -3756,6 +4167,12 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
+        if round.has_terminal_fault() {
+            return Err("terminal recovery fault is permanently retained in Prepare".into());
+        }
+        self.audit_recovery_faults_control(round)
+            .await
+            .map_err(|error| error.to_string())?;
         if round.id.driver != self.instance_id {
             return Err("only the current leader may start its recovery round".into());
         }
@@ -3776,6 +4193,9 @@ impl ClusterController {
         if prepared.round != *round || prepared.phase != RecoverPhase::Prepare {
             return Err("recovery Start does not match the exact active Prepare".into());
         }
+        self.audit_recovery_faults_control(round)
+            .await
+            .map_err(|error| error.to_string())?;
         self.require_recovery_driver_proof(round, "Start publication")
             .await?;
         let announcement = RecoveryAnnouncement {
@@ -3800,6 +4220,9 @@ impl ClusterController {
         epoch: u64,
     ) -> Result<(), String> {
         round.validate()?;
+        if round.has_terminal_fault() {
+            return Err("terminal recovery fault cannot advance to Release".into());
+        }
         if round.id.driver != self.instance_id {
             return Err("only the current leader may release its recovery round".into());
         }
@@ -3858,7 +4281,7 @@ impl ClusterController {
                 "only the current leader may commit its recovery Release".into(),
             ));
         }
-        self.require_recovery_driver_proof_control(round, "Release commit preflight")
+        self.audit_recovery_driver_proof(round, "Release commit preflight")
             .await?;
         match self.read_release_ready(release).await? {
             ReleaseReadyStatus::Complete => {}
@@ -3916,7 +4339,7 @@ impl ClusterController {
             };
             return Err(error);
         }
-        self.require_recovery_driver_proof_control(round, "Release commit publication")
+        self.audit_recovery_driver_proof(round, "Release commit publication")
             .await?;
         match Box::pin(authority.record_recovery_release_commit(&round.leader_proof, reference))
             .await
@@ -4224,6 +4647,9 @@ impl ClusterController {
     /// # Errors
     /// Returns an error when the visible local announcement is malformed.
     pub async fn clear_recover(&self, round: &RecoveryRound) -> Result<bool, String> {
+        if round.has_terminal_fault() {
+            return Err("terminal recovery Prepare cannot be cleared automatically".into());
+        }
         let _guard = self.recovery_writes.lock().await;
         let Some(raw) = self
             .read_recovery_value(self.instance_id, "control:recover")
@@ -4275,7 +4701,14 @@ impl ClusterController {
         };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(ann) = self.observe_barrier_matching(&mut pred).await? {
+            let observed =
+                match tokio::time::timeout_at(deadline, self.observe_barrier_matching(&mut pred))
+                    .await
+                {
+                    Ok(observed) => observed?,
+                    Err(_) => return Ok(None),
+                };
+            if let Some(ann) = observed {
                 return Ok(Some(ann));
             }
             if tokio::time::Instant::now() >= deadline {

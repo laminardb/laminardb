@@ -3378,7 +3378,7 @@ async fn test_cluster_checkpoints_returns_metadata() {
         "row should carry checkpoint_id: {row:?}"
     );
     assert!(
-        row.get("total_checkpoints").is_some(),
-        "row should carry total_checkpoints: {row:?}"
+        row.get("completed_this_runtime").is_some(),
+        "row should carry completed_this_runtime: {row:?}"
     );
 }

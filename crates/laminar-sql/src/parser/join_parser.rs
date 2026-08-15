@@ -399,6 +399,12 @@ fn extract_table_alias(factor: &TableFactor) -> Option<String> {
 pub(crate) struct ParsedTemporalProbeQuery {
     pub(crate) statement: Statement,
     pub(crate) analysis: JoinAnalysis,
+    /// The normalized SQL that produced `statement`.
+    ///
+    /// Keep this alongside the AST because sqlparser's `Display` implementation
+    /// currently renders aliased versioned tables as `table AS alias FOR
+    /// SYSTEM_TIME ...`, while its parser accepts the version before the alias.
+    pub(crate) normalized_sql: String,
 }
 
 #[derive(Clone)]
@@ -608,6 +614,7 @@ pub(crate) fn parse_temporal_probe_query(
     Ok(Some(ParsedTemporalProbeQuery {
         statement: statements.remove(0),
         analysis,
+        normalized_sql,
     }))
 }
 

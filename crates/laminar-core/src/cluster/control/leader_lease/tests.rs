@@ -421,6 +421,7 @@ async fn committed_checkpoint_with_predecessor(
         scope: CheckpointScope::Cluster,
         vnode_count: u16::try_from(fence.vnode_count).unwrap(),
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor,
         participants: fence
             .participants
@@ -436,6 +437,7 @@ async fn committed_checkpoint_with_predecessor(
         source_names: Vec::new(),
         source_offsets: std::collections::BTreeMap::new(),
         channel_progress: Vec::new(),
+        source_watermarks: std::collections::BTreeMap::new(),
         checkpoint_watermark: None,
     };
     decisions.create_committed_checkpoint(&index).await.unwrap()
@@ -447,7 +449,19 @@ async fn begin_checkpoint_artifacts(
     fence: &CheckpointAssignmentFence,
     checkpoint_id: u64,
 ) -> CheckpointArtifactInventory {
-    let inventory = CheckpointArtifactInventory {
+    let inventory = checkpoint_artifact_inventory(store, fence, checkpoint_id).await;
+    store
+        .begin_cluster_checkpoint_artifacts(proof, inventory)
+        .await
+        .unwrap()
+}
+
+async fn checkpoint_artifact_inventory(
+    store: &LeaderLeaseStore,
+    fence: &CheckpointAssignmentFence,
+    checkpoint_id: u64,
+) -> CheckpointArtifactInventory {
+    CheckpointArtifactInventory {
         deployment_id: CheckpointDecisionStore::new(Arc::clone(&store.store))
             .load_or_create_deployment_id()
             .await
@@ -455,11 +469,7 @@ async fn begin_checkpoint_artifacts(
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
         attempt: crate::checkpoint::CheckpointAttempt::canonical(checkpoint_id),
         assignment_fence: Some(fence.clone()),
-    };
-    store
-        .begin_cluster_checkpoint_artifacts(proof, inventory)
-        .await
-        .unwrap()
+    }
 }
 
 async fn record_commit(
@@ -594,7 +604,92 @@ async fn exact_active_recovery_fault_retry_is_idempotent() {
         &[RecoveryFault {
             reporter: incumbent.node,
             sequence: 2,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }]
+    );
+}
+
+#[tokio::test]
+async fn legacy_recoverable_fault_authority_and_release_bytes_remain_canonical() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        panic!("empty authority must be acquired");
+    };
+    let publisher = owner_recovery_fault_publisher(&incumbent);
+    store.record_recovery_fault(publisher, 1).await.unwrap();
+
+    let record = store.load_record().await.unwrap().unwrap();
+    let encoded_record = encode_authority_record(&record).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded_record).contains("disposition"));
+    let decoded_record: LeaderAuthorityRecord = serde_json::from_slice(&encoded_record).unwrap();
+    assert_eq!(
+        encode_authority_record(&decoded_record).unwrap(),
+        encoded_record
+    );
+    assert_eq!(store.load_record().await.unwrap().unwrap(), record);
+
+    let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+    let (encoded_terminal, reference) = encode_recovery_release_terminal(&terminal).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded_terminal).contains("disposition"));
+    let decoded_terminal: RecoveryAnnouncement = serde_json::from_slice(&encoded_terminal).unwrap();
+    let (reencoded_terminal, reencoded_reference) =
+        encode_recovery_release_terminal(&decoded_terminal).unwrap();
+    assert_eq!(reencoded_terminal, encoded_terminal);
+    assert_eq!(reencoded_reference, reference);
+}
+
+#[tokio::test]
+async fn terminal_fault_upgrade_is_sticky_and_blocks_release_commit() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        panic!("empty authority must be acquired");
+    };
+    let publisher = owner_recovery_fault_publisher(&incumbent);
+    assert_eq!(
+        store.record_recovery_fault(publisher, 7).await.unwrap(),
+        RecordRecoveryFaultResult::Active
+    );
+    let recoverable = store.recovery_fault_inventory().await.unwrap();
+    let release = recovery_release_terminal(&store, &lease, 1, 0).await;
+    let reference = store
+        .stage_recovery_release_terminal(&release)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .record_recovery_fault_with_disposition(
+                publisher,
+                7,
+                RecoveryFaultDisposition::Terminal,
+            )
+            .await
+            .unwrap(),
+        RecordRecoveryFaultResult::Active
+    );
+    let terminal = store.recovery_fault_inventory().await.unwrap();
+    assert!(terminal.has_terminal_fault());
+    assert!(terminal.revision() > recoverable.revision());
+    assert!(terminal.faults()[0].sequence > recoverable.faults()[0].sequence);
+
+    assert_eq!(
+        store.record_recovery_fault(publisher, 8).await.unwrap(),
+        RecordRecoveryFaultResult::TerminalFenceActive
+    );
+    let replacement = recovery_fault_publisher(1, 2, 2);
+    assert_eq!(
+        store.record_recovery_fault(replacement, 1).await.unwrap(),
+        RecordRecoveryFaultResult::TerminalFenceActive
+    );
+    assert_eq!(store.recovery_fault_inventory().await.unwrap(), terminal);
+    assert_eq!(
+        store
+            .record_recovery_release_commit(&lease.proof(), reference)
+            .await
+            .unwrap(),
+        RecordRecoveryReleaseCommitResult::FaultsChanged
     );
 }
 
@@ -936,6 +1031,7 @@ async fn fault_report_before_recovery_release_cas_returns_faults_changed() {
         &[RecoveryFault {
             reporter: incumbent.node,
             sequence: 3,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }]
     );
     assert_eq!(
@@ -972,6 +1068,7 @@ async fn recovery_release_cas_before_fault_report_preserves_both_facts() {
         &[RecoveryFault {
             reporter: incumbent.node,
             sequence: 4,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }]
     );
     assert!(!store
@@ -1028,6 +1125,7 @@ async fn recovery_admission_snapshot_retries_when_faults_change_during_terminal_
         publisher,
         request_sequence: 8,
         fault_sequence: sequence,
+        disposition: RecoveryFaultDisposition::Recoverable,
         active: true,
     };
     match changed
@@ -1064,6 +1162,7 @@ async fn recovery_admission_snapshot_retries_when_faults_change_during_terminal_
         &[RecoveryFault {
             reporter: incumbent.node,
             sequence: changed.lease.seq,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }]
     );
 
@@ -1181,6 +1280,7 @@ async fn full_unavailable_fault_inventory_is_compacted_before_new_admission() {
                 publisher: recovery_fault_publisher(ordinal, u128::from(ordinal), 1),
                 request_sequence: 1,
                 fault_sequence: ordinal,
+                disposition: RecoveryFaultDisposition::Recoverable,
                 active: true,
             }
         })
@@ -1269,6 +1369,7 @@ fn recovery_fault_slot_capacity_preserves_authority_headroom() {
                     } else {
                         ordinal
                     },
+                    disposition: RecoveryFaultDisposition::Recoverable,
                     active: true,
                 }
             })
@@ -2618,6 +2719,64 @@ async fn record_before_pointer_crash_is_repaired_without_listing() {
 }
 
 #[tokio::test]
+async fn repaired_head_returns_a_coherent_snapshot_without_chasing_newer_orphans() {
+    let (raw, store) = delayed_response_once_at(1_000, authority_head_path());
+    let incumbent = owner(1, 1, 1);
+    let first = bare_authority_record(&incumbent, 1);
+    let second = bare_authority_record(&incumbent, 2);
+    let third = bare_authority_record(&incumbent, 3);
+    let fourth = bare_authority_record(&incumbent, 4);
+    seed_authority_record(&raw, &first).await;
+    seed_authority_head(&raw, 1).await;
+    seed_authority_record(&raw, &second).await;
+    raw.clear_authority_io_counts();
+
+    let reader = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.load().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    let second_pointer = read_authority_head_pointer(raw.inner.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_pointer.pointer.sequence, 2);
+    seed_authority_record(&raw, &third).await;
+    seed_authority_record(&raw, &fourth).await;
+    raw.inner
+        .put_opts(
+            &authority_head_path(),
+            PutPayload::from(encode_authority_head_pointer(3).unwrap()),
+            PutOptions {
+                mode: PutMode::Update(second_pointer.update_version),
+                ..PutOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    raw.release.add_permits(1);
+
+    assert_eq!(reader.await.unwrap().unwrap(), Some(third.lease));
+    assert_eq!(
+        read_authority_head_pointer(raw.inner.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .pointer
+            .sequence,
+        3
+    );
+    assert!(raw.inner.get(&lease_path(4)).await.is_ok());
+    assert_eq!(raw.put_count(&authority_head_path(), "update"), 1);
+    assert_eq!(raw.list_count(), 0);
+}
+
+#[tokio::test]
 async fn stalled_reader_retries_when_the_pointer_target_was_pruned() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let (raw, store) = blocking_get_once_with_inner(1_000, inner, lease_path(1));
@@ -3374,6 +3533,7 @@ async fn assignment_recovery_requires_exact_sorted_removals_and_matching_proposa
     )
     .await;
     assert!(decision.validate().is_ok());
+    let authority_seq_before_invalid_attempts = store.load().await.unwrap().unwrap().seq;
 
     let mut missing = decision.clone();
     missing.removed_process_fences.pop();
@@ -3410,7 +3570,11 @@ async fn assignment_recovery_requires_exact_sorted_removals_and_matching_proposa
             LeaseError::Invalid(_)
         ))
     ));
-    assert_eq!(store.load().await.unwrap().unwrap().seq, 2);
+    assert_eq!(
+        store.load().await.unwrap().unwrap().seq,
+        authority_seq_before_invalid_attempts,
+        "invalid recovery decisions must not advance the authority sequence"
+    );
 }
 
 #[tokio::test]
@@ -3488,7 +3652,7 @@ async fn recovery_requires_the_current_cut_and_pins_it_until_the_target_commits(
 
 #[tokio::test]
 async fn competing_assignment_recoveries_have_one_same_version_winner() {
-    let (raw, store) = blocking_store_at(1_000, lease_path(3));
+    let (raw, store) = blocking_store_at(1_000, lease_path(4));
     let incumbent = owner(1, 11, 1);
     let failed = owner(2, 22, 1);
     let LeaseOutcome::Acquired(first) = store
@@ -3806,7 +3970,9 @@ async fn drain_and_recovery_share_one_ordered_retention_chain() {
 
 #[tokio::test]
 async fn takeover_fences_a_delayed_assignment_recovery_decision() {
-    let (raw, store) = blocking_once_at(10, lease_path(3));
+    // Establishing the portable predecessor checkpoint advances the authority through artifact
+    // admission and Commit. The recovery decision is therefore the fourth authority record.
+    let (raw, store) = blocking_once_at(10, lease_path(4));
     let incumbent = owner(1, 11, 1);
     let successor = owner(1, 12, 2);
     let failed = owner(2, 22, 1);
@@ -3883,7 +4049,7 @@ async fn takeover_fences_a_delayed_assignment_recovery_decision() {
 
 #[tokio::test]
 async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
-    let (raw, store) = blocking_store_at(1_000, lease_path(3));
+    let (raw, store) = blocking_store_at(1_000, lease_path(4));
     let incumbent = owner(1, 1, 1);
     let LeaseOutcome::Acquired(first) = store
         .acquire_or_renew_current_term_for_test(&incumbent, 0)
@@ -3956,7 +4122,9 @@ async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
 
 #[tokio::test]
 async fn takeover_fences_delayed_drain_commit_and_can_abort_the_transition() {
-    let (raw, store) = blocking_once_at(10, lease_path(3));
+    // Establishing the portable handoff checkpoint advances the authority through artifact
+    // admission and Commit. The drain decision is therefore the fourth authority record.
+    let (raw, store) = blocking_once_at(10, lease_path(4));
     let incumbent = owner(1, 1, 1);
     let successor = owner(2, 2, 1);
     let LeaseOutcome::Acquired(first) = store
@@ -4078,6 +4246,16 @@ async fn assignment_drain_floor_compacts_history_and_rejects_stale_versions() {
         .unwrap();
     assert_eq!(floor.before_target_version, 4);
     assert_eq!(floor.terminal_anchor.unwrap().target_version(), 3);
+    let stale_inventory =
+        checkpoint_artifact_inventory(&store, &assignment_fence(&incumbent), 1).await;
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, stale_inventory)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("below durable assignment-decision floor")
+    ));
     assert!(matches!(
         store.assignment_drain_decision(3).await,
         Err(ClusterCheckpointAuthorityError::Decision(
@@ -4240,6 +4418,318 @@ async fn delayed_cluster_decision_is_fenced_when_takeover_wins_next_sequence() {
         Err(ClusterCheckpointAuthorityError::Fenced)
     ));
     assert!(store.cluster_outcomes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn assignment_decisions_prevent_predecessor_checkpoint_artifacts_from_reopening() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let failed = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let transition = assignment_drain_transition(&incumbent, proof.clone());
+    let drain = committed_drain_decision_for_test(&store, &transition, proof.clone(), 1).await;
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, drain)
+            .await
+            .unwrap(),
+        RecordAssignmentDrainDecisionResult::Created(_)
+    ));
+
+    let predecessor = checkpoint_artifact_inventory(&store, &transition.predecessor, 2).await;
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, predecessor)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("consumed")
+    ));
+    let target = checkpoint_artifact_inventory(&store, &transition.target, 2).await;
+    assert_eq!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, target.clone())
+            .await
+            .unwrap(),
+        target
+    );
+
+    let recovery_store = LeaderLeaseStore::new(Arc::new(InMemory::new()), 1_000);
+    let LeaseOutcome::Acquired(recovery_lease) =
+        recovery_store.begin_new_term(&incumbent, 0).await.unwrap()
+    else {
+        unreachable!()
+    };
+    let recovery_proof = recovery_lease.proof();
+    let recovery = assignment_recovery_decision(
+        &recovery_store,
+        1,
+        &[incumbent.clone(), failed],
+        std::slice::from_ref(&incumbent),
+        recovery_proof.clone(),
+        1,
+    )
+    .await;
+    assert!(matches!(
+        recovery_store
+            .record_assignment_recovery_decision(&recovery_proof, recovery.clone())
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    let predecessor =
+        checkpoint_artifact_inventory(&recovery_store, &recovery.predecessor, 2).await;
+    assert!(matches!(
+        recovery_store
+            .begin_cluster_checkpoint_artifacts(&recovery_proof, predecessor)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("consumed")
+    ));
+    let target = checkpoint_artifact_inventory(&recovery_store, &recovery.target, 2).await;
+    assert_eq!(
+        recovery_store
+            .begin_cluster_checkpoint_artifacts(&recovery_proof, target.clone())
+            .await
+            .unwrap(),
+        target
+    );
+}
+
+#[tokio::test]
+async fn drain_abort_only_reopens_its_materialized_rollback_assignment() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let peer = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let participants = vec![
+        crate::checkpoint::CheckpointParticipant {
+            node_id: incumbent.node.0,
+            boot_incarnation: incumbent.boot,
+        },
+        crate::checkpoint::CheckpointParticipant {
+            node_id: peer.node.0,
+            boot_incarnation: peer.boot,
+        },
+    ];
+    let predecessor = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[incumbent.node.0, peer.node.0],
+        participants.clone(),
+    )
+    .unwrap();
+    let proposed_target = CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[peer.node.0, incumbent.node.0],
+        participants,
+    )
+    .unwrap();
+    let transition =
+        AssignmentDrainTransition::new(predecessor.clone(), proposed_target.clone(), proof.clone())
+            .unwrap();
+    let abort = AssignmentDrainDecision::abort(&transition, proof.clone()).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, abort)
+            .await
+            .unwrap(),
+        RecordAssignmentDrainDecisionResult::Created(_)
+    ));
+
+    let proposed = checkpoint_artifact_inventory(&store, &proposed_target, 1).await;
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, proposed)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("materialized")
+    ));
+    let mut rollback = predecessor;
+    rollback.assignment_version = proposed_target.assignment_version;
+    let rollback_inventory = checkpoint_artifact_inventory(&store, &rollback, 1).await;
+    assert_eq!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, rollback_inventory.clone())
+            .await
+            .unwrap(),
+        rollback_inventory
+    );
+}
+
+#[tokio::test]
+async fn active_predecessor_artifacts_block_drain_settlement_but_not_recovery() {
+    let store = store(1_000);
+    let incumbent = owner(1, 1, 1);
+    let peer = owner(2, 2, 1);
+    let reincarnated = owner(1, 11, 2);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let transition = assignment_drain_transition(&incumbent, proof.clone());
+    let handoff = match record_commit(&store, &proof, &transition.predecessor, 1, 1).await {
+        RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),
+        outcome => panic!("unexpected handoff checkpoint result: {outcome:?}"),
+    };
+    let active = begin_checkpoint_artifacts(&store, &proof, &transition.predecessor, 2).await;
+
+    let commit = AssignmentDrainDecision::commit(&transition, proof.clone(), handoff).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, commit)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("cannot overtake checkpoint")
+    ));
+    let abort = AssignmentDrainDecision::abort(&transition, proof.clone()).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, abort)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("cannot overtake checkpoint")
+    ));
+    let mismatched_participants = vec![
+        crate::checkpoint::CheckpointParticipant {
+            node_id: incumbent.node.0,
+            boot_incarnation: incumbent.boot,
+        },
+        crate::checkpoint::CheckpointParticipant {
+            node_id: peer.node.0,
+            boot_incarnation: peer.boot,
+        },
+    ];
+    let mismatched_predecessor = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[incumbent.node.0, peer.node.0],
+        mismatched_participants.clone(),
+    )
+    .unwrap();
+    let mismatched_target = CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[peer.node.0, incumbent.node.0],
+        mismatched_participants,
+    )
+    .unwrap();
+    let mismatched_transition =
+        AssignmentDrainTransition::new(mismatched_predecessor, mismatched_target, proof.clone())
+            .unwrap();
+    let mismatched_abort =
+        AssignmentDrainDecision::abort(&mismatched_transition, proof.clone()).unwrap();
+    assert!(matches!(
+        store
+            .record_assignment_drain_decision(&proof, mismatched_abort)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("conflicts with predecessor version")
+    ));
+
+    let recovery = assignment_recovery_decision(
+        &store,
+        1,
+        std::slice::from_ref(&incumbent),
+        std::slice::from_ref(&reincarnated),
+        proof.clone(),
+        1,
+    )
+    .await;
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, recovery)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert_eq!(
+        store.cluster_checkpoint_artifacts().await.unwrap(),
+        Some(active.clone())
+    );
+    assert!(matches!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, active)
+            .await,
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("consumed")
+    ));
+}
+
+#[tokio::test]
+async fn contended_identical_artifact_admission_rechecks_a_recovery_decision() {
+    // The recovery checkpoint advances authority through artifact admission and Commit, so the
+    // delayed successor admission below contends at the fourth authority record.
+    let (raw, store) = blocking_once_at(1_000, lease_path(4));
+    let incumbent = owner(1, 1, 1);
+    let failed = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let recovery = assignment_recovery_decision(
+        store.as_ref(),
+        1,
+        &[incumbent.clone(), failed],
+        std::slice::from_ref(&incumbent),
+        proof.clone(),
+        1,
+    )
+    .await;
+    let inventory = checkpoint_artifact_inventory(store.as_ref(), &recovery.predecessor, 2).await;
+
+    let delayed_store = Arc::clone(&store);
+    let delayed_proof = proof.clone();
+    let delayed_inventory = inventory.clone();
+    let delayed = tokio::spawn(async move {
+        delayed_store
+            .begin_cluster_checkpoint_artifacts(&delayed_proof, delayed_inventory)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    assert_eq!(
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
+            .await
+            .unwrap(),
+        inventory
+    );
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, recovery)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    raw.release.add_permits(1);
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), delayed)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ClusterCheckpointAuthorityError::Decision(
+            DecisionError::Conflict(message)
+        )) if message.contains("consumed")
+    ));
+    assert_eq!(
+        store.cluster_checkpoint_artifacts().await.unwrap(),
+        Some(inventory)
+    );
 }
 
 #[tokio::test]
@@ -4728,7 +5218,11 @@ async fn exact_cluster_outcome_bounds_latest_future_and_older_reads() {
         .unwrap();
     assert!(committed.is_commit());
     assert_eq!(checkpoint.unwrap().epoch, 5);
-    assert_eq!(raw.get_count(&lease_path(6)), 1);
+    assert_eq!(
+        raw.get_count(&lease_path(6)),
+        0,
+        "the explicit record read immediately above seeds the exact authority-head cache"
+    );
     assert_eq!(raw.get_count(&deployment_path), 1);
     assert_eq!(
         raw.get_count(&committed_checkpoint_path(&recovery_reference)),
@@ -6061,8 +6555,145 @@ fn set_candidacy(candidate: &watch::Sender<LeaderCandidacy>, eligible: bool) {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn withdrawal_rotates_an_expired_never_published_deadline_generation() {
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::new(store(100)),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl: Duration::from_millis(100),
+            renew_interval: Duration::from_millis(20),
+        },
+    )
+    .unwrap();
+    let expired = manager.deadline();
+    expired.extend(Duration::from_nanos(1));
+    while expired.is_live() {
+        std::hint::spin_loop();
+    }
+
+    assert!(!manager.withdraw());
+    let fresh = manager.deadline();
+    assert!(!Arc::ptr_eq(&expired, &fresh));
+    expired.extend(Duration::from_secs(1));
+    assert!(!expired.is_live());
+    fresh.extend(Duration::from_secs(1));
+    assert!(fresh.is_live());
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
-async fn delayed_durable_acquisition_response_fails_closed_at_attempt_deadline() {
+async fn supervised_manager_exit_signals_process_authority_loss() {
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::new(store(100)),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl: Duration::from_millis(100),
+            renew_interval: Duration::from_millis(20),
+        },
+    )
+    .unwrap();
+    let (candidate_tx, candidate_rx) = candidacy_channel(true);
+    drop(candidate_tx);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let unexpected_exit = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn_supervised(shutdown, candidate_rx, unexpected_exit.clone());
+
+    tokio::time::timeout(Duration::from_secs(1), unexpected_exit.cancelled())
+        .await
+        .expect("unsupervised manager exit did not fence process authority");
+    task.await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn supervised_manager_intentional_shutdown_does_not_signal_authority_loss() {
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::new(store(100)),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl: Duration::from_millis(100),
+            renew_interval: Duration::from_millis(20),
+        },
+    )
+    .unwrap();
+    let mut lease = manager.lease_watch();
+    let (_candidate_tx, candidate_rx) = candidacy_channel(true);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let unexpected_exit = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn_supervised(shutdown.clone(), candidate_rx, unexpected_exit.clone());
+    wait_for_lease(&mut lease).await;
+
+    shutdown.cancel();
+    task.await.unwrap();
+    assert!(!unexpected_exit.is_cancelled());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn supervised_manager_abort_fences_the_published_grant_before_signalling_loss() {
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::new(store(1_000)),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(100),
+        },
+    )
+    .unwrap();
+    let mut lease = manager.lease_watch();
+    let deadline = manager.deadline_watch();
+    let (_candidate_tx, candidate_rx) = candidacy_channel(true);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let unexpected_exit = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn_supervised(shutdown, candidate_rx, unexpected_exit.clone());
+    wait_for_lease(&mut lease).await;
+    let published_deadline = deadline.borrow().clone();
+
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(unexpected_exit.is_cancelled());
+    assert!(lease.borrow().is_none());
+    assert!(!published_deadline.is_live());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn supervised_manager_forced_shutdown_fences_without_reporting_unexpected_loss() {
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::new(store(1_000)),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl: Duration::from_secs(1),
+            renew_interval: Duration::from_millis(100),
+        },
+    )
+    .unwrap();
+    let mut lease = manager.lease_watch();
+    let deadline = manager.deadline_watch();
+    let (_candidate_tx, candidate_rx) = candidacy_channel(true);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let unexpected_exit = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn_supervised(shutdown.clone(), candidate_rx, unexpected_exit.clone());
+    wait_for_lease(&mut lease).await;
+    let published_deadline = deadline.borrow().clone();
+
+    shutdown.cancel();
+    task.abort();
+    let _ = task.await;
+    assert!(!unexpected_exit.is_cancelled());
+    assert!(lease.borrow().is_none());
+    assert!(!published_deadline.is_live());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn delayed_durable_acquisition_response_rotates_after_attempt_deadline() {
     let ttl = Duration::from_millis(40);
     let (raw, store) = delayed_response_once_at(40, lease_path(1));
     let owner = owner(1, 1, 1);
@@ -6075,28 +6706,58 @@ async fn delayed_durable_acquisition_response_fails_closed_at_attempt_deadline()
         },
     )
     .unwrap();
-    let deadline = manager.deadline();
-    let lease = manager.lease_watch();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
+    let mut lease = manager.lease_watch();
     let (_candidate_tx, candidate_rx) = candidacy_channel(true);
-    let task = manager.spawn(tokio_util::sync::CancellationToken::new(), candidate_rx);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn(shutdown.clone(), candidate_rx);
 
     tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    assert!(matches!(
-        store.load().await.unwrap(),
-        Some(LeaderLease { owner: current, .. }) if current == owner
-    ));
-    tokio::time::timeout(ttl + Duration::from_millis(100), task)
+    let first = store
+        .load()
         .await
-        .expect("manager must not wait beyond the attempt's anchored TTL")
-        .unwrap();
+        .unwrap()
+        .expect("durable first term must exist before its delayed response");
+    assert_eq!(first.owner, owner);
+    let stale_proof = first.proof();
 
-    assert!(lease.borrow().is_none());
-    assert!(!deadline.is_live());
+    tokio::time::timeout(ttl + Duration::from_secs(1), async {
+        loop {
+            if lease
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|current| current.token > first.token)
+            {
+                break;
+            }
+            lease.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("manager did not replace the ambiguous first term after its local deadline");
+    let current = lease.borrow().clone().expect("rotated local leader grant");
+    let current_deadline = deadline.borrow().clone();
+    assert!(!old_deadline.is_live());
+    assert!(!Arc::ptr_eq(&old_deadline, &current_deadline));
+    assert!(current_deadline.is_live());
+    assert!(current.token > first.token);
+    assert_eq!(store.load().await.unwrap().unwrap().token, current.token);
+    assert!(!lease_grants_proof(
+        &Some(current),
+        &owner,
+        &current_deadline,
+        &stale_proof,
+    ));
+    assert!(!task.is_finished());
+
     raw.release.add_permits(1);
+    shutdown.cancel();
+    task.await.unwrap();
 }
 
 #[cfg(feature = "cluster")]
@@ -6113,7 +6774,8 @@ async fn candidacy_loss_interrupts_hung_renewal_and_withdraws_the_grant() {
         },
     )
     .unwrap();
-    let deadline = manager.deadline();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
     let mut lease = manager.lease_watch();
     let (candidate_tx, candidate_rx) = candidacy_channel(true);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -6130,7 +6792,10 @@ async fn candidacy_loss_interrupts_hung_renewal_and_withdraws_the_grant() {
         .unwrap()
         .unwrap();
     assert!(lease.borrow().is_none());
-    assert!(!deadline.is_live());
+    let current_deadline = deadline.borrow().clone();
+    assert!(!old_deadline.is_live());
+    assert!(!Arc::ptr_eq(&old_deadline, &current_deadline));
+    assert!(!current_deadline.is_live());
     raw.release.add_permits(1);
     shutdown.cancel();
     task.await.unwrap();
@@ -6150,7 +6815,8 @@ async fn candidacy_reacquisition_rotates_the_durable_fencing_token() {
         },
     )
     .unwrap();
-    let deadline = manager.deadline();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
     let mut lease = manager.lease_watch();
     let (candidate_tx, candidate_rx) = candidacy_channel(true);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -6170,7 +6836,7 @@ async fn candidacy_reacquisition_rotates_the_durable_fencing_token() {
     assert!(!lease_grants_proof(
         &lease.borrow().clone(),
         &owner,
-        &deadline,
+        &old_deadline,
         &stale_proof,
     ));
 
@@ -6200,10 +6866,21 @@ async fn candidacy_reacquisition_rotates_the_durable_fencing_token() {
             .token,
         reacquired.token
     );
+    let current_deadline = deadline.borrow().clone();
+    assert!(!old_deadline.is_live());
+    assert!(!Arc::ptr_eq(&old_deadline, &current_deadline));
+    assert!(current_deadline.is_live());
+    let current_proof = reacquired.proof();
+    assert!(lease_grants_proof(
+        &Some(reacquired.clone()),
+        &owner,
+        &current_deadline,
+        &current_proof,
+    ));
     assert!(!lease_grants_proof(
         &Some(reacquired),
         &owner,
-        &deadline,
+        &current_deadline,
         &stale_proof,
     ));
 
@@ -6225,7 +6902,8 @@ async fn coalesced_candidacy_loss_still_rotates_the_fencing_token() {
         },
     )
     .unwrap();
-    let deadline = manager.deadline();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
     let mut lease = manager.lease_watch();
     let (candidate_tx, candidate_rx) = candidacy_channel(true);
     let shutdown = tokio_util::sync::CancellationToken::new();
@@ -6253,10 +6931,14 @@ async fn coalesced_candidacy_loss_still_rotates_the_fencing_token() {
     .await
     .expect("coalesced candidacy loss reused the old fencing token");
     let current = lease.borrow().clone().expect("rotated leader grant");
+    let current_deadline = deadline.borrow().clone();
+    assert!(!old_deadline.is_live());
+    assert!(!Arc::ptr_eq(&old_deadline, &current_deadline));
+    assert!(current_deadline.is_live());
     assert!(!lease_grants_proof(
         &Some(current),
         &owner,
-        &deadline,
+        &current_deadline,
         &stale_proof,
     ));
 
@@ -6265,36 +6947,195 @@ async fn coalesced_candidacy_loss_still_rotates_the_fencing_token() {
 }
 
 #[cfg(feature = "cluster")]
-#[tokio::test]
-async fn hung_renewal_fences_at_local_deadline() {
-    let (raw, store) = blocking_store(40);
+#[tokio::test(start_paused = true)]
+async fn hung_renewal_withdraws_then_reacquires_with_a_new_fencing_token() {
+    let ttl = Duration::from_millis(200);
+    let (raw, store) = blocking_store(200);
     let owner = owner(1, 1, 1);
     let manager = LeaderLeaseManager::new(
-        store,
+        Arc::clone(&store),
         &process(&owner),
         LeaderLeaseConfig {
-            ttl: Duration::from_millis(40),
-            renew_interval: Duration::from_millis(5),
+            ttl,
+            renew_interval: Duration::from_millis(20),
         },
     )
     .unwrap();
-    let deadline = manager.deadline();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
     let mut lease = manager.lease_watch();
-    let (_candidate_tx, candidate_rx) = candidacy_channel(true);
-    let task = manager.spawn(tokio_util::sync::CancellationToken::new(), candidate_rx);
+    let (candidate_tx, candidate_rx) = candidacy_channel(true);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn(shutdown.clone(), candidate_rx);
     wait_for_lease(&mut lease).await;
+    let first = lease.borrow().clone().expect("initial leader grant");
+    let stale_proof = first.proof();
     tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
         .await
         .unwrap()
         .unwrap()
         .forget();
-    tokio::time::timeout(Duration::from_millis(150), task)
-        .await
-        .unwrap()
-        .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(400), async {
+        while lease.borrow_and_update().is_some() {
+            lease.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("expired renewal did not withdraw the local grant");
     assert!(lease.borrow().is_none());
-    assert!(!deadline.is_live());
+    assert!(!old_deadline.is_live());
+    assert!(!task.is_finished());
+
+    assert!(
+        tokio::time::timeout(ttl / 2, raw.entered.acquire())
+            .await
+            .is_err(),
+        "manager rotated the old fencing token before its settlement grace elapsed"
+    );
+    set_candidacy(&candidate_tx, false);
+    tokio::task::yield_now().await;
+    set_candidacy(&candidate_tx, true);
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(ttl / 4, raw.entered.acquire())
+            .await
+            .is_err(),
+        "candidacy churn erased the outstanding settlement grace"
+    );
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .expect("manager did not retry the durable term after withdrawal")
+        .unwrap()
+        .forget();
     raw.release.add_permits(1);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if lease
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|current| current.token > first.token)
+            {
+                break;
+            }
+            lease.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("manager did not reacquire with a rotated fencing token");
+    let current = lease.borrow().clone().expect("reacquired leader grant");
+    let current_deadline = deadline.borrow().clone();
+    assert!(!Arc::ptr_eq(&old_deadline, &current_deadline));
+    assert!(current_deadline.is_live());
+    assert!(current.token > first.token);
+    assert_eq!(store.load().await.unwrap().unwrap().token, current.token);
+    assert!(!lease_grants_proof(
+        &Some(current),
+        &owner,
+        &current_deadline,
+        &stale_proof,
+    ));
+
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn expired_local_grant_preserves_old_proof_commit_before_token_rotation() {
+    let ttl = Duration::from_millis(200);
+    // Initial lease is sequence 1 and artifact admission is sequence 2. Block the renewal's
+    // sequence-3 create; once that cancelled writer lapses, the old-proof Commit may use seq 3.
+    let (raw, store) = blocking_once_at(200, lease_path(3));
+    let owner = owner(1, 1, 1);
+    let manager = LeaderLeaseManager::new(
+        Arc::clone(&store),
+        &process(&owner),
+        LeaderLeaseConfig {
+            ttl,
+            renew_interval: Duration::from_millis(20),
+        },
+    )
+    .unwrap();
+    let old_deadline = manager.deadline();
+    let deadline = manager.deadline_watch();
+    let mut lease = manager.lease_watch();
+    let (_candidate_tx, candidate_rx) = candidacy_channel(true);
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn(shutdown.clone(), candidate_rx);
+    wait_for_lease(&mut lease).await;
+    let first = lease.borrow().clone().expect("initial leader grant");
+    let proof = first.proof();
+    let fence = assignment_fence(&owner);
+    begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    let committed = committed_checkpoint(&store, &fence, 1, 1).await;
+
+    tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+        .await
+        .expect("renewal did not enter the blocked authority create")
+        .unwrap()
+        .forget();
+    tokio::time::timeout(ttl + Duration::from_millis(1), async {
+        while lease.borrow_and_update().is_some() {
+            lease.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("expired renewal did not withdraw the local grant");
+    assert!(!old_deadline.is_live());
+
+    tokio::time::advance(ttl / 2).await;
+    assert!(lease.borrow().is_none());
+    let outcome = store
+        .record_cluster_outcome(
+            &proof,
+            1,
+            1,
+            fence,
+            CheckpointVerdict::Commit,
+            Some(committed.clone()),
+        )
+        .await
+        .expect("old-proof Commit must remain legal during settlement grace");
+    assert!(matches!(outcome, RecordOutcomeResult::Created(_)));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if lease
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|current| current.token > first.token)
+            {
+                break;
+            }
+            lease.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("manager did not rotate after the settlement grace");
+    let current = lease.borrow().clone().expect("rotated leader grant");
+    let current_deadline = deadline.borrow().clone();
+    assert!(current_deadline.is_live());
+    assert!(current.token > first.token);
+    assert_eq!(
+        store
+            .highest_cluster_committed_outcome()
+            .await
+            .unwrap()
+            .and_then(|outcome| outcome.committed_checkpoint),
+        Some(committed)
+    );
+    assert!(!lease_grants_proof(
+        &Some(current),
+        &owner,
+        &current_deadline,
+        &proof,
+    ));
+
+    raw.release.add_permits(1);
+    shutdown.cancel();
+    task.await.unwrap();
 }
 
 #[cfg(feature = "cluster")]
@@ -6504,12 +7345,21 @@ async fn handoff_pin_rejects_stale_commits_and_releases_on_a_target_commit() {
         Some(&handoff)
     );
 
+    let rejected_inventory =
+        checkpoint_artifact_inventory(&store, &transition.predecessor, 2).await;
     assert!(matches!(
-        try_record_commit(&store, &proof, &transition.predecessor, 2, 2).await,
+        store
+            .begin_cluster_checkpoint_artifacts(&proof, rejected_inventory)
+            .await,
         Err(ClusterCheckpointAuthorityError::Decision(
             DecisionError::Conflict(_)
         ))
     ));
+    assert!(store
+        .cluster_checkpoint_artifacts()
+        .await
+        .unwrap()
+        .is_none());
 
     let target = match record_commit(&store, &proof, &transition.target, 3, 3).await {
         RecordOutcomeResult::Created(outcome) => outcome.committed_checkpoint.unwrap(),

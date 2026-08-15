@@ -21,6 +21,56 @@ pub mod flags {
     pub const HANDOFF: u64 = 1 << 3;
 }
 
+/// Internal flag layout used only by the clustered shuffle fixed-point flush.
+///
+/// These bits never appear in a source barrier, checkpoint request, or control-plane
+/// announcement. Keeping the tag separate from the wave ordinal lets a receiver reject an
+/// untagged or partially encoded marker instead of accidentally treating it as wave zero.
+const SHUFFLE_FLUSH_TAG: u64 = 1 << 31;
+const SHUFFLE_FLUSH_WAVE_SHIFT: u32 = 32;
+const SHUFFLE_FLUSH_WAVE_MASK: u64 = 0x7fff_ffff << SHUFFLE_FLUSH_WAVE_SHIFT;
+const SHUFFLE_FLUSH_ACTIVITY: u64 = 1 << 63;
+const SHUFFLE_FLUSH_INTERNAL_MASK: u64 =
+    SHUFFLE_FLUSH_TAG | SHUFFLE_FLUSH_WAVE_MASK | SHUFFLE_FLUSH_ACTIVITY;
+
+/// Largest shuffle flush wave representable in a checkpoint barrier.
+pub const MAX_SHUFFLE_FLUSH_WAVE: u64 = 0x7fff_ffff;
+
+/// Encode one internal clustered-shuffle flush marker.
+///
+/// The returned value is valid only in the `flags` field of an in-band shuffle barrier. It must
+/// not be copied into checkpoint metadata or cluster control traffic.
+///
+/// # Errors
+/// Returns an error instead of truncating a wave ordinal that does not fit the reserved field.
+pub fn encode_shuffle_flush_flags(wave: u64, activity: bool) -> Result<u64, &'static str> {
+    if wave > MAX_SHUFFLE_FLUSH_WAVE {
+        return Err("shuffle flush wave exceeds its reserved checkpoint-barrier field");
+    }
+    Ok(SHUFFLE_FLUSH_TAG
+        | (wave << SHUFFLE_FLUSH_WAVE_SHIFT)
+        | if activity { SHUFFLE_FLUSH_ACTIVITY } else { 0 })
+}
+
+/// Decode one internal clustered-shuffle flush marker into `(wave, sender_activity)`.
+///
+/// # Errors
+/// Rejects an untagged marker and every bit outside the internal layout. This is deliberately
+/// stricter than the general-purpose checkpoint barrier flags because shuffle-wave metadata must
+/// never be confused with source/control-plane behavior flags.
+pub fn decode_shuffle_flush_flags(flags: u64) -> Result<(u64, bool), &'static str> {
+    if flags & SHUFFLE_FLUSH_TAG == 0 {
+        return Err("shuffle flush marker is missing its internal tag");
+    }
+    if flags & !SHUFFLE_FLUSH_INTERNAL_MASK != 0 {
+        return Err("shuffle flush marker uses reserved or checkpoint behavior flags");
+    }
+    Ok((
+        (flags & SHUFFLE_FLUSH_WAVE_MASK) >> SHUFFLE_FLUSH_WAVE_SHIFT,
+        flags & SHUFFLE_FLUSH_ACTIVITY != 0,
+    ))
+}
+
 /// A checkpoint barrier that flows through the dataflow graph.
 ///
 /// This is a 24-byte `#[repr(C)]` value type that can be cheaply copied
@@ -386,6 +436,28 @@ mod tests {
         assert!(drain.is_drain());
         assert!(!CheckpointBarrier::new(0, 0).is_canonical());
         assert!(!CheckpointBarrier::new(1, 2).is_canonical());
+    }
+
+    #[test]
+    fn shuffle_flush_flags_roundtrip_bounds_and_activity() {
+        for (wave, activity) in [
+            (0, false),
+            (0, true),
+            (1, false),
+            (MAX_SHUFFLE_FLUSH_WAVE, true),
+        ] {
+            let encoded = encode_shuffle_flush_flags(wave, activity).unwrap();
+            assert_eq!(decode_shuffle_flush_flags(encoded), Ok((wave, activity)));
+        }
+        assert!(encode_shuffle_flush_flags(MAX_SHUFFLE_FLUSH_WAVE + 1, false).is_err());
+    }
+
+    #[test]
+    fn shuffle_flush_flags_reject_untagged_and_reserved_bits() {
+        assert!(decode_shuffle_flush_flags(0).is_err());
+        assert!(decode_shuffle_flush_flags(flags::HANDOFF).is_err());
+        let encoded = encode_shuffle_flush_flags(7, true).unwrap();
+        assert!(decode_shuffle_flush_flags(encoded | flags::FULL_SNAPSHOT).is_err());
     }
 
     #[test]

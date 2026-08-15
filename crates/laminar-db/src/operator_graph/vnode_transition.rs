@@ -34,6 +34,16 @@ struct ProjectedTransitionFrames<'a> {
     whole_restores: Vec<ManagedWholeRestore<'a>>,
 }
 
+fn accepts_portable_whole_state(contract: ManagedStateContract) -> bool {
+    matches!(
+        contract,
+        ManagedStateContract::SqlAggregateV1
+            | ManagedStateContract::BoundedIntervalJoinV3
+            | ManagedStateContract::CoreWindowV1
+            | ManagedStateContract::TemporalJoinV1
+    )
+}
+
 impl VnodeTransitionAuthoritySnapshot {
     fn capture(
         config: &ClusterShuffleConfig,
@@ -457,14 +467,15 @@ impl OperatorGraph {
             .iter()
             .map(|owner| owner.0)
             .collect::<Vec<_>>();
-        if predecessor.assignment_version.checked_add(1) != Some(target.assignment_version)
+        if predecessor.assignment_version >= target.assignment_version
             || predecessor.vnode_count != u32::from(self.key_group_count)
             || target.vnode_count != predecessor.vnode_count
+            || target.partitioning_abi_version != predecessor.partitioning_abi_version
             || !predecessor.is_canonical()
             || !predecessor.matches_owner_map(&predecessor_owner_ids)
         {
             return Err(DbError::Checkpoint(
-                "[LDB-6051] reassigned checkpoint restore is not an exact adjacent predecessor cut"
+                "[LDB-6051] reassigned checkpoint restore is not a compatible older committed cut"
                     .into(),
             ));
         }
@@ -852,6 +863,9 @@ impl OperatorGraph {
             frames
                 .restores
                 .sort_unstable_by_key(|restore| restore.vnode);
+            frames
+                .whole_restores
+                .sort_unstable_by_key(|restore| restore.participant_id);
         }
         Ok(projected)
     }
@@ -868,14 +882,26 @@ impl OperatorGraph {
         })
     }
 
-    fn validate_transition_state_budget(
-        &self,
+    pub(super) fn validate_transition_state_budget(
+        &mut self,
         payload_bytes: usize,
         context: impl Into<String>,
     ) -> Result<(), DbError> {
-        let accounted_bytes = self
+        let mut accounted_bytes = self
             .managed_state_accounted_bytes()
             .saturating_add(payload_bytes);
+        if accounted_bytes > self.max_managed_state_bytes {
+            let _reported_evicted_bytes = self
+                .nodes
+                .iter_mut()
+                .filter(|node| !node.removed)
+                .fold(0usize, |total, node| {
+                    total.saturating_add(node.operator.evict_optional_managed_state())
+                });
+            accounted_bytes = self
+                .managed_state_accounted_bytes()
+                .saturating_add(payload_bytes);
+        }
         if accounted_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: context.into(),
@@ -959,14 +985,7 @@ impl OperatorGraph {
                     return Err(error);
                 }
             };
-            if !frames.whole_restores.is_empty()
-                && !matches!(
-                    contract,
-                    ManagedStateContract::BoundedIntervalJoinV3
-                        | ManagedStateContract::CoreWindowV1
-                        | ManagedStateContract::TemporalJoinV1
-                )
-            {
+            if !frames.whole_restores.is_empty() && !accepts_portable_whole_state(contract) {
                 let name = Arc::clone(&self.nodes[node_idx].name);
                 let prepared = PreparedManagedOperators {
                     node_indices: attempted,
@@ -1006,6 +1025,9 @@ impl OperatorGraph {
                     node_indices: attempted,
                 };
                 self.abort_and_finish_managed_operators(&prepared);
+                if error.requires_pipeline_halt() {
+                    return Err(error);
+                }
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6051] vnode transition preparation for operator '{name}' failed: {error}"
                 )));
@@ -1275,5 +1297,17 @@ impl OperatorGraph {
             "completed committed final-owner-exit vnode cleanup"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod portable_whole_tests {
+    use super::*;
+
+    #[test]
+    fn sql_aggregate_accepts_portable_whole_transition_state() {
+        assert!(accepts_portable_whole_state(
+            ManagedStateContract::SqlAggregateV1
+        ));
     }
 }

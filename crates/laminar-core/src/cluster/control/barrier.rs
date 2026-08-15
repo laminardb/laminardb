@@ -195,8 +195,8 @@ const PREPARE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
-    /// Align the shuffle, capture state locally, ack. The durable tail
-    /// (sink pre-commit, manifest, uploads) completes before the ack.
+    /// Align the shuffle, capture state locally, and transfer the immutable cut to a supervised
+    /// tail before acknowledging capture. Durable preparation continues in that tail.
     Prepare,
     /// Every node has aligned + captured this epoch (full-membership
     /// capture quorum). Pipelines may resume the next epoch; the epoch
@@ -446,12 +446,18 @@ fn validate_scanned_announcements(
 /// Follower checkpoint-prepare disposition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BarrierAckDisposition {
-    /// Local alignment, capture, and durable preparation completed.
+    /// Legacy durable-prepare acknowledgement. It is deliberately not accepted as a capture
+    /// acknowledgement without an explicit mixed-version capability negotiation.
     Prepared,
-    /// Local preparation completed and the captured cut retains handoff replay work.
+    /// Legacy durable-prepare acknowledgement retaining handoff replay work.
     PreparedWithReplay,
     /// Local checkpoint preparation failed and requires normal failure handling.
     Failed,
+    /// Local alignment and capture completed, the sink epoch is sealed, and a supervised tail
+    /// owns the exact immutable cut. Durable preparation may still be running.
+    Captured,
+    /// Capture ownership completed and the captured cut retains handoff replay work.
+    CapturedWithReplay,
 }
 
 impl BarrierAckDisposition {
@@ -459,7 +465,9 @@ impl BarrierAckDisposition {
         match self {
             Self::Prepared => 0,
             Self::PreparedWithReplay => 1,
-            Self::Failed => 2,
+            Self::Captured => 2,
+            Self::CapturedWithReplay => 3,
+            Self::Failed => 4,
         }
     }
 }
@@ -475,7 +483,7 @@ pub struct BarrierAck {
     pub assignment_digest: Option<[u8; 32]>,
     /// Exact behavior flags echoed from the announcement.
     pub flags: u64,
-    /// Typed local prepare result.
+    /// Typed local capture/prepare result.
     pub disposition: BarrierAckDisposition,
     /// Free-text reason; populated when preparation fails.
     pub error: Option<String>,
@@ -1008,6 +1016,10 @@ fn ack_disposition_to_wire(disposition: BarrierAckDisposition) -> i32 {
             WireDisposition::BarrierAckPreparedWithReplay as i32
         }
         BarrierAckDisposition::Failed => WireDisposition::BarrierAckFailed as i32,
+        BarrierAckDisposition::Captured => WireDisposition::BarrierAckCaptured as i32,
+        BarrierAckDisposition::CapturedWithReplay => {
+            WireDisposition::BarrierAckCapturedWithReplay as i32
+        }
     }
 }
 
@@ -1051,6 +1063,10 @@ fn ack_disposition_from_wire(value: i32) -> Result<BarrierAckDisposition, String
             Ok(BarrierAckDisposition::PreparedWithReplay)
         }
         Ok(WireDisposition::BarrierAckFailed) => Ok(BarrierAckDisposition::Failed),
+        Ok(WireDisposition::BarrierAckCaptured) => Ok(BarrierAckDisposition::Captured),
+        Ok(WireDisposition::BarrierAckCapturedWithReplay) => {
+            Ok(BarrierAckDisposition::CapturedWithReplay)
+        }
         Err(_) => Err(format!(
             "unknown barrier acknowledgement disposition {value}"
         )),
@@ -1751,6 +1767,7 @@ fn send_local_phase_notification(
 
 /// Typed prepare-failure classification for the quorum wait.
 #[cfg(feature = "cluster")]
+#[derive(Debug)]
 enum PeerFailure {
     Unreachable,
     Nack(String),
@@ -1771,21 +1788,30 @@ struct PrepareFanoutBatch {
 #[cfg(feature = "cluster")]
 #[derive(Clone, Copy)]
 struct PrepareFanoutBudget {
-    total: Duration,
+    deadline: tokio::time::Instant,
     per_attempt: Duration,
 }
 
+#[cfg(not(feature = "cluster"))]
+type PrepareFanoutBudget = ();
+
 #[cfg(feature = "cluster")]
-fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget, String> {
-    if quorum_window.is_zero() {
+fn prepare_fanout_budget(
+    attempt_deadline: tokio::time::Instant,
+    retry_window: Duration,
+) -> Result<PrepareFanoutBudget, String> {
+    if attempt_deadline <= tokio::time::Instant::now() {
+        return Err("Prepare fan-out attempt deadline must be in the future".into());
+    }
+    if retry_window.is_zero() {
         return Err("Prepare quorum window must be greater than zero".into());
     }
-    let per_attempt = quorum_window / 2;
+    let per_attempt = retry_window / 2;
     if per_attempt.is_zero() {
         return Err("Prepare quorum window is too small to divide into retry attempts".into());
     }
     Ok(PrepareFanoutBudget {
-        total: PREPARE_RPC_TIMEOUT.max(quorum_window),
+        deadline: attempt_deadline,
         per_attempt,
     })
 }
@@ -1794,7 +1820,7 @@ fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget,
 enum PrepareFanoutState {
     Pending(PrepareFanoutBatch),
     Claimed(BarrierAnnouncement),
-    QuorumReached(BarrierAnnouncement),
+    CaptureQuorumReached(BarrierAnnouncement),
 }
 
 #[cfg(feature = "cluster")]
@@ -1802,7 +1828,7 @@ impl PrepareFanoutState {
     const fn announcement(&self) -> &BarrierAnnouncement {
         match self {
             Self::Pending(batch) => &batch.announcement,
-            Self::Claimed(announcement) | Self::QuorumReached(announcement) => announcement,
+            Self::Claimed(announcement) | Self::CaptureQuorumReached(announcement) => announcement,
         }
     }
 }
@@ -1897,7 +1923,7 @@ fn clustered_phase_roster(
 #[cfg(feature = "cluster")]
 fn prepare_fanout_plan(
     announcement: &BarrierAnnouncement,
-    quorum_window: Option<Duration>,
+    budget: Option<PrepareFanoutBudget>,
 ) -> Result<(Option<Vec<NodeId>>, Option<PrepareFanoutBudget>), String> {
     if announcement.phase != Phase::Prepare {
         return Ok((None, None));
@@ -1906,12 +1932,10 @@ fn prepare_fanout_plan(
     let budget = roster
         .as_ref()
         .map(|_| {
-            quorum_window.ok_or_else(|| {
+            budget.ok_or_else(|| {
                 "assignment-certified Prepare has no quorum retry window".to_string()
             })
         })
-        .transpose()?
-        .map(prepare_fanout_budget)
         .transpose()?;
     Ok((roster, budget))
 }
@@ -1937,7 +1961,7 @@ fn install_prepare_fanout(
     budget: PrepareFanoutBudget,
 ) {
     let mut pending = state.prepare_fanout.lock();
-    let rpc_deadline = tokio::time::Instant::now() + budget.total;
+    let rpc_deadline = budget.deadline;
     let mut tasks = tokio::task::JoinSet::new();
     for &peer in &expected {
         let clients_pool = Arc::clone(&state.clients);
@@ -1989,7 +2013,7 @@ fn preflight_prepare_fanout(
             PrepareFanoutState::Claimed(_) => {
                 Err("Prepare cannot be republished while its quorum is being collected".into())
             }
-            PrepareFanoutState::QuorumReached(_) => {
+            PrepareFanoutState::CaptureQuorumReached(_) => {
                 Err("Prepare cannot regress an exact quorum-ready checkpoint".into())
             }
         },
@@ -2003,14 +2027,14 @@ fn preflight_prepare_fanout(
 }
 
 #[cfg(feature = "cluster")]
-fn mark_prepare_quorum_reached(
+fn mark_capture_quorum_reached(
     state: &GrpcState,
     prepare: &BarrierAnnouncement,
 ) -> Result<(), String> {
     let mut fanout = state.prepare_fanout.lock();
     match fanout.take() {
         Some(PrepareFanoutState::Claimed(claimed)) if claimed == *prepare => {
-            *fanout = Some(PrepareFanoutState::QuorumReached(claimed));
+            *fanout = Some(PrepareFanoutState::CaptureQuorumReached(claimed));
             Ok(())
         }
         Some(other) => {
@@ -2024,8 +2048,8 @@ fn mark_prepare_quorum_reached(
 #[cfg(feature = "cluster")]
 fn require_aligned_quorum(state: &GrpcState, aligned: &BarrierAnnouncement) -> Result<(), String> {
     let fanout = state.prepare_fanout.lock();
-    let Some(PrepareFanoutState::QuorumReached(prepare)) = fanout.as_ref() else {
-        return Err("clustered Aligned requires a successful exact Prepare quorum".into());
+    let Some(PrepareFanoutState::CaptureQuorumReached(prepare)) = fanout.as_ref() else {
+        return Err("clustered Aligned requires a successful exact capture quorum".into());
     };
     if !same_announcement_identity(prepare, aligned) {
         return Err("clustered Aligned does not match the exact reached Prepare quorum".into());
@@ -2088,7 +2112,7 @@ fn prepare_rpc_request(
 }
 
 #[cfg(feature = "cluster")]
-fn validate_prepare_ack(
+fn validate_capture_ack(
     peer: NodeId,
     prepare: &BarrierAnnouncement,
     assignment_digest: Option<&[u8; 32]>,
@@ -2111,8 +2135,8 @@ fn validate_prepare_ack(
             .unwrap_or_else(|| "Prepare acknowledgement has no reason".to_string())
     };
     let handoff_replay_pending = match ack_disposition_from_wire(ack.disposition) {
-        Ok(BarrierAckDisposition::Prepared) => false,
-        Ok(BarrierAckDisposition::PreparedWithReplay) => {
+        Ok(BarrierAckDisposition::Captured) => false,
+        Ok(BarrierAckDisposition::CapturedWithReplay) => {
             if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
                 return Err((
                     peer,
@@ -2122,6 +2146,15 @@ fn validate_prepare_ack(
                 ));
             }
             true
+        }
+        Ok(BarrierAckDisposition::Prepared | BarrierAckDisposition::PreparedWithReplay) => {
+            return Err((
+                peer,
+                PeerFailure::Nack(
+                    "Prepare requires an explicit Captured acknowledgement from every participant"
+                        .into(),
+                ),
+            ));
         }
         Ok(BarrierAckDisposition::Failed) => {
             return Err((peer, PeerFailure::Nack(reason())));
@@ -2221,7 +2254,7 @@ async fn prepare_peer_until_deadline(
 
         match tokio::time::timeout_at(attempt_deadline, client.prepare(request)).await {
             Ok(Ok(response)) => {
-                return validate_prepare_ack(
+                return validate_capture_ack(
                     peer,
                     &prepare,
                     assignment_digest.as_ref(),
@@ -2263,6 +2296,11 @@ pub struct BarrierCoordinator {
     publication: tokio::sync::Mutex<AnnouncementPublicationState>,
     #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
+    /// First local observation time for each exact Prepare identity. Direct gRPC receipt is the
+    /// preferred clock, while this transport-independent registry gives the gossip fallback the
+    /// same non-refreshing attempt deadline across repeated observations.
+    #[cfg(feature = "cluster")]
+    prepare_observed_at: parking_lot::Mutex<FxHashMap<BarrierIdentity, std::time::Instant>>,
     #[cfg(feature = "cluster")]
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
     #[cfg(feature = "cluster")]
@@ -2304,6 +2342,8 @@ impl BarrierCoordinator {
             publication: tokio::sync::Mutex::new(AnnouncementPublicationState::default()),
             #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            prepare_observed_at: parking_lot::Mutex::new(FxHashMap::default()),
             #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -2517,14 +2557,8 @@ impl BarrierCoordinator {
         *self.leader_election.lock() = Some((instance_id, members_rx, leader_eligible));
     }
 
-    /// Local monotonic receipt time for this exact gRPC Prepare.
     #[cfg(feature = "cluster")]
-    #[must_use]
-    pub fn prepare_received_at(&self, prepare: &BarrierAnnouncement) -> Option<std::time::Instant> {
-        if prepare.phase != Phase::Prepare {
-            return None;
-        }
-        let identity = BarrierIdentity::from_announcement(prepare);
+    fn direct_prepare_received_at(&self, identity: BarrierIdentity) -> Option<std::time::Instant> {
         self.grpc.lock().as_ref().and_then(|state| {
             state
                 .prepare_acks
@@ -2533,6 +2567,97 @@ impl BarrierCoordinator {
                 .get(&identity)
                 .copied()
         })
+    }
+
+    /// Preserve the first local clock for an exact Prepare across retries and across direct or
+    /// gossip delivery. A direct accepted receipt wins when it predates local gossip observation.
+    #[cfg(feature = "cluster")]
+    pub(super) fn prepare_received_at_or_insert(
+        &self,
+        prepare: &BarrierAnnouncement,
+        observed_at: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if prepare.phase != Phase::Prepare {
+            return None;
+        }
+        let identity = BarrierIdentity::from_announcement(prepare);
+        let candidate = self
+            .direct_prepare_received_at(identity)
+            .map_or(observed_at, |received_at| received_at.min(observed_at));
+        let mut observations = self.prepare_observed_at.lock();
+        if !observations.contains_key(&identity) {
+            while observations.len() >= MAX_RETAINED_BARRIER_IDENTITIES {
+                let Some(oldest) = observations
+                    .iter()
+                    .min_by_key(|(_, observed_at)| **observed_at)
+                    .map(|(identity, _)| *identity)
+                else {
+                    break;
+                };
+                observations.remove(&oldest);
+            }
+        }
+        let retained = *observations
+            .entry(identity)
+            .and_modify(|retained| *retained = (*retained).min(candidate))
+            .or_insert(candidate);
+        Some(retained)
+    }
+
+    /// Local monotonic receipt or first-observation time for this exact Prepare.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn prepare_received_at(&self, prepare: &BarrierAnnouncement) -> Option<std::time::Instant> {
+        if prepare.phase != Phase::Prepare {
+            return None;
+        }
+        let identity = BarrierIdentity::from_announcement(prepare);
+        match (
+            self.direct_prepare_received_at(identity),
+            self.prepare_observed_at.lock().get(&identity).copied(),
+        ) {
+            (Some(direct), Some(observed)) => Some(direct.min(observed)),
+            (Some(received), None) | (None, Some(received)) => Some(received),
+            (None, None) => None,
+        }
+    }
+
+    /// Install one direct Prepare receipt through the real relay for deterministic controller
+    /// observation tests. Production direct delivery records the same clock before enqueueing.
+    ///
+    /// # Errors
+    /// Rejects malformed/non-Prepare input, a missing or closed relay, or a relay that does not
+    /// publish the injected value.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(super) async fn inject_direct_prepare_observation_for_test(
+        &self,
+        prepare: BarrierAnnouncement,
+        received_at: std::time::Instant,
+    ) -> Result<(), String> {
+        validate_announcement_attempt(&prepare)?;
+        if prepare.phase != Phase::Prepare {
+            return Err("direct Prepare test observation requires Prepare phase".into());
+        }
+        let state = self.grpc.lock().clone().ok_or_else(|| {
+            "direct Prepare test observation requires a started server".to_string()
+        })?;
+        let identity = BarrierIdentity::from_announcement(&prepare);
+        state
+            .prepare_acks
+            .lock()
+            .received_at
+            .entry(identity)
+            .or_insert(received_at);
+        if state.incoming_tx.send(prepare.clone()).await.is_err() {
+            return Err("direct Prepare test relay is closed".into());
+        }
+        for _ in 0..1_024 {
+            if state.latest_rx.borrow().as_ref() == Some(&prepare) {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err("direct Prepare test observation was not relayed".into())
     }
 
     /// Bind and run the follower's direct gRPC barrier sync server.
@@ -2765,22 +2890,41 @@ impl BarrierCoordinator {
         ann: &BarrierAnnouncement,
         quorum_window: Duration,
     ) -> Result<(), String> {
+        let attempt_deadline = tokio::time::Instant::now() + PREPARE_RPC_TIMEOUT.max(quorum_window);
+        self.announce_prepare_until(ann, attempt_deadline, quorum_window)
+            .await
+    }
+
+    /// Publish Prepare with an exact absolute attempt deadline and an independent short retry
+    /// window. Durable admission/publication latency therefore cannot refresh fan-out lifetime.
+    ///
+    /// # Errors
+    /// Rejects an expired attempt deadline or invalid retry window in addition to
+    /// [`Self::announce_prepare`] errors.
+    #[cfg(feature = "cluster")]
+    pub async fn announce_prepare_until(
+        &self,
+        ann: &BarrierAnnouncement,
+        attempt_deadline: tokio::time::Instant,
+        retry_window: Duration,
+    ) -> Result<(), String> {
         if ann.phase != Phase::Prepare || ann.assignment_fence.is_none() {
             return Err("explicit Prepare fan-out requires an assignment certificate".into());
         }
-        self.announce_inner(ann, Some(quorum_window)).await
+        let budget = prepare_fanout_budget(attempt_deadline, retry_window)?;
+        self.announce_inner(ann, Some(budget)).await
     }
 
     async fn announce_inner(
         &self,
         ann: &BarrierAnnouncement,
-        prepare_quorum_window: Option<Duration>,
+        prepare_budget: Option<PrepareFanoutBudget>,
     ) -> Result<(), String> {
         validate_announcement_attempt(ann)?;
         #[cfg(feature = "cluster")]
         {
             self.validate_reversible_announcement(ann).await?;
-            let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_quorum_window)?;
+            let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_budget)?;
             let grpc_opt = self.grpc.lock().clone();
             let process_bound = self.local_process.get().is_some();
             match (process_bound, ann.assignment_fence.is_some()) {
@@ -2975,7 +3119,7 @@ impl BarrierCoordinator {
 
         #[cfg(not(feature = "cluster"))]
         {
-            let _ = prepare_quorum_window;
+            let _ = prepare_budget;
             let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
             let mut publication = self.publication.lock().await;
             if !publication.initialized {
@@ -3192,7 +3336,7 @@ impl BarrierCoordinator {
                         }
                         Some(
                             state @ (PrepareFanoutState::Claimed(_)
-                            | PrepareFanoutState::QuorumReached(_)),
+                            | PrepareFanoutState::CaptureQuorumReached(_)),
                         ) => {
                             let exact = state.announcement() == prepare;
                             *pending = Some(state);
@@ -3299,7 +3443,7 @@ impl BarrierCoordinator {
                 }
 
                 if prepare.assignment_fence.is_some() {
-                    if let Err(error) = mark_prepare_quorum_reached(&state, prepare) {
+                    if let Err(error) = mark_capture_quorum_reached(&state, prepare) {
                         return QuorumOutcome::Failed {
                             failures: vec![(
                                 expected_roster
@@ -3349,7 +3493,7 @@ impl BarrierCoordinator {
                     continue;
                 }
                 match ack.disposition {
-                    BarrierAckDisposition::Prepared => {
+                    BarrierAckDisposition::Captured => {
                         if let Err(error) = ack.watermark.validate() {
                             failures.push((from, error));
                         } else {
@@ -3360,7 +3504,7 @@ impl BarrierCoordinator {
                                 }));
                         }
                     }
-                    BarrierAckDisposition::PreparedWithReplay => {
+                    BarrierAckDisposition::CapturedWithReplay => {
                         if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
                             failures.push((
                                 from,
@@ -3384,6 +3528,13 @@ impl BarrierCoordinator {
                             ack.error.unwrap_or_else(|| {
                                 "Prepare acknowledgement has no reason".to_string()
                             }),
+                        ));
+                    }
+                    BarrierAckDisposition::Prepared | BarrierAckDisposition::PreparedWithReplay => {
+                        failures.push((
+                            from,
+                            "Prepare requires an explicit Captured acknowledgement from every participant"
+                                .into(),
                         ));
                     }
                 }

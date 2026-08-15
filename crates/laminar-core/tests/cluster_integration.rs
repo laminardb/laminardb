@@ -241,7 +241,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
                 checkpoint_id: 7,
                 assignment_digest,
                 flags: 0,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             })
@@ -661,7 +661,7 @@ async fn quorum_times_out_when_follower_silent() {
             checkpoint_id: 42,
             assignment_digest,
             flags: 0,
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
         })

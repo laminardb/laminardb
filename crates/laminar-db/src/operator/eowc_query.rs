@@ -74,8 +74,33 @@ enum CoreWindowTransitionCleanup {
 
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
 const OPERATOR_CHECKPOINT_BASE_SCRATCH: usize = 512;
+const CHECKPOINT_ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 #[cfg(feature = "cluster")]
 const OPERATOR_CAPTURE_ALLOCATION_CHARGE: usize = 32;
+
+fn checkpoint_alignment_copy_bytes(bytes: &[u8]) -> usize {
+    if bytes.as_ptr().align_offset(CHECKPOINT_ARCHIVE_ALIGNMENT) == 0 {
+        0
+    } else {
+        bytes.len()
+    }
+}
+
+fn with_aligned_checkpoint_bytes<T>(
+    bytes: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    let aligned;
+    let bytes = if checkpoint_alignment_copy_bytes(bytes) == 0 {
+        bytes
+    } else {
+        let mut copy = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        copy.extend_from_slice(bytes);
+        aligned = copy;
+        &aligned
+    };
+    decode(bytes)
+}
 
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct EowcCheckpointFrontier {
@@ -687,7 +712,7 @@ impl EowcQueryOperator {
     }
 
     fn core_window_apply_error(op_name: &str, phase: &str, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             return error;
         }
         DbError::StatefulOperatorPartialApply(format!(
@@ -1201,6 +1226,24 @@ impl EowcQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn cluster_cycle_local_frontier(
+        &self,
+        supplied: InputFrontier,
+        has_data: bool,
+    ) -> Result<InputFrontier, DbError> {
+        if self.last_broadcast == self.local_frontier {
+            return Ok(supplied);
+        }
+        if has_data {
+            return Err(DbError::InvalidOperation(format!(
+                "managed CoreWindow '{}' received local input before its restored frontier was broadcast",
+                self.op_name
+            )));
+        }
+        Ok(self.local_frontier)
+    }
+
+    #[cfg(feature = "cluster")]
     fn normalized_local_frontier(
         &self,
         input: InputFrontier,
@@ -1360,7 +1403,7 @@ impl EowcQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn remote_replay_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::Checkpoint(format!(
@@ -1534,7 +1577,7 @@ impl EowcQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn outbound_finalize_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::ShufflePartialSend(format!(
@@ -1642,6 +1685,12 @@ impl EowcQueryOperator {
         }
         let input_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let has_data = input_batches.iter().any(|batch| batch.num_rows() != 0);
+        // A restored/transitioned topology deliberately leaves its exact local cut
+        // unbroadcast, which makes `wants_input` hold graph-buffered rows. Do not let the
+        // concurrently observed live source frontier leap over that cut during this
+        // frontier-only bootstrap cycle. Once the cut is acknowledged, normal node-local
+        // frontier advancement resumes on the next cycle.
+        let frontier = self.cluster_cycle_local_frontier(frontier, has_data)?;
         let local_frontier = self.normalized_local_frontier(frontier, has_data)?;
         let watermark = Self::frontier_watermark(local_frontier);
         let pre_aggregate = {
@@ -2432,14 +2481,16 @@ impl EowcQueryOperator {
                     self.op_name, restore.participant_id
                 )));
             }
-            let checkpoint =
-                rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(restore.state)
-                    .map_err(|error| {
+            let checkpoint = with_aligned_checkpoint_bytes(restore.state, |state| {
+                rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(state).map_err(
+                    |error| {
                         DbError::Checkpoint(format!(
                             "managed CoreWindow '{}' donor {} whole checkpoint: {error}",
                             self.op_name, restore.participant_id
                         ))
-                    })?;
+                    },
+                )
+            })?;
             if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
                 return Err(DbError::Checkpoint(format!(
                     "managed CoreWindow '{}' donor {} uses unsupported checkpoint version {}",
@@ -2564,6 +2615,12 @@ impl EowcQueryOperator {
                 true
             }
         };
+        let version_edge_valid = if checkpoint_bootstrap {
+            transition.predecessor.assignment_version < transition.target.assignment_version
+        } else {
+            transition.predecessor.assignment_version.checked_add(1)
+                == Some(transition.target.assignment_version)
+        };
         let target_contains_self = assignment.owners().contains(&config.self_id);
         let endpoints_match_process = config.sender.local_id() == config.self_id.0
             && config.receiver.local_id() == config.self_id.0
@@ -2606,8 +2663,7 @@ impl EowcQueryOperator {
             || transition.predecessor.vnode_count != u32::from(self.key_group_count)
             || transition.target.assignment_version != assignment.version()
             || !transition.target.matches_owner_map(&owners)
-            || transition.predecessor.assignment_version.checked_add(1)
-                != Some(transition.target.assignment_version)
+            || !version_edge_valid
             || config.sender.recovery_gen() != config.receiver.recovery_gen()
             || target_contains_self != transition.target.contains(config.self_id.0)
             || (target_contains_self && !active_transport)
@@ -2692,10 +2748,25 @@ impl EowcQueryOperator {
             )
             .try_fold(0usize, usize::checked_add)
             .ok_or_else(|| self.accounting_error())?;
-        if payload_bytes > self.max_managed_state_bytes {
+        let alignment_copy_bytes = transition
+            .restores
+            .iter()
+            .map(|restore| checkpoint_alignment_copy_bytes(restore.state))
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| checkpoint_alignment_copy_bytes(restore.state)),
+            )
+            .max()
+            .unwrap_or(0);
+        let payload_phase_bytes = payload_bytes
+            .checked_add(alignment_copy_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if payload_phase_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: format!("managed CoreWindow '{}' transition payload", self.op_name),
-                accounted_bytes: payload_bytes,
+                accounted_bytes: payload_phase_bytes,
                 limit_bytes: self.max_managed_state_bytes,
             });
         }
@@ -2732,22 +2803,26 @@ impl EowcQueryOperator {
                 ))
             })?;
         for restore in transition.restores {
-            let state = window.preflight_vnode_bytes(
-                restore.vnode,
-                transition.target.vnode_count,
-                restore.state,
-            )?;
-            preflighted.push((restore.vnode, state));
+            with_aligned_checkpoint_bytes(restore.state, |state| {
+                window
+                    .preflight_vnode_bytes(restore.vnode, transition.target.vnode_count, state)
+                    .map(|_| ())
+            })?;
+            preflighted.push((restore.vnode, restore.state));
         }
-        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
-            let state = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
-                state.checkpoint,
-            )
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "CoreWindow '{}' vnode {vnode} transition deserialization: {error}",
-                    self.op_name
-                ))
+        let owned_restores = preflighted.into_iter().map(|(vnode, bytes)| {
+            let state = with_aligned_checkpoint_bytes(bytes, |state| {
+                let state =
+                    window.preflight_vnode_bytes(vnode, transition.target.vnode_count, state)?;
+                rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+                    state.checkpoint,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "CoreWindow '{}' vnode {vnode} transition deserialization: {error}",
+                        self.op_name
+                    ))
+                })
             })?;
             Ok(crate::core_window_state::OwnedCoreWindowVnodeRestore { vnode, state })
         });
@@ -3036,19 +3111,29 @@ impl GraphOperator for EowcQueryOperator {
             )));
         }
         let OperatorCheckpoint { data } = checkpoint;
-        if data.len() > self.max_managed_state_bytes {
+        let restore_bytes = data
+            .len()
+            .checked_add(checkpoint_alignment_copy_bytes(&data))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "EOWC whole checkpoint for '{}' exceeds its restore limit",
+                    self.op_name
+                ))
+            })?;
+        if restore_bytes > self.max_managed_state_bytes {
             return Err(DbError::Checkpoint(format!(
                 "EOWC whole checkpoint for '{}' exceeds its restore limit",
                 self.op_name
             )));
         }
-        let checkpoint = rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(&data)
-            .map_err(|error| {
+        let checkpoint = with_aligned_checkpoint_bytes(&data, |data| {
+            rkyv::from_bytes::<EowcOperatorCheckpoint, rkyv::rancor::Error>(data).map_err(|error| {
                 DbError::Checkpoint(format!(
                     "EOWC whole checkpoint deserialization for '{}': {error}",
                     self.op_name
                 ))
-            })?;
+            })
+        })?;
         drop(data);
         if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
             return Err(DbError::Checkpoint(format!(
@@ -3242,18 +3327,14 @@ impl GraphOperator for EowcQueryOperator {
             )));
         }
         let previous = self.peer_channels[&peer].accepted;
-        self.validate_frontier(previous, frontier, "accepted remote")?;
-        let frontier = if previous.idle && !frontier.idle {
-            InputFrontier {
-                watermark: Self::max_watermark(
-                    frontier.watermark,
-                    self.effective_frontier.watermark,
-                ),
-                idle: false,
-            }
-        } else {
-            frontier
+        if previous.watermark.is_some() && frontier.watermark.is_none() {
+            self.validate_frontier(previous, frontier, "accepted remote")?;
+        }
+        let frontier = InputFrontier {
+            watermark: Self::max_watermark(frontier.watermark, self.effective_frontier.watermark),
+            ..frontier
         };
+        self.validate_frontier(previous, frontier, "accepted remote")?;
         let next_events = self
             .queued_remote_events
             .checked_add(1)
@@ -3330,15 +3411,36 @@ impl GraphOperator for EowcQueryOperator {
                 self.op_name
             ))
         })?;
-        let checkpoint = window.preflight_vnode_bytes(vnode, vnode_count, state)?;
-        let checkpoint = rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
-            checkpoint.checkpoint,
-        )
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "CoreWindow '{}' vnode {vnode} checkpoint deserialization: {error}",
-                self.op_name
-            ))
+        let restore_bytes = state
+            .len()
+            .checked_add(checkpoint_alignment_copy_bytes(state))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} restore accounting overflow",
+                    self.op_name
+                ))
+            })?;
+        if restore_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "managed CoreWindow '{}' vnode {vnode} restore",
+                    self.op_name
+                ),
+                accounted_bytes: restore_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let checkpoint = with_aligned_checkpoint_bytes(state, |state| {
+            let checkpoint = window.preflight_vnode_bytes(vnode, vnode_count, state)?;
+            rkyv::deserialize::<CoreWindowVnodeCheckpoint, rkyv::rancor::Error>(
+                checkpoint.checkpoint,
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "CoreWindow '{}' vnode {vnode} checkpoint deserialization: {error}",
+                    self.op_name
+                ))
+            })
         })?;
         let restored_high_watermark_ms = window.high_watermark_ms();
         let window = self
@@ -3690,8 +3792,20 @@ mod core_tests {
         (capture.vnode, bytes)
     }
 
+    fn unaligned_archive_transport(bytes: &[u8]) -> bytes::Bytes {
+        let mut transport = vec![0_u8; bytes.len() + CHECKPOINT_ARCHIVE_ALIGNMENT];
+        let base = transport.as_ptr() as usize;
+        let offset = (0..CHECKPOINT_ARCHIVE_ALIGNMENT)
+            .find(|offset| (base + offset) % CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .expect("an archive transport offset must be unaligned");
+        transport[offset..offset + bytes.len()].copy_from_slice(bytes);
+        let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());
+        assert_ne!(bytes.as_ptr().align_offset(CHECKPOINT_ARCHIVE_ALIGNMENT), 0);
+        bytes
+    }
+
     #[tokio::test]
-    async fn grouped_window_restores_exact_vnode_frames_and_frontier() {
+    async fn grouped_window_restores_exact_unaligned_vnode_frames_and_frontier() {
         let mut original = EowcQueryOperator::new(
             "managed_window",
             AGG_SQL,
@@ -3716,6 +3830,7 @@ mod core_tests {
         let frames = captures
             .into_iter()
             .map(materialize_capture)
+            .map(|(vnode, state)| (vnode, unaligned_archive_transport(&state)))
             .collect::<Vec<_>>();
         assert!(original
             .checkpoint_vnodes(&required, u32::from(key_groups()), u64::MAX)
@@ -3834,6 +3949,184 @@ mod core_tests {
                 }
             )
         ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpointed_remote_frontiers_compare_in_receiver_domain() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let mut operator = EowcQueryOperator::new(
+            "managed_window",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
+            None,
+        );
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_scope(scope.clone());
+        operator.effective_frontier = InputFrontier {
+            watermark: Some(500),
+            idle: false,
+        };
+        let idle = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        let channel = operator.peer_channels.get_mut(&2).unwrap();
+        channel.applied = idle;
+        channel.accepted = idle;
+        let assignment = scope.registry.assignment_version();
+        let recovery = scope.receiver.recovery_gen();
+        let active = |watermark| InputFrontier {
+            watermark: Some(watermark),
+            idle: false,
+        };
+
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                active(100),
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(500));
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                active(150),
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(500));
+        operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                active(550),
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(550));
+        assert!(operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                InputFrontier {
+                    watermark: None,
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .is_err());
+        assert!(operator
+            .stage_checkpointed_shuffle_frontier(
+                "managed_window",
+                2,
+                active(525),
+                assignment,
+                recovery,
+            )
+            .is_err());
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(550));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let mut operator = EowcQueryOperator::new(
+            "managed_window",
+            AGG_SQL,
+            Some(EmitClause::OnWindowClose),
+            Some(test_window_config()),
+            aggregate_context(),
+            key_groups(),
+            None,
+        );
+        operator.initialize_managed_state().await.unwrap();
+        let (symbol, local) = projected_batch_for_vnode(&operator, 0, 42.0);
+        let buffered = RecordBatch::try_new(
+            test_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![symbol.as_str()])),
+                Arc::new(Float64Array::from(vec![42.0])),
+                Arc::new(Int64Array::from(vec![1_000])),
+            ],
+        )
+        .unwrap();
+        operator.attach_cluster_scope(scope.clone());
+        let restored = InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        };
+        let live = InputFrontier {
+            watermark: Some(1_000),
+            idle: false,
+        };
+        operator.local_frontier = restored;
+        operator.effective_frontier = restored;
+        operator.last_broadcast = InputFrontier::default();
+        operator
+            .state
+            .as_mut()
+            .unwrap()
+            .restore_high_watermark_ms(100)
+            .unwrap();
+        let channel = operator.peer_channels.get_mut(&2).unwrap();
+        channel.applied = restored;
+        channel.accepted = restored;
+
+        assert!(!operator.wants_input());
+        let assignment = scope.registry.versioned_snapshot();
+        let bootstrap = operator.cluster_cycle_local_frontier(live, false).unwrap();
+        assert_eq!(bootstrap, restored);
+        let plan = operator
+            .plan_cluster_batches(Vec::new(), bootstrap, &scope, &assignment, &[2])
+            .unwrap();
+        assert!(matches!(
+            plan.outbound.as_slice(),
+            [(
+                2,
+                ShuffleMessage::Frontier {
+                    watermark: Some(100),
+                    idle: false,
+                    ..
+                }
+            )]
+        ));
+        operator.process_cluster(&[Vec::new()], live).await.unwrap();
+        let mut pending = operator.pending_cluster_input.take().unwrap();
+        assert_eq!(pending.local_frontier, restored);
+        assert!(pending.local_batches.is_empty());
+        pending.send.take().unwrap().abort();
+
+        // Simulate completion of the bootstrap send. The graph may now release its retained row,
+        // and the ordinary node-local frontier is used without being globally frozen.
+        operator.last_broadcast = restored;
+        assert!(operator.wants_input());
+        let admitted = operator.cluster_cycle_local_frontier(live, true).unwrap();
+        assert_eq!(admitted, live);
+        let plan = operator
+            .plan_cluster_batches(vec![local], admitted, &scope, &assignment, &[2])
+            .unwrap();
+        assert_eq!(plan.local_batches.len(), 1);
+        assert_eq!(plan.local_frontier, live);
+        operator
+            .process_cluster(&[vec![buffered]], live)
+            .await
+            .unwrap();
+        let mut pending = operator.pending_cluster_input.take().unwrap();
+        assert_eq!(pending.local_frontier, live);
+        assert_eq!(pending.local_batches.len(), 1);
+        pending.send.take().unwrap().abort();
     }
 
     #[cfg(feature = "cluster")]
@@ -4240,10 +4533,11 @@ mod core_tests {
 
         let target_owners = [1, 1, 2, 2, 2, 2, 2, 2];
         let scope = cluster_scope(target_owners).await;
+        let _skipped_assignment = install_next_assignment(&scope, target_owners);
         let target_fence = install_next_assignment(&scope, target_owners);
         let predecessor_owners = [2, 3, 2, 2, 2, 2, 2, 2];
         let predecessor =
-            test_assignment_fence(target_fence.assignment_version - 1, &predecessor_owners);
+            test_assignment_fence(target_fence.assignment_version - 2, &predecessor_owners);
         let predecessor_nodes = predecessor_owners.map(NodeId);
 
         let mut target = new_operator();
@@ -4338,14 +4632,16 @@ mod core_tests {
         assert_eq!(target.effective_frontier, InputFrontier::default());
         assert_eq!(target.cluster_peers.as_ref(), &[2]);
 
+        let unaligned_donor2 = unaligned_archive_transport(&donor2);
+        let unaligned_donor3 = unaligned_archive_transport(&donor3);
         let valid_whole = [
             ManagedWholeRestore {
                 participant_id: 2,
-                state: &donor2,
+                state: &unaligned_donor2,
             },
             ManagedWholeRestore {
                 participant_id: 3,
-                state: &donor3,
+                state: &unaligned_donor3,
             },
         ];
         target
@@ -4650,6 +4946,49 @@ mod core_tests {
         );
         assert_eq!(&*op.op_name, "test_eowc");
         assert!(op.state.is_none());
+    }
+
+    #[test]
+    fn core_window_partial_apply_wrapper_preserves_terminal_disposition() {
+        let error = EowcQueryOperator::core_window_apply_error(
+            "test_eowc",
+            "window update",
+            DbError::PipelineTerminal("invalid compiled expression".into()),
+        );
+        assert!(matches!(
+            &error,
+            DbError::PipelineTerminal(reason) if reason == "invalid compiled expression"
+        ));
+        assert!(error.requires_pipeline_halt());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn core_window_shuffle_wrappers_preserve_terminal_disposition() {
+        fn assert_terminal(error: DbError, expected: &str) {
+            let DbError::ShuffleTerminal(reason) = error else {
+                panic!("expected permanent shuffle halt, got {error}");
+            };
+            assert_eq!(reason, expected);
+        }
+
+        let operator = EowcQueryOperator::new(
+            "test_eowc",
+            "SELECT symbol, SUM(price) FROM trades GROUP BY symbol",
+            Some(EmitClause::OnWindowClose),
+            None,
+            laminar_sql::create_session_context(),
+            key_groups(),
+            None,
+        );
+        assert_terminal(
+            operator.remote_replay_error(DbError::ShuffleTerminal("remote replay".into())),
+            "remote replay",
+        );
+        assert_terminal(
+            operator.outbound_finalize_error(DbError::ShuffleTerminal("outbound".into())),
+            "outbound",
+        );
     }
 
     #[test]

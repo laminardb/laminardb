@@ -569,6 +569,34 @@ fn runtime_fault_publication_preserves_lifecycle_ownership() {
     }
 }
 
+#[test]
+fn recoverable_runtime_fault_respects_terminal_stop_ownership() {
+    let running_state = std::sync::atomic::AtomicU8::new(DbState::Running as u8);
+    let live_generation = tokio_util::sync::CancellationToken::new();
+    let owns_fault_state = super::publish_runtime_fault_state(&running_state);
+
+    assert!(owns_fault_state);
+    assert!(!super::runtime_exit_is_covered_by_terminal_stop(
+        owns_fault_state,
+        &running_state,
+        &live_generation,
+    ));
+    assert_eq!(DbState::load(&running_state), DbState::Faulted);
+
+    let stopping_state = std::sync::atomic::AtomicU8::new(DbState::ShuttingDown as u8);
+    let cancelled_generation = tokio_util::sync::CancellationToken::new();
+    cancelled_generation.cancel();
+    let owns_fault_state = super::publish_runtime_fault_state(&stopping_state);
+
+    assert!(!owns_fault_state);
+    assert!(super::runtime_exit_is_covered_by_terminal_stop(
+        owns_fault_state,
+        &stopping_state,
+        &cancelled_generation,
+    ));
+    assert_eq!(DbState::load(&stopping_state), DbState::ShuttingDown);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_fault_cannot_steal_a_stop_transition() {
     let db = LaminarDB::open().unwrap();
@@ -654,6 +682,90 @@ async fn only_recovery_authority_can_stop_or_start_while_fenced() {
 
     db.release_coordinated_recovery_lifecycle();
     db.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn terminal_halt_stays_fenced_and_refuses_coordinated_recovery_start() {
+    let db = LaminarDB::open().unwrap();
+    let terminal_reason = "permanent shuffle terminal";
+    DbState::Faulted.store(&db.state);
+    *db.last_fault.lock() = Some(terminal_reason.into());
+    db.terminal_pipeline_halt.store(true, Ordering::Release);
+    db.set_source_gate(true);
+    db.coordinated_recovery_fenced
+        .store(true, Ordering::Release);
+
+    db.release_coordinated_recovery_lifecycle();
+
+    assert!(db.coordinated_recovery_fenced.load(Ordering::Acquire));
+    assert!(db.source_gate.load(Ordering::Acquire));
+    let error = db.start_for_coordinated_recovery().await.unwrap_err();
+    match error {
+        DbError::PipelineTerminal(message) => {
+            assert!(message.contains(terminal_reason), "{message}")
+        }
+        other => panic!("expected a permanent pipeline halt, got {other}"),
+    }
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
+    assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+
+    // Restore the synthetic test-only state so ordinary database shutdown can complete cleanly.
+    db.terminal_pipeline_halt.store(false, Ordering::Release);
+    db.coordinated_recovery_fenced
+        .store(false, Ordering::Release);
+    *db.last_fault.lock() = None;
+    db.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn terminal_latches_linearize_with_source_gate_openers() {
+    let db = LaminarDB::open().unwrap();
+    let transition = Arc::clone(&db.cluster_authority_transition);
+    let opener = transition.lock();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let terminal_db = Arc::clone(&db);
+    let terminal = std::thread::spawn(move || {
+        entered_tx.send(()).unwrap();
+        terminal_db.latch_durable_terminal_recovery_fence();
+        finished_tx.send(()).unwrap();
+    });
+    entered_rx.recv().unwrap();
+    assert!(finished_rx.try_recv().is_err());
+
+    // The already-authorized opener linearizes first. The waiting terminal publication must then
+    // close the gate before it can return.
+    db.source_gate.store(false, Ordering::SeqCst);
+    drop(opener);
+    finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("terminal fence must acquire the released authority transition");
+    terminal.join().unwrap();
+    assert!(db.cluster_intake_fenced());
+
+    // In the reverse ordering, the opener observes the monotonic latch while holding the same
+    // transition and cannot publish an open gate.
+    db.set_source_gate(false);
+    assert!(db.cluster_intake_fenced());
+
+    let local_db = LaminarDB::open().unwrap();
+    local_db.latch_local_terminal_pipeline_halt();
+    local_db.set_source_gate(false);
+    assert!(local_db.cluster_intake_fenced());
+}
+
+#[test]
+fn prelatched_terminal_halt_cannot_complete_startup_successfully() {
+    let db = LaminarDB::open().unwrap();
+    db.terminal_pipeline_halt.store(true, Ordering::SeqCst);
+    *db.last_fault.lock() = Some("halt raced startup completion".into());
+
+    assert!(matches!(
+        db.normalize_start_result_for_terminal_latch(Ok(())),
+        Err(DbError::PipelineTerminal(reason)) if reason == "halt raced startup completion"
+    ));
 }
 
 #[cfg(feature = "cluster")]

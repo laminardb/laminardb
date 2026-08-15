@@ -502,6 +502,31 @@ async fn snapshotable_operator_work_keeps_idle_cycles_live() {
 
 struct RestoreProbe(Arc<std::sync::atomic::AtomicUsize>);
 
+struct TerminalRestoreProbe;
+
+#[async_trait]
+impl GraphOperator for TerminalRestoreProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Err(DbError::PipelineTerminal("poisoned restore frame".into()))
+    }
+}
+
 #[async_trait]
 impl GraphOperator for RestoreProbe {
     fn cluster_capability(&self) -> OperatorCapability {
@@ -557,6 +582,60 @@ impl GraphOperator for ManagedStateAccountingProbe {
 
     fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct OptionalManagedStateProbeState {
+    required_bytes: usize,
+    optional_bytes: usize,
+    required_growth_per_process: usize,
+    process_calls: usize,
+    eviction_calls: usize,
+    reported_evicted_bytes: usize,
+}
+
+struct OptionalManagedStateProbe(Arc<parking_lot::Mutex<OptionalManagedStateProbeState>>);
+
+#[async_trait]
+impl GraphOperator for OptionalManagedStateProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_vnode_state()
+    }
+
+    fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        let state = self.0.lock();
+        Some(ManagedStateAccountingSnapshot {
+            live: state.required_bytes.saturating_add(state.optional_bytes),
+            prepared: 0,
+            retired: 0,
+        })
+    }
+
+    fn evict_optional_managed_state(&mut self) -> usize {
+        let mut state = self.0.lock();
+        state.eviction_calls += 1;
+        let evicted = std::mem::take(&mut state.optional_bytes);
+        state.reported_evicted_bytes = state.reported_evicted_bytes.saturating_add(evicted);
+        evicted
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let mut state = self.0.lock();
+        state.process_calls += 1;
+        state.required_bytes = state
+            .required_bytes
+            .checked_add(state.required_growth_per_process)
+            .expect("test required-state accounting must not overflow");
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
     }
 }
 
@@ -700,6 +779,30 @@ fn state_frame_restore_validates_all_operators_before_mutation() {
 }
 
 #[test]
+fn state_frame_restore_preserves_terminal_operator_error() {
+    let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+    graph.allocate_node(GraphNode::new(
+        Arc::from("terminal"),
+        Box::new(TerminalRestoreProbe),
+        1,
+    ));
+
+    let error = match graph.restore_state_frames(
+        &[("terminal".to_string(), bytes::Bytes::from_static(b"state"))],
+        &[],
+        u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
+    ) {
+        Ok(_) => panic!("terminal operator restore must fail"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        DbError::PipelineTerminal(reason) if reason == "poisoned restore frame"
+    ));
+}
+
+#[test]
 fn state_frame_restore_enforces_managed_state_budget() {
     let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = test_graph();
@@ -737,6 +840,123 @@ fn state_frame_restore_enforces_managed_state_budget() {
     assert!(error.requires_pipeline_halt());
 }
 
+#[tokio::test]
+async fn record_processing_evicts_optional_graph_state_before_budget_failure() {
+    let first = Arc::new(parking_lot::Mutex::new(OptionalManagedStateProbeState {
+        required_bytes: 40,
+        optional_bytes: 0,
+        required_growth_per_process: 5,
+        process_calls: 0,
+        eviction_calls: 0,
+        reported_evicted_bytes: 0,
+    }));
+    let second = Arc::new(parking_lot::Mutex::new(OptionalManagedStateProbeState {
+        required_bytes: 40,
+        optional_bytes: 20,
+        required_growth_per_process: 5,
+        process_calls: 0,
+        eviction_calls: 0,
+        reported_evicted_bytes: 0,
+    }));
+    let mut graph = test_graph();
+    graph.set_max_managed_state_bytes(100);
+    graph.push_test_node(
+        "required-a",
+        Box::new(OptionalManagedStateProbe(Arc::clone(&first))),
+    );
+    graph.push_test_node(
+        "required-b-with-cache",
+        Box::new(OptionalManagedStateProbe(Arc::clone(&second))),
+    );
+
+    graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .expect("optional state must be evicted before record-processing budget rejection");
+
+    let first = first.lock();
+    let second = second.lock();
+    assert_eq!(first.process_calls, 1);
+    assert_eq!(second.process_calls, 1);
+    assert_eq!(first.required_bytes, 45);
+    assert_eq!(second.required_bytes, 45);
+    assert_eq!(first.optional_bytes, 0);
+    assert_eq!(second.optional_bytes, 0);
+    assert_eq!(first.eviction_calls, 1);
+    assert_eq!(second.eviction_calls, 1);
+    assert_eq!(first.reported_evicted_bytes, 0);
+    assert_eq!(second.reported_evicted_bytes, 20);
+    drop(first);
+    drop(second);
+    assert_eq!(graph.managed_state_accounted_bytes(), 90);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn transition_budget_evicts_optional_state_and_recounts_staged_payload() {
+    let first = Arc::new(parking_lot::Mutex::new(OptionalManagedStateProbeState {
+        required_bytes: 40,
+        optional_bytes: 0,
+        required_growth_per_process: 0,
+        process_calls: 0,
+        eviction_calls: 0,
+        reported_evicted_bytes: 0,
+    }));
+    let second = Arc::new(parking_lot::Mutex::new(OptionalManagedStateProbeState {
+        required_bytes: 40,
+        optional_bytes: 20,
+        required_growth_per_process: 0,
+        process_calls: 0,
+        eviction_calls: 0,
+        reported_evicted_bytes: 0,
+    }));
+    let mut graph = test_graph();
+    graph.set_max_managed_state_bytes(85);
+    graph.push_test_node(
+        "transition-required-a",
+        Box::new(OptionalManagedStateProbe(Arc::clone(&first))),
+    );
+    graph.push_test_node(
+        "transition-required-b-with-cache",
+        Box::new(OptionalManagedStateProbe(Arc::clone(&second))),
+    );
+
+    graph
+        .validate_transition_state_budget(5, "test transition payload")
+        .expect("optional state must be evicted before transition payload admission fails");
+    {
+        let first = first.lock();
+        let second = second.lock();
+        assert_eq!(first.required_bytes, 40);
+        assert_eq!(second.required_bytes, 40);
+        assert_eq!(first.optional_bytes, 0);
+        assert_eq!(second.optional_bytes, 0);
+        assert_eq!(first.eviction_calls, 1);
+        assert_eq!(second.eviction_calls, 1);
+        assert_eq!(first.reported_evicted_bytes, 0);
+        assert_eq!(second.reported_evicted_bytes, 20);
+    }
+
+    graph.set_max_managed_state_bytes(84);
+    let error = graph
+        .validate_transition_state_budget(5, "test transition payload")
+        .expect_err("required managed state plus staged payload must still obey the cap");
+    assert!(matches!(
+        error,
+        DbError::ManagedStateBudgetExceeded {
+            ref context,
+            accounted_bytes: 85,
+            limit_bytes: 84,
+        } if context == "test transition payload"
+    ));
+    let first = first.lock();
+    let second = second.lock();
+    assert_eq!(first.required_bytes, 40);
+    assert_eq!(second.required_bytes, 40);
+    assert_eq!(first.eviction_calls, 2);
+    assert_eq!(second.eviction_calls, 2);
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn restored_frame_seeds_output_frontier_until_replay_finishes() {
@@ -764,7 +984,7 @@ async fn restored_frame_seeds_output_frontier_until_replay_finishes() {
 
     let mut results = FxHashMap::default();
     graph
-        .execute_single_operator(0, 100, &mut results)
+        .execute_single_operator(0, 100, &mut results, GraphExecutionMode::Normal)
         .await
         .unwrap();
     assert!(processed.load(std::sync::atomic::Ordering::SeqCst));
@@ -772,7 +992,7 @@ async fn restored_frame_seeds_output_frontier_until_replay_finishes() {
     assert!(!graph.output_idle[0]);
 
     graph
-        .execute_single_operator(0, 100, &mut results)
+        .execute_single_operator(0, 100, &mut results, GraphExecutionMode::Normal)
         .await
         .unwrap();
     assert_eq!(graph.output_watermarks[0], 100);
@@ -1072,7 +1292,7 @@ async fn alignment_harness() -> AlignmentHarness {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn ordered_shuffle_operators_receive_the_node_local_source_frontier() {
+async fn only_temporal_shuffle_uses_the_committed_source_frontier() {
     let mut harness = alignment_harness().await;
     let source = harness.graph.ensure_source_node("events");
     let ordinary_seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -1131,21 +1351,174 @@ async fn ordered_shuffle_operators_receive_the_node_local_source_frontier() {
     let local = FxHashMap::from_iter([(
         Arc::from("events"),
         InputFrontier {
-            watermark: Some(900),
-            idle: false,
+            watermark: Some(1_200),
+            idle: true,
         },
     )]);
     harness.graph.set_local_source_frontiers(&local);
+    // `100` represents the pipeline-wide committed minimum held back by another source. The
+    // temporal input's restored/bootstrap cut is 900 and must neither regress to that scalar
+    // minimum nor advance to the speculative node-local 1,200 frontier.
+    let restored_temporal_watermark = 900;
+    let restored_temporal_frontier = InputFrontier {
+        watermark: Some(restored_temporal_watermark),
+        idle: false,
+    };
+    harness.graph.cap_temporal_source_frontiers(|name| {
+        (name == "events").then_some(restored_temporal_watermark)
+    });
     harness
         .graph
         .execute_cycle(&FxHashMap::default(), 100, Some(&committed))
         .await
         .unwrap();
 
-    for (_, _, seen) in managed {
-        assert_eq!(*seen.lock(), [local["events"]]);
+    for (name, _, seen) in managed {
+        let expected = if name == "temporal_join" {
+            restored_temporal_frontier
+        } else {
+            local["events"]
+        };
+        assert_eq!(*seen.lock(), [expected], "unexpected frontier for {name}");
     }
     assert_eq!(*ordinary_seen.lock(), [committed["events"]]);
+
+    harness.graph.cap_temporal_source_frontiers(|_| None);
+    assert_eq!(
+        harness.graph.temporal_source_frontiers[&source],
+        InputFrontier {
+            watermark: None,
+            idle: false,
+        },
+        "a missing durable source decision must remain an active temporal hold"
+    );
+
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(
+            Arc::from("events"),
+            InputFrontier {
+                watermark: None,
+                idle: true,
+            },
+        )]));
+    harness.graph.cap_temporal_source_frontiers(|name| {
+        (name == "events").then_some(restored_temporal_watermark)
+    });
+    assert_eq!(
+        harness.graph.temporal_source_frontiers[&source], restored_temporal_frontier,
+        "an explicitly empty or all-idle local source must inherit its durable cluster cut"
+    );
+
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(
+            Arc::from("events"),
+            InputFrontier {
+                watermark: Some(800),
+                idle: true,
+            },
+        )]));
+    harness.graph.cap_temporal_source_frontiers(|name| {
+        (name == "events").then_some(restored_temporal_watermark)
+    });
+    assert_eq!(
+        harness.graph.temporal_source_frontiers[&source], restored_temporal_frontier,
+        "an idle local shard must not turn the authoritative all-idle maximum into a lower active minimum"
+    );
+
+    harness
+        .graph
+        .set_local_source_frontiers(&FxHashMap::from_iter([(
+            Arc::from("events"),
+            InputFrontier {
+                watermark: None,
+                idle: false,
+            },
+        )]));
+    harness.graph.cap_temporal_source_frontiers(|name| {
+        (name == "events").then_some(restored_temporal_watermark)
+    });
+    assert_eq!(
+        harness.graph.temporal_source_frontiers[&source],
+        InputFrontier {
+            watermark: None,
+            idle: false,
+        },
+        "an active-uninitialized local source must hold below an initialized cluster cut"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn temporal_shuffle_keeps_the_lower_idle_source_cut_active() {
+    let mut harness = alignment_harness().await;
+    let left = harness.graph.ensure_source_node("left");
+    let right = harness.graph.ensure_source_node("right");
+    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let temporal = harness
+        .graph
+        .place_operator_node(
+            "temporal_join",
+            Box::new(ManagedFrontierProbe {
+                capability: OperatorCapability::managed_temporal_join(),
+                seen: Arc::clone(&seen),
+            }),
+            2,
+        )
+        .unwrap();
+    harness.graph.add_edge(left, temporal, 0);
+    harness.graph.add_edge(right, temporal, 1);
+
+    let local = FxHashMap::from_iter([
+        (
+            Arc::from("left"),
+            InputFrontier {
+                watermark: Some(1_200),
+                idle: false,
+            },
+        ),
+        (
+            Arc::from("right"),
+            InputFrontier {
+                watermark: Some(500),
+                idle: true,
+            },
+        ),
+    ]);
+    harness.graph.set_local_source_frontiers(&local);
+    harness
+        .graph
+        .cap_temporal_source_frontiers(|name| match name {
+            "left" => Some(900),
+            "right" => Some(700),
+            _ => None,
+        });
+    harness
+        .graph
+        .execute_cycle(&FxHashMap::default(), 100, None)
+        .await
+        .unwrap();
+
+    let expected = [
+        InputFrontier {
+            watermark: Some(900),
+            idle: false,
+        },
+        InputFrontier {
+            watermark: Some(700),
+            idle: false,
+        },
+    ];
+    assert_eq!(*seen.lock(), expected);
+    assert_eq!(
+        merge_input_frontiers(&expected, i64::MIN),
+        InputFrontier {
+            watermark: Some(700),
+            idle: false,
+        },
+        "the lower durable right cut must cap the two-input temporal output frontier"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -1743,6 +2116,246 @@ async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
         Some(harness.fence.assignment_version)
     );
     assert_eq!(got[0].recovery_gen(), Some(0));
+}
+
+/// One durable attempt may carry several explicitly tagged flush waves. Repeating the identity
+/// must not be mistaken for an equivocal duplicate, and sender activity must survive the wire.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shuffle_flush_repeats_an_attempt_with_ordered_wave_and_activity_tags() {
+    use laminar_core::checkpoint::barrier::{
+        decode_shuffle_flush_flags, encode_shuffle_flush_flags,
+    };
+    use laminar_core::checkpoint::{CheckpointAttempt, CheckpointBarrier};
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = alignment_harness().await;
+    let attempt = CheckpointAttempt::new(70, 70);
+    for (wave, remote_activity, expected_peer_activity) in
+        [(0_u64, true, true), (1_u64, false, false)]
+    {
+        harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier {
+                    checkpoint_id: attempt.checkpoint_id,
+                    epoch: attempt.epoch,
+                    flags: encode_shuffle_flush_flags(wave, remote_activity).unwrap(),
+                },
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+
+        let aligned = harness
+            .graph
+            .align_shuffle_flush_wave(
+                attempt,
+                wave,
+                false,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(aligned.outcome, ShuffleAlignmentOutcome::Aligned);
+        assert_eq!(aligned.peer_activity, expected_peer_activity);
+
+        let received = harness.remote_receiver.recv().await.unwrap();
+        let ShuffleMessage::Barrier(barrier) = received.message() else {
+            panic!("flush fan-out did not contain a barrier");
+        };
+        assert_eq!(decode_shuffle_flush_flags(barrier.flags), Ok((wave, false)));
+    }
+}
+
+/// A fast peer may enter wave N+1 while this node still waits for a slow peer in wave N. Its
+/// intervening data belongs to the next local drain, and its future marker must remain staged.
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shuffle_flush_stages_fast_peer_data_and_stashes_its_next_wave_marker() {
+    use laminar_core::checkpoint::barrier::encode_shuffle_flush_flags;
+    use laminar_core::checkpoint::{CheckpointAttempt, CheckpointBarrier};
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = three_node_alignment_harness().await;
+    let attempt = CheckpointAttempt::new(70, 70);
+    let marker = |wave, activity| CheckpointBarrier {
+        checkpoint_id: attempt.checkpoint_id,
+        epoch: attempt.epoch,
+        flags: encode_shuffle_flush_flags(wave, activity).unwrap(),
+    };
+
+    harness
+        .peer_two_sender
+        .fan_out_barrier(&[1, 3], marker(0, false), &harness.fence)
+        .await
+        .unwrap();
+    harness
+        .peer_two_sender
+        .send_to(
+            1,
+            &ShuffleMessage::checkpointed("out".into(), 0, test_batch()),
+        )
+        .await
+        .unwrap();
+    harness
+        .peer_two_sender
+        .fan_out_barrier(&[1, 3], marker(1, true), &harness.fence)
+        .await
+        .unwrap();
+
+    {
+        let first = harness.graph.align_shuffle_flush_wave(
+            attempt,
+            0,
+            false,
+            0,
+            &harness.fence,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            None,
+        );
+        tokio::pin!(first);
+        loop {
+            tokio::select! {
+                result = &mut first => panic!("wave zero completed before the slow peer: {result:?}"),
+                () = tokio::task::yield_now() => {
+                    if harness.recorded.lock().len() == 1
+                        && harness.local_receiver.has_staged_checkpoint_barriers()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        harness
+            .peer_three_sender
+            .fan_out_barrier(&[1, 2], marker(0, false), &harness.fence)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.await.unwrap().outcome,
+            ShuffleAlignmentOutcome::Aligned
+        );
+    }
+    harness
+        .peer_three_sender
+        .fan_out_barrier(&[1, 2], marker(1, false), &harness.fence)
+        .await
+        .unwrap();
+    let second = harness
+        .graph
+        .align_shuffle_flush_wave(
+            attempt,
+            1,
+            true,
+            0,
+            &harness.fence,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, ShuffleAlignmentOutcome::Aligned);
+    assert!(
+        second.peer_activity,
+        "peer two's wave-one activity was lost"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shuffle_flush_reports_wave_zero_staging_before_a_durable_abort() {
+    use laminar_core::checkpoint::barrier::encode_shuffle_flush_flags;
+    use laminar_core::checkpoint::{CheckpointAttempt, CheckpointBarrier};
+    use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
+    use laminar_core::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::shuffle::ShuffleMessage;
+
+    let mut harness = three_node_alignment_harness().await;
+    let attempt = CheckpointAttempt::new(80, 80);
+    let controller =
+        alignment_abort_controller_with_announcement(&harness.fence, attempt, false, false).await;
+
+    harness
+        .peer_two_sender
+        .send_to(
+            1,
+            &ShuffleMessage::checkpointed("out".into(), 0, test_batch()),
+        )
+        .await
+        .unwrap();
+    harness
+        .peer_two_sender
+        .fan_out_barrier(
+            &[1, 3],
+            CheckpointBarrier {
+                checkpoint_id: attempt.checkpoint_id,
+                epoch: attempt.epoch,
+                flags: encode_shuffle_flush_flags(0, false).unwrap(),
+            },
+            &harness.fence,
+        )
+        .await
+        .unwrap();
+
+    let alignment = harness.graph.align_shuffle_flush_wave(
+        attempt,
+        0,
+        false,
+        0,
+        &harness.fence,
+        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        Some(controller.as_ref()),
+    );
+    tokio::pin!(alignment);
+    loop {
+        tokio::select! {
+            result = &mut alignment => panic!("wave zero settled before its staged row was observed: {result:?}"),
+            () = tokio::task::yield_now() => {
+                if harness.recorded.lock().len() == 1 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let authority = controller.checkpoint_authority().unwrap();
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: uuid::Uuid::from_u128(1),
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("the exact alignment-test owner must retain the authority term");
+    };
+    let proof = lease.proof();
+    assert!(matches!(
+        authority
+            .record_cluster_outcome(
+                &proof,
+                attempt.epoch,
+                attempt.checkpoint_id,
+                harness.fence.clone(),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap(),
+        RecordOutcomeResult::Created(_)
+    ));
+
+    let outcome = alignment.await.unwrap();
+    assert_eq!(outcome.outcome, ShuffleAlignmentOutcome::Aborted);
+    assert!(
+        outcome.graph_state_staged,
+        "the caller must not classify a post-staging Abort as pre-capture cancellation"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -2844,6 +3457,9 @@ fn test_topo_order() {
 fn test_remove_query() {
     let ctx = laminar_sql::create_session_context();
     let mut graph = OperatorGraph::new(ctx);
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    graph.set_metrics(Arc::clone(&prom));
 
     graph.add_query(
         "q1".to_string(),
@@ -2856,12 +3472,26 @@ fn test_remove_query() {
     );
     assert!(graph.output_map.contains_key("q1"));
     let original_node = graph.output_map["q1"];
+    prom.operator_process_duration
+        .with_label_values(&["q1", "normal"])
+        .observe(0.001);
+    prom.operator_process_duration
+        .with_label_values(&["q1", "checkpoint_drain"])
+        .observe(0.001);
     graph.ensure_live_provider("q1", &test_schema());
     graph.remove_query("q1");
     assert!(!graph.output_map.contains_key("q1"));
     assert!(graph.nodes[1].removed); // node 0 = source, node 1 = q1
     assert!(!graph.changelog_tables.contains("q1"));
     assert!(!graph.live_handles.contains_key("q1"));
+    assert!(prom
+        .operator_process_duration
+        .remove_label_values(&["q1", "normal"])
+        .is_err());
+    assert!(prom
+        .operator_process_duration
+        .remove_label_values(&["q1", "checkpoint_drain"])
+        .is_err());
 
     graph.add_query(
         "q1".to_string(),
@@ -3836,6 +4466,30 @@ fn terminal_shuffle_graph(query_budget_ns: u64) -> OperatorGraph {
     graph.output_map.insert(Arc::from("healthy"), healthy);
     graph.topo_dirty = true;
     graph
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn post_dequeue_shuffle_errors_preserve_halt_and_promote_ordinary_failures() {
+    let terminal = OperatorGraph::post_dequeue_shuffle_error(
+        "ordered shuffle staging",
+        DbError::ShuffleTerminal("invalid routed vnode".into()),
+    );
+    assert!(
+        matches!(&terminal, DbError::ShuffleTerminal(reason) if reason == "invalid routed vnode")
+    );
+    assert!(terminal.requires_pipeline_halt());
+
+    let ordinary = OperatorGraph::post_dequeue_shuffle_error(
+        "ordered shuffle staging",
+        DbError::Pipeline("injected staging failure".into()),
+    );
+    let DbError::StatefulOperatorPartialApply(reason) = &ordinary else {
+        panic!("expected post-dequeue recovery classification, got {ordinary}");
+    };
+    assert!(reason.contains("ordered shuffle staging"), "{reason}");
+    assert!(reason.contains("injected staging failure"), "{reason}");
+    assert!(ordinary.requires_pipeline_recovery());
 }
 
 #[cfg(feature = "cluster")]
@@ -5807,6 +6461,20 @@ async fn test_shed_oldest_policy_drops_rows_and_increments_counter() {
             > 0,
         "shed_records_total should have incremented"
     );
+    assert_eq!(
+        prom.operator_process_duration
+            .with_label_values(&["producer", "normal"])
+            .get_sample_count(),
+        1,
+        "normal operator execution should publish a catalog-bounded timing sample"
+    );
+    assert_eq!(
+        prom.operator_process_duration
+            .with_label_values(&["producer", "checkpoint_drain"])
+            .get_sample_count(),
+        0,
+        "normal execution must not contaminate checkpoint-drain operator timings"
+    );
 }
 
 #[tokio::test]
@@ -5979,7 +6647,7 @@ async fn managed_state_initialization_rejects_a_budget_below_the_empty_topology(
 }
 
 #[tokio::test]
-async fn aggregate_record_growth_requires_recovery_before_output_routing() {
+async fn aggregate_record_growth_halts_before_output_routing() {
     let mut graph = test_graph();
     graph.register_source_schema("trades".to_string(), test_schema());
     graph.add_query(
@@ -6004,23 +6672,37 @@ async fn aggregate_record_growth_requires_recovery_before_output_routing() {
     let baseline = graph.managed_state_accounted_bytes();
     assert!(baseline > 0);
     graph.set_max_managed_state_bytes(baseline);
+    graph.set_max_input_buf_batches(1);
 
     let mut source = FxHashMap::default();
     source.insert(Arc::from("trades"), vec![test_batch()]);
     let error = graph
         .execute_cycle(&source, i64::MAX, None)
         .await
-        .expect_err("record growth above the baseline must require recovery");
+        .expect_err("record growth above the baseline must halt the pipeline");
 
-    let DbError::StatefulOperatorPartialApply(reason) = &error else {
-        panic!("expected partial-apply recovery error, got {error}");
+    let DbError::ManagedStateBudgetExceeded {
+        context,
+        accounted_bytes,
+        limit_bytes,
+    } = &error
+    else {
+        panic!("expected terminal managed-state budget error, got {error}");
     };
-    assert!(
-        reason.contains("operator 'agg' record processing"),
-        "{reason}"
+    assert_eq!(context, "operator 'agg' record processing");
+    assert!(*accounted_bytes > baseline);
+    assert_eq!(*limit_bytes, baseline);
+    assert!(error.requires_pipeline_halt());
+    assert!(!error.requires_pipeline_recovery());
+    assert_eq!(
+        graph.input_bufs[aggregate].len(),
+        graph.nodes[aggregate].input_port_count,
+        "terminal processing must restore the graph's per-port buffer roster"
     );
-    assert!(reason.contains(&format!("limit={baseline}")), "{reason}");
-    assert!(error.requires_pipeline_recovery());
+    assert!(
+        !graph.has_runnable_deferred_work(),
+        "terminal cleanup left runnable graph-owned input"
+    );
     assert!(
         graph.input_bufs[downstream][0].is_empty(),
         "the rejected aggregate output crossed the downstream routing boundary"

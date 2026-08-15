@@ -15,6 +15,29 @@ struct DrainingCaptureFailureOperator {
     fail_vnode_capture: Arc<std::sync::atomic::AtomicBool>,
 }
 
+struct TerminalCaptureFailureOperator;
+
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for TerminalCaptureFailureOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Err(DbError::ShuffleTerminal(
+            "injected permanent checkpoint routing failure".into(),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
@@ -206,6 +229,99 @@ impl crate::operator_graph::GraphOperator for ExternallyRunnableDrainOperator {
 }
 
 #[cfg(feature = "cluster")]
+struct CompletionPolledDrainOperator {
+    pending: Arc<std::sync::atomic::AtomicBool>,
+    completion_ready: Arc<std::sync::atomic::AtomicBool>,
+    process_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for CompletionPolledDrainOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.process_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self
+            .completion_ready
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(Vec::new())
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        self.pending.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        // Matches pending shuffle sends: their task completion is a wake that must be polled by
+        // another operator pass, but the retained send itself is not continuously runnable.
+        false
+    }
+}
+
+#[cfg(feature = "cluster")]
+struct SnapshotableAlignedReplayDrainOperator {
+    checkpoint_drain_pending: Arc<std::sync::atomic::AtomicBool>,
+    aligned_replay_pending: Arc<std::sync::atomic::AtomicBool>,
+    process_calls: Arc<std::sync::atomic::AtomicUsize>,
+    clear_aligned_on_process: bool,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for SnapshotableAlignedReplayDrainOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        assert!(inputs.iter().all(Vec::is_empty));
+        self.process_calls
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.checkpoint_drain_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        if self.clear_aligned_on_process {
+            self.aligned_replay_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn checkpoint_aligned_replay_pending(&self) -> bool {
+        self.aligned_replay_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        self.checkpoint_drain_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "cluster")]
 struct FollowerCheckpointEvidenceOperator;
 
 #[cfg(feature = "cluster")]
@@ -337,6 +453,8 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         source_name_arcs: FxHashMap::default(),
         checkpoint_source_names: Vec::new(),
         source_frontiers_buf: FxHashMap::default(),
+        #[cfg(feature = "cluster")]
+        committed_source_watermarks_snapshot: Arc::new(FxHashMap::default()),
         tracker: None,
         prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
             &prometheus::Registry::new(),
@@ -365,11 +483,14 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         sink_timed_out: false,
         sink_fault: None,
         checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+        pipeline_halt: None,
         last_checkpoint_admission_failure: None,
         checkpoint_admission_recovering: false,
         shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         #[cfg(feature = "cluster")]
         cluster_controller: None,
+        #[cfg(feature = "cluster")]
+        assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(feature = "cluster")]
         shuffle_delivery_loss_incidents: None,
         #[cfg(feature = "cluster")]
@@ -399,6 +520,29 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         checkpoint_committable_sinks: false,
         intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_initial_sink_fence_is_reserved_for_checkpoint_committable_sinks() {
+    let mut callback = empty_callback_fixture();
+    assert!(
+        !callback.initial_checkpoint_sink_fence_required(),
+        "a cluster ALO pipeline already has the mandatory post-fixed-point FIFO fence"
+    );
+
+    callback.checkpoint_committable_sinks = true;
+    assert!(
+        callback.initial_checkpoint_sink_fence_required(),
+        "EO or mixed sinks must retain both checkpoint fences"
+    );
+}
+
+#[cfg(not(feature = "cluster"))]
+#[tokio::test]
+async fn noncluster_checkpoint_retains_its_only_sink_fence() {
+    let callback = empty_callback_fixture();
+    assert!(callback.initial_checkpoint_sink_fence_required());
 }
 
 #[tokio::test]
@@ -466,6 +610,7 @@ async fn zero_cycle_barrier_is_not_suppressed_by_process_metrics() {
         source_checkpoints,
         CheckpointAttempt::new(38, 38),
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         None,
     )
@@ -518,6 +663,8 @@ fn local_controller() -> Arc<laminar_core::cluster::control::ClusterController> 
 #[cfg(feature = "cluster")]
 struct AuthoritativeLocalLeader {
     controller: Arc<laminar_core::cluster::control::ClusterController>,
+    assignment_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
     fence: laminar_core::checkpoint::CheckpointAssignmentFence,
     proof: laminar_core::checkpoint::LeaderProof,
 }
@@ -537,13 +684,43 @@ impl AuthoritativeLocalLeader {
             Phase::Prepare,
         )
     }
+
+    async fn begin_drain(
+        &self,
+    ) -> (
+        laminar_core::cluster::control::AssignmentSnapshot,
+        laminar_core::checkpoint::AssignmentDrainTransition,
+    ) {
+        let predecessor = self.assignment_store.load().await.unwrap().unwrap();
+        let draining = predecessor
+            .next_draining(
+                std::collections::BTreeMap::from([(
+                    0,
+                    laminar_core::cluster::discovery::NodeId(1),
+                )]),
+                predecessor.participants.clone(),
+                self.proof.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            self.assignment_store
+                .save_if_version(&draining, predecessor.version)
+                .await
+                .unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        let transition = draining.drain_transition.clone().unwrap();
+        self.controller
+            .publish_checkpoint_drain_transition(Some(transition.clone()));
+        (draining, transition)
+    }
 }
 
 #[cfg(feature = "cluster")]
 async fn authoritative_local_leader(
     control_kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
 ) -> AuthoritativeLocalLeader {
-    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::checkpoint::CheckpointParticipant;
     use laminar_core::cluster::control::{
         ClusterController, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
         ProcessLeaseAuthority, ProcessLeaseOutcome,
@@ -553,11 +730,16 @@ async fn authoritative_local_leader(
     let node = NodeId(1);
     let boot = "00000000-0000-0000-0000-000000000001".parse().unwrap();
     let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let assignment_store = Arc::new(
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )),
+    );
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
         node,
         Arc::clone(&control_kv),
         control_kv,
-        None,
+        Some(Arc::clone(&assignment_store)),
         members_rx,
         boot,
     ));
@@ -604,29 +786,127 @@ async fn authoritative_local_leader(
     controller
         .set_leader_lease_watch(grant_rx, owner, Arc::clone(&deadline))
         .unwrap();
-    controller.set_leader_lease_store(authority);
+    controller.set_leader_lease_store(Arc::clone(&authority));
     controller.install_local_leader_proof_provider();
     controller
         .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
         .await
         .unwrap();
 
-    let fence = CheckpointAssignmentFence::from_owner_map(
-        1,
-        &[node.0],
-        vec![CheckpointParticipant {
-            node_id: node.0,
-            boot_incarnation: boot,
-        }],
-    )
-    .unwrap();
+    let assignment = laminar_core::cluster::control::AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, node)]),
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    let fence = assignment.assignment_fence().unwrap();
     controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
     let proof = controller.capture_leader_proof().unwrap();
     AuthoritativeLocalLeader {
         controller,
+        assignment_store,
+        authority,
         fence,
         proof,
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn handoff_admission_waits_for_exact_quorum_and_unfinalized_head() {
+    use crate::pipeline::CheckpointAssignmentAdmission;
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, ClusterKv, InMemoryKv, RecordAssignmentDrainDecisionResult,
+    };
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::VnodeRegistry;
+
+    let kv = Arc::new(InMemoryKv::new(NodeId(1)));
+    let control_kv: Arc<dyn ClusterKv> = kv;
+    let leader = authoritative_local_leader(control_kv).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(vec![NodeId(1)].into(), 1);
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(Arc::clone(&leader.controller));
+    callback.vnode_registry = Some(registry);
+    let assignment_lock = Arc::clone(&callback.assignment_adoption_lock);
+
+    let (_draining, transition) = leader.begin_drain().await;
+    match crate::pipeline::PipelineCallback::checkpoint_assignment_for_admission(
+        &mut callback,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    {
+        CheckpointAssignmentAdmission::Deferred(reason) => {
+            assert!(reason.contains("not HANDOFF-ready"), "{reason}");
+        }
+        _ => panic!("an active pre-quorum drain must defer before attempt reservation"),
+    }
+    assert!(
+        Arc::clone(&assignment_lock).try_lock_owned().is_ok(),
+        "a deferred admission must release assignment serialization"
+    );
+
+    leader
+        .controller
+        .announce_drain_ack(&transition)
+        .await
+        .unwrap();
+    let (assignment_fence, flags) =
+        match crate::pipeline::PipelineCallback::checkpoint_assignment_for_admission(
+            &mut callback,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        {
+            CheckpointAssignmentAdmission::Ready {
+                assignment_fence,
+                flags,
+                assignment_guard,
+            } => {
+                assert!(assignment_guard.is_some());
+                assert!(
+                    Arc::clone(&assignment_lock).try_lock_owned().is_err(),
+                    "a ready admission must retain assignment serialization"
+                );
+                drop(assignment_guard);
+                assert!(Arc::clone(&assignment_lock).try_lock_owned().is_ok());
+                (assignment_fence, flags)
+            }
+            _ => panic!("the exact one-process receipt quorum and drain head must admit HANDOFF"),
+        };
+    assert_eq!(assignment_fence, Some(leader.fence.clone()));
+    assert_eq!(flags, laminar_core::checkpoint::flags::HANDOFF);
+
+    assert!(matches!(
+        leader
+            .authority
+            .record_assignment_drain_decision(
+                &leader.proof,
+                AssignmentDrainDecision::abort(&transition, leader.proof.clone()).unwrap(),
+            )
+            .await
+            .unwrap(),
+        RecordAssignmentDrainDecisionResult::Created(_)
+    ));
+    let attempt = CheckpointAttempt::new(41, 41);
+    let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+        &mut callback,
+        attempt,
+        std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        flags,
+        assignment_fence,
+    )
+    .await
+    .expect_err("a terminalized drain must fail the Prepare-time HANDOFF re-audit");
+    assert!(error.contains("not HANDOFF-ready"), "{error}");
+    assert!(!callback.checkpoint_leader_proofs.contains_key(&attempt));
 }
 
 #[cfg(feature = "cluster")]
@@ -714,6 +994,7 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
         FxHashMap::default(),
         attempt,
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         Some(leader.fence),
     )
@@ -1120,6 +1401,7 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
         source_checkpoints,
         attempt,
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         None,
     ));
@@ -1171,6 +1453,7 @@ async fn promoted_follower_faults_on_retained_attempt_mismatch() {
         FxHashMap::default(),
         CheckpointAttempt::new(28, 28),
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         None,
     )
@@ -1252,7 +1535,7 @@ async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
     callback.cluster_controller = Some(controller);
     callback.epoch_allocator = Some(coordinator.epoch_allocator());
     let reserved = callback
-        .reserve_attempt(std::time::Instant::now())
+        .reserve_attempt(tokio::time::Instant::now())
         .await
         .unwrap();
 
@@ -1366,6 +1649,187 @@ async fn expired_checkpoint_deadline_rejects_an_already_quiescent_graph() {
         .is_some_and(|reason| reason.contains("end-to-end deadline")));
 }
 
+#[tokio::test]
+async fn checkpoint_graph_drain_does_not_pollute_normal_cycle_metrics() {
+    let mut callback = empty_callback_fixture();
+    callback.graph.set_metrics(Arc::clone(&callback.prom));
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let runnable = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "immediately-runnable-checkpoint-drain",
+        Box::new(ExternallyRunnableDrainOperator {
+            pending,
+            runnable,
+            process_calls: Arc::clone(&process_calls),
+        }),
+    );
+
+    assert_eq!(callback.prom.cycles.get(), 0);
+    assert_eq!(callback.prom.cycle_duration.get_sample_count(), 0);
+    callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert_eq!(callback.prom.cycles.get(), 0);
+    assert_eq!(callback.prom.cycle_duration.get_sample_count(), 0);
+    assert_eq!(callback.prom.cycle_execute_duration.get_sample_count(), 0);
+    assert_eq!(
+        callback.prom.cycle_output_store_duration.get_sample_count(),
+        0
+    );
+    assert_eq!(
+        callback.prom.cycle_sink_enqueue_duration.get_sample_count(),
+        0
+    );
+    assert_eq!(
+        callback
+            .prom
+            .operator_process_duration
+            .with_label_values(&["immediately-runnable-checkpoint-drain", "checkpoint_drain"])
+            .get_sample_count(),
+        1
+    );
+    assert_eq!(
+        callback
+            .prom
+            .operator_process_duration
+            .with_label_values(&["immediately-runnable-checkpoint-drain", "normal"])
+            .get_sample_count(),
+        0
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn handoff_graph_drain_consumes_snapshotable_aligned_replay_and_reports_activity() {
+    let mut callback = empty_callback_fixture();
+    let checkpoint_drain_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let aligned_replay_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "handoff-aligned-replay",
+        Box::new(SnapshotableAlignedReplayDrainOperator {
+            checkpoint_drain_pending,
+            aligned_replay_pending: Arc::clone(&aligned_replay_pending),
+            process_calls: Arc::clone(&process_calls),
+            clear_aligned_on_process: true,
+        }),
+    );
+
+    let active = callback
+        .drain_handoff_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("handoff drain must execute retained aligned replay");
+
+    assert!(active);
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert!(!aligned_replay_pending.load(std::sync::atomic::Ordering::Acquire));
+    assert!(callback.graph.handoff_is_quiescent());
+    assert!(!callback
+        .drain_handoff_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1),)
+        .await
+        .unwrap());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn handoff_graph_drain_deadline_bounds_rotation_fence_wait() {
+    let mut callback = empty_callback_fixture();
+    let checkpoint_drain_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let aligned_replay_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    callback.graph.push_test_node(
+        "handoff-drain-held-rotation-fence",
+        Box::new(SnapshotableAlignedReplayDrainOperator {
+            checkpoint_drain_pending,
+            aligned_replay_pending,
+            process_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clear_aligned_on_process: true,
+        }),
+    );
+    let rotation_fence = Arc::new(tokio::sync::RwLock::new(()));
+    callback
+        .graph
+        .set_rotation_execution_fence(Arc::clone(&rotation_fence));
+    let held_writer = rotation_fence.write_owned().await;
+
+    let error = callback
+        .drain_handoff_edges_until_inner(tokio::time::Instant::now() + Duration::from_millis(20))
+        .await
+        .expect_err("the absolute attempt deadline must bound a blocked graph pass");
+
+    assert!(
+        error.to_string().contains("absolute attempt deadline"),
+        "{error}"
+    );
+    assert!(callback
+        .checkpoint_fault
+        .lock()
+        .as_deref()
+        .is_some_and(|reason| reason.contains("absolute attempt deadline")));
+    drop(held_writer);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn shuffle_flush_terminal_after_wave_zero_staging_requires_recovery() {
+    let pristine = crate::operator_graph::ShuffleFlushWaveOutcome {
+        outcome: crate::operator_graph::ShuffleAlignmentOutcome::Aborted,
+        peer_activity: false,
+        graph_state_staged: false,
+    };
+    assert!(!ConnectorPipelineCallback::shuffle_flush_attempt_advanced(
+        0, false, &pristine
+    ));
+
+    let staged = crate::operator_graph::ShuffleFlushWaveOutcome {
+        graph_state_staged: true,
+        ..pristine
+    };
+    assert!(ConnectorPipelineCallback::shuffle_flush_attempt_advanced(
+        0, false, &staged
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_graph_drain_accepts_snapshotable_aligned_replay() {
+    let mut callback = empty_callback_fixture();
+    let checkpoint_drain_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let aligned_replay_pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "snapshotable-aligned-replay",
+        Box::new(SnapshotableAlignedReplayDrainOperator {
+            checkpoint_drain_pending: Arc::clone(&checkpoint_drain_pending),
+            aligned_replay_pending: Arc::clone(&aligned_replay_pending),
+            process_calls: Arc::clone(&process_calls),
+            clear_aligned_on_process: false,
+        }),
+    );
+
+    assert!(!callback.graph.checkpoint_is_quiescent());
+    callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect("snapshotable aligned replay must not fault an ordinary checkpoint drain");
+
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert!(!checkpoint_drain_pending.load(std::sync::atomic::Ordering::Acquire));
+    assert!(aligned_replay_pending.load(std::sync::atomic::Ordering::Acquire));
+    assert!(callback.graph.checkpoint_is_quiescent());
+    assert!(
+        !callback.graph.handoff_is_quiescent(),
+        "retained aligned replay remains a handoff blocker"
+    );
+    assert!(callback.checkpoint_fault.lock().is_none());
+
+    aligned_replay_pending.store(false, std::sync::atomic::Ordering::Release);
+    assert!(callback.graph.handoff_is_quiescent());
+}
+
 #[tokio::test(start_paused = true)]
 async fn checkpoint_graph_drain_waits_for_externally_blocked_work() {
     let mut callback = empty_callback_fixture();
@@ -1413,6 +1877,89 @@ async fn checkpoint_graph_drain_waits_for_externally_blocked_work() {
     assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 2);
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_graph_drain_repolls_nonrunnable_completion_after_shuffle_wake() {
+    let mut callback = empty_callback_fixture();
+    let fence = assignment_fence(1, &[1, 7]);
+    let (_sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
+    let work_ready = receiver.work_ready_notify();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let completion_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "completion-polled-checkpoint-drain",
+        Box::new(CompletionPolledDrainOperator {
+            pending,
+            completion_ready: Arc::clone(&completion_ready),
+            process_calls: Arc::clone(&process_calls),
+        }),
+    );
+
+    let drain = tokio::spawn(async move {
+        callback
+            .drain_checkpoint_edges_until_inner(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+    });
+    for _ in 0..64 {
+        if process_calls.load(std::sync::atomic::Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    completion_ready.store(true, std::sync::atomic::Ordering::Release);
+    work_ready.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), drain)
+        .await
+        .expect("shuffle completion wake was consumed without repolling the graph")
+        .unwrap()
+        .unwrap();
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 2);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn checkpoint_graph_drain_repolls_nonrunnable_completion_after_idle_fallback() {
+    let mut callback = empty_callback_fixture();
+    let pending = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let completion_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let process_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    callback.graph.push_test_node(
+        "fallback-polled-checkpoint-drain",
+        Box::new(CompletionPolledDrainOperator {
+            pending,
+            completion_ready: Arc::clone(&completion_ready),
+            process_calls: Arc::clone(&process_calls),
+        }),
+    );
+    let fence = assignment_fence(1, &[1, 7]);
+    let (_sender, _receiver) = install_callback_shuffle(&mut callback, &fence).await;
+
+    let drain = tokio::spawn(async move {
+        callback
+            .drain_checkpoint_edges_until_inner(
+                tokio::time::Instant::now() + Duration::from_secs(5),
+            )
+            .await
+    });
+    for _ in 0..64 {
+        if process_calls.load(std::sync::atomic::Ordering::Acquire) == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+
+    completion_ready.store(true, std::sync::atomic::Ordering::Release);
+    tokio::time::advance(crate::pipeline::streaming_coordinator::IDLE_TIMEOUT).await;
+    drain.await.unwrap().unwrap();
+    assert_eq!(process_calls.load(std::sync::atomic::Ordering::Acquire), 2);
+}
+
 struct WriteCountingSink {
     writes: Arc<std::sync::atomic::AtomicUsize>,
     schema: arrow_schema::SchemaRef,
@@ -1450,6 +1997,299 @@ impl laminar_connectors::connector::SinkConnector for WriteCountingSink {
 
     async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
         Ok(())
+    }
+}
+
+struct BatchRecordingSink {
+    batches: Arc<parking_lot::Mutex<Vec<RecordBatch>>>,
+    schema: arrow_schema::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for BatchRecordingSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        self.batches.lock().push(batch.clone());
+        Ok(laminar_connectors::connector::WriteResult::new(
+            batch.num_rows(),
+            batch.get_array_memory_size() as u64,
+        ))
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+}
+
+fn spawn_batch_recording_sink(
+    name: &str,
+    contract: SinkContract,
+    schema: arrow_schema::SchemaRef,
+    event_tx: laminar_core::streaming::Producer<crate::sink_task::SinkEvent>,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    Arc<parking_lot::Mutex<Vec<RecordBatch>>>,
+) {
+    let batches = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: name.into(),
+        sink_id: Arc::from(name),
+        connector: Box::new(BatchRecordingSink {
+            batches: Arc::clone(&batches),
+            schema,
+        }),
+        contract,
+        requires_recovery_on_error: contract.is_checkpoint_committable(),
+        channel_capacity: 128,
+        flush_interval: Duration::from_secs(5),
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    (handle, batches)
+}
+
+fn recorded_i64_values(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int64Array>()
+                .expect("recorded test values must be Int64")
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn sink_publication_preserves_preflighted_batch_boundaries() {
+    use laminar_connectors::connector::{SinkConsistency, SinkInputMode, SinkTopology};
+
+    const BATCH_COUNT: usize = 40;
+    let mut callback = empty_callback_fixture();
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    callback.sink_event_rx = event_rx;
+    let append_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let boundary_sensitive_append_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let upsert_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::KeyedUpsert,
+    );
+    let changelog_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::FullChangelog,
+    );
+    let committable_contract = SinkContract::new(
+        SinkConsistency::CheckpointCommittable,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let plain_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "value",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
+    let weighted_schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        arrow_schema::Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            arrow_schema::DataType::Int64,
+            false,
+        ),
+    ]));
+
+    let (append_a, append_a_batches) = spawn_batch_recording_sink(
+        "append-a",
+        append_contract,
+        Arc::clone(&plain_schema),
+        event_tx.clone(),
+    );
+    let (append_b, append_b_batches) = spawn_batch_recording_sink(
+        "append-b",
+        append_contract,
+        Arc::clone(&plain_schema),
+        event_tx.clone(),
+    );
+    let (upsert, upsert_batches) = spawn_batch_recording_sink(
+        "upsert",
+        upsert_contract,
+        Arc::clone(&plain_schema),
+        event_tx.clone(),
+    );
+    let (boundary_sensitive, boundary_sensitive_batches) = spawn_batch_recording_sink(
+        "boundary-sensitive",
+        boundary_sensitive_append_contract,
+        Arc::clone(&plain_schema),
+        event_tx.clone(),
+    );
+    let (changelog, changelog_batches) = spawn_batch_recording_sink(
+        "changelog",
+        changelog_contract,
+        Arc::clone(&weighted_schema),
+        event_tx.clone(),
+    );
+    let (committable, committable_batches) = spawn_batch_recording_sink(
+        "committable",
+        committable_contract,
+        Arc::clone(&plain_schema),
+        event_tx,
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    committable.begin_epoch_until(7, deadline).await.unwrap();
+    let admission = committable.begun_epoch_admission(7).unwrap();
+    committable.publish_open_epoch(admission).unwrap();
+
+    callback.sinks.extend([
+        (
+            "append-a".into(),
+            append_a.clone(),
+            None,
+            "plain".into(),
+            append_contract,
+            false,
+        ),
+        (
+            "append-b".into(),
+            append_b.clone(),
+            None,
+            "plain".into(),
+            append_contract,
+            false,
+        ),
+        (
+            "boundary-sensitive".into(),
+            boundary_sensitive.clone(),
+            None,
+            "plain".into(),
+            boundary_sensitive_append_contract,
+            false,
+        ),
+        (
+            "upsert".into(),
+            upsert.clone(),
+            None,
+            "plain".into(),
+            upsert_contract,
+            false,
+        ),
+        (
+            "changelog".into(),
+            changelog.clone(),
+            None,
+            "weighted".into(),
+            changelog_contract,
+            true,
+        ),
+        (
+            "committable".into(),
+            committable.clone(),
+            None,
+            "plain".into(),
+            committable_contract,
+            false,
+        ),
+    ]);
+    let plain = (0..BATCH_COUNT)
+        .map(|value| {
+            RecordBatch::try_new(
+                Arc::clone(&plain_schema),
+                vec![Arc::new(arrow_array::Int64Array::from(vec![value as i64]))],
+            )
+            .unwrap()
+        })
+        .collect();
+    let weighted = (0..BATCH_COUNT)
+        .map(|value| {
+            RecordBatch::try_new(
+                Arc::clone(&weighted_schema),
+                vec![
+                    Arc::new(arrow_array::Int64Array::from(vec![value as i64])),
+                    Arc::new(arrow_array::Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut results = FxHashMap::default();
+    results.insert(Arc::from("plain"), plain);
+    results.insert(Arc::from("weighted"), weighted);
+
+    crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+        .await
+        .unwrap();
+    for handle in [
+        &append_a,
+        &append_b,
+        &boundary_sensitive,
+        &upsert,
+        &changelog,
+        &committable,
+    ] {
+        handle.sync().await.unwrap();
+    }
+
+    let append_a_written = append_a_batches.lock().clone();
+    let append_b_written = append_b_batches.lock().clone();
+    assert_eq!(append_a_written.len(), BATCH_COUNT);
+    assert_eq!(append_b_written.len(), BATCH_COUNT);
+    assert_eq!(
+        recorded_i64_values(&append_a_written),
+        (0..BATCH_COUNT as i64).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recorded_i64_values(&append_b_written),
+        recorded_i64_values(&append_a_written)
+    );
+    assert_eq!(boundary_sensitive_batches.lock().len(), BATCH_COUNT);
+    assert_eq!(upsert_batches.lock().len(), BATCH_COUNT);
+    assert_eq!(changelog_batches.lock().len(), BATCH_COUNT);
+    assert_eq!(committable_batches.lock().len(), BATCH_COUNT);
+
+    for handle in [
+        append_a,
+        append_b,
+        boundary_sensitive,
+        upsert,
+        changelog,
+        committable,
+    ] {
+        handle.close().await.unwrap();
     }
 }
 
@@ -1686,11 +2526,21 @@ async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
         crate::sink_task::SinkEvent,
     >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
     callback.sink_event_rx = event_rx;
-    let contract = SinkContract::new(
+    let full_contract = SinkContract::new(
         SinkConsistency::Ephemeral,
         SinkTopology::MultiWriter,
         SinkInputMode::FullChangelog,
     );
+    let append_contract = SinkContract::new(
+        SinkConsistency::Ephemeral,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let plain_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "value",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
     let int_schema = Arc::new(arrow_schema::Schema::new(vec![
         arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
         arrow_schema::Field::new(
@@ -1716,7 +2566,7 @@ async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
                 writes: Arc::clone(&filtered_writes),
                 schema: Arc::clone(&int_schema),
             }),
-            contract,
+            contract: full_contract,
             requires_recovery_on_error: false,
             channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
             flush_interval: Duration::from_secs(5),
@@ -1733,9 +2583,9 @@ async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
             sink_id: Arc::from("sibling"),
             connector: Box::new(WriteCountingSink {
                 writes: Arc::clone(&sibling_writes),
-                schema: Arc::clone(&int_schema),
+                schema: Arc::clone(&plain_schema),
             }),
-            contract,
+            contract: append_contract,
             requires_recovery_on_error: false,
             channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
             flush_interval: Duration::from_secs(5),
@@ -1750,16 +2600,16 @@ async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
         filtered_handle.clone(),
         Some("value > 0".into()),
         "changes".into(),
-        contract,
+        full_contract,
         true,
     ));
     callback.sinks.push((
         "sibling".into(),
         sibling_handle.clone(),
         None,
-        "changes".into(),
-        contract,
-        true,
+        "plain".into(),
+        append_contract,
+        false,
     ));
     callback.pending_sink_filter_compiles = 1;
     let first = RecordBatch::try_new(
@@ -1780,6 +2630,18 @@ async fn weighted_filter_preflight_is_atomic_across_batches_and_sinks() {
     .unwrap();
     let mut results = FxHashMap::default();
     results.insert(Arc::from("changes"), vec![first, second]);
+    results.insert(
+        Arc::from("plain"),
+        (0..40)
+            .map(|value| {
+                RecordBatch::try_new(
+                    Arc::clone(&plain_schema),
+                    vec![Arc::new(arrow_array::Int64Array::from(vec![value]))],
+                )
+                .unwrap()
+            })
+            .collect(),
+    );
 
     let error = crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
         .await
@@ -2150,6 +3012,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         &mut callback,
         expired,
         std::time::Instant::now() - Duration::from_secs(2),
+        tokio::time::Instant::now(),
         laminar_core::checkpoint::flags::NONE,
         Some(fence.clone()),
     )
@@ -2179,6 +3042,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         &mut callback,
         rejected,
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         Some(fence.clone()),
     )
@@ -2224,6 +3088,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         &mut callback,
         attempt,
         std::time::Instant::now(),
+        tokio::time::Instant::now() + Duration::from_secs(5),
         laminar_core::checkpoint::flags::NONE,
         Some(fence),
     )
@@ -2391,6 +3256,7 @@ fn cluster_callback_fixture(
             source_name_arcs,
             checkpoint_source_names: vec!["orders".into()],
             source_frontiers_buf: FxHashMap::default(),
+            committed_source_watermarks_snapshot: Arc::new(FxHashMap::default()),
             tracker: Some(tracker),
             prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
                 &prometheus::Registry::new(),
@@ -2418,10 +3284,12 @@ fn cluster_callback_fixture(
             sink_timed_out: false,
             sink_fault: None,
             checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            pipeline_halt: None,
             last_checkpoint_admission_failure: None,
             checkpoint_admission_recovering: false,
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             cluster_controller: Some(controller),
+            assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
             shuffle_delivery_loss_incidents: None,
             shuffle_recovered_delivery_loss_incidents: None,
             shuffle_delivery_loss_incidents_seen: 0,
@@ -2529,6 +3397,38 @@ async fn destructive_operator_capture_failure_faults_at_least_once_runtime() {
     let fault = crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback)
         .expect("mutable capture failure must become a runtime fault");
     assert_eq!(fault, error);
+}
+
+#[tokio::test]
+async fn terminal_operator_capture_populates_halt_without_recovery_fault() {
+    let mut callback = empty_callback_fixture();
+    callback
+        .graph
+        .push_test_node("terminal-capture", Box::new(TerminalCaptureFailureOperator));
+
+    let error = callback
+        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .err()
+        .expect("terminal operator capture must reject the checkpoint");
+
+    assert!(
+        error.contains("injected permanent checkpoint routing failure"),
+        "{error}"
+    );
+    assert_eq!(
+        crate::pipeline::PipelineCallback::take_pipeline_halt(&mut callback).as_deref(),
+        Some(error.as_str())
+    );
+    assert!(
+        crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback).is_none(),
+        "a deterministic capture error must not request checkpoint recovery"
+    );
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        callback.shutdown_signal.notified(),
+    )
+    .await
+    .expect("terminal capture must wake the coordinator");
 }
 
 #[tokio::test]
@@ -2658,6 +3558,26 @@ async fn busy_serialization_gate_does_not_hold_assignment_writer_until_timeout()
     drop(held_permit);
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn clustered_capture_without_rotation_fence_cannot_claim_portability() {
+    let mut callback = empty_callback_fixture();
+    let fence = assignment_fence(1, &[1, 7]);
+
+    let error = callback
+        .checkpoint_capture_rotation_guard_until(
+            Some(&fence),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a clustered capture must own a graph assignment-rotation fence");
+
+    assert!(
+        error.contains("no graph assignment-rotation fence"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
     let live_rows = Arc::new(std::sync::atomic::AtomicUsize::new(17));
@@ -2783,6 +3703,7 @@ async fn unclassified_checkpoint_tail_error_faults_only_durable_delivery() {
             handoff_replay_pending: false,
             attempt: CheckpointAttempt::canonical(7),
             attempt_started: std::time::Instant::now(),
+            attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
             checkpoint_timeout: Duration::from_secs(1),
             serialization_timeout: Duration::from_secs(1),
             checkpoint_cleanup_timeout: Duration::from_secs(1),
@@ -2793,8 +3714,6 @@ async fn unclassified_checkpoint_tail_error_faults_only_durable_delivery() {
             controller: None,
             #[cfg(feature = "cluster")]
             leader_proof: None,
-            #[cfg(feature = "cluster")]
-            quorum_timeout: Duration::from_secs(1),
             full_vnode_capture_needed: Arc::clone(&full_vnode_capture_needed),
         };
 
@@ -3028,6 +3947,28 @@ async fn checkpoint_drain_preserves_terminal_shuffle_halt() {
         .expect("checkpoint drain terminal error must notify shutdown");
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_alignment_retains_terminal_disposition_out_of_band() {
+    let mut callback = empty_callback_fixture();
+    let error = DbError::ShuffleTerminal("invalid routing structure".into());
+    let expected = error.to_string();
+
+    callback.record_checkpoint_alignment_error(&error);
+
+    assert_eq!(
+        crate::pipeline::PipelineCallback::take_pipeline_halt(&mut callback).as_deref(),
+        Some(expected.as_str())
+    );
+    assert!(callback.checkpoint_fault.lock().is_none());
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        callback.shutdown_signal.notified(),
+    )
+    .await
+    .expect("checkpoint alignment terminal error must wake the coordinator");
+}
+
 #[tokio::test]
 async fn test_non_backpressure_error_does_not_notify() {
     use crate::pipeline::CycleError;
@@ -3086,6 +4027,96 @@ async fn reserved_attempt_cleanup_deadline_includes_coordinator_lock() {
         "coordinator lock contention must not refresh or bypass the cleanup deadline"
     );
     drop(lock);
+}
+
+#[tokio::test]
+async fn reserved_attempt_failure_is_reported_only_after_cleanup_resolves() {
+    let attempt = CheckpointAttempt::canonical(17);
+    let coordinator = Arc::new(tokio::sync::Mutex::new(None));
+    let coordinator_lock = coordinator.lock().await;
+    let (complete_tx, complete_rx) =
+        crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
+    let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
+    let full_vnode_capture_needed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tail = LeaderTail {
+        in_flight: EpochInFlightGuard::claim(
+            &in_flight,
+            &checkpoint_fault,
+            attempt,
+            std::iter::empty(),
+        )
+        .unwrap(),
+        coordinator: Arc::clone(&coordinator),
+        complete_tx,
+        request: crate::checkpoint_coordinator::CheckpointRequest::default(),
+        operator_state: None,
+        operator_state_staged_cap_bytes: 0,
+        mutable_operator_capture_guard: None,
+        fan_out: FxHashMap::default(),
+        local_watermark: CheckpointWatermark::Uninitialized,
+        handoff_replay_pending: false,
+        attempt,
+        attempt_started: std::time::Instant::now(),
+        attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+        checkpoint_timeout: Duration::from_secs(2),
+        serialization_timeout: Duration::from_secs(1),
+        checkpoint_cleanup_timeout: Duration::from_secs(1),
+        fault_on_retryable_failure: false,
+        fault_on_unclassified_error: false,
+        checkpoint_fault: Arc::clone(&checkpoint_fault),
+        #[cfg(feature = "cluster")]
+        controller: None,
+        #[cfg(feature = "cluster")]
+        leader_proof: None,
+        full_vnode_capture_needed: Arc::clone(&full_vnode_capture_needed),
+    };
+
+    let failure = tokio::spawn(async move {
+        fail_reserved_leader_attempt(
+            &mut tail,
+            "injected admission failure".into(),
+            "reserved-attempt cleanup".into(),
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !full_vnode_capture_needed.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("failure task must reach reserved-attempt cleanup");
+    tokio::task::yield_now().await;
+
+    assert!(matches!(
+        complete_rx.try_recv(),
+        Err(crossfire::TryRecvError::Empty)
+    ));
+    assert!(checkpoint_fault.lock().is_none());
+
+    // Let cleanup acquire the coordinator and classify the missing reservation owner.
+    drop(coordinator_lock);
+    tokio::time::timeout(Duration::from_secs(1), failure)
+        .await
+        .expect("bounded reserved-attempt cleanup must settle")
+        .expect("failure task must not panic");
+
+    let completion = complete_rx.recv().await.unwrap();
+    let crate::pipeline::CheckpointCompletion::Failed {
+        attempt: completed_attempt,
+        error,
+    } = completion
+    else {
+        panic!("reserved attempt must report failure");
+    };
+    assert_eq!(completed_attempt, attempt);
+    assert!(error.contains("injected admission failure"));
+    assert!(error.contains("cleanup incomplete; recovery required"));
+    assert!(checkpoint_fault
+        .lock()
+        .as_deref()
+        .is_some_and(|fault| fault.contains("cleanup incomplete; recovery required")));
 }
 
 /// Rejected must never pass rows through.
@@ -3224,10 +4255,11 @@ fn cap_source_frontiers_lowers_only_sources_above_cluster_min() {
 }
 
 #[cfg(feature = "cluster")]
-#[test]
-fn committed_cluster_watermark_keeps_replayed_rows_from_a_faster_local_frontier() {
+#[tokio::test]
+async fn source_admission_pins_its_committed_frontier_for_the_whole_cycle() {
     use arrow_array::TimestampMillisecondArray;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use laminar_core::checkpoint::ChannelProgress;
 
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -3240,13 +4272,449 @@ fn committed_cluster_watermark_keeps_replayed_rows_from_a_faster_local_frontier(
         ]))],
     )
     .unwrap();
-    let effective = ConnectorPipelineCallback::cap_watermark_by_cluster_min(2_000, Some(1_500));
-    let retained = filter_late_rows(&batch, "ts", effective)
-        .unwrap()
-        .expect("the row after the committed frontier must survive replay");
 
-    assert_eq!(effective, 1_500);
+    let channel = |source_name: &str, watermark: i64| ChannelProgress {
+        participant_id: 1,
+        source_name: source_name.into(),
+        input_channel: vec![0],
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let controller = local_controller();
+    controller
+        .publish_committed_channel_progress(&[
+            channel("orders", 1_500),
+            channel("unrelated_slow_source", 100),
+        ])
+        .unwrap();
+    assert_eq!(controller.cluster_min_watermark(), Some(100));
+
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(Arc::clone(&controller));
+    let mut generator = laminar_core::time::BoundedOutOfOrdernessGenerator::new(0);
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(&mut generator, 2_000);
+    callback.watermark_states.insert(
+        "orders".into(),
+        SourceWatermarkState::new(
+            laminar_core::time::EventTimeExtractor::from_column("ts"),
+            Box::new(generator),
+            "ts".into(),
+        ),
+    );
+    callback
+        .pipeline_watermark
+        .store(2_000, std::sync::atomic::Ordering::Release);
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+
+    // A concurrent durable tail may publish the successor while this cycle is being folded.
+    controller
+        .publish_committed_channel_progress(&[
+            channel("orders", 1_800),
+            channel("unrelated_slow_source", 200),
+        ])
+        .unwrap();
+    let retained = crate::pipeline::PipelineCallback::filter_late_rows(&callback, "orders", &batch)
+        .unwrap()
+        .expect("the row after the cycle-pinned source frontier must survive replay");
     assert_eq!(retained.num_rows(), 1);
+
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+    assert!(
+        crate::pipeline::PipelineCallback::filter_late_rows(&callback, "orders", &batch,)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_source_admission_uses_the_pinned_committed_cut() {
+    use arrow_array::TimestampMillisecondArray;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use laminar_core::checkpoint::ChannelProgress;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )])),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![500, 1_000]))],
+    )
+    .unwrap();
+    let channel = |source_name: &str, watermark: i64| ChannelProgress {
+        participant_id: 1,
+        source_name: source_name.into(),
+        input_channel: vec![0],
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let controller = local_controller();
+    controller
+        .publish_committed_channel_progress(&[
+            channel("orders", 900),
+            channel("unrelated_slow_source", 100),
+        ])
+        .unwrap();
+
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(controller);
+    callback.source_ids.insert("orders".into(), 0);
+    let mut tracker = laminar_core::time::WatermarkTracker::new(1);
+    tracker.update_source(0, 100);
+    tracker.mark_idle(0);
+    callback.tracker = Some(tracker);
+    let mut generator = laminar_core::time::BoundedOutOfOrdernessGenerator::new(0);
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(&mut generator, 100);
+    callback.watermark_states.insert(
+        "orders".into(),
+        SourceWatermarkState::new(
+            laminar_core::time::EventTimeExtractor::from_column("ts"),
+            Box::new(generator),
+            "ts".into(),
+        ),
+    );
+    callback
+        .pipeline_watermark
+        .store(1_500, std::sync::atomic::Ordering::Release);
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+
+    let retained = crate::pipeline::PipelineCallback::filter_late_rows(&callback, "orders", &batch)
+        .unwrap()
+        .expect("the row at or beyond the idle source's committed cut must survive");
+    assert_eq!(retained.num_rows(), 1);
+    assert_eq!(
+        retained
+            .column_by_name("ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(0),
+        1_000
+    );
+
+    callback.tracker.as_mut().unwrap().update_source(0, 100);
+    callback
+        .pipeline_watermark
+        .store(100, std::sync::atomic::Ordering::Release);
+    let retained = crate::pipeline::PipelineCallback::filter_late_rows(&callback, "orders", &batch)
+        .unwrap()
+        .expect("active replay must retain rows above its lower local frontier");
+    assert_eq!(retained.num_rows(), 2);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn empty_idle_source_gaining_a_channel_activates_at_the_pinned_committed_cut() {
+    use laminar_core::checkpoint::{ChannelProgress, SINGLETON_WATERMARK_CHANNEL};
+    use std::time::Duration;
+
+    let channel = |source_name: &str, watermark: i64| ChannelProgress {
+        participant_id: 1,
+        source_name: source_name.into(),
+        input_channel: vec![0],
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let controller = local_controller();
+    controller
+        .publish_committed_channel_progress(&[
+            channel("orders", 900),
+            channel("unrelated_slow_source", 100),
+        ])
+        .unwrap();
+
+    let mut state = SourceWatermarkState::new(
+        laminar_core::time::EventTimeExtractor::from_column("ts"),
+        Box::new(laminar_core::time::BoundedOutOfOrdernessGenerator::new(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        FxHashMap::default(),
+        Some(Arc::from([])),
+    );
+    state
+        .install_input_channels(Some(Arc::from([])), i64::MIN)
+        .unwrap();
+    assert_eq!(state.install_committed_watermark_floor(900), Some(900));
+
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(controller);
+    callback.source_ids.insert("orders".into(), 0);
+    callback.source_name_arcs.insert(0, Arc::from("orders"));
+    callback.checkpoint_source_names = vec!["orders".into()];
+    let mut tracker = laminar_core::time::WatermarkTracker::new(1);
+    tracker.update_source(0, 900);
+    tracker.mark_idle(0);
+    callback.tracker = Some(tracker);
+    callback.watermark_states.insert("orders".into(), state);
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+
+    let request = callback.build_checkpoint_request().unwrap();
+    assert_eq!(request.channel_progress.len(), 1);
+    let marker = &request.channel_progress[0];
+    assert_eq!(marker.source_name, "orders");
+    assert_eq!(marker.input_channel.as_slice(), SINGLETON_WATERMARK_CHANNEL);
+    assert_eq!(marker.watermark, Some(900));
+    assert!(marker.idle);
+
+    crate::pipeline::PipelineCallback::reconcile_source_input_channels(
+        &mut callback,
+        "orders",
+        Some(Arc::from([b"p0".to_vec()])),
+    )
+    .unwrap();
+    let progress = callback.watermark_states["orders"]
+        .input_channel_progress()
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].watermark, Some(900));
+    assert!(!progress[0].idle);
+}
+
+#[tokio::test]
+async fn local_empty_partition_inventory_emits_its_logical_watermark_marker() {
+    use laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL;
+    use std::time::Duration;
+
+    let empty_inventory: Arc<[Vec<u8>]> = Arc::from(Vec::<Vec<u8>>::new());
+    let mut state = SourceWatermarkState::new(
+        laminar_core::time::EventTimeExtractor::from_column("ts"),
+        Box::new(laminar_core::time::BoundedOutOfOrdernessGenerator::new(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        FxHashMap::default(),
+        Some(Arc::clone(&empty_inventory)),
+    );
+    state
+        .install_input_channels(Some(empty_inventory), i64::MIN)
+        .unwrap();
+    assert_eq!(state.install_committed_watermark_floor(900), Some(900));
+
+    let mut callback = empty_callback_fixture();
+    callback.source_ids.insert("orders".into(), 0);
+    callback.source_name_arcs.insert(0, Arc::from("orders"));
+    callback.checkpoint_source_names = vec!["orders".into()];
+    callback.watermark_states.insert("orders".into(), state);
+    let mut tracker = laminar_core::time::WatermarkTracker::new(1);
+    tracker.update_source(0, 900);
+    tracker.mark_idle(0);
+    callback.tracker = Some(tracker);
+
+    let request = callback.build_checkpoint_request().unwrap();
+    assert_eq!(request.channel_progress.len(), 1);
+    let marker = &request.channel_progress[0];
+    assert_eq!(marker.source_name, "orders");
+    assert_eq!(marker.input_channel.as_slice(), SINGLETON_WATERMARK_CHANNEL);
+    assert_eq!(marker.watermark, Some(900));
+    assert!(marker.idle);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cold_empty_successor_rehydrates_the_callback_source_pin() {
+    use laminar_core::checkpoint::{
+        ChannelProgress, CheckpointScope, CommittedCheckpointIndex, CommittedParticipantRef,
+        ConnectorCheckpoint, PipelineIdentity, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    };
+    use laminar_core::state::LOCAL_NODE_ID;
+    use std::{collections::BTreeMap, time::Duration};
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let warm_store =
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(&backing));
+    let deployment_id = warm_store.load_or_create_deployment_id().await.unwrap();
+    let participant = || CommittedParticipantRef {
+        participant_id: LOCAL_NODE_ID.0,
+        manifest_len: 1,
+        manifest_sha256: digest(1),
+        node_data_len: 0,
+        node_data_sha256: digest(2),
+    };
+    let predecessor = CommittedCheckpointIndex {
+        version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+        deployment_id: deployment_id.clone(),
+        pipeline_identity: PipelineIdentity::empty(),
+        epoch: 1,
+        checkpoint_id: 1,
+        scope: CheckpointScope::Local,
+        vnode_count: 1,
+        assignment_fence: None,
+        reassignment_portable: false,
+        predecessor: None,
+        participants: vec![participant()],
+        source_names: vec!["orders".into()],
+        source_offsets: BTreeMap::from([(
+            "orders".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"p0".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        )]),
+        channel_progress: vec![ChannelProgress {
+            participant_id: LOCAL_NODE_ID.0,
+            source_name: "orders".into(),
+            input_channel: b"p0".to_vec(),
+            watermark: Some(900),
+            idle: false,
+        }],
+        source_watermarks: BTreeMap::from([("orders".into(), 900)]),
+        checkpoint_watermark: Some(900),
+    };
+    let predecessor_ref = warm_store
+        .create_committed_checkpoint(&predecessor)
+        .await
+        .unwrap();
+    let mut successor = predecessor.clone();
+    successor.epoch = 2;
+    successor.checkpoint_id = 2;
+    successor.predecessor = Some(predecessor_ref);
+    successor
+        .source_offsets
+        .get_mut("orders")
+        .unwrap()
+        .input_channels = Some(Vec::new());
+    successor.channel_progress.clear();
+    successor.checkpoint_watermark = None;
+    successor.validate_predecessor_index(&predecessor).unwrap();
+    let successor_ref = warm_store
+        .create_committed_checkpoint(&successor)
+        .await
+        .unwrap();
+    drop(warm_store);
+
+    let cold_store = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(backing);
+    let restored = cold_store
+        .load_committed_checkpoint(&successor_ref)
+        .await
+        .unwrap();
+    let restored_predecessor = cold_store
+        .load_committed_checkpoint(restored.predecessor.as_ref().unwrap())
+        .await
+        .unwrap();
+    restored
+        .validate_predecessor_index(&restored_predecessor)
+        .unwrap();
+    let retained = restored.effective_source_watermarks().unwrap();
+    assert!(restored.channel_progress.is_empty());
+    assert_eq!(retained.get("orders"), Some(&900));
+
+    let controller = local_controller();
+    controller
+        .replace_recovered_checkpoint_progress(&restored.channel_progress, &retained)
+        .unwrap();
+    let mut state = SourceWatermarkState::new(
+        laminar_core::time::EventTimeExtractor::from_column("ts"),
+        Box::new(laminar_core::time::BoundedOutOfOrdernessGenerator::new(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        FxHashMap::default(),
+        Some(Arc::from([])),
+    );
+    state
+        .install_input_channels(Some(Arc::from([])), i64::MIN)
+        .unwrap();
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(controller);
+    callback.source_ids.insert("orders".into(), 0);
+    let mut tracker = laminar_core::time::WatermarkTracker::new(1);
+    tracker.mark_idle(0);
+    callback.tracker = Some(tracker);
+    callback.watermark_states.insert("orders".into(), state);
+
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+    assert_eq!(
+        callback.committed_source_watermarks_snapshot.get("orders"),
+        Some(&900)
+    );
+    crate::pipeline::PipelineCallback::reconcile_source_input_channels(
+        &mut callback,
+        "orders",
+        Some(Arc::from([b"p0".to_vec()])),
+    )
+    .unwrap();
+    let progress = callback.watermark_states["orders"]
+        .input_channel_progress()
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].watermark, Some(900));
+    assert!(!progress[0].idle);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn idle_watermark_tick_retains_the_pinned_committed_cut() {
+    use laminar_core::checkpoint::ChannelProgress;
+    use std::time::Duration;
+
+    let channel = |source_name: &str, watermark: i64| ChannelProgress {
+        participant_id: 1,
+        source_name: source_name.into(),
+        input_channel: vec![0],
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let committed_cut = i64::MAX - 1;
+    let controller = local_controller();
+    controller
+        .publish_committed_channel_progress(&[
+            channel("orders", committed_cut),
+            channel("unrelated_slow_source", 100),
+        ])
+        .unwrap();
+
+    let mut state = SourceWatermarkState::new(
+        laminar_core::time::EventTimeExtractor::from_column("ts"),
+        Box::new(laminar_core::time::BoundedOutOfOrdernessGenerator::new(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        Some(Duration::ZERO),
+        FxHashMap::default(),
+        None,
+    );
+    state
+        .install_input_channels(Some(Arc::from([b"p0".to_vec()])), 500)
+        .unwrap();
+
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(controller);
+    callback.source_ids.insert("orders".into(), 0);
+    callback.source_name_arcs.insert(0, Arc::from("orders"));
+    let mut tracker = laminar_core::time::WatermarkTracker::new(1);
+    tracker.update_source(0, 500);
+    callback.tracker = Some(tracker);
+    callback.watermark_states.insert("orders".into(), state);
+    crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
+
+    crate::pipeline::PipelineCallback::tick_idle_watermark(&mut callback);
+    let tracker = callback.tracker.as_ref().unwrap();
+    assert_eq!(tracker.source_watermark(0), Some(committed_cut));
+    assert!(tracker.is_idle(0));
+    let progress = callback.watermark_states["orders"]
+        .input_channel_progress()
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].watermark, Some(committed_cut));
+    assert!(progress[0].idle);
 }
 
 #[cfg(feature = "cluster")]
@@ -3539,6 +5007,295 @@ async fn gate_controller() -> (
         .unwrap();
     controller.set_leader_lease_store(lease_store);
     (kv, controller, leader_id, tx, decision_store)
+}
+
+#[cfg(feature = "cluster")]
+struct PreparedQuorumControllers {
+    leader: Arc<laminar_core::cluster::control::ClusterController>,
+    follower: Arc<laminar_core::cluster::control::ClusterController>,
+    fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+    leader_proof: laminar_core::cluster::control::LeaderProof,
+    _follower_members_tx:
+        tokio::sync::watch::Sender<Vec<laminar_core::cluster::discovery::NodeInfo>>,
+    _leader_members_tx: tokio::sync::watch::Sender<Vec<laminar_core::cluster::discovery::NodeInfo>>,
+    _leader_grant_tx:
+        tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>>,
+}
+
+#[cfg(feature = "cluster")]
+async fn prepared_quorum_controllers() -> PreparedQuorumControllers {
+    use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
+    use laminar_core::cluster::control::{
+        ClusterController, ClusterKv, InMemoryKv, LeaseDeadline, ProcessLease,
+    };
+    use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
+
+    let (follower_kv, follower, leader_id, follower_members_tx, _decision_store) =
+        gate_controller().await;
+    let authority = follower.checkpoint_authority().unwrap();
+    let leader_grant = authority.load().await.unwrap().unwrap();
+    let leader_proof = leader_grant.proof();
+
+    let follower = Arc::new(follower);
+    follower
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    follower
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            &ProcessLease {
+                node: follower.instance_id(),
+                owner: follower.recovery_incarnation(),
+                term: 1,
+                seq: 1,
+                expires_at_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+    let leader_kv = Arc::new(InMemoryKv::new(leader_id));
+    let leader_control: Arc<dyn ClusterKv> = leader_kv.clone();
+    let (leader_members_tx, leader_members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+        id: follower.instance_id(),
+        name: "follower".into(),
+        rpc_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    }]);
+    let leader = Arc::new(ClusterController::new_with_recovery_incarnation(
+        leader_id,
+        Arc::clone(&leader_control),
+        leader_control,
+        None,
+        leader_members_rx,
+        leader_grant.owner.boot,
+    ));
+    leader.set_leader_lease_store(Arc::clone(&authority));
+    let leader_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+    leader
+        .set_process_lease_deadline(Arc::clone(&leader_deadline))
+        .unwrap();
+    let (leader_grant_tx, leader_grant_rx) =
+        tokio::sync::watch::channel(Some(leader_grant.clone()));
+    leader
+        .set_leader_lease_watch(leader_grant_rx, leader_grant.owner.clone(), leader_deadline)
+        .unwrap();
+    leader.install_local_leader_proof_provider();
+    leader
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            &ProcessLease {
+                node: leader_id,
+                owner: leader_grant.owner.boot,
+                term: leader_grant.owner.process_term,
+                seq: 1,
+                expires_at_ms: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+
+    let follower_endpoint = follower_kv
+        .read_from(follower.instance_id(), BARRIER_ADDR_KEY)
+        .await
+        .unwrap();
+    leader_kv.seed(follower.instance_id(), BARRIER_ADDR_KEY, follower_endpoint);
+    let leader_endpoint = leader_kv
+        .read_from(leader_id, BARRIER_ADDR_KEY)
+        .await
+        .unwrap();
+    follower_kv.seed(leader_id, BARRIER_ADDR_KEY, leader_endpoint);
+
+    let fence = assignment_fence(19, &[leader_id.0, follower.instance_id().0]);
+    leader.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    assert_eq!(leader.capture_leader_proof().as_ref(), Some(&leader_proof));
+
+    PreparedQuorumControllers {
+        leader,
+        follower,
+        fence,
+        leader_proof,
+        _follower_members_tx: follower_members_tx,
+        _leader_members_tx: leader_members_tx,
+        _leader_grant_tx: leader_grant_tx,
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn captured_ack_can_arrive_after_thirty_seconds_before_attempt_deadline() {
+    use laminar_core::cluster::control::{BarrierAck, BarrierAckDisposition, Phase};
+
+    let controllers = prepared_quorum_controllers().await;
+    let attempt = CheckpointAttempt::new(41, 41);
+    let flags = laminar_core::checkpoint::flags::NONE;
+    let prepare = certified_barrier(
+        attempt,
+        controllers.fence.clone(),
+        controllers.leader_proof.clone(),
+        Phase::Prepare,
+    );
+    let retry_window = Duration::from_secs(3);
+    let attempt_window = Duration::from_secs(40);
+    let deadline = tokio::time::Instant::now() + attempt_window;
+    controllers
+        .leader
+        .announce_prepare_barrier_until(&prepare, deadline, retry_window)
+        .await
+        .unwrap();
+
+    let prepared = ConnectorPipelineCallback::wait_for_capture_quorum_until(
+        &controllers.leader,
+        deadline,
+        attempt_window,
+        crate::checkpoint_coordinator::PrepareQuorum::new(
+            attempt,
+            CheckpointWatermark::Active(101),
+            &controllers.fence,
+            &controllers.leader_proof,
+            flags,
+        ),
+    );
+    tokio::pin!(prepared);
+    tokio::select! {
+        result = &mut prepared => panic!("capture quorum completed before its follower ack: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    tokio::time::advance(Duration::from_secs(31)).await;
+    controllers
+        .follower
+        .ack_barrier(&BarrierAck {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            assignment_digest: Some(controllers.fence.digest()),
+            flags,
+            disposition: BarrierAckDisposition::Captured,
+            error: None,
+            watermark: CheckpointWatermark::Active(91),
+        })
+        .await
+        .unwrap();
+
+    // The fan-out intentionally uses real loopback gRPC. Resume wall-clock time after proving
+    // that the task survived 31 virtual seconds so Tokio cannot auto-advance the remaining retry
+    // timers past real socket I/O and the exact attempt deadline.
+    tokio::time::resume();
+
+    let (watermark, participants, replay_pending) = prepared
+        .await
+        .expect("an immutable follower capture must satisfy quorum before the exact deadline");
+    assert_eq!(watermark, CheckpointWatermark::Active(91));
+    assert_eq!(participants, vec![controllers.follower.instance_id()]);
+    assert!(!replay_pending);
+    assert!(tokio::time::Instant::now() < deadline);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn capture_quorum_fails_at_the_exact_attempt_deadline() {
+    use laminar_core::cluster::control::Phase;
+
+    let controllers = prepared_quorum_controllers().await;
+    let attempt = CheckpointAttempt::new(42, 42);
+    let prepare = certified_barrier(
+        attempt,
+        controllers.fence.clone(),
+        controllers.leader_proof.clone(),
+        Phase::Prepare,
+    );
+    let retry_window = Duration::from_secs(3);
+    let attempt_window = Duration::from_secs(8);
+    let started = tokio::time::Instant::now();
+    let deadline = started + attempt_window;
+    controllers
+        .leader
+        .announce_prepare_barrier_until(&prepare, deadline, retry_window)
+        .await
+        .unwrap();
+
+    let prepared = ConnectorPipelineCallback::wait_for_capture_quorum_until(
+        &controllers.leader,
+        deadline,
+        attempt_window,
+        crate::checkpoint_coordinator::PrepareQuorum::new(
+            attempt,
+            CheckpointWatermark::Active(101),
+            &controllers.fence,
+            &controllers.leader_proof,
+            laminar_core::checkpoint::flags::NONE,
+        ),
+    );
+    tokio::pin!(prepared);
+    tokio::select! {
+        result = &mut prepared => panic!("capture quorum completed before its deadline: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    tokio::time::advance(retry_window + Duration::from_secs(1)).await;
+    tokio::select! {
+        result = &mut prepared => panic!("legacy retry window ended the attempt early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    tokio::time::advance(attempt_window - (retry_window + Duration::from_secs(1))).await;
+
+    let error = prepared
+        .await
+        .expect_err("missing Captured acknowledgement must fail at the attempt deadline");
+    assert!(
+        error.contains("timed out") || error.contains("end-to-end checkpoint deadline"),
+        "{error}"
+    );
+    assert_eq!(tokio::time::Instant::now(), deadline);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn aligned_resume_gate_survives_the_legacy_retry_window() {
+    use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+    let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+    let (fence, identity) = resume_identity(43, 43);
+    let attempt_window = Duration::from_secs(20);
+    let attempt_deadline = tokio::time::Instant::now() + attempt_window;
+    let aligned = ConnectorPipelineCallback::wait_for_aligned_resume_until(
+        true,
+        &controller,
+        identity.clone(),
+        &fence,
+        attempt_deadline,
+    );
+    tokio::pin!(aligned);
+    tokio::select! {
+        result = &mut aligned => panic!("resume gate completed before Aligned: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    tokio::time::advance(Duration::from_secs(12)).await;
+    kv.seed(
+        leader_id,
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&BarrierAnnouncement {
+            epoch: identity.attempt.epoch,
+            checkpoint_id: identity.attempt.checkpoint_id,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(identity.leader_proof),
+            phase: Phase::Aligned,
+            flags: identity.flags,
+        })
+        .unwrap(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), &mut aligned)
+        .await
+        .expect("Aligned observation must complete before the exact attempt deadline")
+        .expect("the resume gate must outlive the old ten-second derived timeout");
+    assert!(tokio::time::Instant::now() < attempt_deadline);
 }
 
 #[cfg(feature = "cluster")]
@@ -3977,6 +5734,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body
     let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
     let mut request = crate::checkpoint_coordinator::CheckpointRequest::default();
     request.assignment_fence = Some(fence.clone());
+    request.reassignment_portable = true;
     let mut tail = LeaderTail {
         in_flight: EpochInFlightGuard::claim(
             &in_flight,
@@ -3996,6 +5754,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body
         handoff_replay_pending: false,
         attempt,
         attempt_started: std::time::Instant::now(),
+        attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
         checkpoint_timeout: Duration::from_secs(2),
         serialization_timeout: Duration::from_secs(1),
         checkpoint_cleanup_timeout: Duration::from_secs(1),
@@ -4004,7 +5763,6 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body
         checkpoint_fault,
         controller: Some(Arc::clone(&leader)),
         leader_proof: Some(leader_proof),
-        quorum_timeout: Duration::from_secs(1),
         full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
@@ -4033,7 +5791,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body
         assert!(receiver.has_staged_checkpoint_barriers());
         assert!(!control.can_trigger());
 
-        let leader_tail = ConnectorPipelineCallback::prepare_leader_quorum(
+        let leader_tail = ConnectorPipelineCallback::capture_leader_quorum(
             &mut tail,
             tokio::time::Instant::now() + Duration::from_secs(1),
         );
@@ -4426,6 +6184,7 @@ async fn gate_committed_checkpoint(
         scope: CheckpointScope::Cluster,
         vnode_count: u16::try_from(fence.vnode_count).unwrap(),
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor: None,
         participants,
         source_names: vec!["source".into()],
@@ -4434,6 +6193,7 @@ async fn gate_committed_checkpoint(
             ConnectorCheckpoint::default(),
         )]),
         channel_progress,
+        source_watermarks: std::collections::BTreeMap::from([("source".into(), 42)]),
         checkpoint_watermark: Some(42),
     }
 }

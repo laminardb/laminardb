@@ -17,12 +17,12 @@ use rustc_hash::FxHashMap;
 
 use crate::catalog::schema_has_reserved_mutation_columns;
 use crate::connector_task_fence::ConnectorTaskFenceRegistration;
-#[cfg(feature = "cluster")]
-use crate::db::ClusterStartupDisposition;
 use crate::db::{
     exact_table_reference, DbState, LaminarDB, RecoveredInputChannelProgress, RuntimeMode,
     SourceWatermarkState,
 };
+#[cfg(feature = "cluster")]
+use crate::db::{ClusterStartupDisposition, StartupCheckpointArtifactAudit};
 use crate::error::DbError;
 use crate::pipeline::streaming_coordinator::{admit_append_only_source, TrackedSourceRegistration};
 
@@ -43,6 +43,46 @@ const KEYED_SOURCE_PRIMARY_KEY: &str =
     "[LDB-5038] keyed-upsert sources require an explicit CREATE SOURCE PRIMARY KEY";
 #[cfg(feature = "cluster")]
 const CLUSTER_COMPUTE_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
+const PUBLIC_PIPELINE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "cluster")]
+const COORDINATED_RECOVERY_STOP_FINALIZATION_MARGIN: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+fn checked_pipeline_deadline(
+    timeout: std::time::Duration,
+    context: &str,
+) -> Result<tokio::time::Instant, DbError> {
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            DbError::InvalidOperation(format!(
+                "{context} timeout {timeout:?} exceeds the platform clock range"
+            ))
+        })
+}
+
+#[cfg(feature = "cluster")]
+fn configured_checkpoint_timeout(config: &crate::config::LaminarConfig) -> std::time::Duration {
+    config
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.timeout_ms)
+        .map_or(
+            crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+            std::time::Duration::from_millis,
+        )
+}
+
+#[cfg(feature = "cluster")]
+fn coordinated_recovery_stop_ceiling(
+    checkpoint_timeout: std::time::Duration,
+    cleanup_timeout: std::time::Duration,
+) -> std::time::Duration {
+    checkpoint_timeout
+        .saturating_add(cleanup_timeout)
+        .saturating_add(cleanup_timeout)
+        .saturating_add(COORDINATED_RECOVERY_STOP_FINALIZATION_MARGIN)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PipelineLifecycleAuthority {
@@ -59,6 +99,13 @@ enum StartupFailureKind {
     InvalidOperation,
     Shutdown,
     Pipeline,
+    PipelineTerminal,
+    BackpressureFail,
+    ShuffleTerminal,
+    ManagedStateBudgetExceeded {
+        accounted_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -78,6 +125,20 @@ impl StartupFailure {
             DbError::InvalidOperation(message) => (StartupFailureKind::InvalidOperation, message),
             DbError::Shutdown => (StartupFailureKind::Shutdown, String::new()),
             DbError::Pipeline(message) => (StartupFailureKind::Pipeline, message),
+            DbError::PipelineTerminal(message) => (StartupFailureKind::PipelineTerminal, message),
+            DbError::BackpressureFail(message) => (StartupFailureKind::BackpressureFail, message),
+            DbError::ShuffleTerminal(message) => (StartupFailureKind::ShuffleTerminal, message),
+            DbError::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes,
+                limit_bytes,
+            } => (
+                StartupFailureKind::ManagedStateBudgetExceeded {
+                    accounted_bytes,
+                    limit_bytes,
+                },
+                context,
+            ),
             error => (StartupFailureKind::Pipeline, error.to_string()),
         };
         Self {
@@ -95,6 +156,17 @@ impl StartupFailure {
             StartupFailureKind::InvalidOperation => DbError::InvalidOperation(message),
             StartupFailureKind::Shutdown => DbError::Shutdown,
             StartupFailureKind::Pipeline => DbError::Pipeline(message),
+            StartupFailureKind::PipelineTerminal => DbError::PipelineTerminal(message),
+            StartupFailureKind::BackpressureFail => DbError::BackpressureFail(message),
+            StartupFailureKind::ShuffleTerminal => DbError::ShuffleTerminal(message),
+            StartupFailureKind::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+            } => DbError::ManagedStateBudgetExceeded {
+                context: message,
+                accounted_bytes,
+                limit_bytes,
+            },
         }
     }
 }
@@ -132,8 +204,15 @@ impl StartupAttempt {
         self.notify.notify_waiters();
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.outcome.lock().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_success_for_test() -> Arc<Self> {
+        let attempt = Arc::new(Self::new());
+        attempt.complete(Ok(()));
+        attempt
     }
 
     async fn wait(&self) -> Result<(), DbError> {
@@ -170,6 +249,65 @@ async fn report_cluster_compute_fault(
         crate::coordinated_recovery::request_local_fault(&controller, &pending).await
     {
         tracing::warn!(%error, "cluster compute fault queued for monitor retry");
+    }
+}
+
+/// Persist the non-recoverable disposition before allowing a halted generation to disappear.
+#[cfg(feature = "cluster")]
+pub(crate) async fn report_cluster_terminal_halt(
+    controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    pending: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let Some(controller) = controller else {
+        tracing::error!(
+            "cluster terminal pipeline halt has no recovery controller; durable publication remains pending"
+        );
+        return std::future::pending::<()>().await;
+    };
+    let mut backoff = std::time::Duration::from_millis(25);
+    let mut authority_lost = false;
+    loop {
+        if !authority_lost && controller.process_lease_is_live() {
+            match crate::coordinated_recovery::request_local_terminal_fault(&controller, &pending)
+                .await
+            {
+                Ok((
+                    _,
+                    laminar_core::cluster::control::RecoveryFaultReportOutcome::Active
+                    | laminar_core::cluster::control::RecoveryFaultReportOutcome::TerminalFenceActive,
+                )) => return,
+                Ok((_, outcome)) => {
+                    tracing::warn!(
+                        ?outcome,
+                        "terminal pipeline fault request was not yet admitted"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "durable terminal pipeline halt publication failed; retrying while shutdown remains fenced");
+                }
+            }
+        }
+
+        if authority_lost || !controller.process_lease_is_live() {
+            authority_lost = true;
+            let durable = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                controller.read_recovery_fault_inventory(),
+            )
+            .await;
+            if matches!(durable, Ok(Ok(inventory)) if inventory.has_terminal_fault()) {
+                return;
+            }
+            tracing::error!(
+                "terminal pipeline fault lost process authority before durable confirmation; \
+                 waiting for a namespace-wide terminal marker while shutdown remains fenced"
+            );
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = backoff
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(1));
     }
 }
 
@@ -531,6 +669,12 @@ struct PipelineRecoveryState {
     recovered_channel_progress:
         FxHashMap<String, FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
     recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>>,
+    /// Exact source-keyed cuts owned by the committed checkpoint decision. Unlike physical
+    /// channel progress, this map retains a source's cut across an empty current inventory.
+    recovered_source_watermarks: FxHashMap<String, i64>,
+    /// `None` denotes a fresh start. The version distinguishes cumulative v4 source cuts from
+    /// legacy v3 indices whose empty current inventory cannot reconstruct an erased prior cut.
+    recovered_checkpoint_index_version: Option<u32>,
     recovered_watermark_frontier: Option<i64>,
     restored_reference_tables: bool,
 }
@@ -547,9 +691,14 @@ struct PipelineWatermarks {
 fn recovered_source_watermark(
     progress: Option<&FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
     owns_empty_inventory: bool,
+    committed_source_watermark: Option<i64>,
 ) -> (Option<i64>, bool) {
     let Some(progress) = progress.filter(|progress| !progress.is_empty()) else {
-        return (None, owns_empty_inventory);
+        return if owns_empty_inventory {
+            (committed_source_watermark, true)
+        } else {
+            (None, false)
+        };
     };
     let mut active = false;
     let mut active_min = i64::MAX;
@@ -569,7 +718,224 @@ fn recovered_source_watermark(
     if active {
         (Some(active_min), false)
     } else {
-        (idle_max, true)
+        (committed_source_watermark.or(idle_max), true)
+    }
+}
+
+fn physical_recovered_input_channel_progress(
+    progress: Option<&FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+) -> FxHashMap<Box<[u8]>, RecoveredInputChannelProgress> {
+    let mut physical = progress.cloned().unwrap_or_default();
+    physical.remove(SINGLETON_WATERMARK_CHANNEL);
+    physical
+}
+
+fn restore_source_watermark_state(
+    state: &mut SourceWatermarkState,
+    recovered: Option<i64>,
+    idle: bool,
+    committed_source_watermark: Option<i64>,
+) {
+    let Some(watermark) = recovered else {
+        return;
+    };
+    if idle && committed_source_watermark == Some(watermark) {
+        // A committed source decision is trusted recovery evidence. Installing it as the
+        // partitioned external floor ensures a subsequently installed all-idle inventory writes
+        // the same exact per-channel cut rather than regressing to its older physical values.
+        let _ = state.install_committed_watermark_floor(watermark);
+    } else {
+        state.generator.restore_watermark_for_recovery(watermark);
+    }
+}
+
+fn validate_recovered_source_watermark(
+    source_name: &str,
+    recovered: Option<i64>,
+    idle: bool,
+    committed_source_watermark: Option<i64>,
+    recovered_checkpoint_index_version: Option<u32>,
+) -> Result<(), DbError> {
+    if let Some(version) = recovered_checkpoint_index_version {
+        if version < laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION
+            && idle
+            && recovered.is_none()
+            && committed_source_watermark.is_none()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "legacy committed checkpoint index version {version} cannot reconstruct the \
+                 retained watermark for idle source '{source_name}' from empty or uninitialized \
+                 channel progress"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recovered_source_watermark_tests {
+    use super::*;
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    fn channel_progress(
+        entries: &[(&[u8], Option<i64>, bool)],
+    ) -> FxHashMap<Box<[u8]>, RecoveredInputChannelProgress> {
+        entries
+            .iter()
+            .map(|(channel, watermark, idle)| {
+                (
+                    Box::<[u8]>::from(*channel),
+                    RecoveredInputChannelProgress {
+                        watermark: *watermark,
+                        idle: *idle,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_owned_inventory_restores_its_exact_committed_source_cut() {
+        let progress = FxHashMap::default();
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), true, Some(900)),
+            (Some(900), true)
+        );
+    }
+
+    #[test]
+    fn all_idle_inventory_prefers_the_exact_committed_source_cut() {
+        let progress = channel_progress(&[(b"left", Some(700), true), (b"right", Some(800), true)]);
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), false, Some(900)),
+            (Some(900), true)
+        );
+    }
+
+    #[test]
+    fn logical_empty_inventory_marker_is_not_restored_as_a_physical_channel() {
+        let progress = channel_progress(&[(SINGLETON_WATERMARK_CHANNEL, Some(900), true)]);
+        let physical = physical_recovered_input_channel_progress(Some(&progress));
+        let inventory: Arc<[Vec<u8>]> = Arc::from(Vec::<Vec<u8>>::new());
+
+        assert!(physical.is_empty());
+        validate_recovered_input_channels("orders", &physical, Some(&inventory)).unwrap();
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), true, Some(900)),
+            (Some(900), true),
+            "the unstripped logical marker must still recover the source decision"
+        );
+    }
+
+    #[test]
+    fn active_uninitialized_inventory_ignores_a_retained_committed_cut() {
+        let progress = channel_progress(&[
+            (b"initialized", Some(700), false),
+            (b"uninitialized", None, false),
+        ]);
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), false, Some(900)),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn legacy_idle_inventory_without_a_reconstructable_cut_fails_closed() {
+        let legacy_version =
+            laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION.saturating_sub(1);
+        let error =
+            validate_recovered_source_watermark("orders", None, true, None, Some(legacy_version))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::Checkpoint(message)
+                if message.contains("legacy committed checkpoint index")
+                    && message.contains("orders")
+        ));
+    }
+
+    #[test]
+    fn current_index_and_active_uninitialized_legacy_source_remain_uninitialized() {
+        assert!(validate_recovered_source_watermark(
+            "orders",
+            None,
+            true,
+            None,
+            Some(laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION),
+        )
+        .is_ok());
+        assert!(validate_recovered_source_watermark(
+            "orders",
+            None,
+            false,
+            None,
+            Some(laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION - 1),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn committed_idle_cut_becomes_the_recovered_partition_floor() {
+        let inventory: Arc<[Vec<u8>]> = Arc::from([b"partition".to_vec()]);
+        let progress = channel_progress(&[(b"partition", Some(700), true)]);
+        let mut state = SourceWatermarkState::new(
+            EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+            Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+            "ts".into(),
+        )
+        .with_input_channels(
+            std::time::Duration::ZERO,
+            0,
+            None,
+            progress.clone(),
+            Some(Arc::clone(&inventory)),
+        );
+        let (recovered, idle) = recovered_source_watermark(Some(&progress), false, Some(900));
+        restore_source_watermark_state(&mut state, recovered, idle, Some(900));
+        state
+            .install_input_channels(Some(inventory), i64::MIN)
+            .unwrap();
+
+        assert_eq!(state.generator.current_watermark(), 900);
+        let restored = state.input_channel_progress().unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].watermark, Some(900));
+        assert!(restored[0].idle);
+    }
+
+    #[test]
+    fn committed_empty_inventory_cut_floors_its_first_recovered_channel() {
+        let empty_inventory: Arc<[Vec<u8>]> = Arc::from(Vec::<Vec<u8>>::new());
+        let progress = FxHashMap::default();
+        let mut state = SourceWatermarkState::new(
+            EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+            Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+            "ts".into(),
+        )
+        .with_input_channels(
+            std::time::Duration::ZERO,
+            0,
+            None,
+            progress.clone(),
+            Some(Arc::clone(&empty_inventory)),
+        );
+        let (recovered, idle) = recovered_source_watermark(Some(&progress), true, Some(900));
+        restore_source_watermark_state(&mut state, recovered, idle, Some(900));
+        state
+            .install_input_channels(Some(empty_inventory), i64::MIN)
+            .unwrap();
+
+        assert_eq!(state.generator.current_watermark(), 900);
+        assert_eq!(state.input_channels_all_idle(), Some(true));
+        assert!(state.input_channel_progress().unwrap().unwrap().is_empty());
+
+        state
+            .install_input_channels(Some(Arc::from([b"new-partition".to_vec()])), i64::MIN)
+            .unwrap();
+        let restored = state.input_channel_progress().unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].watermark, Some(900));
+        assert!(!restored[0].idle);
     }
 }
 
@@ -1735,7 +2101,126 @@ fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
     }
 }
 
+fn runtime_exit_is_covered_by_terminal_stop(
+    owns_fault_state: bool,
+    state: &std::sync::atomic::AtomicU8,
+    runtime_shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !owns_fault_state
+        && runtime_shutdown.is_cancelled()
+        && DbState::load(state) == DbState::ShuttingDown
+}
+
+/// Retire every vnode-state claim owned by a terminal cluster compute generation before making
+/// its fault observable. The compute future and its private runtime must already be dropped, so
+/// taking the write side proves no callback from that generation can still publish the staged
+/// transition. Assignment adoption takes the same fence and therefore cannot split retirement
+/// from the `Faulted` publication.
+#[cfg(feature = "cluster")]
+fn retire_cluster_compute_generation(
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) {
+    pending_vnode_transition.lock().take();
+    installed_vnode_state.lock().take();
+}
+
+/// Serialize retirement of the two vnode-state claims against every graph callback and
+/// assignment adoption. The returned guard lets lifecycle callers retain the serialization
+/// through their terminal state publication.
+#[cfg(feature = "cluster")]
+async fn retire_cluster_compute_generation_until(
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, tokio::time::error::Elapsed> {
+    let generation =
+        tokio::time::timeout_at(deadline, Arc::clone(rotation_execution_fence).write_owned())
+            .await?;
+    retire_cluster_compute_generation(pending_vnode_transition, installed_vnode_state);
+    Ok(generation)
+}
+
+#[cfg(feature = "cluster")]
+fn publish_cluster_compute_fault_state(
+    state: &std::sync::atomic::AtomicU8,
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) -> bool {
+    let _generation = rotation_execution_fence.blocking_write();
+    retire_cluster_compute_generation(pending_vnode_transition, installed_vnode_state);
+    publish_runtime_fault_state(state)
+}
+
+#[cfg(feature = "cluster")]
+fn publish_cluster_terminal_compute_halt_state(
+    state: &std::sync::atomic::AtomicU8,
+    authority_transition: &parking_lot::Mutex<()>,
+    terminal_pipeline_halt: &std::sync::atomic::AtomicBool,
+    source_gate: &std::sync::atomic::AtomicBool,
+    recovery_fence: &std::sync::atomic::AtomicBool,
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) -> bool {
+    latch_cluster_terminal_data_plane(
+        authority_transition,
+        terminal_pipeline_halt,
+        source_gate,
+        recovery_fence,
+    );
+    publish_cluster_compute_fault_state(
+        state,
+        rotation_execution_fence,
+        pending_vnode_transition,
+        installed_vnode_state,
+    )
+}
+
+/// Linearize a terminal latch and its data-plane close against every source/shuffle authority
+/// grant. Vnode-generation retirement deliberately happens after this guard is released: the
+/// assignment activation path takes the rotation fence before this transition lock.
+#[cfg(feature = "cluster")]
+fn latch_cluster_terminal_data_plane(
+    authority_transition: &parking_lot::Mutex<()>,
+    terminal_latch: &std::sync::atomic::AtomicBool,
+    source_gate: &std::sync::atomic::AtomicBool,
+    recovery_fence: &std::sync::atomic::AtomicBool,
+) {
+    let _transition = authority_transition.lock();
+    terminal_latch.store(true, std::sync::atomic::Ordering::SeqCst);
+    recovery_fence.store(true, std::sync::atomic::Ordering::Release);
+    source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl LaminarDB {
+    /// Permanently fence this process after a deterministic pipeline halt. This is process-local;
+    /// remote durable terminal evidence uses [`Self::latch_durable_terminal_recovery_fence`].
+    #[cfg(feature = "cluster")]
+    pub(crate) fn latch_local_terminal_pipeline_halt(&self) {
+        latch_cluster_terminal_data_plane(
+            &self.cluster_authority_transition,
+            &self.terminal_pipeline_halt,
+            &self.source_gate,
+            &self.coordinated_recovery_fenced,
+        );
+    }
+
+    /// Permanently fence this DB instance after terminal evidence is durable anywhere in the
+    /// cluster authority namespace. Healthy peers retain a distinct local-halt latch so they can
+    /// still quiesce and acknowledge the terminal Prepare.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn latch_durable_terminal_recovery_fence(&self) {
+        latch_cluster_terminal_data_plane(
+            &self.cluster_authority_transition,
+            &self.durable_terminal_recovery_fence,
+            &self.source_gate,
+            &self.coordinated_recovery_fenced,
+        );
+    }
+
     #[cfg(feature = "cluster")]
     fn validate_fresh_cluster_vnode_start(&self) -> Result<(), DbError> {
         if self.has_unapplied_vnode_transition() {
@@ -1906,9 +2391,15 @@ impl LaminarDB {
         }
         let _transition = self.cluster_authority_transition.lock();
         if self
-            .pending_recovery_fault
+            .terminal_pipeline_halt
             .load(std::sync::atomic::Ordering::Acquire)
-            != 0
+            || self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
         {
             self.source_gate
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1939,6 +2430,9 @@ impl LaminarDB {
     /// opens the gate.
     #[cfg(feature = "cluster")]
     pub fn fence_cluster_startup(&self) {
+        // Every startup boundary invalidates prior same-process evidence. A later graph attempt
+        // must either publish a fresh pre-start audit or use finish's fail-closed durable fallback.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         self.set_source_gate(true);
         if let Some(controller) = self.cluster_controller.lock().as_ref() {
             controller.set_recovering(true);
@@ -1959,15 +2453,20 @@ impl LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) fn release_coordinated_recovery_lifecycle(&self) {
         let _lifecycle_claim = self.startup_attempt.lock();
-        self.coordinated_recovery_fenced
-            .store(false, std::sync::atomic::Ordering::Release);
-        if self
-            .pending_recovery_fault
+        let keep_fenced = self
+            .terminal_pipeline_halt
             .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
-            self.coordinated_recovery_fenced
-                .store(true, std::sync::atomic::Ordering::Release);
+            || self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0;
+        self.coordinated_recovery_fenced
+            .store(keep_fenced, std::sync::atomic::Ordering::Release);
+        if keep_fenced {
+            self.set_source_gate(true);
         }
     }
 
@@ -1984,6 +2483,31 @@ impl LaminarDB {
         {
             return Err(DbError::InvalidOperation(format!(
                 "pipeline {operation} is fenced by coordinated recovery"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_terminal_halt_allows_start(
+        &self,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<(), DbError> {
+        let _ = authority;
+        let local_halt = self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(feature = "cluster")]
+        let durable_halt = self.is_cluster_runtime()
+            && self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(feature = "cluster"))]
+        let durable_halt = false;
+        if local_halt || durable_halt {
+            return Err(DbError::PipelineTerminal(format!(
+                "cannot restart a permanently halted pipeline in this process: {}",
+                self.last_fault()
+                    .unwrap_or_else(|| "terminal halt reason was not recorded".into())
             )));
         }
         Ok(())
@@ -2104,41 +2628,12 @@ impl LaminarDB {
             }
             None => true,
         };
-        let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
-            DbError::Checkpoint(format!(
-                "cluster startup checkpoint authority is unavailable: {error}"
-            ))
-        })?;
-        let unresolved_artifacts = tokio::time::timeout_at(
-            deadline,
-            checkpoint_authority.cluster_checkpoint_artifacts(),
-        )
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "cluster startup artifact inventory read failed: {error}"
-            ))
-        })?;
-        if unresolved_artifacts.is_some() {
-            controller.set_recovering(true);
-            tokio::time::timeout_at(
-                deadline,
-                crate::coordinated_recovery::request_local_fault(
-                    &controller,
-                    &self.pending_recovery_fault,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint("startup artifact recovery fault publication timed out".into())
-            })?
-            .map_err(DbError::Checkpoint)?;
-            return Ok(ClusterStartupDisposition::RecoveryFenced);
-        }
         if idle {
+            // This process is absent from the exact owner-complete checkpoint roster. A global
+            // artifact inventory can therefore belong only to the active owners; treating it as
+            // local crash residue would let an idle join interrupt their live checkpoint. Install
+            // topology metadata while retaining the local data-plane fence, without publishing a
+            // recovery fault or attempting to settle another process's artifacts.
             controller.set_recovering(false);
             let drain_transition = controller
                 .checkpoint_drain_transition()
@@ -2157,8 +2652,66 @@ impl LaminarDB {
             }
             return Ok(ClusterStartupDisposition::Idle);
         }
-        let pending_fault =
-            match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
+        // A clean pre-start audit linearizes before this process can publish graph readiness. Once
+        // the owner-complete assignment fence exists, every participant has crossed that same
+        // boundary, so a later inventory belongs to live checkpoint work and is not crash residue.
+        // Evidence from any other process generation is unusable and falls back to the durable
+        // read below.
+        let audited_artifacts = self
+            .startup_checkpoint_artifact_audit
+            .lock()
+            .as_ref()
+            .copied()
+            .filter(|audit| {
+                controller
+                    .try_live_local_process_authority_identity()
+                    .is_ok_and(|process| process == audit.process())
+            });
+        let unresolved_artifacts = match audited_artifacts {
+            Some(StartupCheckpointArtifactAudit::Clean(_)) => false,
+            Some(StartupCheckpointArtifactAudit::Artifacts(_)) => true,
+            None => {
+                let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "cluster startup checkpoint authority is unavailable: {error}"
+                    ))
+                })?;
+                tokio::time::timeout_at(
+                    deadline,
+                    checkpoint_authority.cluster_checkpoint_artifacts(),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "cluster startup artifact inventory read failed: {error}"
+                    ))
+                })?
+                .is_some()
+            }
+        };
+        if unresolved_artifacts {
+            controller.set_recovering(true);
+            tokio::time::timeout_at(
+                deadline,
+                crate::coordinated_recovery::request_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("startup artifact recovery fault publication timed out".into())
+            })?
+            .map_err(DbError::Checkpoint)?;
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
+        let fault_inventory =
+            match tokio::time::timeout_at(deadline, controller.read_recovery_fault_inventory())
+                .await
+            {
                 Err(_) => {
                     controller.set_recovering(true);
                     return Err(DbError::Checkpoint(
@@ -2171,8 +2724,16 @@ impl LaminarDB {
                         "cluster startup recovery fault audit failed: {error}"
                     )));
                 }
-                Ok(Ok(reports)) => reports.iter().any(|(_, sequence)| *sequence != 0),
+                Ok(Ok(inventory)) => inventory,
             };
+        if fault_inventory.has_terminal_fault() {
+            self.latch_durable_terminal_recovery_fence();
+            controller.set_recovering(true);
+            let reason = "cluster startup is fenced by a durable terminal pipeline fault";
+            self.last_fault.lock().get_or_insert(reason.into());
+            return Err(DbError::PipelineTerminal(reason.into()));
+        }
+        let pending_fault = !fault_inventory.faults().is_empty();
         let Ok(active) = tokio::time::timeout_at(deadline, controller.observe_recover()).await
         else {
             return Err(DbError::Checkpoint(
@@ -2295,6 +2856,9 @@ impl LaminarDB {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        // Never reuse evidence from an earlier or failed bootstrap attempt. Only the complete
+        // authority-checked read below publishes a replacement latch.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("cluster recovery generation bootstrap has no controller".into())
         })?;
@@ -2303,6 +2867,13 @@ impl LaminarDB {
                 "cluster recovery generation bootstrap lost its process lease".into(),
             ));
         }
+        let audit_process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "cluster startup artifact audit has no live process authority: {error}"
+                ))
+            })?;
         let terminal =
             tokio::time::timeout_at(deadline, controller.latest_committed_recover_release())
                 .await
@@ -2319,11 +2890,42 @@ impl LaminarDB {
         let committed = terminal
             .as_ref()
             .map_or(0, |release| release.round.id.generation);
-        if !controller.process_lease_is_live() {
+        let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup checkpoint authority is unavailable: {error}"
+            ))
+        })?;
+        let unresolved_artifacts = tokio::time::timeout_at(
+            deadline,
+            checkpoint_authority.cluster_checkpoint_artifacts(),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup artifact inventory read failed: {error}"
+            ))
+        })?
+        .is_some();
+        let final_process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "cluster startup artifact audit lost process authority: {error}"
+                ))
+            })?;
+        if final_process != audit_process {
             return Err(DbError::Checkpoint(
-                "cluster recovery generation bootstrap lost its process lease".into(),
+                "cluster startup artifact audit changed process authority during its read".into(),
             ));
         }
+        *self.startup_checkpoint_artifact_audit.lock() = Some(if unresolved_artifacts {
+            StartupCheckpointArtifactAudit::Artifacts(audit_process)
+        } else {
+            StartupCheckpointArtifactAudit::Clean(audit_process)
+        });
         let current = self.shuffle_recovery_generation()?.unwrap_or(0);
         if current == committed {
             return Ok(());
@@ -2743,7 +3345,7 @@ impl LaminarDB {
         if self.is_closed() {
             return Err(DbError::Shutdown);
         }
-        self.ensure_catalog_cleanup_unfenced("pipeline start")?;
+        self.ensure_terminal_halt_allows_start(authority)?;
         #[cfg(feature = "cluster")]
         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
         #[cfg(not(feature = "cluster"))]
@@ -2752,6 +3354,7 @@ impl LaminarDB {
         let runtime = self.control_runtime.handle()?;
         let attempt = {
             let mut owned = self.startup_attempt.lock();
+            self.ensure_terminal_halt_allows_start(authority)?;
             #[cfg(feature = "cluster")]
             self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
             #[cfg(not(feature = "cluster"))]
@@ -2788,6 +3391,7 @@ impl LaminarDB {
                         // A compute fault publishes the cluster recovery fence before Faulted.
                         // Re-read that fence after observing the state so a public restart cannot
                         // slip through the fence-before-state publication window.
+                        self.ensure_terminal_halt_allows_start(authority)?;
                         #[cfg(feature = "cluster")]
                         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
                         #[cfg(not(feature = "cluster"))]
@@ -2812,6 +3416,7 @@ impl LaminarDB {
                                         driver_runtime.block_on(db.clone().drive_start_attempt(
                                             driver_attempt,
                                             claimed == DbState::Faulted,
+                                            authority,
                                         ));
                                     }));
                                 if result.is_err() && !emergency_attempt.is_complete() {
@@ -2858,6 +3463,7 @@ impl LaminarDB {
         self: Arc<Self>,
         attempt: Arc<StartupAttempt>,
         starting_from_fault: bool,
+        authority: PipelineLifecycleAuthority,
     ) {
         let terminal = StartupDriverGuard::new(&self, Arc::clone(&attempt));
         let result =
@@ -2875,6 +3481,14 @@ impl LaminarDB {
                 DbState::Faulted.store(&self.state);
                 match cleanup {
                     Ok(Ok(())) => Err(DbError::Pipeline(reason)),
+                    Ok(Err(error)) if error.requires_pipeline_halt() => {
+                        tracing::error!(
+                            panic = %reason,
+                            cleanup_error = %error,
+                            "terminal cleanup error superseded a generic startup panic"
+                        );
+                        Err(error)
+                    }
                     Ok(Err(error)) => Err(DbError::Pipeline(format!(
                         "{reason}; failed-start cleanup remains fenced: {error}"
                     ))),
@@ -2885,7 +3499,98 @@ impl LaminarDB {
                 }
             }
         };
+        let result = self.normalize_start_result_for_terminal_latch(result);
+        self.terminalize_start_attempt_if_needed(authority, &result)
+            .await;
         terminal.finish(result);
+    }
+
+    fn normalize_start_result_for_terminal_latch(
+        &self,
+        result: Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        if !self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return result;
+        }
+        match result {
+            Err(error) if error.requires_pipeline_halt() => Err(error),
+            Ok(()) | Err(_) => Err(DbError::PipelineTerminal(
+                self.last_fault()
+                    .unwrap_or_else(|| "terminal startup failure".into()),
+            )),
+        }
+    }
+
+    /// A startup owner outlives callers that time out while awaiting it. Terminalization therefore
+    /// belongs here, before the sticky attempt result is published, rather than in a recovery
+    /// monitor that may already have dropped its receiver.
+    async fn terminalize_start_attempt_if_needed(
+        &self,
+        authority: PipelineLifecycleAuthority,
+        result: &Result<(), DbError>,
+    ) {
+        let Err(error) = result else {
+            return;
+        };
+        if !error.requires_pipeline_halt() {
+            return;
+        }
+        let _ = authority;
+        let reason = if self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.last_fault().unwrap_or_else(|| error.to_string())
+        } else {
+            error.to_string()
+        };
+        *self.last_fault.lock() = Some(reason.clone());
+
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            self.latch_local_terminal_pipeline_halt();
+            let controller = self.cluster_controller.lock().clone();
+            if let Some(controller) = controller.as_deref() {
+                controller.set_recovering(true);
+                if let Err(publication_error) = crate::coordinated_recovery::queue_local_fault(
+                    controller,
+                    &self.pending_recovery_fault,
+                ) {
+                    tracing::error!(
+                        %publication_error,
+                        "could not retain terminal startup fault request"
+                    );
+                }
+            }
+            let generation = Arc::clone(&self.rotation_execution_fence)
+                .write_owned()
+                .await;
+            retire_cluster_compute_generation(
+                &self.pending_vnode_transition,
+                &self.installed_vnode_state,
+            );
+            publish_runtime_fault_state(&self.state);
+            drop(generation);
+            tracing::error!(
+                %reason,
+                "pipeline startup hit a permanent error; awaiting durable terminal fencing"
+            );
+            report_cluster_terminal_halt(controller, Arc::clone(&self.pending_recovery_fault))
+                .await;
+            self.latch_durable_terminal_recovery_fence();
+            return;
+        }
+
+        self.terminal_pipeline_halt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        publish_runtime_fault_state(&self.state);
+        tracing::error!(
+            %reason,
+            "pipeline startup hit a permanent error; automatic restart is disabled"
+        );
     }
 
     async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
@@ -2906,7 +3611,7 @@ impl LaminarDB {
             .quiesce_connector_generation_until(generation_quiesce_deadline)
             .await
         {
-            if starting_from_fault {
+            if starting_from_fault || error.requires_pipeline_halt() {
                 DbState::Faulted.store(&self.state);
             } else {
                 DbState::Created.store(&self.state);
@@ -2945,6 +3650,18 @@ impl LaminarDB {
                 // An incomplete rollback is a terminal per-instance fence: never turn it into a
                 // retryable startup failure by publishing `Created` over the guard's `Faulted`.
                 DbState::Faulted.store(&self.state);
+                if error.requires_pipeline_halt() {
+                    tracing::error!(
+                        %cleanup_error,
+                        "catalog rollback also failed after a permanent startup error"
+                    );
+                    return Err(error);
+                }
+                if cleanup_error.requires_pipeline_halt() {
+                    return Err(DbError::PipelineTerminal(format!(
+                        "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
+                    )));
+                }
                 return Err(DbError::Pipeline(format!(
                     "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
                 )));
@@ -2952,6 +3669,10 @@ impl LaminarDB {
 
             // No runtime resources have been constructed and catalog rollback completed. Publish
             // a retryable state only if no concurrent fault superseded this startup generation.
+            if error.requires_pipeline_halt() {
+                DbState::Faulted.store(&self.state);
+                return Err(error);
+            }
             return match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state)
             {
                 Ok(_) => Err(error),
@@ -2979,12 +3700,32 @@ impl LaminarDB {
                 match self.finish_start_transition() {
                     Ok(()) => Ok(()),
                     Err(error) => match self.cleanup_failed_start().await {
-                        Ok(()) => Err(error),
+                        Ok(()) => {
+                            if error.requires_pipeline_halt() {
+                                DbState::Faulted.store(&self.state);
+                            }
+                            Err(error)
+                        }
                         Err(cleanup_error) => {
                             DbState::Faulted.store(&self.state);
-                            Err(DbError::Pipeline(format!(
-                                "{error}; failed-start cleanup remains fenced: {cleanup_error}"
-                            )))
+                            if error.requires_pipeline_halt() {
+                                tracing::error!(
+                                    %cleanup_error,
+                                    "failed-start cleanup also failed after a permanent startup error"
+                                );
+                                Err(error)
+                            } else if cleanup_error.requires_pipeline_halt() {
+                                tracing::error!(
+                                    startup_error = %error,
+                                    %cleanup_error,
+                                    "terminal cleanup error superseded a generic startup failure"
+                                );
+                                Err(cleanup_error)
+                            } else {
+                                Err(DbError::Pipeline(format!(
+                                    "{error}; failed-start cleanup remains fenced: {cleanup_error}"
+                                )))
+                            }
                         }
                     },
                 }
@@ -2992,15 +3733,34 @@ impl LaminarDB {
             Err(e) => {
                 match self.cleanup_failed_start().await {
                     Ok(()) => {
-                        // Reset so a retry re-runs startup rather than silently returning Ok.
-                        DbState::Created.store(&self.state);
+                        if e.requires_pipeline_halt() {
+                            DbState::Faulted.store(&self.state);
+                        } else {
+                            // Reset so a retry re-runs startup rather than silently returning Ok.
+                            DbState::Created.store(&self.state);
+                        }
                         Err(e)
                     }
                     Err(cleanup_error) => {
                         DbState::Faulted.store(&self.state);
-                        Err(DbError::Pipeline(format!(
-                            "{e}; failed-start cleanup remains fenced: {cleanup_error}"
-                        )))
+                        if e.requires_pipeline_halt() {
+                            tracing::error!(
+                                %cleanup_error,
+                                "failed-start cleanup also failed after a permanent startup error"
+                            );
+                            Err(e)
+                        } else if cleanup_error.requires_pipeline_halt() {
+                            tracing::error!(
+                                startup_error = %e,
+                                %cleanup_error,
+                                "terminal cleanup error superseded a generic startup failure"
+                            );
+                            Err(cleanup_error)
+                        } else {
+                            Err(DbError::Pipeline(format!(
+                                "{e}; failed-start cleanup remains fenced: {cleanup_error}"
+                            )))
+                        }
                     }
                 }
             }
@@ -4178,6 +4938,17 @@ impl LaminarDB {
         let injected_cluster_checkpoint_store =
             self.validate_startup_durability(startup_runtime)?;
 
+        // Freeze assignment publication before checkpoint initialization snapshots the registry.
+        // The previous, narrower guard in `start_connector_pipeline` left a window where a watcher
+        // could advance the registry after the coordinator captured its version but before runtime
+        // launch, binding the new graph to the stale assignment.
+        #[cfg(feature = "cluster")]
+        let startup_assignment_guard = if startup_runtime == RuntimeMode::Cluster {
+            Some(self.assignment_adoption_lock.lock().await)
+        } else {
+            None
+        };
+
         let pipeline_identity = self
             .initialize_checkpointing(
                 &source_regs,
@@ -4217,6 +4988,9 @@ impl LaminarDB {
                 "Starting in embedded (in-memory) mode — no streams"
             );
         }
+
+        #[cfg(feature = "cluster")]
+        drop(startup_assignment_guard);
 
         Ok(())
     }
@@ -5142,6 +5916,8 @@ impl LaminarDB {
             FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
         > = FxHashMap::default();
         let mut recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>> = FxHashMap::default();
+        let mut recovered_source_watermarks: FxHashMap<String, i64> = FxHashMap::default();
+        let mut recovered_checkpoint_index_version = None;
         let mut recovered_watermark_frontier = None;
         let mut restored_reference_tables = false;
         {
@@ -5191,6 +5967,13 @@ impl LaminarDB {
                 }
                 match recovery {
                     Ok(Some(recovered)) => {
+                        recovered_checkpoint_index_version = Some(recovered.committed.version);
+                        recovered_source_watermarks = recovered
+                            .committed
+                            .effective_source_watermarks()
+                            .map_err(DbError::Checkpoint)?
+                            .into_iter()
+                            .collect();
                         #[cfg(feature = "cluster")]
                         let recovered_assignment = if runtime_mode == RuntimeMode::Cluster {
                             Some(
@@ -5315,6 +6098,8 @@ impl LaminarDB {
             recovered_mv_store,
             recovered_channel_progress,
             recovered_input_channels,
+            recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
             restored_reference_tables,
         })
@@ -5451,6 +6236,8 @@ impl LaminarDB {
             FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
         >,
         recovered_input_channels: &FxHashMap<String, Arc<[Vec<u8>]>>,
+        recovered_source_watermarks: &FxHashMap<String, i64>,
+        recovered_checkpoint_index_version: Option<u32>,
         recovered_watermark_frontier: Option<i64>,
     ) -> Result<PipelineWatermarks, DbError> {
         let stream_entries: Vec<_> = self
@@ -5539,10 +6326,9 @@ impl LaminarDB {
                         && contract.row_positions
                             == SourceRowPositionCapability::OrderedDeterministic
                     {
-                        let recovered = recovered_channel_progress
-                            .get(&name)
-                            .cloned()
-                            .unwrap_or_default();
+                        let recovered = physical_recovered_input_channel_progress(
+                            recovered_channel_progress.get(&name),
+                        );
                         let recovered_inventory = recovered_input_channels.get(&name).cloned();
                         if recovered_channel_progress.contains_key(&name)
                             || recovered_input_channels.contains_key(&name)
@@ -5619,11 +6405,24 @@ impl LaminarDB {
             let (recovered, idle) = recovered_source_watermark(
                 recovered_channel_progress.get(name),
                 owns_empty_inventory,
+                recovered_source_watermarks.get(name).copied(),
             );
+            validate_recovered_source_watermark(
+                name,
+                recovered,
+                idle,
+                recovered_source_watermarks.get(name).copied(),
+                recovered_checkpoint_index_version,
+            )?;
             tracker_watermarks[source_id] = recovered;
             idle_sources[source_id] = idle;
-            if let (Some(state), Some(watermark)) = (watermark_states.get_mut(name), recovered) {
-                state.generator.restore_watermark_for_recovery(watermark);
+            if let Some(state) = watermark_states.get_mut(name) {
+                restore_source_watermark_state(
+                    state,
+                    recovered,
+                    idle,
+                    recovered_source_watermarks.get(name).copied(),
+                );
             }
         }
         if let Some(tracker) = tracker.as_mut() {
@@ -5712,7 +6511,7 @@ impl LaminarDB {
             .expect("EngineMetrics must be set before start()");
 
         let (force_checkpoint_tx, force_checkpoint_rx) =
-            crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointReply>(
+            crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointRequest>(
                 crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY,
             );
         *self.force_ckpt_tx.lock() = Some(force_checkpoint_tx);
@@ -5800,6 +6599,8 @@ impl LaminarDB {
             source_name_arcs,
             checkpoint_source_names,
             source_frontiers_buf,
+            #[cfg(feature = "cluster")]
+            committed_source_watermarks_snapshot: Arc::new(rustc_hash::FxHashMap::default()),
             tracker,
             prom,
             #[cfg(feature = "cluster")]
@@ -5822,6 +6623,7 @@ impl LaminarDB {
             sink_timed_out: false,
             sink_fault: None,
             checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            pipeline_halt: None,
             last_checkpoint_admission_failure: None,
             checkpoint_admission_recovering: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
@@ -5829,6 +6631,8 @@ impl LaminarDB {
             vnode_registry,
             #[cfg(feature = "cluster")]
             cluster_controller: callback_controller,
+            #[cfg(feature = "cluster")]
+            assignment_adoption_lock: Arc::clone(&self.assignment_adoption_lock),
             #[cfg(feature = "cluster")]
             follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
@@ -5882,7 +6686,7 @@ impl LaminarDB {
         setup: PipelineRuntimeSetup,
         shutdown: Arc<tokio::sync::Notify>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "cluster")] startup_generation_fence: Option<
+        #[cfg(feature = "cluster")] mut startup_generation_fence: Option<
             tokio::sync::OwnedRwLockWriteGuard<()>,
         >,
     ) -> Result<(), DbError> {
@@ -5934,25 +6738,30 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         let compute_fault_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
         #[cfg(feature = "cluster")]
+        let compute_fault_authority_transition = Arc::clone(&self.cluster_authority_transition);
+        let compute_terminal_pipeline_halt = Arc::clone(&self.terminal_pipeline_halt);
+        #[cfg(feature = "cluster")]
         let compute_fault_is_cluster = runtime_mode == RuntimeMode::Cluster;
         #[cfg(feature = "cluster")]
         let compute_fault_installed_vnode_state = Arc::clone(&self.installed_vnode_state);
         #[cfg(feature = "cluster")]
+        let compute_fault_pending_vnode_transition = Arc::clone(&self.pending_vnode_transition);
+        #[cfg(feature = "cluster")]
+        let compute_fault_rotation_execution_fence = Arc::clone(&self.rotation_execution_fence);
+        #[cfg(feature = "cluster")]
         let compute_fault_controller = self.cluster_controller.lock().clone();
         #[cfg(feature = "cluster")]
         let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
-        #[cfg(feature = "cluster")]
         let compute_fault_runtime_shutdown = runtime_shutdown.clone();
+        #[cfg(all(test, feature = "cluster"))]
+        let compute_before_ready_panic = Arc::clone(&self.compute_before_ready_panic);
         let compute_thread = std::thread::Builder::new().name("laminar-compute".into());
         #[cfg(feature = "cluster")]
-        let compute_thread = if runtime_mode == RuntimeMode::Cluster {
-            // Windows' default thread stack is too small for the clustered graph/control
-            // lifecycle. Keep this explicit and bounded: there is one compute thread per running
-            // pipeline, and the cluster I/O workers use the same 4 MiB policy.
-            compute_thread.stack_size(CLUSTER_COMPUTE_THREAD_STACK_BYTES)
-        } else {
-            compute_thread
-        };
+        // The local and clustered runtimes share the cluster-enabled coordinator state machine.
+        // Windows' default thread stack is too small for that debug/test layout even when the
+        // binary is running a local pipeline. Keep the allocation explicit and bounded: there is
+        // one compute thread per running pipeline, and cluster I/O workers use the same 4 MiB.
+        let compute_thread = compute_thread.stack_size(CLUSTER_COMPUTE_THREAD_STACK_BYTES);
         match compute_thread
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -5966,6 +6775,10 @@ impl LaminarDB {
                     }
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(all(test, feature = "cluster"))]
+                    if compute_before_ready_panic.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        panic!("injected cluster compute panic before readiness");
+                    }
                     rt.block_on(async move {
                         Box::pin(coordinator.run_with_ready(callback, startup_tx)).await
                     })
@@ -5991,6 +6804,66 @@ impl LaminarDB {
                     crate::pipeline::ExitReason::Shutdown => {
                         crate::pipeline::ExitReason::Shutdown
                     }
+                    crate::pipeline::ExitReason::Halt(reason) => {
+                        #[cfg(feature = "cluster")]
+                        if !compute_fault_is_cluster {
+                            compute_terminal_pipeline_halt
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        #[cfg(not(feature = "cluster"))]
+                        compute_terminal_pipeline_halt
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        #[cfg(feature = "cluster")]
+                        if compute_fault_is_cluster {
+                            // The local disposition must precede request allocation so a monitor
+                            // that observes the retained ordinal can only publish it as Terminal.
+                            // The state helper idempotently repeats this fence before retirement.
+                            latch_cluster_terminal_data_plane(
+                                &compute_fault_authority_transition,
+                                &compute_terminal_pipeline_halt,
+                                &compute_fault_source_gate,
+                                &compute_fault_recovery_fence,
+                            );
+                            if let Some(controller) = compute_fault_controller.as_deref() {
+                                if let Err(error) = crate::coordinated_recovery::queue_local_fault(
+                                    controller,
+                                    &compute_fault_pending,
+                                ) {
+                                    tracing::error!(
+                                        %error,
+                                        "could not allocate terminal pipeline fault request"
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "cluster")]
+                        let owns_fault_state = if compute_fault_is_cluster {
+                            publish_cluster_terminal_compute_halt_state(
+                                &fault_state,
+                                &compute_fault_authority_transition,
+                                &compute_terminal_pipeline_halt,
+                                &compute_fault_source_gate,
+                                &compute_fault_recovery_fence,
+                                &compute_fault_rotation_execution_fence,
+                                &compute_fault_pending_vnode_transition,
+                                &compute_fault_installed_vnode_state,
+                            )
+                        } else {
+                            publish_runtime_fault_state(&fault_state)
+                        };
+                        #[cfg(not(feature = "cluster"))]
+                        let owns_fault_state = publish_runtime_fault_state(&fault_state);
+                        let _ = owns_fault_state;
+                        tracing::error!(
+                            reason = %reason,
+                            "pipeline halted after a permanent error; automatic recovery is disabled"
+                        );
+                        *fault_slot.lock() = Some(reason.clone());
+                        if let Some(ref metrics) = fault_metrics {
+                            metrics.pipeline_faults_total.inc();
+                        }
+                        crate::pipeline::ExitReason::Halt(reason)
+                    }
                     crate::pipeline::ExitReason::Fault(reason) => {
                         #[cfg(feature = "cluster")]
                         if compute_fault_is_cluster {
@@ -6000,23 +6873,30 @@ impl LaminarDB {
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
                             compute_fault_recovery_fence
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            compute_fault_installed_vnode_state.lock().take();
                         }
 
-                        // Publish before notifying the watcher. This closes the ready-send ->
-                        // watcher-scheduled window in which start() could otherwise report
-                        // Running after the compute loop had already exited.
+                        // Publish before notifying the watcher. The cluster path first retires all
+                        // authority owned by this now-dropped graph generation under the rotation
+                        // fence; a full checkpoint restore can then publish the current assignment
+                        // without replaying a stale predecessor transition.
                         #[cfg(feature = "cluster")]
+                        let owns_fault_state = if compute_fault_is_cluster {
+                            publish_cluster_compute_fault_state(
+                                &fault_state,
+                                &compute_fault_rotation_execution_fence,
+                                &compute_fault_pending_vnode_transition,
+                                &compute_fault_installed_vnode_state,
+                            )
+                        } else {
+                            publish_runtime_fault_state(&fault_state)
+                        };
+                        #[cfg(not(feature = "cluster"))]
                         let owns_fault_state = publish_runtime_fault_state(&fault_state);
-                        #[cfg(not(feature = "cluster"))]
-                        publish_runtime_fault_state(&fault_state);
-                        #[cfg(feature = "cluster")]
-                        let covered_by_terminal_stop = compute_fault_is_cluster
-                            && !owns_fault_state
-                            && compute_fault_runtime_shutdown.is_cancelled()
-                            && DbState::load(&fault_state) == DbState::ShuttingDown;
-                        #[cfg(not(feature = "cluster"))]
-                        let covered_by_terminal_stop = false;
+                        let covered_by_terminal_stop = runtime_exit_is_covered_by_terminal_stop(
+                            owns_fault_state,
+                            &fault_state,
+                            &compute_fault_runtime_shutdown,
+                        );
 
                         if covered_by_terminal_stop {
                             crate::pipeline::ExitReason::Shutdown
@@ -6068,14 +6948,20 @@ impl LaminarDB {
         match startup_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Shutdown);
             }
             Ok(Err(e)) => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Config(e));
             }
             Err(_) => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Config(
                     "compute thread exited before entering the runtime control loop".into(),
@@ -6102,9 +6988,16 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         let watcher_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
         #[cfg(feature = "cluster")]
+        let watcher_authority_transition = Arc::clone(&self.cluster_authority_transition);
+        let watcher_terminal_pipeline_halt = Arc::clone(&self.terminal_pipeline_halt);
+        #[cfg(feature = "cluster")]
         let watcher_is_cluster = runtime_mode == RuntimeMode::Cluster;
         #[cfg(feature = "cluster")]
         let watcher_installed_vnode_state = Arc::clone(&self.installed_vnode_state);
+        #[cfg(feature = "cluster")]
+        let watcher_pending_vnode_transition = Arc::clone(&self.pending_vnode_transition);
+        #[cfg(feature = "cluster")]
+        let watcher_rotation_execution_fence = Arc::clone(&self.rotation_execution_fence);
         #[cfg(feature = "cluster")]
         let watcher_pending_compute_fault = Arc::clone(&self.pending_recovery_fault);
         #[cfg(feature = "cluster")]
@@ -6121,6 +7014,58 @@ impl LaminarDB {
                     // writer has settled. The watcher cannot prove that merely because the
                     // compute thread exited, so a timed-out stop remains ShuttingDown until retry.
                 }
+                crate::pipeline::ExitReason::Halt(reason) => {
+                    tracing::error!(
+                        %reason,
+                        "laminar-compute thread exited after a permanent error"
+                    );
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        latch_cluster_terminal_data_plane(
+                            &watcher_authority_transition,
+                            &watcher_terminal_pipeline_halt,
+                            &watcher_source_gate,
+                            &watcher_recovery_fence,
+                        );
+                    } else {
+                        watcher_terminal_pipeline_halt
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    watcher_terminal_pipeline_halt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    watcher_fault.lock().get_or_insert(reason);
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        // Repeat the fail-closed publication in case the compute thread lost its
+                        // terminal channel after returning the disposition.
+                        let generation = Arc::clone(&watcher_rotation_execution_fence)
+                            .write_owned()
+                            .await;
+                        retire_cluster_compute_generation(
+                            &watcher_pending_vnode_transition,
+                            &watcher_installed_vnode_state,
+                        );
+                        publish_runtime_fault_state(&watcher_state);
+                        drop(generation);
+                    }
+                    #[cfg(feature = "cluster")]
+                    if !watcher_is_cluster {
+                        publish_runtime_fault_state(&watcher_state);
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    publish_runtime_fault_state(&watcher_state);
+                    watcher_shutdown.notify_one();
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        report_cluster_terminal_halt(
+                            watcher_controller,
+                            watcher_pending_compute_fault,
+                        )
+                        .await;
+                        return;
+                    }
+                    // A permanent halt is operator-owned. Do not invoke the local supervisor.
+                }
                 crate::pipeline::ExitReason::Fault(reason) => {
                     tracing::error!(%reason, "laminar-compute thread exited with a recoverable fault");
                     watcher_fault.lock().get_or_insert(reason);
@@ -6130,8 +7075,21 @@ impl LaminarDB {
                         // its normal fault publication reached this watcher.
                         watcher_source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
                         watcher_recovery_fence.store(true, std::sync::atomic::Ordering::Release);
-                        watcher_installed_vnode_state.lock().take();
+                        let generation = Arc::clone(&watcher_rotation_execution_fence)
+                            .write_owned()
+                            .await;
+                        retire_cluster_compute_generation(
+                            &watcher_pending_vnode_transition,
+                            &watcher_installed_vnode_state,
+                        );
+                        publish_runtime_fault_state(&watcher_state);
+                        drop(generation);
                     }
+                    #[cfg(feature = "cluster")]
+                    if !watcher_is_cluster {
+                        publish_runtime_fault_state(&watcher_state);
+                    }
+                    #[cfg(not(feature = "cluster"))]
                     publish_runtime_fault_state(&watcher_state);
                     watcher_shutdown.notify_one();
                     // Cluster mode: report the fault and let the leader drive a global
@@ -6178,13 +7136,6 @@ impl LaminarDB {
         use crate::pipeline::{CheckpointSchedule, PipelineConfig};
 
         let runtime_mode = self.runtime_mode();
-
-        #[cfg(feature = "cluster")]
-        let startup_assignment_guard = if runtime_mode == RuntimeMode::Cluster {
-            Some(self.assignment_adoption_lock.lock().await)
-        } else {
-            None
-        };
 
         #[cfg(feature = "cluster")]
         let startup_generation_fence = if runtime_mode == RuntimeMode::Cluster {
@@ -6307,6 +7258,8 @@ impl LaminarDB {
             recovered_mv_store,
             recovered_channel_progress,
             recovered_input_channels,
+            recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
             restored_reference_tables,
         } = recovery;
@@ -6323,6 +7276,7 @@ impl LaminarDB {
                     recovered_input_channels
                         .get(&source_name)
                         .is_some_and(|inventory| inventory.is_empty()),
+                    recovered_source_watermarks.get(&source_name).copied(),
                 );
                 entry
                     .source
@@ -6337,6 +7291,8 @@ impl LaminarDB {
             &stream_regs,
             &recovered_channel_progress,
             &recovered_input_channels,
+            &recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
         )?;
         let max_poll = self.config.default_buffer_size.min(1024);
@@ -6392,10 +7348,12 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         let graph_ready_vnode_state = if runtime_mode == RuntimeMode::Cluster {
-            self.prepare_graph_ready_vnode_state_binding(
-                tokio::time::Instant::now() + pipeline_checkpoint_timeout,
-            )
-            .await?
+            let graph_ready_deadline = checked_pipeline_deadline(
+                pipeline_checkpoint_timeout,
+                "pipeline graph-ready checkpoint",
+            )?;
+            self.prepare_graph_ready_vnode_state_binding(graph_ready_deadline)
+                .await?
         } else {
             None
         };
@@ -6426,11 +7384,6 @@ impl LaminarDB {
         if let Some(guard) = vnode_transition_launch.as_mut() {
             guard.complete();
         }
-
-        // Readiness has transferred the exact captured assignment and its staged state to the
-        // live graph. A watcher may now prepare a successor generation.
-        #[cfg(feature = "cluster")]
-        drop(startup_assignment_guard);
 
         Ok(())
     }
@@ -6481,8 +7434,18 @@ impl LaminarDB {
         // a new startup while shutdown is queued behind that stop.
         self.close();
         #[cfg(feature = "cluster")]
-        if self.is_cluster_runtime() {
-            self.installed_vnode_state.lock().take();
+        if self.is_cluster_runtime()
+            && self
+                .terminal_pipeline_halt
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Catalog bootstrap can fail before the recovery monitor exists. Shutdown is then the
+            // last live owner capable of proving the permanent disposition to shared authority;
+            // it must not quiesce that authority or publish Stopped until durable proof exists.
+            let controller = { self.cluster_controller.lock().clone() };
+            report_cluster_terminal_halt(controller, Arc::clone(&self.pending_recovery_fault))
+                .await;
+            self.latch_durable_terminal_recovery_fence();
         }
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         #[cfg(feature = "cluster")]
@@ -6575,6 +7538,32 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
+
+        // The runtime can call `complete_pending_vnode_transition` until its join handle has
+        // finished. Retire the staged transition and its predecessor binding only after that
+        // generation is gone, and keep the graph rotation write fence through terminal lifecycle
+        // publication so no callback or assignment adoption can observe a split pair.
+        #[cfg(feature = "cluster")]
+        let _retired_cluster_generation = if self.is_cluster_runtime() {
+            Some(
+                retire_cluster_compute_generation_until(
+                    &self.rotation_execution_fence,
+                    &self.pending_vnode_transition,
+                    &self.installed_vnode_state,
+                    deadline,
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "pipeline shutdown could not retire cluster vnode state before its \
+                         deadline; runtime remains fenced in ShuttingDown"
+                            .into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         if watcher_error.is_none() {
             if let Some(fault) = self.last_fault.lock().clone() {
                 watcher_error = Some(DbError::Pipeline(format!(
@@ -6606,6 +7595,20 @@ impl LaminarDB {
             .await
     }
 
+    /// End-to-end deadline owned by the recovery stop itself. This is derived only from the
+    /// immutable database configuration: consulting the live coordinator here can deadlock with
+    /// the coordinator task that stop is joining. Two cleanup windows cover an admitted attempt
+    /// and its retained tail, with a final margin for lifecycle and connector settlement.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn coordinated_recovery_stop_timeout(&self) -> std::time::Duration {
+        let cleanup_timeout =
+            crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout;
+        coordinated_recovery_stop_ceiling(
+            configured_checkpoint_timeout(&self.config),
+            cleanup_timeout,
+        )
+    }
+
     /// Recovery-owned stop after the lifecycle fence is published.
     #[cfg(feature = "cluster")]
     pub(crate) async fn stop_pipeline_for_coordinated_recovery(&self) -> Result<(), DbError> {
@@ -6617,8 +7620,14 @@ impl LaminarDB {
         &self,
         authority: PipelineLifecycleAuthority,
     ) -> Result<(), DbError> {
-        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+        let stop_timeout = match authority {
+            PipelineLifecycleAuthority::Public => PUBLIC_PIPELINE_STOP_TIMEOUT,
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::CoordinatedRecovery => {
+                self.coordinated_recovery_stop_timeout()
+            }
+        };
+        let deadline = checked_pipeline_deadline(stop_timeout, "pipeline stop")?;
         let first_stop = loop {
             let startup = {
                 let owned = self.startup_attempt.lock();
@@ -6632,10 +7641,6 @@ impl LaminarDB {
                     match DbState::load(&self.state) {
                         DbState::Created | DbState::Stopped => {
                             drop(owned);
-                            #[cfg(feature = "cluster")]
-                            if self.is_cluster_runtime() {
-                                self.installed_vnode_state.lock().take();
-                            }
                             return Ok(());
                         }
                         DbState::Starting => {
@@ -6646,13 +7651,6 @@ impl LaminarDB {
                         }
                         DbState::ShuttingDown => break false,
                         observed @ (DbState::Running | DbState::Faulted) => {
-                            #[cfg(feature = "cluster")]
-                            if self.is_cluster_runtime() {
-                                // Adoption revalidates this slot while holding the same mutex.
-                                // Clear it before retiring Running so no cold preparation can
-                                // publish against a graph generation that stop is removing.
-                                self.installed_vnode_state.lock().take();
-                            }
                             if DbState::compare_exchange(
                                 observed,
                                 DbState::ShuttingDown,
@@ -6692,19 +7690,17 @@ impl LaminarDB {
         let _topology = tokio::time::timeout_at(deadline, self.topology_ddl_lock.write())
             .await
             .map_err(|_| {
-                DbError::InvalidOperation(
-                    "pipeline stop could not acquire topology ownership within 10s; catalog mutation remains fenced"
-                        .into(),
-                )
+                DbError::InvalidOperation(format!(
+                    "pipeline stop could not acquire topology ownership within {stop_timeout:?}; catalog mutation remains fenced"
+                ))
             })?;
         let _lifecycle = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
             .await
             .map_err(|_| {
-                DbError::InvalidOperation(
-                    "pipeline stop could not acquire lifecycle ownership within 10s; an earlier \
-                     lifecycle operation remains fenced"
-                        .into(),
-                )
+                DbError::InvalidOperation(format!(
+                    "pipeline stop could not acquire lifecycle ownership within {stop_timeout:?}; \
+                     an earlier lifecycle operation remains fenced"
+                ))
             })?;
         let mut runtime_handle = tokio::time::timeout_at(deadline, self.runtime_handle.lock())
             .await
@@ -6726,7 +7722,8 @@ impl LaminarDB {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
+                        timeout = ?stop_timeout,
+                        "Pipeline stop still draining; will finalize when the coordinator exits"
                     );
                     return Err(DbError::InvalidOperation(
                         "pipeline stop is taking longer than expected; coordinator still \
@@ -6737,6 +7734,33 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
+
+        // Do not clear the installed predecessor binding while the old compute generation can
+        // still observe its staged transition. The joined runtime cannot hold a graph read fence;
+        // taking the write side now retires both claims atomically with respect to callbacks and
+        // assignment adoption, and retaining it through `Created` publication closes the final
+        // lifecycle race.
+        #[cfg(feature = "cluster")]
+        let _retired_cluster_generation = if self.is_cluster_runtime() {
+            Some(
+                retire_cluster_compute_generation_until(
+                    &self.rotation_execution_fence,
+                    &self.pending_vnode_transition,
+                    &self.installed_vnode_state,
+                    deadline,
+                )
+                .await
+                .map_err(|_| {
+                    DbError::InvalidOperation(
+                        "pipeline stop could not retire cluster vnode state before its deadline; \
+                         runtime remains fenced in ShuttingDown"
+                            .into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
 
         // Do not announce Created or release the exclusive deployment lock while a timed-out
         // decision create can still mutate the recovery frontier. A later stop retry resumes here.
@@ -6750,12 +7774,120 @@ impl LaminarDB {
             // is intentional if that shutdown was cancelled; a retry must finish its teardown.
             return Ok(());
         }
+        if self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            match DbState::compare_exchange(DbState::ShuttingDown, DbState::Faulted, &self.state) {
+                Ok(_) | Err(DbState::Faulted) => return Ok(()),
+                Err(observed) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "terminal pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
+                    )));
+                }
+            }
+        }
         match DbState::compare_exchange(DbState::ShuttingDown, DbState::Created, &self.state) {
             Ok(_) | Err(DbState::Created | DbState::Stopped) => Ok(()),
             Err(observed) => Err(DbError::InvalidOperation(format!(
                 "pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
             ))),
         }
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod recovery_stop_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn coordinated_stop_ceiling_resolves_immutable_checkpoint_config() {
+        let defaults = crate::checkpoint_coordinator::CheckpointConfig::default();
+        assert_eq!(
+            defaults.checkpoint_timeout,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(defaults.cleanup_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            PUBLIC_PIPELINE_STOP_TIMEOUT,
+            std::time::Duration::from_secs(10)
+        );
+
+        let mut config = crate::config::LaminarConfig::default();
+        assert_eq!(
+            configured_checkpoint_timeout(&config),
+            defaults.checkpoint_timeout
+        );
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(
+                configured_checkpoint_timeout(&config),
+                defaults.cleanup_timeout,
+            ),
+            std::time::Duration::from_secs(210)
+        );
+
+        config.checkpoint = Some(laminar_core::streaming::StreamCheckpointConfig {
+            timeout_ms: Some(1_234),
+            ..Default::default()
+        });
+        assert_eq!(
+            configured_checkpoint_timeout(&config),
+            std::time::Duration::from_millis(1_234)
+        );
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(
+                configured_checkpoint_timeout(&config),
+                defaults.cleanup_timeout,
+            ),
+            std::time::Duration::from_millis(91_234)
+        );
+
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(std::time::Duration::MAX, defaults.cleanup_timeout,),
+            std::time::Duration::MAX
+        );
+        assert!(checked_pipeline_deadline(std::time::Duration::ZERO, "test").is_ok());
+        assert!(checked_pipeline_deadline(std::time::Duration::MAX, "test").is_err());
+    }
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    async fn roundtrip(error: DbError) -> DbError {
+        let attempt = StartupAttempt::new();
+        attempt.complete(Err(error));
+        attempt.wait().await.expect_err("startup must fail")
+    }
+
+    #[tokio::test]
+    async fn startup_attempt_preserves_every_terminal_error_variant() {
+        assert!(matches!(
+            roundtrip(DbError::PipelineTerminal("pipeline poison".into())).await,
+            DbError::PipelineTerminal(reason) if reason == "pipeline poison"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::BackpressureFail("bounded queue".into())).await,
+            DbError::BackpressureFail(reason) if reason == "bounded queue"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::ShuffleTerminal("invalid owner".into())).await,
+            DbError::ShuffleTerminal(reason) if reason == "invalid owner"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::ManagedStateBudgetExceeded {
+                context: "restore budget".into(),
+                accounted_bytes: 17,
+                limit_bytes: 16,
+            })
+            .await,
+            DbError::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes: 17,
+                limit_bytes: 16,
+            } if context == "restore budget"
+        ));
     }
 }
 

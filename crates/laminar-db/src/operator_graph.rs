@@ -326,6 +326,15 @@ pub(crate) trait GraphOperator: Send {
         None
     }
 
+    /// Drop reconstructible retained state before the graph rejects the global managed-state cap.
+    ///
+    /// Implementations must leave required/checkpointed state unchanged and return the bytes that
+    /// were removed from their next [`Self::managed_state_accounting`] snapshot. The graph treats
+    /// this value as diagnostic only and always recomputes authoritative accounting afterward.
+    fn evict_optional_managed_state(&mut self) -> usize {
+        0
+    }
+
     /// Install the pipeline-wide retained-state limit for bounded restore preflight.
     fn set_managed_state_budget(&mut self, _bytes: usize) {}
 
@@ -538,8 +547,8 @@ pub(crate) struct ManagedWholeRestore<'a> {
     pub(crate) state: &'a [u8],
 }
 
-/// Whether a managed transition advances live state or initializes a new graph from the
-/// immediately preceding committed assignment.
+/// Whether a managed transition advances live state or initializes a new graph from an older
+/// committed assignment cut.
 #[cfg(feature = "cluster")]
 #[derive(Clone, Copy)]
 pub(crate) enum ManagedVnodeTransitionMode<'a> {
@@ -574,6 +583,15 @@ enum GateDecision {
 enum GraphExecutionMode {
     Normal,
     CheckpointDrain,
+}
+
+impl GraphExecutionMode {
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::CheckpointDrain => "checkpoint_drain",
+        }
+    }
 }
 
 const GRAPH_EXECUTION_POISON_REASON: &str =
@@ -911,11 +929,34 @@ pub(crate) enum ShuffleAlignmentOutcome {
     ScopeCancelledBeforeStaging,
 }
 
+/// Result of one tagged distributed shuffle-flush wave.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShuffleFlushWaveOutcome {
+    pub(crate) outcome: ShuffleAlignmentOutcome,
+    /// Whether any remote participant reported work in the drain preceding this wave.
+    pub(crate) peer_activity: bool,
+    /// Whether this wave staged any inbound data or frontier into operator-owned replay state.
+    ///
+    /// A terminal outcome is benign only before this mutation. Once staged, the attempt must be
+    /// reconciled by coordinated recovery even when the durable authority concurrently Aborts it.
+    pub(crate) graph_state_staged: bool,
+}
+
 #[cfg(feature = "cluster")]
 enum ShuffleFanOutGate {
     Sent,
     WorkReady,
     Terminal(ShuffleAlignmentOutcome),
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShuffleMarkerRelation {
+    Current { activity: bool },
+    FutureAttempt,
+    FutureWave { wave: u64 },
+    Past,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -973,6 +1014,10 @@ pub(crate) struct OperatorGraph {
     output_idle: Vec<bool>,
     #[cfg(feature = "cluster")]
     local_source_frontiers: Vec<InputFrontier>,
+    /// Decision-bound per-source caps used only by managed temporal joins. Other ordered
+    /// operators intentionally retain node-local progress for prompt output and reclamation.
+    #[cfg(feature = "cluster")]
+    temporal_source_frontiers: FxHashMap<usize, InputFrontier>,
     max_input_buf_batches: usize,
     max_input_buf_bytes: Option<usize>,
     backpressure_policy: BackpressurePolicy,
@@ -1068,6 +1113,8 @@ impl OperatorGraph {
             output_idle: Vec::new(),
             #[cfg(feature = "cluster")]
             local_source_frontiers: Vec::new(),
+            #[cfg(feature = "cluster")]
+            temporal_source_frontiers: FxHashMap::default(),
             max_input_buf_batches: 0,
             max_input_buf_bytes: None,
             backpressure_policy: BackpressurePolicy::default(),
@@ -1411,6 +1458,7 @@ impl OperatorGraph {
         &mut self,
         frontiers: &FxHashMap<Arc<str>, InputFrontier>,
     ) {
+        self.temporal_source_frontiers.clear();
         for &node_id in &self.source_node_ids {
             self.local_source_frontiers[node_id] = InputFrontier::default();
         }
@@ -1418,6 +1466,37 @@ impl OperatorGraph {
             if let Some(frontier) = frontiers.get(name) {
                 self.local_source_frontiers[node_id] = *frontier;
             }
+        }
+    }
+
+    /// Cap temporal-join inputs by the exact committed frontier for their own source.
+    ///
+    /// This is called immediately after [`Self::set_local_source_frontiers`]. Inserting an
+    /// uninitialized frontier for a source with no committed decision is deliberate: before the
+    /// first durable cut, a speculative local frontier must not close temporal history.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cap_temporal_source_frontiers(
+        &mut self,
+        mut committed_watermark: impl FnMut(&str) -> Option<i64>,
+    ) {
+        self.temporal_source_frontiers.clear();
+        for (name, &node_id) in self.source_map.iter().chain(&self.positioned_source_map) {
+            let mut frontier = self.local_source_frontiers[node_id];
+            let committed = committed_watermark(name);
+            frontier.watermark = match (frontier.idle, frontier.watermark, committed) {
+                // The committed per-source cut already applies standard idleness semantics. An
+                // idle local shard must inherit that authoritative cut instead of becoming a
+                // dormant active minimum below it (or an uninitialized hold forever).
+                (true, _, Some(committed)) => Some(committed),
+                (false, Some(local), Some(committed)) => Some(local.min(committed)),
+                _ => None,
+            };
+            // This frontier is a decision-bound safety fence, not a live source-idleness signal.
+            // Keeping a speculative `idle` bit would let a temporal join exclude this input and
+            // publish beyond its durable cut; replay could then revive below an irreversible
+            // output frontier. An uninitialized committed cut is likewise an active hold.
+            frontier.idle = false;
+            self.temporal_source_frontiers.insert(node_id, frontier);
         }
     }
 
@@ -1727,10 +1806,14 @@ impl OperatorGraph {
                 .initialize_managed_state()
                 .await
                 .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "managed-state initialization for operator '{}' failed: {error}",
-                        node.name
-                    ))
+                    if error.requires_pipeline_halt() {
+                        error
+                    } else {
+                        DbError::Checkpoint(format!(
+                            "managed-state initialization for operator '{}' failed: {error}",
+                            node.name
+                        ))
+                    }
                 })?;
             let resolved = node.operator.cluster_capability();
             #[cfg(feature = "cluster")]
@@ -1770,8 +1853,18 @@ impl OperatorGraph {
             })
     }
 
-    fn validate_managed_state_budget(&self, context: impl Into<String>) -> Result<(), DbError> {
-        let accounted_bytes = self.managed_state_accounted_bytes();
+    fn validate_managed_state_budget(&mut self, context: impl Into<String>) -> Result<(), DbError> {
+        let mut accounted_bytes = self.managed_state_accounted_bytes();
+        if accounted_bytes > self.max_managed_state_bytes {
+            let _reported_evicted_bytes = self
+                .nodes
+                .iter_mut()
+                .filter(|node| !node.removed)
+                .fold(0usize, |total, node| {
+                    total.saturating_add(node.operator.evict_optional_managed_state())
+                });
+            accounted_bytes = self.managed_state_accounted_bytes();
+        }
         if accounted_bytes > self.max_managed_state_bytes {
             return Err(DbError::ManagedStateBudgetExceeded {
                 context: context.into(),
@@ -2682,6 +2775,11 @@ impl OperatorGraph {
                         .managed_state_accounted_bytes
                         .remove_label_values(&[&self.nodes[id].name, phase]);
                 }
+                for mode in ["normal", "checkpoint_drain"] {
+                    let _ = prom
+                        .operator_process_duration
+                        .remove_label_values(&[&self.nodes[id].name, mode]);
+                }
             }
             self.managed_state_accounting_peaks[id] = ManagedStateAccountingSnapshot::default();
             self.nodes[id].removed = true;
@@ -2957,6 +3055,7 @@ impl OperatorGraph {
         node_id: usize,
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        mode: GraphExecutionMode,
     ) -> Result<(), DbError> {
         let accept = self.nodes[node_id].operator.wants_input();
         let (mut inputs, mut input_bytes) = if accept {
@@ -2970,9 +3069,11 @@ impl OperatorGraph {
 
         let port_count = self.nodes[node_id].input_port_count;
         #[cfg(feature = "cluster")]
+        let managed_state = self.nodes[node_id].capability.managed_state;
+        #[cfg(feature = "cluster")]
         let use_local_source_frontier = self.cluster_shuffle.is_some()
             && matches!(
-                self.nodes[node_id].capability.managed_state,
+                managed_state,
                 Some(
                     ManagedStateContract::CoreWindowV1
                         | ManagedStateContract::SqlAggregateV1
@@ -2980,11 +3081,21 @@ impl OperatorGraph {
                         | ManagedStateContract::TemporalJoinV1
                 )
             );
+        #[cfg(feature = "cluster")]
+        let use_temporal_source_frontier =
+            matches!(managed_state, Some(ManagedStateContract::TemporalJoinV1));
         let frontiers: smallvec::SmallVec<[InputFrontier; 2]> = (0..port_count)
             .map(|port| {
                 let upstream = self.input_sources[node_id][port];
                 #[cfg(feature = "cluster")]
                 if use_local_source_frontier && self.source_node_ids.contains(&upstream) {
+                    if use_temporal_source_frontier {
+                        return self
+                            .temporal_source_frontiers
+                            .get(&upstream)
+                            .copied()
+                            .unwrap_or(self.local_source_frontiers[upstream]);
+                    }
                     return self.local_source_frontiers[upstream];
                 }
                 if upstream < self.output_watermarks.len() {
@@ -2999,22 +3110,32 @@ impl OperatorGraph {
             })
             .collect();
 
+        let process_timer = self.prom.as_ref().map(|prom| {
+            prom.operator_process_duration
+                .with_label_values(&[&self.nodes[node_id].name, mode.metric_label()])
+                .start_timer()
+        });
         let output_result = self.nodes[node_id]
             .operator
             .process_with_frontiers(if accept { inputs.as_slice() } else { &[][..] }, &frontiers)
             .await;
+        drop(process_timer);
         let output_result = match output_result {
-            Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => self
-                .validate_managed_state_budget(format!(
-                    "operator '{}' record processing",
-                    self.nodes[node_id].name
-                ))
-                .map_err(|error| {
-                    DbError::StatefulOperatorPartialApply(format!(
-                        "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
-                    ))
-                })
-                .map(|()| batches),
+            Ok(batches) if self.nodes[node_id].capability.managed_state.is_some() => {
+                let budget_context =
+                    format!("operator '{}' record processing", self.nodes[node_id].name);
+                self.validate_managed_state_budget(budget_context)
+                    .map_err(|error| {
+                        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+                            error
+                        } else {
+                            DbError::StatefulOperatorPartialApply(format!(
+                                "managed state changed before the post-process budget check; recovery from the committed checkpoint is required: {error}"
+                            ))
+                        }
+                    })
+                    .map(|()| batches)
+            }
             Ok(batches) => Ok(batches),
             Err(error) => Err(error),
         };
@@ -3044,6 +3165,18 @@ impl OperatorGraph {
             }
             Err(e) => {
                 if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
+                    // `inputs` owns the node's outer per-port roster after `mem::take`. The
+                    // supervisor may inspect deferred work/backpressure before replacing this
+                    // graph generation, so restore that structural roster even though the rows
+                    // themselves must be discarded after a terminal/partial-apply outcome.
+                    if accept {
+                        for port in &mut inputs {
+                            port.clear();
+                        }
+                        input_bytes.fill(0);
+                        self.input_bufs[node_id] = inputs;
+                        self.input_buf_bytes[node_id] = input_bytes;
+                    }
                     self.poison_after_terminal_error();
                     return Err(e);
                 }
@@ -3449,7 +3582,7 @@ impl OperatorGraph {
             }
 
             if let Err(e) = self
-                .execute_single_operator(node_id, current_watermark, &mut results)
+                .execute_single_operator(node_id, current_watermark, &mut results, mode)
                 .await
             {
                 if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
@@ -3670,7 +3803,12 @@ impl OperatorGraph {
                 GateDecision::Run => {}
             }
             if let Err(e) = self
-                .execute_single_operator(deferred_id, current_watermark, results)
+                .execute_single_operator(
+                    deferred_id,
+                    current_watermark,
+                    results,
+                    GraphExecutionMode::Normal,
+                )
                 .await
             {
                 if e.requires_pipeline_recovery() || e.requires_pipeline_halt() {
@@ -3885,7 +4023,7 @@ impl OperatorGraph {
 
     #[cfg(feature = "cluster")]
     fn post_dequeue_shuffle_error(context: &str, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::StatefulOperatorPartialApply(format!("{context}: {error}"))
@@ -4205,6 +4343,52 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
+    fn classify_shuffle_marker(
+        expected_attempt: laminar_core::checkpoint::CheckpointAttempt,
+        expected_flush_wave: Option<u64>,
+        barrier: laminar_core::checkpoint::CheckpointBarrier,
+    ) -> Result<ShuffleMarkerRelation, DbError> {
+        let observed_attempt =
+            laminar_core::checkpoint::CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
+        match Self::compare_shuffle_attempts(expected_attempt, observed_attempt)? {
+            std::cmp::Ordering::Greater => return Ok(ShuffleMarkerRelation::FutureAttempt),
+            std::cmp::Ordering::Less => return Ok(ShuffleMarkerRelation::Past),
+            std::cmp::Ordering::Equal => {}
+        }
+        let Some(expected_wave) = expected_flush_wave else {
+            if barrier.flags != laminar_core::checkpoint::flags::NONE {
+                return Err(DbError::Pipeline(format!(
+                    "ordinary shuffle barrier carried unexpected flags {:#x}",
+                    barrier.flags
+                )));
+            }
+            return Ok(ShuffleMarkerRelation::Current { activity: false });
+        };
+        let (observed_wave, activity) =
+            laminar_core::checkpoint::barrier::decode_shuffle_flush_flags(barrier.flags).map_err(
+                |error| {
+                    DbError::Pipeline(format!(
+                        "shuffle flush barrier has invalid internal flags: {error}"
+                    ))
+                },
+            )?;
+        Ok(match observed_wave.cmp(&expected_wave) {
+            std::cmp::Ordering::Equal => ShuffleMarkerRelation::Current { activity },
+            std::cmp::Ordering::Greater => {
+                if expected_wave.checked_add(1) != Some(observed_wave) {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle flush barrier skipped from wave {expected_wave} to {observed_wave}"
+                    )));
+                }
+                ShuffleMarkerRelation::FutureWave {
+                    wave: observed_wave,
+                }
+            }
+            std::cmp::Ordering::Less => ShuffleMarkerRelation::Past,
+        })
+    }
+
+    #[cfg(feature = "cluster")]
     fn is_shuffle_alignment_terminal_hint(
         attempt: laminar_core::checkpoint::CheckpointAttempt,
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
@@ -4463,19 +4647,20 @@ impl OperatorGraph {
         &mut self,
         cfg: &crate::operator::sql_query::ClusterShuffleConfig,
         attempt: laminar_core::checkpoint::CheckpointAttempt,
+        expected_flush_wave: Option<u64>,
         watermark: i64,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
         recovery_gen: u64,
         mut remaining: rustc_hash::FxHashSet<u64>,
-        mut barrier_cuts: rustc_hash::FxHashMap<u64, u64>,
+        mut barrier_cuts: rustc_hash::FxHashMap<u64, (u64, bool)>,
         staged_graph_state: &mut bool,
         irreversible_dequeue: &mut bool,
         mut queued_work_pending: bool,
         mut fan_out_complete: bool,
         mut fan_out: std::pin::Pin<&mut F>,
-    ) -> Result<ShuffleAlignmentOutcome, DbError>
+    ) -> Result<ShuffleFlushWaveOutcome, DbError>
     where
         F: std::future::Future<Output = std::io::Result<()>>,
     {
@@ -4533,7 +4718,11 @@ impl OperatorGraph {
                     )
                     .await?
                     {
-                        return Ok(outcome);
+                        return Ok(ShuffleFlushWaveOutcome {
+                            outcome,
+                            peer_activity: false,
+                            graph_state_staged: *staged_graph_state,
+                        });
                     }
                     check_interval.reset_at(tokio::time::Instant::now() + RECHECK);
                     terminal_hint.set(Self::wait_for_shuffle_alignment_terminal_hint(
@@ -4553,7 +4742,12 @@ impl OperatorGraph {
                                 && !*staged_graph_state
                                 && !*irreversible_dequeue
                             {
-                                return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                                return Ok(ShuffleFlushWaveOutcome {
+                                    outcome:
+                                        ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
+                                    peer_activity: false,
+                                    graph_state_staged: false,
+                                });
                             }
                             let error = DbError::Pipeline(format!(
                                 "shuffle barrier fan-out: {error}"
@@ -4585,7 +4779,11 @@ impl OperatorGraph {
                         )
                         .await?
                     {
-                        return Ok(outcome);
+                        return Ok(ShuffleFlushWaveOutcome {
+                            outcome,
+                            peer_activity: false,
+                            graph_state_staged: *staged_graph_state,
+                        });
                     }
                 }
                 res = cfg.receiver.recv() => {
@@ -4612,7 +4810,18 @@ impl OperatorGraph {
                     ) {
                         let peer = received.peer();
                         let sequence = received.checkpoint_sequence();
-                        if let Some(cut) = barrier_cuts.get(&peer) {
+                        if let Some((cut, _)) = barrier_cuts.get(&peer) {
+                            if expected_flush_wave.is_some() {
+                                self.stage_received_ordered_shuffle(received, watermark)
+                                    .map_err(|error| {
+                                        Self::post_dequeue_shuffle_error(
+                                            "shuffle future-wave staging",
+                                            error,
+                                        )
+                                    })?;
+                                *staged_graph_state = true;
+                                continue;
+                            }
                             if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
                                 controller,
                                 attempt,
@@ -4634,7 +4843,11 @@ impl OperatorGraph {
                                         )
                                     })?;
                                 *staged_graph_state = true;
-                                return Ok(outcome);
+                                return Ok(ShuffleFlushWaveOutcome {
+                                    outcome,
+                                    peer_activity: false,
+                                    graph_state_staged: *staged_graph_state,
+                                });
                             }
                             return Err(Self::post_dequeue_shuffle_error(
                                 "shuffle barrier alignment ordering validation",
@@ -4666,25 +4879,26 @@ impl OperatorGraph {
                             )),
                         ));
                     }
-                    let observed = laminar_core::checkpoint::CheckpointAttempt::new(
-                        barrier.epoch,
-                        barrier.checkpoint_id,
-                    );
-                    match Self::compare_shuffle_attempts(attempt, observed).map_err(|error| {
+                    match Self::classify_shuffle_marker(
+                        attempt,
+                        expected_flush_wave,
+                        *barrier,
+                    )
+                    .map_err(|error| {
                         Self::post_dequeue_shuffle_error(
                             "shuffle barrier alignment attempt validation",
                             error,
                         )
                     })? {
-                        std::cmp::Ordering::Equal => {
+                        ShuffleMarkerRelation::Current { activity } => {
                             let peer = received.peer();
                             let cut = received.checkpoint_sequence();
-                            if let Some(previous) = barrier_cuts.insert(peer, cut) {
-                                if previous != cut {
+                            if let Some(previous) = barrier_cuts.insert(peer, (cut, activity)) {
+                                if previous != (cut, activity) {
                                     return Err(Self::post_dequeue_shuffle_error(
                                         "shuffle barrier alignment high-water validation",
                                         DbError::Pipeline(format!(
-                                            "shuffle peer {peer} repeated checkpoint barrier with conflicting high-water sequences {previous} and {cut}"
+                                            "shuffle peer {peer} repeated checkpoint barrier with conflicting cut/activity {previous:?} and ({cut}, {activity})"
                                         )),
                                     ));
                                 }
@@ -4694,10 +4908,22 @@ impl OperatorGraph {
                                 break;
                             }
                         }
-                        std::cmp::Ordering::Greater => {
+                        ShuffleMarkerRelation::FutureAttempt => {
                             cfg.receiver.stash_barrier(received);
                         }
-                        std::cmp::Ordering::Less => {}
+                        ShuffleMarkerRelation::FutureWave { wave } => {
+                            let peer = received.peer();
+                            if remaining.contains(&peer) {
+                                return Err(Self::post_dequeue_shuffle_error(
+                                    "shuffle flush wave ordering validation",
+                                    DbError::Pipeline(format!(
+                                        "shuffle peer {peer} sent future wave {wave} before its current-wave marker"
+                                    )),
+                                ));
+                            }
+                            cfg.receiver.stash_barrier(received);
+                        }
+                        ShuffleMarkerRelation::Past => {}
                     }
                 }
             }
@@ -4707,14 +4933,22 @@ impl OperatorGraph {
         if let Some(outcome) =
             Self::audit_shuffle_alignment_settlement(controller, attempt, assignment_fence).await?
         {
-            return Ok(outcome);
+            return Ok(ShuffleFlushWaveOutcome {
+                outcome,
+                peer_activity: false,
+                graph_state_staged: *staged_graph_state,
+            });
         }
         tracing::debug!(
             checkpoint_id = attempt.checkpoint_id,
             epoch = attempt.epoch,
             "shuffle align: complete"
         );
-        Ok(ShuffleAlignmentOutcome::Aligned)
+        Ok(ShuffleFlushWaveOutcome {
+            outcome: ShuffleAlignmentOutcome::Aligned,
+            peer_activity: barrier_cuts.values().any(|(_, activity)| *activity),
+            graph_state_staged: *staged_graph_state,
+        })
     }
     /// Aligned shuffle checkpointing: fan out an in-band barrier, retain each peer's pre-barrier
     /// rows as channel state, and wait until every peer's barrier is observed before snapshotting.
@@ -4730,26 +4964,35 @@ impl OperatorGraph {
     /// # Errors
     /// Returns a recovery-classified error for timeout, loss, scope conflict, or supersession.
     #[cfg(feature = "cluster")]
-    pub(crate) async fn align_shuffle_barriers(
+    async fn align_shuffle_barriers_inner(
         &mut self,
         attempt: laminar_core::checkpoint::CheckpointAttempt,
+        flush_wave: Option<(u64, bool)>,
         watermark: i64,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
-    ) -> Result<ShuffleAlignmentOutcome, DbError> {
+    ) -> Result<ShuffleFlushWaveOutcome, DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::shuffle::ShuffleMessage;
         use rustc_hash::{FxHashMap, FxHashSet};
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
-            return Ok(ShuffleAlignmentOutcome::Aligned);
+            return Ok(ShuffleFlushWaveOutcome {
+                outcome: ShuffleAlignmentOutcome::Aligned,
+                peer_activity: false,
+                graph_state_staged: false,
+            });
         };
         let mut staged_graph_state = false;
         let mut irreversible_dequeue = false;
         let alignment = tokio::time::timeout_at(deadline, async {
             if cfg.receiver.assignment_version() == 0 || cfg.sender.assignment_version() == 0 {
-                return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                return Ok(ShuffleFlushWaveOutcome {
+                    outcome: ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
+                    peer_activity: false,
+                    graph_state_staged: false,
+                });
             }
             let recovery_gen = cfg.receiver.recovery_gen();
             Self::validate_shuffle_attempt_scope(
@@ -4766,10 +5009,24 @@ impl OperatorGraph {
                 .filter(|peer| *peer != cfg.self_id.0)
                 .collect();
             if peers.is_empty() {
-                return Ok(ShuffleAlignmentOutcome::Aligned);
+                return Ok(ShuffleFlushWaveOutcome {
+                    outcome: ShuffleAlignmentOutcome::Aligned,
+                    peer_activity: false,
+                    graph_state_staged: false,
+                });
             }
 
-            let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
+            let barrier = match flush_wave {
+                Some((wave, activity)) => CheckpointBarrier {
+                    checkpoint_id: attempt.checkpoint_id,
+                    epoch: attempt.epoch,
+                    flags: laminar_core::checkpoint::barrier::encode_shuffle_flush_flags(
+                        wave, activity,
+                    )
+                    .map_err(|error| DbError::Checkpoint(error.into()))?,
+                },
+                None => CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+            };
             let fan_out = cfg
                 .sender
                 .fan_out_barrier(&peers, barrier, assignment_fence);
@@ -4787,7 +5044,13 @@ impl OperatorGraph {
             {
                 ShuffleFanOutGate::Sent => (true, false),
                 ShuffleFanOutGate::WorkReady => (false, true),
-                ShuffleFanOutGate::Terminal(outcome) => return Ok(outcome),
+                ShuffleFanOutGate::Terminal(outcome) => {
+                    return Ok(ShuffleFlushWaveOutcome {
+                        outcome,
+                        peer_activity: false,
+                        graph_state_staged: false,
+                    });
+                }
             };
 
             // Once fan-out succeeds or live input needs queue space, transfer the already bounded
@@ -4815,7 +5078,11 @@ impl OperatorGraph {
                             DbError::Pipeline(error.to_string()),
                         ));
                     }
-                    return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                    return Ok(ShuffleFlushWaveOutcome {
+                        outcome: ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
+                        peer_activity: false,
+                        graph_state_staged: false,
+                    });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     return Err(DbError::Pipeline(
@@ -4837,7 +5104,7 @@ impl OperatorGraph {
             })?;
 
             let mut remaining: FxHashSet<u64> = peers.iter().copied().collect();
-            let mut barrier_cuts: FxHashMap<u64, u64> = FxHashMap::default();
+            let mut barrier_cuts: FxHashMap<u64, (u64, bool)> = FxHashMap::default();
             tracing::debug!(
                 checkpoint_id = attempt.checkpoint_id,
                 epoch = attempt.epoch,
@@ -4878,33 +5145,46 @@ impl OperatorGraph {
                         ),
                     ));
                 };
-                let observed = laminar_core::checkpoint::CheckpointAttempt::new(
-                    barrier.epoch,
-                    barrier.checkpoint_id,
-                );
-                match Self::compare_shuffle_attempts(attempt, observed).map_err(|error| {
+                match Self::classify_shuffle_marker(
+                    attempt,
+                    flush_wave.map(|(wave, _)| wave),
+                    *barrier,
+                )
+                .map_err(|error| {
                     Self::post_dequeue_shuffle_error(
                         "checkpoint shuffle barrier attempt validation",
                         error,
                     )
                 })? {
-                    std::cmp::Ordering::Equal => {
+                    ShuffleMarkerRelation::Current { activity } => {
                         let peer = received.peer();
                         let cut = received.checkpoint_sequence();
-                        if let Some(previous) = barrier_cuts.insert(peer, cut) {
-                            if previous != cut {
+                        if let Some(previous) = barrier_cuts.insert(peer, (cut, activity)) {
+                            if previous != (cut, activity) {
                                 return Err(Self::post_dequeue_shuffle_error(
                                     "checkpoint shuffle barrier high-water validation",
                                     DbError::Pipeline(format!(
-                                        "shuffle peer {peer} repeated checkpoint barrier with conflicting high-water sequences {previous} and {cut}"
+                                        "shuffle peer {peer} repeated checkpoint barrier with conflicting cut/activity {previous:?} and ({cut}, {activity})"
                                     )),
                                 ));
                             }
                         }
                         remaining.remove(&peer);
                     }
-                    std::cmp::Ordering::Greater => cfg.receiver.stash_barrier(received),
-                    std::cmp::Ordering::Less => {}
+                    ShuffleMarkerRelation::FutureAttempt => cfg.receiver.stash_barrier(received),
+                    ShuffleMarkerRelation::FutureWave { wave } => {
+                        let peer = received.peer();
+                        if remaining.contains(&peer) {
+                            return Err(Self::post_dequeue_shuffle_error(
+                                "checkpoint shuffle flush wave ordering validation",
+                                DbError::Pipeline(format!(
+                                    "shuffle peer {peer} sent future wave {wave} before its current-wave marker"
+                                )),
+                            ));
+                        }
+                        cfg.receiver.stash_barrier(received);
+                    }
+                    ShuffleMarkerRelation::Past => {}
                 }
             }
 
@@ -4929,8 +5209,23 @@ impl OperatorGraph {
                 })?;
                 let peer = received.peer();
                 let sequence = received.checkpoint_sequence();
-                if let Some(cut) = barrier_cuts.get(&peer) {
+                if let Some((cut, _)) = barrier_cuts.get(&peer) {
                     if sequence >= *cut {
+                        if flush_wave.is_some() {
+                            self.stage_checkpointed_shuffle(
+                                &stage,
+                                RetainedBatch::from_received(received),
+                                watermark,
+                            )
+                            .map_err(|error| {
+                                Self::post_dequeue_shuffle_error(
+                                    "checkpoint future-wave shuffle batch staging",
+                                    error,
+                                )
+                            })?;
+                            staged_graph_state = true;
+                            continue;
+                        }
                         post_cut_error.get_or_insert_with(|| {
                             format!(
                                 "shuffle data sequence {sequence} from peer {peer} is at or after its checkpoint barrier high-water {cut}"
@@ -4985,7 +5280,11 @@ impl OperatorGraph {
                         })?;
                         staged_graph_state = true;
                     }
-                    return Ok(outcome);
+                    return Ok(ShuffleFlushWaveOutcome {
+                        outcome,
+                        peer_activity: false,
+                        graph_state_staged: staged_graph_state,
+                    });
                 }
                 return Err(Self::post_dequeue_shuffle_error(
                     "checkpoint shuffle high-water validation",
@@ -4996,6 +5295,7 @@ impl OperatorGraph {
                 .wait_for_remaining_shuffle_barriers(
                     &cfg,
                     attempt,
+                    flush_wave.map(|(wave, _)| wave),
                     watermark,
                     assignment_fence,
                     deadline,
@@ -5019,10 +5319,14 @@ impl OperatorGraph {
             ))
         })?;
         let outcome = alignment.map_err(|error| {
-            DbError::Checkpoint(format!(
-                "shuffle barrier alignment for checkpoint {} epoch {} requires recovery: {error}",
-                attempt.checkpoint_id, attempt.epoch
-            ))
+            if error.requires_pipeline_halt() {
+                error
+            } else {
+                DbError::Checkpoint(format!(
+                    "shuffle barrier alignment for checkpoint {} epoch {} requires recovery: {error}",
+                    attempt.checkpoint_id, attempt.epoch
+                ))
+            }
         })?;
         if staged_graph_state {
             self.validate_managed_state_budget("checkpoint shuffle alignment staging")
@@ -5034,6 +5338,59 @@ impl OperatorGraph {
                 })?;
         }
         Ok(outcome)
+    }
+
+    /// Run one legacy single-cut shuffle alignment. This wrapper intentionally rejects tagged
+    /// fixed-point markers so tests and non-portable callers cannot silently weaken their cut.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn align_shuffle_barriers(
+        &mut self,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
+        watermark: i64,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+    ) -> Result<ShuffleAlignmentOutcome, DbError> {
+        self.align_shuffle_barriers_inner(
+            attempt,
+            None,
+            watermark,
+            assignment_fence,
+            deadline,
+            controller,
+        )
+        .await
+        .map(|result| result.outcome)
+    }
+
+    /// Run one tagged wave of the clustered shuffle fixed-point flush.
+    ///
+    /// `local_activity` reports whether this participant executed any graph drain pass since its
+    /// preceding wave. Every peer observes the same activity vector before deciding whether a
+    /// later wave can be terminal.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn align_shuffle_flush_wave(
+        &mut self,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
+        wave: u64,
+        local_activity: bool,
+        watermark: i64,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+    ) -> Result<ShuffleFlushWaveOutcome, DbError> {
+        // Validate the ordinal before fan-out or inbound dequeue can mutate transport/graph state.
+        laminar_core::checkpoint::barrier::encode_shuffle_flush_flags(wave, local_activity)
+            .map_err(|error| DbError::Checkpoint(error.into()))?;
+        self.align_shuffle_barriers_inner(
+            attempt,
+            Some((wave, local_activity)),
+            watermark,
+            assignment_fence,
+            deadline,
+            controller,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -5301,10 +5658,14 @@ impl OperatorGraph {
                     data: bytes.to_vec(),
                 })
                 .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6029] operator '{}' restore failed: {error}",
-                        node.name
-                    ))
+                    if error.requires_pipeline_halt() {
+                        error
+                    } else {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6029] operator '{}' restore failed: {error}",
+                            node.name
+                        ))
+                    }
                 })?;
             restored += 1;
         }
@@ -5318,10 +5679,14 @@ impl OperatorGraph {
             node.operator
                 .restore_vnode(*vnode, vnode_count, bytes)
                 .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6029] operator '{}' vnode {vnode} restore failed: {error}",
-                        node.name
-                    ))
+                    if error.requires_pipeline_halt() {
+                        error
+                    } else {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6029] operator '{}' vnode {vnode} restore failed: {error}",
+                            node.name
+                        ))
+                    }
                 })?;
             restored += 1;
         }

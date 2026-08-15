@@ -82,16 +82,6 @@ impl LeaseDeadline {
         self.changed.notify_waiters();
     }
 
-    /// Withdraw a renewable grant without terminalizing its manager.
-    pub(crate) fn withdraw(&self) {
-        let _transition = self.transition.lock();
-        if self.terminal.load(Ordering::Acquire) {
-            return;
-        }
-        self.valid_until_ns.store(0, Ordering::Release);
-        self.changed.notify_waiters();
-    }
-
     /// Whether the holder remains inside its last successful renewal deadline.
     #[must_use]
     pub fn is_live(&self) -> bool {
@@ -220,18 +210,6 @@ mod tests {
         assert!(deadline.terminal.load(Ordering::Acquire));
         assert!(!deadline.is_live());
         assert_eq!(deadline.valid_until_ns.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn withdrawn_renewable_grant_can_be_reacquired() {
-        let deadline = LeaseDeadline::live_for(Duration::from_secs(60));
-
-        deadline.withdraw();
-        assert!(!deadline.is_live());
-        assert!(!deadline.terminal.load(Ordering::Acquire));
-
-        deadline.extend(Duration::from_secs(60));
-        assert!(deadline.is_live());
     }
 
     #[test]

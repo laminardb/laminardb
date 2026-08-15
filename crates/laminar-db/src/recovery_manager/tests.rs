@@ -81,6 +81,7 @@ async fn committed_checkpoint() -> Fixture {
         scope: CheckpointScope::Local,
         vnode_count: 1,
         assignment_fence: None,
+        reassignment_portable: false,
         participants: vec![participant],
         source_names: manifest.source_names.clone(),
         source_offsets: BTreeMap::from([(
@@ -88,6 +89,7 @@ async fn committed_checkpoint() -> Fixture {
             manifest.source_offsets["source"].clone(),
         )]),
         channel_progress: manifest.channel_progress.clone(),
+        source_watermarks: BTreeMap::from([("source".into(), 1_000)]),
         checkpoint_watermark: Some(1_000),
     };
     let (_, reference) = committed.encode_and_reference().unwrap();
@@ -144,7 +146,7 @@ async fn exact_commit_restores_complete_checked_frames_and_progress() {
 }
 
 #[tokio::test]
-async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
+async fn cluster_recovery_selects_exact_and_newer_target_frames() {
     let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
     let objects = Arc::new(InMemory::new());
     let local_store = ObjectStoreCheckpointStore::new(objects.clone(), "cluster-recovery")
@@ -177,6 +179,7 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
     let mut local = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
     local.deployment_id = DEPLOYMENT_ID.into();
     local.assignment_fence = Some(fence.clone());
+    local.reassignment_portable = true;
     local.owned_vnodes = vec![0];
     local.node_data.object_length = 11;
     local.node_data.sha256 = checkpoint_sha256(b"whole1local");
@@ -210,6 +213,7 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
     remote.bind_participant(2);
     remote.deployment_id = DEPLOYMENT_ID.into();
     remote.assignment_fence = Some(fence.clone());
+    remote.reassignment_portable = true;
     remote.owned_vnodes = vec![1];
     remote.node_data.object_length = 12;
     remote.node_data.sha256 = checkpoint_sha256(b"whole2remote");
@@ -265,11 +269,13 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
         scope: CheckpointScope::Cluster,
         vnode_count: 2,
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor: None,
         participants: vec![local_ref, remote_ref],
         source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
+        source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
     };
     let (_, committed_ref) = committed.encode_and_reference().unwrap();
@@ -314,7 +320,7 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
     assert!(!zero_owner.reassigned);
 
     let successor = CheckpointAssignmentFence::from_owner_map(
-        2,
+        3,
         &[3, 3],
         vec![CheckpointParticipant {
             node_id: 3,
@@ -322,6 +328,24 @@ async fn cluster_recovery_selects_exact_and_adjacent_target_frames() {
         }],
     )
     .unwrap();
+    let mut nonportable = committed.clone();
+    nonportable.reassignment_portable = false;
+    let nonportable_error = match fresh_manager.select_state_frames(
+        &nonportable,
+        &[local.clone(), remote.clone()],
+        Some(&ClusterRecoveryTarget {
+            assignment: successor.clone(),
+            owned_vnodes: vec![0, 1],
+            max_graph_payload_bytes: 64,
+        }),
+    ) {
+        Ok(_) => panic!("a nonportable checkpoint must not drive reassignment recovery"),
+        Err(error) => error,
+    };
+    assert!(
+        nonportable_error.to_string().contains("not a portable"),
+        "{nonportable_error}"
+    );
     let reassigned = fresh_manager
         .recover_committed_for_target(
             &outcome,

@@ -43,6 +43,18 @@ fn store(backing: Arc<dyn ObjectStore>) -> ObjectStoreCheckpointStore {
         .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
 }
 
+#[test]
+fn checkpoint_node_data_limit_respects_the_allocation_ceiling() {
+    validate_max_checkpoint_node_data_bytes(isize::MAX as u64).unwrap();
+    let error = validate_max_checkpoint_node_data_bytes((isize::MAX as u64) + 1).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds this process address space"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn one_node_object_supports_verified_range_reads() {
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());

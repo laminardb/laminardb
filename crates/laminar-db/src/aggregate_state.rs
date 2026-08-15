@@ -5,11 +5,11 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::{Array, ArrayRef};
 use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
@@ -28,11 +28,11 @@ mod concrete;
 mod keys;
 mod scalar_ipc;
 mod vnode_state;
-pub(crate) use checkpoints::AggStateArchiveRestoreProfile;
 pub(crate) use checkpoints::{
     query_fingerprint, query_fingerprint_with_config, AggStateCheckpoint, EmittedCheckpoint,
     GroupCheckpoint, WindowCheckpoint,
 };
+pub(crate) use checkpoints::{AggStateArchiveRestoreProfile, AggStateRestorePreflight};
 #[cfg(test)]
 pub(crate) use compile::expr_to_sql;
 pub(crate) use compile::{
@@ -164,6 +164,91 @@ impl AggFuncSpec {
                 self.udf.name()
             ))
         })
+    }
+}
+
+fn decimal_fits_managed_checkpoint_ipc(precision: u8, scale: i8, maximum: u8) -> bool {
+    let Ok(maximum_scale) = i8::try_from(maximum) else {
+        return false;
+    };
+    precision != 0
+        && precision <= maximum
+        && scale <= maximum_scale
+        && (scale <= 0 || u8::try_from(scale).is_ok_and(|scale| scale <= precision))
+}
+
+/// Mirrors the non-nested Arrow field shapes accepted by the managed aggregate checkpoint
+/// preflight. Dictionary encoding adds one index buffer around an otherwise scalar value; a
+/// second dictionary layer would require another IPC dictionary descriptor and is not admitted.
+fn is_managed_checkpoint_scalar_type(data_type: &DataType, allow_dictionary: bool) -> bool {
+    match data_type {
+        DataType::Null
+        | DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View => true,
+        DataType::Time32(unit) => matches!(unit, TimeUnit::Second | TimeUnit::Millisecond),
+        DataType::Time64(unit) => matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond),
+        DataType::FixedSizeBinary(width) => *width >= 0,
+        DataType::Decimal32(precision, scale) => {
+            decimal_fits_managed_checkpoint_ipc(*precision, *scale, 9)
+        }
+        DataType::Decimal64(precision, scale) => {
+            decimal_fits_managed_checkpoint_ipc(*precision, *scale, 18)
+        }
+        DataType::Decimal128(precision, scale) => {
+            decimal_fits_managed_checkpoint_ipc(*precision, *scale, 38)
+        }
+        DataType::Decimal256(precision, scale) => {
+            decimal_fits_managed_checkpoint_ipc(*precision, *scale, 76)
+        }
+        DataType::Dictionary(index, value) if allow_dictionary => {
+            index.is_dictionary_key_type()
+                && is_managed_checkpoint_scalar_type(value.as_ref(), false)
+        }
+        DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::Struct(_)
+        | DataType::Union(_, _)
+        | DataType::Dictionary(_, _)
+        | DataType::Map(_, _)
+        | DataType::RunEndEncoded(_, _) => false,
+    }
+}
+
+fn require_managed_checkpoint_scalar_type(
+    data_type: &DataType,
+    component: std::fmt::Arguments<'_>,
+) -> Result<(), DbError> {
+    if is_managed_checkpoint_scalar_type(data_type, true) {
+        Ok(())
+    } else {
+        Err(DbError::Unsupported(format!(
+            "[{}] managed aggregate {component} type {data_type:?} is outside the scalar checkpoint IPC contract",
+            laminar_core::error_codes::SQL_UNSUPPORTED
+        )))
     }
 }
 
@@ -521,7 +606,7 @@ type DecodedGroupState = (arrow::row::OwnedRow, i64, i64, Vec<Vec<ScalarValue>>)
 
 struct DecodedAggMutation {
     groups: Vec<DecodedGroupState>,
-    last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    last_emitted: Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>,
 }
 
 /// A decoded vnode image built off-side before publication.
@@ -530,12 +615,11 @@ struct StagedAggMutation {
     last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
 }
 
-fn validate_unique_decoded_group_keys(groups: &[DecodedGroupState]) -> Result<(), DbError> {
-    let mut keys: FxHashSet<&[u8]> =
-        FxHashSet::with_capacity_and_hasher(groups.len(), FxBuildHasher);
+fn canonicalize_decoded_group_keys(groups: &mut [DecodedGroupState]) -> Result<(), DbError> {
+    groups.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
     if groups
-        .iter()
-        .any(|(key, _, _, _)| !keys.insert(key.as_ref()))
+        .windows(2)
+        .any(|pair| pair[0].0.as_ref() == pair[1].0.as_ref())
     {
         return Err(DbError::Pipeline(
             "aggregate checkpoint contains a duplicate group key".into(),
@@ -751,7 +835,8 @@ impl IncrementalAggState {
             self.query_fingerprint(),
             self.agg_specs.len(),
             self.max_groups,
-            self.num_group_cols > 0,
+            self.num_group_cols,
+            self.agg_specs.len(),
             self.emit_changelog,
         )
     }
@@ -781,15 +866,8 @@ impl IncrementalAggState {
             )?;
         }
 
-        let mut restored = rustc_hash::FxHashSet::default();
-        restored
-            .try_reserve(restored_lower_bounds.len())
-            .map_err(|error| {
-                DbError::Pipeline(format!(
-                    "aggregate vnode transition could not reserve restored preflight roster: {error}"
-                ))
-            })?;
         let mut replacement_lower_bound = 0_usize;
+        let mut previous_vnode = None;
         for &(vnode, vnode_lower_bound) in restored_lower_bounds {
             if self.num_group_cols == 0 && vnode != 0 {
                 return Err(DbError::Pipeline(format!(
@@ -802,11 +880,12 @@ impl IncrementalAggState {
                     vnode_count.get()
                 )));
             }
-            if !restored.insert(vnode) {
+            if previous_vnode.is_some_and(|previous| previous >= vnode) {
                 return Err(DbError::Pipeline(format!(
-                    "aggregate vnode transition repeats restored vnode {vnode}"
+                    "aggregate vnode transition restore roster is not strictly increasing at vnode {vnode}"
                 )));
             }
+            previous_vnode = Some(vnode);
             if !revoked.contains(&vnode) {
                 transitioned_group_count = checked_vnode_transition_capacity(
                     transitioned_group_count,
@@ -832,6 +911,35 @@ impl IncrementalAggState {
             )));
         }
         Ok(())
+    }
+
+    /// Deterministic inline roster bytes allocated while one all-vnode replacement is prepared.
+    pub(crate) fn vnode_transition_restore_roster_bytes(
+        &self,
+        restore_count: usize,
+        revoked_count: usize,
+    ) -> Result<usize, DbError> {
+        let transitioned = checked_vnode_transition_capacity(restore_count, revoked_count)?;
+        transitioned
+            .checked_mul(std::mem::size_of::<u32>())
+            .and_then(|bytes| {
+                restore_count
+                    .checked_mul(std::mem::size_of::<(u32, Box<AggregateVnodeState>)>())
+                    .and_then(|restores| bytes.checked_add(restores))
+            })
+            .and_then(|bytes| {
+                transitioned
+                    .checked_mul(std::mem::size_of::<(u32, Option<Box<AggregateVnodeState>>)>())
+                    .and_then(|replacements| bytes.checked_add(replacements))
+            })
+            .and_then(|bytes| {
+                usize::from(self.key_group_count.get())
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .and_then(|active| bytes.checked_add(active))
+            })
+            .ok_or_else(|| {
+                DbError::Pipeline("aggregate vnode transition roster accounting overflow".into())
+            })
     }
 
     #[cfg(test)]
@@ -1155,6 +1263,12 @@ impl IncrementalAggState {
             let agg_field = agg_schema.field(i);
             group_types.push(agg_field.data_type().clone());
         }
+        for (index, data_type) in group_types.iter().enumerate() {
+            require_managed_checkpoint_scalar_type(
+                data_type,
+                format_args!("group key column {index}"),
+            )?;
+        }
 
         // single_source_table rejects self-joins where compilation is unsafe.
         let compile_source = crate::sql_analysis::single_source_table(sql);
@@ -1198,6 +1312,13 @@ impl IncrementalAggState {
         let compiled_exprs = builder.compiled_exprs;
         let proj_fields = builder.proj_fields;
 
+        for (index, spec) in agg_specs.iter().enumerate() {
+            require_managed_checkpoint_scalar_type(
+                &spec.return_type,
+                format_args!("emitted result {index} ('{}')", spec.output_name),
+            )?;
+        }
+
         let clauses = extract_clauses(sql);
 
         let source_has_weight = query_reads_weighted_changelog(ctx, sql).await?;
@@ -1210,6 +1331,26 @@ impl IncrementalAggState {
             .iter()
             .map(|spec| ConcreteAggregateState::try_new(spec, input_mode))
             .collect::<Result<Vec<_>, _>>()?;
+        for (aggregate_index, (spec, template)) in
+            agg_specs.iter().zip(&aggregate_templates).enumerate()
+        {
+            let checkpoint_state = template.checkpoint_state().map_err(|error| {
+                DbError::Unsupported(format!(
+                    "[{}] managed aggregate checkpoint state {aggregate_index} ('{}') cannot expose its initialization shape: {error}",
+                    laminar_core::error_codes::SQL_UNSUPPORTED,
+                    spec.output_name
+                ))
+            })?;
+            for (state_index, scalar) in checkpoint_state.iter().enumerate() {
+                require_managed_checkpoint_scalar_type(
+                    &scalar.data_type(),
+                    format_args!(
+                        "checkpoint state {aggregate_index}.{state_index} ('{}')",
+                        spec.output_name
+                    ),
+                )?;
+            }
+        }
 
         let weight_col_idx = if source_has_weight {
             let idx = next_col_idx;
@@ -2151,6 +2292,21 @@ impl IncrementalAggState {
         self.cached_pre_agg_physical.as_ref()
     }
 
+    /// Whether changing append-input batch boundaries preserves every concrete accumulator's
+    /// update and error semantics. Weighted input is prefix-sensitive, while SUM and AVG can
+    /// expose batch-local overflow or floating-point reduction boundaries.
+    pub(crate) fn certifies_local_input_coalescing(&self) -> bool {
+        self.weight_col_idx.is_none()
+            && self.aggregate_templates.iter().all(|state| {
+                matches!(
+                    state,
+                    ConcreteAggregateState::Count(_)
+                        | ConcreteAggregateState::Min(_)
+                        | ConcreteAggregateState::Max(_)
+                )
+            })
+    }
+
     pub(crate) fn query_fingerprint(&self) -> u64 {
         let config = [1, u8::from(self.weight_col_idx.is_some())];
         query_fingerprint_with_config(&self.query_sql, &self.output_schema, &config)
@@ -2190,8 +2346,13 @@ impl IncrementalAggState {
     fn decode_last_emitted(
         &self,
         entries: &[EmittedCheckpoint],
-    ) -> Result<FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>, DbError> {
-        let mut out = FxHashMap::with_capacity_and_hasher(entries.len(), FxBuildHasher);
+    ) -> Result<Vec<(arrow::row::OwnedRow, Vec<ScalarValue>)>, DbError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(entries.len()).map_err(|error| {
+            DbError::Pipeline(format!(
+                "aggregate checkpoint could not reserve changelog decode roster: {error}"
+            ))
+        })?;
         for ec in entries {
             let sv_key = ipc_to_scalars(&ec.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
@@ -2212,11 +2373,16 @@ impl IncrementalAggState {
                     )));
                 }
             }
-            if out.insert(row_key, vals).is_some() {
-                return Err(DbError::Pipeline(
-                    "aggregate checkpoint contains a duplicate changelog key".into(),
-                ));
-            }
+            out.push((row_key, vals));
+        }
+        out.sort_unstable_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        if out
+            .windows(2)
+            .any(|pair| pair[0].0.as_ref() == pair[1].0.as_ref())
+        {
+            return Err(DbError::Pipeline(
+                "aggregate checkpoint contains a duplicate changelog key".into(),
+            ));
         }
         Ok(out)
     }
@@ -2421,7 +2587,7 @@ impl IncrementalAggState {
         }
         validate_columnar_acc_shape(checkpoint, &self.agg_specs)?;
         let last_emitted = self.decode_last_emitted(&checkpoint.last_emitted)?;
-        let groups = decode_columnar_state_scalars(
+        let mut groups = decode_columnar_state_scalars(
             &self.row_converter,
             self.num_group_cols,
             &checkpoint.keys_ipc,
@@ -2429,7 +2595,7 @@ impl IncrementalAggState {
             &checkpoint.input_weights,
             &checkpoint.last_updated_ms,
         )?;
-        validate_unique_decoded_group_keys(&groups)?;
+        canonicalize_decoded_group_keys(&mut groups)?;
         Ok(DecodedAggMutation {
             groups,
             last_emitted,
@@ -2490,9 +2656,9 @@ impl IncrementalAggState {
         let restore_count = restores.len();
         let transitioned_capacity =
             checked_vnode_transition_capacity(restore_count, revoked.len())?;
-        let mut transitioned = rustc_hash::FxHashSet::default();
-        transitioned
-            .try_reserve(transitioned_capacity)
+        let mut transitioned_vnodes = Vec::new();
+        transitioned_vnodes
+            .try_reserve_exact(transitioned_capacity)
             .map_err(|error| reserve_error("vnode roster", error))?;
         for vnode in revoked {
             if *vnode >= vnode_count.get() {
@@ -2501,18 +2667,16 @@ impl IncrementalAggState {
                     vnode_count.get()
                 )));
             }
-            transitioned.insert(*vnode);
+            transitioned_vnodes.push(*vnode);
         }
+        transitioned_vnodes.sort_unstable();
 
-        let mut restored_vnodes = rustc_hash::FxHashSet::default();
-        restored_vnodes
-            .try_reserve(restore_count)
-            .map_err(|error| reserve_error("restored vnode roster", error))?;
-        let mut replacement_by_vnode = FxHashMap::default();
-        replacement_by_vnode
-            .try_reserve(restore_count)
+        let mut restored_replacements = Vec::new();
+        restored_replacements
+            .try_reserve_exact(restore_count)
             .map_err(|error| reserve_error("replacement vnode roster", error))?;
         let mut replacement_group_count = 0_usize;
+        let mut previous_restored_vnode = None;
         let current_fp = self.query_fingerprint();
         for restore in restores {
             let OwnedAggVnodeRestore { vnode, state } = restore?;
@@ -2523,12 +2687,15 @@ impl IncrementalAggState {
                     vnode_count.get()
                 )));
             }
-            if !restored_vnodes.insert(vnode) {
+            if previous_restored_vnode.is_some_and(|previous| previous >= vnode) {
                 return Err(DbError::Pipeline(format!(
-                    "aggregate vnode transition repeats restored vnode {vnode}"
+                    "aggregate vnode transition restore roster is not strictly increasing at vnode {vnode}"
                 )));
             }
-            transitioned.insert(vnode);
+            previous_restored_vnode = Some(vnode);
+            if let Err(position) = transitioned_vnodes.binary_search(&vnode) {
+                transitioned_vnodes.insert(position, vnode);
+            }
 
             let group_capacity = state.last_updated_ms.len().min(self.max_groups);
             let emitted_capacity = state.last_emitted.len().min(self.max_groups);
@@ -2556,8 +2723,8 @@ impl IncrementalAggState {
                 .any(|(key, _, _, _)| !belongs_to_vnode(key))
                 || decoded
                     .last_emitted
-                    .keys()
-                    .any(|key| !belongs_to_vnode(key))
+                    .iter()
+                    .any(|(key, _)| !belongs_to_vnode(key))
             {
                 return Err(DbError::Pipeline(format!(
                     "authoritative vnode {vnode} checkpoint contains a key for another vnode"
@@ -2591,25 +2758,22 @@ impl IncrementalAggState {
             .map_err(|(component, error)| reserve_error(component, error))?;
             // Ownership lives in the graph, not in this sparse working set. An authoritative EMPTY
             // image therefore clears any old slot without adding an inert active-roster entry.
-            if !replacement.groups.is_empty()
-                && replacement_by_vnode
-                    .insert(vnode, Box::new(replacement))
-                    .is_some()
-            {
-                return Err(DbError::Pipeline(format!(
-                    "aggregate vnode transition repeats restored vnode {vnode}"
-                )));
+            if !replacement.groups.is_empty() {
+                restored_replacements.push((vnode, Box::new(replacement)));
             }
         }
 
-        let transitioned_group_count = transitioned.iter().try_fold(0_usize, |total, vnode| {
-            checked_vnode_transition_capacity(
-                total,
-                self.vnode_states
-                    .get(*vnode)
-                    .map_or(0, |state| state.groups.len()),
-            )
-        })?;
+        let transitioned_group_count =
+            transitioned_vnodes
+                .iter()
+                .try_fold(0_usize, |total, vnode| {
+                    checked_vnode_transition_capacity(
+                        total,
+                        self.vnode_states
+                            .get(*vnode)
+                            .map_or(0, |state| state.groups.len()),
+                    )
+                })?;
         let retained_group_count = checked_vnode_transition_final_count(
             self.vnode_states.resident_group_count(),
             transitioned_group_count,
@@ -2625,16 +2789,28 @@ impl IncrementalAggState {
             )));
         }
 
-        let mut transitioned_vnodes = transitioned.into_iter().collect::<Vec<_>>();
-        transitioned_vnodes.sort_unstable();
         let mut replacements = Vec::new();
         replacements
             .try_reserve_exact(transitioned_vnodes.len())
             .map_err(|error| reserve_error("replacement slot roster", error))?;
+        let mut restored_replacements = restored_replacements.into_iter().peekable();
         for &vnode in &transitioned_vnodes {
-            replacements.push((vnode, replacement_by_vnode.remove(&vnode)));
+            let replacement = if restored_replacements
+                .peek()
+                .is_some_and(|(restored, _)| *restored == vnode)
+            {
+                Some(
+                    restored_replacements
+                        .next()
+                        .expect("peeked aggregate vnode replacement")
+                        .1,
+                )
+            } else {
+                None
+            };
+            replacements.push((vnode, replacement));
         }
-        debug_assert!(replacement_by_vnode.is_empty());
+        debug_assert!(restored_replacements.next().is_none());
         let mut final_active_vnodes = Vec::new();
         let slot_count = usize::from(self.key_group_count.get());
         // Reserve the immutable topology bound during preparation so publication can swap the

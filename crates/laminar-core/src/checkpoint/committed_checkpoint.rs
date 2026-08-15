@@ -8,13 +8,15 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    classify_channel_progress, ChannelProgress, CheckpointAssignmentFence, CheckpointManifest,
-    ConnectorCheckpoint, PipelineIdentity, SINGLETON_WATERMARK_CHANNEL,
+    channel_progress_frontiers_by_source, classify_channel_progress, ChannelProgress,
+    CheckpointAssignmentFence, CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
+    SINGLETON_WATERMARK_CHANNEL,
 };
 use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
 /// Current committed-checkpoint index format.
-pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 2;
+pub const COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 4;
+const LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION: u32 = 3;
 
 /// Hard bound on one canonical committed-checkpoint index.
 pub const MAX_COMMITTED_CHECKPOINT_INDEX_BYTES: usize = 8 * 1024 * 1024;
@@ -235,6 +237,8 @@ pub struct CommittedCheckpointIndex {
     pub vnode_count: u16,
     /// Exact cluster assignment; absent in local mode.
     pub assignment_fence: Option<CheckpointAssignmentFence>,
+    /// Whether every participant captured a cut portable across vnode reassignment.
+    pub reassignment_portable: bool,
     /// Direct prior committed index used for explicit, LIST-free retention traversal.
     pub predecessor: Option<CommittedCheckpointRef>,
     /// Canonically sorted exact participant objects.
@@ -245,6 +249,10 @@ pub struct CommittedCheckpointIndex {
     pub source_offsets: BTreeMap<String, ConnectorCheckpoint>,
     /// Complete merged per-channel event-time progress.
     pub channel_progress: Vec<ChannelProgress>,
+    /// Monotonic decision frontier retained for every source, including sources whose current
+    /// physical input-channel inventory is empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_watermarks: BTreeMap<String, i64>,
     /// Safe event-time frontier at this cut.
     pub checkpoint_watermark: Option<i64>,
 }
@@ -255,10 +263,13 @@ impl CommittedCheckpointIndex {
     /// # Errors
     /// Returns an error when the index is not a complete canonical checkpoint cut.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != COMMITTED_CHECKPOINT_INDEX_VERSION {
+        if !matches!(
+            self.version,
+            LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION | COMMITTED_CHECKPOINT_INDEX_VERSION
+        ) {
             return Err(format!(
-                "unsupported committed checkpoint index version {}; expected {COMMITTED_CHECKPOINT_INDEX_VERSION}",
-                self.version
+                "unsupported committed checkpoint index version {}; expected {} or {COMMITTED_CHECKPOINT_INDEX_VERSION}",
+                self.version, LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION
             ));
         }
         validate_attempt(self.epoch, self.checkpoint_id, "committed checkpoint index")?;
@@ -288,7 +299,13 @@ impl CommittedCheckpointIndex {
         match (self.scope, self.assignment_fence.as_ref()) {
             (CheckpointScope::Local, None)
                 if self.participants.len() == 1
-                    && self.participants[0].participant_id == LOCAL_NODE_ID.0 => {}
+                    && self.participants[0].participant_id == LOCAL_NODE_ID.0
+                    && !self.reassignment_portable => {}
+            (CheckpointScope::Local, None) if self.reassignment_portable => {
+                return Err(
+                    "local committed checkpoint cannot claim vnode reassignment portability".into(),
+                );
+            }
             (CheckpointScope::Local, None) => {
                 return Err("local committed checkpoint requires only LOCAL_NODE_ID".into());
             }
@@ -296,6 +313,12 @@ impl CommittedCheckpointIndex {
                 return Err("local committed checkpoint cannot carry an assignment fence".into());
             }
             (CheckpointScope::Cluster, Some(fence)) => {
+                if !self.reassignment_portable {
+                    return Err(
+                        "cluster committed checkpoint must be portable across vnode reassignment"
+                            .into(),
+                    );
+                }
                 if !fence.is_canonical() || fence.vnode_count != u32::from(self.vnode_count) {
                     return Err(
                         "cluster committed checkpoint has an invalid assignment fence".into(),
@@ -331,6 +354,31 @@ impl CommittedCheckpointIndex {
             &self.channel_progress,
             self.checkpoint_watermark,
         )?;
+        if self.version == LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION {
+            if !self.source_watermarks.is_empty() {
+                return Err("legacy committed checkpoint cannot carry source watermarks".into());
+            }
+        } else {
+            validate_source_watermarks(
+                &self.source_names,
+                &self.channel_progress,
+                &self.source_watermarks,
+            )?;
+            if self.predecessor.is_none() {
+                let exact = channel_progress_frontiers_by_source(&self.channel_progress)?
+                    .into_iter()
+                    .filter_map(|(source, frontier)| {
+                        frontier.map(|frontier| (source.to_owned(), frontier))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                if self.source_watermarks != exact {
+                    return Err(
+                        "initial committed source watermarks do not exactly match channel progress"
+                            .into(),
+                    );
+                }
+            }
+        }
         validate_channel_rosters(&self.source_offsets, &self.channel_progress)?;
         if self.channel_progress.iter().any(|channel| {
             self.participants
@@ -354,6 +402,11 @@ impl CommittedCheckpointIndex {
     ) -> Result<(), String> {
         self.validate()?;
         predecessor.validate()?;
+        if self.version < predecessor.version {
+            return Err(
+                "committed checkpoint index version regresses across its predecessor".into(),
+            );
+        }
         let expected = self
             .predecessor
             .as_ref()
@@ -364,10 +417,59 @@ impl CommittedCheckpointIndex {
             || predecessor.pipeline_identity != self.pipeline_identity
             || predecessor.scope != self.scope
             || predecessor.vnode_count != self.vnode_count
+            || predecessor.source_names != self.source_names
         {
             return Err("committed checkpoint predecessor breaks recovery continuity".into());
         }
+        if self.version == COMMITTED_CHECKPOINT_INDEX_VERSION {
+            let mut expected = predecessor
+                .effective_source_watermarks()?
+                .into_iter()
+                .filter(|(source, _)| self.source_names.binary_search(source).is_ok())
+                .collect::<BTreeMap<_, _>>();
+            for (source, frontier) in channel_progress_frontiers_by_source(&self.channel_progress)?
+            {
+                let Some(frontier) = frontier else {
+                    continue;
+                };
+                if expected
+                    .get(source)
+                    .is_some_and(|predecessor| *predecessor > frontier)
+                {
+                    return Err(format!(
+                        "committed source watermark for '{source}' regresses across its predecessor"
+                    ));
+                }
+                expected.insert(source.to_owned(), frontier);
+            }
+            if self.source_watermarks != expected {
+                return Err(
+                    "committed source watermarks do not exactly continue their predecessor".into(),
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Return the source-keyed decision cuts represented by this index.
+    ///
+    /// Version 3 encoded only physical channel progress, so its effective map is derived. Version
+    /// 4 carries the cumulative map explicitly so an empty current inventory retains its cut.
+    ///
+    /// # Errors
+    /// Returns an error when channel progress contains an invalid watermark sentinel.
+    pub fn effective_source_watermarks(&self) -> Result<BTreeMap<String, i64>, String> {
+        if self.version == LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION {
+            return channel_progress_frontiers_by_source(&self.channel_progress).map(|frontiers| {
+                frontiers
+                    .into_iter()
+                    .filter_map(|(source, frontier)| {
+                        frontier.map(|frontier| (source.to_owned(), frontier))
+                    })
+                    .collect()
+            });
+        }
+        Ok(self.source_watermarks.clone())
     }
 
     /// Verify exact participant manifest bytes and complete, exclusive vnode ownership.
@@ -402,6 +504,7 @@ impl CommittedCheckpointIndex {
                 || manifest.pipeline_identity != self.pipeline_identity
                 || manifest.vnode_count != self.vnode_count
                 || manifest.assignment_fence != self.assignment_fence
+                || manifest.reassignment_portable != self.reassignment_portable
             {
                 return Err(format!(
                     "participant {} manifest belongs to a different checkpoint cut",
@@ -576,10 +679,10 @@ fn validate_channel_progress(
     let mut physical_channels = BTreeSet::new();
     for channel in channels {
         if channel.input_channel == SINGLETON_WATERMARK_CHANNEL {
-            logical_sources.insert(channel.source_name.as_str());
+            logical_sources.insert((channel.participant_id, channel.source_name.as_str()));
             continue;
         }
-        physical_sources.insert(channel.source_name.as_str());
+        physical_sources.insert((channel.participant_id, channel.source_name.as_str()));
         if !physical_channels.insert((&channel.source_name, &channel.input_channel)) {
             return Err(format!(
                 "source '{}' input channel is owned by multiple participants",
@@ -587,9 +690,9 @@ fn validate_channel_progress(
             ));
         }
     }
-    if let Some(source) = logical_sources.intersection(&physical_sources).next() {
+    if let Some((participant_id, source)) = logical_sources.intersection(&physical_sources).next() {
         return Err(format!(
-            "channel progress source '{source}' mixes logical and physical input channels"
+            "channel progress participant {participant_id} source '{source}' mixes logical and physical input channels"
         ));
     }
     let classification = classify_channel_progress(channels)?;
@@ -609,20 +712,52 @@ fn validate_channel_rosters(
         };
         let mut actual = channels
             .iter()
-            .filter(|channel| channel.source_name == *source)
+            .filter(|channel| {
+                channel.source_name == *source
+                    && channel.input_channel != SINGLETON_WATERMARK_CHANNEL
+            })
             .map(|channel| channel.input_channel.as_slice())
             .collect::<Vec<_>>();
-        if actual.is_empty()
-            || actual
-                .iter()
-                .all(|channel| *channel == SINGLETON_WATERMARK_CHANNEL)
-        {
+        if actual.is_empty() {
             continue;
         }
         actual.sort_unstable();
         if !actual.into_iter().eq(expected.iter().map(Vec::as_slice)) {
             return Err(format!(
                 "source '{source}' input channels do not match its channel progress roster"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_source_watermarks(
+    source_names: &[String],
+    channels: &[ChannelProgress],
+    source_watermarks: &BTreeMap<String, i64>,
+) -> Result<(), String> {
+    for (source, watermark) in source_watermarks {
+        validate_name("source watermark", source)?;
+        if source_names.binary_search(source).is_err() {
+            return Err(format!(
+                "source watermark '{source}' is absent from the committed source topology"
+            ));
+        }
+        if *watermark == i64::MIN {
+            return Err(format!(
+                "source watermark '{source}' uses the reserved uninitialized value"
+            ));
+        }
+    }
+    for (source, current) in
+        channel_progress_frontiers_by_source(channels).map_err(|error| error.to_string())?
+    {
+        let Some(current) = current else {
+            continue;
+        };
+        if source_watermarks.get(source) != Some(&current) {
+            return Err(format!(
+                "source watermark '{source}' does not match its exact channel progress"
             ));
         }
     }
@@ -742,6 +877,7 @@ mod tests {
             scope: CheckpointScope::Local,
             vnode_count: 4,
             assignment_fence: None,
+            reassignment_portable: false,
             predecessor: None,
             participants: vec![CommittedParticipantRef {
                 participant_id: LOCAL_NODE_ID.0,
@@ -765,6 +901,7 @@ mod tests {
                 watermark: Some(42),
                 idle: false,
             }],
+            source_watermarks: BTreeMap::from([("source".into(), 42)]),
             checkpoint_watermark: Some(42),
         }
     }
@@ -791,6 +928,7 @@ mod tests {
                 manifest.bind_participant(participant_id);
                 manifest.deployment_id = deployment_id.clone();
                 manifest.assignment_fence = Some(fence.clone());
+                manifest.reassignment_portable = true;
                 manifest.owned_vnodes = vec![u16::try_from(vnode).unwrap()];
                 manifest.source_names = vec!["source".into()];
                 manifest.sink_names = vec!["sink".into()];
@@ -807,11 +945,13 @@ mod tests {
             scope: CheckpointScope::Cluster,
             vnode_count: 2,
             assignment_fence: Some(fence),
+            reassignment_portable: true,
             predecessor: None,
             participants: Vec::new(),
             source_names: vec!["source".into()],
             source_offsets: BTreeMap::from([("source".into(), ConnectorCheckpoint::default())]),
             channel_progress: Vec::new(),
+            source_watermarks: BTreeMap::new(),
             checkpoint_watermark: None,
         };
         bind_manifests(&mut index, &manifests);
@@ -858,6 +998,53 @@ mod tests {
     }
 
     #[test]
+    fn exact_scope_requires_reassignment_portability() {
+        let mut local = local_index();
+        local.reassignment_portable = true;
+        assert!(local
+            .validate()
+            .unwrap_err()
+            .contains("local committed checkpoint cannot claim"));
+
+        let (mut cluster, _) = cluster_cut();
+        cluster.reassignment_portable = false;
+        assert!(cluster
+            .validate()
+            .unwrap_err()
+            .contains("cluster committed checkpoint must be portable"));
+    }
+
+    #[test]
+    fn version_three_index_remains_canonical_and_version_two_fails_closed() {
+        let mut index = local_index();
+        index.version = 2;
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .contains("unsupported committed checkpoint index version 2"));
+
+        let mut v3_shape = serde_json::to_value(local_index()).unwrap();
+        let object = v3_shape.as_object_mut().unwrap();
+        object.insert("version".into(), serde_json::Value::from(3));
+        object.remove("source_watermarks");
+        let v3_bytes = canonical_json_bytes(&v3_shape).unwrap();
+        let restored: CommittedCheckpointIndex = serde_json::from_slice(&v3_bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(
+            restored.effective_source_watermarks().unwrap()["source"],
+            42
+        );
+        assert_eq!(canonical_json_bytes(&restored).unwrap(), v3_bytes);
+
+        let mut impossible_v3 = restored;
+        impossible_v3.source_watermarks.insert("source".into(), 42);
+        assert!(impossible_v3
+            .validate()
+            .unwrap_err()
+            .contains("legacy committed checkpoint cannot carry"));
+    }
+
+    #[test]
     fn reference_binds_exact_canonical_bytes() {
         let index = local_index();
         let (bytes, reference) = index.encode_and_reference().unwrap();
@@ -867,8 +1054,87 @@ mod tests {
         let mut changed = index;
         changed.checkpoint_watermark = None;
         changed.channel_progress[0].watermark = None;
+        changed.source_watermarks.clear();
         let (_, changed_reference) = changed.encode_and_reference().unwrap();
         assert_ne!(reference.sha256, changed_reference.sha256);
+    }
+
+    #[test]
+    fn empty_source_inventory_retains_the_exact_predecessor_decision() {
+        let predecessor = local_index();
+        let (_, predecessor_ref) = predecessor.encode_and_reference().unwrap();
+        let mut successor = predecessor.clone();
+        successor.epoch = 8;
+        successor.checkpoint_id = 8;
+        successor.predecessor = Some(predecessor_ref);
+        successor.channel_progress.clear();
+        successor.checkpoint_watermark = None;
+
+        successor.validate().unwrap();
+        successor.validate_predecessor_index(&predecessor).unwrap();
+        assert_eq!(successor.source_watermarks["source"], 42);
+
+        successor.source_watermarks.insert("source".into(), 43);
+        assert!(successor
+            .validate_predecessor_index(&predecessor)
+            .unwrap_err()
+            .contains("do not exactly continue"));
+    }
+
+    #[test]
+    fn legacy_successor_cannot_erase_a_version_four_source_cut() {
+        let predecessor = local_index();
+        let (_, predecessor_ref) = predecessor.encode_and_reference().unwrap();
+        let mut successor = predecessor.clone();
+        successor.version = LEGACY_COMMITTED_CHECKPOINT_INDEX_VERSION;
+        successor.epoch = 8;
+        successor.checkpoint_id = 8;
+        successor.predecessor = Some(predecessor_ref);
+        successor.source_watermarks.clear();
+
+        successor.validate().unwrap();
+        assert!(successor
+            .validate_predecessor_index(&predecessor)
+            .unwrap_err()
+            .contains("version regresses"));
+    }
+
+    #[test]
+    fn predecessor_continuity_rejects_a_source_topology_change() {
+        let predecessor = local_index();
+        let (_, predecessor_ref) = predecessor.encode_and_reference().unwrap();
+        let mut successor = predecessor.clone();
+        successor.epoch = 8;
+        successor.checkpoint_id = 8;
+        successor.predecessor = Some(predecessor_ref);
+        successor.source_names = vec!["other-source".into()];
+        let offset = successor.source_offsets.remove("source").unwrap();
+        successor
+            .source_offsets
+            .insert("other-source".into(), offset);
+        successor.channel_progress[0].source_name = "other-source".into();
+        let watermark = successor.source_watermarks.remove("source").unwrap();
+        successor
+            .source_watermarks
+            .insert("other-source".into(), watermark);
+
+        successor.validate().unwrap();
+        assert!(successor
+            .validate_predecessor_index(&predecessor)
+            .unwrap_err()
+            .contains("breaks recovery continuity"));
+    }
+
+    #[test]
+    fn initial_index_cannot_invent_a_channel_less_source_decision() {
+        let mut index = local_index();
+        index.channel_progress.clear();
+        index.checkpoint_watermark = None;
+
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .contains("initial committed source watermarks"));
     }
 
     #[test]
@@ -877,6 +1143,7 @@ mod tests {
         index.channel_progress[0].watermark = None;
         assert!(index.validate().is_err());
         index.checkpoint_watermark = None;
+        index.source_watermarks.clear();
         assert!(index.validate().is_ok());
     }
 
@@ -903,6 +1170,74 @@ mod tests {
 
         let error = index.validate().unwrap_err();
         assert!(error.contains("owned by multiple participants"));
+    }
+
+    #[test]
+    fn empty_participant_marker_can_share_a_source_with_remote_physical_channels() {
+        let (mut index, mut manifests) = cluster_cut();
+        index
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![b"partition-0".to_vec()]);
+        index.channel_progress = vec![
+            ChannelProgress {
+                participant_id: 1,
+                source_name: "source".into(),
+                input_channel: b"partition-0".to_vec(),
+                watermark: Some(42),
+                idle: false,
+            },
+            ChannelProgress {
+                participant_id: 2,
+                source_name: "source".into(),
+                input_channel: SINGLETON_WATERMARK_CHANNEL.to_vec(),
+                watermark: Some(41),
+                idle: true,
+            },
+        ];
+        index.source_watermarks.insert("source".into(), 42);
+        index.checkpoint_watermark = Some(42);
+        manifests[0].source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-0".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        manifests[0].channel_progress = vec![index.channel_progress[0].clone()];
+        manifests[0].checkpoint_watermark = Some(42);
+        manifests[1].source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(Vec::new()),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        manifests[1].channel_progress = vec![index.channel_progress[1].clone()];
+        let encoded = bind_manifests(&mut index, &manifests);
+        index.validate().unwrap();
+        validate_manifests(&index, &manifests, &encoded).unwrap();
+
+        index.channel_progress = vec![
+            ChannelProgress {
+                participant_id: 1,
+                source_name: "source".into(),
+                input_channel: SINGLETON_WATERMARK_CHANNEL.to_vec(),
+                watermark: Some(41),
+                idle: true,
+            },
+            ChannelProgress {
+                participant_id: 1,
+                source_name: "source".into(),
+                input_channel: b"partition-0".to_vec(),
+                watermark: Some(42),
+                idle: false,
+            },
+        ];
+        let error = index.validate().unwrap_err();
+        assert!(error.contains("participant 1"), "{error}");
+        assert!(error.contains("mixes logical and physical"), "{error}");
     }
 
     #[test]
@@ -950,6 +1285,7 @@ mod tests {
                 idle: false,
             },
         ];
+        index.source_watermarks.insert("source".into(), 41);
         index.checkpoint_watermark = Some(41);
         assert!(index.validate().is_ok());
         index.source_offsets.clear();
@@ -969,6 +1305,16 @@ mod tests {
 
         let error = validate_manifests(&index, &manifests, &encoded).unwrap_err();
         assert!(error.contains("vnode owners do not match the assignment fence"));
+    }
+
+    #[test]
+    fn every_cluster_manifest_must_bind_the_portability_proof() {
+        let (mut index, mut manifests) = cluster_cut();
+        manifests[1].reassignment_portable = false;
+        let encoded = bind_manifests(&mut index, &manifests);
+
+        let error = validate_manifests(&index, &manifests, &encoded).unwrap_err();
+        assert!(error.contains("must be proven portable across vnode reassignment"));
     }
 
     #[test]

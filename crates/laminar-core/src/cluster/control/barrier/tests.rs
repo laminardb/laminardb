@@ -134,16 +134,18 @@ fn prepare_retry_classification_keeps_fence_failures_semantic() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn eager_prepare_retry_budget_tracks_the_configured_quorum_window() {
-    let default = prepare_fanout_budget(Duration::from_secs(3)).unwrap();
+fn eager_prepare_retry_budget_keeps_exact_attempt_deadline_and_short_rpc_cadence() {
+    let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let default = prepare_fanout_budget(attempt_deadline, Duration::from_secs(3)).unwrap();
     assert_eq!(default.per_attempt, Duration::from_millis(1_500));
-    assert_eq!(default.total, PREPARE_RPC_TIMEOUT);
+    assert_eq!(default.deadline, attempt_deadline);
 
-    let extended = prepare_fanout_budget(Duration::from_secs(40)).unwrap();
+    let extended = prepare_fanout_budget(attempt_deadline, Duration::from_secs(40)).unwrap();
     assert_eq!(extended.per_attempt, Duration::from_secs(20));
-    assert_eq!(extended.total, Duration::from_secs(40));
-    assert!(prepare_fanout_budget(Duration::ZERO).is_err());
-    assert!(prepare_fanout_budget(Duration::from_nanos(1)).is_err());
+    assert_eq!(extended.deadline, attempt_deadline);
+    assert!(prepare_fanout_budget(attempt_deadline, Duration::ZERO).is_err());
+    assert!(prepare_fanout_budget(attempt_deadline, Duration::from_nanos(1)).is_err());
+    assert!(prepare_fanout_budget(tokio::time::Instant::now(), Duration::from_secs(3)).is_err());
 }
 
 #[cfg(feature = "cluster")]
@@ -474,7 +476,7 @@ fn phase_ack_rejects_same_map_from_a_restarted_process() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn phase_ack_and_prepare_cache_bind_flags_and_failure_precedence() {
+fn phase_ack_and_capture_cache_bind_flags_and_failure_precedence() {
     assert!(ack_disposition_from_wire(0).is_err());
 
     let announcement = BarrierAnnouncement {
@@ -504,36 +506,92 @@ fn phase_ack_and_prepare_cache_bind_flags_and_failure_precedence() {
     let handoff = BarrierIdentity::from_announcement(&announcement);
     assert_ne!(regular, handoff);
 
-    let prepared = BarrierAck {
+    let captured = BarrierAck {
         epoch: announcement.epoch,
         checkpoint_id: announcement.checkpoint_id,
         assignment_digest: None,
         flags: announcement.flags,
-        disposition: BarrierAckDisposition::Prepared,
+        disposition: BarrierAckDisposition::Captured,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     };
     let replay = BarrierAck {
-        disposition: BarrierAckDisposition::PreparedWithReplay,
-        ..prepared.clone()
+        disposition: BarrierAckDisposition::CapturedWithReplay,
+        ..captured.clone()
     };
     let failed = BarrierAck {
         disposition: BarrierAckDisposition::Failed,
         error: Some("durable prepare failed".into()),
-        ..prepared.clone()
+        ..captured.clone()
+    };
+    let legacy_prepared_with_replay = BarrierAck {
+        disposition: BarrierAckDisposition::PreparedWithReplay,
+        ..captured.clone()
     };
     let mut cache = PrepareAckState::default();
-    assert_eq!(cache.record_ack(handoff, &prepared), prepared);
+    assert_eq!(cache.record_ack(handoff, &captured), captured);
+    assert_eq!(
+        cache.record_ack(handoff, &legacy_prepared_with_replay),
+        captured
+    );
     assert_eq!(cache.record_ack(handoff, &replay), replay);
-    assert_eq!(cache.record_ack(handoff, &prepared), replay);
+    assert_eq!(cache.record_ack(handoff, &captured), replay);
     assert_eq!(cache.record_ack(handoff, &failed), failed);
     assert_eq!(cache.record_ack(handoff, &replay), failed);
 
     let regular_ack = BarrierAck {
         flags: 0,
-        ..prepared
+        ..captured
     };
     assert_eq!(cache.record_ack(regular, &regular_ack), regular_ack);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn prepare_quorum_requires_an_explicit_captured_ack() {
+    use barrier_v1::CheckpointWatermarkStatus as WireStatus;
+
+    let fence = test_fence(17, &[1, 2], &[(1, 11), (2, 22)]);
+    let mut prepare = BarrierAnnouncement {
+        epoch: 22,
+        checkpoint_id: 22,
+        assignment_fence: Some(fence.clone()),
+        leader_proof: None,
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    let mut ack = barrier_v1::Ack {
+        epoch: prepare.epoch,
+        disposition: ack_disposition_to_wire(BarrierAckDisposition::Captured),
+        error: None,
+        local_watermark_ms: Some(91),
+        checkpoint_id: prepare.checkpoint_id,
+        assignment_digest: fence.digest().to_vec(),
+        watermark_status: WireStatus::CheckpointWatermarkActive as i32,
+        flags: prepare.flags,
+    };
+
+    assert_eq!(
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap(),
+        (NodeId(2), CheckpointWatermark::Active(91), false)
+    );
+
+    ack.disposition = ack_disposition_to_wire(BarrierAckDisposition::Prepared);
+    let (_, failure) =
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap_err();
+    assert!(matches!(failure, PeerFailure::Nack(message) if message.contains("explicit Captured")));
+
+    ack.disposition = ack_disposition_to_wire(BarrierAckDisposition::CapturedWithReplay);
+    let (_, failure) =
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap_err();
+    assert!(matches!(failure, PeerFailure::Nack(message) if message.contains("HANDOFF")));
+
+    prepare.flags = crate::checkpoint::flags::HANDOFF;
+    ack.flags = prepare.flags;
+    assert_eq!(
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap(),
+        (NodeId(2), CheckpointWatermark::Active(91), true)
+    );
 }
 
 #[cfg(all(test, feature = "cluster"))]
@@ -1043,7 +1101,7 @@ mod grpc_tests {
             checkpoint_id,
             assignment_digest,
             flags: 0,
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Active(17),
         };
@@ -1517,7 +1575,7 @@ mod grpc_tests {
                     .as_ref()
                     .map(crate::checkpoint::CheckpointAssignmentFence::digest),
                 flags: prepare.flags,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -1803,7 +1861,7 @@ mod grpc_tests {
 
         let error = leader.announce(&aligned).await.unwrap_err();
 
-        assert!(error.contains("successful exact Prepare quorum"), "{error}");
+        assert!(error.contains("successful exact capture quorum"), "{error}");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), leader_watch.changed())
                 .await
@@ -2486,7 +2544,7 @@ mod grpc_tests {
                 checkpoint_id: prepare.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
                 flags: prepare.flags,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark: CheckpointWatermark::Active(91),
             })
@@ -2503,7 +2561,7 @@ mod grpc_tests {
     }
 
     #[tokio::test]
-    async fn eager_prepare_ack_before_quorum_wait_is_retained() {
+    async fn captured_ack_reaches_quorum_while_durable_tail_is_blocked() {
         let (leader, follower, proof) = started_barrier_pair().await;
         let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
         let prepare = BarrierAnnouncement {
@@ -2520,18 +2578,23 @@ mod grpc_tests {
             .await
             .unwrap();
         wait_for_direct_prepare(&follower, &prepare).await;
+        let (durable_release_tx, durable_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let durable_tail = tokio::spawn(async move {
+            let _ = durable_release_rx.await;
+        });
         follower
             .ack(&BarrierAck {
                 epoch: prepare.epoch,
                 checkpoint_id: prepare.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
                 flags: prepare.flags,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark: CheckpointWatermark::Active(92),
             })
             .await
             .unwrap();
+        assert!(!durable_tail.is_finished());
 
         let outcome = leader
             .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(1))
@@ -2544,6 +2607,9 @@ mod grpc_tests {
                 handoff_replay_pending: false,
             } if acks == vec![NodeId(2)]
         ));
+        assert!(!durable_tail.is_finished());
+        durable_release_tx.send(()).unwrap();
+        durable_tail.await.unwrap();
     }
 
     #[tokio::test]
@@ -2893,7 +2959,7 @@ mod grpc_tests {
                     checkpoint_id: 1,
                     assignment_digest: Some(follower_fence.digest()),
                     flags: 0,
-                    disposition: BarrierAckDisposition::Prepared,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Active(100),
                 })
@@ -3129,7 +3195,7 @@ mod grpc_tests {
                     checkpoint_id: announcement.checkpoint_id,
                     assignment_digest: Some(follower_fence.digest()),
                     flags: announcement.flags,
-                    disposition: BarrierAckDisposition::Prepared,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Active(101),
                 })
@@ -3213,7 +3279,7 @@ mod grpc_tests {
                     checkpoint_id: accepted.checkpoint_id,
                     assignment_digest: Some(accepted_fence.digest()),
                     flags: accepted.flags,
-                    disposition: BarrierAckDisposition::Prepared,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Uninitialized,
                 })
@@ -3728,7 +3794,7 @@ async fn coordinator_rejects_noncanonical_attempts_before_publication() {
             checkpoint_id,
             assignment_digest: None,
             flags: 0,
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         };
@@ -4120,7 +4186,7 @@ async fn quorum_reached_when_all_ack_success() {
         checkpoint_id: 7,
         assignment_digest,
         flags: 0,
-        disposition: BarrierAckDisposition::Prepared,
+        disposition: BarrierAckDisposition::Captured,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4170,7 +4236,7 @@ async fn uninitialized_participant_blocks_cluster_watermark_advancement() {
                 checkpoint_id: 7,
                 assignment_digest,
                 flags: 0,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -4215,7 +4281,7 @@ async fn idle_participant_is_excluded_from_cluster_watermark_minimum() {
                 checkpoint_id: 7,
                 assignment_digest,
                 flags: 0,
-                disposition: BarrierAckDisposition::Prepared,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -4256,7 +4322,7 @@ async fn quorum_timeout_dominates_prepared_with_replay_when_follower_silent() {
             .as_ref()
             .map(crate::checkpoint::CheckpointAssignmentFence::digest),
         flags: crate::checkpoint::flags::HANDOFF,
-        disposition: BarrierAckDisposition::PreparedWithReplay,
+        disposition: BarrierAckDisposition::CapturedWithReplay,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4294,7 +4360,7 @@ async fn fatal_prepare_ack_dominates_prepared_with_replay() {
         checkpoint_id: 9,
         assignment_digest,
         flags,
-        disposition: BarrierAckDisposition::PreparedWithReplay,
+        disposition: BarrierAckDisposition::CapturedWithReplay,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     };
@@ -4327,7 +4393,7 @@ async fn fatal_prepare_ack_dominates_prepared_with_replay() {
         NodeId(3),
         ACK_KEY,
         serde_json::to_string(&BarrierAck {
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             ..replay
         })
         .unwrap(),
@@ -4356,7 +4422,7 @@ async fn wrong_epoch_ack_is_ignored() {
             .as_ref()
             .map(crate::checkpoint::CheckpointAssignmentFence::digest),
         flags: 0,
-        disposition: BarrierAckDisposition::Prepared,
+        disposition: BarrierAckDisposition::Captured,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4392,7 +4458,7 @@ async fn wrong_attempt_or_assignment_ack_is_ignored() {
             checkpoint_id: 9,
             assignment_digest: Some(expected_fence.digest()),
             flags: 0,
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         },
@@ -4401,7 +4467,7 @@ async fn wrong_attempt_or_assignment_ack_is_ignored() {
             checkpoint_id: 10,
             assignment_digest: Some(wrong_fence.digest()),
             flags: 0,
-            disposition: BarrierAckDisposition::Prepared,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         },

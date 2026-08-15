@@ -31,7 +31,7 @@ use super::catalog_manifest::{
 };
 use super::controller::{
     RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement, RecoveryFault,
-    RecoveryFaultInventory, RecoveryFaultPublisher, RecoveryReleaseId,
+    RecoveryFaultDisposition, RecoveryFaultInventory, RecoveryFaultPublisher, RecoveryReleaseId,
     MAX_RECOVERY_ANNOUNCEMENT_BYTES,
 };
 use super::lease_deadline::LeaseDeadline;
@@ -412,6 +412,11 @@ struct AuthorityRecoveryFaultSlot {
     publisher: RecoveryFaultPublisher,
     request_sequence: u64,
     fault_sequence: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "RecoveryFaultDisposition::is_recoverable"
+    )]
+    disposition: RecoveryFaultDisposition,
     active: bool,
 }
 
@@ -423,6 +428,11 @@ impl AuthorityRecoveryFaultSlot {
                 "recovery fault request and authority sequence must be nonzero".into(),
             ));
         }
+        if self.disposition == RecoveryFaultDisposition::Terminal && !self.active {
+            return Err(LeaseError::Invalid(
+                "terminal recovery fault authority cannot be tombstoned".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -430,11 +440,19 @@ impl AuthorityRecoveryFaultSlot {
         RecoveryFault {
             reporter: NodeId(self.publisher.participant.node_id),
             sequence: self.fault_sequence,
+            disposition: self.disposition,
         }
     }
 
-    fn matches_request(&self, publisher: RecoveryFaultPublisher, request_sequence: u64) -> bool {
-        self.publisher == publisher && self.request_sequence == request_sequence
+    fn matches_request(
+        &self,
+        publisher: RecoveryFaultPublisher,
+        request_sequence: u64,
+        disposition: RecoveryFaultDisposition,
+    ) -> bool {
+        self.publisher == publisher
+            && self.request_sequence == request_sequence
+            && self.disposition == disposition
     }
 }
 
@@ -519,6 +537,7 @@ pub(crate) enum RecordRecoveryFaultResult {
     Active,
     AlreadyCleared,
     CoveredByNewerRequest,
+    TerminalFenceActive,
     Superseded,
 }
 
@@ -802,6 +821,27 @@ impl AuthorityAssignmentDecision {
         match self {
             Self::Drain(decision) => decision.target_version(),
             Self::Recovery(decision) => decision.target_version(),
+        }
+    }
+
+    fn predecessor(&self) -> &CheckpointAssignmentFence {
+        match self {
+            Self::Drain(decision) => &decision.transition.predecessor,
+            Self::Recovery(decision) => &decision.predecessor,
+        }
+    }
+
+    fn materialized_target(&self) -> CheckpointAssignmentFence {
+        match self {
+            Self::Drain(decision) => match decision.verdict {
+                AssignmentDrainVerdict::Commit => decision.transition.target.clone(),
+                AssignmentDrainVerdict::Abort => {
+                    let mut target = decision.transition.predecessor.clone();
+                    target.assignment_version = decision.transition.target.assignment_version;
+                    target
+                }
+            },
+            Self::Recovery(decision) => decision.target.clone(),
         }
     }
 
@@ -1697,7 +1737,9 @@ impl LeaderAuthorityRecord {
                 if !self.lease.matches_proof(&commit.leader_proof)
                     || self.recovery_release_head.as_ref() != Some(&expected)
                     || self.recovery_fault_revision != self.lease.seq
-                    || self.recovery_fault_slots.iter().any(|slot| slot.active)
+                    || self.recovery_fault_slots.iter().any(|slot| {
+                        slot.active || slot.disposition == RecoveryFaultDisposition::Terminal
+                    })
                 {
                     return Err(LeaseError::Invalid(
                         "recovery release commit is not bound to its exact authority sequence, term, and settled fault inventory"
@@ -1986,10 +2028,25 @@ impl LeaderLeaseStore {
         Ok(Self::recovery_fault_inventory_from(&record))
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_recovery_fault(
         &self,
         publisher: RecoveryFaultPublisher,
         request_sequence: u64,
+    ) -> Result<RecordRecoveryFaultResult, ClusterCheckpointAuthorityError> {
+        self.record_recovery_fault_with_disposition(
+            publisher,
+            request_sequence,
+            RecoveryFaultDisposition::Recoverable,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_recovery_fault_with_disposition(
+        &self,
+        publisher: RecoveryFaultPublisher,
+        request_sequence: u64,
+        disposition: RecoveryFaultDisposition,
     ) -> Result<RecordRecoveryFaultResult, ClusterCheckpointAuthorityError> {
         publisher.validate().map_err(LeaseError::Invalid)?;
         if request_sequence == 0 {
@@ -2012,12 +2069,17 @@ impl LeaderLeaseStore {
             let (insert_at, replace) = match slot_index {
                 Ok(index) => {
                     let slot = &current.recovery_fault_slots[index];
-                    if slot.matches_request(publisher, request_sequence) {
+                    if slot.matches_request(publisher, request_sequence, disposition) {
                         return Ok(if slot.active {
                             RecordRecoveryFaultResult::Active
                         } else {
                             RecordRecoveryFaultResult::AlreadyCleared
                         });
+                    }
+                    // A terminal slot is an operator-owned cluster fence. Neither a later request
+                    // nor a replacement process may silently downgrade or tombstone it.
+                    if slot.disposition == RecoveryFaultDisposition::Terminal {
+                        return Ok(RecordRecoveryFaultResult::TerminalFenceActive);
                     }
                     if publisher.process_term < slot.publisher.process_term {
                         return Ok(RecordRecoveryFaultResult::Superseded);
@@ -2056,6 +2118,7 @@ impl LeaderLeaseStore {
                 // compacted. A delayed retry can therefore become a conservative fresh fault,
                 // but can never alias a sequence already remembered by a recovery monitor.
                 fault_sequence: sequence,
+                disposition,
                 active: true,
             };
             if replace {
@@ -2099,7 +2162,11 @@ impl LeaderLeaseStore {
         {
             return Ok(false);
         }
-        if current.recovery_fault_slots.iter().any(|slot| slot.active) {
+        if current
+            .recovery_fault_slots
+            .iter()
+            .any(|slot| slot.active || slot.disposition == RecoveryFaultDisposition::Terminal)
+        {
             return Ok(false);
         }
         let slot_index = current
@@ -2256,6 +2323,11 @@ impl LeaderLeaseStore {
             let fault_inventory = Self::recovery_fault_inventory_from(current);
             if fault_inventory.revision != terminal.round.fault_revision()
                 || fault_inventory.faults != terminal.round.faults
+                || fault_inventory
+                    .faults
+                    .iter()
+                    .copied()
+                    .any(RecoveryFault::is_terminal)
             {
                 return Ok(RecordRecoveryReleaseCommitResult::FaultsChanged);
             }
@@ -2925,57 +2997,92 @@ impl LeaderLeaseStore {
     async fn load_published_authority_head(
         &self,
     ) -> Result<Option<PublishedAuthorityHead>, LeaseError> {
-        for attempt in 0..MAX_LEASE_HEAD_READ_ATTEMPTS {
-            let Some(pointer) = read_authority_head_pointer(self.store.as_ref()).await? else {
+        let pointer = match read_authority_head_pointer(self.store.as_ref()).await? {
+            Some(pointer) => pointer,
+            None => {
                 let Some(discovered) = self.discover_authority_head().await? else {
-                    if read_authority_head_pointer(self.store.as_ref())
-                        .await?
-                        .is_none()
-                    {
+                    let Some(pointer) = read_authority_head_pointer(self.store.as_ref()).await?
+                    else {
                         return Ok(None);
-                    }
-                    if attempt + 1 < MAX_LEASE_HEAD_READ_ATTEMPTS {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    break;
+                    };
+                    return self.load_authority_head_target(pointer).await.map(Some);
                 };
-                self.publish_authority_head(discovered.lease.seq, None)
+                let discovered_sequence = discovered.lease.seq;
+                let published_sequence = self
+                    .publish_authority_head(discovered_sequence, None)
                     .await?;
-                if attempt + 1 < MAX_LEASE_HEAD_READ_ATTEMPTS {
-                    tokio::task::yield_now().await;
-                    continue;
+                let pointer = self
+                    .reload_authority_head_pointer(published_sequence)
+                    .await?;
+                if published_sequence > discovered_sequence
+                    || pointer.pointer.sequence > published_sequence
+                {
+                    return self.load_authority_head_target(pointer).await.map(Some);
                 }
-                break;
-            };
+                pointer
+            }
+        };
 
-            let sequence = pointer.pointer.sequence;
-            let successor_sequence = sequence.checked_add(1);
-            let (record, successor) = if let Some(successor_sequence) = successor_sequence {
-                tokio::try_join!(
-                    read_authority_record(self.store.as_ref(), sequence),
-                    read_authority_record(self.store.as_ref(), successor_sequence)
-                )?
-            } else {
-                (
-                    read_authority_record(self.store.as_ref(), sequence).await?,
-                    None,
-                )
-            };
-            let Some(record) = record else {
+        let sequence = pointer.pointer.sequence;
+        let successor_sequence = sequence.checked_add(1);
+        let (record, successor) = if let Some(successor_sequence) = successor_sequence {
+            tokio::try_join!(
+                read_authority_record(self.store.as_ref(), sequence),
+                read_authority_record(self.store.as_ref(), successor_sequence)
+            )?
+        } else {
+            (
+                read_authority_record(self.store.as_ref(), sequence).await?,
+                None,
+            )
+        };
+        let Some(record) = record else {
+            let rechecked = read_authority_head_pointer(self.store.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LeaseError::Invalid(
+                        "leader authority head disappeared while reading its target".into(),
+                    )
+                })?;
+            if rechecked.pointer.sequence > sequence {
+                return self
+                    .reload_published_authority_snapshot(rechecked.pointer.sequence)
+                    .await
+                    .map(Some);
+            }
+            if rechecked.pointer.sequence < sequence {
+                return Err(LeaseError::Invalid(format!(
+                    "leader authority head regressed from sequence {sequence} to {}",
+                    rechecked.pointer.sequence
+                )));
+            }
+            return Err(LeaseError::Invalid(format!(
+                "leader authority head points ahead to missing sequence {sequence}"
+            )));
+        };
+        let Some(successor_sequence) = successor_sequence else {
+            return Ok(Some(PublishedAuthorityHead { record, pointer }));
+        };
+        if successor.is_none() {
+            return Ok(Some(PublishedAuthorityHead { record, pointer }));
+        }
+
+        if let Some(after_successor) = successor_sequence.checked_add(1) {
+            if read_authority_record(self.store.as_ref(), after_successor)
+                .await?
+                .is_some()
+            {
                 let rechecked = read_authority_head_pointer(self.store.as_ref())
                     .await?
                     .ok_or_else(|| {
                         LeaseError::Invalid(
-                            "leader authority head disappeared while reading its target".into(),
+                            "leader authority head disappeared while checking pointer lag".into(),
                         )
                     })?;
-                if rechecked.pointer.sequence > sequence {
-                    if attempt + 1 < MAX_LEASE_HEAD_READ_ATTEMPTS {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    break;
+                if rechecked.pointer.sequence == sequence {
+                    return Err(LeaseError::Invalid(format!(
+                        "leader authority head at sequence {sequence} lags by more than one record"
+                    )));
                 }
                 if rechecked.pointer.sequence < sequence {
                     return Err(LeaseError::Invalid(format!(
@@ -2983,59 +3090,85 @@ impl LeaderLeaseStore {
                         rechecked.pointer.sequence
                     )));
                 }
+                return self
+                    .reload_published_authority_snapshot(rechecked.pointer.sequence)
+                    .await
+                    .map(Some);
+            }
+        }
+
+        let published_sequence = self
+            .publish_authority_head(successor_sequence, Some(&pointer))
+            .await?;
+        self.reload_published_authority_snapshot(published_sequence)
+            .await
+            .map(Some)
+    }
+
+    async fn reload_published_authority_snapshot(
+        &self,
+        minimum_sequence: u64,
+    ) -> Result<PublishedAuthorityHead, LeaseError> {
+        let pointer = self.reload_authority_head_pointer(minimum_sequence).await?;
+        self.load_authority_head_target(pointer).await
+    }
+
+    async fn reload_authority_head_pointer(
+        &self,
+        minimum_sequence: u64,
+    ) -> Result<VersionedAuthorityHeadPointer, LeaseError> {
+        let pointer = read_authority_head_pointer(self.store.as_ref())
+            .await?
+            .ok_or_else(|| {
+                LeaseError::Invalid(
+                    "leader authority head disappeared while reloading its published snapshot"
+                        .into(),
+                )
+            })?;
+        if pointer.pointer.sequence < minimum_sequence {
+            return Err(LeaseError::Invalid(format!(
+                "leader authority head regressed from sequence {minimum_sequence} to {}",
+                pointer.pointer.sequence
+            )));
+        }
+        Ok(pointer)
+    }
+
+    async fn load_authority_head_target(
+        &self,
+        mut pointer: VersionedAuthorityHeadPointer,
+    ) -> Result<PublishedAuthorityHead, LeaseError> {
+        for attempt in 0..MAX_LEASE_HEAD_READ_ATTEMPTS {
+            let sequence = pointer.pointer.sequence;
+            if let Some(record) = read_authority_record(self.store.as_ref(), sequence).await? {
+                return Ok(PublishedAuthorityHead { record, pointer });
+            }
+
+            let rechecked = read_authority_head_pointer(self.store.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    LeaseError::Invalid(
+                        "leader authority head disappeared while reading its target".into(),
+                    )
+                })?;
+            if rechecked.pointer.sequence < sequence {
+                return Err(LeaseError::Invalid(format!(
+                    "leader authority head regressed from sequence {sequence} to {}",
+                    rechecked.pointer.sequence
+                )));
+            }
+            if rechecked.pointer.sequence == sequence {
                 return Err(LeaseError::Invalid(format!(
                     "leader authority head points ahead to missing sequence {sequence}"
                 )));
-            };
-            let Some(successor_sequence) = successor_sequence else {
-                return Ok(Some(PublishedAuthorityHead { record, pointer }));
-            };
-            if successor.is_none() {
-                return Ok(Some(PublishedAuthorityHead { record, pointer }));
             }
-
-            if let Some(after_successor) = successor_sequence.checked_add(1) {
-                if read_authority_record(self.store.as_ref(), after_successor)
-                    .await?
-                    .is_some()
-                {
-                    let rechecked = read_authority_head_pointer(self.store.as_ref())
-                        .await?
-                        .ok_or_else(|| {
-                            LeaseError::Invalid(
-                                "leader authority head disappeared while checking pointer lag"
-                                    .into(),
-                            )
-                        })?;
-                    if rechecked.pointer.sequence == sequence {
-                        return Err(LeaseError::Invalid(format!(
-                            "leader authority head at sequence {sequence} lags by more than one record"
-                        )));
-                    }
-                    if rechecked.pointer.sequence < sequence {
-                        return Err(LeaseError::Invalid(format!(
-                            "leader authority head regressed from sequence {sequence} to {}",
-                            rechecked.pointer.sequence
-                        )));
-                    }
-                    if attempt + 1 < MAX_LEASE_HEAD_READ_ATTEMPTS {
-                        tokio::task::yield_now().await;
-                        continue;
-                    }
-                    break;
-                }
-            }
-
-            self.publish_authority_head(successor_sequence, Some(&pointer))
-                .await?;
+            pointer = rechecked;
             if attempt + 1 < MAX_LEASE_HEAD_READ_ATTEMPTS {
                 tokio::task::yield_now().await;
-                continue;
             }
-            break;
         }
         Err(LeaseError::Io(format!(
-            "leader authority head changed during {MAX_LEASE_HEAD_READ_ATTEMPTS} read attempts"
+            "leader authority head target changed during {MAX_LEASE_HEAD_READ_ATTEMPTS} read attempts"
         )))
     }
 
@@ -3126,16 +3259,6 @@ impl LeaderLeaseStore {
             }
         }
         if current.pointer.sequence >= sequence {
-            if current.pointer.sequence > sequence {
-                read_authority_record(self.store.as_ref(), current.pointer.sequence)
-                    .await?
-                    .ok_or_else(|| {
-                        LeaseError::Invalid(format!(
-                            "leader authority head points ahead to missing sequence {}",
-                            current.pointer.sequence
-                        ))
-                    })?;
-            }
             return Ok(current.pointer.sequence);
         }
         Err(LeaseError::Io(format!(
@@ -4194,6 +4317,47 @@ impl LeaderLeaseStore {
             .and_then(|head| head.active_checkpoint_artifacts))
     }
 
+    async fn reject_consumed_checkpoint_assignment(
+        &self,
+        current: &LeaderAuthorityRecord,
+        assignment_fence: &CheckpointAssignmentFence,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        let decisions = self.audited_assignment_decisions_from(current).await?;
+        if let Some(floor) = current.assignment_decision_floor.as_ref() {
+            // The floor is half-open: only target versions below it were compacted. Equality is
+            // not evidence that the fence was consumed (notably for a bootstrap assignment),
+            // while any decision at the boundary remains in `decisions` and is checked below.
+            if assignment_fence.assignment_version < floor.before_target_version {
+                return Err(DecisionError::Conflict(format!(
+                    "checkpoint assignment version {} is below durable assignment-decision floor {}",
+                    assignment_fence.assignment_version, floor.before_target_version
+                ))
+                .into());
+            }
+        }
+        let Some(newest) = decisions.last() else {
+            return Ok(());
+        };
+        if newest.target_version() > assignment_fence.assignment_version {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint assignment version {} was consumed by assignment decision version {}",
+                assignment_fence.assignment_version,
+                newest.target_version()
+            ))
+            .into());
+        }
+        if newest.target_version() == assignment_fence.assignment_version
+            && newest.materialized_target() != *assignment_fence
+        {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint assignment version {} does not match its materialized assignment decision",
+                assignment_fence.assignment_version
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     /// Admit one exact cluster checkpoint attempt before any participant writes artifacts.
     ///
     /// An identical retry returns the durable inventory. A later attempt cannot begin until the
@@ -4251,6 +4415,8 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
+            self.reject_consumed_checkpoint_assignment(current, assignment_fence)
+                .await?;
             if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
                 if active == &inventory
                     && current.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
@@ -4301,15 +4467,6 @@ impl LeaderLeaseStore {
                 AuthorityCreateOutcome::Contended(winner) => {
                     if !winner.lease.matches_proof(proof) {
                         return Err(ClusterCheckpointAuthorityError::Fenced);
-                    }
-                    if winner.active_checkpoint_artifacts.as_ref() == Some(&inventory)
-                        && winner.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
-                        && winner.outcome_head.is_none_or(|head| {
-                            head.epoch != inventory.attempt.epoch
-                                || head.checkpoint_id != inventory.attempt.checkpoint_id
-                        })
-                    {
-                        return Ok(inventory);
                     }
                     tokio::task::yield_now().await;
                 }
@@ -4953,6 +5110,29 @@ impl LeaderLeaseStore {
                         winner: winner.clone(),
                     })
                 };
+            }
+            if matches!(&decision, AuthorityAssignmentDecision::Drain(_)) {
+                let predecessor = decision.predecessor();
+                if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
+                    let active_fence = active.assignment_fence.as_ref().ok_or_else(|| {
+                        DecisionError::Conflict(
+                            "active checkpoint artifact inventory lost its assignment fence".into(),
+                        )
+                    })?;
+                    if active_fence.assignment_version == predecessor.assignment_version {
+                        let detail = if active_fence == predecessor {
+                            "matches"
+                        } else {
+                            "conflicts with"
+                        };
+                        return Err(DecisionError::Conflict(format!(
+                            "assignment drain decision cannot overtake checkpoint {} whose assignment fence {detail} predecessor version {}",
+                            active.attempt.checkpoint_id,
+                            predecessor.assignment_version
+                        ))
+                        .into());
+                    }
+                }
             }
             if let Some(last) = decisions.last() {
                 if decision.target_version() <= last.target_version() {
@@ -6471,7 +6651,7 @@ pub struct LeaderLeaseManager {
     owner: LeaderLeaseOwner,
     config: LeaderLeaseConfig,
     lease_tx: watch::Sender<Option<LeaderLease>>,
-    deadline: Arc<LeaseDeadline>,
+    deadline_tx: watch::Sender<Arc<LeaseDeadline>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -6483,6 +6663,28 @@ enum LeaseOperationEvent {
         result: Result<LeaseOutcome, LeaseError>,
         valid_until: tokio::time::Instant,
     },
+}
+
+#[cfg(feature = "cluster")]
+struct LeaderLeaseExitGuard {
+    shutdown: tokio_util::sync::CancellationToken,
+    unexpected_exit: tokio_util::sync::CancellationToken,
+    lease_tx: watch::Sender<Option<LeaderLease>>,
+    deadline_tx: watch::Sender<Arc<LeaseDeadline>>,
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for LeaderLeaseExitGuard {
+    fn drop(&mut self) {
+        self.deadline_tx.borrow().fence();
+        self.lease_tx.send_replace(None);
+        if !self.shutdown.is_cancelled() {
+            tracing::error!(
+                "leader lease manager exited without intentional shutdown; fencing process authority"
+            );
+            self.unexpected_exit.cancel();
+        }
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -6532,12 +6734,13 @@ impl LeaderLeaseManager {
             ));
         }
         let (lease_tx, _lease_rx) = watch::channel(None);
+        let (deadline_tx, _deadline_rx) = watch::channel(Arc::new(LeaseDeadline::uninitialized()));
         Ok(Self {
             store,
             owner,
             config,
             lease_tx,
-            deadline: Arc::new(LeaseDeadline::uninitialized()),
+            deadline_tx,
         })
     }
 
@@ -6553,22 +6756,83 @@ impl LeaderLeaseManager {
         self.lease_tx.subscribe()
     }
 
-    /// Shared local-monotonic liveness gate for leader hot paths.
+    /// Snapshot the current local-monotonic deadline generation.
+    ///
+    /// This is useful before the manager starts and in fixed-generation tests. A running manager
+    /// may replace it after any discontinuous grant; runtime consumers must subscribe through
+    /// [`Self::deadline_watch`].
     #[must_use]
     pub fn deadline(&self) -> Arc<LeaseDeadline> {
-        Arc::clone(&self.deadline)
+        self.deadline_tx.borrow().clone()
+    }
+
+    /// Subscribe to generation-scoped local leader deadlines.
+    ///
+    /// A discontinuous grant permanently fences the previous deadline and publishes a fresh
+    /// inactive one before another durable fencing term can become locally authoritative.
+    #[must_use]
+    pub fn deadline_watch(&self) -> watch::Receiver<Arc<LeaseDeadline>> {
+        self.deadline_tx.subscribe()
     }
 
     #[cfg(feature = "cluster")]
-    fn withdraw(&self) {
-        self.deadline.withdraw();
+    fn withdraw(&self) -> bool {
+        let deadline = self.deadline_tx.borrow().clone();
+        let had_grant = self.lease_tx.borrow().is_some() || deadline.is_live();
+        // Always rotate the generation. An acquisition may have crossed its deadline after the
+        // durable response but before local publication, leaving an expired, never-published
+        // deadline that `is_live()` cannot distinguish from a fresh inactive one.
+        deadline.fence();
         self.lease_tx.send_replace(None);
+        self.deadline_tx
+            .send_replace(Arc::new(LeaseDeadline::uninitialized()));
+        had_grant
     }
 
     #[cfg(feature = "cluster")]
     fn fence(&self) {
-        self.deadline.fence();
+        self.deadline_tx.borrow().fence();
         self.lease_tx.send_replace(None);
+    }
+
+    #[cfg(feature = "cluster")]
+    fn withdraw_for_new_term(
+        &self,
+        ticker: &mut tokio::time::Interval,
+        valid_until: &mut Option<tokio::time::Instant>,
+        observation: &mut Option<LeaderLeaseObservation>,
+        held_token: &mut Option<u64>,
+        rotate_not_before: &mut Option<tokio::time::Instant>,
+    ) {
+        // Permanently fence the process-local grant before forgetting its fencing token. A later
+        // acquisition runs through `begin_new_term` and a fresh deadline generation, so neither
+        // half of the expired proof can become live again.
+        let had_grant = self.withdraw();
+        *valid_until = None;
+        *observation = None;
+        *held_token = None;
+        let now = tokio::time::Instant::now();
+        if had_grant {
+            let retry_at = now
+                .checked_add(self.config.ttl)
+                .unwrap_or_else(tokio::time::Instant::now);
+            // An old-proof checkpoint tail is still allowed to win the authority CAS while no
+            // newer term exists. Preserve one full TTL for that bounded settlement before the
+            // same process rotates the durable token.
+            if rotate_not_before.is_none_or(|current| retry_at > current) {
+                *rotate_not_before = Some(retry_at);
+            }
+        }
+        if let Some(retry_at) = *rotate_not_before {
+            if retry_at > now {
+                ticker.reset_at(retry_at);
+            } else {
+                *rotate_not_before = None;
+                ticker.reset_immediately();
+            }
+        } else {
+            ticker.reset_immediately();
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -6647,22 +6911,29 @@ impl LeaderLeaseManager {
         // A newly constructed manager and every locally withdrawn grant need a new durable
         // fencing token. Only uninterrupted renewals may preserve the current token.
         let mut held_token = None;
+        let mut rotate_not_before = None;
         let mut candidacy_generation = candidate.borrow().generation;
 
         loop {
             let candidacy = *candidate.borrow_and_update();
             if candidacy.generation != candidacy_generation {
-                self.withdraw();
-                observation = None;
-                valid_until = None;
-                held_token = None;
+                self.withdraw_for_new_term(
+                    &mut ticker,
+                    &mut valid_until,
+                    &mut observation,
+                    &mut held_token,
+                    &mut rotate_not_before,
+                );
                 candidacy_generation = candidacy.generation;
             }
             if !candidacy.eligible {
-                self.withdraw();
-                observation = None;
-                valid_until = None;
-                held_token = None;
+                self.withdraw_for_new_term(
+                    &mut ticker,
+                    &mut valid_until,
+                    &mut observation,
+                    &mut held_token,
+                    &mut rotate_not_before,
+                );
                 if !self
                     .wait_for_candidacy_change(&shutdown, &mut candidate)
                     .await
@@ -6686,8 +6957,18 @@ impl LeaderLeaseManager {
                     continue;
                 }
                 () = wait_for_deadline(valid_until) => {
-                    self.fence();
-                    return;
+                    tracing::warn!(
+                        owner = ?self.owner,
+                        "leader lease local deadline expired; withdrawing and rotating the fencing token"
+                    );
+                    self.withdraw_for_new_term(
+                        &mut ticker,
+                        &mut valid_until,
+                        &mut observation,
+                        &mut held_token,
+                        &mut rotate_not_before,
+                    );
+                    continue;
                 }
                 _ = ticker.tick() => {}
             }
@@ -6701,9 +6982,23 @@ impl LeaderLeaseManager {
             ))
             .await
             {
-                LeaseOperationEvent::Shutdown | LeaseOperationEvent::Deadline => {
+                LeaseOperationEvent::Shutdown => {
                     self.fence();
                     return;
+                }
+                LeaseOperationEvent::Deadline => {
+                    tracing::warn!(
+                        owner = ?self.owner,
+                        "leader lease operation exceeded its local deadline; withdrawing and rotating the fencing token"
+                    );
+                    self.withdraw_for_new_term(
+                        &mut ticker,
+                        &mut valid_until,
+                        &mut observation,
+                        &mut held_token,
+                        &mut rotate_not_before,
+                    );
+                    continue;
                 }
                 LeaseOperationEvent::Candidacy(changed) => {
                     if changed.is_err() {
@@ -6720,8 +7015,18 @@ impl LeaderLeaseManager {
                     if response_at >= attempt_valid_until
                         || valid_until.is_some_and(|current| response_at >= current)
                     {
-                        self.fence();
-                        return;
+                        tracing::warn!(
+                            owner = ?self.owner,
+                            "leader lease response arrived after its local deadline; withdrawing and rotating the fencing token"
+                        );
+                        self.withdraw_for_new_term(
+                            &mut ticker,
+                            &mut valid_until,
+                            &mut observation,
+                            &mut held_token,
+                            &mut rotate_not_before,
+                        );
+                        continue;
                     }
                     (result, attempt_valid_until)
                 }
@@ -6733,13 +7038,39 @@ impl LeaderLeaseManager {
                     if publication_at >= attempt_valid_until
                         || valid_until.is_some_and(|current| publication_at >= current)
                     {
-                        self.fence();
-                        return;
+                        tracing::warn!(
+                            owner = ?self.owner,
+                            "leader lease publication crossed its local deadline; withdrawing and rotating the fencing token"
+                        );
+                        self.withdraw_for_new_term(
+                            &mut ticker,
+                            &mut valid_until,
+                            &mut observation,
+                            &mut held_token,
+                            &mut rotate_not_before,
+                        );
+                        continue;
                     }
                     observation = None;
                     valid_until = Some(attempt_valid_until);
                     held_token = Some(lease.token);
-                    self.deadline.extend_until(attempt_valid_until.into_std());
+                    rotate_not_before = None;
+                    let deadline = self.deadline_tx.borrow().clone();
+                    deadline.extend_until(attempt_valid_until.into_std());
+                    if !deadline.is_live() {
+                        tracing::warn!(
+                            owner = ?self.owner,
+                            "leader lease deadline expired during local publication; withdrawing and rotating the fencing token"
+                        );
+                        self.withdraw_for_new_term(
+                            &mut ticker,
+                            &mut valid_until,
+                            &mut observation,
+                            &mut held_token,
+                            &mut rotate_not_before,
+                        );
+                        continue;
+                    }
                     self.lease_tx.send_replace(Some(lease));
                 }
                 Ok(LeaseOutcome::Acquired(_)) => {
@@ -6776,8 +7107,9 @@ impl LeaderLeaseManager {
     }
 
     /// Spawn the renewal loop. Loss of candidacy withdraws the current local grant so this
-    /// manager can contend again later. Shutdown, a missed renewal, or an invalid lease outcome
-    /// terminally fences the manager.
+    /// manager can contend again later. A missed local deadline withdraws the grant and rotates
+    /// its fencing token before reacquisition. Shutdown or an invalid lease outcome terminally
+    /// fences the manager.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(
@@ -6786,6 +7118,30 @@ impl LeaderLeaseManager {
         candidate: watch::Receiver<LeaderCandidacy>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(self.run(shutdown, candidate))
+    }
+
+    /// Spawn the renewal loop and signal any exit not preceded by intentional shutdown.
+    ///
+    /// The guard lives inside the same task as the manager future, so panic and forced task abort
+    /// cannot detach a still-running inner lease writer.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn spawn_supervised(
+        self,
+        shutdown: tokio_util::sync::CancellationToken,
+        candidate: watch::Receiver<LeaderCandidacy>,
+        unexpected_exit: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let run_shutdown = shutdown.clone();
+            let _exit_guard = LeaderLeaseExitGuard {
+                shutdown,
+                unexpected_exit,
+                lease_tx: self.lease_tx.clone(),
+                deadline_tx: self.deadline_tx.clone(),
+            };
+            self.run(run_shutdown, candidate).await;
+        })
     }
 }
 

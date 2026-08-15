@@ -220,6 +220,13 @@ impl LeaderLeaseRuntime {
         self.shutdown.clone()
     }
 
+    async fn wait_for_exit(&self) {
+        let Some(task) = self.task.as_ref() else {
+            return;
+        };
+        wait_for_cluster_task_exit(task).await;
+    }
+
     async fn stop(&mut self) {
         self.cancel();
         let Some(mut task) = self.task.take() else {
@@ -262,10 +269,31 @@ fn revoke_process_authority(
     leader_lease_shutdown: &tokio_util::sync::CancellationToken,
     terminal: &tokio_util::sync::CancellationToken,
 ) {
+    leader_lease_shutdown.cancel();
     serving_gate.fence();
     db.revoke_cluster_authority();
-    leader_lease_shutdown.cancel();
     terminal.cancel();
+}
+
+fn fence_post_active_startup_failure(
+    db: &LaminarDB,
+    controller: &laminar_core::cluster::control::ClusterController,
+    serving_gate: &crate::http::ServingGate,
+    leader_lease_shutdown: &tokio_util::sync::CancellationToken,
+    process_lease: &ProcessLeaseRuntime,
+    rebalance_shutdown: Option<&tokio_util::sync::CancellationToken>,
+    api_handle: &tokio::task::JoinHandle<()>,
+) {
+    leader_lease_shutdown.cancel();
+    if let Some(shutdown) = rebalance_shutdown {
+        shutdown.cancel();
+    }
+    controller.set_active(false);
+    db.fence_cluster_startup();
+    serving_gate.fence();
+    db.revoke_cluster_authority();
+    process_lease.fence_authority();
+    api_handle.abort();
 }
 
 async fn cleanup_cluster_startup(
@@ -275,6 +303,7 @@ async fn cleanup_cluster_startup(
     terminal: &tokio_util::sync::CancellationToken,
     force_terminal: bool,
 ) {
+    leader_lease.cancel();
     let mut authority_lost = force_terminal || terminal.is_cancelled();
     let shutdown = db.shutdown();
     tokio::pin!(shutdown);
@@ -304,11 +333,21 @@ async fn cleanup_cluster_startup(
 
 impl ProcessLeaseRuntime {
     fn is_live(&self) -> bool {
-        self.deadline.is_live() && *self.live_rx.borrow() && !self.renewal_task.is_finished()
+        self.deadline.is_live()
+            && *self.live_rx.borrow()
+            && !self.terminal.is_cancelled()
+            && !self.renewal_task.is_finished()
     }
 
     fn terminal_token(&self) -> tokio_util::sync::CancellationToken {
         self.terminal.clone()
+    }
+
+    fn fence_authority(&self) {
+        self.deadline.fence();
+        self.shutdown.cancel();
+        self.renewal_task.abort();
+        self.terminal.cancel();
     }
 
     fn disarm_for_shutdown(&mut self) -> bool {
@@ -324,6 +363,8 @@ impl ProcessLeaseRuntime {
 
         self.shutdown.cancel();
         self.renewal_task.abort();
+        self.deadline.fence();
+        self.terminal.cancel();
         was_live
     }
 
@@ -440,14 +481,29 @@ pub struct ClusterHandle {
 enum ClusterShutdownTrigger {
     Signal,
     ProcessLeaseLost,
+    LeaderLeaseExited,
+    HttpApiExited,
+    RebalanceTaskExited,
 }
 
 async fn wait_for_cluster_shutdown_trigger(
     terminal: &tokio_util::sync::CancellationToken,
+    leader_lease: &LeaderLeaseRuntime,
+    api_handle: &tokio::task::JoinHandle<()>,
+    rebalance_tasks: &[tokio::task::JoinHandle<()>],
 ) -> Result<ClusterShutdownTrigger, ClusterStartupError> {
     tokio::select! {
         biased;
         () = terminal.cancelled() => Ok(ClusterShutdownTrigger::ProcessLeaseLost),
+        () = leader_lease.wait_for_exit() => {
+            Ok(ClusterShutdownTrigger::LeaderLeaseExited)
+        }
+        () = wait_for_cluster_task_exit(api_handle) => {
+            Ok(ClusterShutdownTrigger::HttpApiExited)
+        }
+        () = wait_for_rebalance_task_exit(rebalance_tasks), if !rebalance_tasks.is_empty() => {
+            Ok(ClusterShutdownTrigger::RebalanceTaskExited)
+        }
         signal = server::wait_for_termination_signal() => {
             signal.map_err(|e| {
                 ClusterStartupError::Discovery(format!("signal handler: {e}"))
@@ -505,6 +561,38 @@ async fn announce_node_state_with_bound(
         ),
     }
     terminal.is_cancelled()
+}
+
+async fn announce_node_state_after_fence_with_bound(
+    discovery: &DiscoveryImpl,
+    info: NodeInfo,
+    operation: &'static str,
+) -> bool {
+    match tokio::time::timeout(DISCOVERY_ANNOUNCEMENT_TIMEOUT, discovery.announce(info)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(%error, operation, "Discovery announcement failed after authority fencing");
+            false
+        }
+        Err(_) => {
+            warn!(
+                operation,
+                timeout = ?DISCOVERY_ANNOUNCEMENT_TIMEOUT,
+                "Discovery announcement timed out after authority fencing"
+            );
+            false
+        }
+    }
+}
+
+async fn announce_left_after_fence_with_bound(
+    discovery: &DiscoveryImpl,
+    active: &NodeInfo,
+    operation: &'static str,
+) -> bool {
+    let mut left = active.clone();
+    left.state = NodeState::Left;
+    announce_node_state_after_fence_with_bound(discovery, left, operation).await
 }
 
 async fn stop_discovery_with_bound(discovery: &mut DiscoveryImpl) -> bool {
@@ -579,6 +667,66 @@ async fn stop_rebalance_tasks(
     stopped_cleanly && tasks.is_empty()
 }
 
+async fn stop_bootstrap_rebalance_tasks(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    operation_timeout: std::time::Duration,
+) -> bool {
+    shutdown.cancel();
+    let graceful_timeout = operation_timeout
+        .checked_add(CLUSTER_TASK_SHUTDOWN_TIMEOUT)
+        .unwrap_or(operation_timeout);
+    let graceful_deadline = tokio::time::Instant::now() + graceful_timeout;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(graceful_deadline, &mut tasks[0]).await {
+            Ok(Ok(())) => {
+                tasks.swap_remove(0);
+            }
+            Ok(Err(error)) => {
+                warn!(%error, "Bootstrap rebalance task failed before quiescence");
+                tasks.swap_remove(0);
+                for task in tasks.iter() {
+                    task.abort();
+                }
+                while let Some(task) = tasks.pop() {
+                    let _ = log_rebalance_task_result(task.await);
+                }
+                return false;
+            }
+            Err(_) => {
+                warn!(
+                    remaining = tasks.len(),
+                    timeout = ?graceful_timeout,
+                    "Bootstrap rebalance tasks did not quiesce before pipeline initialization"
+                );
+                for task in tasks.iter() {
+                    task.abort();
+                }
+                while let Some(task) = tasks.pop() {
+                    let _ = log_rebalance_task_result(task.await);
+                }
+                return false;
+            }
+        }
+    }
+    true
+}
+
+async fn wait_for_rebalance_task_exit(tasks: &[tokio::task::JoinHandle<()>]) {
+    loop {
+        if tasks.iter().any(tokio::task::JoinHandle::is_finished) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_cluster_task_exit(task: &tokio::task::JoinHandle<()>) {
+    while !task.is_finished() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 async fn stop_cluster_advertisement_and_admission(
     discovery: &mut DiscoveryImpl,
     membership_handle: &mut tokio::task::JoinHandle<()>,
@@ -609,11 +757,39 @@ async fn stop_cluster_advertisement_and_admission(
 impl ClusterHandle {
     pub async fn wait_for_shutdown(mut self) -> Result<(), ClusterStartupError> {
         let terminal = self.process_lease.terminal_token();
-        let mut authority_lost = wait_for_cluster_shutdown_trigger(&terminal).await?
-            == ClusterShutdownTrigger::ProcessLeaseLost;
+        let shutdown_trigger = wait_for_cluster_shutdown_trigger(
+            &terminal,
+            &self.leader_lease,
+            &self.api_handle,
+            &self.rebalance_tasks,
+        )
+        .await?;
+        let runtime_failure = match shutdown_trigger {
+            ClusterShutdownTrigger::LeaderLeaseExited => {
+                Some("leader lease manager exited unexpectedly")
+            }
+            ClusterShutdownTrigger::HttpApiExited => Some("HTTP API server exited unexpectedly"),
+            ClusterShutdownTrigger::RebalanceTaskExited => {
+                Some("rebalance control task exited unexpectedly")
+            }
+            ClusterShutdownTrigger::Signal | ClusterShutdownTrigger::ProcessLeaseLost => None,
+        };
+        let mut authority_lost = shutdown_trigger != ClusterShutdownTrigger::Signal;
         self.serving_gate.fence();
 
-        if authority_lost {
+        if let Some(error) = runtime_failure {
+            self.rebalance_shutdown.cancel();
+            self.cluster_controller.set_active(false);
+            self.db.fence_cluster_startup();
+            self.db.revoke_cluster_authority();
+            self.leader_lease.cancel();
+            self.process_lease.fence_authority();
+            self.api_handle.abort();
+            warn!(
+                reason = error,
+                "Cluster runtime task stopped; fencing and shutting down node"
+            );
+        } else if authority_lost {
             warn!("Stable node identity lease lost; stopping cluster node");
         } else {
             info!("Received shutdown signal, shutting down cluster node...");
@@ -802,7 +978,15 @@ impl ClusterHandle {
             self.db.revoke_cluster_authority();
         }
 
-        if authority_lost {
+        if let Some(runtime_failure) = runtime_failure {
+            if let Err(error) = &shutdown_result {
+                warn!(%error, "Database shutdown after runtime task failure failed");
+            }
+            if !runtime_tasks_clean {
+                warn!("Cluster runtime cleanup was incomplete after a runtime task failure");
+            }
+            Err(ClusterStartupError::EngineShutdown(runtime_failure.into()))
+        } else if authority_lost {
             if let Err(error) = shutdown_result {
                 warn!(%error, "Database shutdown after authority loss failed");
             }
@@ -828,6 +1012,7 @@ impl ClusterHandle {
 
 impl Drop for ClusterHandle {
     fn drop(&mut self) {
+        self.leader_lease.cancel();
         let _ = self.process_lease.disarm_for_shutdown();
         self.serving_gate.fence();
         self.db.revoke_cluster_authority();
@@ -842,7 +1027,6 @@ impl Drop for ClusterHandle {
                 }));
             }
         }
-        self.leader_lease.cancel();
         for task in &self.rebalance_tasks {
             task.abort();
         }
@@ -1379,9 +1563,8 @@ pub async fn start_cluster(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
-    // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
-    // every node adopts it; otherwise the first peer CAS-creates it and losers
-    // re-load and adopt the winner.
+    // Build the vnode registry. Exact same-formation genesis peers may preinstall v1; every
+    // existing or racing different formation boots unassigned for the audited bootstrap path.
     let assignment = tokio::select! {
         biased;
         () = process_lease_terminal.cancelled() => None,
@@ -1686,10 +1869,10 @@ pub async fn start_cluster(
             )));
         }
     };
-    if let Err(error) = cluster_controller.set_leader_lease_watch(
+    if let Err(error) = cluster_controller.set_leader_lease_runtime_watches(
         manager.lease_watch(),
         manager.owner().clone(),
-        manager.deadline(),
+        manager.deadline_watch(),
     ) {
         let _ = db.shutdown().await;
         let _ = discovery.stop().await;
@@ -1697,7 +1880,7 @@ pub async fn start_cluster(
     }
     let token = tokio_util::sync::CancellationToken::new();
     let candidacy = cluster_controller.leader_candidacy_watch();
-    let task = manager.spawn(token.clone(), candidacy);
+    let task = manager.spawn_supervised(token.clone(), candidacy, process_lease_terminal.clone());
     info!(
         "Leader lease manager started (ttl={}s)",
         lease_cfg.ttl.as_secs()
@@ -1796,8 +1979,8 @@ pub async fn start_cluster(
         ));
     }
 
-    // Coordinated recovery is the only cluster fault path. Before start() so an early
-    // fault is observed.
+    // Fence startup and audit this process generation's checkpoint artifacts before assignment
+    // certification. The recovery monitor is installed only after the initial pipeline start.
     db.fence_cluster_startup();
     let recovery_generation = tokio::select! {
         biased;
@@ -1835,65 +2018,14 @@ pub async fn start_cluster(
             ));
         }
     }
-    if let Err(error) = db.enable_coordinated_recovery() {
-        cleanup_cluster_startup(
-            &mut discovery,
-            &db,
-            &mut leader_lease,
-            &process_lease_terminal,
-            false,
-        )
-        .await;
-        return Err(ClusterStartupError::EngineConstruction(format!(
-            "cluster recovery monitor initialization: {error}"
-        )));
-    }
-
-    let pipeline_start = tokio::select! {
-        biased;
-        () = process_lease_terminal.cancelled() => None,
-        result = db.start() => Some(result),
-    };
-    match pipeline_start {
-        Some(Ok(())) => {}
-        Some(Err(error)) => {
-            cleanup_cluster_startup(
-                &mut discovery,
-                &db,
-                &mut leader_lease,
-                &process_lease_terminal,
-                false,
-            )
-            .await;
-            return Err(ClusterStartupError::EngineConstruction(format!(
-                "pipeline start: {error}"
-            )));
-        }
-        None => {
-            cleanup_cluster_startup(
-                &mut discovery,
-                &db,
-                &mut leader_lease,
-                &process_lease_terminal,
-                true,
-            )
-            .await;
-            return Err(ClusterStartupError::AuthorityLost(
-                "stable node identity lease was lost while starting the pipeline".into(),
-            ));
-        }
-    }
-    info!("Pipeline started");
-
     let rebalance_config = laminar_db::rebalance::RebalanceConfig {
         placement_isolation_tier: cluster_cfg.discovery.placement_isolation_tier,
         ..laminar_db::rebalance::RebalanceConfig::default()
     };
 
-    // Existing clusters deliberately start replacement processes unassigned. The retained
-    // assignment names predecessor process incarnations and must not be installed in a new graph.
-    // Keep intake and the HTTP serving gate closed until the watcher/rebalancer, started after the
-    // process is announced Active, materializes and certifies an authority-sequenced successor.
+    // Existing clusters deliberately boot replacement processes unassigned. Certify and install
+    // the current-process assignment while the DB and HTTP serving gate are still closed, then
+    // perform normal checkpoint/source recovery against that exact fence before runtime launch.
 
     let catalog_verification = tokio::select! {
         biased;
@@ -2085,8 +2217,9 @@ pub async fn start_cluster(
         ));
     }
 
-    // The pipeline, shuffle receiver, and gated HTTP listener are live. Only now publish
-    // assignment eligibility so an occupied API port can never leave an Active ghost node.
+    // The shuffle receiver and gated HTTP listener are live. Only now publish assignment
+    // eligibility so an occupied API port can never leave an Active ghost node. The pipeline
+    // remains Created and source intake remains fenced until assignment certification and restore.
     let mut active = local_node.clone();
     active.state = NodeState::Active;
     let active_announcement = tokio::select! {
@@ -2099,6 +2232,12 @@ pub async fn start_cluster(
     };
     let Some(active_announcement) = active_announcement else {
         let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        revoke_process_authority(
+            &db,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease_terminal,
+        );
         cleanup_cluster_startup(
             &mut discovery,
             &db,
@@ -2118,25 +2257,30 @@ pub async fn start_cluster(
         )),
     };
     if let Err(error) = active_announcement {
+        // A timeout or transport error may follow a remotely committed Active announcement.
+        // Fence every local authority synchronously before any rollback I/O.
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            None,
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after readiness announcement failure",
+        )
+        .await;
         let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
-        startup_controller.set_active(false);
-        if !process_lease_terminal.is_cancelled() {
-            let mut left = local_node.clone();
-            left.state = NodeState::Left;
-            let _ = announce_node_state_with_bound(
-                &discovery,
-                left,
-                &process_lease_terminal,
-                "withdraw node after readiness announcement failure",
-            )
-            .await;
-        }
         cleanup_cluster_startup(
             &mut discovery,
             &db,
             &mut leader_lease,
             &process_lease_terminal,
-            false,
+            true,
         )
         .await;
         return Err(ClusterStartupError::EngineConstruction(format!(
@@ -2145,8 +2289,308 @@ pub async fn start_cluster(
     }
     startup_controller.set_active(true);
 
-    // Rebalance and assignment certification use the same durable snapshot in every discovery
-    // mode.
+    // Bootstrap assignment certification against the current process incarnation before building
+    // the checkpoint coordinator. These tasks are stopped and joined after certification so no
+    // watcher can advance the registry while startup snapshots its assignment.
+    let bootstrap_rebalance_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut bootstrap_rebalance_tasks = vec![
+        laminar_db::rebalance::spawn_snapshot_watcher(
+            Arc::clone(&db),
+            Arc::clone(&snapshot_store),
+            Arc::clone(&vnode_registry),
+            bootstrap_rebalance_shutdown.clone(),
+            rebalance_config,
+            Some(Arc::clone(startup_controller)),
+        ),
+        laminar_db::rebalance::spawn_rebalance_controller(
+            Arc::clone(&db),
+            Arc::clone(startup_controller),
+            Arc::clone(&snapshot_store),
+            Arc::clone(&vnode_registry),
+            bootstrap_rebalance_shutdown.clone(),
+            rebalance_config,
+        ),
+    ];
+    info!("Bootstrap assignment control plane started");
+
+    let assignment_gate = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => {
+            Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while certifying the startup assignment"
+                    .into(),
+            ))
+        }
+        () = wait_for_cluster_task_exit(&api_handle) => {
+            Err(ClusterStartupError::EngineConstruction(
+                "HTTP API server exited while certifying the startup assignment".into(),
+            ))
+        }
+        result = wait_for_startup_assignment_fence(
+            startup_controller,
+            &vnode_registry,
+            &bootstrap_rebalance_tasks,
+        ) => result,
+    };
+    if let Err(error) = assignment_gate {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            Some(&bootstrap_rebalance_shutdown),
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after startup assignment failure",
+        )
+        .await;
+        let _ = stop_bootstrap_rebalance_tasks(
+            &mut bootstrap_rebalance_tasks,
+            &bootstrap_rebalance_shutdown,
+            rebalance_config.checkpoint_timeout,
+        )
+        .await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(error);
+    }
+    let bootstrap_tasks_stop = stop_bootstrap_rebalance_tasks(
+        &mut bootstrap_rebalance_tasks,
+        &bootstrap_rebalance_shutdown,
+        rebalance_config.checkpoint_timeout,
+    );
+    tokio::pin!(bootstrap_tasks_stop);
+    let bootstrap_stop_result = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => {
+            fence_post_active_startup_failure(
+                &db,
+                startup_controller,
+                &serving_gate,
+                &leader_lease.shutdown,
+                &process_lease,
+                Some(&bootstrap_rebalance_shutdown),
+                &api_handle,
+            );
+            Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while stopping bootstrap assignment tasks"
+                    .into(),
+            ))
+        }
+        () = wait_for_cluster_task_exit(&api_handle) => {
+            fence_post_active_startup_failure(
+                &db,
+                startup_controller,
+                &serving_gate,
+                &leader_lease.shutdown,
+                &process_lease,
+                Some(&bootstrap_rebalance_shutdown),
+                &api_handle,
+            );
+            Err(ClusterStartupError::EngineConstruction(
+                "HTTP API server exited while stopping bootstrap assignment tasks".into(),
+            ))
+        }
+        stopped = &mut bootstrap_tasks_stop => Ok(stopped),
+    };
+    let bootstrap_tasks_stopped = match bootstrap_stop_result {
+        Ok(stopped) => stopped,
+        Err(error) => {
+            let _ = announce_left_after_fence_with_bound(
+                &discovery,
+                &active,
+                "withdraw node after bootstrap assignment task interruption",
+            )
+            .await;
+            let _ = bootstrap_tasks_stop.await;
+            let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                true,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if !bootstrap_tasks_stopped {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            Some(&bootstrap_rebalance_shutdown),
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after bootstrap assignment task shutdown failure",
+        )
+        .await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "bootstrap assignment tasks did not stop before pipeline initialization".into(),
+        ));
+    }
+    let stable_assignment = if !process_lease.is_live() {
+        Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost before pipeline initialization".into(),
+        ))
+    } else {
+        tokio::select! {
+            biased;
+            () = process_lease_terminal.cancelled() => {
+                Err(ClusterStartupError::AuthorityLost(
+                    "stable node identity lease was lost while auditing the startup assignment"
+                        .into(),
+                ))
+            }
+            () = wait_for_cluster_task_exit(&api_handle) => {
+                Err(ClusterStartupError::EngineConstruction(
+                    "HTTP API server exited while auditing the startup assignment".into(),
+                ))
+            }
+            result = audit_stable_startup_assignment(
+                startup_controller,
+                &snapshot_store,
+                &vnode_registry,
+                rebalance_config.checkpoint_timeout,
+            ) => result,
+        }
+    };
+    if let Err(error) = stable_assignment {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            None,
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after bootstrap assignment changed during shutdown",
+        )
+        .await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(error);
+    }
+    info!(
+        assignment_version = vnode_registry.assignment_version(),
+        "Bootstrap assignment certified; starting checkpoint recovery"
+    );
+
+    let pipeline_start = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => {
+            Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while starting the pipeline".into(),
+            ))
+        }
+        () = wait_for_cluster_task_exit(&api_handle) => {
+            Err(ClusterStartupError::EngineConstruction(
+                "HTTP API server exited while starting the pipeline".into(),
+            ))
+        }
+        result = db.start() => result.map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!("pipeline start: {error}"))
+        }),
+    };
+    if let Err(error) = pipeline_start {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            None,
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after pipeline startup failure",
+        )
+        .await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(error);
+    }
+    info!("Pipeline started from the certified assignment");
+
+    if let Err(error) = db.enable_coordinated_recovery() {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            None,
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after recovery monitor initialization failure",
+        )
+        .await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::EngineConstruction(format!(
+            "cluster recovery monitor initialization: {error}"
+        )));
+    }
+
+    // Runtime launch is complete. Start the fresh long-lived watcher/rebalancer immediately: a
+    // second process failure during startup recovery must still be able to authorize and follow a
+    // successor assignment. Recovery fencing keeps source/checkpoint work closed meanwhile.
     let rebalance_shutdown = tokio_util::sync::CancellationToken::new();
     let mut rebalance_tasks = vec![
         laminar_db::rebalance::spawn_snapshot_watcher(
@@ -2175,8 +2619,17 @@ pub async fn start_cluster(
                 "stable node identity lease was lost while certifying startup authority".into(),
             ))
         }
+        () = wait_for_rebalance_task_exit(&rebalance_tasks) => {
+            Err(ClusterStartupError::EngineConstruction(
+                "rebalance control task exited while certifying startup authority".into(),
+            ))
+        }
+        () = wait_for_cluster_task_exit(&api_handle) => {
+            Err(ClusterStartupError::EngineConstruction(
+                "HTTP API server exited while certifying startup authority".into(),
+            ))
+        }
         result = async {
-            wait_for_startup_assignment_fence(startup_controller, &vnode_registry).await?;
             wait_for_startup_leader_authority(
                 startup_controller,
                 &vnode_registry,
@@ -2201,27 +2654,29 @@ pub async fn start_cluster(
     let startup_disposition = match startup_gate {
         Ok(disposition) => disposition,
         Err(error) => {
-            let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
-            db.fence_cluster_startup();
-            startup_controller.set_active(false);
-            if !process_lease_terminal.is_cancelled() {
-                let mut left = active.clone();
-                left.state = NodeState::Left;
-                let _ = announce_node_state_with_bound(
-                    &discovery,
-                    left,
-                    &process_lease_terminal,
-                    "withdraw node after startup authority failure",
-                )
-                .await;
-            }
+            fence_post_active_startup_failure(
+                &db,
+                startup_controller,
+                &serving_gate,
+                &leader_lease.shutdown,
+                &process_lease,
+                Some(&rebalance_shutdown),
+                &api_handle,
+            );
+            let _ = announce_left_after_fence_with_bound(
+                &discovery,
+                &active,
+                "withdraw node after startup authority failure",
+            )
+            .await;
             let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+            let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
             cleanup_cluster_startup(
                 &mut discovery,
                 &db,
                 &mut leader_lease,
                 &process_lease_terminal,
-                false,
+                true,
             )
             .await;
             return Err(error);
@@ -2244,6 +2699,16 @@ pub async fn start_cluster(
                             .into(),
                     ))
                 }
+                () = wait_for_rebalance_task_exit(&rebalance_tasks) => {
+                    Err(ClusterStartupError::EngineConstruction(
+                        "rebalance control task exited during coordinated startup recovery".into(),
+                    ))
+                }
+                () = wait_for_cluster_task_exit(&api_handle) => {
+                    Err(ClusterStartupError::EngineConstruction(
+                        "HTTP API server exited during coordinated startup recovery".into(),
+                    ))
+                }
                 result = tokio::time::timeout(STARTUP_RECOVERY_TIMEOUT, async {
                     while db.cluster_intake_fenced() || startup_controller.is_recovering() {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2255,27 +2720,29 @@ pub async fn start_cluster(
                 }),
             };
             if let Err(error) = recovery_wait {
-                let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
-                db.fence_cluster_startup();
-                startup_controller.set_active(false);
-                if !process_lease_terminal.is_cancelled() {
-                    let mut left = active.clone();
-                    left.state = NodeState::Left;
-                    let _ = announce_node_state_with_bound(
-                        &discovery,
-                        left,
-                        &process_lease_terminal,
-                        "withdraw node after startup recovery failure",
-                    )
-                    .await;
-                }
+                fence_post_active_startup_failure(
+                    &db,
+                    startup_controller,
+                    &serving_gate,
+                    &leader_lease.shutdown,
+                    &process_lease,
+                    Some(&rebalance_shutdown),
+                    &api_handle,
+                );
+                let _ = announce_left_after_fence_with_bound(
+                    &discovery,
+                    &active,
+                    "withdraw node after startup recovery failure",
+                )
+                .await;
                 let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+                let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
                 cleanup_cluster_startup(
                     &mut discovery,
                     &db,
                     &mut leader_lease,
                     &process_lease_terminal,
-                    false,
+                    true,
                 )
                 .await;
                 return Err(error);
@@ -2285,22 +2752,29 @@ pub async fn start_cluster(
 
     // An idle worker serves control-plane readiness while its data plane remains fenced until the
     // watcher grants ownership.
-    if !app_state.open_startup_gate() || !process_lease.is_live() {
-        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
-        db.revoke_cluster_authority();
-        startup_controller.set_active(false);
-        if !process_lease_terminal.is_cancelled() {
-            let mut left = active.clone();
-            left.state = NodeState::Left;
-            let _ = announce_node_state_with_bound(
-                &discovery,
-                left,
-                &process_lease_terminal,
-                "withdraw node after serving gate failure",
-            )
-            .await;
-        }
+    let api_exited_before_serving = api_handle.is_finished();
+    let process_lease_lost_before_serving = !process_lease.is_live();
+    if api_exited_before_serving
+        || process_lease_lost_before_serving
+        || !app_state.open_startup_gate()
+    {
+        fence_post_active_startup_failure(
+            &db,
+            startup_controller,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease,
+            Some(&rebalance_shutdown),
+            &api_handle,
+        );
+        let _ = announce_left_after_fence_with_bound(
+            &discovery,
+            &active,
+            "withdraw node after serving gate failure",
+        )
+        .await;
         let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
         cleanup_cluster_startup(
             &mut discovery,
             &db,
@@ -2309,9 +2783,14 @@ pub async fn start_cluster(
             true,
         )
         .await;
-        return Err(ClusterStartupError::EngineConstruction(
-            "stable node identity lease was lost before HTTP serving authority opened".into(),
-        ));
+        let reason = if api_exited_before_serving {
+            "HTTP API server exited before serving authority opened"
+        } else if process_lease_lost_before_serving {
+            "stable node identity lease was lost before HTTP serving authority opened"
+        } else {
+            "HTTP serving gate could not be opened"
+        };
+        return Err(ClusterStartupError::EngineConstruction(reason.into()));
     }
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
     let membership_rx = discovery.membership_watch();
@@ -2353,9 +2832,88 @@ fn exact_startup_assignment_fence(
     registry: &laminar_core::state::VnodeRegistry,
 ) -> Option<laminar_core::checkpoint::CheckpointAssignmentFence> {
     let assignment = registry.versioned_snapshot();
+    if assignment.version() == 0 {
+        return None;
+    }
     let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
     let fence = controller.checkpoint_assignment_fence(assignment.version())?;
-    fence.matches_owner_map(&owners).then_some(fence)
+    if !fence.matches_owner_map(&owners) {
+        return None;
+    }
+    let local = controller.instance_id().0;
+    let owns = owners.contains(&local);
+    let local_incarnation = fence.participant_incarnation(local);
+    ((owns && local_incarnation == Some(controller.recovery_incarnation()))
+        || (!owns && local_incarnation.is_none()))
+    .then_some(fence)
+}
+
+async fn audit_stable_startup_assignment(
+    controller: &laminar_core::cluster::control::ClusterController,
+    store: &laminar_core::cluster::control::AssignmentSnapshotStore,
+    registry: &laminar_core::state::VnodeRegistry,
+    timeout: std::time::Duration,
+) -> Result<(), ClusterStartupError> {
+    let expected = exact_startup_assignment_fence(controller, registry).ok_or_else(|| {
+        ClusterStartupError::EngineConstruction(
+            "startup assignment is not certified for the current process".into(),
+        )
+    })?;
+    tokio::time::timeout(timeout, async {
+        let head = store
+            .load()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "durable assignment head is missing".to_string())?;
+        let committed =
+            laminar_db::rebalance::startup_committed_assignment(store, Some(controller), head)
+                .await?;
+        if committed.draining
+            || committed.version != expected.assignment_version
+            || committed
+                .assignment_fence()
+                .map_err(|error| error.to_string())?
+                != expected
+        {
+            return Err(format!(
+                "durable assignment {} does not match certified startup assignment {}",
+                committed.version, expected.assignment_version
+            ));
+        }
+        let confirmed = store
+            .load()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                "durable assignment head disappeared during startup audit".to_string()
+            })?;
+        if confirmed != committed {
+            return Err(format!(
+                "durable assignment changed from {} to {} during startup audit",
+                committed.version, confirmed.version
+            ));
+        }
+        if exact_startup_assignment_fence(controller, registry).as_ref() != Some(&expected)
+            || !controller.process_lease_is_live()
+        {
+            return Err(
+                "startup assignment certificate or process authority changed during durable audit"
+                    .into(),
+            );
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| {
+        ClusterStartupError::EngineConstruction(format!(
+            "durable startup assignment audit exceeded {timeout:?}"
+        ))
+    })?
+    .map_err(|error| {
+        ClusterStartupError::EngineConstruction(format!(
+            "durable startup assignment audit failed: {error}"
+        ))
+    })
 }
 
 fn startup_leader_audit_deadline(overall: tokio::time::Instant) -> tokio::time::Instant {
@@ -2475,19 +3033,22 @@ async fn wait_for_startup_leader_authority(
 async fn wait_for_startup_assignment_fence(
     controller: &laminar_core::cluster::control::ClusterController,
     registry: &laminar_core::state::VnodeRegistry,
+    rebalance_tasks: &[tokio::task::JoinHandle<()>],
 ) -> Result<(), ClusterStartupError> {
     let mut fence_rx = controller.checkpoint_assignment_watch();
     let mut members_rx = controller.members_watch();
     let wait = async {
         loop {
-            let assignment = registry.versioned_snapshot();
-            let version = assignment.version();
-            let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
-            if controller
-                .checkpoint_assignment_fence(version)
-                .is_some_and(|fence| fence.matches_owner_map(&owners))
-            {
+            if exact_startup_assignment_fence(controller, registry).is_some() {
                 return Ok(());
+            }
+            if rebalance_tasks
+                .iter()
+                .any(tokio::task::JoinHandle::is_finished)
+            {
+                return Err(ClusterStartupError::EngineConstruction(
+                    "bootstrap assignment task exited before certification".into(),
+                ));
             }
             tokio::select! {
                 result = fence_rx.changed() => result.map_err(|_| {
@@ -2500,6 +3061,7 @@ async fn wait_for_startup_assignment_fence(
                         "cluster membership channel closed during assignment certification".into(),
                     )
                 })?,
+                () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {},
             }
         }
     };
@@ -2622,9 +3184,31 @@ fn advertised_startup_participants(
         .collect())
 }
 
+fn is_same_formation_genesis(
+    stored: &laminar_core::cluster::control::AssignmentSnapshot,
+    proposed: &laminar_core::cluster::control::AssignmentSnapshot,
+) -> bool {
+    if stored.version != 1
+        || proposed.version != 1
+        || stored.draining
+        || proposed.draining
+        || stored.drain_transition.is_some()
+        || proposed.drain_transition.is_some()
+        || stored.vnodes != proposed.vnodes
+    {
+        return false;
+    }
+    matches!(
+        (stored.assignment_fence(), proposed.assignment_fence()),
+        (Ok(stored), Ok(proposed)) if stored == proposed
+    )
+}
+
 /// Resolve the boot-time vnode registry and shared assignment store.
-/// Existing clusters boot unassigned and adopt the audited committed head after `db.start()`.
-/// A new cluster CAS-creates its rendezvous assignment and CAS losers install the winner.
+/// Existing clusters boot unassigned and adopt the audited committed head during the pre-start
+/// bootstrap control-plane phase.
+/// A new cluster CAS-creates its rendezvous assignment; peers with that exact owner formation may
+/// also preinstall the winner when its v1 map and process-incarnation roster match their proposal.
 async fn resolve_vnode_assignment(
     self_id: laminar_core::cluster::discovery::NodeId,
     peers: &[laminar_core::cluster::discovery::NodeInfo],
@@ -2657,32 +3241,6 @@ async fn resolve_vnode_assignment(
 
     let snapshot_store = Arc::new(AssignmentSnapshotStore::new(control_store));
 
-    // Snapshot exists → restart or joiner. Boot owning nothing: the stored snapshot may be
-    // stale (a shed can race the restart), and acting on assumed ownership bypasses the adopt
-    // protocol. `start_cluster` explicitly adopts the stored snapshot after `db.start()`.
-    if let Some(existing) = snapshot_store
-        .load()
-        .await
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
-    {
-        if !process_deadline.is_live() {
-            return Err(ClusterStartupError::AuthorityLost(
-                "stable node identity lease expired while loading the assignment".into(),
-            ));
-        }
-        existing.to_vnode_vec(vnode_count).map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!("stored assignment: {error}"))
-        })?;
-        let registry = VnodeRegistry::new_unassigned(vnode_count);
-        info!(
-            stored_version = existing.version,
-            "found stored assignment snapshot; booting unassigned — adopt runs after start"
-        );
-        return Ok((Arc::new(registry), snapshot_store));
-    }
-
-    // Nothing stored yet — propose ours and CAS-create. A racing peer
-    // may win; if so, re-load and adopt the winner.
     let owner_ids: std::collections::BTreeSet<u64> =
         assignment.iter().map(|owner| owner.0).collect();
     let owner_participants: Vec<_> = startup_participants
@@ -2703,6 +3261,44 @@ async fn resolve_vnode_assignment(
         .map_err(|error| {
             ClusterStartupError::EngineConstruction(format!("initial assignment snapshot: {error}"))
         })?;
+
+    // Snapshot exists → restart or joiner. Boot owning nothing: the stored snapshot may be
+    // stale (a shed can race the restart), and acting on assumed ownership bypasses the adopt
+    // protocol. The sole exception is the exact v1 proposal another member of this owner
+    // formation already created. An owner restart changes the process-incarnation fence and
+    // remains unassigned; a new process outside the owner set can only preinstall a zero-owner
+    // view of the exact existing map.
+    if let Some(existing) = snapshot_store
+        .load()
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
+    {
+        if !process_deadline.is_live() {
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease expired while loading the assignment".into(),
+            ));
+        }
+        let existing_assignment = existing.to_vnode_vec(vnode_count).map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!("stored assignment: {error}"))
+        })?;
+        let registry = VnodeRegistry::new_unassigned(vnode_count);
+        if is_same_formation_genesis(&existing, &proposal) {
+            registry.set_assignment_and_version(existing_assignment.into(), existing.version);
+            info!(
+                stored_version = existing.version,
+                "preinstalled same-formation initial assignment"
+            );
+        } else {
+            info!(
+                stored_version = existing.version,
+                "found stored assignment snapshot; booting unassigned for audited pre-start adoption"
+            );
+        }
+        return Ok((Arc::new(registry), snapshot_store));
+    }
+
+    // Nothing stored yet — propose ours and CAS-create. A racing peer may win; preinstall that
+    // winner only when it is the exact same genesis formation, matching the existing-head path.
     if !process_deadline.is_live() {
         return Err(ClusterStartupError::AuthorityLost(
             "stable node identity lease expired before the initial assignment CAS".into(),
@@ -2729,7 +3325,7 @@ async fn resolve_vnode_assignment(
                         "snapshot CAS lost but re-load returned None".into(),
                     )
                 })?;
-            info!("Adopted snapshot v{} after CAS race", w.version);
+            info!("Observed snapshot v{} after CAS race", w.version);
             w
         }
     };
@@ -2742,7 +3338,18 @@ async fn resolve_vnode_assignment(
     let winning_assignment = winner.to_vnode_vec(vnode_count).map_err(|error| {
         ClusterStartupError::EngineConstruction(format!("winning assignment: {error}"))
     })?;
-    registry.set_assignment_and_version(winning_assignment.into(), winner.version);
+    if is_same_formation_genesis(&winner, &proposal) {
+        registry.set_assignment_and_version(winning_assignment.into(), winner.version);
+        info!(
+            stored_version = winner.version,
+            "preinstalled same-formation initial assignment after CAS race"
+        );
+    } else {
+        info!(
+            stored_version = winner.version,
+            "CAS race selected a different formation; booting unassigned for audited pre-start adoption"
+        );
+    }
     Ok((Arc::new(registry), snapshot_store))
 }
 

@@ -24,8 +24,9 @@ pub use controller::CheckpointPrepareObservation;
 pub use controller::{
     ClusterController, LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError,
     LocalProcessAuthorityIdentity, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,
-    RecoveryControlError, RecoveryFault, RecoveryFaultReportOutcome, RecoveryFaultRequest,
-    RecoveryRound, RecoveryRoundId, RecoveryStoppedReport, ReleaseCommitStatus,
+    RecoveryControlError, RecoveryFault, RecoveryFaultDisposition, RecoveryFaultReportOutcome,
+    RecoveryFaultRequest, RecoveryRound, RecoveryRoundId, RecoveryStoppedReport,
+    ReleaseCommitStatus,
 };
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe

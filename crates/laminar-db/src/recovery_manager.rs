@@ -1,4 +1,4 @@
-//! Exact-cut recovery from committed v8 checkpoint manifests.
+//! Exact-cut recovery from committed v9 checkpoint manifests.
 #![allow(clippy::disallowed_types)] // bounded recovery metadata
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,7 +41,7 @@ pub struct RecoveredState {
     pub manifests: Vec<CheckpointManifest>,
     /// Verified frame inventory selected for the active runtime assignment.
     pub state_frames: Vec<RecoveredStateFrame>,
-    /// Whether the active assignment is the committed assignment's direct successor.
+    /// Whether the active assignment is newer than the committed assignment that owns the cut.
     pub(crate) reassigned: bool,
     /// Committed owner of every vnode, in vnode order.
     #[cfg(any(feature = "cluster", test))]
@@ -365,11 +365,12 @@ impl<'a> RecoveryManager<'a> {
             });
         }
 
-        if predecessor.assignment_version.checked_add(1)
-            != Some(target.assignment.assignment_version)
+        if predecessor.assignment_version >= target.assignment.assignment_version
+            || predecessor.partitioning_abi_version != target.assignment.partitioning_abi_version
+            || !committed.reassignment_portable
         {
             return Err(checkpoint_error(format!(
-                "recovery target assignment {} is not the direct successor of committed assignment {}",
+                "recovery target assignment {} is not a portable compatible newer assignment than committed assignment {}",
                 target.assignment.assignment_version, predecessor.assignment_version
             )));
         }

@@ -48,9 +48,9 @@ use crate::temporal_join_state::{
 const ABSENT_VNODE: u8 = 0;
 const PRESENT_VNODE: u8 = 1;
 const OPERATOR_CHECKPOINT_VERSION: u8 = 2;
-#[cfg(feature = "cluster")]
 const OPERATOR_CAPTURE_ALLOCATION_CHARGE: usize = 32;
 const OPERATOR_CHECKPOINT_BASE_SCRATCH: usize = 512;
+const CHECKPOINT_ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 const PENDING_HOLD_ENTRY_CHARGE: usize = 64;
 const TEMPORAL_TMP_TABLE: &str = "__temporal_tmp";
 const MAX_PENDING_PROBES_PER_VNODE: usize = 1_000_000;
@@ -68,6 +68,226 @@ const RETAINED_BATCH_ARC_CHARGE: usize =
 const REMOTE_DRAIN_BYTE_BUDGET_PER_SIDE: usize = laminar_core::shuffle::ROUTE_MAX_BATCH_BYTES * 2;
 #[cfg(feature = "cluster")]
 const REMOTE_DRAIN_ROW_BUDGET_PER_SIDE: usize = laminar_core::shuffle::ROUTE_MAX_BATCH_ROWS * 2;
+#[cfg(feature = "cluster")]
+const WHOLE_RESTORE_IPC_EXPANSION_FACTOR: usize = 8;
+#[cfg(feature = "cluster")]
+const WHOLE_RESTORE_ROW_SCRATCH_CHARGE: usize = 2_048;
+
+fn checkpoint_allocation_bytes(payload: usize) -> Result<usize, DbError> {
+    payload
+        .checked_add(usize::from(payload != 0) * OPERATOR_CAPTURE_ALLOCATION_CHARGE)
+        .ok_or_else(|| {
+            DbError::Checkpoint("temporal whole-checkpoint allocation accounting overflow".into())
+        })
+}
+
+fn checkpoint_roster_bytes(count: usize, item_bytes: usize) -> Result<usize, DbError> {
+    count
+        .checked_mul(item_bytes)
+        .ok_or_else(|| {
+            DbError::Checkpoint("temporal whole-checkpoint roster accounting overflow".into())
+        })
+        .and_then(checkpoint_allocation_bytes)
+}
+
+fn checkpoint_alignment_copy_bytes(bytes: &[u8]) -> usize {
+    if bytes.as_ptr().align_offset(CHECKPOINT_ARCHIVE_ALIGNMENT) == 0 {
+        0
+    } else {
+        bytes.len()
+    }
+}
+
+fn checkpoint_alignment_copy_charge(bytes: &[u8]) -> Result<usize, DbError> {
+    checkpoint_allocation_bytes(checkpoint_alignment_copy_bytes(bytes))
+}
+
+fn vnode_checkpoint_alignment_copy_bytes(bytes: &[u8]) -> usize {
+    bytes.get(1..).map_or(0, checkpoint_alignment_copy_bytes)
+}
+
+fn vnode_checkpoint_alignment_copy_charge(bytes: &[u8]) -> Result<usize, DbError> {
+    checkpoint_allocation_bytes(vnode_checkpoint_alignment_copy_bytes(bytes))
+}
+
+fn with_aligned_checkpoint_bytes<T>(
+    bytes: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    let aligned;
+    let bytes = if checkpoint_alignment_copy_bytes(bytes) == 0 {
+        bytes
+    } else {
+        let mut copy = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        copy.extend_from_slice(bytes);
+        aligned = copy;
+        &aligned
+    };
+    decode(bytes)
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+struct TemporalIpcRestorePreflight {
+    rows: usize,
+    scratch_rows: usize,
+    body_bytes: usize,
+}
+
+#[cfg(feature = "cluster")]
+fn preflight_temporal_channel_ipc_restore(
+    bytes: &[u8],
+    expected_rows: impl IntoIterator<Item = u64>,
+    context: &str,
+) -> Result<TemporalIpcRestorePreflight, DbError> {
+    const CONTINUATION: u32 = u32::MAX;
+
+    let mut expected_rows = expected_rows.into_iter();
+    let Some(first_expected) = expected_rows.next() else {
+        if bytes.is_empty() {
+            return Ok(TemporalIpcRestorePreflight {
+                rows: 0,
+                scratch_rows: 0,
+                body_bytes: 0,
+            });
+        }
+        return Err(DbError::Checkpoint(format!(
+            "{context} IPC exists without queued data events"
+        )));
+    };
+    let mut next_expected = Some(first_expected);
+    let mut offset = 0usize;
+    let mut saw_schema = false;
+    let mut rows = 0usize;
+    let mut scratch_rows = 0usize;
+    let mut body_bytes = 0usize;
+    loop {
+        let prefix_end = offset
+            .checked_add(4)
+            .ok_or_else(|| DbError::Checkpoint(format!("{context} IPC framing overflow")))?;
+        let prefix = bytes
+            .get(offset..prefix_end)
+            .ok_or_else(|| DbError::Checkpoint(format!("{context} IPC frame is truncated")))?;
+        offset = prefix_end;
+        let mut metadata_len = u32::from_le_bytes(prefix.try_into().expect("four-byte prefix"));
+        if metadata_len == CONTINUATION {
+            let length_end = offset
+                .checked_add(4)
+                .ok_or_else(|| DbError::Checkpoint(format!("{context} IPC framing overflow")))?;
+            let length = bytes.get(offset..length_end).ok_or_else(|| {
+                DbError::Checkpoint(format!("{context} IPC continuation is truncated"))
+            })?;
+            offset = length_end;
+            metadata_len = u32::from_le_bytes(length.try_into().expect("four-byte length"));
+        }
+        if metadata_len == 0 {
+            if offset != bytes.len() || !saw_schema || next_expected.is_some() {
+                return Err(DbError::Checkpoint(format!(
+                    "{context} IPC stream is non-canonical"
+                )));
+            }
+            break;
+        }
+        let metadata_len = usize::try_from(metadata_len).map_err(|_| {
+            DbError::Checkpoint(format!("{context} IPC metadata length exceeds usize"))
+        })?;
+        let metadata_end = offset.checked_add(metadata_len).ok_or_else(|| {
+            DbError::Checkpoint(format!("{context} IPC metadata framing overflow"))
+        })?;
+        let metadata = bytes
+            .get(offset..metadata_end)
+            .ok_or_else(|| DbError::Checkpoint(format!("{context} IPC metadata is truncated")))?;
+        offset = metadata_end;
+        let message = arrow_ipc::root_as_message(metadata).map_err(|error| {
+            DbError::Checkpoint(format!("{context} IPC metadata is invalid: {error}"))
+        })?;
+        let body_len = usize::try_from(message.bodyLength()).map_err(|_| {
+            DbError::Checkpoint(format!(
+                "{context} IPC body length is negative or too large"
+            ))
+        })?;
+        let body_end = offset
+            .checked_add(body_len)
+            .ok_or_else(|| DbError::Checkpoint(format!("{context} IPC body framing overflow")))?;
+        if body_end > bytes.len() {
+            return Err(DbError::Checkpoint(format!(
+                "{context} IPC body is truncated"
+            )));
+        }
+        body_bytes = body_bytes.checked_add(body_len).ok_or_else(|| {
+            DbError::Checkpoint(format!("{context} IPC body accounting overflow"))
+        })?;
+        match message.header_type() {
+            arrow_ipc::MessageHeader::Schema if !saw_schema && rows == 0 => {
+                saw_schema = true;
+            }
+            arrow_ipc::MessageHeader::DictionaryBatch if saw_schema => {
+                let dictionary = message.header_as_dictionary_batch().ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC dictionary-batch header is missing"))
+                })?;
+                let data = dictionary.data().ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC dictionary-batch data is missing"))
+                })?;
+                let dictionary_rows = usize::try_from(data.length()).map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "{context} IPC dictionary-batch length is negative or too large"
+                    ))
+                })?;
+                scratch_rows = scratch_rows.checked_add(dictionary_rows).ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC dictionary row accounting overflow"))
+                })?;
+                if data.compression().is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "{context} IPC compression is unsupported"
+                    )));
+                }
+            }
+            arrow_ipc::MessageHeader::RecordBatch if saw_schema => {
+                let batch = message.header_as_record_batch().ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC record-batch header is missing"))
+                })?;
+                if batch.compression().is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "{context} IPC compression is unsupported"
+                    )));
+                }
+                let batch_rows = usize::try_from(batch.length()).map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "{context} IPC record-batch length is negative or too large"
+                    ))
+                })?;
+                let expected = next_expected.take().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "{context} IPC has more batches than queued data events"
+                    ))
+                })?;
+                if u64::try_from(batch_rows).ok() != Some(expected) {
+                    return Err(DbError::Checkpoint(format!(
+                        "{context} IPC row count does not match its queued data event"
+                    )));
+                }
+                rows = rows.checked_add(batch_rows).ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC row accounting overflow"))
+                })?;
+                scratch_rows = scratch_rows.checked_add(batch_rows).ok_or_else(|| {
+                    DbError::Checkpoint(format!("{context} IPC row accounting overflow"))
+                })?;
+                next_expected = expected_rows.next();
+            }
+            _ => {
+                return Err(DbError::Checkpoint(format!(
+                    "{context} IPC message order is non-canonical"
+                )));
+            }
+        }
+        offset = body_end;
+    }
+    Ok(TemporalIpcRestorePreflight {
+        rows,
+        scratch_rows,
+        body_bytes,
+    })
+}
 
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct TemporalCheckpointFrontier {
@@ -174,6 +394,11 @@ struct TemporalJoinOperatorCheckpointCapture {
     #[cfg(feature = "cluster")]
     cluster: Option<CapturedTemporalClusterCheckpoint>,
     retained_bytes: usize,
+}
+
+struct TemporalWholeRestorePreflight {
+    decoded_checkpoint: usize,
+    runtime_scratch: usize,
 }
 
 impl TemporalJoinOperatorCheckpointCapture {
@@ -1300,6 +1525,26 @@ impl ManagedTemporalJoinOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn decoded_cluster_runtime_bytes(
+        &self,
+        cluster: &DecodedTemporalCluster,
+    ) -> Result<usize, DbError> {
+        cluster
+            .peer_channels
+            .iter()
+            .map(BTreeMap::len)
+            .sum::<usize>()
+            .checked_mul(
+                std::mem::size_of::<(u64, TemporalPeerChannel)>()
+                    .checked_add(PENDING_HOLD_ENTRY_CHARGE)
+                    .ok_or_else(|| self.accounting_error())?,
+            )
+            .and_then(|bytes| bytes.checked_add(cluster.queued_event_capacity_bytes))
+            .and_then(|bytes| bytes.checked_add(cluster.queued_shuffle_bytes))
+            .ok_or_else(|| self.accounting_error())
+    }
+
+    #[cfg(feature = "cluster")]
     fn checkpoint_stream_reader<'a>(
         &self,
         side: TemporalInputSide,
@@ -1334,6 +1579,7 @@ impl ManagedTemporalJoinOperator {
         &self,
         checkpoint: TemporalClusterCheckpoint,
         saved_frontiers: [InputFrontier; 2],
+        restore_scratch_bytes: usize,
     ) -> Result<DecodedTemporalCluster, DbError> {
         let (config, assignment, peers) = self.active_cluster_scope()?;
         let expected_peers = Self::remote_owner_peers(&assignment, config.self_id);
@@ -1375,7 +1621,10 @@ impl ManagedTemporalJoinOperator {
         let mut queued_shuffle_bytes = 0usize;
         let mut queued_remote_events = 0usize;
         let mut queued_event_capacity_bytes = 0usize;
-        let restore_base = self.checked_accounted_state_bytes()?;
+        let restore_base = self
+            .checked_accounted_state_bytes()?
+            .checked_add(restore_scratch_bytes)
+            .ok_or_else(|| self.accounting_error())?;
         self.ensure_cluster_restore_budget(restore_base, 0, 0)?;
         for (port, archived_channels) in checkpoint.channels.into_iter().enumerate() {
             let side = if port == 0 {
@@ -1784,6 +2033,287 @@ impl ManagedTemporalJoinOperator {
                 idle: right_idle,
             },
         ]
+    }
+
+    fn preflight_whole_checkpoint_archive(
+        &self,
+        bytes: &[u8],
+        context: &str,
+        validate: impl FnOnce(&ArchivedTemporalJoinOperatorCheckpoint) -> Result<(), DbError>,
+    ) -> Result<TemporalWholeRestorePreflight, DbError> {
+        with_aligned_checkpoint_bytes(bytes, |bytes| {
+            let archived =
+                rkyv::access::<ArchivedTemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(bytes)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "temporal join [{}] {context} archive validation: {error}",
+                            self.name
+                        ))
+                    })?;
+            if archived.version != OPERATOR_CHECKPOINT_VERSION {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] {context} uses unsupported checkpoint version {}",
+                    self.name, archived.version
+                )));
+            }
+            validate(archived)?;
+
+            let mut decoded_bytes = std::mem::size_of::<TemporalJoinOperatorCheckpoint>();
+            let mut add = |charge: usize| -> Result<(), DbError> {
+                decoded_bytes = decoded_bytes.checked_add(charge).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "temporal join [{}] {context} decoded-checkpoint accounting overflow",
+                        self.name
+                    ))
+                })?;
+                Ok(())
+            };
+            let mut runtime_scratch = 0usize;
+            let mut add_runtime = |charge: usize| -> Result<(), DbError> {
+                runtime_scratch = runtime_scratch.checked_add(charge).ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "temporal join [{}] {context} runtime-scratch accounting overflow",
+                        self.name
+                    ))
+                })?;
+                Ok(())
+            };
+            if let Some(cluster) = archived.cluster.as_ref() {
+                for (port, channels) in cluster.channels.iter().enumerate() {
+                    add(checkpoint_roster_bytes(
+                        channels.len(),
+                        std::mem::size_of::<TemporalCheckpointChannel>(),
+                    )?)?;
+                    #[cfg(feature = "cluster")]
+                    add_runtime(
+                        channels
+                            .len()
+                            .checked_mul(
+                                std::mem::size_of::<(u64, TemporalPeerChannel)>()
+                                    .checked_add(PENDING_HOLD_ENTRY_CHARGE)
+                                    .ok_or_else(|| self.accounting_error())?,
+                            )
+                            .ok_or_else(|| self.accounting_error())?,
+                    )?;
+                    for channel in channels.iter() {
+                        add(checkpoint_roster_bytes(
+                            channel.events.len(),
+                            std::mem::size_of::<TemporalCheckpointEvent>(),
+                        )?)?;
+                        add(checkpoint_allocation_bytes(channel.positioned_ipc.len())?)?;
+                        add(checkpoint_allocation_bytes(channel.mutation_ipc.len())?)?;
+                        #[cfg(feature = "cluster")]
+                        add_runtime(checkpoint_allocation_bytes(
+                            channel
+                                .events
+                                .len()
+                                .checked_mul(REMOTE_EVENT_CHARGE)
+                                .ok_or_else(|| self.accounting_error())?,
+                        )?)?;
+                        #[cfg(feature = "cluster")]
+                        let positioned_preflight = preflight_temporal_channel_ipc_restore(
+                            channel.positioned_ipc.as_slice(),
+                            channel.events.iter().filter_map(|event| match event {
+                                ArchivedTemporalCheckpointEvent::Data {
+                                    row_count,
+                                    mutation_stream: false,
+                                    ..
+                                } => Some(row_count.to_native()),
+                                ArchivedTemporalCheckpointEvent::Data { .. }
+                                | ArchivedTemporalCheckpointEvent::Frontier { .. } => None,
+                            }),
+                            &format!(
+                                "temporal join [{}] {} peer {} positioned channel",
+                                self.name,
+                                if port == 0 { "left" } else { "right" },
+                                channel.peer
+                            ),
+                        )?;
+                        #[cfg(feature = "cluster")]
+                        let mutation_preflight = preflight_temporal_channel_ipc_restore(
+                            channel.mutation_ipc.as_slice(),
+                            channel.events.iter().filter_map(|event| match event {
+                                ArchivedTemporalCheckpointEvent::Data {
+                                    row_count,
+                                    mutation_stream: true,
+                                    ..
+                                } => Some(row_count.to_native()),
+                                ArchivedTemporalCheckpointEvent::Data { .. }
+                                | ArchivedTemporalCheckpointEvent::Frontier { .. } => None,
+                            }),
+                            &format!(
+                                "temporal join [{}] {} peer {} mutation channel",
+                                self.name,
+                                if port == 0 { "left" } else { "right" },
+                                channel.peer
+                            ),
+                        )?;
+                        #[cfg(feature = "cluster")]
+                        {
+                            if port == 0 && mutation_preflight.rows != 0 {
+                                return Err(DbError::Checkpoint(format!(
+                                    "temporal join [{}] left peer {} uses a mutation stream",
+                                    self.name, channel.peer
+                                )));
+                            }
+                            let ipc_bytes = channel
+                                .positioned_ipc
+                                .len()
+                                .checked_add(channel.mutation_ipc.len())
+                                .and_then(|bytes| {
+                                    bytes.checked_mul(WHOLE_RESTORE_IPC_EXPANSION_FACTOR)
+                                })
+                                .ok_or_else(|| self.accounting_error())?;
+                            let decoded_rows = positioned_preflight
+                                .scratch_rows
+                                .checked_add(mutation_preflight.scratch_rows)
+                                .ok_or_else(|| self.accounting_error())?;
+                            let row_scratch = decoded_rows
+                                .checked_mul(WHOLE_RESTORE_ROW_SCRATCH_CHARGE)
+                                .ok_or_else(|| self.accounting_error())?;
+                            let body_bytes = positioned_preflight
+                                .body_bytes
+                                .checked_add(mutation_preflight.body_bytes)
+                                .ok_or_else(|| self.accounting_error())?;
+                            if body_bytes
+                                > channel
+                                    .positioned_ipc
+                                    .len()
+                                    .saturating_add(channel.mutation_ipc.len())
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "temporal join [{}] peer {} IPC body accounting is invalid",
+                                    self.name, channel.peer
+                                )));
+                            }
+                            add_runtime(
+                                ipc_bytes
+                                    .checked_add(row_scratch)
+                                    .ok_or_else(|| self.accounting_error())?,
+                            )?;
+                        }
+                        for event in channel.events.iter() {
+                            if let ArchivedTemporalCheckpointEvent::Data {
+                                routed_vnodes,
+                                row_count,
+                                mutation_stream,
+                                ..
+                            } = event
+                            {
+                                let row_count =
+                                    usize::try_from(row_count.to_native()).map_err(|_| {
+                                        DbError::Checkpoint(format!(
+                                            "temporal join [{}] {context} row count exceeds usize",
+                                            self.name
+                                        ))
+                                    })?;
+                                if row_count == 0
+                                    || row_count > laminar_core::shuffle::ROUTE_MAX_BATCH_ROWS
+                                    || routed_vnodes.is_empty()
+                                    || routed_vnodes
+                                        .as_slice()
+                                        .windows(2)
+                                        .any(|pair| pair[0] >= pair[1])
+                                    || routed_vnodes
+                                        .iter()
+                                        .any(|vnode| *vnode >= u32::from(self.key_group_count))
+                                    || (port == 0 && *mutation_stream)
+                                {
+                                    return Err(DbError::Checkpoint(format!(
+                                        "temporal join [{}] {context} queued data shape is invalid",
+                                        self.name
+                                    )));
+                                }
+                                add(checkpoint_roster_bytes(
+                                    routed_vnodes.len(),
+                                    std::mem::size_of::<u32>(),
+                                )?)?;
+                                #[cfg(feature = "cluster")]
+                                {
+                                    let key_columns = if port == 0 {
+                                        self.left_key_indices.len()
+                                    } else {
+                                        self.right_key_indices.len()
+                                    };
+                                    let route_scratch = routed_vnodes
+                                        .len()
+                                        .checked_add(
+                                            row_count
+                                                .checked_mul(2)
+                                                .ok_or_else(|| self.accounting_error())?,
+                                        )
+                                        .and_then(|count| {
+                                            count.checked_mul(std::mem::size_of::<u32>())
+                                        })
+                                        .and_then(|bytes| {
+                                            key_columns
+                                                .checked_mul(std::mem::size_of::<
+                                                    Arc<dyn arrow::array::Array>,
+                                                >(
+                                                ))
+                                                .and_then(|columns| bytes.checked_add(columns))
+                                        })
+                                        .and_then(|bytes| {
+                                            bytes.checked_add(RETAINED_BATCH_ARC_CHARGE)
+                                        })
+                                        .and_then(|bytes| {
+                                            bytes
+                                                .checked_add(6 * OPERATOR_CAPTURE_ALLOCATION_CHARGE)
+                                        })
+                                        .ok_or_else(|| self.accounting_error())?;
+                                    add_runtime(route_scratch)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(TemporalWholeRestorePreflight {
+                decoded_checkpoint: decoded_bytes,
+                runtime_scratch,
+            })
+        })
+    }
+
+    fn decoded_whole_checkpoint_bytes(
+        checkpoint: &TemporalJoinOperatorCheckpoint,
+    ) -> Result<usize, DbError> {
+        let mut decoded_bytes = std::mem::size_of::<TemporalJoinOperatorCheckpoint>();
+        let mut add = |charge: usize| -> Result<(), DbError> {
+            decoded_bytes = decoded_bytes.checked_add(charge).ok_or_else(|| {
+                DbError::Checkpoint("temporal decoded whole-checkpoint accounting overflow".into())
+            })?;
+            Ok(())
+        };
+        if let Some(cluster) = &checkpoint.cluster {
+            for channels in &cluster.channels {
+                add(checkpoint_roster_bytes(
+                    channels.capacity(),
+                    std::mem::size_of::<TemporalCheckpointChannel>(),
+                )?)?;
+                for channel in channels {
+                    add(checkpoint_roster_bytes(
+                        channel.events.capacity(),
+                        std::mem::size_of::<TemporalCheckpointEvent>(),
+                    )?)?;
+                    add(checkpoint_allocation_bytes(
+                        channel.positioned_ipc.capacity(),
+                    )?)?;
+                    add(checkpoint_allocation_bytes(
+                        channel.mutation_ipc.capacity(),
+                    )?)?;
+                    for event in &channel.events {
+                        if let TemporalCheckpointEvent::Data { routed_vnodes, .. } = event {
+                            add(checkpoint_roster_bytes(
+                                routed_vnodes.capacity(),
+                                std::mem::size_of::<u32>(),
+                            )?)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(decoded_bytes)
     }
 
     fn decode_vnode_frame(
@@ -2502,6 +3032,24 @@ impl ManagedTemporalJoinOperator {
         peers: &[u64],
     ) -> Result<ClusterInputPlan, DbError> {
         self.validate_inputs(inputs)?;
+        // Publishing a vnode transition deliberately leaves the restored local cut waiting for
+        // one bootstrap broadcast. While that broadcast is outstanding `wants_input()` is false,
+        // so the graph steps us with empty input even when post-checkpoint source rows are already
+        // buffered. Do not let the freshly extracted source frontier overtake those rows: publish
+        // the exact restored cut first. Once the send completes, input is admitted together with
+        // the then-current source frontier in the following plan.
+        let has_data = inputs.iter().flatten().any(|batch| batch.num_rows() != 0);
+        let frontiers = if self.last_broadcasts == self.local_frontiers {
+            frontiers
+        } else {
+            if has_data {
+                return Err(DbError::InvalidOperation(format!(
+                    "temporal join [{}] received local input before its restored frontier was broadcast",
+                    self.name
+                )));
+            }
+            self.local_frontiers
+        };
         for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
             let port = side.port();
             validate_frontier(
@@ -2982,16 +3530,13 @@ impl ManagedTemporalJoinOperator {
     fn normalize_remote_frontier(
         &self,
         side: TemporalInputSide,
-        previous: InputFrontier,
         mut next: InputFrontier,
     ) -> InputFrontier {
-        if previous.idle && !next.idle {
-            let port = side.port();
-            let floor = self
-                .pending_frontiers
-                .map_or(self.frontiers[port], |pending| pending[port]);
-            next.watermark = max_watermark(next.watermark, floor.watermark);
-        }
+        let port = side.port();
+        let floor = self
+            .pending_frontiers
+            .map_or(self.frontiers[port], |pending| pending[port]);
+        next.watermark = max_watermark(next.watermark, floor.watermark);
         next
     }
 
@@ -3583,7 +4128,7 @@ impl ManagedTemporalJoinOperator {
 
     #[cfg(feature = "cluster")]
     fn outbound_finalize_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             return error;
         }
         DbError::ShufflePartialSend(format!(
@@ -3594,7 +4139,7 @@ impl ManagedTemporalJoinOperator {
 
     #[cfg(feature = "cluster")]
     fn remote_replay_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::Checkpoint(format!(
@@ -3870,7 +4415,7 @@ impl ManagedTemporalJoinOperator {
     }
 
     fn post_projection_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::StatefulOperatorPartialApply(format!(
@@ -3881,7 +4426,7 @@ impl ManagedTemporalJoinOperator {
     }
 
     fn after_apply_error(&self, applied: bool, vnode: u32, error: DbError) -> DbError {
-        if !applied || error.requires_pipeline_recovery() {
+        if !applied || error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             return error;
         }
         DbError::StatefulOperatorPartialApply(format!(
@@ -4010,16 +4555,27 @@ impl ManagedTemporalJoinOperator {
                     self.name, restore.participant_id
                 )));
             }
-            let checkpoint =
-                rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(
-                    restore.state,
-                )
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "temporal join [{}] donor {} whole checkpoint: {error}",
-                        self.name, restore.participant_id
-                    ))
-                })?;
+            let preflight = self.preflight_whole_checkpoint_archive(
+                restore.state,
+                &format!("donor {} whole checkpoint", restore.participant_id),
+                |_| Ok(()),
+            )?;
+            let checkpoint = with_aligned_checkpoint_bytes(restore.state, |state| {
+                rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(state)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "temporal join [{}] donor {} whole checkpoint: {error}",
+                            self.name, restore.participant_id
+                        ))
+                    })
+            })?;
+            let decoded_bytes = Self::decoded_whole_checkpoint_bytes(&checkpoint)?;
+            if decoded_bytes > preflight.decoded_checkpoint {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] donor {} decoded whole checkpoint exceeds its preflighted transition headroom",
+                    self.name, restore.participant_id
+                )));
+            }
             if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
                 return Err(DbError::Checkpoint(format!(
                     "temporal join [{}] donor {} uses unsupported checkpoint version {}",
@@ -4232,9 +4788,14 @@ impl ManagedTemporalJoinOperator {
                 true
             }
         };
+        let version_edge_valid = if checkpoint_bootstrap {
+            transition.predecessor.assignment_version < transition.target.assignment_version
+        } else {
+            transition.predecessor.assignment_version.checked_add(1)
+                == Some(transition.target.assignment_version)
+        };
         if transition.predecessor.vnode_count != self.vnode_count.get()
-            || transition.predecessor.assignment_version.checked_add(1)
-                != Some(transition.target.assignment_version)
+            || !version_edge_valid
             || self.local_assignment.owners().len() != assignment.owners().len()
             || if checkpoint_bootstrap {
                 self.local_assignment.version() != assignment.version()
@@ -4312,12 +4873,6 @@ impl ManagedTemporalJoinOperator {
                 self.name
             )));
         }
-        let mut handoff_cut = self.portable_handoff_cut(transition, fresh_acquirer)?;
-        let transition_frontiers = handoff_cut.map_or(self.frontiers, |cut| cut.frontiers);
-        let mut published_output_frontier = handoff_cut
-            .map_or(self.published_output_frontier, |cut| {
-                cut.published_output_frontier
-            });
 
         if self.pending_cluster_input.is_some()
             || self.pending_frontiers.is_some()
@@ -4404,19 +4959,124 @@ impl ManagedTemporalJoinOperator {
                 limit_bytes: self.max_managed_state_bytes,
             });
         }
-        let restore_payload_bytes = transition
+        let raw_restore_bytes = transition
             .restores
             .iter()
-            .try_fold(0usize, |total, restore| {
-                total.checked_add(restore.state.len())
-            })
+            .map(|restore| restore.state.len())
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| restore.state.len()),
+            )
+            .try_fold(0usize, usize::checked_add)
             .ok_or_else(|| self.accounting_error())?;
-        if restore_payload_bytes > self.max_managed_state_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] transition restore payload exceeds its {}-byte limit",
-                self.name, self.max_managed_state_bytes
-            )));
+        let vnode_alignment_peak = transition
+            .restores
+            .iter()
+            .map(|restore| vnode_checkpoint_alignment_copy_charge(restore.state))
+            .try_fold(0usize, |peak, charge| charge.map(|charge| peak.max(charge)))?;
+        let whole_alignment_peak = transition
+            .whole_restores
+            .iter()
+            .map(|restore| checkpoint_alignment_copy_charge(restore.state))
+            .try_fold(0usize, |peak, charge| charge.map(|charge| peak.max(charge)))?;
+        let transport_phase_bytes = raw_restore_bytes
+            .checked_add(vnode_alignment_peak.max(whole_alignment_peak))
+            .ok_or_else(|| self.accounting_error())?;
+        let transport_peak = live_bytes
+            .checked_add(transport_phase_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if transport_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] transition restore payload", self.name),
+                accounted_bytes: transport_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
         }
+
+        let predecessor_participants = transition.predecessor.participant_ids();
+        let mut sequential_restore_peak = vnode_alignment_peak;
+        if fresh_acquirer {
+            for restore in transition.whole_restores {
+                let decoded_bytes = self
+                    .preflight_whole_checkpoint_archive(
+                    restore.state,
+                    &format!("donor {} whole checkpoint", restore.participant_id),
+                    |archived| {
+                        let cluster = archived.cluster.as_ref().ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "temporal join [{}] donor {} whole checkpoint is not from cluster mode",
+                                self.name, restore.participant_id
+                            ))
+                        })?;
+                        if cluster.assignment_version
+                            != transition.predecessor.assignment_version
+                            || cluster.owner_map_digest
+                                != transition.predecessor.assignment_digest
+                            || cluster.self_id != restore.participant_id
+                        {
+                            return Err(DbError::Checkpoint(format!(
+                                "temporal join [{}] donor {} whole checkpoint is outside the predecessor assignment",
+                                self.name, restore.participant_id
+                            )));
+                        }
+                        for port in 0..2 {
+                            let channels = &cluster.channels[port];
+                            let expected_peers = predecessor_participants
+                                .iter()
+                                .copied()
+                                .filter(|peer| *peer != restore.participant_id);
+                            if channels.len()
+                                != predecessor_participants
+                                    .len()
+                                    .saturating_sub(1)
+                                || !channels
+                                    .iter()
+                                    .map(|channel| channel.peer)
+                                    .eq(expected_peers)
+                                || channels.iter().any(|channel| {
+                                    !channel.events.is_empty()
+                                        || !channel.positioned_ipc.is_empty()
+                                        || !channel.mutation_ipc.is_empty()
+                                })
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "temporal join [{}] donor {} has an invalid archived peer cut",
+                                    self.name, restore.participant_id
+                                )));
+                            }
+                        }
+                        Ok(())
+                    },
+                )?
+                    .decoded_checkpoint;
+                let decode_peak = checkpoint_alignment_copy_charge(restore.state)?
+                    .checked_add(decoded_bytes)
+                    .ok_or_else(|| self.accounting_error())?;
+                sequential_restore_peak = sequential_restore_peak.max(decode_peak);
+            }
+        }
+        let restore_phase_bytes = raw_restore_bytes
+            .checked_add(sequential_restore_peak)
+            .ok_or_else(|| self.accounting_error())?;
+        let restore_peak = live_bytes
+            .checked_add(restore_phase_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if restore_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("temporal join [{}] transition restore preflight", self.name),
+                accounted_bytes: restore_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+
+        let mut handoff_cut = self.portable_handoff_cut(transition, fresh_acquirer)?;
+        let transition_frontiers = handoff_cut.map_or(self.frontiers, |cut| cut.frontiers);
+        let mut published_output_frontier = handoff_cut
+            .map_or(self.published_output_frontier, |cut| {
+                cut.published_output_frontier
+            });
 
         let mut replacements = BTreeMap::new();
         for &vnode in transition.revoked {
@@ -4427,7 +5087,7 @@ impl ManagedTemporalJoinOperator {
             let limit = if restore.state.first() == Some(&PRESENT_VNODE) {
                 self.max_managed_state_bytes
                     .checked_sub(live_bytes)
-                    .and_then(|bytes| bytes.checked_sub(restore_payload_bytes))
+                    .and_then(|bytes| bytes.checked_sub(restore_phase_bytes))
                     .and_then(|bytes| bytes.checked_sub(restored_state_bytes))
                     .and_then(|bytes| bytes.checked_sub(PENDING_HOLD_ENTRY_CHARGE))
                     .filter(|bytes| *bytes != 0)
@@ -4552,7 +5212,7 @@ impl ManagedTemporalJoinOperator {
             handoff_cut,
         };
         let total = live_bytes
-            .checked_add(restore_payload_bytes)
+            .checked_add(restore_phase_bytes)
             .and_then(|bytes| bytes.checked_add(Self::transition_accounted_bytes(&prepared)))
             .ok_or_else(|| self.accounting_error())?;
         if total > self.max_managed_state_bytes {
@@ -4747,20 +5407,118 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             )));
         }
         let OperatorCheckpoint { data } = checkpoint;
-        if data.len() > self.max_managed_state_bytes {
-            return Err(DbError::Checkpoint(format!(
-                "temporal join [{}] operator checkpoint exceeds its restore limit",
-                self.name
-            )));
+        let live_bytes = self.checked_accounted_state_bytes()?;
+        let encoded_frame_bytes = checkpoint_allocation_bytes(data.capacity())?
+            .checked_add(checkpoint_alignment_copy_charge(&data)?)
+            .ok_or_else(|| self.accounting_error())?;
+        let encoded_peak = live_bytes
+            .checked_add(encoded_frame_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if encoded_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "temporal join [{}] operator checkpoint restore payload",
+                    self.name
+                ),
+                accounted_bytes: encoded_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
         }
-        let checkpoint =
-            rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(&data)
-                .map_err(|error| {
+
+        let restore_preflight = self.preflight_whole_checkpoint_archive(
+            &data,
+            "operator checkpoint",
+            |archived| {
+                #[cfg(feature = "cluster")]
+                match (self.cluster_shuffle.as_ref(), archived.cluster.as_ref()) {
+                    (Some(config), Some(cluster)) => {
+                        let (_, assignment, peers) = self.active_cluster_scope()?;
+                        if cluster.assignment_version != assignment.version()
+                            || cluster.owner_map_digest != self.owner_map_digest(&assignment)
+                            || cluster.self_id != config.self_id.0
+                        {
+                            return Err(DbError::Checkpoint(format!(
+                                "temporal join [{}] archived cluster checkpoint identity is invalid",
+                                self.name
+                            )));
+                        }
+                        for port in 0..2 {
+                            let channels = &cluster.channels[port];
+                            if channels.len() != peers.len()
+                                || !channels
+                                    .iter()
+                                    .map(|channel| channel.peer)
+                                    .eq(peers.iter().copied())
+                            {
+                                return Err(DbError::Checkpoint(format!(
+                                    "temporal join [{}] archived cluster channel roster is invalid",
+                                    self.name
+                                )));
+                            }
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(DbError::Checkpoint(format!(
+                            "temporal join [{}] archived checkpoint deployment mode does not match the operator",
+                            self.name
+                        )));
+                    }
+                }
+                #[cfg(not(feature = "cluster"))]
+                if archived.cluster.is_some() {
+                    return Err(DbError::Checkpoint(format!(
+                        "temporal join [{}] archived checkpoint contains cluster channel state",
+                        self.name
+                    )));
+                }
+                Ok(())
+            },
+        )?;
+        let preflight_peak = encoded_peak
+            .checked_add(restore_preflight.decoded_checkpoint)
+            .ok_or_else(|| self.accounting_error())?;
+        if preflight_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "temporal join [{}] operator checkpoint restore preflight",
+                    self.name
+                ),
+                accounted_bytes: preflight_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let runtime_peak = live_bytes
+            .checked_add(restore_preflight.decoded_checkpoint)
+            .and_then(|bytes| bytes.checked_add(restore_preflight.runtime_scratch))
+            .ok_or_else(|| self.accounting_error())?;
+        if runtime_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "temporal join [{}] cluster checkpoint restore preflight",
+                    self.name
+                ),
+                accounted_bytes: runtime_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let checkpoint = with_aligned_checkpoint_bytes(&data, |data| {
+            rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(data).map_err(
+                |error| {
                     DbError::Checkpoint(format!(
                         "temporal join [{}] operator checkpoint: {error}",
                         self.name
                     ))
-                })?;
+                },
+            )
+        })?;
+        let decoded_checkpoint_bytes = Self::decoded_whole_checkpoint_bytes(&checkpoint)?;
+        if decoded_checkpoint_bytes > restore_preflight.decoded_checkpoint {
+            return Err(DbError::Checkpoint(format!(
+                "temporal join [{}] decoded operator checkpoint exceeds its preflighted bound",
+                self.name
+            )));
+        }
         drop(data);
         if checkpoint.version != OPERATOR_CHECKPOINT_VERSION {
             return Err(DbError::Checkpoint(format!(
@@ -4829,7 +5587,11 @@ impl GraphOperator for ManagedTemporalJoinOperator {
 
         #[cfg(feature = "cluster")]
         let decoded_cluster = match (self.cluster_shuffle.is_some(), cluster) {
-            (true, Some(cluster)) => Some(self.decode_cluster_checkpoint(cluster, frontiers)?),
+            (true, Some(cluster)) => Some(self.decode_cluster_checkpoint(
+                cluster,
+                frontiers,
+                decoded_checkpoint_bytes,
+            )?),
             (false, None) => None,
             _ => {
                 return Err(DbError::Checkpoint(format!(
@@ -4844,6 +5606,31 @@ impl GraphOperator for ManagedTemporalJoinOperator {
                 "temporal join [{}] checkpoint contains cluster channel state",
                 self.name
             )));
+        }
+
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = decoded_cluster.as_ref() {
+            let restored_cluster_bytes = self.decoded_cluster_runtime_bytes(cluster)?;
+            if restored_cluster_bytes > restore_preflight.runtime_scratch {
+                return Err(DbError::Checkpoint(format!(
+                    "temporal join [{}] restored cluster state exceeds its preflighted bound",
+                    self.name
+                )));
+            }
+            let restored_peak = live_bytes
+                .checked_add(decoded_checkpoint_bytes)
+                .and_then(|bytes| bytes.checked_add(restored_cluster_bytes))
+                .ok_or_else(|| self.accounting_error())?;
+            if restored_peak > self.max_managed_state_bytes {
+                return Err(DbError::ManagedStateBudgetExceeded {
+                    context: format!(
+                        "temporal join [{}] cluster checkpoint restore peak",
+                        self.name
+                    ),
+                    accounted_bytes: restored_peak,
+                    limit_bytes: self.max_managed_state_bytes,
+                });
+            }
         }
 
         self.frontiers = frontiers;
@@ -4964,8 +5751,11 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             )));
         }
         let previous = self.peer_channels[side.port()][&peer].accepted;
+        if previous.watermark.is_some() && frontier.watermark.is_none() {
+            validate_frontier(previous, frontier, side.name(), &self.name)?;
+        }
+        let frontier = self.normalize_remote_frontier(side, frontier);
         validate_frontier(previous, frontier, side.name(), &self.name)?;
-        let frontier = self.normalize_remote_frontier(side, previous, frontier);
         let (next_queue_bytes, next_queue_events) =
             self.reserve_remote_event_slot(side, peer, 0, "ordered frontier queue")?;
         self.queued_shuffle_bytes = next_queue_bytes;
@@ -5133,17 +5923,35 @@ impl GraphOperator for ManagedTemporalJoinOperator {
             .as_ref()
             .map_or(0, |state| state.accounted_state_bytes());
         let total = self.checked_accounted_state_bytes()?;
+        let other_bytes = total
+            .checked_sub(current_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        let restore_frame_bytes = bytes
+            .len()
+            .checked_add(vnode_checkpoint_alignment_copy_charge(bytes)?)
+            .ok_or_else(|| self.accounting_error())?;
+        let transport_peak = other_bytes
+            .checked_add(restore_frame_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if transport_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!(
+                    "temporal join [{}] vnode {vnode} restore payload",
+                    self.name
+                ),
+                accounted_bytes: transport_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
         let limit = if bytes.first() == Some(&PRESENT_VNODE) {
-            let other = total
-                .checked_sub(current_bytes)
-                .ok_or_else(|| self.accounting_error())?;
             self.max_managed_state_bytes
-                .checked_sub(other)
+                .checked_sub(other_bytes)
+                .and_then(|limit| limit.checked_sub(restore_frame_bytes))
                 .and_then(|limit| limit.checked_sub(PENDING_HOLD_ENTRY_CHARGE))
                 .filter(|limit| *limit != 0)
                 .ok_or_else(|| DbError::ManagedStateBudgetExceeded {
                     context: format!("temporal join [{}] vnode {vnode} restore", self.name),
-                    accounted_bytes: total,
+                    accounted_bytes: transport_peak.saturating_add(PENDING_HOLD_ENTRY_CHARGE),
                     limit_bytes: self.max_managed_state_bytes,
                 })?
         } else {
@@ -5438,6 +6246,35 @@ mod tests {
         (operator, left, right)
     }
 
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn terminal_errors_survive_every_temporal_post_admission_wrapper() {
+        fn assert_terminal(error: DbError, expected: &str) {
+            let DbError::ShuffleTerminal(reason) = error else {
+                panic!("expected permanent shuffle halt, got {error}");
+            };
+            assert_eq!(reason, expected);
+        }
+
+        let (operator, _, _) = operator(1);
+        assert_terminal(
+            operator.outbound_finalize_error(DbError::ShuffleTerminal("outbound".into())),
+            "outbound",
+        );
+        assert_terminal(
+            operator.remote_replay_error(DbError::ShuffleTerminal("remote replay".into())),
+            "remote replay",
+        );
+        assert_terminal(
+            operator.post_projection_error(DbError::ShuffleTerminal("post projection".into())),
+            "post projection",
+        );
+        assert_terminal(
+            operator.after_apply_error(true, 1, DbError::ShuffleTerminal("after apply".into())),
+            "after apply",
+        );
+    }
+
     fn positions(rows: usize, first: u64) -> SourceRowPositions {
         let partitions = std::iter::repeat_n(b"p0".as_slice(), rows);
         let orders: Vec<[u8; 8]> = (first..first + rows as u64).map(u64::to_be_bytes).collect();
@@ -5532,6 +6369,23 @@ mod tests {
         capture.materialize(&mut staged_bytes, u64::MAX).unwrap()
     }
 
+    fn unaligned_temporal_archive_transport(bytes: &[u8], archive_offset: usize) -> bytes::Bytes {
+        let mut transport = vec![0_u8; bytes.len() + CHECKPOINT_ARCHIVE_ALIGNMENT];
+        let base = transport.as_ptr() as usize;
+        let offset = (0..CHECKPOINT_ARCHIVE_ALIGNMENT)
+            .find(|offset| (base + offset + archive_offset) % CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .expect("a temporal archive transport offset must be unaligned");
+        transport[offset..offset + bytes.len()].copy_from_slice(bytes);
+        let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());
+        assert_ne!(
+            bytes[archive_offset..]
+                .as_ptr()
+                .align_offset(CHECKPOINT_ARCHIVE_ALIGNMENT),
+            0
+        );
+        bytes
+    }
+
     fn frontier(watermark: i64) -> [InputFrontier; 2] {
         [
             InputFrontier {
@@ -5543,6 +6397,97 @@ mod tests {
                 idle: false,
             },
         ]
+    }
+
+    #[test]
+    fn whole_checkpoint_preflight_bounds_unaligned_owned_vectors() {
+        let checkpoint = TemporalJoinOperatorCheckpoint {
+            version: OPERATOR_CHECKPOINT_VERSION,
+            frontiers: frontier(10).map(Into::into),
+            maintenance_cursor: 0,
+            maintenance_pending: false,
+            maintenance_remaining: 0,
+            maintenance_rescan: false,
+            published_output_frontier: Some(frontier(10)[0].into()),
+            cluster: Some(TemporalClusterCheckpoint {
+                assignment_version: 7,
+                owner_map_digest: [3; 32],
+                self_id: 1,
+                local_frontiers: frontier(10).map(Into::into),
+                remote_peer_cursors: [None; 2],
+                channels: [
+                    vec![TemporalCheckpointChannel {
+                        peer: 2,
+                        applied: frontier(10)[0].into(),
+                        events: vec![TemporalCheckpointEvent::Frontier {
+                            recovery_gen: 4,
+                            frontier: frontier(10)[0].into(),
+                        }],
+                        positioned_ipc: Vec::new(),
+                        mutation_ipc: Vec::new(),
+                    }],
+                    vec![TemporalCheckpointChannel {
+                        peer: 2,
+                        applied: frontier(10)[1].into(),
+                        events: Vec::new(),
+                        positioned_ipc: Vec::new(),
+                        mutation_ipc: Vec::new(),
+                    }],
+                ],
+            }),
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint).unwrap();
+        let encoded = unaligned_temporal_archive_transport(&encoded, 0);
+        assert_eq!(checkpoint_alignment_copy_bytes(&encoded), encoded.len());
+
+        let (operator, _, _) = operator(8);
+        let preflight = operator
+            .preflight_whole_checkpoint_archive(&encoded, "test checkpoint", |_| Ok(()))
+            .unwrap();
+        let decoded = with_aligned_checkpoint_bytes(&encoded, |bytes| {
+            rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(bytes)
+                .map_err(|error| DbError::Checkpoint(error.to_string()))
+        })
+        .unwrap();
+        assert!(
+            ManagedTemporalJoinOperator::decoded_whole_checkpoint_bytes(&decoded).unwrap()
+                <= preflight.decoded_checkpoint
+        );
+        assert!(operator
+            .preflight_whole_checkpoint_archive(&[0xff, 0xfe, 0xfd], "malformed", |_| Ok(()))
+            .is_err());
+    }
+
+    #[test]
+    fn whole_restore_rejects_preflight_peak_one_byte_over_budget() {
+        let (mut donor, _, _) = operator(8);
+        donor.frontiers = frontier(10);
+        let checkpoint = donor.checkpoint().unwrap().unwrap();
+        let (mut restored, _, _) = operator(8);
+        let restore_preflight = restored
+            .preflight_whole_checkpoint_archive(&checkpoint.data, "test checkpoint", |archived| {
+                if archived.cluster.is_some() {
+                    return Err(DbError::Checkpoint("unexpected cluster checkpoint".into()));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let required = restored
+            .checked_accounted_state_bytes()
+            .unwrap()
+            .checked_add(checkpoint_allocation_bytes(checkpoint.data.capacity()).unwrap())
+            .and_then(|bytes| {
+                bytes.checked_add(checkpoint_alignment_copy_charge(&checkpoint.data).unwrap())
+            })
+            .and_then(|bytes| bytes.checked_add(restore_preflight.decoded_checkpoint))
+            .unwrap();
+        restored.set_managed_state_budget(required - 1);
+
+        assert!(matches!(
+            restored.restore(checkpoint),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert_eq!(restored.frontiers, [InputFrontier::default(); 2]);
     }
 
     #[tokio::test]
@@ -5781,6 +6726,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_bound_source_cuts_survive_temporal_checkpoint_round_trip() {
+        let decision_cut = [
+            InputFrontier {
+                watermark: Some(900),
+                idle: false,
+            },
+            InputFrontier {
+                watermark: Some(700),
+                idle: false,
+            },
+        ];
+        let (mut operator, _, _) = operator(8);
+
+        operator
+            .process_with_frontiers(&[], &decision_cut)
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            if operator.wants_input() {
+                break;
+            }
+            operator
+                .process_with_frontiers(&[], &decision_cut)
+                .await
+                .unwrap();
+        }
+        assert!(
+            operator.wants_input(),
+            "temporal frontier drain did not settle"
+        );
+        assert_eq!(
+            operator.published_output_frontier,
+            Some(InputFrontier {
+                watermark: Some(700),
+                idle: false,
+            }),
+            "the higher left decision must not publish beyond the lower right decision"
+        );
+
+        let checkpoint = operator
+            .checkpoint()
+            .unwrap()
+            .expect("an initialized temporal frontier must be checkpointed");
+        let (mut restored, _, _) = self::operator(8);
+        restored.restore(checkpoint).unwrap();
+        assert_eq!(
+            restored.published_output_frontier,
+            Some(InputFrontier {
+                watermark: Some(700),
+                idle: false,
+            })
+        );
+
+        restored
+            .process_with_frontiers(&[], &decision_cut)
+            .await
+            .unwrap();
+        for _ in 0..32 {
+            if restored.wants_input() {
+                break;
+            }
+            restored
+                .process_with_frontiers(&[], &decision_cut)
+                .await
+                .unwrap();
+        }
+        assert!(
+            restored.wants_input(),
+            "restored frontier drain did not settle"
+        );
+        assert_eq!(
+            restored.published_output_frontier,
+            Some(InputFrontier {
+                watermark: Some(700),
+                idle: false,
+            })
+        );
+        assert!(restored.checkpoint().unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn projection_sees_only_visible_join_columns() {
         let keys = [key_for_vnode(0), key_for_vnode(1)];
         let (mut operator, _, _) = operator_with_projection(
@@ -5912,11 +6938,30 @@ mod tests {
         let (mut restored, _, _) = operator(8);
         restored.restore(whole).unwrap();
         assert_eq!(restored.maintenance_cursor, 1);
-        for (vnode, state) in &captured {
-            restored
-                .restore_vnode(*vnode, 2, state.as_deref().unwrap())
-                .unwrap();
-        }
+        restored
+            .restore_vnode(0, 2, captured[0].1.as_deref().unwrap())
+            .unwrap();
+        let present = unaligned_temporal_archive_transport(captured[1].1.as_deref().unwrap(), 1);
+        assert_eq!(
+            vnode_checkpoint_alignment_copy_bytes(&present),
+            present.len() - 1
+        );
+        let restore_transport_peak = restored
+            .checked_accounted_state_bytes()
+            .unwrap()
+            .checked_add(present.len())
+            .and_then(|bytes| {
+                bytes.checked_add(vnode_checkpoint_alignment_copy_charge(&present).unwrap())
+            })
+            .unwrap();
+        restored.set_managed_state_budget(restore_transport_peak - 1);
+        assert!(matches!(
+            restored.restore_vnode(1, 2, &present),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert!(restored.vnode_states[1].is_none());
+        restored.set_managed_state_budget(usize::MAX);
+        restored.restore_vnode(1, 2, &present).unwrap();
         assert!(restored.vnode_states[0].is_none());
         assert!(restored.vnode_states[1].is_some());
         restored.force_full_vnode_capture();
@@ -6052,6 +7097,7 @@ mod tests {
         }
         let captured = donor.checkpoint_vnodes(&[0], 2, u64::MAX).unwrap().unwrap();
         let vnode_frame = materialize_capture(captured.into_iter().next().unwrap().state.unwrap());
+        let vnode_frame = unaligned_temporal_archive_transport(&vnode_frame, 1);
 
         let scope = two_owner_scope().await;
         let target_version = scope.registry.assignment_version() + 1;
@@ -6227,10 +7273,44 @@ mod tests {
         assert!(target.vnode_states.iter().all(Option::is_none));
 
         let whole_frame = encode_whole(2, 3, false, 100);
+        let whole_frame = unaligned_temporal_archive_transport(&whole_frame, 0);
         let whole_restores = [ManagedWholeRestore {
             participant_id: 2,
             state: &whole_frame,
         }];
+        let decoded_bound = target
+            .preflight_whole_checkpoint_archive(&whole_frame, "test donor", |_| Ok(()))
+            .unwrap()
+            .decoded_checkpoint;
+        let raw_restore_bytes = vnode_frame.len().checked_add(whole_frame.len()).unwrap();
+        let sequential_peak = vnode_checkpoint_alignment_copy_charge(&vnode_frame)
+            .unwrap()
+            .max(
+                checkpoint_alignment_copy_charge(&whole_frame)
+                    .unwrap()
+                    .checked_add(decoded_bound)
+                    .unwrap(),
+            );
+        let restore_peak = target
+            .checked_accounted_state_bytes()
+            .unwrap()
+            .checked_add(raw_restore_bytes)
+            .and_then(|bytes| bytes.checked_add(sequential_peak))
+            .unwrap();
+        target.set_managed_state_budget(restore_peak - 1);
+        assert!(matches!(
+            target.prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target_fence,
+                revoked: &rustc_hash::FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::Live,
+            }),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert!(target.prepared_vnode_transition.is_none());
+        target.set_managed_state_budget(usize::MAX);
         target
             .prepare_vnode_transition(ManagedVnodeTransition {
                 predecessor: &predecessor,
@@ -6673,6 +7753,114 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn bootstrap_broadcast_holds_restored_cut_ahead_of_live_replay_frontier() {
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let key = key_for_vnode(1);
+        let (mut operator, _, _) = operator(8);
+        let scope = two_owner_scope().await;
+        operator.attach_cluster_shuffle(scope.clone());
+        let cut = InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        };
+        let live = InputFrontier {
+            watermark: Some(300),
+            idle: false,
+        };
+        operator.frontiers = [cut; 2];
+        operator.local_frontiers = [cut; 2];
+        operator.last_broadcasts = [InputFrontier::default(); 2];
+        for channels in &mut operator.peer_channels {
+            let channel = channels.get_mut(&2).unwrap();
+            channel.applied = cut;
+            channel.accepted = cut;
+        }
+        let assignment = scope.registry.versioned_snapshot();
+
+        assert!(!operator.wants_input());
+        let bootstrap = operator
+            .plan_cluster_inputs(
+                &[Vec::new(), Vec::new()],
+                [live; 2],
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(bootstrap.local_frontiers, [cut; 2]);
+        assert_eq!(bootstrap.outbound.len(), 2);
+        assert!(bootstrap.outbound.iter().all(|(_, message)| {
+            matches!(
+                message,
+                ShuffleMessage::Frontier {
+                    watermark: Some(100),
+                    idle: false,
+                    ..
+                }
+            )
+        }));
+
+        let replay = right_batch(
+            std::slice::from_ref(&key),
+            &["X"],
+            &[150],
+            &["replayed"],
+            &[SourceMutation::Put],
+        );
+        let error = match operator.plan_cluster_inputs(
+            &[Vec::new(), vec![replay.clone()]],
+            [live; 2],
+            &scope,
+            &assignment,
+            &[2],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("local replay must wait for the restored frontier broadcast"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("before its restored frontier was broadcast"),
+            "{error}"
+        );
+
+        operator.last_broadcasts = [cut; 2];
+        let replay = operator
+            .plan_cluster_inputs(
+                &[Vec::new(), vec![replay]],
+                [live; 2],
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(replay.local_frontiers, [live; 2]);
+        assert_eq!(replay.outbound.len(), 3);
+        assert!(matches!(
+            &replay.outbound[0].1,
+            ShuffleMessage::Data { stage, .. } if stage == "temporal::right"
+        ));
+        assert!(matches!(
+            &replay.outbound[1].1,
+            ShuffleMessage::Frontier {
+                stage,
+                watermark: Some(300),
+                idle: false,
+            } if stage == "temporal::right"
+        ));
+        assert!(matches!(
+            &replay.outbound[2].1,
+            ShuffleMessage::Frontier {
+                stage,
+                watermark: Some(300),
+                idle: false,
+            } if stage == "temporal::left"
+        ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn zero_admission_send_restarts_once_without_becoming_runnable() {
         use laminar_core::shuffle::ShuffleMessage;
 
@@ -7041,6 +8229,29 @@ mod tests {
     #[tokio::test]
     async fn cluster_channel_checkpoint_round_trip_preserves_order_and_replay() {
         let (checkpoint, scope) = queued_cluster_checkpoint().await;
+        let checkpoint_data = checkpoint.data.clone();
+        let (mut tight, _, _) = operator(8);
+        tight.attach_cluster_shuffle(scope.clone());
+        let preflight = tight
+            .preflight_whole_checkpoint_archive(&checkpoint_data, "tight queued checkpoint", |_| {
+                Ok(())
+            })
+            .unwrap();
+        assert!(preflight.runtime_scratch > 0);
+        let live_bytes = tight.checked_accounted_state_bytes().unwrap();
+        let runtime_peak = live_bytes
+            .checked_add(preflight.decoded_checkpoint)
+            .and_then(|bytes| bytes.checked_add(preflight.runtime_scratch))
+            .unwrap();
+        tight.set_managed_state_budget(runtime_peak - 1);
+        assert!(matches!(
+            tight.restore(OperatorCheckpoint {
+                data: checkpoint_data.clone(),
+            }),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert_cluster_restore_pristine(&tight);
+
         scope.sender.set_recovery_gen(1);
         scope.receiver.set_recovery_gen(1);
         let (mut restored, _, _) = operator(8);
@@ -7138,7 +8349,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(restored.peer_channels[1][&2].accepted.watermark, Some(500));
-        assert!(restored
+        let key = key_for_vnode(0);
+        let late = crate::operator::RetainedBatch::restored_channel(
+            right_batch(
+                std::slice::from_ref(&key),
+                &["X"],
+                &[499],
+                &["late"],
+                &[SourceMutation::Put],
+            ),
+            2,
+            assignment,
+            recovery,
+            Arc::from([0_u32]),
+        );
+        let error = restored
+            .stage_checkpointed_shuffle("temporal::right", late, i64::MIN)
+            .unwrap_err();
+        assert!(error.to_string().contains("applied frontier 500"));
+        restored
             .stage_checkpointed_shuffle_frontier(
                 "temporal::right",
                 2,
@@ -7149,13 +8378,81 @@ mod tests {
                 assignment,
                 recovery,
             )
+            .unwrap();
+        assert_eq!(restored.peer_channels[1][&2].accepted.watermark, Some(500));
+        restored
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: Some(550),
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .unwrap();
+        assert_eq!(restored.peer_channels[1][&2].accepted.watermark, Some(550));
+        assert!(restored
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: None,
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
             .is_err());
+        assert!(restored
+            .stage_checkpointed_shuffle_frontier(
+                "temporal::right",
+                2,
+                InputFrontier {
+                    watermark: Some(525),
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .is_err());
+        assert_eq!(restored.peer_channels[1][&2].accepted.watermark, Some(550));
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn cluster_checkpoint_restore_rejects_topology_and_routes_atomically() {
         let (checkpoint, scope) = queued_cluster_checkpoint().await;
+        let mut wrong_rows =
+            rkyv::from_bytes::<TemporalJoinOperatorCheckpoint, rkyv::rancor::Error>(
+                &checkpoint.data,
+            )
+            .unwrap();
+        let wrong_row_count = wrong_rows
+            .cluster
+            .as_mut()
+            .unwrap()
+            .channels
+            .iter_mut()
+            .flatten()
+            .flat_map(|channel| channel.events.iter_mut())
+            .find_map(|event| match event {
+                TemporalCheckpointEvent::Data { row_count, .. } => Some(row_count),
+                TemporalCheckpointEvent::Frontier { .. } => None,
+            })
+            .unwrap();
+        *wrong_row_count = wrong_row_count.checked_add(1).unwrap();
+        let wrong_rows = OperatorCheckpoint {
+            data: rkyv::to_bytes::<rkyv::rancor::Error>(&wrong_rows)
+                .unwrap()
+                .to_vec(),
+        };
+        let (mut restored, _, _) = operator(8);
+        restored.attach_cluster_shuffle(scope.clone());
+        assert!(restored.restore(wrong_rows).is_err());
+        assert_cluster_restore_pristine(&restored);
+
         let mut wrong_topology = rkyv::from_bytes::<
             TemporalJoinOperatorCheckpoint,
             rkyv::rancor::Error,

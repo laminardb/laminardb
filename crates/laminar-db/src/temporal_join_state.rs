@@ -6,7 +6,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use arrow::array::{
-    new_null_array, Array, ArrayRef, BinaryArray, Int64Array, RecordBatch,
+    make_array, new_null_array, Array, ArrayData, ArrayRef, BinaryArray, Int64Array, RecordBatch,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt32Array,
 };
@@ -259,6 +259,16 @@ impl From<CheckpointSourcePosition> for TemporalSourcePosition {
         Self {
             partition: Arc::from(source.partition),
             order: Arc::from(source.order),
+            sub_offset: source.sub_offset,
+        }
+    }
+}
+
+impl From<&CheckpointSourcePosition> for TemporalSourcePosition {
+    fn from(source: &CheckpointSourcePosition) -> Self {
+        Self {
+            partition: Arc::from(source.partition.as_slice()),
+            order: Arc::from(source.order.as_slice()),
             sub_offset: source.sub_offset,
         }
     }
@@ -2721,7 +2731,7 @@ impl TemporalJoinVnodeState {
 
     fn restore_pending(
         &mut self,
-        pending: Vec<CheckpointProbe>,
+        mut pending: Vec<CheckpointProbe>,
         rows: RecordBatch,
     ) -> Result<(), DbError> {
         if rows.schema().as_ref() != self.left_schema.as_ref() || rows.num_rows() != pending.len() {
@@ -2734,7 +2744,65 @@ impl TemporalJoinVnodeState {
                 "temporal checkpoint exceeds pending-probe limit".into(),
             ));
         }
-        let rows = Arc::new(rows);
+        let decoded_rows = Arc::new(rows);
+        let decoded_row_count = decoded_rows.num_rows();
+        let decoded_positions = extract_source_positions(&decoded_rows)?;
+        let decoded_keys = self.encode_keys(&decoded_rows, true)?;
+        let decoded_times = extract_times(&decoded_rows, self.config.left_time_index, "left")?;
+        let decoded_fingerprints = fingerprint_rows(&self.left_row_codec, &decoded_rows, "left")?;
+        let decoded_key_columns = self.key_columns(&decoded_rows, true);
+        let mut used_decoded_rows = FxHashSet::default();
+        let mut canonical_indices: FxHashMap<TemporalSourcePosition, u32> = FxHashMap::default();
+        let mut canonical_rows = Vec::new();
+        canonical_rows.try_reserve(pending.len()).map_err(|_| {
+            DbError::Checkpoint("temporal pending checkpoint row roster is too large".into())
+        })?;
+        canonical_indices.try_reserve(pending.len()).map_err(|_| {
+            DbError::Checkpoint("temporal pending checkpoint row roster is too large".into())
+        })?;
+        for probe in &mut pending {
+            let source = TemporalSourcePosition::from(&probe.source);
+            let row = probe.left_row as usize;
+            if row >= decoded_row_count || !used_decoded_rows.insert(probe.left_row) {
+                return Err(DbError::Checkpoint(
+                    "temporal pending checkpoint row references are invalid".into(),
+                ));
+            }
+            if decoded_positions[row] != source
+                || decoded_key_columns.iter().any(|column| column.is_null(row))
+                || decoded_keys.row(row).as_ref() != probe.key
+                || decoded_times.value(row, "left")? != probe.left_event_time
+                || decoded_fingerprints[row] != probe.payload_fingerprint
+            {
+                return Err(DbError::Checkpoint(
+                    "temporal pending checkpoint row disagrees with probe metadata".into(),
+                ));
+            }
+            probe.left_row = match canonical_indices.entry(source) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let canonical = u32::try_from(canonical_rows.len()).map_err(|_| {
+                        DbError::Checkpoint("temporal pending checkpoint has too many rows".into())
+                    })?;
+                    canonical_rows.push(RowRef {
+                        batch: Arc::clone(&decoded_rows),
+                        row: probe.left_row,
+                    });
+                    entry.insert(canonical);
+                    canonical
+                }
+            };
+        }
+        if used_decoded_rows.len() != decoded_row_count {
+            return Err(DbError::Checkpoint(
+                "temporal pending checkpoint contains an unreferenced row".into(),
+            ));
+        }
+        let rows = Arc::new(compact_detached_rows(
+            self.left_schema.as_ref(),
+            &canonical_rows,
+            "left",
+        )?);
         let left_row_count = rows.num_rows();
         let row_positions = extract_source_positions(&rows)?;
         let row_keys = self.encode_keys(&rows, true)?;
@@ -2789,11 +2857,7 @@ impl TemporalJoinVnodeState {
             }
             self.reject_evicted_probe(probe_time)
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            if !used_rows.insert(left_row) {
-                return Err(DbError::Checkpoint(
-                    "temporal pending checkpoint row is referenced more than once".into(),
-                ));
-            }
+            used_rows.insert(left_row);
             let row = left_row as usize;
             if row_positions[row] != source
                 || key_columns.iter().any(|column| column.is_null(row))
@@ -2900,6 +2964,35 @@ fn validate_config(
     right: &Schema,
     config: &TemporalJoinStateConfig,
 ) -> Result<(), DbError> {
+    fn reject_expansion_prone_checkpoint_type(
+        data_type: &DataType,
+        side: &str,
+    ) -> Result<(), DbError> {
+        match data_type {
+            DataType::RunEndEncoded(_, _) => Err(DbError::Config(format!(
+                "temporal {side} input rejects run-end encoded fields because checkpoint row compaction can expand their retained representation"
+            ))),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => {
+                reject_expansion_prone_checkpoint_type(field.data_type(), side)
+            }
+            DataType::Struct(fields) => fields
+                .iter()
+                .try_for_each(|field| reject_expansion_prone_checkpoint_type(field.data_type(), side)),
+            DataType::Union(fields, _) => fields.iter().try_for_each(|(_, field)| {
+                reject_expansion_prone_checkpoint_type(field.data_type(), side)
+            }),
+            DataType::Dictionary(_, value) => {
+                reject_expansion_prone_checkpoint_type(value.as_ref(), side)
+            }
+            _ => Ok(()),
+        }
+    }
+
     if config.vnode >= config.vnode_count.get() {
         return Err(DbError::Config(
             "temporal vnode is outside vnode count".into(),
@@ -2946,6 +3039,11 @@ fn validate_config(
     }
     validate_position_schema(left, "left")?;
     validate_position_schema(right, "right")?;
+    for (schema, side) in [(left, "left"), (right, "right")] {
+        for field in schema.fields() {
+            reject_expansion_prone_checkpoint_type(field.data_type(), side)?;
+        }
+    }
     if config.left_name.is_empty()
         || config.right_name.is_empty()
         || config.operator_name.is_empty()
@@ -3350,8 +3448,136 @@ fn compact_rows(schema: &Schema, rows: &[RowRef], side: &str) -> Result<RecordBa
         .map_err(|error| DbError::Checkpoint(format!("temporal {side} compaction: {error}")))
 }
 
+fn compact_detached_rows(
+    schema: &Schema,
+    rows: &[RowRef],
+    side: &str,
+) -> Result<RecordBatch, DbError> {
+    let compacted = compact_rows(schema, rows, side)?;
+    let columns = compacted
+        .columns()
+        .iter()
+        .cloned()
+        .map(|column| detach_compacted_buffers(column, side))
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new(Arc::new(schema.clone()), columns)
+        .map_err(|error| DbError::Checkpoint(format!("temporal {side} compaction: {error}")))
+}
+
+fn detach_compacted_buffers(array: ArrayRef, side: &str) -> Result<ArrayRef, DbError> {
+    fn detach_data(data: ArrayData) -> Result<ArrayData, arrow::error::ArrowError> {
+        // Dictionary and nested interleave paths may return zero-copy slices of their inputs.
+        // Retained temporal state must not keep any allocation owned by the expanded legacy IPC
+        // batch, so recursively detach every buffer after row canonicalization. Copy byte-view
+        // buffers as-is: Arrow's `gc` duplicates repeated non-inline views and is not charge-
+        // monotone for deduplicated data buffers.
+        let children = data
+            .child_data()
+            .iter()
+            .cloned()
+            .map(detach_data)
+            .collect::<Result<Vec<_>, _>>()?;
+        let buffers = data
+            .buffers()
+            .iter()
+            .map(|buffer| arrow::buffer::Buffer::from(buffer.as_slice()))
+            .collect();
+        let nulls = data
+            .nulls()
+            .map(|nulls| nulls.iter().collect::<arrow::buffer::NullBuffer>());
+        data.into_builder()
+            .buffers(buffers)
+            .child_data(children)
+            .nulls(nulls)
+            .build()
+    }
+
+    detach_data(array.to_data())
+        .map(make_array)
+        .map_err(|error| DbError::Checkpoint(format!("temporal {side} buffer compaction: {error}")))
+}
+
 fn batch_charge(batch: &RecordBatch) -> Option<usize> {
-    batch.get_array_memory_size().checked_add(BATCH_CHARGE)
+    struct BufferStats {
+        repeated_capacity: usize,
+        repeated_length: usize,
+        buffer_count: usize,
+        node_count: usize,
+        validity_upper_bound: usize,
+        unique: FxHashMap<usize, usize>,
+    }
+
+    fn collect_buffer_stats(data: &ArrayData, stats: &mut BufferStats) -> Option<()> {
+        stats.node_count = stats.node_count.checked_add(1)?;
+        stats.validity_upper_bound = stats
+            .validity_upper_bound
+            .checked_add(data.len().checked_add(7)?.checked_div(8)?)?;
+        let mut visit = |buffer: &arrow::buffer::Buffer| -> Option<()> {
+            let capacity = buffer.capacity();
+            stats.repeated_capacity = stats.repeated_capacity.checked_add(capacity)?;
+            stats.repeated_length = stats.repeated_length.checked_add(buffer.len())?;
+            stats.buffer_count = stats.buffer_count.checked_add(1)?;
+            if capacity != 0 {
+                let allocation = buffer.data_ptr().as_ptr() as usize;
+                stats
+                    .unique
+                    .entry(allocation)
+                    .and_modify(|known| *known = (*known).max(capacity))
+                    .or_insert(capacity);
+            }
+            Some(())
+        };
+        for buffer in data.buffers() {
+            visit(buffer)?;
+        }
+        if let Some(nulls) = data.nulls() {
+            visit(nulls.buffer())?;
+        }
+        for child in data.child_data() {
+            collect_buffer_stats(child, stats)?;
+        }
+        Some(())
+    }
+
+    // Arrow IPC decodes every column as slices of one shared record-body allocation. Arrow's
+    // `get_array_memory_size` deliberately sums each slice's underlying Buffer capacity and can
+    // therefore charge one allocation once per column. Keep the full capacity of every unique
+    // allocation, plus a representation-independent upper bound for the canonical uncompressed
+    // IPC body: every referenced buffer length, one possible validity bitmap per ArrayData node,
+    // and one 64-byte alignment unit per buffer/node. Taking the maximum admits IPC padding while
+    // still charging large sliced/backing allocations in live input. A captured batch can then be
+    // restored under the same hard limit without weakening retained-allocation accounting.
+    let arrays = batch.columns().iter().try_fold(0usize, |total, array| {
+        total.checked_add(array.get_array_memory_size())
+    })?;
+    let mut stats = BufferStats {
+        repeated_capacity: 0,
+        repeated_length: 0,
+        buffer_count: 0,
+        node_count: 0,
+        validity_upper_bound: 0,
+        unique: FxHashMap::default(),
+    };
+    for array in batch.columns() {
+        collect_buffer_stats(&array.to_data(), &mut stats)?;
+    }
+    let unique_buffer_capacity = stats
+        .unique
+        .values()
+        .try_fold(0usize, |total, capacity| total.checked_add(*capacity))?;
+    let ipc_alignment = stats
+        .buffer_count
+        .checked_add(stats.node_count)?
+        .checked_add(1)?
+        .checked_mul(64)?;
+    let canonical_ipc_capacity = stats
+        .repeated_length
+        .checked_add(stats.validity_upper_bound)?
+        .checked_add(ipc_alignment)?;
+    arrays
+        .checked_sub(stats.repeated_capacity)?
+        .checked_add(unique_buffer_capacity.max(canonical_ipc_capacity))?
+        .checked_add(BATCH_CHARGE)
 }
 
 fn cutoff_is_newer(candidate: Option<i64>, completed: Option<i64>) -> bool {
@@ -3420,7 +3646,12 @@ fn calculate_charge(state: &TemporalJoinVnodeState) -> Result<usize, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{StringArray, TimestampMillisecondArray, UInt8Array};
+    use arrow::array::{
+        ArrayAccessor, DictionaryArray, Int32Array, StringArray, TimestampMillisecondArray,
+        UInt8Array,
+    };
+    use arrow::array::{StringViewArray, StringViewBuilder};
+    use arrow::datatypes::Int32Type;
     use laminar_connectors::connector::{
         schema_with_source_mutations_and_row_positions, source_mutations,
     };
@@ -3429,6 +3660,40 @@ mod tests {
         Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, true),
             Field::new(format!("{prefix}_value"), DataType::Int64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false),
+            Field::new(SOURCE_ORDER_COLUMN, DataType::Binary, false),
+            Field::new(SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32, false),
+        ]))
+    }
+
+    fn view_schema(prefix: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new(format!("{prefix}_value"), DataType::Utf8View, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false),
+            Field::new(SOURCE_ORDER_COLUMN, DataType::Binary, false),
+            Field::new(SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32, false),
+        ]))
+    }
+
+    fn dictionary_schema(prefix: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new(
+                format!("{prefix}_value"),
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8View)),
+                true,
+            ),
             Field::new(
                 "ts",
                 DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -3464,6 +3729,55 @@ mod tests {
                 Arc::new(UInt32Array::from_iter_values(
                     0..u32::try_from(rows).unwrap(),
                 )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn view_batch(
+        schema: SchemaRef,
+        keys: Vec<Option<&str>>,
+        values: Vec<Option<&str>>,
+        times: Vec<Option<i64>>,
+        orders: Vec<u8>,
+    ) -> RecordBatch {
+        let rows = keys.len();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(StringViewArray::from(values)),
+                Arc::new(TimestampMillisecondArray::from(times)),
+                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                    b"p0".as_slice(),
+                    rows,
+                ))),
+                Arc::new(BinaryArray::from_iter_values(
+                    orders.into_iter().map(|order| vec![order]),
+                )),
+                Arc::new(UInt32Array::from_iter_values(
+                    0..u32::try_from(rows).unwrap(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn dictionary_batch(schema: SchemaRef, value: &str) -> RecordBatch {
+        let dictionary = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(vec![Some(0)]),
+            Arc::new(StringViewArray::from(vec![Some(value)])),
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("A")])),
+                Arc::new(dictionary),
+                Arc::new(TimestampMillisecondArray::from(vec![Some(100)])),
+                Arc::new(BinaryArray::from_iter_values([b"p0".as_slice()])),
+                Arc::new(BinaryArray::from_iter_values([b"1".as_slice()])),
+                Arc::new(UInt32Array::from(vec![0])),
             ],
         )
         .unwrap()
@@ -3637,6 +3951,319 @@ mod tests {
             state.accounted_state_bytes(),
             calculate_charge(&state).unwrap()
         );
+    }
+
+    #[test]
+    fn ipc_compaction_does_not_multiply_shared_buffer_accounting() {
+        let input = batch(
+            schema("right"),
+            vec![Some("A"), Some("B"), Some("C")],
+            vec![Some(10), Some(20), Some(30)],
+            vec![Some(100), Some(200), Some(300)],
+            vec![1, 2, 3],
+        );
+        let encoded = serialize_batches_stream_bounded(
+            input.schema().as_ref(),
+            std::iter::once(&input),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let restored = deserialize_batch_stream(&encoded).unwrap();
+
+        // IPC columns share one record-body allocation, so Arrow's generic memory-size helper
+        // counts substantially more than the allocator actually retains for this batch.
+        assert!(restored.get_array_memory_size() > input.get_array_memory_size());
+        let live_charge = batch_charge(&input).unwrap();
+        let restored_charge = batch_charge(&restored).unwrap();
+        assert!(
+            restored_charge <= live_charge,
+            "IPC restore increased canonical temporal batch charge from {live_charge} to {restored_charge}"
+        );
+    }
+
+    #[test]
+    fn ipc_padding_charge_is_stable_for_many_narrow_columns() {
+        let fields = (0..64)
+            .map(|column| Field::new(format!("c{column}"), DataType::Int64, false))
+            .collect::<Vec<_>>();
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(fields)),
+            (0..64)
+                .map(|value| Arc::new(Int64Array::from(vec![value])) as ArrayRef)
+                .collect(),
+        )
+        .unwrap();
+        let encoded = serialize_batches_stream_bounded(
+            input.schema().as_ref(),
+            std::iter::once(&input),
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+        let restored = deserialize_batch_stream(&encoded).unwrap();
+
+        assert!(restored.get_array_memory_size() > input.get_array_memory_size());
+        assert!(batch_charge(&restored).unwrap() <= batch_charge(&input).unwrap());
+    }
+
+    #[test]
+    fn detached_view_compaction_preserves_deduplicated_backing_charge() {
+        let rows = 8;
+        let payload = "x".repeat(128 * 1024);
+        let mut values = StringViewBuilder::with_capacity(rows)
+            .with_fixed_block_size(u32::try_from(payload.len()).unwrap())
+            .with_deduplicate_strings();
+        for _ in 0..rows {
+            values.append_value(&payload);
+        }
+        let values = values.finish();
+        assert_eq!(values.data_buffers().len(), 1);
+        assert!(values.views().windows(2).all(|views| views[0] == views[1]));
+        let left_schema = view_schema("left");
+        let left = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"); rows])),
+                Arc::new(values),
+                Arc::new(TimestampMillisecondArray::from(vec![Some(100); rows])),
+                Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                    b"p0".as_slice(),
+                    rows,
+                ))),
+                Arc::new(BinaryArray::from_iter_values(
+                    (1..=u8::try_from(rows).unwrap()).map(|order| vec![order]),
+                )),
+                Arc::new(UInt32Array::from_iter_values(
+                    0..u32::try_from(rows).unwrap(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut cfg = config(
+            TemporalJoinKind::Left,
+            TemporalProbeSchedule::list((1..=16).map(i64::from).collect()).unwrap(),
+        );
+        cfg.limits.max_pending_probes = 256;
+        let mut state =
+            TemporalJoinVnodeState::try_new(Arc::clone(&left_schema), schema("right"), cfg.clone())
+                .unwrap();
+        assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(state.pending_probes(), rows * 16);
+        let live_limit = state.accounted_state_bytes();
+        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+
+        cfg.limits.max_retained_bytes = live_limit;
+        let restored =
+            TemporalJoinVnodeState::restore(left_schema, schema("right"), cfg, &checkpoint)
+                .unwrap();
+        assert!(restored.accounted_state_bytes() <= live_limit);
+        let retained = restored.left_batches.values().next().unwrap();
+        assert_eq!(retained.batch.num_rows(), rows);
+        assert_eq!(retained.references, rows * 16);
+        let restored_values = retained
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(restored_values.data_buffers().len(), 1);
+        assert!(restored_values
+            .iter()
+            .all(|value| value == Some(payload.as_str())));
+    }
+
+    #[test]
+    fn checkpoint_compaction_restores_within_the_live_state_limit() {
+        let mut cfg = config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of());
+        let mut state =
+            TemporalJoinVnodeState::try_new(schema("left"), schema("right"), cfg.clone()).unwrap();
+        let keys = (0..200).map(|key| format!("K{key:03}")).collect::<Vec<_>>();
+        let key_refs = keys
+            .iter()
+            .map(|key| Some(key.as_str()))
+            .collect::<Vec<_>>();
+        let input = batch(
+            schema("right"),
+            key_refs,
+            (0..200).map(|value| Some(i64::from(value))).collect(),
+            (0..200).map(|time| Some(1_000 + i64::from(time))).collect(),
+            (0..200).map(|order| order as u8).collect(),
+        );
+        state.apply_right_batch(&input, None).unwrap();
+        let live_limit = state.accounted_state_bytes();
+        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+
+        cfg.limits.max_retained_bytes = live_limit;
+        let restored =
+            TemporalJoinVnodeState::restore(schema("left"), schema("right"), cfg, &checkpoint)
+                .unwrap();
+        assert!(restored.accounted_state_bytes() <= live_limit);
+        assert_eq!(restored.retained_versions(), state.retained_versions());
+    }
+
+    #[test]
+    fn temporal_checkpoint_admission_rejects_run_end_encoded_fields() {
+        let mut fields = schema("left").fields().to_vec();
+        fields[1] = Arc::new(Field::new(
+            "left_value",
+            DataType::RunEndEncoded(
+                Arc::new(Field::new("run_ends", DataType::Int32, false)),
+                Arc::new(Field::new("values", DataType::Utf8, true)),
+            ),
+            true,
+        ));
+        let error = TemporalJoinVnodeState::try_new(
+            Arc::new(Schema::new(fields)),
+            schema("right"),
+            config(TemporalJoinKind::Left, TemporalProbeSchedule::as_of()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("run-end encoded"));
+    }
+
+    #[test]
+    fn legacy_list_probe_checkpoint_canonicalizes_view_backing_and_one_left_row() {
+        let offsets = (1..=32).map(i64::from).collect::<Vec<_>>();
+        let mut cfg = config(
+            TemporalJoinKind::Left,
+            TemporalProbeSchedule::list(offsets).unwrap(),
+        );
+        cfg.limits.max_offsets_per_row = 64;
+        let left_schema = view_schema("left");
+        let mut state =
+            TemporalJoinVnodeState::try_new(Arc::clone(&left_schema), schema("right"), cfg.clone())
+                .unwrap();
+        let left = view_batch(
+            Arc::clone(&left_schema),
+            vec![Some("A")],
+            vec![Some(
+                "a deliberately long payload retained by an Arrow string view",
+            )],
+            vec![Some(100)],
+            vec![1],
+        );
+        assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(state.pending_probes(), 32);
+        let live_limit = state.accounted_state_bytes();
+        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+
+        let mut decoded =
+            rkyv::from_bytes::<TemporalJoinCheckpoint, rkyv::rancor::Error>(&checkpoint).unwrap();
+        assert_eq!(decoded.pending.len(), 32);
+        assert_eq!(
+            decoded
+                .pending
+                .iter()
+                .map(|probe| probe.left_row)
+                .collect::<Vec<_>>(),
+            (0..32).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            deserialize_batch_stream(&decoded.left_rows_ipc)
+                .unwrap()
+                .num_rows(),
+            32
+        );
+        decoded.pending[1].left_row = 0;
+        let writer = rkyv::ser::writer::IoWriter::new(
+            laminar_core::serialization::BoundedBytesWriter::new(4 * 1024 * 1024),
+        );
+        let corrupt = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(&decoded, writer)
+            .unwrap()
+            .into_inner()
+            .into_vec();
+        assert!(TemporalJoinVnodeState::restore(
+            Arc::clone(&left_schema),
+            schema("right"),
+            cfg.clone(),
+            &corrupt,
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("row references are invalid"));
+
+        cfg.limits.max_retained_bytes = live_limit;
+        let mut restored = TemporalJoinVnodeState::restore(
+            Arc::clone(&left_schema),
+            schema("right"),
+            cfg,
+            &checkpoint,
+        )
+        .unwrap();
+        assert_eq!(restored.pending_probes(), 32);
+        assert!(restored.accounted_state_bytes() <= live_limit);
+        let retained = restored.left_batches.values().next().unwrap();
+        assert_eq!(retained.batch.num_rows(), 1);
+        assert_eq!(retained.references, 32);
+        let restored_view = retained
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(
+            restored_view.value(0),
+            "a deliberately long payload retained by an Arrow string view"
+        );
+        assert_eq!(restored_view.data_buffers().len(), 1);
+        restored.advance_right_frontier(Some(102), false).unwrap();
+        let first = restored
+            .drain_ready_probes(NonZeroUsize::new(1).unwrap())
+            .unwrap();
+        assert_eq!(first.drained_probes, 1);
+        let retained = restored.left_batches.values().next().unwrap();
+        assert_eq!(retained.batch.num_rows(), 1);
+        assert_eq!(retained.references, 31);
+        restored.advance_right_frontier(Some(1_000), false).unwrap();
+        let drained = restored
+            .drain_ready_probes(NonZeroUsize::new(64).unwrap())
+            .unwrap();
+        assert_eq!(drained.drained_probes, 31);
+        assert_eq!(drained.output.num_rows(), 31);
+        assert_eq!(restored.pending_probes(), 0);
+        assert!(restored.left_batches.is_empty());
+        assert_eq!(
+            restored.accounted_state_bytes(),
+            calculate_charge(&restored).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_list_probe_checkpoint_detaches_dictionary_backing() {
+        let schedule = TemporalProbeSchedule::list((1..=32).map(i64::from).collect()).unwrap();
+        let mut cfg = config(TemporalJoinKind::Left, schedule);
+        cfg.limits.max_offsets_per_row = 64;
+        let left_schema = dictionary_schema("left");
+        let mut state =
+            TemporalJoinVnodeState::try_new(Arc::clone(&left_schema), schema("right"), cfg.clone())
+                .unwrap();
+        // An inline View makes Arrow's `gc` take its zero-buffer fast path. The recursive copier
+        // must still detach its views/null allocation from the expanded decoded IPC body.
+        let value = "inline";
+        let left = dictionary_batch(Arc::clone(&left_schema), value);
+        assert_eq!(state.probe_left_batch(&left).unwrap().num_rows(), 0);
+        assert_eq!(state.pending_probes(), 32);
+        let live_limit = state.accounted_state_bytes();
+        let checkpoint = state.checkpoint(4 * 1024 * 1024).unwrap();
+
+        cfg.limits.max_retained_bytes = live_limit;
+        let restored =
+            TemporalJoinVnodeState::restore(left_schema, schema("right"), cfg, &checkpoint)
+                .unwrap();
+        assert!(restored.accounted_state_bytes() <= live_limit);
+        let retained = restored.left_batches.values().next().unwrap();
+        assert_eq!(retained.batch.num_rows(), 1);
+        assert_eq!(retained.references, 32);
+        let dictionary = retained
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap()
+            .downcast_dict::<StringViewArray>()
+            .unwrap();
+        assert_eq!(dictionary.value(0), value);
     }
 
     #[test]

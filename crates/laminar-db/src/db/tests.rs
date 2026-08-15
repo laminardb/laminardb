@@ -130,6 +130,11 @@ async fn vnode_state_readiness_requires_the_bound_pipeline_and_exact_assignment(
     )
     .unwrap();
 
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+    DbState::Running.store(&db.state);
     assert!(db
         .local_vnode_state_is_ready(&registry, &assignment)
         .await
@@ -767,6 +772,8 @@ async fn audited_final_owner_exit_preserves_predecessor_binding_until_graph_publ
 struct VnodeAcquisitionProbe {
     live: Arc<parking_lot::Mutex<std::collections::BTreeMap<u32, Vec<u8>>>>,
     prepared: Option<std::collections::BTreeMap<u32, Vec<u8>>>,
+    whole: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
+    prepared_whole: Option<Option<Vec<u8>>>,
     prepare_count: Arc<std::sync::atomic::AtomicUsize>,
     publish_count: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -794,7 +801,7 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
         &mut self,
         transition: crate::operator_graph::ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
-        if self.prepared.is_some() || !transition.whole_restores.is_empty() {
+        if self.prepared.is_some() || self.prepared_whole.is_some() {
             return Err(DbError::Checkpoint(
                 "acquisition probe received an invalid prepared transition".into(),
             ));
@@ -806,7 +813,19 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
         for restore in transition.restores {
             prepared.insert(restore.vnode, restore.state.to_vec());
         }
+        let prepared_whole = match transition.whole_restores {
+            [] => self.whole.lock().clone(),
+            [restore] if restore.participant_id == 2 && restore.state == b"donor-whole" => {
+                Some(restore.state.to_vec())
+            }
+            _ => {
+                return Err(DbError::Checkpoint(
+                    "acquisition probe did not receive the exact donor whole frame".into(),
+                ));
+            }
+        };
         self.prepared = Some(prepared);
+        self.prepared_whole = Some(prepared_whole);
         self.prepare_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -814,6 +833,7 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
 
     fn abort_vnode_transition(&mut self) {
         self.prepared = None;
+        self.prepared_whole = None;
     }
 
     fn publish_vnode_transition(&mut self) {
@@ -821,6 +841,10 @@ impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
             .prepared
             .take()
             .expect("acquisition probe transition must be prepared");
+        *self.whole.lock() = self
+            .prepared_whole
+            .take()
+            .expect("acquisition probe whole transition must be prepared");
         self.publish_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -869,13 +893,34 @@ async fn record_two_vnode_acquisition_checkpoint(
         let store = ObjectStoreCheckpointStore::new(Arc::clone(objects), "")
             .with_key_group_count(key_groups)
             .with_participant_id(participant_id);
-        let payload = bytes::Bytes::copy_from_slice(state);
+        let whole = (participant_id == 2).then_some(b"donor-whole".as_slice());
+        let mut payload_bytes =
+            Vec::with_capacity(state.len() + whole.as_ref().map_or(0, |whole| whole.len()));
+        if let Some(whole) = whole {
+            payload_bytes.extend_from_slice(whole);
+        }
+        payload_bytes.extend_from_slice(state);
+        let payload = bytes::Bytes::from(payload_bytes);
         let mut manifest = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
         manifest.bind_participant(participant_id);
         manifest.pipeline_identity = pipeline_identity.clone();
         manifest.deployment_id.clone_from(&deployment_id);
         manifest.assignment_fence = Some(fence.clone());
+        manifest.reassignment_portable = true;
         manifest.owned_vnodes = vec![vnode];
+        if let Some(whole) = whole {
+            manifest.state_frames.push(StateFrame {
+                key: StateFrameKey::OperatorWhole {
+                    operator_id: "graph:acquisition-probe".into(),
+                },
+                chunk: manifest.node_data.chunk,
+                range: ByteRange {
+                    offset: 0,
+                    length: whole.len() as u64,
+                },
+                sha256: checkpoint_sha256(whole),
+            });
+        }
         manifest.state_frames.push(StateFrame {
             key: StateFrameKey::Vnode {
                 operator_id: "graph:acquisition-probe".into(),
@@ -883,10 +928,10 @@ async fn record_two_vnode_acquisition_checkpoint(
             },
             chunk: manifest.node_data.chunk,
             range: ByteRange {
-                offset: 0,
-                length: payload.len() as u64,
+                offset: whole.map_or(0, |whole| whole.len()) as u64,
+                length: state.len() as u64,
             },
-            sha256: checkpoint_sha256(&payload),
+            sha256: checkpoint_sha256(state),
         });
         manifest.node_data.object_length = payload.len() as u64;
         manifest.node_data.sha256 = checkpoint_sha256(&payload);
@@ -907,11 +952,13 @@ async fn record_two_vnode_acquisition_checkpoint(
         scope: CheckpointScope::Cluster,
         vnode_count: key_groups.get(),
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor: None,
         participants,
         source_names: Vec::new(),
         source_offsets: Default::default(),
         channel_progress: Vec::new(),
+        source_watermarks: Default::default(),
         checkpoint_watermark: None,
     };
     let reference = authority.create_committed_checkpoint(&index).await.unwrap();
@@ -1004,7 +1051,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
     authority
         .record_assignment_drain_decision(
             &transition.leader,
-            AssignmentDrainDecision::commit(transition, leader, handoff).unwrap(),
+            AssignmentDrainDecision::commit(transition, leader, handoff.clone()).unwrap(),
         )
         .await
         .unwrap();
@@ -1021,7 +1068,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::clone(&objects))
         .vnode_registry(Arc::clone(&registry))
-        .assignment_snapshot_store(assignments)
+        .assignment_snapshot_store(Arc::clone(&assignments))
         .build()
         .await
         .unwrap();
@@ -1043,6 +1090,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .unwrap();
     coordinator.set_assignment_version(predecessor.version);
     coordinator.set_vnode_set(vec![0]);
+    coordinator.set_last_committed_ref_for_test(handoff.clone());
     *db.coordinator.lock().await = Some(coordinator);
     *db.installed_vnode_state.lock() = Some(
         crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
@@ -1052,27 +1100,54 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .unwrap(),
     );
 
-    db.adopt_assignment_snapshot(
-        target.clone(),
-        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
+    let exact_adoption = db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(!exact_adoption.recovery_required);
     let pending = db.pending_vnode_transition.lock().clone().unwrap();
     assert_eq!(pending.acquired_vnodes(), &[1]);
-    assert_eq!(pending.state_frames().len(), 1);
-    assert_eq!(pending.state_frames()[0].participant_id, donor_id.0);
+    assert_eq!(pending.state_frames().len(), 2);
+    let pending_vnode = pending
+        .state_frames()
+        .iter()
+        .find(|frame| {
+            matches!(
+                &frame.key,
+                laminar_core::checkpoint::StateFrameKey::Vnode { .. }
+            )
+        })
+        .unwrap();
+    let pending_whole = pending
+        .state_frames()
+        .iter()
+        .find(|frame| {
+            matches!(
+                &frame.key,
+                laminar_core::checkpoint::StateFrameKey::OperatorWhole { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(pending_vnode.participant_id, donor_id.0);
     assert_eq!(
-        pending.state_frames()[0].key,
-        laminar_core::checkpoint::StateFrameKey::Vnode {
+        &pending_vnode.key,
+        &laminar_core::checkpoint::StateFrameKey::Vnode {
             operator_id: "graph:acquisition-probe".into(),
             vnode: 1,
         }
     );
+    assert_eq!(pending_vnode.payload, b"acquired-state".as_slice());
+    assert_eq!(pending_whole.participant_id, donor_id.0);
     assert_eq!(
-        pending.state_frames()[0].payload,
-        b"acquired-state".as_slice()
+        &pending_whole.key,
+        &laminar_core::checkpoint::StateFrameKey::OperatorWhole {
+            operator_id: "graph:acquisition-probe".into(),
+        }
     );
+    assert_eq!(pending_whole.payload, b"donor-whole".as_slice());
     assert!(db
         .installed_vnode_state
         .lock()
@@ -1113,6 +1188,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
     ));
     let prepare_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let publish_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let whole = Arc::new(parking_lot::Mutex::new(None));
     let mut graph =
         crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
     graph.set_key_group_count(key_groups);
@@ -1121,6 +1197,8 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         Box::new(VnodeAcquisitionProbe {
             live: Arc::clone(&live),
             prepared: None,
+            whole: Arc::clone(&whole),
+            prepared_whole: None,
             prepare_count: Arc::clone(&prepare_count),
             publish_count: Arc::clone(&publish_count),
         }),
@@ -1154,6 +1232,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .is_some_and(|binding| binding.matches(&target_fence, &identity)));
     assert_eq!(prepare_count.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(whole.lock().as_deref(), Some(b"donor-whole".as_slice()));
 
     let owners = [self_id, self_id];
     let owner_ids = [self_id.0, self_id.0];
@@ -1194,6 +1273,75 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         .lock()
         .as_ref()
         .is_some_and(|binding| binding.matches(&topology_target, &identity)));
+
+    // A replacement whose complete resident cut does not exactly match the handoff must publish
+    // only the target topology. Importing donor vnode frames into that source/runtime generation
+    // would mix checkpoint cuts and can regress a managed operator frontier on the next barrier.
+    let lagging_registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    lagging_registry
+        .set_assignment_and_version(Arc::from([self_id, donor_id]), predecessor.version);
+    let lagging_db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::clone(&objects))
+        .vnode_registry(Arc::clone(&lagging_registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&lagging_db.state);
+    let lagging_store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "")
+        .with_key_group_count(key_groups)
+        .with_participant_id(self_id.0);
+    let mut lagging_coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(lagging_store),
+    )
+    .unwrap();
+    lagging_coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    lagging_coordinator.set_assignment_version(predecessor.version);
+    lagging_coordinator.set_vnode_set(vec![0]);
+    let mut different_cut = handoff.clone();
+    different_cut.sha256 = "00".repeat(32);
+    assert_ne!(different_cut, handoff);
+    lagging_coordinator.set_last_committed_ref_for_test(different_cut);
+    *lagging_db.coordinator.lock().await = Some(lagging_coordinator);
+    *lagging_db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            predecessor_fence,
+            identity,
+        )
+        .unwrap(),
+    );
+
+    let lagging_adoption = lagging_db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(lagging_adoption.adopted);
+    assert!(lagging_adoption.recovery_required);
+    assert_eq!(lagging_registry.assignment_version(), target.version);
+    assert!(lagging_db.pending_vnode_transition.lock().is_none());
+    assert!(lagging_db.installed_vnode_state.lock().is_none());
+    assert!(lagging_db.cluster_intake_fenced());
+    assert!(lagging_db.coordinated_recovery_in_progress());
+    assert!(controller.is_recovering());
+    assert!(controller.checkpoint_assignment_watch().borrow().is_none());
+    assert!(controller.checkpoint_drain_transition().is_none());
+    assert!(!lagging_db
+        .local_vnode_state_is_ready(&lagging_registry, &target.assignment_fence().unwrap())
+        .await
+        .unwrap());
+    assert_ne!(
+        lagging_db
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -2193,6 +2341,157 @@ async fn manual_checkpoint_before_start_fails_closed() {
     assert!(
         matches!(&error, DbError::Checkpoint(message) if message.contains("not running")),
         "manual checkpoint without a live coordinator must fail closed, got {error:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn admitted_manual_checkpoint_wait_is_bounded_until_exact_attempt_reservation() {
+    let db = LaminarDB::open_with_config(LaminarConfig {
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    DbState::Running.store(&db.state);
+    let (force_tx, force_rx) = crossfire::mpsc::bounded_async::<ForceCheckpointRequest>(1);
+    *db.force_ckpt_tx.lock() = Some(force_tx);
+
+    let checkpoint = db.checkpoint_with_timeout(std::time::Duration::from_secs(1));
+    tokio::pin!(checkpoint);
+    let mut held_request = tokio::select! {
+        result = &mut checkpoint => panic!(
+            "checkpoint completed before its accepted request could be observed: {result:?}"
+        ),
+        request = force_rx.recv() => request.expect("manual checkpoint sender remained live"),
+    };
+    assert!(held_request.reservation_claim.is_some());
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let result = futures::poll!(checkpoint.as_mut());
+    let std::task::Poll::Ready(result) = result else {
+        panic!("an accepted but never-reserved request remained pending past its deadline");
+    };
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, DbError::Checkpoint(message)
+            if message.contains("deadline expired before exact attempt reservation")),
+        "unexpected pre-reservation deadline result: {error:?}"
+    );
+    assert!(
+        !held_request
+            .reservation_claim
+            .take()
+            .expect("request must retain its unclaimed reservation token")
+            .try_claim(),
+        "the coordinator claimed ownership after the caller's deadline won"
+    );
+
+    drop(held_request);
+    *db.force_ckpt_tx.lock() = None;
+    DbState::Created.store(&db.state);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reserved_manual_checkpoint_waits_for_terminal_reply_past_deadline() {
+    let db = LaminarDB::open_with_config(LaminarConfig {
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    DbState::Running.store(&db.state);
+    let (force_tx, force_rx) = crossfire::mpsc::bounded_async::<ForceCheckpointRequest>(1);
+    *db.force_ckpt_tx.lock() = Some(force_tx);
+
+    let checkpoint = db.checkpoint_with_timeout(std::time::Duration::from_secs(1));
+    tokio::pin!(checkpoint);
+    let mut request = tokio::select! {
+        result = &mut checkpoint => panic!(
+            "checkpoint completed before its accepted request could be observed: {result:?}"
+        ),
+        request = force_rx.recv() => request.expect("manual checkpoint sender remained live"),
+    };
+    let reservation_claim = request
+        .reservation_claim
+        .take()
+        .expect("request must carry one reservation claim");
+    assert!(
+        reservation_claim.try_claim(),
+        "coordinator must win bounded reservation ownership"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(
+        futures::poll!(checkpoint.as_mut()).is_pending(),
+        "a reserved request returned before exact-attempt cleanup became terminal"
+    );
+    assert_eq!(
+        reservation_claim.attach(tokio::time::Instant::now(), tokio::time::Instant::now(),),
+        ForceCheckpointReservationAttachment::Attached
+    );
+    request.reply.send(Err(DbError::Checkpoint(
+        "exact attempt cleanup completed".into(),
+    )));
+    let error = checkpoint.await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("exact attempt cleanup completed"));
+
+    *db.force_ckpt_tx.lock() = None;
+    DbState::Created.store(&db.state);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn forwarded_manual_checkpoint_never_reforwards_from_a_non_leader() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{
+        NodeId as ClusterNodeId, NodeInfo, NodeMetadata, NodeState,
+    };
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let node = ClusterNodeId(2);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let leader = NodeInfo {
+        id: ClusterNodeId(1),
+        name: "leader".into(),
+        rpc_address: "127.0.0.1:1".into(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![leader]);
+    let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+    install_test_process_deadline(&controller);
+    assert_eq!(controller.current_leader(), Some(ClusterNodeId(1)));
+    assert!(!controller.is_leader());
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(
+            1,
+            StateNodeId(node.0),
+        )))
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+
+    let error = db
+        .checkpoint_forwarded_with_timeout(std::time::Duration::from_secs(1))
+        .await
+        .expect_err("a forwarded request must never make a second network hop");
+    assert!(
+        error.to_string().contains("no longer the cluster leader"),
+        "{error}"
     );
 }
 

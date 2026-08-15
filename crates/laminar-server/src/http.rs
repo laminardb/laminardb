@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{future::Future as _, future::IntoFuture as _, task::Poll};
 
 use prometheus::Registry;
@@ -13,9 +13,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 #[cfg(feature = "cluster")]
 use axum::extract::{Extension, RawQuery};
 use axum::extract::{MatchedPath, Path, Query, State};
-use axum::http::StatusCode;
 #[cfg(feature = "cluster")]
-use axum::http::{HeaderMap, Method};
+use axum::http::Method;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -904,8 +904,33 @@ async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(ConnectorsResponse { sources, sinks })
 }
 
-async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.db.checkpoint().await {
+async fn trigger_checkpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let forwarded_budget = match headers.get("x-laminar-checkpoint-budget-nanos") {
+        None => None,
+        Some(value) => {
+            let parsed = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|budget| *budget != 0);
+            let Some(budget) = parsed else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid forwarded checkpoint budget",
+                )
+                .into_response();
+            };
+            Some(Duration::from_nanos(budget))
+        }
+    };
+    let result = match forwarded_budget {
+        Some(timeout) => state.db.checkpoint_forwarded_with_timeout(timeout).await,
+        None => state.db.checkpoint().await,
+    };
+    match result {
         Ok(result) => {
             let status = if result.success {
                 StatusCode::OK

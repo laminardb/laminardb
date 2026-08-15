@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
@@ -30,7 +31,8 @@ use crate::aggregate_state::{
 };
 #[cfg(feature = "cluster")]
 use crate::aggregate_state::{
-    OwnedAggVnodeRestore, PreparedAggVnodeTransition, RetiredAggVnodeTransition,
+    AggStateRestorePreflight, OwnedAggVnodeRestore, PreparedAggVnodeTransition,
+    RetiredAggVnodeTransition,
 };
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
@@ -38,7 +40,9 @@ use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
-use crate::operator_graph::{merge_input_frontier_iter, ManagedVnodeTransition};
+use crate::operator_graph::{
+    merge_input_frontier_iter, ManagedVnodeTransition, ManagedVnodeTransitionMode,
+};
 use crate::operator_graph::{
     try_evaluate_compiled, CapturedVnodeState, EncodedStateFrame, GraphOperator, InputFrontier,
     ManagedStateAccountingSnapshot, OperatorCheckpoint, StateFrameCapture,
@@ -46,6 +50,170 @@ use crate::operator_graph::{
 use crate::sql_analysis::{
     extract_projection_filter, projection_sql_preserving_weight, single_source_table,
 };
+
+// Keep batches created by local aggregate coalescing small enough to bound both accumulator work
+// and the temporary old-plus-new Arrow buffers held while concatenating one group.
+const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
+const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
+
+/// Whether Arrow concatenation is representation-stable for this local aggregate input type.
+///
+/// Dictionary and nested encodings can make independently valid batches fail only when their
+/// value spaces or offsets are merged. Preserve their original apply boundaries unless a
+/// type-specific coalescing proof is added.
+fn certifies_local_aggregate_concat_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+            | DataType::Binary
+            | DataType::FixedSizeBinary(_)
+            | DataType::LargeBinary
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+/// Coalesce already-projected local aggregate input without changing row or schema order.
+///
+/// The input is consumed so concatenation overlaps new Arrow buffers with only the current group.
+/// Existing oversized batches are preserved: these limits constrain only batches created here.
+fn coalesce_local_aggregate_batches(
+    op_name: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, DbError> {
+    // Retraction validity is checked at each weighted batch boundary. For example, [-1] then
+    // [+1] must reject the invalid prefix rather than being merged into a valid-looking zero.
+    if batches.iter().any(|batch| {
+        batch
+            .schema()
+            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
+            .is_ok()
+    }) {
+        return Ok(batches);
+    }
+
+    if batches.iter().any(|batch| {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| !certifies_local_aggregate_concat_type(field.data_type()))
+    }) {
+        return Ok(batches);
+    }
+
+    fn flush_group(
+        op_name: &str,
+        group: &mut Vec<RecordBatch>,
+        output: &mut Vec<RecordBatch>,
+    ) -> Result<(), DbError> {
+        match group.len() {
+            0 => Ok(()),
+            1 => {
+                output.push(
+                    group
+                        .pop()
+                        .expect("single aggregate coalescing group batch"),
+                );
+                Ok(())
+            }
+            _ => {
+                let schema = group[0].schema();
+                let combined = arrow::compute::concat_batches(&schema, group.as_slice())
+                    .map_err(|error| {
+                        DbError::Pipeline(format!(
+                            "aggregate '{op_name}' local input concat failed before state application: {error}"
+                        ))
+                    })?;
+                let logical_bytes = laminar_core::shuffle::logical_batch_bytes(&combined)
+                    .map_err(|error| {
+                        DbError::Pipeline(format!(
+                            "aggregate '{op_name}' local input size accounting failed before state application: {error}"
+                        ))
+                    })?;
+                if combined.num_rows() > LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
+                    || logical_bytes > LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "aggregate '{op_name}' coalesced local input exceeded its target before state application: {} rows/{logical_bytes} bytes (limits: {} rows/{} bytes)",
+                        combined.num_rows(),
+                        LOCAL_AGG_COALESCE_MAX_BATCH_ROWS,
+                        LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES,
+                    )));
+                }
+                group.clear();
+                output.push(combined);
+                Ok(())
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    let mut group = Vec::new();
+    let mut group_rows = 0usize;
+    let mut group_bytes = 0usize;
+
+    for batch in batches.into_iter().filter(|batch| batch.num_rows() != 0) {
+        let batch_rows = batch.num_rows();
+        let batch_bytes =
+            laminar_core::shuffle::logical_batch_bytes(&batch).map_err(|error| {
+                DbError::Pipeline(format!(
+                    "aggregate '{op_name}' local input size accounting failed before state application: {error}"
+                ))
+            })?;
+        let independently_coalescible = batch.num_rows() <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
+            && batch_bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES;
+        if !independently_coalescible {
+            flush_group(op_name, &mut group, &mut output)?;
+            group_rows = 0;
+            group_bytes = 0;
+            output.push(batch);
+            continue;
+        }
+
+        let same_schema = group
+            .first()
+            .is_none_or(|first: &RecordBatch| first.schema().as_ref() == batch.schema().as_ref());
+        let next_rows = group_rows.checked_add(batch.num_rows());
+        let next_bytes = group_bytes.checked_add(batch_bytes);
+        let fits = same_schema
+            && next_rows.is_some_and(|rows| rows <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS)
+            && next_bytes.is_some_and(|bytes| bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES);
+        if !fits {
+            flush_group(op_name, &mut group, &mut output)?;
+            group_rows = 0;
+            group_bytes = 0;
+        }
+        group.push(batch);
+        group_rows += batch_rows;
+        group_bytes += batch_bytes;
+    }
+    flush_group(op_name, &mut group, &mut output)?;
+    Ok(output)
+}
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -56,6 +224,16 @@ enum QueryState {
     CachedPlan(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
     // Multi-source JOIN; the hash table is rebuilt each cycle from fresh live-source data.
     CachedPhysical(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
+}
+
+/// A shallowly retained, final local full-state aggregate emission.
+///
+/// `retained_bytes` conservatively charges the Arrow backing allocations and batch/column rosters
+/// held by `batches`. Returned batches are shallow clones of these `RecordBatch` handles and do not
+/// add another cache charge.
+struct CachedLocalAggregateOutput {
+    batches: Vec<RecordBatch>,
+    retained_bytes: usize,
 }
 
 #[cfg(feature = "cluster")]
@@ -105,6 +283,55 @@ impl std::fmt::Debug for ClusterShuffleConfig {
 
 #[cfg(feature = "cluster")]
 const AGG_OP_CHECKPOINT_VERSION: u8 = 2;
+const AGG_CHECKPOINT_ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
+
+fn aggregate_checkpoint_alignment_copy_bytes(bytes: &[u8]) -> usize {
+    if bytes
+        .as_ptr()
+        .align_offset(AGG_CHECKPOINT_ARCHIVE_ALIGNMENT)
+        == 0
+    {
+        0
+    } else {
+        bytes.len()
+    }
+}
+
+fn with_aligned_aggregate_checkpoint_bytes<T>(
+    bytes: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, DbError>,
+) -> Result<T, DbError> {
+    let aligned;
+    let bytes = if aggregate_checkpoint_alignment_copy_bytes(bytes) == 0 {
+        bytes
+    } else {
+        let mut copy = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+        copy.extend_from_slice(bytes);
+        aligned = copy;
+        &aligned
+    };
+    decode(bytes)
+}
+
+#[cfg(feature = "cluster")]
+fn aggregate_transition_roster_scratch_bytes(
+    donor_capacity: usize,
+    preflight_capacity: usize,
+    lower_bound_capacity: usize,
+) -> Option<usize> {
+    donor_capacity
+        .checked_mul(std::mem::size_of::<u64>())
+        .and_then(|bytes| {
+            preflight_capacity
+                .checked_mul(std::mem::size_of::<(u32, &[u8], AggStateRestorePreflight)>())
+                .and_then(|preflight| bytes.checked_add(preflight))
+        })
+        .and_then(|bytes| {
+            lower_bound_capacity
+                .checked_mul(std::mem::size_of::<(u32, usize)>())
+                .and_then(|lower_bounds| bytes.checked_add(lower_bounds))
+        })
+}
 
 #[cfg(feature = "cluster")]
 #[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -130,6 +357,17 @@ impl From<AggCheckpointFrontier> for InputFrontier {
             watermark: frontier.watermark,
             idle: frontier.idle,
         }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn archived_agg_checkpoint_frontier(frontier: &ArchivedAggCheckpointFrontier) -> InputFrontier {
+    InputFrontier {
+        watermark: frontier
+            .watermark
+            .as_ref()
+            .map(|watermark| watermark.to_native()),
+        idle: frontier.idle,
     }
 }
 
@@ -646,6 +884,7 @@ pub(crate) struct SqlQueryOperator {
     execution_path_logged: bool,
     emit_changelog: bool,
     max_managed_state_bytes: usize,
+    cached_local_aggregate_output: Option<CachedLocalAggregateOutput>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
@@ -734,6 +973,7 @@ impl SqlQueryOperator {
             execution_path_logged: false,
             emit_changelog,
             max_managed_state_bytes: crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES,
+            cached_local_aggregate_output: None,
             #[cfg(feature = "cluster")]
             cluster_shuffle: None,
             #[cfg(feature = "cluster")]
@@ -769,8 +1009,103 @@ impl SqlQueryOperator {
         }
     }
 
+    fn local_full_aggregate_cache_enabled(&self) -> bool {
+        let QueryState::Agg(aggregate) = &self.state else {
+            return false;
+        };
+        if self.emit_changelog || aggregate.having_filter().is_some() {
+            return false;
+        }
+        #[cfg(feature = "cluster")]
+        {
+            self.cluster_shuffle.is_none()
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            true
+        }
+    }
+
+    fn invalidate_local_aggregate_output_cache(&mut self) {
+        self.cached_local_aggregate_output = None;
+    }
+
+    fn local_aggregate_output_cache_bytes(&self) -> usize {
+        self.cached_local_aggregate_output
+            .as_ref()
+            .map_or(0, |cached| cached.retained_bytes)
+    }
+
+    fn clone_cached_local_aggregate_output(&self) -> Option<Vec<RecordBatch>> {
+        if !self.local_full_aggregate_cache_enabled() {
+            return None;
+        }
+        self.cached_local_aggregate_output
+            .as_ref()
+            .map(|cached| cached.batches.clone())
+    }
+
+    fn try_cache_local_aggregate_output(&mut self, batches: &[RecordBatch]) {
+        self.invalidate_local_aggregate_output_cache();
+        if !self.local_full_aggregate_cache_enabled() {
+            return;
+        }
+        let retained_batches = batches.to_vec();
+        let Some(retained_bytes) = retained_batches
+            .capacity()
+            .checked_mul(std::mem::size_of::<RecordBatch>())
+            .and_then(|roster_bytes| {
+                retained_batches
+                    .iter()
+                    .try_fold(roster_bytes, |total, batch| {
+                        batch
+                            .num_columns()
+                            .checked_mul(std::mem::size_of::<arrow::array::ArrayRef>())
+                            .and_then(|columns| total.checked_add(columns))
+                            .and_then(|total| total.checked_add(batch.get_array_memory_size()))
+                    })
+            })
+        else {
+            return;
+        };
+        let QueryState::Agg(aggregate) = &self.state else {
+            return;
+        };
+        let Some(accounted_with_cache) = aggregate
+            .accounted_state_bytes()
+            .checked_add(retained_bytes)
+        else {
+            return;
+        };
+        if accounted_with_cache > self.max_managed_state_bytes {
+            return;
+        }
+        self.cached_local_aggregate_output = Some(CachedLocalAggregateOutput {
+            batches: retained_batches,
+            retained_bytes,
+        });
+    }
+
+    fn drop_local_aggregate_cache_over_budget(&mut self) {
+        let Some(cached) = self.cached_local_aggregate_output.as_ref() else {
+            return;
+        };
+        let QueryState::Agg(aggregate) = &self.state else {
+            self.invalidate_local_aggregate_output_cache();
+            return;
+        };
+        if aggregate
+            .accounted_state_bytes()
+            .checked_add(cached.retained_bytes)
+            .is_none_or(|accounted| accounted > self.max_managed_state_bytes)
+        {
+            self.invalidate_local_aggregate_output_cache();
+        }
+    }
+
     #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        self.invalidate_local_aggregate_output_cache();
         debug_assert!(self.cluster_shuffle.is_none());
         debug_assert_eq!(
             config.registry.vnode_count(),
@@ -791,6 +1126,7 @@ impl SqlQueryOperator {
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
+        self.invalidate_local_aggregate_output_cache();
         if let Some(agg_state) = IncrementalAggState::try_from_sql(
             &self.ctx,
             &self.sql,
@@ -1045,11 +1381,29 @@ impl SqlQueryOperator {
         Ok(batches)
     }
 
+    fn prepare_local_aggregate_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        match &self.state {
+            QueryState::Agg(aggregate) if aggregate.certifies_local_input_coalescing() => {
+                coalesce_local_aggregate_batches(&self.op_name, batches)
+            }
+            QueryState::Agg(_) => Ok(batches),
+            _ => Err(DbError::Pipeline(
+                "internal: local aggregate input preparation targeted non-aggregate state".into(),
+            )),
+        }
+    }
+
     fn apply_routed_aggregate(
         &mut self,
         batches: &[(RecordBatch, Option<u32>)],
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Any routed apply may change accumulator or tombstone state. Drop the reusable full-state
+        // emission before the first mutation so partial-apply failures cannot leave a stale cache.
+        self.invalidate_local_aggregate_output_cache();
         let QueryState::Agg(ref mut aggregate) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: routed aggregate apply targeted non-aggregate state".into(),
@@ -1066,15 +1420,22 @@ impl SqlQueryOperator {
         inputs: &[RecordBatch],
         watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Finish projection and all coalescing fallible work before aggregate state can change.
         let batches = self.pre_aggregate(inputs).await?;
+        let batches = self.prepare_local_aggregate_batches(batches)?;
         let routed = batches
             .into_iter()
             .map(|batch| (batch, None))
             .collect::<Vec<_>>();
-        self.apply_routed_aggregate(&routed, watermark)
+        let output = self
+            .apply_routed_aggregate(&routed, watermark)
             .map_err(|error| {
                 stateful_apply_outcome_unknown(&self.op_name, "state update or output", error)
-            })
+            })?;
+        // `emit_agg_output` has already applied HAVING. Cache only this successful final result;
+        // caching is an optional optimization and silently declines on accounting/budget limits.
+        self.try_cache_local_aggregate_output(&output);
+        Ok(output)
     }
 
     #[cfg(feature = "cluster")]
@@ -1134,6 +1495,121 @@ impl SqlQueryOperator {
             u32::from(self.key_group_count),
             &owners,
         )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn portable_handoff_cut(
+        &self,
+        transition: &ManagedVnodeTransition<'_>,
+        expected_donors: &[u64],
+    ) -> Result<Option<InputFrontier>, DbError> {
+        if transition.whole_restores.len() != expected_donors.len()
+            || !transition
+                .whole_restores
+                .iter()
+                .map(|restore| restore.participant_id)
+                .eq(expected_donors.iter().copied())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' portable whole donors do not exactly match acquired-state donors {expected_donors:?}",
+                self.op_name
+            )));
+        }
+        if expected_donors.is_empty() {
+            return Ok(None);
+        }
+
+        let predecessor_participants = &transition.predecessor.participants;
+        let mut common = None;
+        for restore in transition.whole_restores {
+            let cut = with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
+                let checkpoint = rkyv::access::<ArchivedAggOpCheckpoint, rkyv::rancor::Error>(
+                    state,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' donor {} whole checkpoint archive: {error}",
+                        self.op_name, restore.participant_id
+                    ))
+                })?;
+                if checkpoint.version != AGG_OP_CHECKPOINT_VERSION
+                    || checkpoint.assignment_version.to_native()
+                        != transition.predecessor.assignment_version
+                    || checkpoint.owner_map_digest != transition.predecessor.assignment_digest
+                    || checkpoint.self_id.to_native() != restore.participant_id
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate '{}' donor {} whole checkpoint is outside the portable predecessor cut",
+                        self.op_name, restore.participant_id
+                    )));
+                }
+
+                let expected_peer_count = predecessor_participants.len().saturating_sub(1);
+                // The v2 archive deliberately omits `accepted`: capture reconstructs the
+                // accepted frontier from `applied` plus the serialized event tail and rejects a
+                // mismatch. An empty validated tail is therefore exact accepted == applied
+                // evidence, not merely an absence of payload bytes.
+                if checkpoint.channels.len() != expected_peer_count
+                    || !checkpoint
+                        .channels
+                        .iter()
+                        .map(|channel| channel.peer.to_native())
+                        .eq(predecessor_participants.iter().filter_map(|participant| {
+                            (participant.node_id != restore.participant_id)
+                                .then_some(participant.node_id)
+                        }))
+                    || checkpoint
+                        .channels
+                        .iter()
+                        .any(|channel| !channel.events.is_empty())
+                    || checkpoint.remote_peer_cursor.as_ref().is_some_and(|peer| {
+                        let peer = peer.to_native();
+                        peer == restore.participant_id || !transition.predecessor.contains(peer)
+                    })
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate '{}' donor {} portable channel roster is invalid",
+                        self.op_name, restore.participant_id
+                    )));
+                }
+
+                let local = archived_agg_checkpoint_frontier(&checkpoint.local_frontier);
+                let effective = archived_agg_checkpoint_frontier(&checkpoint.effective_frontier);
+                self.validate_frontier(InputFrontier::default(), local, "portable local")?;
+                self.validate_frontier(InputFrontier::default(), effective, "portable effective")?;
+                for channel in checkpoint.channels.iter() {
+                    self.validate_frontier(
+                        InputFrontier::default(),
+                        archived_agg_checkpoint_frontier(&channel.applied),
+                        "portable remote",
+                    )?;
+                }
+                let merged = merge_input_frontier_iter(
+                    std::iter::once(local).chain(
+                        checkpoint
+                            .channels
+                            .iter()
+                            .map(|channel| archived_agg_checkpoint_frontier(&channel.applied)),
+                    ),
+                    i64::MIN,
+                );
+                if merged != effective {
+                    return Err(DbError::Checkpoint(format!(
+                        "aggregate '{}' donor {} portable frontiers do not form one drained cut",
+                        self.op_name, restore.participant_id
+                    )));
+                }
+                Ok(effective)
+            })?;
+            if common.is_some_and(|expected| expected != cut) {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate '{}' donor whole checkpoints disagree on the handoff frontier",
+                    self.op_name
+                )));
+            }
+            common = Some(cut);
+        }
+        Ok(common)
     }
 
     #[cfg(feature = "cluster")]
@@ -1217,6 +1693,7 @@ impl SqlQueryOperator {
         aggregate
             .checked_add(self.cluster_topology_bytes()?)
             .and_then(|bytes| bytes.checked_add(self.queued_payload_bytes))
+            .and_then(|bytes| bytes.checked_add(self.local_aggregate_output_cache_bytes()))
             .and_then(|bytes| {
                 bytes.checked_add(
                     self.pending_cluster_input
@@ -1476,6 +1953,24 @@ impl SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
+    fn cluster_cycle_local_frontier(
+        &self,
+        supplied: InputFrontier,
+        has_input: bool,
+    ) -> Result<InputFrontier, DbError> {
+        if self.last_broadcast == self.local_frontier {
+            return Ok(supplied);
+        }
+        if has_input {
+            return Err(DbError::InvalidOperation(format!(
+                "aggregate '{}' received local input before its restored frontier was broadcast",
+                self.op_name
+            )));
+        }
+        Ok(self.local_frontier)
+    }
+
+    #[cfg(feature = "cluster")]
     fn normalized_local_frontier(
         &self,
         input: InputFrontier,
@@ -1662,7 +2157,7 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn remote_replay_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::Checkpoint(format!(
@@ -1814,7 +2309,7 @@ impl SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn outbound_finalize_error(&self, error: DbError) -> DbError {
-        if error.requires_pipeline_recovery() {
+        if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
             error
         } else {
             DbError::ShufflePartialSend(format!(
@@ -1959,6 +2454,12 @@ impl SqlQueryOperator {
             return Ok(output);
         }
         let input_batches = inputs.first().map_or(&[][..], Vec::as_slice);
+        // A restored/transitioned topology deliberately leaves its exact local cut
+        // unbroadcast, which makes `wants_input` hold graph-buffered rows. Do not let the
+        // concurrently observed live source frontier leap over that cut during this
+        // frontier-only bootstrap cycle. Once the cut is acknowledged, normal node-local
+        // frontier advancement resumes on the next cycle.
+        let frontier = self.cluster_cycle_local_frontier(frontier, has_input)?;
         let local_frontier = self.normalized_local_frontier(frontier, has_input)?;
         let pre_aggregate = self.pre_aggregate(input_batches).await?;
         let plan =
@@ -2346,7 +2847,9 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(feature = "cluster")]
         let live = self.checked_live_state_bytes().unwrap_or(usize::MAX);
         #[cfg(not(feature = "cluster"))]
-        let live = aggregate.accounted_state_bytes();
+        let live = aggregate
+            .accounted_state_bytes()
+            .saturating_add(self.local_aggregate_output_cache_bytes());
         #[cfg(feature = "cluster")]
         let _ = aggregate;
 
@@ -2357,8 +2860,15 @@ impl GraphOperator for SqlQueryOperator {
         })
     }
 
+    fn evict_optional_managed_state(&mut self) -> usize {
+        let evicted = self.local_aggregate_output_cache_bytes();
+        self.invalidate_local_aggregate_output_cache();
+        evicted
+    }
+
     fn set_managed_state_budget(&mut self, bytes: usize) {
         self.max_managed_state_bytes = bytes;
+        self.drop_local_aggregate_cache_over_budget();
     }
 
     async fn initialize_managed_state(&mut self) -> Result<(), DbError> {
@@ -2413,6 +2923,9 @@ impl GraphOperator for SqlQueryOperator {
 
         if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
             if matches!(self.state, QueryState::Agg(_)) {
+                if let Some(cached) = self.clone_cached_local_aggregate_output() {
+                    return Ok(cached);
+                }
                 return self.execute_agg(input_batches, watermark).await;
             }
             return Ok(Vec::new());
@@ -2546,27 +3059,39 @@ impl GraphOperator for SqlQueryOperator {
 
         #[cfg(feature = "cluster")]
         {
+            self.invalidate_local_aggregate_output_cache();
             if !matches!(self.state, QueryState::Agg(_)) {
                 return Err(DbError::Checkpoint(format!(
                     "aggregate '{}' channel restore targeted non-aggregate state",
                     self.op_name
                 )));
             }
-            if checkpoint.data.len() > self.max_managed_state_bytes {
+            let OperatorCheckpoint { data } = checkpoint;
+            let restore_bytes = data
+                .len()
+                .checked_add(aggregate_checkpoint_alignment_copy_bytes(&data))
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "aggregate '{}' channel checkpoint restore accounting overflow",
+                        self.op_name
+                    ))
+                })?;
+            if restore_bytes > self.max_managed_state_bytes {
                 return Err(DbError::ManagedStateBudgetExceeded {
                     context: format!("aggregate '{}' channel checkpoint restore", self.op_name),
-                    accounted_bytes: checkpoint.data.len(),
+                    accounted_bytes: restore_bytes,
                     limit_bytes: self.max_managed_state_bytes,
                 });
             }
-            let checkpoint =
-                rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "checkpoint deserialization for '{}': {error}",
-                            self.op_name
-                        ))
-                    })?;
+            let checkpoint = with_aligned_aggregate_checkpoint_bytes(&data, |data| {
+                rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(data).map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "checkpoint deserialization for '{}': {error}",
+                        self.op_name
+                    ))
+                })
+            })?;
+            drop(data);
             let (config, assignment, peers) = self.active_cluster_scope()?;
             let pristine = !self.whole_restore_applied
                 && self.pending_cluster_input.is_none()
@@ -2954,18 +3479,14 @@ impl GraphOperator for SqlQueryOperator {
             )));
         }
         let previous = self.peer_channels[&peer].accepted;
-        self.validate_frontier(previous, frontier, "accepted remote")?;
-        let frontier = if previous.idle && !frontier.idle {
-            InputFrontier {
-                watermark: Self::max_watermark(
-                    frontier.watermark,
-                    self.effective_frontier.watermark,
-                ),
-                idle: false,
-            }
-        } else {
-            frontier
+        if previous.watermark.is_some() && frontier.watermark.is_none() {
+            self.validate_frontier(previous, frontier, "accepted remote")?;
+        }
+        let frontier = InputFrontier {
+            watermark: Self::max_watermark(frontier.watermark, self.effective_frontier.watermark),
+            ..frontier
         };
+        self.validate_frontier(previous, frontier, "accepted remote")?;
         let next_events = self
             .queued_remote_events
             .checked_add(1)
@@ -2998,6 +3519,7 @@ impl GraphOperator for SqlQueryOperator {
                 self.op_name
             )));
         }
+        self.invalidate_local_aggregate_output_cache();
         let QueryState::Agg(aggregate) = &mut self.state else {
             return Ok(None);
         };
@@ -3044,22 +3566,80 @@ impl GraphOperator for SqlQueryOperator {
                 self.op_name
             )));
         }
-        let QueryState::Agg(aggregate) = &mut self.state else {
+        self.invalidate_local_aggregate_output_cache();
+        let restore_bytes = state
+            .len()
+            .checked_add(aggregate_checkpoint_alignment_copy_bytes(state))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' vnode {vnode} restore accounting overflow",
+                    self.op_name
+                ))
+            })?;
+        if restore_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' vnode {vnode} restore", self.op_name),
+                accounted_bytes: restore_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let QueryState::Agg(aggregate) = &self.state else {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' vnode restore requires initialized managed state",
                 self.op_name
             )));
         };
         let profile = aggregate.vnode_archive_restore_profile();
-        let checkpoint = profile
-            .preflight(
-                state,
-                format_args!("aggregate '{}' vnode {vnode}", self.op_name),
-            )
-            .and_then(|archive| {
-                archive.deserialize(format_args!("aggregate '{}' vnode {vnode}", self.op_name))
+        #[cfg(feature = "cluster")]
+        let live_bytes = self.checked_live_state_bytes()?;
+        #[cfg(not(feature = "cluster"))]
+        let live_bytes = aggregate.accounted_state_bytes();
+        let transition_roster_bytes = aggregate.vnode_transition_restore_roster_bytes(1, 0)?;
+        let restore_preflight = with_aligned_aggregate_checkpoint_bytes(state, |state| {
+            profile
+                .preflight(
+                    state,
+                    format_args!("aggregate '{}' vnode {vnode}", self.op_name),
+                )
+                .map(|archive| archive.restore_preflight())
+                .map_err(|error| DbError::Checkpoint(error.to_string()))
+        })?;
+        let accounted_bytes = live_bytes
+            .checked_add(restore_bytes)
+            .and_then(|bytes| bytes.checked_add(transition_roster_bytes))
+            .and_then(|bytes| {
+                restore_preflight
+                    .sequential_decode_bytes()
+                    .and_then(|decode| bytes.checked_add(decode))
             })
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            .and_then(|bytes| bytes.checked_add(restore_preflight.final_state_upper_bytes()))
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' vnode {vnode} restore accounting overflow",
+                    self.op_name
+                ))
+            })?;
+        if accounted_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' vnode {vnode} restore decode", self.op_name),
+                accounted_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let checkpoint = with_aligned_aggregate_checkpoint_bytes(state, |state| {
+            profile
+                .preflight(
+                    state,
+                    format_args!("aggregate '{}' vnode {vnode}", self.op_name),
+                )
+                .and_then(|archive| {
+                    archive.deserialize(format_args!("aggregate '{}' vnode {vnode}", self.op_name))
+                })
+                .map_err(|error| DbError::Checkpoint(error.to_string()))
+        })?;
+        let QueryState::Agg(aggregate) = &mut self.state else {
+            unreachable!("aggregate restore profile came from initialized aggregate state")
+        };
         aggregate
             .restore_vnode(vnode, vnode_count, checkpoint)
             .map_err(|error| {
@@ -3075,6 +3655,7 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
         transition: ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
+        self.invalidate_local_aggregate_output_cache();
         if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' already owns vnode transition state",
@@ -3128,10 +3709,8 @@ impl GraphOperator for SqlQueryOperator {
             .map(|owner| owner.0)
             .collect::<Vec<_>>();
         let checkpoint_bootstrap = match transition.mode {
-            crate::operator_graph::ManagedVnodeTransitionMode::Live => false,
-            crate::operator_graph::ManagedVnodeTransitionMode::CheckpointBootstrap {
-                predecessor_owners,
-            } => {
+            ManagedVnodeTransitionMode::Live => false,
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
                 let predecessor = predecessor_owners
                     .iter()
                     .map(|owner| owner.0)
@@ -3144,6 +3723,12 @@ impl GraphOperator for SqlQueryOperator {
                 }
                 true
             }
+        };
+        let version_edge_valid = if checkpoint_bootstrap {
+            transition.predecessor.assignment_version < transition.target.assignment_version
+        } else {
+            transition.predecessor.assignment_version.checked_add(1)
+                == Some(transition.target.assignment_version)
         };
         let target_contains_self = transition.target.contains(config.self_id.0);
         let endpoints_match_process = config.sender.local_id() == config.self_id.0
@@ -3166,9 +3751,7 @@ impl GraphOperator for SqlQueryOperator {
         if transition.target.vnode_count != config.registry.vnode_count()
             || transition.target.assignment_version != assignment.version()
             || !transition.target.matches_owner_map(&owners)
-            || !transition.whole_restores.is_empty()
-            || transition.predecessor.assignment_version.checked_add(1)
-                != Some(transition.target.assignment_version)
+            || !version_edge_valid
             || config.sender.recovery_gen() != config.receiver.recovery_gen()
             || (target_contains_self && !active_transport)
             || (!target_contains_self && !inactive_transport)
@@ -3187,7 +3770,103 @@ impl GraphOperator for SqlQueryOperator {
             )));
         }
 
-        let archive_profile = aggregate.vnode_archive_restore_profile();
+        let predecessor_owners: &[NodeId] = match transition.mode {
+            ManagedVnodeTransitionMode::Live => installed.owners(),
+            ManagedVnodeTransitionMode::CheckpointBootstrap { predecessor_owners } => {
+                predecessor_owners
+            }
+        };
+        let predecessor_retained = !checkpoint_bootstrap
+            && transition
+                .predecessor
+                .participant_incarnation(config.self_id.0)
+                == Some(config.sender.incarnation());
+        let payload_bytes = transition
+            .restores
+            .iter()
+            .map(|restore| restore.state.len())
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| restore.state.len()),
+            )
+            .try_fold(0usize, usize::checked_add)
+            .ok_or_else(|| self.accounting_error())?;
+        let alignment_copy_bytes = transition
+            .restores
+            .iter()
+            .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state))
+            .chain(
+                transition
+                    .whole_restores
+                    .iter()
+                    .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state)),
+            )
+            .max()
+            .unwrap_or(0);
+        let minimum_roster_scratch_bytes = aggregate_transition_roster_scratch_bytes(
+            transition.predecessor.participants.len(),
+            transition.restores.len(),
+            transition.restores.len(),
+        )
+        .ok_or_else(|| self.accounting_error())?;
+        let minimum_payload_phase_bytes = payload_bytes
+            .checked_add(alignment_copy_bytes)
+            .and_then(|bytes| bytes.checked_add(minimum_roster_scratch_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if minimum_payload_phase_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' transition payload", self.op_name),
+                accounted_bytes: minimum_payload_phase_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let live_bytes = self.checked_live_state_bytes()?;
+        let minimum_transport_peak = live_bytes
+            .checked_add(minimum_payload_phase_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if minimum_transport_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' transition transport", self.op_name),
+                accounted_bytes: minimum_transport_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+
+        let mut expected_donors = Vec::new();
+        expected_donors
+            .try_reserve_exact(transition.predecessor.participants.len())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' could not reserve portable donor roster: {error}",
+                    self.op_name
+                ))
+            })?;
+        for (vnode, owner) in assignment.owners().iter().enumerate() {
+            if *owner != config.self_id
+                || (predecessor_retained && predecessor_owners.get(vnode) == Some(&config.self_id))
+            {
+                continue;
+            }
+            let donor = predecessor_owners.get(vnode).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' predecessor owner map is incomplete",
+                    self.op_name
+                ))
+            })?;
+            if donor.is_unassigned() {
+                return Err(DbError::Checkpoint(format!(
+                    "aggregate '{}' acquired vnode {vnode} has no predecessor donor",
+                    self.op_name
+                )));
+            }
+            if let Err(position) = expected_donors.binary_search(&donor.0) {
+                expected_donors.insert(position, donor.0);
+            }
+        }
+        let fresh_acquirer = target_contains_self && !predecessor_retained;
+
         let mut preflighted = Vec::new();
         preflighted
             .try_reserve_exact(transition.restores.len())
@@ -3206,16 +3885,80 @@ impl GraphOperator for SqlQueryOperator {
                     self.op_name
                 ))
             })?;
+        let roster_scratch_bytes = aggregate_transition_roster_scratch_bytes(
+            expected_donors.capacity(),
+            preflighted.capacity(),
+            restored_lower_bounds.capacity(),
+        )
+        .ok_or_else(|| self.accounting_error())?;
+        let payload_phase_bytes = payload_bytes
+            .checked_add(alignment_copy_bytes)
+            .and_then(|bytes| bytes.checked_add(roster_scratch_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if payload_phase_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' transition payload", self.op_name),
+                accounted_bytes: payload_phase_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+        let transport_peak = live_bytes
+            .checked_add(payload_phase_bytes)
+            .ok_or_else(|| self.accounting_error())?;
+        if transport_peak > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' transition transport", self.op_name),
+                accounted_bytes: transport_peak,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+
+        let handoff_cut = self.portable_handoff_cut(&transition, &expected_donors)?;
+        if !fresh_acquirer
+            && handoff_cut.is_some_and(|frontier| frontier != self.effective_frontier)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' donor cut does not match the retained owner frontier",
+                self.op_name
+            )));
+        }
+        let transition_frontier = if fresh_acquirer {
+            handoff_cut.ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aggregate '{}' fresh owner is missing its portable whole cut",
+                    self.op_name
+                ))
+            })?
+        } else {
+            self.effective_frontier
+        };
+
+        let archive_profile = aggregate.vnode_archive_restore_profile();
+        let mut replacement_state_upper_bytes = 0usize;
+        let mut sequential_decode_peak_bytes = 0usize;
         for restore in transition.restores {
-            let state = archive_profile.preflight(
-                restore.state,
-                format_args!(
-                    "per-vnode state for '{}' vnode {}",
-                    self.op_name, restore.vnode
-                ),
-            )?;
-            restored_lower_bounds.push((restore.vnode, state.group_count()));
-            preflighted.push((restore.vnode, state));
+            let restore_preflight =
+                with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
+                    archive_profile
+                        .preflight(
+                            state,
+                            format_args!(
+                                "per-vnode state for '{}' vnode {}",
+                                self.op_name, restore.vnode
+                            ),
+                        )
+                        .map(|archive| archive.restore_preflight())
+                })?;
+            replacement_state_upper_bytes = replacement_state_upper_bytes
+                .checked_add(restore_preflight.final_state_upper_bytes())
+                .ok_or_else(|| self.accounting_error())?;
+            sequential_decode_peak_bytes = sequential_decode_peak_bytes.max(
+                restore_preflight
+                    .sequential_decode_bytes()
+                    .ok_or_else(|| self.accounting_error())?,
+            );
+            restored_lower_bounds.push((restore.vnode, restore_preflight.group_count()));
+            preflighted.push((restore.vnode, restore.state, restore_preflight));
         }
         aggregate.preflight_vnode_transition_cardinality(
             transition.target.vnode_count,
@@ -3223,11 +3966,61 @@ impl GraphOperator for SqlQueryOperator {
             transition.revoked,
         )?;
 
-        let owned_restores = preflighted.into_iter().map(|(vnode, state)| {
-            let state = state.deserialize(format_args!(
-                "per-vnode state for '{}' vnode {vnode}",
-                self.op_name
-            ))?;
+        let internal_roster_bytes = aggregate.vnode_transition_restore_roster_bytes(
+            transition.restores.len(),
+            transition.revoked.len(),
+        )?;
+        let target_peer_count = transition
+            .target
+            .participants
+            .iter()
+            .filter(|participant| participant.node_id != config.self_id.0)
+            .count();
+        let topology_upper_bytes = assignment
+            .owners()
+            .len()
+            .checked_mul(std::mem::size_of::<NodeId>() + std::mem::size_of::<u64>())
+            .and_then(|bytes| {
+                target_peer_count
+                    .checked_mul(std::mem::size_of::<u64>())
+                    .and_then(|peers| bytes.checked_add(peers))
+            })
+            .and_then(|bytes| {
+                target_peer_count
+                    .checked_mul(
+                        std::mem::size_of::<(u64, AggPeerChannel)>()
+                            + AGG_PEER_CHANNEL_ENTRY_CHARGE,
+                    )
+                    .and_then(|channels| bytes.checked_add(channels))
+            })
+            .ok_or_else(|| self.accounting_error())?;
+        let decode_peak_bytes = live_bytes
+            .checked_add(payload_phase_bytes)
+            .and_then(|bytes| bytes.checked_add(internal_roster_bytes))
+            .and_then(|bytes| bytes.checked_add(topology_upper_bytes))
+            .and_then(|bytes| bytes.checked_add(replacement_state_upper_bytes))
+            .and_then(|bytes| bytes.checked_add(sequential_decode_peak_bytes))
+            .ok_or_else(|| self.accounting_error())?;
+        if decode_peak_bytes > self.max_managed_state_bytes {
+            return Err(DbError::ManagedStateBudgetExceeded {
+                context: format!("aggregate '{}' transition decode", self.op_name),
+                accounted_bytes: decode_peak_bytes,
+                limit_bytes: self.max_managed_state_bytes,
+            });
+        }
+
+        let owned_restores = preflighted.into_iter().map(|(vnode, bytes, preflight)| {
+            let state = with_aligned_aggregate_checkpoint_bytes(bytes, |bytes| {
+                let archive = archive_profile.preflight(
+                    bytes,
+                    format_args!("per-vnode state for '{}' vnode {vnode}", self.op_name),
+                )?;
+                debug_assert_eq!(archive.restore_preflight(), preflight);
+                archive.deserialize(format_args!(
+                    "per-vnode state for '{}' vnode {vnode}",
+                    self.op_name
+                ))
+            })?;
             Ok(OwnedAggVnodeRestore { vnode, state })
         });
         let aggregate = aggregate.prepare_owned_vnode_transition(
@@ -3240,11 +4033,17 @@ impl GraphOperator for SqlQueryOperator {
         for &peer in &target_peers {
             let same_incarnation = transition.predecessor.participant_incarnation(peer)
                 == transition.target.participant_incarnation(peer);
-            let channel = if same_incarnation {
+            let channel = if fresh_acquirer || !same_incarnation {
+                AggPeerChannel {
+                    applied: transition_frontier,
+                    accepted: transition_frontier,
+                    events: VecDeque::new(),
+                }
+            } else {
                 self.peer_channels.get(&peer).map_or(
                     AggPeerChannel {
-                        applied: self.effective_frontier,
-                        accepted: self.effective_frontier,
+                        applied: transition_frontier,
+                        accepted: transition_frontier,
                         events: VecDeque::new(),
                     },
                     |channel| AggPeerChannel {
@@ -3253,23 +4052,27 @@ impl GraphOperator for SqlQueryOperator {
                         events: VecDeque::new(),
                     },
                 )
-            } else {
-                AggPeerChannel {
-                    applied: self.effective_frontier,
-                    accepted: self.effective_frontier,
-                    events: VecDeque::new(),
-                }
             };
             channels.insert(peer, channel);
         }
+        let local_frontier = if fresh_acquirer {
+            transition_frontier
+        } else {
+            self.local_frontier
+        };
         let effective = merge_input_frontier_iter(
-            std::iter::once(self.local_frontier)
-                .chain(channels.values().map(|channel| channel.applied)),
+            std::iter::once(local_frontier).chain(channels.values().map(|channel| channel.applied)),
             i64::MIN,
         );
-        self.validate_frontier(self.effective_frontier, effective, "transition target")?;
+        self.validate_frontier(transition_frontier, effective, "transition target")?;
+        if fresh_acquirer && effective != transition_frontier {
+            return Err(DbError::Checkpoint(format!(
+                "aggregate '{}' reset target channels do not form the transition cut",
+                self.op_name
+            )));
+        }
         let last_broadcast = if target_peers.is_empty() {
-            self.local_frontier
+            local_frontier
         } else {
             InputFrontier::default()
         };
@@ -3278,14 +4081,14 @@ impl GraphOperator for SqlQueryOperator {
             assignment_digest: transition.target.assignment_digest,
             peers: target_peers.into(),
             channels,
-            local_frontier: self.local_frontier,
+            local_frontier,
             last_broadcast,
             effective_frontier: effective,
         };
-        let live_bytes = self.checked_live_state_bytes()?;
         let prepared_bytes = aggregate
             .accounted_state_bytes()
             .checked_add(topology.accounted_state_bytes())
+            .and_then(|bytes| bytes.checked_add(payload_phase_bytes))
             .and_then(|bytes| bytes.checked_add(live_bytes))
             .ok_or_else(|| self.accounting_error())?;
         if prepared_bytes > self.max_managed_state_bytes {
@@ -3316,6 +4119,7 @@ impl GraphOperator for SqlQueryOperator {
 
     #[cfg(feature = "cluster")]
     fn publish_vnode_transition(&mut self) {
+        self.invalidate_local_aggregate_output_cache();
         let prepared = self
             .prepared_vnode_transition
             .take()
@@ -3376,6 +4180,7 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn force_full_vnode_capture(&mut self) {
+        self.invalidate_local_aggregate_output_cache();
         if let QueryState::Agg(aggregate) = &mut self.state {
             aggregate.force_full_vnode_capture();
         }
@@ -3386,9 +4191,9 @@ impl GraphOperator for SqlQueryOperator {
 mod checkpoint_tests {
     use super::*;
     #[cfg(feature = "cluster")]
-    use crate::operator_graph::ManagedVnodeTransitionMode;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::operator_graph::{ManagedVnodeRestore, ManagedVnodeTransitionMode};
+    use arrow::array::{DictionaryArray, Int64Array, Int8Array, StringArray};
+    use arrow::datatypes::{Field, Int8Type, Schema};
 
     #[test]
     fn sql_capability_classification_is_shape_aware_and_fail_closed() {
@@ -3517,6 +4322,151 @@ mod checkpoint_tests {
             .unwrap();
         assert_eq!(captured.len(), 8);
         assert!(captured.iter().all(|frame| frame.state.is_some()));
+    }
+
+    #[tokio::test]
+    async fn managed_aggregate_rejects_nested_checkpoint_types_at_initialization() {
+        let cases = [
+            (
+                "nested-group",
+                "SELECT make_array(key) AS keys, COUNT(*) AS count FROM events GROUP BY make_array(key)",
+                "group key",
+            ),
+            (
+                "nested-result",
+                "SELECT MIN(struct(key, value)) AS min_pair FROM events",
+                "emitted result",
+            ),
+        ];
+
+        for (name, sql, component) in cases {
+            let (context, _) = context_and_batch();
+            let mut operator = SqlQueryOperator::new(name, sql, context, None, false);
+            let error = operator
+                .initialize_managed_state()
+                .await
+                .expect_err("nested aggregate checkpoint types must fail during initialization");
+            assert!(matches!(&error, DbError::Unsupported(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains(laminar_core::error_codes::SQL_UNSUPPORTED),
+                "{error}"
+            );
+            assert!(error.to_string().contains(component), "{error}");
+            assert!(matches!(operator.state, QueryState::Uninit));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_full_state_aggregate_reuses_budgeted_final_output_on_empty_cycles() {
+        let (context, batch) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "cached-counts",
+            "SELECT key, COUNT(*) AS count FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+
+        let first = operator
+            .process(&[vec![batch.clone()]], &[i64::MIN])
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let cached_bytes = operator
+            .cached_local_aggregate_output
+            .as_ref()
+            .expect("successful final post-HAVING output must be cached")
+            .retained_bytes;
+        assert!(
+            cached_bytes
+                >= first
+                    .iter()
+                    .map(RecordBatch::get_array_memory_size)
+                    .sum::<usize>(),
+            "the cache charge must cover retained Arrow backing allocations"
+        );
+        let QueryState::Agg(aggregate) = &operator.state else {
+            panic!("count query must use aggregate state");
+        };
+        assert_eq!(
+            operator.managed_state_accounting().unwrap().live,
+            aggregate
+                .accounted_state_bytes()
+                .checked_add(cached_bytes)
+                .unwrap(),
+            "the retained output is part of managed live state"
+        );
+
+        let empty = operator.process(&[Vec::new()], &[123]).await.unwrap();
+        assert_eq!(empty.len(), first.len());
+        for (original, reused) in first.iter().zip(&empty) {
+            assert_eq!(original.schema(), reused.schema());
+            for (original, reused) in original.columns().iter().zip(reused.columns()) {
+                assert!(
+                    Arc::ptr_eq(original, reused),
+                    "an empty cycle must shallow-clone the cached Arrow output"
+                );
+            }
+        }
+
+        let updated = operator
+            .process(&[vec![batch.slice(0, 1)]], &[456])
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert!(
+            first[0]
+                .columns()
+                .iter()
+                .zip(updated[0].columns())
+                .any(|(before, after)| !Arc::ptr_eq(before, after)),
+            "a state mutation must replace the cached emission"
+        );
+        let updated_empty = operator.process(&[Vec::new()], &[789]).await.unwrap();
+        assert!(updated[0]
+            .columns()
+            .iter()
+            .zip(updated_empty[0].columns())
+            .all(|(original, reused)| Arc::ptr_eq(original, reused)));
+
+        let QueryState::Agg(aggregate) = &operator.state else {
+            panic!("count query must retain aggregate state");
+        };
+        let aggregate_bytes = aggregate.accounted_state_bytes();
+        let updated_cache_bytes = operator
+            .cached_local_aggregate_output
+            .as_ref()
+            .expect("updated full-state output must replace the cache")
+            .retained_bytes;
+        let tight_budget = aggregate_bytes
+            .checked_add(updated_cache_bytes)
+            .and_then(|bytes| bytes.checked_sub(1))
+            .unwrap();
+        operator.set_managed_state_budget(tight_budget);
+        assert!(operator.cached_local_aggregate_output.is_none());
+
+        let tight_output = operator
+            .process(&[vec![batch.slice(0, 1)]], &[1_000])
+            .await
+            .expect("declining the optional cache must not fail aggregate processing");
+        assert_eq!(tight_output.len(), 1);
+        assert!(
+            operator.cached_local_aggregate_output.is_none(),
+            "live aggregate plus output above the operator budget must not be cached"
+        );
+        let uncached_empty = operator
+            .process(&[Vec::new()], &[1_001])
+            .await
+            .expect("an uncached empty cycle must retain explicit full-state semantics");
+        assert_eq!(uncached_empty.len(), 1);
+        assert!(operator.cached_local_aggregate_output.is_none());
+        assert!(tight_output[0]
+            .columns()
+            .iter()
+            .zip(uncached_empty[0].columns())
+            .any(|(before, after)| !Arc::ptr_eq(before, after)));
     }
 
     #[tokio::test]
@@ -3674,6 +4624,293 @@ mod checkpoint_tests {
         }
     }
 
+    #[tokio::test]
+    async fn local_aggregate_coalescing_preserves_append_rows_and_state() {
+        let context = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["seed"])),
+                Arc::new(Int64Array::from(vec![0])),
+            ],
+        )
+        .unwrap();
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                .unwrap();
+        context.register_table("changes", Arc::new(table)).unwrap();
+
+        let mut tiny_inputs = Vec::new();
+        let mut expected_projected_rows = Vec::new();
+        for index in 0..2_050usize {
+            let key = format!("k{}", index % 7);
+            let value = i64::try_from(index).unwrap() + 1;
+            tiny_inputs.push(
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(StringArray::from(vec![key.as_str()])),
+                        Arc::new(Int64Array::from(vec![value])),
+                    ],
+                )
+                .unwrap(),
+            );
+            expected_projected_rows.push((key, value));
+        }
+        let combined_input =
+            arrow::compute::concat_batches(&schema, tiny_inputs.as_slice()).unwrap();
+        let sql = "SELECT key, COUNT(*) AS match_count, MAX(value) AS max_value \
+                   FROM changes GROUP BY key";
+
+        let mut coalesced_operator =
+            SqlQueryOperator::new("coalesced", sql, context.clone(), None, false);
+        coalesced_operator.lazy_init().await.unwrap();
+        let projected = coalesced_operator
+            .pre_aggregate(&tiny_inputs)
+            .await
+            .unwrap();
+        let QueryState::Agg(aggregate) = &coalesced_operator.state else {
+            panic!("coalesced operator must be initialized");
+        };
+        assert!(aggregate.certifies_local_input_coalescing());
+        let projected_schema = projected[0].schema();
+        let coalesced = coalesced_operator
+            .prepare_local_aggregate_batches(projected)
+            .unwrap();
+        assert_eq!(
+            coalesced
+                .iter()
+                .map(RecordBatch::num_rows)
+                .collect::<Vec<_>>(),
+            [1_024, 1_024, 2],
+            "the actual aggregate apply input is bounded by the local row target"
+        );
+        assert!(coalesced.iter().all(|batch| {
+            batch.schema().as_ref() == projected_schema.as_ref()
+                && batch.num_rows() <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
+                && laminar_core::shuffle::logical_batch_bytes(batch).unwrap()
+                    <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES
+        }));
+        let actual_projected_rows = coalesced
+            .iter()
+            .flat_map(|batch| {
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let values = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                (0..batch.num_rows())
+                    .map(|row| (keys.value(row).to_owned(), values.value(row)))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_projected_rows, expected_projected_rows);
+
+        let tiny_ports = vec![tiny_inputs];
+        let coalesced_output = coalesced_operator
+            .process(&tiny_ports, &[777])
+            .await
+            .unwrap();
+        let mut single_batch_operator =
+            SqlQueryOperator::new("single-batch", sql, context, None, false);
+        let single_batch_ports = vec![vec![combined_input]];
+        let single_batch_output = single_batch_operator
+            .process(&single_batch_ports, &[777])
+            .await
+            .unwrap();
+
+        let output_rows = |batches: &[RecordBatch]| {
+            let mut rows = std::collections::BTreeMap::new();
+            for batch in batches {
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let counts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let maxima = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    rows.insert(
+                        keys.value(row).to_owned(),
+                        (counts.value(row), maxima.value(row)),
+                    );
+                }
+            }
+            rows
+        };
+        assert_eq!(
+            coalesced_output[0].schema(),
+            single_batch_output[0].schema()
+        );
+        assert_eq!(
+            output_rows(&coalesced_output),
+            output_rows(&single_batch_output)
+        );
+
+        let QueryState::Agg(coalesced_state) = &coalesced_operator.state else {
+            panic!("coalesced operator must retain aggregate state");
+        };
+        let QueryState::Agg(single_batch_state) = &single_batch_operator.state else {
+            panic!("single-batch operator must retain aggregate state");
+        };
+        assert_eq!(coalesced_state.logical_group_count_for_test(), 7);
+        assert_eq!(
+            coalesced_state.working_set_snapshot_for_test(),
+            single_batch_state.working_set_snapshot_for_test()
+        );
+    }
+
+    #[test]
+    fn local_aggregate_coalescing_preserves_dictionary_batch_boundaries() {
+        let batches = (0..130)
+            .map(|index| {
+                let values: arrow::array::ArrayRef =
+                    Arc::new(StringArray::from(vec![format!("dictionary-{index}")]));
+                let dictionary =
+                    DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![0]), values).unwrap();
+                RecordBatch::try_from_iter(vec![(
+                    "dictionary_value",
+                    Arc::new(dictionary) as arrow::array::ArrayRef,
+                )])
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let preserved = coalesce_local_aggregate_batches("dictionary", batches).unwrap();
+        assert_eq!(preserved.len(), 130);
+        for (index, batch) in preserved.iter().enumerate() {
+            let dictionary = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int8Type>>()
+                .unwrap();
+            let values = dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(values.value(0), format!("dictionary-{index}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_aggregate_coalescing_preserves_weighted_prefix_rejection() {
+        let context = laminar_sql::create_session_context();
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+            Field::new(weight, DataType::Int64, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["seed"])),
+                Arc::new(Int64Array::from(vec![0])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![seed]])
+                .unwrap();
+        context.register_table("changes", Arc::new(table)).unwrap();
+
+        let weighted_batch = |row_weight| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec!["absent"])),
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![row_weight])),
+                ],
+            )
+            .unwrap()
+        };
+        let mut operator = SqlQueryOperator::new(
+            "weighted-prefix",
+            "SELECT key, COUNT(*) AS count FROM changes GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.lazy_init().await.unwrap();
+        let QueryState::Agg(aggregate) = &operator.state else {
+            panic!("weighted operator must be initialized");
+        };
+        assert!(!aggregate.certifies_local_input_coalescing());
+
+        let weighted_inputs = vec![weighted_batch(-1), weighted_batch(1)];
+        let projected = operator.pre_aggregate(&weighted_inputs).await.unwrap();
+        let preserved = operator.prepare_local_aggregate_batches(projected).unwrap();
+        assert_eq!(preserved.len(), 2);
+        assert_eq!(
+            preserved
+                .iter()
+                .map(|batch| {
+                    batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                })
+                .collect::<Vec<_>>(),
+            [-1, 1]
+        );
+
+        let inputs = vec![weighted_inputs];
+        let error = operator.process(&inputs, &[777]).await.unwrap_err();
+        assert!(
+            error.to_string().contains("input weight became negative"),
+            "weighted batches must retain their prefix validation boundary: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_aggregate_coalescing_does_not_resegment_sum() {
+        let (context, batch) = context_and_batch();
+        let mut operator = SqlQueryOperator::new(
+            "sum-boundaries",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.lazy_init().await.unwrap();
+        let QueryState::Agg(aggregate) = &operator.state else {
+            panic!("SUM operator must be initialized");
+        };
+        assert!(!aggregate.certifies_local_input_coalescing());
+
+        let inputs = vec![batch.slice(0, 1), batch.slice(1, 1)];
+        let projected = operator.pre_aggregate(&inputs).await.unwrap();
+        assert_eq!(projected.len(), 2);
+        let preserved = operator.prepare_local_aggregate_batches(projected).unwrap();
+        assert_eq!(
+            preserved.len(),
+            2,
+            "SUM keeps its original overflow and floating-point reduction boundaries"
+        );
+    }
+
     pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {
         let context = laminar_sql::create_session_context();
         let schema = Arc::new(Schema::new(vec![
@@ -3701,6 +4938,23 @@ mod checkpoint_tests {
         )
         .unwrap();
         (context, batch)
+    }
+
+    fn unaligned_aggregate_archive_transport(bytes: &[u8]) -> bytes::Bytes {
+        let mut transport = vec![0_u8; bytes.len() + AGG_CHECKPOINT_ARCHIVE_ALIGNMENT];
+        let base = transport.as_ptr() as usize;
+        let offset = (0..AGG_CHECKPOINT_ARCHIVE_ALIGNMENT)
+            .find(|offset| (base + offset) % AGG_CHECKPOINT_ARCHIVE_ALIGNMENT != 0)
+            .expect("an aggregate archive transport offset must be unaligned");
+        transport[offset..offset + bytes.len()].copy_from_slice(bytes);
+        let bytes = bytes::Bytes::from(transport).slice(offset..offset + bytes.len());
+        assert_ne!(
+            bytes
+                .as_ptr()
+                .align_offset(AGG_CHECKPOINT_ARCHIVE_ALIGNMENT),
+            0
+        );
+        bytes
     }
 
     #[cfg(feature = "cluster")]
@@ -3751,6 +5005,37 @@ mod checkpoint_tests {
             receiver,
             self_id: NodeId(1),
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn portable_aggregate_whole_frame(
+        predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        donor: u64,
+        frontier: InputFrontier,
+    ) -> Vec<u8> {
+        let channels = predecessor
+            .participant_ids()
+            .into_iter()
+            .filter(|peer| *peer != donor)
+            .map(|peer| AggCheckpointChannel {
+                peer,
+                applied: frontier.into(),
+                events: Vec::new(),
+            })
+            .collect();
+        rkyv::to_bytes::<rkyv::rancor::Error>(&AggOpCheckpoint {
+            version: AGG_OP_CHECKPOINT_VERSION,
+            assignment_version: predecessor.assignment_version,
+            owner_map_digest: predecessor.assignment_digest,
+            self_id: donor,
+            recovery_gen: 0,
+            local_frontier: frontier.into(),
+            effective_frontier: frontier.into(),
+            remote_peer_cursor: None,
+            channels,
+        })
+        .unwrap()
+        .to_vec()
     }
 
     #[cfg(feature = "cluster")]
@@ -3813,6 +5098,156 @@ mod checkpoint_tests {
             .unwrap()
             .evaluate(&input)
             .unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpointed_remote_frontiers_compare_in_receiver_domain() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+            KeyGroupCount::try_from(8_u16).unwrap(),
+        );
+        operator.initialize_managed_state().await.unwrap();
+        operator.attach_cluster_shuffle(scope.clone());
+        operator.effective_frontier = InputFrontier {
+            watermark: Some(500),
+            idle: false,
+        };
+        let idle = InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        };
+        let channel = operator.peer_channels.get_mut(&2).unwrap();
+        channel.applied = idle;
+        channel.accepted = idle;
+        let assignment = scope.registry.assignment_version();
+        let recovery = scope.receiver.recovery_gen();
+        let active = |watermark| InputFrontier {
+            watermark: Some(watermark),
+            idle: false,
+        };
+
+        operator
+            .stage_checkpointed_shuffle_frontier("sum", 2, active(100), assignment, recovery)
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(500));
+        operator
+            .stage_checkpointed_shuffle_frontier("sum", 2, active(150), assignment, recovery)
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(500));
+        operator
+            .stage_checkpointed_shuffle_frontier("sum", 2, active(550), assignment, recovery)
+            .unwrap();
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(550));
+        assert!(operator
+            .stage_checkpointed_shuffle_frontier(
+                "sum",
+                2,
+                InputFrontier {
+                    watermark: None,
+                    idle: false,
+                },
+                assignment,
+                recovery,
+            )
+            .is_err());
+        assert!(operator
+            .stage_checkpointed_shuffle_frontier("sum", 2, active(525), assignment, recovery,)
+            .is_err());
+        assert_eq!(operator.peer_channels[&2].accepted.watermark, Some(550));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
+        let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+        let (context, _) = context_and_batch();
+        let mut operator = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+            KeyGroupCount::try_from(8_u16).unwrap(),
+        );
+        operator.initialize_managed_state().await.unwrap();
+        let (key, local) = projected_batch_for_vnode(&operator, 0, 42);
+        let buffered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![key.as_str()])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        operator.attach_cluster_shuffle(scope.clone());
+        let restored = InputFrontier {
+            watermark: Some(100),
+            idle: false,
+        };
+        let live = InputFrontier {
+            watermark: Some(1_000),
+            idle: false,
+        };
+        operator.local_frontier = restored;
+        operator.effective_frontier = restored;
+        operator.last_broadcast = InputFrontier::default();
+        let channel = operator.peer_channels.get_mut(&2).unwrap();
+        channel.applied = restored;
+        channel.accepted = restored;
+
+        assert!(!operator.wants_input());
+        let assignment = scope.registry.versioned_snapshot();
+        let bootstrap = operator.cluster_cycle_local_frontier(live, false).unwrap();
+        assert_eq!(bootstrap, restored);
+        let plan = operator
+            .plan_cluster_batches(Vec::new(), bootstrap, &scope, &assignment, &[2])
+            .unwrap();
+        assert!(matches!(
+            plan.outbound.as_slice(),
+            [(
+                2,
+                ShuffleMessage::Frontier {
+                    watermark: Some(100),
+                    idle: false,
+                    ..
+                }
+            )]
+        ));
+        operator.process_cluster(&[Vec::new()], live).await.unwrap();
+        let mut pending = operator.pending_cluster_input.take().unwrap();
+        assert_eq!(pending.local_frontier, restored);
+        assert!(pending.local_batches.is_empty());
+        pending.send.take().unwrap().abort();
+
+        // Simulate completion of the bootstrap send. The graph may now release its retained row,
+        // and the ordinary node-local frontier is used without being globally frozen.
+        operator.last_broadcast = restored;
+        assert!(operator.wants_input());
+        let admitted = operator.cluster_cycle_local_frontier(live, true).unwrap();
+        assert_eq!(admitted, live);
+        let plan = operator
+            .plan_cluster_batches(vec![local], admitted, &scope, &assignment, &[2])
+            .unwrap();
+        assert_eq!(plan.local_batches.len(), 1);
+        assert_eq!(plan.local_frontier, live);
+        operator
+            .process_cluster(&[vec![buffered]], live)
+            .await
+            .unwrap();
+        let mut pending = operator.pending_cluster_input.take().unwrap();
+        assert_eq!(pending.local_frontier, live);
+        assert_eq!(pending.local_batches.len(), 1);
+        pending.send.take().unwrap().abort();
     }
 
     #[cfg(feature = "cluster")]
@@ -4311,6 +5746,495 @@ mod checkpoint_tests {
         assert_eq!(operator.managed_state_accounting().unwrap().retired, 0);
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn aggregate_checkpoint_bootstrap_requires_every_whole_donor_and_installs_common_cut() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+        let predecessor_owners = [2, 3, 2, 3, 2, 3, 2, 3];
+        let target_owners = [1; 8];
+        // The bootstrap process was not a predecessor owner, so attach its transport directly to
+        // the recovery target while retaining the independent predecessor fence below.
+        let scope = cluster_scope(target_owners).await;
+        let (context, batch) = context_and_batch();
+        let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+        let participant = |node_id| CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        };
+        let predecessor_version = scope.registry.assignment_version();
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version,
+            &predecessor_owners,
+            vec![participant(2), participant(3)],
+        )
+        .unwrap();
+        let target = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version + 1,
+            &target_owners,
+            vec![participant(1)],
+        )
+        .unwrap();
+        scope.registry.set_assignment_and_version(
+            Arc::from(target_owners.map(NodeId)),
+            target.assignment_version,
+        );
+        scope
+            .sender
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+        assert_eq!(scope.receiver.recovery_gen(), 0);
+
+        let mut donors = Vec::new();
+        let frontier = InputFrontier {
+            watermark: Some(777),
+            idle: false,
+        };
+        for donor in [2, 3] {
+            let mut frame = rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(
+                &portable_aggregate_whole_frame(&predecessor, donor, frontier),
+            )
+            .unwrap();
+            // A fresh acquirer can legitimately have missed owner-only recovery rounds. The
+            // donor's portable whole frame imports an empty, predecessor-bound channel cut, not
+            // live transport-generation state, so a newer donor generation remains admissible.
+            frame.recovery_gen = 7;
+            donors.push((
+                donor,
+                rkyv::to_bytes::<rkyv::rancor::Error>(&frame)
+                    .unwrap()
+                    .to_vec(),
+            ));
+        }
+        let whole_restores = donors
+            .iter()
+            .map(
+                |(participant_id, state)| crate::operator_graph::ManagedWholeRestore {
+                    participant_id: *participant_id,
+                    state,
+                },
+            )
+            .collect::<Vec<_>>();
+
+        let mut donor_state = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT SUM(value) AS total FROM events",
+            context.clone(),
+            None,
+            false,
+            key_groups,
+        );
+        donor_state.initialize_managed_state().await.unwrap();
+        donor_state.process(&[vec![batch]], &[100]).await.unwrap();
+        let vnode_frames = donor_state
+            .checkpoint_vnodes(&[0], 8, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|frame| {
+                let capture = frame.state.unwrap();
+                let mut staged = capture.retained_bytes();
+                let state = capture.materialize(&mut staged, u64::MAX).unwrap();
+                (frame.vnode, state)
+            })
+            .collect::<Vec<_>>();
+        let restores = vnode_frames
+            .iter()
+            .map(|(vnode, state)| ManagedVnodeRestore {
+                participant_id: predecessor_owners[*vnode as usize],
+                vnode: *vnode,
+                state,
+            })
+            .collect::<Vec<_>>();
+
+        let mut target_operator = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT SUM(value) AS total FROM events",
+            context,
+            None,
+            false,
+            key_groups,
+        );
+        target_operator.initialize_managed_state().await.unwrap();
+        target_operator.attach_cluster_shuffle(scope);
+        let revoked = rustc_hash::FxHashSet::default();
+        let predecessor_owner_nodes = predecessor_owners.map(NodeId);
+        let transition = || ManagedVnodeTransition {
+            predecessor: &predecessor,
+            target: &target,
+            revoked: &revoked,
+            restores: &restores,
+            whole_restores: &whole_restores,
+            mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                predecessor_owners: &predecessor_owner_nodes,
+            },
+        };
+
+        let missing = ManagedVnodeTransition {
+            whole_restores: &whole_restores[..1],
+            ..transition()
+        };
+        assert!(target_operator.prepare_vnode_transition(missing).is_err());
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        let mut queued_donors = donors.clone();
+        let mut queued =
+            rkyv::from_bytes::<AggOpCheckpoint, rkyv::rancor::Error>(&queued_donors[0].1).unwrap();
+        queued.channels[0]
+            .events
+            .push(AggCheckpointEvent::Frontier {
+                recovery_gen: 0,
+                frontier: frontier.into(),
+            });
+        queued_donors[0].1 = rkyv::to_bytes::<rkyv::rancor::Error>(&queued)
+            .unwrap()
+            .to_vec();
+        let queued_whole = queued_donors
+            .iter()
+            .map(
+                |(participant_id, state)| crate::operator_graph::ManagedWholeRestore {
+                    participant_id: *participant_id,
+                    state,
+                },
+            )
+            .collect::<Vec<_>>();
+        let queued_transition = ManagedVnodeTransition {
+            whole_restores: &queued_whole,
+            ..transition()
+        };
+        assert!(target_operator
+            .prepare_vnode_transition(queued_transition)
+            .is_err());
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        let disagreeing_donors = [
+            (2, portable_aggregate_whole_frame(&predecessor, 2, frontier)),
+            (
+                3,
+                portable_aggregate_whole_frame(
+                    &predecessor,
+                    3,
+                    InputFrontier {
+                        watermark: Some(778),
+                        idle: false,
+                    },
+                ),
+            ),
+        ];
+        let disagreeing_whole = disagreeing_donors
+            .iter()
+            .map(
+                |(participant_id, state)| crate::operator_graph::ManagedWholeRestore {
+                    participant_id: *participant_id,
+                    state,
+                },
+            )
+            .collect::<Vec<_>>();
+        let disagreeing_transition = ManagedVnodeTransition {
+            whole_restores: &disagreeing_whole,
+            ..transition()
+        };
+        assert!(target_operator
+            .prepare_vnode_transition(disagreeing_transition)
+            .is_err());
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        let unaligned_donors = donors
+            .iter()
+            .map(|(participant_id, state)| {
+                (
+                    *participant_id,
+                    unaligned_aggregate_archive_transport(state),
+                )
+            })
+            .collect::<Vec<_>>();
+        let unaligned_whole = unaligned_donors
+            .iter()
+            .map(
+                |(participant_id, state)| crate::operator_graph::ManagedWholeRestore {
+                    participant_id: *participant_id,
+                    state,
+                },
+            )
+            .collect::<Vec<_>>();
+        let raw_payload = restores
+            .iter()
+            .map(|restore| restore.state.len())
+            .chain(unaligned_whole.iter().map(|restore| restore.state.len()))
+            .sum::<usize>();
+        let alignment_copy = restores
+            .iter()
+            .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state))
+            .chain(
+                unaligned_whole
+                    .iter()
+                    .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state)),
+            )
+            .max()
+            .unwrap();
+        let roster_scratch = aggregate_transition_roster_scratch_bytes(
+            predecessor.participants.len(),
+            restores.len(),
+            restores.len(),
+        )
+        .unwrap();
+        let payload_peak = raw_payload + alignment_copy + roster_scratch;
+        target_operator.set_managed_state_budget(payload_peak - 1);
+        let unaligned_transition = ManagedVnodeTransition {
+            whole_restores: &unaligned_whole,
+            ..transition()
+        };
+        assert!(matches!(
+            target_operator.prepare_vnode_transition(unaligned_transition),
+            Err(DbError::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+                ..
+            }) if accounted_bytes == payload_peak && limit_bytes == payload_peak - 1
+        ));
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        let QueryState::Agg(aggregate) = &target_operator.state else {
+            panic!("expected aggregate transition target");
+        };
+        let profile = aggregate.vnode_archive_restore_profile();
+        let restore_preflights = restores
+            .iter()
+            .map(|restore| {
+                with_aligned_aggregate_checkpoint_bytes(restore.state, |state| {
+                    profile
+                        .preflight(state, format_args!("transition decode-bound test"))
+                        .map(|archive| archive.restore_preflight())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(restore_preflights
+            .iter()
+            .any(|preflight| preflight.group_count() != 0));
+        let replacement_upper = restore_preflights
+            .iter()
+            .map(|preflight| preflight.final_state_upper_bytes())
+            .sum::<usize>();
+        let sequential_peak = restore_preflights
+            .iter()
+            .map(|preflight| preflight.sequential_decode_bytes().unwrap())
+            .max()
+            .unwrap_or(0);
+        let raw_payload = restores
+            .iter()
+            .map(|restore| restore.state.len())
+            .chain(whole_restores.iter().map(|restore| restore.state.len()))
+            .sum::<usize>();
+        let alignment_copy = restores
+            .iter()
+            .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state))
+            .chain(
+                whole_restores
+                    .iter()
+                    .map(|restore| aggregate_checkpoint_alignment_copy_bytes(restore.state)),
+            )
+            .max()
+            .unwrap_or(0);
+        let payload_phase = raw_payload
+            + alignment_copy
+            + aggregate_transition_roster_scratch_bytes(
+                predecessor.participants.len(),
+                restores.len(),
+                restores.len(),
+            )
+            .unwrap();
+        let topology_upper =
+            target_owners.len() * (std::mem::size_of::<NodeId>() + std::mem::size_of::<u64>());
+        let decode_peak = target_operator.checked_live_state_bytes().unwrap()
+            + payload_phase
+            + aggregate
+                .vnode_transition_restore_roster_bytes(restores.len(), revoked.len())
+                .unwrap()
+            + topology_upper
+            + replacement_upper
+            + sequential_peak;
+        target_operator.set_managed_state_budget(decode_peak - 1);
+        assert!(matches!(
+            target_operator.prepare_vnode_transition(transition()),
+            Err(DbError::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+                ..
+            }) if accounted_bytes == decode_peak && limit_bytes == decode_peak - 1
+        ));
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        target_operator.set_managed_state_budget(usize::MAX);
+        target_operator
+            .prepare_vnode_transition(transition())
+            .unwrap();
+        target_operator.publish_vnode_transition();
+        assert_eq!(target_operator.local_frontier, frontier);
+        assert_eq!(target_operator.effective_frontier, frontier);
+        assert!(target_operator.cluster_peers.is_empty());
+        assert!(target_operator.peer_channels.is_empty());
+        target_operator.finish_vnode_transition();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn aggregate_transition_restores_unaligned_vnode_archive_with_bounded_copy() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+        let predecessor_owners = [2, 1, 1, 1, 1, 1, 1, 1];
+        let target_owners = [1, 1, 1, 1, 1, 1, 1, 1];
+        let scope = cluster_scope(predecessor_owners).await;
+        let (context, _) = context_and_batch();
+        let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+
+        let mut donor = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+            key_groups,
+        );
+        donor.initialize_managed_state().await.unwrap();
+        let required = (0..8).collect::<Vec<_>>();
+        let donor_vnode = donor
+            .checkpoint_vnodes(&required, 8, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .find(|frame| frame.vnode == 0)
+            .unwrap();
+        let capture = donor_vnode.state.unwrap();
+        let mut staged_bytes = capture.retained_bytes();
+        let donor_vnode = capture.materialize(&mut staged_bytes, u64::MAX).unwrap();
+        let donor_vnode = unaligned_aggregate_archive_transport(&donor_vnode);
+
+        let mut target_operator = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+            key_groups,
+        );
+        target_operator.initialize_managed_state().await.unwrap();
+        target_operator.attach_cluster_shuffle(scope.clone());
+
+        let participant = |node_id| CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        };
+        let predecessor_version = scope.registry.assignment_version();
+        let predecessor = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version,
+            &predecessor_owners,
+            vec![participant(1), participant(2)],
+        )
+        .unwrap();
+        let target = CheckpointAssignmentFence::from_owner_map(
+            predecessor_version + 1,
+            &target_owners,
+            vec![participant(1)],
+        )
+        .unwrap();
+        scope.registry.set_assignment_and_version(
+            Arc::from(target_owners.map(NodeId)),
+            target.assignment_version,
+        );
+        scope
+            .sender
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+        scope
+            .receiver
+            .install_assignment_fence(&target, &target_owners)
+            .unwrap();
+
+        let restores = [ManagedVnodeRestore {
+            participant_id: 2,
+            vnode: 0,
+            state: &donor_vnode,
+        }];
+        let donor_whole = portable_aggregate_whole_frame(&predecessor, 2, InputFrontier::default());
+        let whole_restores = [crate::operator_graph::ManagedWholeRestore {
+            participant_id: 2,
+            state: &donor_whole,
+        }];
+        let revoked = rustc_hash::FxHashSet::default();
+        let payload_phase_bytes = donor_vnode
+            .len()
+            .checked_add(donor_whole.len())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    aggregate_checkpoint_alignment_copy_bytes(&donor_vnode)
+                        .max(aggregate_checkpoint_alignment_copy_bytes(&donor_whole)),
+                )
+            })
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    aggregate_transition_roster_scratch_bytes(
+                        predecessor.participants.len(),
+                        restores.len(),
+                        restores.len(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .unwrap();
+        let payload_limit = payload_phase_bytes - 1;
+        target_operator.set_managed_state_budget(payload_limit);
+        let error = target_operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+                whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap_err();
+        match error {
+            DbError::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+                ..
+            } => {
+                assert_eq!(accounted_bytes, payload_phase_bytes);
+                assert_eq!(limit_bytes, payload_limit);
+            }
+            other => panic!("unaligned aggregate transition returned the wrong error: {other}"),
+        }
+        assert!(target_operator.prepared_vnode_transition.is_none());
+
+        target_operator.set_managed_state_budget(usize::MAX);
+        target_operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &predecessor,
+                target: &target,
+                revoked: &revoked,
+                restores: &restores,
+                whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+            .unwrap();
+        assert!(target_operator.managed_state_accounting().unwrap().prepared > 0);
+        target_operator.publish_vnode_transition();
+        assert_eq!(
+            target_operator
+                .cluster_assignment
+                .as_ref()
+                .unwrap()
+                .version(),
+            target.assignment_version
+        );
+        target_operator.finish_vnode_transition();
+    }
+
     #[tokio::test]
     async fn derived_aggregate_requires_incremental_execution() {
         let (context, _) = context_and_batch();
@@ -4350,6 +6274,33 @@ mod checkpoint_tests {
             DbError::BackpressureFail("injected halt".into()),
         );
         assert!(matches!(halt, DbError::BackpressureFail(_)));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn aggregate_shuffle_wrappers_preserve_terminal_disposition() {
+        fn assert_terminal(error: DbError, expected: &str) {
+            let DbError::ShuffleTerminal(reason) = error else {
+                panic!("expected permanent shuffle halt, got {error}");
+            };
+            assert_eq!(reason, expected);
+        }
+
+        let operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            laminar_sql::create_session_context(),
+            None,
+            false,
+        );
+        assert_terminal(
+            operator.remote_replay_error(DbError::ShuffleTerminal("remote replay".into())),
+            "remote replay",
+        );
+        assert_terminal(
+            operator.outbound_finalize_error(DbError::ShuffleTerminal("outbound".into())),
+            "outbound",
+        );
     }
 
     #[tokio::test]
@@ -4418,7 +6369,7 @@ mod checkpoint_tests {
     }
 
     #[tokio::test]
-    async fn vnode_capture_is_incremental_and_restores_without_whole_state() {
+    async fn vnode_capture_is_incremental_and_restores_unaligned_without_whole_state() {
         let (context, batch) = context_and_batch();
         let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
         let mut donor = SqlQueryOperator::new_with_key_groups(
@@ -4444,6 +6395,124 @@ mod checkpoint_tests {
             .unwrap()
             .is_empty());
 
+        let frames = baseline
+            .into_iter()
+            .map(|frame| {
+                let capture = frame.state.unwrap();
+                let mut staged_bytes = capture.retained_bytes();
+                let state = capture.materialize(&mut staged_bytes, u64::MAX).unwrap();
+                (frame.vnode, unaligned_aggregate_archive_transport(&state))
+            })
+            .collect::<Vec<_>>();
+        assert!(frames.iter().all(|(_, state)| {
+            state
+                .as_ptr()
+                .align_offset(AGG_CHECKPOINT_ARCHIVE_ALIGNMENT)
+                != 0
+        }));
+
+        let mut limited = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+            key_groups,
+        );
+        limited.initialize_managed_state().await.unwrap();
+        let (limited_vnode, limited_state) = &frames[0];
+        let alignment_accounted = limited_state.len().checked_mul(2).unwrap();
+        let limit = alignment_accounted - 1;
+        limited.set_managed_state_budget(limit);
+        let error = limited
+            .restore_vnode(*limited_vnode, 8, limited_state)
+            .unwrap_err();
+        match error {
+            DbError::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+                ..
+            } => {
+                assert_eq!(accounted_bytes, alignment_accounted);
+                assert_eq!(limit_bytes, limit);
+            }
+            other => panic!("unaligned aggregate restore returned the wrong error: {other}"),
+        }
+        let QueryState::Agg(limited_state) = &limited.state else {
+            panic!("expected limited aggregate state");
+        };
+        assert_eq!(limited_state.logical_group_count_for_test(), 0);
+
+        let (decode_vnode, decode_state) = frames
+            .iter()
+            .find(|(_, state)| {
+                let QueryState::Agg(aggregate) = &limited.state else {
+                    return false;
+                };
+                let profile = aggregate.vnode_archive_restore_profile();
+                with_aligned_aggregate_checkpoint_bytes(state, |state| {
+                    profile
+                        .preflight(state, format_args!("decode-bound test"))
+                        .map(|archive| archive.group_count() != 0)
+                })
+                .unwrap()
+            })
+            .expect("captured aggregate has a nonempty vnode");
+        let mut decode_limited = SqlQueryOperator::new_with_key_groups(
+            "sum",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context.clone(),
+            None,
+            false,
+            key_groups,
+        );
+        decode_limited.initialize_managed_state().await.unwrap();
+        let QueryState::Agg(aggregate) = &decode_limited.state else {
+            panic!("expected decode-limited aggregate state");
+        };
+        let profile = aggregate.vnode_archive_restore_profile();
+        let restore_preflight = with_aligned_aggregate_checkpoint_bytes(decode_state, |state| {
+            profile
+                .preflight(state, format_args!("decode-bound test"))
+                .map(|archive| archive.restore_preflight())
+        })
+        .unwrap();
+        let decode_peak = aggregate
+            .accounted_state_bytes()
+            .checked_add(decode_state.len())
+            .and_then(|bytes| {
+                bytes.checked_add(aggregate_checkpoint_alignment_copy_bytes(decode_state))
+            })
+            .and_then(|bytes| {
+                aggregate
+                    .vnode_transition_restore_roster_bytes(1, 0)
+                    .ok()
+                    .and_then(|roster| bytes.checked_add(roster))
+            })
+            .and_then(|bytes| {
+                restore_preflight
+                    .sequential_decode_bytes()
+                    .and_then(|decode| bytes.checked_add(decode))
+            })
+            .and_then(|bytes| bytes.checked_add(restore_preflight.final_state_upper_bytes()))
+            .unwrap();
+        decode_limited.set_managed_state_budget(decode_peak - 1);
+        let error = decode_limited
+            .restore_vnode(*decode_vnode, 8, decode_state)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+                ..
+            } if accounted_bytes == decode_peak && limit_bytes == decode_peak - 1
+        ));
+        let QueryState::Agg(aggregate) = &decode_limited.state else {
+            panic!("expected decode-limited aggregate state");
+        };
+        assert_eq!(aggregate.logical_group_count_for_test(), 0);
+
         let mut restored = SqlQueryOperator::new_with_key_groups(
             "sum",
             "SELECT key, SUM(value) AS total FROM events GROUP BY key",
@@ -4453,16 +6522,16 @@ mod checkpoint_tests {
             key_groups,
         );
         restored.initialize_managed_state().await.unwrap();
-        for frame in baseline {
-            let capture = frame.state.unwrap();
-            let mut staged_bytes = capture.retained_bytes();
-            let state = capture.materialize(&mut staged_bytes, u64::MAX).unwrap();
-            restored.restore_vnode(frame.vnode, 8, &state).unwrap();
+        for (vnode, state) in &frames {
+            restored.restore_vnode(*vnode, 8, state).unwrap();
         }
-        let QueryState::Agg(aggregate) = &mut restored.state else {
+        let QueryState::Agg(aggregate) = &restored.state else {
             panic!("expected restored aggregate state");
         };
         assert_eq!(aggregate.logical_group_count_for_test(), 2);
+        let expected = donor.process(&[Vec::new()], &[200]).await.unwrap();
+        let actual = restored.process(&[Vec::new()], &[200]).await.unwrap();
+        assert_eq!(actual, expected);
 
         donor.force_full_vnode_capture();
         let forced = donor

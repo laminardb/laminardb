@@ -645,14 +645,16 @@ async fn scenario_3_at_least_once_has_no_loss_after_db_restart() {
 
 fn kv_batch(ks: &[i64], vs: &[i64]) -> arrow::array::RecordBatch {
     use std::sync::Arc;
-    arrow::array::RecordBatch::try_from_iter(vec![
+    arrow::array::RecordBatch::try_from_iter_with_nullable(vec![
         (
             "k",
             Arc::new(arrow::array::Int64Array::from(ks.to_vec())) as _,
+            true,
         ),
         (
             "v",
             Arc::new(arrow::array::Int64Array::from(vs.to_vec())) as _,
+            true,
         ),
     ])
     .unwrap()

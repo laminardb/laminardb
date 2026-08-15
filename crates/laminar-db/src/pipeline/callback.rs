@@ -304,6 +304,9 @@ pub enum CheckpointAssignmentAdmission {
     Ready {
         assignment_fence: Option<CheckpointAssignmentFence>,
         flags: u64,
+        /// Retains the cluster assignment linearization boundary until the exact Prepare and
+        /// source-barrier commands are installed. `None` outside a clustered runtime.
+        assignment_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     },
     /// Topology is transitioning; retry later without faulting or reserving an attempt.
     Deferred(String),
@@ -452,6 +455,17 @@ pub trait PipelineCallback: Send + 'static {
         Ok(())
     }
 
+    /// Pin decision-bound source frontiers before a new source-admission cycle begins.
+    ///
+    /// The coordinator does not call this while graph-owned deferred input is replaying, so one
+    /// snapshot covers source filtering, initial execution, and every retained replay pass.
+    ///
+    /// # Errors
+    /// Returns an error when the frontier snapshot cannot be installed.
+    fn pin_source_frontiers_for_new_cycle(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Execute a SQL cycle over the accumulated source batches. `Err` is a whole-cycle
     /// failure (all domains, or a backpressure halt); per-domain faults surface in
     /// [`CycleOutcome`] so healthy domains still commit.
@@ -575,6 +589,13 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// Take a pending deterministic pipeline halt. A halt is permanent for the current
+    /// deployment and therefore takes precedence over consistency faults that would otherwise
+    /// trigger recovery of the same poison input.
+    fn take_pipeline_halt(&mut self) -> Option<String> {
+        None
+    }
+
     /// Take a pending consistency fault from checkpointing or a poisoned sink epoch. The
     /// coordinator stops intake so recovery can replay from the last committed cut.
     fn take_pipeline_fault(&mut self) -> Option<String> {
@@ -605,7 +626,7 @@ pub trait PipelineCallback: Send + 'static {
     /// reservation may be abandoned, but its ID is permanently burned.
     fn reserve_checkpoint_attempt(
         &mut self,
-        _attempt_started: std::time::Instant,
+        _deadline: tokio::time::Instant,
     ) -> impl std::future::Future<Output = Result<CheckpointAttempt, String>> + Send {
         std::future::ready(Err(
             "checkpoint coordinator has no durable attempt allocator".into(),
@@ -618,6 +639,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         _attempt: CheckpointAttempt,
         _attempt_started: std::time::Instant,
+        _deadline: tokio::time::Instant,
         _flags: u64,
         _assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
@@ -662,10 +684,12 @@ pub trait PipelineCallback: Send + 'static {
     /// Capture the exact assignment certificate for a new attempt.
     fn checkpoint_assignment_for_admission(
         &mut self,
+        _deadline: tokio::time::Instant,
     ) -> impl std::future::Future<Output = CheckpointAssignmentAdmission> + Send {
         std::future::ready(CheckpointAssignmentAdmission::Ready {
             assignment_fence: None,
             flags: laminar_core::checkpoint::flags::NONE,
+            assignment_guard: None,
         })
     }
 
@@ -698,12 +722,17 @@ pub trait PipelineCallback: Send + 'static {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         attempt_started: std::time::Instant,
+        deadline: tokio::time::Instant,
         flags: u64,
         assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> BarrierOutcome;
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
+
+    /// Record the three timed phases of one successfully published normal cycle. Checkpoint graph
+    /// drains use a separate execution path and must not call this hook.
+    fn record_cycle_phases(&self, _execute_ns: u64, _output_store_ns: u64, _sink_enqueue_ns: u64) {}
 
     /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
     fn note_cycle_error(&self) {}

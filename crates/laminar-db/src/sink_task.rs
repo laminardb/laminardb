@@ -24,8 +24,11 @@ use tokio::time::Instant;
 type SinkCommandTx = MAsyncTx<mpsc::Array<SinkCommand>>;
 type SinkCommandRx = AsyncRx<mpsc::Array<SinkCommand>>;
 
-/// Default capacity for the sink command channel.
-pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+/// Default capacity for the sink command channel. Keep the queue shallow enough that a checkpoint
+/// `Sync` fence cannot sit behind a long tail of individually acknowledged connector writes; the
+/// bounded sender applies backpressure before that latency is transferred wholesale into the
+/// stop-the-world checkpoint barrier.
+pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 
 /// Default periodic flush interval for sink tasks.
 #[cfg(test)]
@@ -1741,10 +1744,6 @@ async fn run_process_fenced_sink_task(
                     epoch_state.epoch(),
                     epoch_poisoned.as_ref(),
                 ).await;
-                if retire {
-                    actor_state.stop_admission();
-                    return;
-                }
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,
@@ -1752,6 +1751,10 @@ async fn run_process_fenced_sink_task(
                         epoch_poisoned.as_ref(),
                         None,
                     ).await;
+                    return;
+                }
+                if retire {
+                    actor_state.stop_admission();
                     return;
                 }
             }

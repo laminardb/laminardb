@@ -1104,10 +1104,32 @@ impl LaminarDB {
                 "[LDB-6044] catalog cleanup failed and the instance is permanently fenced".into()
             })
         };
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            self.latch_local_terminal_pipeline_halt();
+            if let Some(controller) = self.cluster_controller.lock().clone() {
+                controller.set_recovering(true);
+                if let Err(publication_error) = crate::coordinated_recovery::queue_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ) {
+                    tracing::error!(
+                        %publication_error,
+                        "could not retain terminal catalog-cleanup fault request"
+                    );
+                }
+            }
+        } else {
+            self.terminal_pipeline_halt
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        #[cfg(not(feature = "cluster"))]
+        self.terminal_pipeline_halt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         DbState::Faulted.store(&self.state);
         self.shutdown_signal.notify_one();
         tracing::error!(reason = %recorded, "catalog cleanup terminally fenced the database");
-        DbError::Pipeline(recorded)
+        DbError::PipelineTerminal(recorded)
     }
 
     pub(crate) fn rollback_catalog_create(
@@ -1142,7 +1164,7 @@ impl LaminarDB {
             "[LDB-6044] catalog cleanup is incomplete and this LaminarDB instance is permanently fenced"
                 .into()
         });
-        Err(DbError::Pipeline(format!(
+        Err(DbError::PipelineTerminal(format!(
             "{operation} rejected by terminal catalog cleanup fence: {reason}"
         )))
     }

@@ -40,6 +40,7 @@ fn donor_manifest(
     manifest.bind_participant(participant_id);
     manifest.deployment_id = deployment_id.into();
     manifest.assignment_fence = Some(fence.clone());
+    manifest.reassignment_portable = true;
     manifest.owned_vnodes.clone_from(&owned_vnodes);
 
     let mut entries = vec![
@@ -145,11 +146,13 @@ async fn handoff_fixture() -> HandoffFixture {
         scope: CheckpointScope::Cluster,
         vnode_count: key_group_count.get(),
         assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
         predecessor: None,
         participants,
         source_names: Vec::new(),
         source_offsets: BTreeMap::new(),
         channel_progress: Vec::new(),
+        source_watermarks: BTreeMap::new(),
         checkpoint_watermark: None,
     };
     let reference = decisions.create_committed_checkpoint(&index).await.unwrap();

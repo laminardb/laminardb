@@ -23,6 +23,52 @@ async fn try_from_sql_for_key_groups(
     IncrementalAggState::try_from_sql(ctx, sql, emit_changelog, key_group_count).await
 }
 
+#[test]
+fn managed_checkpoint_scalar_type_gate_preserves_supported_encodings() {
+    use arrow::datatypes::{IntervalUnit, TimeUnit};
+
+    for data_type in [
+        DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8View)),
+        DataType::BinaryView,
+        DataType::FixedSizeBinary(0),
+        DataType::FixedSizeBinary(16),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        DataType::Duration(TimeUnit::Microsecond),
+        DataType::Interval(IntervalUnit::MonthDayNano),
+        DataType::Decimal32(9, 2),
+        DataType::Decimal64(18, 4),
+        DataType::Decimal128(38, 8),
+        DataType::Decimal256(76, 16),
+    ] {
+        assert!(
+            is_managed_checkpoint_scalar_type(&data_type, true),
+            "{data_type:?}"
+        );
+    }
+
+    let item = Arc::new(Field::new("item", DataType::Int64, true));
+    for data_type in [
+        DataType::List(Arc::clone(&item)),
+        DataType::LargeList(Arc::clone(&item)),
+        DataType::FixedSizeList(item, 2),
+        DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+        DataType::FixedSizeBinary(-1),
+        DataType::Time32(TimeUnit::Nanosecond),
+    ] {
+        assert!(
+            !is_managed_checkpoint_scalar_type(&data_type, true),
+            "{data_type:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let ctx = laminar_sql::create_session_context();

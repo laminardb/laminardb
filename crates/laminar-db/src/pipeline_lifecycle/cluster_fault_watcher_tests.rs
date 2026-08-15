@@ -1,8 +1,10 @@
 use super::{
+    publish_cluster_compute_fault_state, publish_cluster_terminal_compute_halt_state,
     publish_runtime_fault_state, queue_owned_cluster_compute_fault, report_cluster_compute_fault,
+    retire_cluster_compute_generation_until,
 };
-use crate::db::DbState;
-use crate::{ClusterStartupDisposition, LaminarDB};
+use crate::db::{DbState, StartupCheckpointArtifactAudit};
+use crate::{ClusterStartupDisposition, DbError, LaminarDB};
 use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
@@ -225,6 +227,7 @@ async fn startup_db() -> (
         vec![RecoveryFault {
             reporter: node_id,
             sequence: 1,
+            disposition: laminar_core::cluster::control::RecoveryFaultDisposition::Recoverable,
         }],
     )
     .unwrap();
@@ -314,6 +317,48 @@ async fn fresh_certified_cluster_startup_opens_intake() {
 }
 
 #[tokio::test]
+async fn clean_prestart_artifact_audit_does_not_fault_on_later_live_inventory() {
+    let (db, controller, _kv, _members, round, _manifest_store, proof, deployment_id) =
+        startup_db().await;
+    db.prepare_cluster_startup_recovery_generation(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        *db.startup_checkpoint_artifact_audit.lock(),
+        Some(StartupCheckpointArtifactAudit::Clean(_))
+    ));
+
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .begin_cluster_checkpoint_artifacts(
+            &proof,
+            laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                deployment_id,
+                pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                assignment_fence: Some(round.assignment_fence),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClusterStartupDisposition::Serving
+    );
+    assert_eq!(
+        db.pending_recovery_fault.load(Ordering::Acquire),
+        0,
+        "live work admitted after the pre-start audit must not become a recovery fault"
+    );
+}
+
+#[tokio::test]
 async fn durable_fault_before_startup_audit_keeps_intake_closed() {
     let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
         startup_db().await;
@@ -348,6 +393,24 @@ async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
         )
         .await
         .unwrap();
+    db.prepare_cluster_startup_recovery_generation(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        *db.startup_checkpoint_artifact_audit.lock(),
+        Some(StartupCheckpointArtifactAudit::Artifacts(_))
+    ));
+    assert_eq!(
+        db.pending_recovery_fault.load(Ordering::Acquire),
+        0,
+        "pre-start audit must not publish a fault before the graph is live"
+    );
+    assert!(
+        controller.read_fault_reports().await.unwrap().is_empty(),
+        "pre-start audit must defer durable fault publication to startup finish"
+    );
 
     assert_eq!(
         db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -362,10 +425,86 @@ async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
             .load(std::sync::atomic::Ordering::Acquire),
         0
     );
+    assert!(!controller.read_fault_reports().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
+async fn startup_fence_invalidates_prior_clean_artifact_audit() {
+    let (db, controller, _kv, _members, round, _manifest_store, proof, deployment_id) =
+        startup_db().await;
+    db.prepare_cluster_startup_recovery_generation(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        *db.startup_checkpoint_artifact_audit.lock(),
+        Some(StartupCheckpointArtifactAudit::Clean(_))
+    ));
+
+    db.fence_cluster_startup();
+    assert_eq!(*db.startup_checkpoint_artifact_audit.lock(), None);
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .begin_cluster_checkpoint_artifacts(
+            &proof,
+            laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                deployment_id,
+                pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                assignment_fence: Some(round.assignment_fence),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClusterStartupDisposition::RecoveryFenced
+    );
+    assert!(db.cluster_intake_fenced());
+    assert_ne!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn mismatched_prestart_artifact_audit_falls_back_to_durable_inventory() {
+    let (db, controller, _kv, _members, round, _manifest_store, proof, deployment_id) =
+        startup_db().await;
+    let mut foreign_process = controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
+    foreign_process.participant.boot_incarnation = uuid::Uuid::from_u128(999);
+    *db.startup_checkpoint_artifact_audit.lock() =
+        Some(StartupCheckpointArtifactAudit::Clean(foreign_process));
+    controller
+        .checkpoint_authority()
+        .unwrap()
+        .begin_cluster_checkpoint_artifacts(
+            &proof,
+            laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                deployment_id,
+                pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
+                assignment_fence: Some(round.assignment_fence),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        ClusterStartupDisposition::RecoveryFenced
+    );
+    assert_ne!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn ownerless_worker_ignores_active_owner_artifacts_and_stays_fenced() {
     let local = StateNodeId(7);
     let owner = StateNodeId(8);
     let owner_boot = uuid::Uuid::from_u128(88);
@@ -388,14 +527,49 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         Some(Arc::clone(&assignment_store)),
         members_rx,
     ));
-    controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(
-        Arc::clone(&objects),
-        10_000,
-    )));
+    let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 10_000));
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(Arc::clone(&objects), Duration::from_secs(60)).unwrap(),
+    );
+    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+        .store_for(local)
+        .try_acquire(controller.recovery_incarnation(), 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty test authority must grant the ownerless process lease");
+    };
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
     controller
         .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
         .unwrap();
-    controller.publish_recovery_incarnation().await.unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
+    let leader_owner = LeaderLeaseOwner {
+        node: local,
+        boot: controller.recovery_incarnation(),
+        process_term: process_lease.term,
+    };
+    let LeaseOutcome::Acquired(leader_lease) = leader_authority
+        .begin_new_term(&leader_owner, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty test authority must grant ownerless test leadership");
+    };
+    let (_leader_tx, leader_rx) = tokio::sync::watch::channel(Some(leader_lease));
+    controller
+        .set_leader_lease_watch(
+            leader_rx,
+            leader_owner,
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
+        )
+        .unwrap();
+    controller.set_leader_lease_store(leader_authority);
     controller.set_active(true);
     let assignment = AssignmentSnapshot::empty()
         .next_for_participants(
@@ -460,6 +634,11 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         .unwrap()
         .is_none());
     db.fence_cluster_startup();
+    let audit_process = controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
+    *db.startup_checkpoint_artifact_audit.lock() =
+        Some(StartupCheckpointArtifactAudit::Artifacts(audit_process));
 
     assert_eq!(
         db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -476,6 +655,10 @@ async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         db.pending_recovery_fault
             .load(std::sync::atomic::Ordering::Acquire),
         0
+    );
+    assert!(
+        controller.read_fault_reports().await.unwrap().is_empty(),
+        "an ownerless process must not turn active owners' artifacts into a recovery fault"
     );
 }
 
@@ -563,8 +746,52 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
 }
 
 #[tokio::test]
-async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
+async fn cluster_compute_panic_before_ready_releases_the_startup_rotation_fence() {
     let (db, _controller, _kv, _members, _round, manifest_store, proof, _deployment_id) =
+        startup_db().await;
+    manifest_store
+        .seal(
+            &CatalogManifest::new(vec![
+                CatalogManifestEntry {
+                    canonical_name: "idle_input".into(),
+                    kind: CatalogObjectKind::Source,
+                    ddl: "CREATE SOURCE idle_input (id BIGINT) FROM \"idle-cluster-test\"".into(),
+                },
+                CatalogManifestEntry {
+                    canonical_name: "idle_output".into(),
+                    kind: CatalogObjectKind::Stream,
+                    ddl: "CREATE STREAM idle_output AS SELECT id FROM idle_input".into(),
+                },
+            ])
+            .unwrap(),
+            &proof,
+        )
+        .await
+        .unwrap();
+    db.compute_before_ready_panic.store(true, Ordering::Release);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), db.start())
+        .await
+        .expect("pre-ready compute panic must not deadlock startup")
+        .expect_err("injected pre-ready compute panic must fail startup");
+    assert!(
+        error
+            .to_string()
+            .contains("compute thread exited before entering the runtime control loop"),
+        "{error}"
+    );
+    assert!(!db.compute_before_ready_panic.load(Ordering::Acquire));
+    assert!(db.cluster_intake_fenced());
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(Arc::clone(&db.rotation_execution_fence)
+        .try_write_owned()
+        .is_ok());
+}
+
+#[tokio::test]
+async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
+    let (db, controller, _kv, _members, _round, manifest_store, proof, _deployment_id) =
         startup_db().await;
     manifest_store
         .seal(
@@ -599,6 +826,14 @@ async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
         "{start_error}"
     );
     assert_eq!(DbState::load(&db.state), DbState::Faulted);
+    assert!(db.terminal_pipeline_halt.load(Ordering::Acquire));
+    assert!(db.durable_terminal_recovery_fence.load(Ordering::Acquire));
+    assert_ne!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    assert!(controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap()
+        .has_terminal_fault());
     assert!(db
         .catalog_cleanup_fenced
         .load(std::sync::atomic::Ordering::Acquire));
@@ -611,9 +846,47 @@ async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
     assert!(terminal_reason.contains("[LDB-6044]"));
 
     let retry_error = db.start().await.unwrap_err();
+    assert!(retry_error.requires_pipeline_halt());
     assert!(retry_error.to_string().contains("[LDB-6044]"));
     assert_eq!(DbState::load(&db.state), DbState::Faulted);
     assert_eq!(db.last_fault().as_deref(), Some(terminal_reason.as_str()));
+}
+
+#[tokio::test]
+async fn late_startup_owner_terminalizes_after_its_original_waiter_times_out() {
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
+    DbState::Starting.store(&db.state);
+    let owner = {
+        let db = Arc::clone(&db);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let result = Err(DbError::PipelineTerminal("late restore poison".into()));
+            db.terminalize_start_attempt_if_needed(
+                super::PipelineLifecycleAuthority::CoordinatedRecovery,
+                &result,
+            )
+            .await;
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(
+        !owner.is_finished(),
+        "the original bounded waiter timed out first"
+    );
+    tokio::time::timeout(Duration::from_secs(2), owner)
+        .await
+        .expect("detached startup owner must reach durable terminal proof")
+        .expect("startup owner must not panic");
+
+    assert!(db.terminal_pipeline_halt.load(Ordering::Acquire));
+    assert!(db.durable_terminal_recovery_fence.load(Ordering::Acquire));
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
+    assert!(controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap()
+        .has_terminal_fault());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -752,4 +1025,181 @@ async fn lifecycle_arbitration_queues_only_a_live_generation_that_won_faulted() 
     )
     .unwrap());
     assert_ne!(pending.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn compute_fault_retires_stale_pending_transition_before_fault_publication() {
+    use crate::vnode_transition_staging::{InstalledVnodeStateBinding, PendingVnodeTransition};
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, PipelineIdentity};
+
+    let participant = CheckpointParticipant {
+        node_id: 7,
+        boot_incarnation: uuid::Uuid::from_u128(7),
+    };
+    let owners = [StateNodeId(7)];
+    let owner_ids = [7];
+    let predecessor =
+        CheckpointAssignmentFence::from_owner_map(2, &owner_ids, vec![participant]).unwrap();
+    let target =
+        CheckpointAssignmentFence::from_owner_map(3, &owner_ids, vec![participant]).unwrap();
+    let pipeline_identity = PipelineIdentity::empty();
+    let pending = Arc::new(
+        PendingVnodeTransition::assignment_change(
+            predecessor.clone(),
+            &owners,
+            target.clone(),
+            &owners,
+            participant,
+            pipeline_identity.clone(),
+            Vec::new(),
+            None,
+        )
+        .unwrap(),
+    );
+    let pending = Arc::new(parking_lot::Mutex::new(Some(pending)));
+    let installed = Arc::new(parking_lot::Mutex::new(Some(
+        InstalledVnodeStateBinding::new(predecessor, pipeline_identity.clone()).unwrap(),
+    )));
+    let state = std::sync::atomic::AtomicU8::new(DbState::Running as u8);
+    let execution = Arc::new(tokio::sync::RwLock::new(()));
+
+    assert!(publish_cluster_compute_fault_state(
+        &state, &execution, &pending, &installed,
+    ));
+    assert_eq!(DbState::load(&state), DbState::Faulted);
+    assert!(pending.lock().is_none());
+    assert!(installed.lock().is_none());
+
+    // A full recovery installs the exact current target directly; the dead graph's v2 -> v3
+    // callback work must no longer make that success marker look like a predecessor mismatch.
+    *installed.lock() =
+        Some(InstalledVnodeStateBinding::new(target.clone(), pipeline_identity.clone()).unwrap());
+    assert!(installed
+        .lock()
+        .as_ref()
+        .is_some_and(|binding| binding.matches(&target, &pipeline_identity)));
+}
+
+fn staged_vnode_transition_pair() -> (
+    crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) {
+    use crate::vnode_transition_staging::{InstalledVnodeStateBinding, PendingVnodeTransition};
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, PipelineIdentity};
+
+    let participant = CheckpointParticipant {
+        node_id: 7,
+        boot_incarnation: uuid::Uuid::from_u128(7),
+    };
+    let owners = [StateNodeId(7)];
+    let predecessor =
+        CheckpointAssignmentFence::from_owner_map(2, &[7], vec![participant]).unwrap();
+    let target = CheckpointAssignmentFence::from_owner_map(3, &[7], vec![participant]).unwrap();
+    let identity = PipelineIdentity::empty();
+    let pending = PendingVnodeTransition::assignment_change(
+        predecessor.clone(),
+        &owners,
+        target,
+        &owners,
+        participant,
+        identity.clone(),
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    (
+        Arc::new(parking_lot::Mutex::new(Some(Arc::new(pending)))),
+        Arc::new(parking_lot::Mutex::new(Some(
+            InstalledVnodeStateBinding::new(predecessor, identity).unwrap(),
+        ))),
+    )
+}
+
+#[test]
+fn terminal_compute_halt_fences_cluster_and_retires_vnode_claims_before_faulted() {
+    let (pending, installed) = staged_vnode_transition_pair();
+    let state = std::sync::atomic::AtomicU8::new(DbState::Running as u8);
+    let terminal_halt = AtomicBool::new(false);
+    let source_gate = AtomicBool::new(false);
+    let recovery_fence = AtomicBool::new(false);
+    let authority_transition = parking_lot::Mutex::new(());
+    let execution = Arc::new(tokio::sync::RwLock::new(()));
+
+    assert!(publish_cluster_terminal_compute_halt_state(
+        &state,
+        &authority_transition,
+        &terminal_halt,
+        &source_gate,
+        &recovery_fence,
+        &execution,
+        &pending,
+        &installed,
+    ));
+
+    assert!(terminal_halt.load(Ordering::Acquire));
+    assert!(source_gate.load(Ordering::Acquire));
+    assert!(recovery_fence.load(Ordering::Acquire));
+    assert!(pending.lock().is_none());
+    assert!(installed.lock().is_none());
+    assert_eq!(DbState::load(&state), DbState::Faulted);
+}
+
+#[tokio::test]
+async fn lifecycle_retirement_keeps_staged_and_installed_vnode_state_paired() {
+    let (pending, installed) = staged_vnode_transition_pair();
+    let execution = Arc::new(tokio::sync::RwLock::new(()));
+    let active_callback = Arc::clone(&execution).read_owned().await;
+    let retirement = {
+        let execution = Arc::clone(&execution);
+        let pending = Arc::clone(&pending);
+        let installed = Arc::clone(&installed);
+        tokio::spawn(async move {
+            retire_cluster_compute_generation_until(
+                &execution,
+                &pending,
+                &installed,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert!(!retirement.is_finished());
+    assert!(pending.lock().is_some());
+    assert!(installed.lock().is_some());
+
+    drop(active_callback);
+    let generation = tokio::time::timeout(Duration::from_secs(2), retirement)
+        .await
+        .expect("retirement remained blocked after the graph callback exited")
+        .expect("retirement task panicked")
+        .expect("retirement deadline expired");
+    assert!(pending.lock().is_none());
+    assert!(installed.lock().is_none());
+    drop(generation);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_retirement_timeout_preserves_both_vnode_state_claims() {
+    let (pending, installed) = staged_vnode_transition_pair();
+    let execution = Arc::new(tokio::sync::RwLock::new(()));
+    let active_callback = Arc::clone(&execution).read_owned().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let retirement = {
+        let execution = Arc::clone(&execution);
+        let pending = Arc::clone(&pending);
+        let installed = Arc::clone(&installed);
+        tokio::spawn(async move {
+            retire_cluster_compute_generation_until(&execution, &pending, &installed, deadline)
+                .await
+        })
+    };
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(retirement.await.unwrap().is_err());
+    assert!(pending.lock().is_some());
+    assert!(installed.lock().is_some());
+    drop(active_callback);
 }

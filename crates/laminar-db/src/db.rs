@@ -290,6 +290,9 @@ pub struct LaminarDB {
     #[cfg(all(test, feature = "cluster"))]
     pub(crate) catalog_seal_gate:
         parking_lot::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// One-shot fault injection for the compute-thread pre-ready ownership boundary.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) compute_before_ready_panic: Arc<std::sync::atomic::AtomicBool>,
     /// Kept inside an async mutex while joined. A cancelled stop future drops only the guard,
     /// never the sole watcher handle, so a retry cannot publish a false terminal state.
     pub(crate) runtime_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -356,10 +359,25 @@ pub struct LaminarDB {
     /// report's quiescence claim.
     #[cfg(feature = "cluster")]
     pub(crate) coordinated_recovery_fenced: Arc<std::sync::atomic::AtomicBool>,
+    /// Monotonic process view of a terminal fault durably installed anywhere in this cluster
+    /// authority namespace. Unlike `terminal_pipeline_halt`, this is also set by remote evidence;
+    /// it fences every reopen path but must not prevent healthy peers from quiescing for Prepare.
+    /// Only replacing the entire authority namespace and constructing a new DB instance resets it.
+    #[cfg(feature = "cluster")]
+    pub(crate) durable_terminal_recovery_fence: std::sync::atomic::AtomicBool,
+    /// Process-lifetime fail-closed latch for a deterministic runtime halt. Coordinated recovery
+    /// must never rebuild the same poison input while this process remains alive.
+    pub(crate) terminal_pipeline_halt: Arc<std::sync::atomic::AtomicBool>,
     /// Opaque local fault request retained through durable publication and cleared only while an
     /// authorized committed recovery Release is consumed. A newer fault atomically replaces it.
     #[cfg(feature = "cluster")]
     pub(crate) pending_recovery_fault: Arc<std::sync::atomic::AtomicU64>,
+    /// Exact-process result of the checkpoint-artifact audit completed before the first clustered
+    /// graph generation starts. Missing or mismatched evidence never suppresses the later fallback
+    /// audit.
+    #[cfg(feature = "cluster")]
+    pub(crate) startup_checkpoint_artifact_audit:
+        parking_lot::Mutex<Option<StartupCheckpointArtifactAudit>>,
     /// Epoch the most recent start restored from (`None` = started fresh). A rejoin fault
     /// is reported only when prior local state existed — a fresh joiner lost no window.
     #[cfg(feature = "cluster")]
@@ -375,7 +393,7 @@ pub struct LaminarDB {
     pub(crate) cluster_authority_revoked: std::sync::atomic::AtomicBool,
     /// Serializes source/shuffle authority grants with terminal revocation.
     #[cfg(feature = "cluster")]
-    pub(crate) cluster_authority_transition: parking_lot::Mutex<()>,
+    pub(crate) cluster_authority_transition: Arc<parking_lot::Mutex<()>>,
     pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
     pub(crate) physical_optimizer_rules:
         Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
@@ -407,9 +425,11 @@ pub struct LaminarDB {
     /// Exact assignment and state ABI installed in the current graph generation.
     #[cfg(feature = "cluster")]
     pub(crate) installed_vnode_state: crate::vnode_transition_staging::InstalledVnodeStateHandle,
-    /// Serializes successor preparation with assignment-certificate publication.
+    /// Serializes successor preparation with assignment-certificate and checkpoint admission.
+    /// A checkpoint retains an owned claim until its exact Prepare and source barriers are
+    /// installed, so a source drain cannot become durable in the admission-to-Prepare gap.
     #[cfg(feature = "cluster")]
-    pub(crate) assignment_adoption_lock: tokio::sync::Mutex<()>,
+    pub(crate) assignment_adoption_lock: Arc<tokio::sync::Mutex<()>>,
     /// Changes whenever local assignment authority is suspended or invalidated. The snapshot
     /// watcher uses it to reject a certificate computed from a head read before that closure.
     #[cfg(feature = "cluster")]
@@ -805,11 +825,158 @@ const fn checkpoint_participant_for_runtime(_db: &LaminarDB) -> Option<u64> {
 pub(crate) type ForceCheckpointReply =
     crossfire::oneshot::TxOneshot<Result<crate::checkpoint_coordinator::CheckpointResult, DbError>>;
 
+const FORCE_CHECKPOINT_RESERVATION_WAITING: u8 = 0;
+const FORCE_CHECKPOINT_RESERVATION_CLAIMED: u8 = 1;
+const FORCE_CHECKPOINT_RESERVATION_CANCELLED: u8 = 2;
+
+/// Linearizable ownership claim for one not-yet-reserved manual-checkpoint request.
+///
+/// The coordinator and caller race one atomic transition out of `WAITING`. The wake channel only
+/// makes a won coordinator claim promptly observable; it is not itself the ownership boundary.
+pub(crate) struct ForceCheckpointReservationClaim {
+    state: Arc<std::sync::atomic::AtomicU8>,
+    wake: tokio::sync::oneshot::Sender<()>,
+}
+
+pub(crate) struct ForceCheckpointReservationWait {
+    state: Arc<std::sync::atomic::AtomicU8>,
+    wake: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForceCheckpointReservationAttachment {
+    Attached,
+    Expired,
+    Cancelled,
+}
+
+impl ForceCheckpointReservationClaim {
+    pub(crate) fn new() -> (Self, ForceCheckpointReservationWait) {
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(
+            FORCE_CHECKPOINT_RESERVATION_WAITING,
+        ));
+        let (wake_tx, wake_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                state: Arc::clone(&state),
+                wake: wake_tx,
+            },
+            ForceCheckpointReservationWait {
+                state,
+                wake: wake_rx,
+            },
+        )
+    }
+
+    /// Claim the coordinator's bounded exact-reservation operation. This transition occurs before
+    /// durable ID reservation, whose implementation is itself hard-deadline-bounded.
+    pub(crate) fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FORCE_CHECKPOINT_RESERVATION_WAITING,
+                FORCE_CHECKPOINT_RESERVATION_CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Attach this waiter after durable ID reservation. Ordinary admission is already CLAIMED.
+    /// A caller coalesced onto owned HANDOFF replay can still be WAITING, so attachment atomically
+    /// classifies an elapsed deadline even when that caller's timer task has not been polled yet.
+    pub(crate) fn attach(
+        self,
+        deadline: tokio::time::Instant,
+        now: tokio::time::Instant,
+    ) -> ForceCheckpointReservationAttachment {
+        use ForceCheckpointReservationAttachment::{Attached, Cancelled, Expired};
+
+        let attachment = match self.state.load(std::sync::atomic::Ordering::Acquire) {
+            FORCE_CHECKPOINT_RESERVATION_CLAIMED => Attached,
+            FORCE_CHECKPOINT_RESERVATION_CANCELLED => Cancelled,
+            FORCE_CHECKPOINT_RESERVATION_WAITING if now >= deadline => {
+                match self.state.compare_exchange(
+                    FORCE_CHECKPOINT_RESERVATION_WAITING,
+                    FORCE_CHECKPOINT_RESERVATION_CANCELLED,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                ) {
+                    Ok(_) => Expired,
+                    Err(FORCE_CHECKPOINT_RESERVATION_CLAIMED) => Attached,
+                    Err(_) => Cancelled,
+                }
+            }
+            FORCE_CHECKPOINT_RESERVATION_WAITING => match self.state.compare_exchange(
+                FORCE_CHECKPOINT_RESERVATION_WAITING,
+                FORCE_CHECKPOINT_RESERVATION_CLAIMED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) | Err(FORCE_CHECKPOINT_RESERVATION_CLAIMED) => Attached,
+                Err(_) => Cancelled,
+            },
+            _ => Cancelled,
+        };
+        if attachment == Attached {
+            let _ = self.wake.send(());
+        }
+        attachment
+    }
+}
+
+impl Drop for ForceCheckpointReservationWait {
+    fn drop(&mut self) {
+        // External future cancellation participates in the same ownership race as the public
+        // deadline. Once CLAIMED, dropping the caller cannot revoke the bounded reservation work.
+        let _ = self.state.compare_exchange(
+            FORCE_CHECKPOINT_RESERVATION_WAITING,
+            FORCE_CHECKPOINT_RESERVATION_CANCELLED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+}
+
+impl ForceCheckpointReservationWait {
+    /// Returns true only when the public deadline wins before exact-attempt ownership.
+    fn cancel_before_reservation(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FORCE_CHECKPOINT_RESERVATION_WAITING,
+                FORCE_CHECKPOINT_RESERVATION_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_claimed(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire)
+            == FORCE_CHECKPOINT_RESERVATION_CLAIMED
+    }
+
+    pub(crate) async fn wait(&mut self) -> Result<(), tokio::sync::oneshot::error::RecvError> {
+        (&mut self.wake).await
+    }
+}
+
+/// One exact manual-checkpoint request and its caller-owned end-to-end deadline.
+///
+/// Dropping the reply receiver cancels admission while the request is still queued. Once an exact
+/// attempt has been reserved, the coordinator completes or cleans up that attempt before replying.
+pub(crate) struct ForceCheckpointRequest {
+    pub(crate) reply: ForceCheckpointReply,
+    /// Present until the first exact attempt adopts this request. A HANDOFF replay can move an
+    /// already-acknowledged request back to the waiting queue, so this is intentionally optional.
+    pub(crate) reservation_claim: Option<ForceCheckpointReservationClaim>,
+    pub(crate) deadline: tokio::time::Instant,
+}
+
 pub(crate) type ForceCheckpointTx =
-    crossfire::MAsyncTx<crossfire::mpsc::Array<ForceCheckpointReply>>;
+    crossfire::MAsyncTx<crossfire::mpsc::Array<ForceCheckpointRequest>>;
 
 pub(crate) type ForceCheckpointRx =
-    crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointReply>>;
+    crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointRequest>>;
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
 
@@ -952,6 +1119,26 @@ impl SourceWatermarkState {
         self.partitioned
             .as_ref()
             .map(PartitionedSourceWatermarks::all_idle)
+    }
+
+    /// Install a trusted, durable source-decision floor without wall-clock skew rejection.
+    ///
+    /// Unlike checkpoint restore this is monotonic: a live source can only advance. The normal
+    /// `advance_watermark` path intentionally rejects implausibly future event timestamps, but a
+    /// committed cluster cut may legitimately originate from a peer clock and must be reproduced
+    /// exactly by both aggregate and per-channel checkpoint state.
+    pub(crate) fn install_committed_watermark_floor(&mut self, watermark: i64) -> Option<i64> {
+        if watermark <= i64::MIN {
+            return None;
+        }
+        if let Some(state) = self.partitioned.as_mut() {
+            state.external_floor = state.external_floor.max(watermark);
+        }
+        if watermark <= self.generator.current_watermark() {
+            return None;
+        }
+        self.generator.restore_watermark_for_recovery(watermark);
+        Some(watermark)
     }
 
     pub(crate) fn install_input_channels(
@@ -1210,6 +1397,97 @@ pub struct SnapshotAdoption {
     pub adopted: bool,
     /// The snapshot version considered.
     pub version: u64,
+    /// The target topology was published only to admit a coordinated restore of its exact handoff
+    /// checkpoint. No live vnode transition was staged and source intake remains closed.
+    pub recovery_required: bool,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentAdoptionMode {
+    LiveTransition,
+    ColdRecovery,
+    /// Publish only the next authority-audited topology after coordinated recovery has completely
+    /// stopped this graph: an ownerless Commit acquisition, an exact stopped-owner Commit
+    /// (including final owner exit), an exact Abort rollback reported by a stopped owner/evidence
+    /// process, or an exact recovery successor whose pinned cut still belongs to the stopped
+    /// predecessor. The successor graph restores the durable cut at startup.
+    StoppedRecoveryTopology,
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) async fn audited_stopped_terminal_round(
+    controller: &laminar_core::cluster::control::ClusterController,
+    predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    deadline: tokio::time::Instant,
+) -> Result<Option<laminar_core::cluster::control::RecoveryRound>, DbError> {
+    use laminar_core::cluster::control::{RecoverPhase, RecoveryAnnouncement};
+
+    let active = tokio::time::timeout_at(deadline, controller.observe_recover_control())
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("stopped-recovery Prepare authority observation timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "stopped-recovery Prepare authority observation failed: {error}"
+            ))
+        })?;
+    let Some(RecoveryAnnouncement {
+        round,
+        phase: RecoverPhase::Prepare,
+    }) = active
+    else {
+        return Ok(None);
+    };
+    let local = controller.instance_id();
+    if round.assignment_fence != *predecessor
+        || !controller.recovery_driver_is_current(&round)
+        || !controller.recovery_round_requires_current_process_stop(&round)
+        || !controller.process_lease_is_live()
+    {
+        return Ok(None);
+    }
+    let reports = tokio::time::timeout_at(deadline, controller.read_stopped(&round, &[local]))
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("stopped-recovery local stopped-report read timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "stopped-recovery local stopped-report read failed: {error}"
+            ))
+        })?;
+    let expected = laminar_core::checkpoint::CheckpointParticipant {
+        node_id: local.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    if reports.len() != 1
+        || reports[0].publisher() != expected
+        || reports[0].validate(&round).is_err()
+    {
+        return Ok(None);
+    }
+    let confirmed = tokio::time::timeout_at(deadline, controller.observe_recover_control())
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("stopped-recovery Prepare authority recheck timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "stopped-recovery Prepare authority recheck failed: {error}"
+            ))
+        })?;
+    if confirmed
+        != Some(RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Prepare,
+        })
+        || !controller.process_lease_is_live()
+    {
+        return Ok(None);
+    }
+    Ok(Some(round))
 }
 
 /// Result of certifying a clustered process at startup.
@@ -1222,6 +1500,32 @@ pub enum ClusterStartupDisposition {
     Idle,
     /// A coordinated recovery must release this process before it may serve data.
     RecoveryFenced,
+}
+
+/// Result of the checkpoint-artifact audit performed before this exact process starts its graph.
+///
+/// A clean audit is process-bound evidence that a later active inventory can belong to live
+/// checkpoint work admitted after startup. An inventory observed on the pre-start side is instead
+/// retained as a recovery requirement through the later startup-authority gate.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupCheckpointArtifactAudit {
+    /// No unresolved inventory existed before this process started its graph.
+    Clean(laminar_core::cluster::control::LocalProcessAuthorityIdentity),
+    /// An unresolved inventory existed before this process started its graph.
+    Artifacts(laminar_core::cluster::control::LocalProcessAuthorityIdentity),
+}
+
+#[cfg(feature = "cluster")]
+impl StartupCheckpointArtifactAudit {
+    /// Exact process authority that bracketed the durable artifact read.
+    pub(crate) const fn process(
+        self,
+    ) -> laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+        match self {
+            Self::Clean(process) | Self::Artifacts(process) => process,
+        }
+    }
 }
 
 /// Result of publishing one locally serialized assignment-authority certificate.
@@ -1317,6 +1621,12 @@ impl LaminarDB {
         registry: &laminar_core::state::VnodeRegistry,
         assignment: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) -> Result<bool, DbError> {
+        // A Created/Starting graph has not restored its checkpoint state yet. In particular, a
+        // replacement may publish its assignment before public startup; coordinator=None must not
+        // be mistaken for an installed managed-state generation during that interval.
+        if DbState::load(&self.state) != DbState::Running {
+            return Ok(false);
+        }
         let local_assignment = registry.versioned_snapshot();
         let owner_ids: Vec<u64> = local_assignment
             .owners()
@@ -1556,6 +1866,8 @@ impl LaminarDB {
             stop_after_claim_gate: parking_lot::Mutex::new(None),
             #[cfg(all(test, feature = "cluster"))]
             catalog_seal_gate: parking_lot::Mutex::new(None),
+            #[cfg(all(test, feature = "cluster"))]
+            compute_before_ready_panic: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime_handle: tokio::sync::Mutex::new(None),
             checkpoint_namespace_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -1590,7 +1902,12 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             coordinated_recovery_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
+            durable_terminal_recovery_fence: std::sync::atomic::AtomicBool::new(false),
+            terminal_pipeline_halt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
             pending_recovery_fault: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "cluster")]
+            startup_checkpoint_artifact_audit: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             last_recovery_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -1600,7 +1917,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "cluster")]
-            cluster_authority_transition: parking_lot::Mutex::new(()),
+            cluster_authority_transition: Arc::new(parking_lot::Mutex::new(())),
             vnode_registry: parking_lot::Mutex::new((runtime_mode == RuntimeMode::Local).then(
                 || {
                     Arc::new(laminar_core::state::VnodeRegistry::single_owner(
@@ -1628,7 +1945,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             installed_vnode_state: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
-            assignment_adoption_lock: tokio::sync::Mutex::new(()),
+            assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(feature = "cluster")]
             assignment_authority_revision: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "cluster")]
@@ -2241,6 +2558,12 @@ impl LaminarDB {
             }
             let authority_unchanged = || {
                 tokio::time::Instant::now() < deadline
+                    && !self
+                        .terminal_pipeline_halt
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && !self
+                        .durable_terminal_recovery_fence
+                        .load(std::sync::atomic::Ordering::Acquire)
                     && self
                         .assignment_authority_revision
                         .load(std::sync::atomic::Ordering::Acquire)
@@ -2604,8 +2927,12 @@ impl LaminarDB {
         let version = snapshot.version;
         tokio::time::timeout_at(deadline, async {
             let _adoption = self.assignment_adoption_lock.lock().await;
-            self.adopt_assignment_snapshot_locked(snapshot, deadline)
-                .await
+            self.adopt_assignment_snapshot_locked(
+                snapshot,
+                deadline,
+                AssignmentAdoptionMode::LiveTransition,
+            )
+            .await
         })
         .await
         .unwrap_or_else(|_| {
@@ -2615,58 +2942,90 @@ impl LaminarDB {
         })
     }
 
+    /// Install an authority-sequenced failure-recovery successor. A still-running graph uses the
+    /// ordinary live transition. Only an exactly faulted, terminally observed and recovery-fenced
+    /// graph selects cold publication without reusing predecessor heap memory.
     #[cfg(feature = "cluster")]
-    async fn adopt_assignment_snapshot_locked(
+    pub(crate) async fn adopt_recovery_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
         deadline: tokio::time::Instant,
     ) -> Result<SnapshotAdoption, DbError> {
-        if snapshot.draining {
-            return Err(DbError::Checkpoint(format!(
-                "assignment {} is a draining generation and cannot publish ownership",
-                snapshot.version
-            )));
-        }
-        if !snapshot.has_canonical_participants() {
-            return Err(DbError::Checkpoint(format!(
-                "assignment {} has no canonical process roster",
-                snapshot.version
-            )));
-        }
-        let Some(registry) = self.vnode_registry.lock().clone() else {
-            return Ok(SnapshotAdoption::default());
-        };
-        let vnode_count = registry.vnode_count();
-        let new_assignment: Arc<[laminar_core::state::NodeId]> = snapshot
-            .to_vnode_vec(vnode_count)
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?
-            .into();
-        if snapshot.version <= registry.assignment_version() {
-            return Ok(SnapshotAdoption {
-                adopted: false,
-                version: snapshot.version,
-            });
-        }
-        // A successor cannot reinterpret transition bytes staged for the current assignment.
-        // Reject this local condition before any durable-authority I/O; publication checks it
-        // again under the execution fence to close the preparation race.
-        if self.has_unapplied_vnode_transition() {
-            return Err(DbError::ShuffleNotReady(format!(
-                "[LDB-6053] assignment {} cannot overtake an unapplied vnode transition for \
+        let version = snapshot.version;
+        tokio::time::timeout_at(deadline, async {
+            let _adoption = self.assignment_adoption_lock.lock().await;
+            let mode = if DbState::load(&self.state) == DbState::Faulted {
+                AssignmentAdoptionMode::ColdRecovery
+            } else {
+                AssignmentAdoptionMode::LiveTransition
+            };
+            self.adopt_assignment_snapshot_locked(snapshot, deadline, mode)
+                .await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(DbError::Checkpoint(format!(
+                "recovery assignment {version} adoption exceeded its end-to-end deadline"
+            )))
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn adopt_assignment_snapshot_locked(
+        &self,
+        snapshot: laminar_core::cluster::control::AssignmentSnapshot,
+        deadline: tokio::time::Instant,
+        mode: AssignmentAdoptionMode,
+    ) -> futures::future::BoxFuture<'_, Result<SnapshotAdoption, DbError>> {
+        Box::pin(async move {
+            let mut mode = mode;
+            if snapshot.draining {
+                return Err(DbError::Checkpoint(format!(
+                    "assignment {} is a draining generation and cannot publish ownership",
+                    snapshot.version
+                )));
+            }
+            if !snapshot.has_canonical_participants() {
+                return Err(DbError::Checkpoint(format!(
+                    "assignment {} has no canonical process roster",
+                    snapshot.version
+                )));
+            }
+            let Some(registry) = self.vnode_registry.lock().clone() else {
+                return Ok(SnapshotAdoption::default());
+            };
+            let vnode_count = registry.vnode_count();
+            let new_assignment: Arc<[laminar_core::state::NodeId]> = snapshot
+                .to_vnode_vec(vnode_count)
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?
+                .into();
+            if snapshot.version <= registry.assignment_version() {
+                return Ok(SnapshotAdoption {
+                    adopted: false,
+                    version: snapshot.version,
+                    recovery_required: false,
+                });
+            }
+            // A successor cannot reinterpret transition bytes staged for the current assignment.
+            // Reject this local condition before any durable-authority I/O; publication checks it
+            // again under the execution fence to close the preparation race.
+            if self.has_unapplied_vnode_transition() {
+                return Err(DbError::ShuffleNotReady(format!(
+                    "[LDB-6053] assignment {} cannot overtake an unapplied vnode transition for \
                  assignment {}; retry after graph execution completes it or an explicitly fenced \
                  replacement graph restores the committed cut",
-                snapshot.version,
-                registry.assignment_version()
-            )));
-        }
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Checkpoint(format!(
-                "[LDB-6053] assignment {} has no live local process identity",
-                snapshot.version
-            ))
-        })?;
-        let assignment_snapshot_store =
-            self.assignment_snapshot_store
+                    snapshot.version,
+                    registry.assignment_version()
+                )));
+            }
+            let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6053] assignment {} has no live local process identity",
+                    snapshot.version
+                ))
+            })?;
+            let assignment_snapshot_store = self
+                .assignment_snapshot_store
                 .lock()
                 .clone()
                 .ok_or_else(|| {
@@ -2675,163 +3034,308 @@ impl LaminarDB {
                     snapshot.version
                 ))
                 })?;
-        let durable_target = assignment_snapshot_store
-            .load_version(snapshot.version)
+            let durable_target = assignment_snapshot_store
+                .load_version(snapshot.version)
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] failed to load durable assignment {}: {error}",
+                        snapshot.version
+                    ))
+                })?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} is absent from durable history",
+                        snapshot.version
+                    ))
+                })?;
+            if durable_target != snapshot {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] assignment {} does not match its durable materialization",
+                    snapshot.version
+                )));
+            }
+            let audited_target = crate::rebalance::audit_assignment_snapshot_authority_outcome(
+                &assignment_snapshot_store,
+                Some(controller.as_ref()),
+                &snapshot,
+            )
             .await
             .map_err(|error| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6053] failed to load durable assignment {}: {error}",
-                    snapshot.version
-                ))
-            })?
-            .ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6053] assignment {} is absent from durable history",
+                    "assignment {} authority audit failed: {error}",
                     snapshot.version
                 ))
             })?;
-        if durable_target != snapshot {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6053] assignment {} does not match its durable materialization",
-                snapshot.version
-            )));
-        }
-        let audited_target = crate::rebalance::audit_assignment_snapshot_authority_outcome(
-            &assignment_snapshot_store,
-            Some(controller.as_ref()),
-            &snapshot,
-        )
-        .await
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "assignment {} authority audit failed: {error}",
-                snapshot.version
-            ))
-        })?;
-        let audited_predecessor = audited_target.predecessor().cloned();
-        let committed_handoff_checkpoint = audited_target.handoff_checkpoint().cloned();
-        let audited_drain = audited_target.into_terminal();
-        let self_id = laminar_core::state::NodeId(controller.instance_id().0);
-        let observed_assignment = registry.versioned_snapshot();
-        let observed_version = observed_assignment.version();
-        if observed_version == 0 {
-            let pristine_boot = observed_assignment
-                .owners()
-                .iter()
-                .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED)
-                && self.pending_vnode_transition.lock().is_none()
-                && self.installed_vnode_state.lock().is_none();
-            if !pristine_boot {
-                return Err(DbError::Checkpoint(
+            let audited_recovery = audited_target.is_recovery();
+            let audited_predecessor = audited_target.predecessor().cloned();
+            let committed_handoff_checkpoint = audited_target.handoff_checkpoint().cloned();
+            let recovery_origin = audited_target.recovery_origin().cloned();
+            let recovery_pin_is_active = audited_target.recovery_pin_is_active();
+            let recovery_checkpoint_was_consumed =
+                audited_target.recovery_checkpoint_was_consumed();
+            let audited_drain = audited_target.into_terminal();
+            let terminal_drain_authority = !audited_recovery && audited_drain.is_some();
+            let aborted_drain_authority = !audited_recovery
+                && audited_drain
+                    .as_ref()
+                    .is_some_and(crate::rebalance::AuditedDrainOutcome::is_abort);
+            let committed_drain_authority = !audited_recovery
+                && committed_handoff_checkpoint.is_some()
+                && audited_drain
+                    .clone()
+                    .and_then(crate::rebalance::AuditedDrainOutcome::into_committed_transition)
+                    .is_some();
+            // A drain terminal can land while checkpoint-abort cleanup is faulting the exact
+            // predecessor graph. That graph has already discarded its installed vnode binding,
+            // so an ordinary live transition must not reinterpret its retained heap. This also
+            // covers an audited Abort: its target-version rollback retains the predecessor map but
+            // still needs topology publication before a pristine graph can restore that older cut.
+            // Reuse the cold-publication path only when the immutable drain audit and exact faulted
+            // lifecycle below both hold; neither outcome reuses predecessor heap memory.
+            let faulted_terminal_drain_cold =
+                terminal_drain_authority && DbState::load(&self.state) == DbState::Faulted;
+            if mode == AssignmentAdoptionMode::LiveTransition && faulted_terminal_drain_cold {
+                mode = AssignmentAdoptionMode::ColdRecovery;
+            }
+            let target_fence = snapshot
+                .assignment_fence()
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            let recovery_requires_cold = audited_recovery
+                && (recovery_checkpoint_was_consumed
+                    || recovery_origin.as_ref().is_some_and(|origin| {
+                        audited_predecessor.as_ref().is_some_and(|predecessor| {
+                            origin.assignment_version < predecessor.assignment_version
+                        })
+                    }));
+            if mode == AssignmentAdoptionMode::ColdRecovery {
+                if !audited_recovery && !faulted_terminal_drain_cold {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} is neither an authority-sequenced recovery successor nor an audited terminal drain",
+                        snapshot.version
+                    )));
+                }
+                if audited_recovery {
+                    let expected_handoff = committed_handoff_checkpoint.as_ref().ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] recovery assignment {} has no pinned predecessor checkpoint",
+                            snapshot.version
+                        ))
+                    })?;
+                    let authority = controller.checkpoint_authority().map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] recovery assignment {} has no checkpoint authority: {error}",
+                            snapshot.version
+                        ))
+                    })?;
+                    if recovery_pin_is_active {
+                        let pinned = tokio::time::timeout_at(
+                            deadline,
+                            authority.assignment_handoff_checkpoint(&target_fence),
+                        )
+                        .await
+                        .map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} checkpoint-pin audit timed out",
+                                snapshot.version
+                            ))
+                        })?
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} checkpoint-pin audit failed: {error}",
+                                snapshot.version
+                            ))
+                        })?;
+                        if pinned.as_ref() != Some(expected_handoff) {
+                            return Err(DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} does not retain its exact authorized checkpoint pin",
+                                snapshot.version
+                            )));
+                        }
+                    } else if recovery_checkpoint_was_consumed {
+                        let head = tokio::time::timeout_at(
+                            deadline,
+                            authority.highest_cluster_committed_outcome(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} consumed-checkpoint audit timed out",
+                                snapshot.version
+                            ))
+                        })?
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} consumed-checkpoint audit failed: {error}",
+                                snapshot.version
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} has no committed recovery head",
+                                snapshot.version
+                            ))
+                        })?;
+                        if head.assignment_fence.as_ref() != Some(&target_fence)
+                            || head.committed_checkpoint.as_ref() != Some(expected_handoff)
+                        {
+                            return Err(DbError::Checkpoint(format!(
+                                "[LDB-6053] recovery assignment {} no longer owns its consumed committed head",
+                                snapshot.version
+                            )));
+                        }
+                    } else {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6053] recovery assignment {} has no audited checkpoint lifecycle",
+                            snapshot.version
+                        )));
+                    }
+                }
+            }
+            let self_id = laminar_core::state::NodeId(controller.instance_id().0);
+            let observed_assignment = registry.versioned_snapshot();
+            let observed_version = observed_assignment.version();
+            if observed_version == 0 {
+                let pristine_boot = observed_assignment
+                    .owners()
+                    .iter()
+                    .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED)
+                    && self.pending_vnode_transition.lock().is_none()
+                    && self.installed_vnode_state.lock().is_none();
+                if !pristine_boot {
+                    return Err(DbError::Checkpoint(
                     "[LDB-6053] assignment-zero bootstrap contains retained vnode lifecycle state"
                         .into(),
                 ));
-            }
-            let durable_head = assignment_snapshot_store
-                .load()
+                }
+                let durable_head = assignment_snapshot_store
+                    .load()
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] failed to load the durable assignment head: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "[LDB-6053] assignment-zero bootstrap has no durable assignment head"
+                                .into(),
+                        )
+                    })?;
+                let committed = crate::rebalance::startup_committed_assignment(
+                    assignment_snapshot_store.as_ref(),
+                    Some(controller.as_ref()),
+                    durable_head,
+                )
                 .await
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6053] failed to load the durable assignment head: {error}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "[LDB-6053] assignment-zero bootstrap has no durable assignment head"
-                            .into(),
-                    )
-                })?;
-            let committed = crate::rebalance::startup_committed_assignment(
-                assignment_snapshot_store.as_ref(),
-                Some(controller.as_ref()),
-                durable_head,
-            )
-            .await
-            .map_err(|error| DbError::Checkpoint(format!("[LDB-6053] {error}")))?;
-            if committed != snapshot {
-                return Err(DbError::Checkpoint(format!(
+                .map_err(|error| DbError::Checkpoint(format!("[LDB-6053] {error}")))?;
+                if committed != snapshot {
+                    return Err(DbError::Checkpoint(format!(
                     "[LDB-6053] assignment-zero bootstrap target {} is not the current committed assignment {}",
                     snapshot.version, committed.version
                 )));
-            }
-        } else if snapshot.version != observed_version.saturating_add(1) {
-            return Err(DbError::Checkpoint(format!(
+                }
+            } else if (mode == AssignmentAdoptionMode::LiveTransition
+                || faulted_terminal_drain_cold)
+                && snapshot.version != observed_version.saturating_add(1)
+            {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} is not the exact successor of local assignment {observed_version}; coordinated recovery must install missing generations",
                 snapshot.version
             )));
-        }
-        let predecessor_snapshot = if observed_version == 0 {
-            None
-        } else {
-            // The target authority audit above certified the immediate target -> predecessor
-            // edge. Retention intentionally keeps that predecessor, not its complete ancestry;
-            // recursively auditing older generations would reject a valid successor after GC.
-            let predecessor = assignment_snapshot_store
-                .load_version(observed_version)
+            }
+            let predecessor_snapshot = if observed_version == 0
+                && mode == AssignmentAdoptionMode::LiveTransition
+            {
+                None
+            } else {
+                // The target authority audit above certified the immediate target -> predecessor
+                // edge. Retention intentionally keeps that predecessor, not its complete ancestry;
+                // recursively auditing older generations would reject a valid successor after GC.
+                // A cold recovery may skip locally uninstalled generations, so bind this proof to the
+                // target's durable immediate predecessor rather than to the stale local registry.
+                let predecessor_version = if mode == AssignmentAdoptionMode::ColdRecovery {
+                    snapshot.version.checked_sub(1).ok_or_else(|| {
+                        DbError::Checkpoint(
+                            "[LDB-6053] recovery target has no predecessor generation".into(),
+                        )
+                    })?
+                } else {
+                    observed_version
+                };
+                let predecessor = assignment_snapshot_store
+                .load_version(predecessor_version)
                 .await
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
-                        "[LDB-6053] failed to load predecessor assignment {observed_version}: {error}"
+                        "[LDB-6053] failed to load predecessor assignment {predecessor_version}: {error}"
                     ))
                 })?
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
-                        "[LDB-6053] predecessor assignment {observed_version} is unavailable"
+                        "[LDB-6053] predecessor assignment {predecessor_version} is unavailable"
                     ))
                 })?;
-            let predecessor_owners = predecessor
-                .to_vnode_vec(vnode_count)
-                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            let predecessor_fence = predecessor
-                .assignment_fence()
-                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-            if audited_predecessor.as_ref() != Some(&predecessor_fence) {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6053] predecessor assignment {observed_version} does not match the audited target edge"
+                let predecessor_owners = predecessor
+                    .to_vnode_vec(vnode_count)
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                let predecessor_fence = predecessor
+                    .assignment_fence()
+                    .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+                if audited_predecessor.as_ref() != Some(&predecessor_fence) {
+                    return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] predecessor assignment {predecessor_version} does not match the audited target edge"
                 )));
-            }
-            if predecessor_owners.as_slice() != observed_assignment.owners() {
-                return Err(DbError::Checkpoint(format!(
+                }
+                if (mode == AssignmentAdoptionMode::LiveTransition || faulted_terminal_drain_cold)
+                    && predecessor_owners.as_slice() != observed_assignment.owners()
+                {
+                    return Err(DbError::Checkpoint(format!(
                     "[LDB-6053] local owner map at assignment {observed_version} does not match durable history"
                 )));
+                }
+                Some(predecessor)
+            };
+            let predecessor_fence = predecessor_snapshot
+                .as_ref()
+                .map(laminar_core::cluster::control::AssignmentSnapshot::assignment_fence)
+                .transpose()
+                .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+            let current_incarnation = controller.recovery_incarnation();
+            let local_participant = laminar_core::checkpoint::CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: current_incarnation,
+            };
+            crate::vnode_transition_staging::PendingVnodeTransition::validate_target_process(
+                &target_fence,
+                &new_assignment,
+                local_participant,
+            )?;
+            let predecessor_process_is_current =
+                predecessor_fence.as_ref().is_some_and(|predecessor| {
+                    predecessor.participant_incarnation(self_id.0) == Some(current_incarnation)
+                });
+            // A replacement process may retain the stable node id without inheriting any of the old
+            // process's memory. Use this effective predecessor roster everywhere below so acquisition,
+            // revoke, and final-owner authority cannot disagree with transition construction.
+            let effective_predecessor_owned = if predecessor_process_is_current {
+                owned_vnode_indices(observed_assignment.owners(), self_id)?
+            } else {
+                Vec::new()
+            };
+            let preflight_new_owned = owned_vnode_indices(&new_assignment, self_id)?;
+            if mode == AssignmentAdoptionMode::ColdRecovery && preflight_new_owned.is_empty() {
+                return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] recovery assignment {} cold publication requires target-bound local vnode ownership",
+                snapshot.version
+            )));
             }
-            Some(predecessor)
-        };
-        let predecessor_fence = predecessor_snapshot
-            .as_ref()
-            .map(laminar_core::cluster::control::AssignmentSnapshot::assignment_fence)
-            .transpose()
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let target_fence = snapshot
-            .assignment_fence()
-            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
-        let current_incarnation = controller.recovery_incarnation();
-        let local_participant = laminar_core::checkpoint::CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: current_incarnation,
-        };
-        crate::vnode_transition_staging::PendingVnodeTransition::validate_target_process(
-            &target_fence,
-            &new_assignment,
-            local_participant,
-        )?;
-        let predecessor_process_is_current =
-            predecessor_fence.as_ref().is_some_and(|predecessor| {
-                predecessor.participant_incarnation(self_id.0) == Some(current_incarnation)
-            });
-        // A replacement process may retain the stable node id without inheriting any of the old
-        // process's memory. Use this effective predecessor roster everywhere below so acquisition,
-        // revoke, and final-owner authority cannot disagree with transition construction.
-        let effective_predecessor_owned = if predecessor_process_is_current {
-            owned_vnode_indices(observed_assignment.owners(), self_id)?
-        } else {
-            Vec::new()
-        };
-        let preflight_new_owned = owned_vnode_indices(&new_assignment, self_id)?;
-        let final_owner_exit = if !effective_predecessor_owned.is_empty()
-            && preflight_new_owned.is_empty()
-        {
-            Some(audited_drain
+            let final_owner_exit = if mode == AssignmentAdoptionMode::LiveTransition
+                && !effective_predecessor_owned.is_empty()
+                && preflight_new_owned.is_empty()
+            {
+                Some(audited_drain
+                .clone()
                 .and_then(crate::rebalance::AuditedDrainOutcome::into_committed_transition)
                 .ok_or_else(|| {
                     DbError::Checkpoint(format!(
@@ -2839,296 +3343,982 @@ impl LaminarDB {
                         snapshot.version
                     ))
                 })?)
-        } else {
-            None
-        };
-        // The target is now durable-authority-audited and still newer. Close every predecessor
-        // admission path before reading its process roster, source handoff, or vnode state. Scope
-        // cancellation releases compute cycles blocked in shuffle so the final write fence can
-        // drain; any later error deliberately leaves this authority closed for a full retry.
-        self.set_source_gate(true);
-        controller.publish_checkpoint_assignment_fence(None);
-        self.invalidate_shuffle_assignment_fence();
-        let predecessor_drain = Arc::clone(&self.rotation_execution_fence)
-            .write_owned()
-            .await;
-        drop(predecessor_drain);
+            } else {
+                None
+            };
+            // Cold recovery must arrive through an already-fenced fault path. Remember this before
+            // ordinary adoption closes the gate itself, so that mutation cannot manufacture cold
+            // eligibility.
+            let cold_source_gate_was_closed =
+                self.source_gate.load(std::sync::atomic::Ordering::Acquire);
+            // The target is now durable-authority-audited and still newer. Close every predecessor
+            // admission path before reading its process roster, source handoff, or vnode state. Scope
+            // cancellation releases compute cycles blocked in shuffle so the final write fence can
+            // drain; any later error deliberately leaves this authority closed for a full retry.
+            self.set_source_gate(true);
+            controller.publish_checkpoint_assignment_fence(None);
+            self.invalidate_shuffle_assignment_fence();
+            let predecessor_drain = Arc::clone(&self.rotation_execution_fence)
+                .write_owned()
+                .await;
+            drop(predecessor_drain);
 
-        // Hold the coord mutex so registry + fence updates land between epochs.
-        let guard = self.coordinator.lock().await;
-        let prepared_pipeline_identity = guard
-            .as_ref()
-            .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
-            .transpose()?;
-        // Re-check under the lock: a concurrent adopt may have advanced the version,
-        // which we must not regress.
-        if snapshot.version <= registry.assignment_version() {
-            return Ok(SnapshotAdoption {
-                adopted: false,
-                version: snapshot.version,
-            });
-        }
+            // Hold the coord mutex so registry + fence updates land between epochs.
+            let guard = self.coordinator.lock().await;
+            let prepared_pipeline_identity = guard
+                .as_ref()
+                .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
+                .transpose()?;
+            // Re-check under the lock: a concurrent adopt may have advanced the version,
+            // which we must not regress.
+            if snapshot.version <= registry.assignment_version() {
+                return Ok(SnapshotAdoption {
+                    adopted: false,
+                    version: snapshot.version,
+                    recovery_required: false,
+                });
+            }
 
-        let prepared_assignment = registry.versioned_snapshot();
-        let prepared_from_version = prepared_assignment.version();
-        if prepared_from_version != observed_version {
-            return Err(DbError::Checkpoint(format!(
+            let prepared_assignment = registry.versioned_snapshot();
+            let prepared_from_version = prepared_assignment.version();
+            if prepared_from_version != observed_version {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment base advanced from {observed_version} to {prepared_from_version} while preparing target {}",
                 snapshot.version
             )));
-        }
-        let prepared_db_state = DbState::load(&self.state);
-        let prepared_runtime_shutdown = self.runtime_shutdown.read().clone();
-        let prepared_installed_state = self.installed_vnode_state.lock().clone();
-        let predecessor_binding_missing = local_state_lacks_exact_predecessor_binding(
-            observed_version,
-            predecessor_fence.as_ref(),
-            prepared_pipeline_identity.as_ref(),
-            (prepared_db_state == DbState::Running)
-                .then_some(prepared_installed_state.as_ref())
-                .flatten(),
-        );
-        let old_owned = effective_predecessor_owned;
-        if predecessor_binding_missing && !old_owned.is_empty() {
-            return Err(DbError::Checkpoint(format!(
+            }
+            let prepared_db_state = DbState::load(&self.state);
+            let prepared_runtime_shutdown = self.runtime_shutdown.read().clone();
+            let prepared_installed_state = self.installed_vnode_state.lock().clone();
+            let prepared_recovery_fault = self
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire);
+            let prepared_startup_attempt = self.startup_attempt.lock().clone();
+            // A fully stopped recovery generation has no resident vnode heap to transition and its
+            // cancelled runtime cannot consume staged frames. Topology-only publication admits an
+            // ownerless Commit acquisition under its active fault, or an exact stopped predecessor
+            // owner publishing Commit/Abort under the durable Prepare plus its boot-bound stopped
+            // report, or an authority-audited recovery successor pinned to that same stopped
+            // predecessor. A healthy stopped participant need not own the triggering fault.
+            let stopped_recovery_topology_common = mode == AssignmentAdoptionMode::LiveTransition
+                && prepared_db_state == DbState::Created
+                && prepared_runtime_shutdown.is_cancelled()
+                && cold_source_gate_was_closed
+                && self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+                && controller.process_lease_is_live()
+                && !self
+                    .cluster_authority_revoked
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && self
+                    .coordinated_recovery_fenced
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .coordinated_lifecycle_active
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !self.assignment_restore_shutdown.is_cancelled()
+                && !self
+                    .catalog_cleanup_fenced
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !self.is_closed()
+                && prepared_startup_attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.is_complete())
+                && guard.is_some()
+                && prepared_pipeline_identity.is_some()
+                && self.pending_vnode_transition.lock().is_none()
+                && prepared_installed_state.is_none()
+                && self.recover_target_epoch.lock().is_none()
+                && snapshot.version == observed_version.saturating_add(1);
+            let stopped_committed_topology_shape = committed_drain_authority
+                && observed_assignment
+                    .owners()
+                    .iter()
+                    .all(|owner| *owner != self_id)
+                && effective_predecessor_owned.is_empty()
+                && predecessor_fence.as_ref().is_some_and(|predecessor| {
+                    predecessor.participant_incarnation(self_id.0).is_none()
+                })
+                && !preflight_new_owned.is_empty()
+                && target_fence.participant_incarnation(self_id.0) == Some(current_incarnation);
+            let stopped_committed_owner_topology_shape = committed_drain_authority
+                && !effective_predecessor_owned.is_empty()
+                && predecessor_process_is_current
+                && audited_drain.as_ref().is_some_and(|terminal| {
+                    terminal.is_commit()
+                        && predecessor_fence.as_ref().is_some_and(|predecessor| {
+                            terminal.transition().predecessor == *predecessor
+                                && terminal.transition().target == target_fence
+                        })
+                })
+                && if preflight_new_owned.is_empty() {
+                    target_fence.participant_incarnation(self_id.0).is_none()
+                } else {
+                    target_fence.participant_incarnation(self_id.0) == Some(current_incarnation)
+                };
+            let stopped_aborted_owner_topology_shape = aborted_drain_authority
+                && !effective_predecessor_owned.is_empty()
+                && predecessor_process_is_current
+                && predecessor_snapshot.as_ref().is_some_and(|predecessor| {
+                    predecessor.vnodes == snapshot.vnodes
+                        && predecessor.participants == snapshot.participants
+                })
+                && new_assignment.as_ref() == observed_assignment.owners()
+                && preflight_new_owned == effective_predecessor_owned
+                && predecessor_fence.as_ref().is_some_and(|predecessor| {
+                    predecessor.participants == target_fence.participants
+                        && predecessor.assignment_digest == target_fence.assignment_digest
+                        && predecessor.vnode_count == target_fence.vnode_count
+                        && predecessor.partitioning_abi_version
+                            == target_fence.partitioning_abi_version
+                        && predecessor.assignment_version.checked_add(1)
+                            == Some(target_fence.assignment_version)
+                })
+                && target_fence.participant_incarnation(self_id.0) == Some(current_incarnation);
+            // A non-owner fault reporter is part of the exact recovery stopped roster but is absent
+            // from both the rollback predecessor and target assignment rosters. It has no vnode heap
+            // to retain or restore; after its exact stopped report, it must still advance the local
+            // topology generation so it can observe the successor owner-complete recovery round.
+            let stopped_aborted_ownerless_topology_shape = aborted_drain_authority
+                && effective_predecessor_owned.is_empty()
+                && !predecessor_process_is_current
+                && observed_assignment
+                    .owners()
+                    .iter()
+                    .all(|owner| *owner != self_id)
+                && preflight_new_owned.is_empty()
+                && predecessor_snapshot.as_ref().is_some_and(|predecessor| {
+                    predecessor.vnodes == snapshot.vnodes
+                        && predecessor.participants == snapshot.participants
+                })
+                && new_assignment.as_ref() == observed_assignment.owners()
+                && predecessor_fence.as_ref().is_some_and(|predecessor| {
+                    predecessor.participant_incarnation(self_id.0).is_none()
+                        && predecessor.participants == target_fence.participants
+                        && predecessor.assignment_digest == target_fence.assignment_digest
+                        && predecessor.vnode_count == target_fence.vnode_count
+                        && predecessor.partitioning_abi_version
+                            == target_fence.partitioning_abi_version
+                        && predecessor.assignment_version.checked_add(1)
+                            == Some(target_fence.assignment_version)
+                })
+                && target_fence.participant_incarnation(self_id.0).is_none();
+            let stopped_aborted_topology_shape =
+                stopped_aborted_owner_topology_shape || stopped_aborted_ownerless_topology_shape;
+            let stopped_recovery_successor_topology_shape = audited_recovery
+                && recovery_pin_is_active
+                && committed_handoff_checkpoint.is_some()
+                && predecessor_fence.is_some();
+            let prepared_recovery_fault_is_active = if stopped_recovery_topology_common
+                && stopped_committed_topology_shape
+                && prepared_recovery_fault != 0
+            {
+                let request = controller
+                    .recovery_fault_request(prepared_recovery_fault)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault identity is invalid: {error}",
+                            snapshot.version
+                        ))
+                    })?;
+                let outcome = tokio::time::timeout_at(deadline, controller.report_fault(request))
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault audit timed out",
+                            snapshot.version
+                        ))
+                    })?
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault audit failed: {error}",
+                            snapshot.version
+                        ))
+                    })?;
+                outcome == laminar_core::cluster::control::RecoveryFaultReportOutcome::Active
+            } else {
+                false
+            };
+            let stopped_abort_round =
+                if stopped_recovery_topology_common && stopped_aborted_topology_shape {
+                    audited_stopped_terminal_round(
+                        controller.as_ref(),
+                        predecessor_fence
+                            .as_ref()
+                            .expect("abort shape has predecessor"),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            let stopped_commit_owner_round =
+                if stopped_recovery_topology_common && stopped_committed_owner_topology_shape {
+                    audited_stopped_terminal_round(
+                        controller.as_ref(),
+                        predecessor_fence
+                            .as_ref()
+                            .expect("committed owner shape has predecessor"),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            let stopped_recovery_successor_round =
+                if stopped_recovery_topology_common && stopped_recovery_successor_topology_shape {
+                    audited_stopped_terminal_round(
+                        controller.as_ref(),
+                        predecessor_fence
+                            .as_ref()
+                            .expect("recovery successor shape has predecessor"),
+                        deadline,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+            let stopped_commit_owner_pin_is_active = if stopped_recovery_topology_common
+                && stopped_committed_owner_topology_shape
+            {
+                let expected = committed_handoff_checkpoint
+                    .as_ref()
+                    .expect("committed drain authority has a handoff checkpoint");
+                let authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority is unavailable: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                let pinned = tokio::time::timeout_at(
+                    deadline,
+                    authority.assignment_handoff_checkpoint(&target_fence),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit timed out",
+                        snapshot.version
+                    ))
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit handoff-pin audit failed: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                pinned.as_ref() == Some(expected)
+            } else {
+                false
+            };
+            let stopped_recovery_topology = stopped_recovery_topology_common
+                && ((stopped_committed_topology_shape && prepared_recovery_fault_is_active)
+                    || (stopped_aborted_topology_shape && stopped_abort_round.is_some())
+                    || (stopped_committed_owner_topology_shape
+                        && stopped_commit_owner_round.is_some()
+                        && stopped_commit_owner_pin_is_active)
+                    || (stopped_recovery_successor_topology_shape
+                        && stopped_recovery_successor_round.is_some()));
+            if stopped_recovery_topology {
+                mode = AssignmentAdoptionMode::StoppedRecoveryTopology;
+            }
+            // A propagated recovery cut cannot seed a resident live-state transition: its archive
+            // is bound to an older assignment than the target's immediate predecessor. Two local
+            // shapes carry no predecessor heap across that edge and are therefore safe without
+            // waiting for the faulted cold path:
+            //
+            // * an authority-validated Created process with no coordinator or installed heap
+            //   defers the complete graph restore to startup; and
+            // * a zero-owner process publishes topology only, with neither retained nor acquired
+            //   vnode state and no installed binding.
+            //
+            // Keep every stateful live path fail-closed. In particular, merely being a replacement
+            // process is not enough when the target assigns it vnodes.
+            let pristine_startup_bootstrap = prepared_db_state == DbState::Created
+                && prepared_installed_state.is_none()
+                && guard.is_none()
+                && effective_predecessor_owned.is_empty()
+                && cold_source_gate_was_closed
+                && controller.is_recovering()
+                && controller.process_lease_is_live()
+                && (!audited_recovery || prepared_recovery_fault != 0)
+                && self.pending_vnode_transition.lock().is_none()
+                && self.recover_target_epoch.lock().is_none()
+                && !self
+                    .coordinated_recovery_fenced
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .catalog_cleanup_fenced
+                    .load(std::sync::atomic::Ordering::Acquire)
+                && !self.is_closed();
+            let metadata_only_zero_owner_transition = effective_predecessor_owned.is_empty()
+                && preflight_new_owned.is_empty()
+                && prepared_installed_state.is_none();
+            if mode == AssignmentAdoptionMode::LiveTransition
+                && recovery_requires_cold
+                && !pristine_startup_bootstrap
+                && !metadata_only_zero_owner_transition
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] recovery assignment {} must wait for a faulted cold bootstrap because its committed cut is not the live predecessor edge",
+                    snapshot.version
+                )));
+            }
+            if mode == AssignmentAdoptionMode::ColdRecovery
+                && (prepared_db_state != DbState::Faulted
+                    || !cold_source_gate_was_closed
+                    || !self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+                    || !controller.is_recovering()
+                    || !self
+                        .coordinated_recovery_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || prepared_recovery_fault == 0
+                    || !controller.process_lease_is_live()
+                    || self
+                        .catalog_cleanup_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self.is_closed()
+                    || guard.is_none()
+                    || self.pending_vnode_transition.lock().is_some()
+                    || prepared_installed_state.is_some())
+            {
+                return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] recovery assignment {} cold publication requires the exact faulted graph, live process lease, closed source gate, recovery lifecycle fence, pending fault, coordinator, and empty pending/installed vnode state",
+                snapshot.version
+            )));
+            }
+            let predecessor_binding_missing = local_state_lacks_exact_predecessor_binding(
+                observed_version,
+                predecessor_fence.as_ref(),
+                prepared_pipeline_identity.as_ref(),
+                (prepared_db_state == DbState::Running)
+                    .then_some(prepared_installed_state.as_ref())
+                    .flatten(),
+            );
+            let old_owned = if matches!(
+                mode,
+                AssignmentAdoptionMode::ColdRecovery
+                    | AssignmentAdoptionMode::StoppedRecoveryTopology
+            ) {
+                Vec::new()
+            } else {
+                effective_predecessor_owned
+            };
+            if mode == AssignmentAdoptionMode::LiveTransition
+                && predecessor_binding_missing
+                && !old_owned.is_empty()
+            {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} cannot reuse retained vnode memory without its exact predecessor binding; coordinated recovery is required",
                 snapshot.version
             )));
-        }
-        if old_owned.is_empty() && prepared_installed_state.is_some() {
-            return Err(DbError::Checkpoint(format!(
+            }
+            if mode == AssignmentAdoptionMode::LiveTransition
+                && old_owned.is_empty()
+                && prepared_installed_state.is_some()
+            {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} found installed vnode state without current-process predecessor ownership; coordinated recovery is required",
                 snapshot.version
             )));
-        }
-        let old_set: rustc_hash::FxHashSet<u32> = old_owned.iter().copied().collect();
-        let new_owned = preflight_new_owned;
-        // Compute from the new assignment before reading state or publishing ownership.
-        let vnodes_requiring_restore: Vec<u32> = new_owned
-            .iter()
-            .copied()
-            .filter(|vnode| !old_set.contains(vnode))
-            .collect();
-        // Startup installs the committed assignment before the lifecycle restores its complete
-        // graph. A live graph loads only its acquired vnode ranges at this fenced boundary.
-        let startup_restore_deferred = observed_version == 0
-            && prepared_db_state != DbState::Running
-            && predecessor_snapshot.is_none();
-        let state_frames = if !vnodes_requiring_restore.is_empty() && !startup_restore_deferred {
-            let handoff = committed_handoff_checkpoint.as_ref().ok_or_else(|| {
+            }
+            let old_set: rustc_hash::FxHashSet<u32> = old_owned.iter().copied().collect();
+            let new_owned = preflight_new_owned;
+            // Compute from the new assignment before reading state or publishing ownership.
+            let vnodes_requiring_restore: Vec<u32> = if matches!(
+                mode,
+                AssignmentAdoptionMode::ColdRecovery
+                    | AssignmentAdoptionMode::StoppedRecoveryTopology
+            ) {
+                Vec::new()
+            } else {
+                new_owned
+                    .iter()
+                    .copied()
+                    .filter(|vnode| !old_set.contains(vnode))
+                    .collect()
+            };
+            // Startup installs the committed assignment before the lifecycle restores its complete
+            // graph. A live graph loads only its acquired vnode ranges at this fenced boundary.
+            let startup_restore_deferred = matches!(
+                mode,
+                AssignmentAdoptionMode::ColdRecovery
+                    | AssignmentAdoptionMode::StoppedRecoveryTopology
+            ) || pristine_startup_bootstrap;
+            let prepared_handoff_cut_mismatch = if mode == AssignmentAdoptionMode::LiveTransition
+                && !vnodes_requiring_restore.is_empty()
+                && !startup_restore_deferred
+            {
+                let handoff = committed_handoff_checkpoint.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "[LDB-6050] assignment {} has no exact committed checkpoint authority for vnode acquisition",
                     snapshot.version
                 ))
             })?;
-            let predecessor = predecessor_fence.as_ref().ok_or_else(|| {
-                DbError::Checkpoint(format!(
+                let coordinator = guard.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6050] assignment {} has no checkpoint coordinator for vnode acquisition",
+                        snapshot.version
+                    ))
+                })?;
+                coordinator.last_committed_ref() != Some(handoff)
+            } else {
+                false
+            };
+            let state_frames = if mode == AssignmentAdoptionMode::LiveTransition
+                && !vnodes_requiring_restore.is_empty()
+                && !startup_restore_deferred
+                && !prepared_handoff_cut_mismatch
+            {
+                let handoff = committed_handoff_checkpoint
+                    .as_ref()
+                    .expect("live vnode acquisition checked exact committed checkpoint authority");
+                let predecessor = predecessor_fence.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
                     "[LDB-6050] assignment {} has no predecessor certificate for vnode acquisition",
                     snapshot.version
                 ))
-            })?;
-            let coordinator = guard.as_ref().ok_or_else(|| {
-                DbError::Checkpoint(format!(
+                })?;
+                let coordinator = guard.as_ref().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
                     "[LDB-6050] assignment {} has no checkpoint coordinator for vnode acquisition",
                     snapshot.version
                 ))
-            })?;
-            let max_payload_bytes = self
-                .config
-                .pipeline_max_managed_state_bytes
-                .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
-            tokio::select! {
-                biased;
-                () = self.assignment_restore_shutdown.cancelled() => {
-                    return Err(DbError::Shutdown);
+                })?;
+                let max_payload_bytes = self
+                    .config
+                    .pipeline_max_managed_state_bytes
+                    .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
+                tokio::select! {
+                    biased;
+                    () = self.assignment_restore_shutdown.cancelled() => {
+                        return Err(DbError::Shutdown);
+                    }
+                    () = prepared_runtime_shutdown.cancelled() => {
+                        return Err(DbError::Shutdown);
+                    }
+                    result = coordinator.load_handoff_state_frames(
+                        handoff,
+                        predecessor,
+                        observed_assignment.owners(),
+                        &vnodes_requiring_restore,
+                        // Portable whole cuts carry donor-global channel/frontier state. They are
+                        // required even when this process retains other vnodes (notably aggregates).
+                        true,
+                        max_payload_bytes,
+                        deadline,
+                    ) => result?,
                 }
-                () = prepared_runtime_shutdown.cancelled() => {
-                    return Err(DbError::Shutdown);
-                }
-                result = coordinator.load_handoff_state_frames(
-                    handoff,
-                    predecessor,
-                    observed_assignment.owners(),
-                    &vnodes_requiring_restore,
-                    old_owned.is_empty(),
-                    max_payload_bytes,
-                    deadline,
-                ) => result?,
-            }
-        } else {
-            Vec::new()
-        };
+            } else {
+                Vec::new()
+            };
 
-        drop(guard);
+            drop(guard);
 
-        // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won,
-        // the bound pipeline changed, or a newer durable cut appeared during the reads.
-        let _execution_guard = Arc::clone(&self.rotation_execution_fence)
-            .write_owned()
-            .await;
-        let mut guard = self.coordinator.lock().await;
-        let current_pipeline_identity = guard
-            .as_ref()
-            .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
-            .transpose()?;
-        if current_pipeline_identity != prepared_pipeline_identity {
-            return Err(DbError::Checkpoint(format!(
+            // Re-acquire the epoch boundary and discard the prepared adoption if another rotation won,
+            // the bound pipeline changed, or a newer durable cut appeared during the reads.
+            let _execution_guard = Arc::clone(&self.rotation_execution_fence)
+                .write_owned()
+                .await;
+            let mut guard = self.coordinator.lock().await;
+            let current_pipeline_identity = guard
+                .as_ref()
+                .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
+                .transpose()?;
+            if current_pipeline_identity != prepared_pipeline_identity {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] pipeline identity changed while preparing assignment {}; retrying the complete transition",
                 snapshot.version
-            )));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(DbError::Checkpoint(format!(
-                "assignment {} adoption reached its deadline before publication",
-                snapshot.version
-            )));
-        }
-        let current_version = registry.assignment_version();
-        if snapshot.version <= current_version {
-            return Ok(SnapshotAdoption {
-                adopted: false,
-                version: snapshot.version,
-            });
-        }
-        if current_version != prepared_from_version {
-            return Err(DbError::Checkpoint(format!(
+                )));
+            }
+            let durable_recovery_fault_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_committed_topology_shape
+            {
+                let request = controller
+                    .recovery_fault_request(prepared_recovery_fault)
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault identity changed: {error}",
+                            snapshot.version
+                        ))
+                    })?;
+                let outcome = tokio::time::timeout_at(deadline, controller.report_fault(request))
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault recheck timed out",
+                            snapshot.version
+                        ))
+                    })?
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6053] assignment {} stopped-recovery fault recheck failed: {error}",
+                            snapshot.version
+                        ))
+                    })?;
+                outcome == laminar_core::cluster::control::RecoveryFaultReportOutcome::Active
+            } else {
+                true
+            };
+            let durable_stopped_abort_round_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_aborted_topology_shape
+            {
+                audited_stopped_terminal_round(
+                    controller.as_ref(),
+                    predecessor_fence
+                        .as_ref()
+                        .expect("abort shape has predecessor"),
+                    deadline,
+                )
+                .await?
+                    == stopped_abort_round
+            } else {
+                true
+            };
+            let durable_stopped_commit_owner_round_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_committed_owner_topology_shape
+            {
+                audited_stopped_terminal_round(
+                    controller.as_ref(),
+                    predecessor_fence
+                        .as_ref()
+                        .expect("committed owner shape has predecessor"),
+                    deadline,
+                )
+                .await?
+                    == stopped_commit_owner_round
+            } else {
+                true
+            };
+            let durable_stopped_recovery_successor_round_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_recovery_successor_topology_shape
+            {
+                audited_stopped_terminal_round(
+                    controller.as_ref(),
+                    predecessor_fence
+                        .as_ref()
+                        .expect("recovery successor shape has predecessor"),
+                    deadline,
+                )
+                .await?
+                    == stopped_recovery_successor_round
+            } else {
+                true
+            };
+            let durable_stopped_commit_owner_pin_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_committed_owner_topology_shape
+            {
+                let expected = committed_handoff_checkpoint
+                    .as_ref()
+                    .expect("committed drain authority has a handoff checkpoint");
+                let authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit checkpoint authority changed: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                let pinned = tokio::time::timeout_at(
+                    deadline,
+                    authority.assignment_handoff_checkpoint(&target_fence),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck timed out",
+                        snapshot.version
+                    ))
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-Commit handoff-pin recheck failed: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                pinned.as_ref() == Some(expected)
+            } else {
+                true
+            };
+            let durable_stopped_recovery_successor_pin_is_active = if mode
+                == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && stopped_recovery_successor_topology_shape
+            {
+                let expected = committed_handoff_checkpoint
+                    .as_ref()
+                    .expect("recovery successor authority has a handoff checkpoint");
+                let authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-recovery checkpoint authority changed: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                let pinned = tokio::time::timeout_at(
+                    deadline,
+                    authority.assignment_handoff_checkpoint(&target_fence),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck timed out",
+                        snapshot.version
+                    ))
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} stopped-recovery handoff-pin recheck failed: {error}",
+                        snapshot.version
+                    ))
+                })?;
+                pinned.as_ref() == Some(expected)
+            } else {
+                true
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DbError::Checkpoint(format!(
+                    "assignment {} adoption reached its deadline before publication",
+                    snapshot.version
+                )));
+            }
+            let handoff_cut_mismatch = if mode == AssignmentAdoptionMode::LiveTransition
+                && !vnodes_requiring_restore.is_empty()
+                && !startup_restore_deferred
+            {
+                guard.as_ref().and_then(
+                    crate::checkpoint_coordinator::CheckpointCoordinator::last_committed_ref,
+                ) != committed_handoff_checkpoint.as_ref()
+            } else {
+                false
+            };
+            if prepared_handoff_cut_mismatch && !handoff_cut_mismatch {
+                // The local checkpoint advanced while the handoff read boundary was released.
+                // Retry so acquired frames are loaded from the now-coherent exact cut.
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] assignment {} resident checkpoint advanced to its handoff cut during adoption; retrying",
+                    snapshot.version
+                )));
+            }
+            let current_version = registry.assignment_version();
+            if snapshot.version <= current_version {
+                return Ok(SnapshotAdoption {
+                    adopted: false,
+                    version: snapshot.version,
+                    recovery_required: false,
+                });
+            }
+            if current_version != prepared_from_version {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment base advanced from {prepared_from_version} to {current_version} while preparing target {}; retrying from the new owner set",
                 snapshot.version
             )));
-        }
-        let adoption = SnapshotAdoption {
-            adopted: true,
-            version: snapshot.version,
-        };
-        // A resident graph advances every adjacent topology generation, including zero-owner
-        // generations, so a later acquisition is based on the exact predecessor assignment.
-        let has_local_transition = !startup_restore_deferred
-            && (!old_owned.is_empty()
-                || !vnodes_requiring_restore.is_empty()
-                || (observed_version != 0 && prepared_db_state == DbState::Running));
-        let pending_transition = if has_local_transition {
-            guard.as_ref().ok_or_else(|| {
+            }
+            let adoption = SnapshotAdoption {
+                adopted: true,
+                version: snapshot.version,
+                recovery_required: handoff_cut_mismatch,
+            };
+            // A resident graph advances every adjacent topology generation, including zero-owner
+            // generations, so a later acquisition is based on the exact predecessor assignment.
+            let has_local_transition = mode == AssignmentAdoptionMode::LiveTransition
+                && !startup_restore_deferred
+                && !handoff_cut_mismatch
+                && (!old_owned.is_empty()
+                    || !vnodes_requiring_restore.is_empty()
+                    || (observed_version != 0 && prepared_db_state == DbState::Running));
+            let pending_transition = if has_local_transition {
+                guard.as_ref().ok_or_else(|| {
                 DbError::Checkpoint(format!(
                     "[LDB-6053] assignment {} has no checkpoint coordinator for transition identity",
                     snapshot.version
                 ))
             })?;
-            let pipeline_identity = current_pipeline_identity.clone().ok_or_else(|| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6053] assignment {} has no bound pipeline identity",
-                    snapshot.version
-                ))
-            })?;
-            let transition =
-                crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
-                    predecessor_fence.clone().ok_or_else(|| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6053] assignment {} has no predecessor certificate",
-                            snapshot.version
-                        ))
-                    })?,
-                    observed_assignment.owners(),
-                    target_fence.clone(),
-                    &new_assignment,
-                    local_participant,
-                    pipeline_identity,
-                    state_frames,
-                    final_owner_exit,
-                )?;
-            if transition.acquired_vnodes() != vnodes_requiring_restore {
-                return Err(DbError::Checkpoint(format!(
+                let pipeline_identity = current_pipeline_identity.clone().ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6053] assignment {} has no bound pipeline identity",
+                        snapshot.version
+                    ))
+                })?;
+                let transition =
+                    crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
+                        predecessor_fence.clone().ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "[LDB-6053] assignment {} has no predecessor certificate",
+                                snapshot.version
+                            ))
+                        })?,
+                        observed_assignment.owners(),
+                        target_fence.clone(),
+                        &new_assignment,
+                        local_participant,
+                        pipeline_identity,
+                        state_frames,
+                        final_owner_exit,
+                    )?;
+                if transition.acquired_vnodes() != vnodes_requiring_restore {
+                    return Err(DbError::Checkpoint(format!(
                     "[LDB-6053] assignment {} transition acquisition roster changed during preparation",
                     snapshot.version
                 )));
+                }
+                Some(Arc::new(transition))
+            } else {
+                None
+            };
+            let installed_after_publication = if mode == AssignmentAdoptionMode::LiveTransition
+                && !new_owned.is_empty()
+                && pending_transition.is_none()
+                && vnodes_requiring_restore.is_empty()
+            {
+                current_pipeline_identity
+                    .clone()
+                    .map(|pipeline_identity| {
+                        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+                            target_fence.clone(),
+                            pipeline_identity,
+                        )
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+
+            // Assignment zero is intentionally noncanonical and can never have published a readiness
+            // report. Replacement processes therefore stage their first target restore without an
+            // impossible predecessor withdrawal; the watcher publishes target=false after adoption.
+            if predecessor_readiness_withdrawal_required(
+                pending_transition
+                    .as_ref()
+                    .is_some_and(|pending| pending.requires_predecessor_binding()),
+                observed_assignment.version(),
+            ) {
+                tokio::time::timeout_at(
+                    deadline,
+                    self.publish_local_vnode_state_report(&controller, &observed_assignment, false),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "assignment {} timed out withdrawing predecessor vnode-state readiness",
+                        snapshot.version
+                    ))
+                })??;
             }
-            Some(Arc::new(transition))
-        } else {
-            None
-        };
-        let installed_after_publication = if !new_owned.is_empty()
-            && pending_transition.is_none()
-            && vnodes_requiring_restore.is_empty()
-        {
-            current_pipeline_identity
-                .clone()
-                .map(|pipeline_identity| {
-                    crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
-                        target_fence.clone(),
-                        pipeline_identity,
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
 
-        // Assignment zero is intentionally noncanonical and can never have published a readiness
-        // report. Replacement processes therefore stage their first target restore without an
-        // impossible predecessor withdrawal; the watcher publishes target=false after adoption.
-        if predecessor_readiness_withdrawal_required(
-            pending_transition
-                .as_ref()
-                .is_some_and(|pending| pending.requires_predecessor_binding()),
-            observed_assignment.version(),
-        ) {
-            tokio::time::timeout_at(
-                deadline,
-                self.publish_local_vnode_state_report(&controller, &observed_assignment, false),
-            )
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "assignment {} timed out withdrawing predecessor vnode-state readiness",
-                    snapshot.version
-                ))
-            })??;
-        }
-
-        // Publish one complete immutable transition while the compute-cycle write fence is held,
-        // then publish ownership before releasing its slot. The next cycle therefore observes
-        // either the old assignment or the exact target-bound transition, never split half-state.
-        // Close and pipeline stop cancel under the write side of this lock. Holding the read side
-        // through publication prevents shutdown from landing between this check and the registry.
-        let runtime_shutdown = self.runtime_shutdown.read();
-        if self.is_closed()
-            || runtime_shutdown.is_cancelled()
-            || self.assignment_restore_shutdown.is_cancelled()
-            || prepared_runtime_shutdown.is_cancelled()
-        {
-            return Err(DbError::Shutdown);
-        }
-        let mut pending_slot = self.pending_vnode_transition.lock();
-        if pending_slot.is_some() {
-            return Err(DbError::Checkpoint(format!(
+            // Publish one complete immutable transition while the compute-cycle write fence is held,
+            // then publish ownership before releasing its slot. The next cycle therefore observes
+            // either the old assignment or the exact target-bound transition, never split half-state.
+            // Close and pipeline stop cancel under the write side of this lock. Holding the read side
+            // through publication prevents shutdown from landing between this check and the registry.
+            // Serialize the cold eligibility check with start/stop/recovery-fence lifecycle claims.
+            // Stop takes this same lock before clearing installed state and changing Faulted, while a
+            // recovery Release takes it before lifting the persistent lifecycle fence.
+            let lifecycle_claim = (mode == AssignmentAdoptionMode::ColdRecovery
+                || mode == AssignmentAdoptionMode::StoppedRecoveryTopology
+                || startup_restore_deferred
+                || handoff_cut_mismatch)
+                .then(|| self.startup_attempt.lock());
+            let runtime_shutdown = self.runtime_shutdown.read();
+            let runtime_generation_is_valid =
+                if mode == AssignmentAdoptionMode::StoppedRecoveryTopology {
+                    runtime_shutdown.is_cancelled() && prepared_runtime_shutdown.is_cancelled()
+                } else {
+                    !runtime_shutdown.is_cancelled() && !prepared_runtime_shutdown.is_cancelled()
+                };
+            if self.is_closed()
+                || self.assignment_restore_shutdown.is_cancelled()
+                || !runtime_generation_is_valid
+            {
+                return Err(DbError::Shutdown);
+            }
+            let mut pending_slot = self.pending_vnode_transition.lock();
+            if pending_slot.is_some() {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] assignment {} reached publication while another vnode transition was pending",
                 snapshot.version
             )));
-        }
-        let mut installed_state = self.installed_vnode_state.lock();
-        if DbState::load(&self.state) != prepared_db_state
-            || installed_state.as_ref() != prepared_installed_state.as_ref()
-        {
-            return Err(DbError::Checkpoint(format!(
+            }
+            let mut installed_state = self.installed_vnode_state.lock();
+            if DbState::load(&self.state) != prepared_db_state
+                || installed_state.as_ref() != prepared_installed_state.as_ref()
+            {
+                return Err(DbError::Checkpoint(format!(
                 "[LDB-6053] local execution state changed while preparing assignment {}; retrying from the current state",
                 snapshot.version
+                )));
+            }
+            if startup_restore_deferred
+                && mode == AssignmentAdoptionMode::LiveTransition
+                && (prepared_db_state != DbState::Created
+                    || lifecycle_claim
+                        .as_ref()
+                        .is_none_or(|attempt| attempt.as_ref().is_some())
+                    || !self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+                    || !controller.is_recovering()
+                    || !controller.process_lease_is_live()
+                    || (audited_recovery
+                        && (prepared_recovery_fault == 0
+                            || self
+                                .pending_recovery_fault
+                                .load(std::sync::atomic::Ordering::Acquire)
+                                != prepared_recovery_fault))
+                    || guard.is_some()
+                    || pending_slot.is_some()
+                    || installed_state.is_some()
+                    || self.recover_target_epoch.lock().is_some()
+                    || self
+                        .coordinated_recovery_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self
+                        .catalog_cleanup_fenced
+                        .load(std::sync::atomic::Ordering::Acquire))
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] assignment {} startup-deferred publication requires the exact Created assignment-zero lifecycle with closed intake, live process authority, and no concurrent startup or recovered state",
+                    snapshot.version
+                )));
+            }
+            if mode == AssignmentAdoptionMode::ColdRecovery
+                && (!self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+                    || !controller.is_recovering()
+                    || !self
+                        .coordinated_recovery_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self
+                        .pending_recovery_fault
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != prepared_recovery_fault
+                    || prepared_recovery_fault == 0
+                    || !controller.process_lease_is_live()
+                    || self
+                        .catalog_cleanup_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || pending_slot.is_some()
+                    || installed_state.is_some())
+            {
+                return Err(DbError::Checkpoint(format!(
+                "[LDB-6053] recovery assignment {} cold-publication authority changed before registry commit",
+                snapshot.version
             )));
-        }
-        *pending_slot = pending_transition;
-        registry.set_assignment_and_version(new_assignment, snapshot.version);
-        if let Some(coord) = guard.as_mut() {
-            coord.set_assignment_version(snapshot.version);
-            coord.set_vnode_set(new_owned.clone());
-        }
-        if pending_slot.is_none() {
-            *installed_state = installed_after_publication;
-        }
-        drop(installed_state);
-        drop(pending_slot);
-        drop(guard);
-        drop(runtime_shutdown);
+            }
+            // Startup publishes a fresh attempt before it can replace the checkpoint coordinator.
+            // Holding this claim and matching the exact completed Arc therefore proves that the
+            // coordinator whose pipeline identity was rechecked above is still the stopped graph's
+            // coordinator, not a same-identity successor generation.
+            let stopped_startup_attempt_is_same = lifecycle_claim.as_ref().is_some_and(|owned| {
+                match (owned.as_ref(), prepared_startup_attempt.as_ref()) {
+                    (Some(current), Some(prepared)) => {
+                        Arc::ptr_eq(current, prepared) && current.is_complete()
+                    }
+                    (None, None) | (None, Some(_)) | (Some(_), None) => false,
+                }
+            });
+            let stopped_topology_shape_is_same = (stopped_committed_topology_shape
+                && prepared_recovery_fault != 0
+                && self
+                    .pending_recovery_fault
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == prepared_recovery_fault
+                && durable_recovery_fault_is_active)
+                || (stopped_aborted_topology_shape
+                    && stopped_abort_round.is_some()
+                    && durable_stopped_abort_round_is_active)
+                || (stopped_committed_owner_topology_shape
+                    && stopped_commit_owner_round.is_some()
+                    && stopped_commit_owner_pin_is_active
+                    && durable_stopped_commit_owner_round_is_active
+                    && durable_stopped_commit_owner_pin_is_active)
+                || (stopped_recovery_successor_topology_shape
+                    && stopped_recovery_successor_round.is_some()
+                    && durable_stopped_recovery_successor_round_is_active
+                    && durable_stopped_recovery_successor_pin_is_active);
+            if mode == AssignmentAdoptionMode::StoppedRecoveryTopology
+                && (prepared_db_state != DbState::Created
+                    || !cold_source_gate_was_closed
+                    || !self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+                    || !controller.process_lease_is_live()
+                    || self
+                        .cluster_authority_revoked
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || !self
+                        .coordinated_recovery_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self
+                        .coordinated_lifecycle_active
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self
+                        .catalog_cleanup_fenced
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    || self.recover_target_epoch.lock().is_some()
+                    || !stopped_startup_attempt_is_same
+                    || !stopped_topology_shape_is_same
+                    || guard.is_none()
+                    || current_pipeline_identity.is_none()
+                    || pending_slot.is_some()
+                    || installed_state.is_some()
+                    || registry.versioned_snapshot().owners() != prepared_assignment.owners()
+                    || if new_owned.is_empty() {
+                        target_fence.participant_incarnation(self_id.0).is_some()
+                    } else {
+                        target_fence.participant_incarnation(self_id.0) != Some(current_incarnation)
+                    }
+                    || snapshot.version != observed_version.saturating_add(1))
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6053] assignment {} stopped-recovery topology authority changed before registry commit",
+                    snapshot.version
+                )));
+            }
+            if mode == AssignmentAdoptionMode::StoppedRecoveryTopology || handoff_cut_mismatch {
+                // Readiness remains false for a stopped graph or a live graph whose cut mismatches
+                // the handoff. Keep recovery asserted before exposing topology so the owner-complete
+                // certificate can trigger a full restore without opening source intake.
+                controller.set_recovering(true);
+                controller.publish_checkpoint_drain_transition(None);
+                controller.publish_checkpoint_assignment_fence(None);
+            }
+            if handoff_cut_mismatch {
+                // Allocate the durable fault identity before the first target mutation. Once the
+                // registry advances, publication below is deliberately infallible and atomic with
+                // the already-held execution/coordinator/startup claims.
+                self.coordinated_recovery_fenced
+                    .store(true, std::sync::atomic::Ordering::Release);
+                crate::coordinated_recovery::queue_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6050] assignment {} could not queue exact-handoff recovery: {error}",
+                        snapshot.version
+                    ))
+                })?;
+            }
+            *pending_slot = pending_transition;
+            registry.set_assignment_and_version(new_assignment, snapshot.version);
+            if let Some(coord) = guard.as_mut() {
+                coord.set_assignment_version(snapshot.version);
+                coord.set_vnode_set(new_owned.clone());
+            }
+            if pending_slot.is_none() {
+                *installed_state = installed_after_publication;
+            }
+            if handoff_cut_mismatch {
+                // The resident source/runtime cut and imported vnode cut must be one exact
+                // checkpoint. Publish target topology (with false readiness) so recovery can form
+                // its owner-complete quorum, but never expose mixed-cut state to graph execution.
+                *installed_state = None;
+            }
+            drop(installed_state);
+            drop(pending_slot);
+            drop(guard);
+            drop(runtime_shutdown);
+            drop(lifecycle_claim);
 
-        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
-        Ok(adoption)
+            tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
+            Ok(adoption)
+        })
     }
 
     /// Wait for every local source to publish an exact FIFO drain receipt.
@@ -4890,6 +6080,93 @@ impl LaminarDB {
     pub async fn checkpoint(
         &self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        let timeout = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.timeout_ms)
+            .map_or(
+                crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+                std::time::Duration::from_millis,
+            );
+        self.checkpoint_with_timeout(timeout).await
+    }
+
+    /// Trigger one manual checkpoint within a caller-provided relative budget.
+    ///
+    /// The budget is capped by the configured checkpoint timeout. It bounds admission and attempt
+    /// work; once an exact attempt is reserved, this call waits for terminal cleanup even if that
+    /// requires the coordinator's private cleanup budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` under the same conditions as [`Self::checkpoint`], or when
+    /// the caller-provided budget cannot be represented as an absolute deadline.
+    pub async fn checkpoint_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        let deadline = self.manual_checkpoint_deadline(timeout)?;
+        self.checkpoint_until(deadline).await
+    }
+
+    /// Execute a forwarded manual checkpoint directly, without another network forwarding hop.
+    ///
+    /// This is the server-side entry point for a request already routed by a follower. Refusing a
+    /// second hop prevents stale, inconsistent leader views from forming an HTTP forwarding loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Checkpoint` under the same conditions as [`Self::checkpoint`], when the
+    /// caller-provided budget cannot be represented as an absolute deadline, or when this cluster
+    /// node is not the leader that can admit the forwarded request.
+    #[doc(hidden)]
+    pub async fn checkpoint_forwarded_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        let deadline = self.manual_checkpoint_deadline(timeout)?;
+        self.checkpoint_until_inner(deadline, false).await
+    }
+
+    fn manual_checkpoint_deadline(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::time::Instant, DbError> {
+        let configured_timeout = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.timeout_ms)
+            .map_or(
+                crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+                std::time::Duration::from_millis,
+            );
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout.min(configured_timeout))
+            .ok_or_else(|| DbError::Checkpoint("manual checkpoint deadline overflowed".into()))?;
+        Ok(deadline)
+    }
+
+    /// Trigger one manual checkpoint under a caller-selected absolute deadline.
+    ///
+    /// The deadline bounds admission and every exact-attempt phase. After reservation this method
+    /// deliberately waits past the deadline for the coordinator's terminal cleanup reply, so a
+    /// caller cannot begin a conflicting lifecycle transition while the attempt remains live.
+    pub(crate) async fn checkpoint_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        self.checkpoint_until_inner(deadline, true).await
+    }
+
+    async fn checkpoint_until_inner(
+        &self,
+        deadline: tokio::time::Instant,
+        allow_forwarding: bool,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = allow_forwarding;
         self.ensure_catalog_cleanup_unfenced("manual checkpoint")?;
         #[cfg(feature = "cluster")]
         self.ensure_coordinated_recovery_mutation_unfenced("manual checkpoint")?;
@@ -4914,6 +6191,10 @@ impl LaminarDB {
                 })?;
                 match cc {
                     cc if cc.is_leader() => Ok(None),
+                    _ if !allow_forwarding => Err(DbError::Checkpoint(
+                        "forwarded checkpoint reached a node that is no longer the cluster leader"
+                            .into(),
+                    )),
                     cc => {
                         let leader_id = cc.current_leader().ok_or_else(|| {
                             DbError::Checkpoint(
@@ -4942,7 +6223,9 @@ impl LaminarDB {
                     "Forwarding checkpoint request to leader node at HTTP address {}",
                     leader_rpc
                 );
-                return self.forward_checkpoint_to_leader(&leader_rpc).await;
+                return self
+                    .forward_checkpoint_to_leader(&leader_rpc, deadline)
+                    .await;
             }
         }
 
@@ -4953,12 +6236,67 @@ impl LaminarDB {
                 "manual checkpoint coordinator is not running — call start() first".into(),
             )
         })?;
-        let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
-        tx.send(reply_tx).await.map_err(|_| {
-            DbError::Checkpoint(
-                "manual checkpoint receiver closed — engine may be shutting down".into(),
-            )
-        })?;
+        let (reply_tx, mut reply_rx) = crossfire::oneshot::oneshot();
+        let (reservation_claim, mut reservation_wait) = ForceCheckpointReservationClaim::new();
+        let request = ForceCheckpointRequest {
+            reply: reply_tx,
+            reservation_claim: Some(reservation_claim),
+            deadline,
+        };
+        tokio::time::timeout_at(deadline, tx.send(request))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "manual checkpoint deadline expired before coordinator admission".into(),
+                )
+            })?
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "manual checkpoint receiver closed — engine may be shutting down".into(),
+                )
+            })?;
+        // Admission into the bounded channel is not exact-attempt ownership: the coordinator can
+        // be alive but unable to cycle while a prior durable tail is still retiring. Bound that
+        // pre-reservation interval. Once the coordinator's atomic claim wins (observed either by
+        // its wake or by losing the deadline CAS), deliberately wait without the caller deadline
+        // so a lifecycle transition cannot overlap durable reservation or terminal cleanup.
+        let mut reservation_wake_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut reply_rx => {
+                    return result.map_err(|_| {
+                        DbError::Checkpoint(
+                            "manual checkpoint ended without a terminal reply".into(),
+                        )
+                    })?;
+                }
+                reservation = reservation_wait.wait(), if reservation_wake_open => {
+                    if reservation.is_ok() {
+                        break;
+                    }
+                    // A pre-reservation rejection drops the wake after sending its terminal reply.
+                    // Keep the reply/deadline race live rather than treating channel closure as
+                    // exact ownership.
+                    reservation_wake_open = false;
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    if reservation_wait.cancel_before_reservation() {
+                        return Err(DbError::Checkpoint(
+                            "manual checkpoint deadline expired before exact attempt reservation"
+                                .into(),
+                        ));
+                    }
+                    if reservation_wait.is_claimed() {
+                        break;
+                    }
+                    return Err(DbError::Checkpoint(
+                        "manual checkpoint deadline expired before exact attempt reservation"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let result = reply_rx.await.map_err(|_| {
             DbError::Checkpoint("manual checkpoint ended without a terminal reply".into())
         })?;
@@ -4970,6 +6308,7 @@ impl LaminarDB {
     async fn forward_checkpoint_to_leader(
         &self,
         addr: &str,
+        deadline: tokio::time::Instant,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         #[derive(serde::Deserialize)]
         struct ForwardedCheckpointResponse {
@@ -4982,9 +6321,32 @@ impl LaminarDB {
                 Option<crate::checkpoint_coordinator::CheckpointFailureDisposition>,
         }
 
-        let mut req = reqwest::Client::new()
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "manual checkpoint deadline expired before leader forwarding".into(),
+                )
+            })?;
+        let budget_nanos = u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX);
+        // Bound connection establishment by the caller's remaining admission window. Once the
+        // leader accepts the request there is deliberately no client-side total timeout: the
+        // leader may need its private cleanup budget to make a reserved attempt terminal.
+        let client = reqwest::Client::builder()
+            .connect_timeout(remaining)
+            .build()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "failed to build checkpoint forwarding client: {error}"
+                ))
+            })?;
+        let mut req = client
             .post(format!("http://{addr}/api/v1/checkpoint"))
-            .timeout(std::time::Duration::from_secs(10));
+            .header(
+                "x-laminar-checkpoint-budget-nanos",
+                budget_nanos.to_string(),
+            );
         if let Some(token) = &self.config.http_auth_token {
             req = req.bearer_auth(token.expose());
         }

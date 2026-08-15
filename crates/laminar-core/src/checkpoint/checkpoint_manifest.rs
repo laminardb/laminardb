@@ -13,7 +13,7 @@ use crate::state::{
 };
 
 /// Current checkpoint manifest format. Every other version is rejected.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 8;
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 9;
 
 /// Canonical pipeline-identity payload version.
 pub const PIPELINE_IDENTITY_VERSION: u16 = 6;
@@ -215,6 +215,11 @@ pub struct CheckpointManifest {
     pub vnode_count: u16,
     /// Exact cluster assignment generation and participant fence; local manifests use `None`.
     pub assignment_fence: Option<CheckpointAssignmentFence>,
+    /// Whether this cut can be restored under a different cluster vnode assignment.
+    ///
+    /// Cluster manifests must carry an affirmative, capture-time proof. Local manifests cannot
+    /// claim reassignment portability because they have no assignment-fenced recovery domain.
+    pub reassignment_portable: bool,
     /// Canonically sorted vnodes whose state inventory this participant supplies.
     pub owned_vnodes: Vec<u16>,
     /// Derived checkpoint watermark retained with the exact cut.
@@ -278,6 +283,7 @@ impl CheckpointManifest {
             partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnode_count: key_group_count.get(),
             assignment_fence: None,
+            reassignment_portable: false,
             owned_vnodes: (0..key_group_count.get()).collect(),
             checkpoint_watermark: None,
             channel_progress: Vec::new(),
@@ -301,7 +307,7 @@ impl CheckpointManifest {
         self.node_data.chunk.participant_id = participant_id;
     }
 
-    /// Validate the exact v8 recovery contract.
+    /// Validate the exact v9 recovery contract.
     #[must_use]
     pub fn validate(
         &self,
@@ -366,11 +372,19 @@ impl CheckpointManifest {
                     "assignment_fence does not cover this manifest topology and participant".into(),
                 );
             }
+            if !self.reassignment_portable {
+                error(
+                    "a cluster manifest must be proven portable across vnode reassignment".into(),
+                );
+            }
         } else {
             let owns_complete_domain = self.owned_vnodes.len() == usize::from(self.vnode_count)
                 && self.owned_vnodes.iter().copied().eq(0..self.vnode_count);
             if self.participant_id != LOCAL_NODE_ID.0 || !owns_complete_domain {
                 error("a local manifest must use LOCAL_NODE_ID and own every vnode".into());
+            }
+            if self.reassignment_portable {
+                error("a local manifest cannot claim vnode reassignment portability".into());
             }
         }
         validate_sorted_unique("source_names", &self.source_names, &mut error);
@@ -829,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn v8_round_trip_carries_input_channels_ranges_sinks_and_prior_chunk_refs() {
+    fn v9_round_trip_carries_portability_channels_ranges_sinks_and_prior_chunk_refs() {
         let mut manifest = valid_manifest(9);
         manifest.source_offsets.insert(
             "source".into(),
@@ -891,20 +905,40 @@ mod tests {
         let encoded = serde_json::to_vec(&manifest).unwrap();
         let restored: CheckpointManifest = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored, manifest);
+        assert!(!restored.reassignment_portable);
     }
 
     #[test]
     fn previous_manifest_versions_are_not_accepted() {
         let mut manifest = valid_manifest(1);
-        manifest.version = 7;
+        manifest.version = 8;
         let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
         assert!(errors
             .iter()
-            .any(|error| error.message.contains("unsupported manifest version 7")));
+            .any(|error| error.message.contains("unsupported manifest version 8")));
 
         let mut json = serde_json::to_value(valid_manifest(1)).unwrap();
         json.as_object_mut().unwrap().remove("node_data");
         assert!(serde_json::from_value::<CheckpointManifest>(json).is_err());
+
+        let mut v8_shape = serde_json::to_value(valid_manifest(1)).unwrap();
+        let object = v8_shape.as_object_mut().unwrap();
+        object.insert("version".into(), serde_json::Value::from(8));
+        object.remove("reassignment_portable");
+        assert!(serde_json::from_value::<CheckpointManifest>(v8_shape).is_err());
+    }
+
+    #[test]
+    fn local_manifest_cannot_claim_reassignment_portability() {
+        let mut manifest = valid_manifest(1);
+        manifest.reassignment_portable = true;
+
+        let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
+        assert!(errors.iter().any(|error| {
+            error
+                .message
+                .contains("local manifest cannot claim vnode reassignment portability")
+        }));
     }
 
     #[test]

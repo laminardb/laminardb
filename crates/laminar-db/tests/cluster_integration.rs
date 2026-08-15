@@ -45,6 +45,7 @@ async fn cluster_runtime_uses_one_verified_checkpoint_object_store() {
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .verified_cluster_namespaces(namespaces)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
         .build()
         .await
         .unwrap();
