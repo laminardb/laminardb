@@ -157,8 +157,13 @@ otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 wiremock = "0.6"
+
+[[bench]]
+name = "json_decoder"
+harness = false

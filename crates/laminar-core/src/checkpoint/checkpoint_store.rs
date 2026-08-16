@@ -3,11 +3,10 @@
 #![allow(clippy::disallowed_types)] // cold path: checkpoint metadata
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::checkpoint_manifest::{
@@ -17,6 +16,17 @@ use crate::checkpoint::checkpoint_manifest::{
 use crate::checkpoint::{canonical_json_bytes, canonical_json_sha256};
 use crate::checkpoint_decision::CheckpointArtifactInventory;
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
+
+mod conditional_probe;
+mod validation;
+
+pub use conditional_probe::{
+    probe_object_store_conditional_create, probe_object_store_conditional_update,
+};
+use validation::{
+    checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, missing_node_data, sha256,
+    validate_abort_seal, validate_abort_seal_request, validate_node_data_layout,
+};
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ABORT_SEAL_BYTES: u64 = MAX_MANIFEST_BYTES + 64 * 1024;
@@ -895,278 +905,6 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     async fn delete_node_data(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
         self.delete_exact(&self.node_data_path(chunk)).await
     }
-}
-
-/// Prove that conditional create rejects an existing object.
-///
-/// # Errors
-/// Returns an error when conditional create is absent, times out, or cannot be cleaned up.
-pub async fn probe_object_store_conditional_create(
-    store: &dyn ObjectStore,
-    prefix: &str,
-    timeout: Duration,
-) -> Result<(), CheckpointStoreError> {
-    run_conditional_probe(store, prefix, false, timeout).await
-}
-
-/// Prove conditional create/update and stale-update rejection.
-///
-/// # Errors
-/// Returns an error when any conditional operation is absent, times out, or cannot be cleaned up.
-pub async fn probe_object_store_conditional_update(
-    store: &dyn ObjectStore,
-    prefix: &str,
-    timeout: Duration,
-) -> Result<(), CheckpointStoreError> {
-    run_conditional_probe(store, prefix, true, timeout).await
-}
-
-async fn run_conditional_probe(
-    store: &dyn ObjectStore,
-    prefix: &str,
-    require_update: bool,
-    timeout: Duration,
-) -> Result<(), CheckpointStoreError> {
-    let path = object_store::path::Path::from(format!(
-        "{}capability-probes/{}.bin",
-        normalize_prefix(prefix),
-        uuid::Uuid::new_v4()
-    ));
-    let probe = async {
-        let create = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        store
-            .put_opts(
-                &path,
-                PutPayload::from_static(b"laminardb-conditional-create-v1"),
-                create.clone(),
-            )
-            .await?;
-        match store
-            .put_opts(
-                &path,
-                PutPayload::from_static(b"must-not-overwrite"),
-                create,
-            )
-            .await
-        {
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => {}
-            Ok(_) => {
-                return Err(CheckpointStoreError::Invalid(
-                    "object store overwrote an existing conditional-create probe".into(),
-                ));
-            }
-            Err(error) => return Err(error.into()),
-        }
-        if require_update {
-            let observed = store.get(&path).await?;
-            let stale = UpdateVersion {
-                e_tag: observed.meta.e_tag.clone(),
-                version: observed.meta.version.clone(),
-            };
-            if stale.e_tag.is_none() && stale.version.is_none() {
-                return Err(CheckpointStoreError::Invalid(
-                    "object store GET returned neither ETag nor version for conditional update"
-                        .into(),
-                ));
-            }
-            store
-                .put_opts(
-                    &path,
-                    PutPayload::from_static(b"laminardb-conditional-update-v2"),
-                    PutOptions {
-                        mode: PutMode::Update(stale.clone()),
-                        ..PutOptions::default()
-                    },
-                )
-                .await?;
-            match store
-                .put_opts(
-                    &path,
-                    PutPayload::from_static(b"must-not-stale-update"),
-                    PutOptions {
-                        mode: PutMode::Update(stale),
-                        ..PutOptions::default()
-                    },
-                )
-                .await
-            {
-                Err(object_store::Error::Precondition { .. }) => {}
-                Ok(_) => {
-                    return Err(CheckpointStoreError::Invalid(
-                        "object store accepted a stale conditional update".into(),
-                    ));
-                }
-                Err(error) => return Err(error.into()),
-            }
-            let observed = store.get(&path).await?;
-            let current = UpdateVersion {
-                e_tag: observed.meta.e_tag.clone(),
-                version: observed.meta.version.clone(),
-            };
-            if current.e_tag.is_none() && current.version.is_none() {
-                return Err(CheckpointStoreError::Invalid(
-                    "object store GET returned neither ETag nor version after conditional update"
-                        .into(),
-                ));
-            }
-            store
-                .put_opts(
-                    &path,
-                    PutPayload::from_static(b"laminardb-conditional-update-v3"),
-                    PutOptions {
-                        mode: PutMode::Update(current),
-                        ..PutOptions::default()
-                    },
-                )
-                .await?;
-        }
-        Ok::<(), CheckpointStoreError>(())
-    };
-
-    let result = match tokio::time::timeout(timeout, probe).await {
-        Ok(result) => result,
-        Err(_) => Err(CheckpointStoreError::Invalid(
-            "conditional-put probe timed out".into(),
-        )),
-    };
-    let cleanup = tokio::time::timeout(timeout, store.delete(&path)).await;
-    match cleanup {
-        Ok(Ok(()) | Err(object_store::Error::NotFound { .. })) => result,
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(CheckpointStoreError::Invalid(
-            "conditional-put probe cleanup timed out".into(),
-        )),
-    }
-}
-
-fn validate_abort_seal_request(
-    chunk: StateChunkId,
-    expected_artifact_identity_sha256: &str,
-) -> Result<(), CheckpointStoreError> {
-    if chunk.participant_id == 0
-        || chunk.checkpoint_id == 0
-        || !is_canonical_sha256(expected_artifact_identity_sha256)
-    {
-        return Err(CheckpointStoreError::Invalid(
-            "checkpoint artifact abort seal identity is not canonical".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_abort_seal(
-    seal: &CheckpointArtifactAbortSeal,
-    expected_chunk: StateChunkId,
-    expected_artifact_identity_sha256: &str,
-) -> Result<(), CheckpointStoreError> {
-    validate_abort_seal_request(expected_chunk, expected_artifact_identity_sha256)?;
-    if seal.version != CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
-        || seal.chunk != expected_chunk
-        || seal.artifact_identity_sha256 != expected_artifact_identity_sha256
-    {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "participant {} checkpoint {} has a different abort seal",
-            expected_chunk.participant_id, expected_chunk.checkpoint_id
-        )));
-    }
-    Ok(())
-}
-
-fn checkpoint_artifact_abort_seal_bytes(
-    seal: &CheckpointArtifactAbortSeal,
-) -> Result<Bytes, CheckpointStoreError> {
-    let encoded = Bytes::from(canonical_json_bytes(seal)?);
-    if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_ABORT_SEAL_BYTES {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "checkpoint artifact abort seal exceeds the {MAX_ABORT_SEAL_BYTES}-byte limit"
-        )));
-    }
-    Ok(encoded)
-}
-
-fn ensure_manifest_valid(
-    manifest: &CheckpointManifest,
-    participant_id: u64,
-    key_group_count: KeyGroupCount,
-    max_node_data_bytes: u64,
-) -> Result<(), CheckpointStoreError> {
-    validate_max_checkpoint_node_data_bytes(max_node_data_bytes)?;
-    if participant_id == 0 || manifest.participant_id != participant_id {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "manifest participant {} does not match store participant {participant_id}",
-            manifest.participant_id
-        )));
-    }
-    let errors = manifest.validate(key_group_count);
-    if !errors.is_empty() {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "manifest validation: {}",
-            errors
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
-    }
-    if manifest.node_data.object_length > max_node_data_bytes {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "node data object is {} bytes, exceeding the {max_node_data_bytes}-byte limit",
-            manifest.node_data.object_length
-        )));
-    }
-    Ok(())
-}
-
-fn validate_node_data_layout(
-    manifest: &CheckpointManifest,
-    chunks: &[Bytes],
-    limit: u64,
-) -> Result<(), CheckpointStoreError> {
-    let length = checked_chunks_len(chunks)?;
-    if length > limit {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "node data object is {length} bytes, exceeding the {limit}-byte limit"
-        )));
-    }
-    if length != manifest.node_data.object_length {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "node data is {length} bytes; manifest declares {}",
-            manifest.node_data.object_length
-        )));
-    }
-    Ok(())
-}
-
-fn checked_chunks_len(chunks: &[Bytes]) -> Result<u64, CheckpointStoreError> {
-    chunks.iter().try_fold(0_u64, |total, chunk| {
-        total
-            .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
-            .ok_or_else(|| CheckpointStoreError::Invalid("node data length overflow".into()))
-    })
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn is_canonical_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn missing_node_data(chunk: StateChunkId) -> CheckpointStoreError {
-    CheckpointStoreError::Invalid(format!(
-        "node data object for participant {} checkpoint {} is missing",
-        chunk.participant_id, chunk.checkpoint_id
-    ))
 }
 
 fn normalize_prefix(prefix: &str) -> String {

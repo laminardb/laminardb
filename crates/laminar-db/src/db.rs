@@ -159,7 +159,7 @@ impl DbControlRuntime {
                 runtime.block_on(async {
                     let _ = shutdown_rx.await;
                 });
-                runtime.shutdown_timeout(std::time::Duration::from_secs(10));
+                runtime.shutdown_timeout(Duration::from_secs(10));
             })
             .map_err(|error| {
                 DbError::Pipeline(format!("failed to spawn LaminarDB I/O runtime: {error}"))
@@ -265,7 +265,7 @@ pub struct LaminarDB {
     /// Self-ref set by `enable_supervision`; empty `Weak` (default) disables auto-restart.
     pub(crate) supervisor_self: Arc<parking_lot::Mutex<std::sync::Weak<LaminarDB>>>,
     /// Auto-restart timestamps within the sliding window; bounds restart storms.
-    pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
+    pub(crate) restart_history: Arc<parking_lot::Mutex<Vec<Instant>>>,
     /// Serializes start/stop/shutdown ownership across awaits. Runtime-handle `None` means an
     /// owner is currently joining only while this lock is held; another caller must never treat
     /// it as completed teardown.
@@ -322,7 +322,7 @@ pub struct LaminarDB {
     pub(crate) checkpoint_barrier_timings:
         Arc<crate::checkpoint_timing::CheckpointBarrierTimingLedger>,
     pub(crate) prometheus_registry: parking_lot::Mutex<Option<Arc<prometheus::Registry>>>,
-    pub(crate) start_time: std::time::Instant,
+    pub(crate) start_time: Instant,
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
@@ -441,7 +441,7 @@ pub struct LaminarDB {
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
     /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
-        parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
+        parking_lot::RwLock<HashMap<String, arrow_schema::SchemaRef>>,
 }
 
 impl Drop for LaminarDB {
@@ -1760,12 +1760,12 @@ impl LaminarDB {
         config.source_idle_timeout =
             crate::config::source_idle_timeout_ms(config.source_idle_timeout)
                 .map_err(|error| DbError::Config(error.to_string()))?
-                .map(std::time::Duration::from_millis);
+                .map(Duration::from_millis);
         let future_skew_ms =
             crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
                 .map_err(|error| DbError::Config(error.to_string()))?;
         config.event_time_max_future_skew =
-            std::time::Duration::from_millis(future_skew_ms.unsigned_abs());
+            Duration::from_millis(future_skew_ms.unsigned_abs());
         let max_managed_state_bytes = config
             .pipeline_max_managed_state_bytes
             .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
@@ -1879,7 +1879,7 @@ impl LaminarDB {
                 crate::checkpoint_timing::CheckpointBarrierTimingLedger::new(),
             ),
             prometheus_registry: parking_lot::Mutex::new(None),
-            start_time: std::time::Instant::now(),
+            start_time: Instant::now(),
             session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,

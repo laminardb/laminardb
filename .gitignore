@@ -51,6 +51,9 @@ wal/
 /tools/*
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
+!/tools/readability-check/
+/tools/readability-check/Cargo.lock
+/tools/readability-check/target/
 
 # Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md

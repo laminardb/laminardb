@@ -13,16 +13,14 @@ use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use rdkafka::ClientConfig;
 use tracing::{debug, info, warn};
 
-use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
     SinkInputMode, SinkTopology, WriteResult,
 };
-use crate::error::{ConnectorError, SerdeError};
-use crate::serde::{self, Format, RecordSerializer};
+use crate::error::ConnectorError;
+use crate::serde::{Format, RecordSerializer};
 
-use super::avro_serializer::AvroSerializer;
 use super::metadata_error::{fetch_error, invalid_response, topic_error};
 use super::partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
@@ -31,248 +29,26 @@ use super::schema_registry::SchemaRegistryClient;
 use super::sink_config::{KafkaSinkConfig, PartitionStrategy, SinkEnvelope};
 use super::sink_metrics::KafkaSinkMetrics;
 
-/// One queue-full retry deadline is shared by every record sent through a
-/// producer phase. A non-record failure stops new enqueue work.
-const QUEUE_RETRY_TIMEOUT: Duration = Duration::from_millis(500);
-const QUEUE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const WRITE_TIMEOUT_HEADROOM: Duration = Duration::from_secs(5);
+mod failure;
+mod keys;
+mod lifecycle;
+mod serialization;
+mod upsert;
 
-fn queue_retry_delay(deadline: Instant, now: Instant) -> Option<Duration> {
-    let remaining = deadline.saturating_duration_since(now);
-    (!remaining.is_zero()).then_some(remaining.min(QUEUE_RETRY_INTERVAL))
-}
+use failure::{
+    kafka_write_timeout, producer_creation_error, queue_retry_delay, record_failure,
+    unresolved_delivery_error, validate_payload_cardinality, KafkaFailure, KafkaFailureCertainty,
+    KafkaFailureScope, QUEUE_RETRY_TIMEOUT,
+};
+use keys::KeyBuffer;
+use serialization::select_serializer;
+use upsert::{project_upsert_values, validate_upsert_keys};
 
-fn delivery_outcome_unknown(
-    operation: &str,
-    detail: impl std::fmt::Display,
-    retryable: bool,
-) -> ConnectorError {
-    ConnectorError::outcome_unknown(
-        format!(
-            "Kafka {operation} was dispatched but its external outcome is not fully known: {detail}"
-        ),
-        retryable,
-    )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KafkaFailureCertainty {
-    DefinitelyNotPersisted,
-    OutcomeUnknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KafkaFailureScope {
-    Record,
-    Infrastructure,
-    Connector,
-}
-
-#[derive(Debug)]
-struct KafkaFailure {
-    certainty: KafkaFailureCertainty,
-    scope: KafkaFailureScope,
-    retryable: bool,
-    detail: String,
-}
-
-impl KafkaFailure {
-    /// `FutureProducer::send_result` returned the record, proving that this
-    /// attempt never entered librdkafka's queue.
-    fn enqueue(error: &KafkaError, operation: &str) -> Self {
-        let (scope, retryable) = kafka_error_policy(error);
-        Self {
-            certainty: KafkaFailureCertainty::DefinitelyNotPersisted,
-            scope,
-            retryable,
-            detail: format!("{operation} enqueue failed before dispatch: {error}"),
-        }
-    }
-
-    /// rdkafka 0.39's `FutureProducer` discards native
-    /// `rd_kafka_message_status` when it creates an owned delivery result.
-    /// Error codes alone cannot prove non-persistence after driver retries.
-    fn delivery(error: &KafkaError, operation: &str) -> Self {
-        let (scope, retryable) = kafka_error_policy(error);
-        Self {
-            certainty: KafkaFailureCertainty::OutcomeUnknown,
-            scope,
-            retryable,
-            detail: format!("{operation} delivery failed: {error}"),
-        }
-    }
-
-    fn canceled(operation: &str) -> Self {
-        Self {
-            certainty: KafkaFailureCertainty::OutcomeUnknown,
-            scope: KafkaFailureScope::Infrastructure,
-            retryable: true,
-            detail: format!("{operation} delivery canceled because the producer was dropped"),
-        }
-    }
-
-    fn dlq_eligible(&self) -> bool {
-        self.certainty == KafkaFailureCertainty::DefinitelyNotPersisted
-            && self.scope == KafkaFailureScope::Record
-            && !self.retryable
-    }
-}
-
-/// Error scope and retryability are independent of persistence certainty. This
-/// is deliberately a positive transient list: fatal, unknown, and future codes
-/// fail closed instead of creating an unbounded restart loop.
-fn kafka_error_policy(error: &KafkaError) -> (KafkaFailureScope, bool) {
-    match error.rdkafka_error_code() {
-        Some(
-            RDKafkaErrorCode::KeySerialization
-            | RDKafkaErrorCode::ValueSerialization
-            | RDKafkaErrorCode::MessageSizeTooLarge
-            | RDKafkaErrorCode::InvalidTimestamp
-            | RDKafkaErrorCode::InvalidRecord,
-        ) => (KafkaFailureScope::Record, false),
-        Some(
-            RDKafkaErrorCode::BrokerDestroy
-            | RDKafkaErrorCode::BrokerTransportFailure
-            | RDKafkaErrorCode::Resolve
-            | RDKafkaErrorCode::MessageTimedOut
-            | RDKafkaErrorCode::AllBrokersDown
-            | RDKafkaErrorCode::OperationTimedOut
-            | RDKafkaErrorCode::QueueFull
-            | RDKafkaErrorCode::ISRInsufficient
-            | RDKafkaErrorCode::TimedOutQueue
-            | RDKafkaErrorCode::WaitCache
-            | RDKafkaErrorCode::Interrupted
-            | RDKafkaErrorCode::Retry
-            | RDKafkaErrorCode::PurgeQueue
-            | RDKafkaErrorCode::PurgeInflight
-            | RDKafkaErrorCode::DestroyBroker
-            | RDKafkaErrorCode::UnknownTopicOrPartition
-            | RDKafkaErrorCode::LeaderNotAvailable
-            | RDKafkaErrorCode::NotLeaderForPartition
-            | RDKafkaErrorCode::RequestTimedOut
-            | RDKafkaErrorCode::BrokerNotAvailable
-            | RDKafkaErrorCode::ReplicaNotAvailable
-            | RDKafkaErrorCode::NetworkException
-            | RDKafkaErrorCode::NotEnoughReplicas
-            | RDKafkaErrorCode::NotEnoughReplicasAfterAppend
-            | RDKafkaErrorCode::NotController
-            | RDKafkaErrorCode::KafkaStorageError
-            | RDKafkaErrorCode::ReassignmentInProgress
-            | RDKafkaErrorCode::FencedLeaderEpoch
-            | RDKafkaErrorCode::UnknownLeaderEpoch
-            | RDKafkaErrorCode::StaleBrokerEpoch
-            | RDKafkaErrorCode::EligibleLeadersNotAvailable
-            | RDKafkaErrorCode::ThrottlingQuotaExceeded
-            | RDKafkaErrorCode::UnknownTopicId,
-        ) => (KafkaFailureScope::Infrastructure, true),
-        _ => (KafkaFailureScope::Connector, false),
-    }
-}
-
-fn unresolved_delivery_error(
-    operation: &str,
-    total: usize,
-    applied: usize,
-    definitely_not_persisted: usize,
-    ambiguous: usize,
-    first_error: Option<String>,
-    retryable: bool,
-) -> ConnectorError {
-    let detail = format!(
-        "{definitely_not_persisted} definitely not persisted, {ambiguous} outcome unknown, \
-         {applied} already applied out of {total}; first error: {}",
-        first_error.unwrap_or_else(|| "unknown".into())
-    );
-    if ambiguous > 0 || applied > 0 {
-        delivery_outcome_unknown(operation, detail, retryable)
-    } else if retryable {
-        ConnectorError::WriteError(format!("Kafka {operation} failed: {detail}"))
-    } else {
-        ConnectorError::ConfigurationError(format!("Kafka {operation} was rejected: {detail}"))
-    }
-}
-
-fn record_failure(
-    failure: &KafkaFailure,
-    count: usize,
-    definitely_not_persisted: &mut usize,
-    ambiguous: &mut usize,
-    first_error: &mut Option<String>,
-    retryable: &mut bool,
-) {
-    match failure.certainty {
-        KafkaFailureCertainty::DefinitelyNotPersisted => *definitely_not_persisted += count,
-        KafkaFailureCertainty::OutcomeUnknown => *ambiguous += count,
-    }
-    *retryable &= failure.retryable;
-    first_error.get_or_insert_with(|| failure.detail.clone());
-}
-
-fn kafka_write_timeout(delivery_timeout: Duration) -> Duration {
-    delivery_timeout
-        .saturating_add(QUEUE_RETRY_TIMEOUT)
-        .saturating_add(QUEUE_RETRY_TIMEOUT)
-        .saturating_add(WRITE_TIMEOUT_HEADROOM)
-}
-
-fn producer_creation_error(role: &str, error: &KafkaError) -> ConnectorError {
-    ConnectorError::ConfigurationError(format!("failed to create Kafka {role} producer: {error}"))
-}
-
-fn validate_payload_cardinality(expected: usize, actual: usize) -> Result<(), ConnectorError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(ConnectorError::Serde(SerdeError::RecordCountMismatch {
-            expected,
-            got: actual,
-        }))
-    }
-}
-
-/// Contiguous key buffer — stores all key bytes in a single allocation
-/// with per-row `(offset, length)` pairs. Avoids N separate heap
-/// allocations for N rows.
-struct KeyBuffer {
-    data: Vec<u8>,
-    offsets: Vec<(usize, usize)>,
-}
-
-impl KeyBuffer {
-    fn with_capacity(num_rows: usize, avg_key_len: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(num_rows * avg_key_len),
-            offsets: Vec::with_capacity(num_rows),
-        }
-    }
-
-    fn push(&mut self, key: &[u8]) {
-        let start = self.data.len();
-        self.data.extend_from_slice(key);
-        self.offsets.push((start, key.len()));
-    }
-
-    fn push_empty(&mut self) {
-        self.offsets.push((0, 0));
-    }
-
-    fn key(&self, i: usize) -> &[u8] {
-        let (start, len) = self.offsets[i];
-        &self.data[start..start + len]
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.offsets.len()
-    }
-}
-
-impl std::ops::Index<usize> for KeyBuffer {
-    type Output = [u8];
-
-    fn index(&self, i: usize) -> &[u8] {
-        self.key(i)
-    }
+fn required_producer(producer: Option<&FutureProducer>) -> Result<&FutureProducer, ConnectorError> {
+    producer.ok_or_else(|| ConnectorError::InvalidState {
+        expected: "producer initialized".into(),
+        actual: "producer is None".into(),
+    })
 }
 
 /// Kafka sink connector that writes Arrow `RecordBatch` data to Kafka topics.
@@ -409,95 +185,24 @@ impl KafkaSink {
         self.schema_registry.is_some()
     }
 
-    /// Destroy the final producer references away from Tokio workers. rdkafka
-    /// purges, flushes for up to 500 ms, and joins its polling thread in Drop.
-    fn retire_producers(&mut self) {
-        if let Some(producer) = self.producer.take() {
-            self.spawn_producer_drop(producer, "main");
-        }
-        if let Some(producer) = self.dlq_producer.take() {
-            self.spawn_producer_drop(producer, "DLQ");
-        }
+    fn serialize_payloads(
+        &self,
+        batch: &arrow_array::RecordBatch,
+    ) -> Result<Vec<Vec<u8>>, ConnectorError> {
+        let payloads = self.serializer.serialize(batch).map_err(|error| {
+            self.metrics.record_serialization_error();
+            ConnectorError::Serde(error)
+        })?;
+        validate_payload_cardinality(batch.num_rows(), payloads.len())?;
+        Ok(payloads)
     }
 
-    fn spawn_producer_drop(&self, producer: FutureProducer, role: &'static str) {
-        let Some(terminal_guard) = self.task_owner.track() else {
-            // The owner is a field on this live connector, so sealing before
-            // Drop is an invariant violation rather than a recoverable state.
-            tracing::error!(
-                role,
-                "Kafka producer teardown could not enter the terminal task tracker"
-            );
-            return;
-        };
-        let teardown = move || {
-            let _terminal_guard = terminal_guard;
-            drop(producer);
-        };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            drop(runtime.spawn_blocking(teardown));
-        } else if let Err(error) = std::thread::Builder::new()
-            .name("laminardb-kafka-producer-drop".into())
-            .spawn(teardown)
-        {
-            // This branch cannot run on a Tokio worker. The closure has already
-            // been dropped by `spawn`, so only report the resource failure.
-            tracing::error!(role, %error, "failed to start Kafka producer teardown thread");
-        }
-    }
-
-    /// Ensures the sink schema and SR registration match the actual data.
-    async fn ensure_schema_ready(
-        &mut self,
-        batch_schema: &SchemaRef,
-    ) -> Result<(), ConnectorError> {
-        let schema_changed = self.schema != *batch_schema;
-        let needs_registration = self.config.format == Format::Avro
-            && (schema_changed
-                || self
-                    .avro_schema_id
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    == 0);
-
-        // Register with SR *before* advancing schema/serializer so a failure
-        // doesn't leave avro_schema_id stale while the serializer already
-        // encodes with the new schema.
-        if needs_registration {
-            if let Some(ref sr) = self.schema_registry {
-                let subject = format!("{}-value", self.config.topic);
-                let avro_schema =
-                    super::schema_registry::arrow_to_avro_schema(batch_schema, &self.config.topic)
-                        .map_err(ConnectorError::Serde)?;
-                let schema_id = sr
-                    .register_schema(
-                        &subject,
-                        &avro_schema,
-                        super::schema_registry::SchemaType::Avro,
-                    )
-                    .await?;
-                #[allow(clippy::cast_sign_loss)]
-                self.avro_schema_id
-                    .store(schema_id as u32, std::sync::atomic::Ordering::Relaxed);
-                info!(subject = %subject, schema_id, "registered Avro schema");
-            }
-        }
-
-        if schema_changed {
-            debug!(
-                old = ?self.schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
-                new = ?batch_schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
-                "sink schema updated from incoming batch"
-            );
-            self.schema = batch_schema.clone();
-            self.serializer = select_serializer(
-                self.config.format,
-                &self.schema,
-                Arc::clone(&self.avro_schema_id),
-                self.schema_registry.clone(),
-            )?;
-        }
-
-        Ok(())
+    fn required_partition_count(&self) -> Result<i32, ConnectorError> {
+        self.topic_partition_count
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "broker topic metadata installed".into(),
+                actual: "partition count is unavailable".into(),
+            })
     }
 
     /// Contiguous key buffer: all key bytes in one allocation with per-row offsets.
@@ -643,70 +348,27 @@ impl KafkaSink {
     /// emit a keyed value for a live group (`_op = U`) or a null-value tombstone for a removed group
     /// (`_op = D`). The topic must be log-compacted and keyed on the merge key for the tombstones to
     /// GC and for the latest-per-key state to be recoverable from offset 0.
-    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)] // matches write_batch
+    #[allow(clippy::cast_possible_truncation)]
     async fn write_upsert_batch(
         &mut self,
         batch: &arrow_array::RecordBatch,
     ) -> Result<WriteResult, ConnectorError> {
-        let key_col = self.config.key_column.clone().ok_or_else(|| {
-            ConnectorError::ConfigurationError("envelope = 'upsert' requires 'key.column'".into())
-        })?;
-        let collapsed = collapse_changelog(batch, std::slice::from_ref(&key_col))?;
+        let collapsed = self.collapse_upsert_changelog(batch)?;
         let rows = collapsed.num_rows();
         if rows == 0 {
             return Ok(WriteResult::new(0, 0));
         }
-        let op_idx = collapsed
-            .schema()
-            .index_of("_op")
-            .map_err(|_| ConnectorError::Internal("collapsed changelog missing _op".into()))?;
-        let ops = collapsed
-            .column(op_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| ConnectorError::Internal("_op column is not Utf8".into()))?
-            .clone();
-
-        // The value is the collapsed row without the `_op` tag — i.e. the plain MV row.
-        let value_idxs: Vec<usize> = (0..collapsed.num_columns())
-            .filter(|&i| i != op_idx)
-            .collect();
-        let value_batch = collapsed
-            .project(&value_idxs)
-            .map_err(|e| ConnectorError::Internal(format!("project value columns: {e}")))?;
+        let (value_batch, ops) = project_upsert_values(&collapsed)?;
 
         self.ensure_schema_ready(&value_batch.schema()).await?;
-        let payloads = self.serializer.serialize(&value_batch).map_err(|e| {
-            self.metrics.record_serialization_error();
-            ConnectorError::Serde(e)
-        })?;
-        validate_payload_cardinality(rows, payloads.len())?;
+        let payloads = self.serialize_payloads(&value_batch)?;
         let keys = self.extract_keys(&collapsed)?;
         // Reject empty/NULL merge keys before producing ANY record: a compacted topic can't
         // represent an unkeyed row, and a mid-loop bail would leave earlier rows already enqueued.
-        if let Some(kb) = keys.as_ref() {
-            for i in 0..payloads.len() {
-                if kb.key(i).is_empty() {
-                    return Err(ConnectorError::WriteError(format!(
-                        "upsert envelope: row {i} has an empty/NULL merge key"
-                    )));
-                }
-            }
-        }
+        validate_upsert_keys(keys.as_ref(), payloads.len())?;
 
-        let partition_count =
-            self.topic_partition_count
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "broker topic metadata installed".into(),
-                    actual: "partition count is unavailable".into(),
-                })?;
-        let producer = self
-            .producer
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "producer initialized".into(),
-                actual: "producer is None".into(),
-            })?;
+        let partition_count = self.required_partition_count()?;
+        let producer = required_producer(self.producer.as_ref())?;
 
         let mut delivery_futures = Vec::with_capacity(rows);
         let mut enqueue_failure: Option<(KafkaFailure, usize)> = None;
@@ -813,7 +475,6 @@ impl KafkaSink {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl SinkConnector for KafkaSink {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.task_tracker.clone())
@@ -973,7 +634,12 @@ impl SinkConnector for KafkaSink {
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)] // Record batch row/byte counts fit in narrower types
+    #[allow(clippy::cast_possible_truncation)]
+    // Record batch row/byte counts fit in narrower types
+    // WHY: Keep main enqueue, DLQ enqueue, and both delivery drains in one chronological protocol.
+    // Splitting these phases across async helpers would add hot-path futures and make it harder to
+    // audit which accepted deliveries are drained before an outcome-unknown error is returned.
+    #[allow(clippy::too_many_lines)]
     async fn write_batch(
         &mut self,
         batch: &arrow_array::RecordBatch,
@@ -993,26 +659,11 @@ impl SinkConnector for KafkaSink {
 
         self.ensure_schema_ready(&batch.schema()).await?;
 
-        let payloads = self.serializer.serialize(batch).map_err(|e| {
-            self.metrics.record_serialization_error();
-            ConnectorError::Serde(e)
-        })?;
-        validate_payload_cardinality(batch.num_rows(), payloads.len())?;
+        let payloads = self.serialize_payloads(batch)?;
 
         let keys = self.extract_keys(batch)?;
-        let partition_count =
-            self.topic_partition_count
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "broker topic metadata installed".into(),
-                    actual: "partition count is unavailable".into(),
-                })?;
-        let producer = self
-            .producer
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "producer initialized".into(),
-                actual: "producer is None".into(),
-            })?;
+        let partition_count = self.required_partition_count()?;
+        let producer = required_producer(self.producer.as_ref())?;
 
         // Phase 1: enqueue every record into librdkafka's bounded internal queue.
         // A record-local terminal rejection may continue only when it can be
@@ -1270,28 +921,6 @@ impl std::fmt::Debug for KafkaSink {
     }
 }
 
-/// Selects the appropriate serializer for the given format.
-///
-/// For Avro, uses the shared `schema_id` handle so that Schema Registry
-/// registration updates are visible to the serializer.
-fn select_serializer(
-    format: Format,
-    schema: &SchemaRef,
-    schema_id: Arc<std::sync::atomic::AtomicU32>,
-    registry: Option<Arc<SchemaRegistryClient>>,
-) -> Result<Box<dyn RecordSerializer>, ConnectorError> {
-    match format {
-        Format::Avro => Ok(Box::new(AvroSerializer::with_shared_schema_id(
-            schema.clone(),
-            schema_id,
-            registry,
-        ))),
-        other => serde::create_serializer(other).map_err(|e| {
-            ConnectorError::ConfigurationError(format!("unsupported sink format '{other}': {e}"))
-        }),
-    }
-}
-
 /// Selects the appropriate partitioner for the given strategy.
 fn select_partitioner(strategy: PartitionStrategy) -> Box<dyn KafkaPartitioner> {
     match strategy {
@@ -1302,429 +931,4 @@ fn select_partitioner(strategy: PartitionStrategy) -> Box<dyn KafkaPartitioner> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_array::Int64Array;
-    use arrow_schema::{DataType, Field, Schema};
-
-    struct MismatchedSerializer;
-
-    impl RecordSerializer for MismatchedSerializer {
-        fn serialize(&self, _batch: &arrow_array::RecordBatch) -> Result<Vec<Vec<u8>>, SerdeError> {
-            Ok(vec![b"one-payload".to_vec()])
-        }
-
-        fn format(&self) -> Format {
-            Format::Json
-        }
-    }
-
-    fn test_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Utf8, false),
-        ]))
-    }
-
-    fn test_config() -> KafkaSinkConfig {
-        let mut cfg = KafkaSinkConfig::default();
-        cfg.bootstrap_servers = "localhost:9092".into();
-        cfg.topic = "output-events".into();
-        cfg
-    }
-
-    fn two_row_batch() -> arrow_array::RecordBatch {
-        arrow_array::RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a", "b"])),
-            ],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_new_defaults() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        assert_eq!(sink.state(), ConnectorState::Created);
-        assert!(sink.producer.is_none());
-        assert_eq!(sink.topic_partition_count, None);
-    }
-
-    #[test]
-    fn local_producer_creation_failure_is_terminal_configuration() {
-        let mut invalid = ClientConfig::new();
-        invalid.set("laminardb.invalid.kafka.property", "value");
-        let Err(error) = invalid.create::<FutureProducer>() else {
-            panic!("an unknown local librdkafka option must fail client creation");
-        };
-
-        let mapped = producer_creation_error("main", &error);
-        assert!(matches!(mapped, ConnectorError::ConfigurationError(_)));
-        assert!(!mapped.is_transient());
-    }
-
-    #[test]
-    fn malformed_broker_metadata_is_terminal_and_has_no_partition_fallback() {
-        let error = invalid_response("orders", "metadata response omitted the topic");
-        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
-        assert!(!error.is_transient());
-
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        assert_eq!(sink.topic_partition_count, None);
-    }
-
-    #[tokio::test]
-    async fn append_cardinality_mismatch_fails_before_producer_access() {
-        let mut sink = KafkaSink::new(test_schema(), test_config(), None);
-        sink.state = ConnectorState::Running;
-        sink.topic_partition_count = Some(3);
-        sink.serializer = Box::new(MismatchedSerializer);
-
-        let error = sink.write_batch(&two_row_batch()).await.unwrap_err();
-        assert!(matches!(
-            error,
-            ConnectorError::Serde(SerdeError::RecordCountMismatch {
-                expected: 2,
-                got: 1
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn upsert_cardinality_mismatch_fails_before_producer_access() {
-        let mut config = test_config();
-        config.envelope = SinkEnvelope::Upsert;
-        config.key_column = Some("id".into());
-        let mut sink = KafkaSink::new(test_schema(), config, None);
-        sink.state = ConnectorState::Running;
-        sink.topic_partition_count = Some(3);
-        sink.serializer = Box::new(MismatchedSerializer);
-
-        let error = sink.write_batch(&two_row_batch()).await.unwrap_err();
-        assert!(matches!(
-            error,
-            ConnectorError::Serde(SerdeError::RecordCountMismatch {
-                expected: 2,
-                got: 1
-            })
-        ));
-    }
-
-    #[tokio::test]
-    async fn schema_registration_preserves_terminal_registry_error() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/subjects/output-events-value/versions"))
-            .respond_with(ResponseTemplate::new(422).set_body_string("invalid schema"))
-            .mount(&server)
-            .await;
-        let mut config = test_config();
-        config.format = Format::Avro;
-        config.schema_registry_url = Some(server.uri());
-        let registry = SchemaRegistryClient::new(server.uri(), None).unwrap();
-        let mut sink = KafkaSink::with_schema_registry(test_schema(), config, registry);
-
-        let error = sink.ensure_schema_ready(&test_schema()).await.unwrap_err();
-        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
-        assert!(!error.is_transient());
-        assert!(error.to_string().contains("output-events-value"));
-    }
-
-    #[tokio::test]
-    async fn compatibility_put_preserves_terminal_registry_error() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/config/output-events-value"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("invalid credentials"))
-            .mount(&server)
-            .await;
-        let mut config = test_config();
-        config.format = Format::Avro;
-        config.schema_registry_url = Some(server.uri());
-        config.schema_compatibility = Some(crate::kafka::config::CompatibilityLevel::Backward);
-        let registry = SchemaRegistryClient::new(server.uri(), None).unwrap();
-        let mut sink = KafkaSink::with_schema_registry(test_schema(), config, registry);
-
-        let error = sink.open(&ConnectorConfig::new("kafka")).await.unwrap_err();
-        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
-        assert!(!error.is_transient());
-        assert!(error.to_string().contains("output-events-value"));
-    }
-
-    #[test]
-    fn terminal_tracker_seals_when_sink_is_dropped() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let terminal = sink.terminal_task_tracker().unwrap();
-        assert!(!terminal.is_terminated());
-        drop(sink);
-        assert!(terminal.is_terminated());
-    }
-
-    #[test]
-    fn test_schema_returned() {
-        let schema = test_schema();
-        let sink = KafkaSink::new(schema.clone(), test_config(), None);
-        assert_eq!(sink.schema(), schema);
-    }
-
-    #[test]
-    fn contract_is_multi_writer_durable_at_least_once() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let contract = sink.contract(&ConnectorConfig::new("kafka")).unwrap();
-        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
-        assert_eq!(contract.topology, SinkTopology::MultiWriter);
-        assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
-        assert!(!contract.is_cluster_exact_delivery_certified());
-        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(126));
-    }
-
-    #[test]
-    fn delivery_error_codes_never_claim_non_persistence_without_native_status() {
-        for code in [
-            RDKafkaErrorCode::MessageTimedOut,
-            RDKafkaErrorCode::TimedOutQueue,
-            RDKafkaErrorCode::PurgeQueue,
-            RDKafkaErrorCode::PurgeInflight,
-            RDKafkaErrorCode::MessageSizeTooLarge,
-            RDKafkaErrorCode::TopicAuthorizationFailed,
-        ] {
-            let error = KafkaError::MessageProduction(code);
-            assert_eq!(
-                KafkaFailure::delivery(&error, "test").certainty,
-                KafkaFailureCertainty::OutcomeUnknown,
-                "delivery code {code:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn only_terminal_record_local_enqueue_failures_are_dlq_eligible() {
-        let too_large = KafkaFailure::enqueue(
-            &KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge),
-            "test",
-        );
-        assert_eq!(
-            too_large.certainty,
-            KafkaFailureCertainty::DefinitelyNotPersisted
-        );
-        assert_eq!(too_large.scope, KafkaFailureScope::Record);
-        assert!(!too_large.retryable);
-        assert!(too_large.dlq_eligible());
-
-        let queue_full = KafkaFailure::enqueue(
-            &KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull),
-            "test",
-        );
-        assert_eq!(queue_full.scope, KafkaFailureScope::Infrastructure);
-        assert!(queue_full.retryable);
-        assert!(!queue_full.dlq_eligible());
-
-        let unauthorized = KafkaFailure::enqueue(
-            &KafkaError::MessageProduction(RDKafkaErrorCode::TopicAuthorizationFailed),
-            "test",
-        );
-        assert_eq!(unauthorized.scope, KafkaFailureScope::Connector);
-        assert!(!unauthorized.retryable);
-        assert!(!unauthorized.dlq_eligible());
-    }
-
-    #[test]
-    fn fatal_and_unknown_codes_fail_closed() {
-        for code in [
-            RDKafkaErrorCode::Unknown,
-            RDKafkaErrorCode::Fatal,
-            RDKafkaErrorCode::ProducerFenced,
-        ] {
-            let failure = KafkaFailure::delivery(&KafkaError::MessageProduction(code), "test");
-            assert_eq!(failure.scope, KafkaFailureScope::Connector);
-            assert!(!failure.retryable, "delivery code {code:?}");
-        }
-    }
-
-    #[test]
-    fn aggregate_retryability_is_the_conjunction_of_every_failure() {
-        let transient = KafkaFailure::delivery(
-            &KafkaError::MessageProduction(RDKafkaErrorCode::RequestTimedOut),
-            "test",
-        );
-        let terminal = KafkaFailure::enqueue(
-            &KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge),
-            "test",
-        );
-        let mut definitely_not_persisted = 0;
-        let mut ambiguous = 0;
-        let mut first_error = None;
-        let mut retryable = true;
-        record_failure(
-            &transient,
-            1,
-            &mut definitely_not_persisted,
-            &mut ambiguous,
-            &mut first_error,
-            &mut retryable,
-        );
-        record_failure(
-            &terminal,
-            2,
-            &mut definitely_not_persisted,
-            &mut ambiguous,
-            &mut first_error,
-            &mut retryable,
-        );
-
-        assert_eq!(definitely_not_persisted, 2);
-        assert_eq!(ambiguous, 1);
-        assert!(!retryable);
-    }
-
-    #[test]
-    fn suggested_timeout_tracks_driver_deadline_with_constant_headroom() {
-        let mut config = test_config();
-        config.delivery_timeout = Duration::from_secs(42);
-        let sink = KafkaSink::new(test_schema(), config, None);
-        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(48));
-    }
-
-    #[test]
-    fn queue_retry_wait_is_bounded_across_records() {
-        let start = Instant::now();
-        let deadline = start + QUEUE_RETRY_TIMEOUT;
-        let mut now = start;
-        let mut total_wait = Duration::ZERO;
-
-        for _ in 0..32 {
-            if let Some(delay) = queue_retry_delay(deadline, now) {
-                total_wait += delay;
-                now += delay;
-            }
-        }
-
-        assert_eq!(total_wait, QUEUE_RETRY_TIMEOUT);
-        assert_eq!(now, deadline);
-        assert_eq!(queue_retry_delay(deadline, now), None);
-    }
-
-    #[test]
-    fn later_record_cannot_restart_an_expired_queue_retry_budget() {
-        let start = Instant::now();
-        let deadline = start + QUEUE_RETRY_TIMEOUT;
-
-        assert_eq!(
-            queue_retry_delay(
-                deadline,
-                deadline.checked_sub(Duration::from_millis(25)).unwrap(),
-            ),
-            Some(Duration::from_millis(25))
-        );
-        assert_eq!(
-            queue_retry_delay(deadline, deadline + Duration::from_secs(1)),
-            None
-        );
-    }
-
-    #[test]
-    fn partial_or_ambiguous_batch_requires_generation_retirement() {
-        let error =
-            unresolved_delivery_error("produce", 3, 1, 2, 0, Some("rejected".into()), false);
-        assert!(error.is_outcome_unknown());
-        assert!(!error.is_transient());
-
-        let error =
-            unresolved_delivery_error("produce", 1, 0, 0, 1, Some("timed out".into()), true);
-        assert!(error.is_outcome_unknown());
-        assert!(error.is_transient());
-
-        let error =
-            unresolved_delivery_error("produce", 1, 0, 1, 0, Some("too large".into()), false);
-        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
-    }
-
-    #[test]
-    fn upsert_contract_requires_singleton_writer() {
-        let mut config = test_config();
-        config.envelope = SinkEnvelope::Upsert;
-        config.key_column = Some("id".into());
-        let sink = KafkaSink::new(test_schema(), config, None);
-
-        let contract = sink.contract(&ConnectorConfig::new("kafka")).unwrap();
-
-        assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
-        assert_eq!(contract.topology, SinkTopology::Singleton);
-        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
-    }
-
-    #[test]
-    fn test_serializer_selection_json() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        assert_eq!(sink.serializer.format(), Format::Json);
-    }
-
-    #[test]
-    fn test_serializer_selection_avro() {
-        let mut cfg = test_config();
-        cfg.format = Format::Avro;
-        let sink = KafkaSink::new(test_schema(), cfg, None);
-        assert_eq!(sink.serializer.format(), Format::Avro);
-    }
-
-    #[test]
-    fn test_with_schema_registry() {
-        let sr = SchemaRegistryClient::new("http://localhost:8081", None).unwrap();
-        let mut cfg = test_config();
-        cfg.format = Format::Avro;
-        cfg.schema_registry_url = Some("http://localhost:8081".into());
-
-        let sink = KafkaSink::with_schema_registry(test_schema(), cfg, sr);
-        assert!(sink.has_schema_registry());
-        assert_eq!(sink.serializer.format(), Format::Avro);
-    }
-
-    #[test]
-    fn test_debug_output() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let debug = format!("{sink:?}");
-        assert!(debug.contains("KafkaSink"));
-        assert!(debug.contains("output-events"));
-    }
-
-    #[test]
-    fn test_extract_keys_no_key_column() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let batch = arrow_array::RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a", "b"])),
-            ],
-        )
-        .unwrap();
-        assert!(sink.extract_keys(&batch).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_extract_keys_with_key_column() {
-        let mut cfg = test_config();
-        cfg.key_column = Some("value".into());
-        let sink = KafkaSink::new(test_schema(), cfg, None);
-        let batch = arrow_array::RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["key-a", "key-b"])),
-            ],
-        )
-        .unwrap();
-        let keys = sink.extract_keys(&batch).unwrap().unwrap();
-        assert_eq!(keys.len(), 2);
-        assert_eq!(&keys[0], b"key-a");
-        assert_eq!(&keys[1], b"key-b");
-    }
-}
+mod tests;

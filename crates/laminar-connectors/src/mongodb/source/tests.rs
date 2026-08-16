@@ -1,5 +1,8 @@
 use super::super::change_event::Namespace;
 use super::*;
+use crate::checkpoint::SourceCheckpoint;
+use crate::config::ConnectorConfig;
+use crate::connector::{SourceConnector, SourcePosition, SourceStart};
 
 const TEST_COLLECTION_UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const TEST_DEPLOYMENT_OBJECT_ID: &str = "0123456789abcdef01234567";

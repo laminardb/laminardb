@@ -1,4 +1,10 @@
 use super::super::callback::CycleOutcome;
+#[cfg(feature = "cluster")]
+use super::source_drain::{
+    apply_latest_source_drain_command, publish_source_drain_ready, resolve_pending_source_drain,
+};
+use super::source_lifecycle::source_barrier_release_covers;
+use super::source_runtime::{source_actor_terminal_guard, SourceActorTerminalState};
 use super::*;
 use arrow::array::{BinaryArray, Int64Array, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -1219,6 +1225,8 @@ impl PipelineCallback for MockCallback {
         self.checkpoint_order.lock().push("capture");
         self.barrier_captures
             .push((attempt, source_checkpoints.len()));
+        #[cfg(not(feature = "cluster"))]
+        let _ = (flags, self.handoff_replay_pending);
         #[cfg(feature = "cluster")]
         crate::pipeline_callback::fence_intake_after_terminal_handoff_capture(
             &self.intake_gate,

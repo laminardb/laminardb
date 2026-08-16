@@ -41,6 +41,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo +nightly fmt --all -- --check
+      - name: Readability review baseline
+        run: cargo +nightly run --quiet --manifest-path tools/readability-check/Cargo.toml -- .
 
   # ============================================
   # Clippy Lints
@@ -76,6 +78,8 @@ jobs:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       - name: Clippy (no default features)
         run: cargo clippy --workspace --no-default-features -- -D warnings
+      - name: Clippy (readability check)
+        run: cargo clippy --manifest-path tools/readability-check/Cargo.toml --all-targets -- -D warnings
 
   # ============================================
   # Build & Test (Multi-Platform)
