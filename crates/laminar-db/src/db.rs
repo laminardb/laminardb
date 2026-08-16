@@ -1948,7 +1948,7 @@ impl LaminarDB {
             rotation_execution_fence: Arc::new(tokio::sync::RwLock::new(())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
-            stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            stream_schemas: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -2438,7 +2438,7 @@ impl LaminarDB {
             }
             let shuffle_sender = { self.shuffle_sender.lock().clone() };
             if let Some(sender) = shuffle_sender {
-                let mut retry_delay = std::time::Duration::from_millis(25);
+                let mut retry_delay = Duration::from_millis(25);
                 let mut last_error = None;
                 loop {
                     if !controller.process_lease_is_live() {
@@ -2501,8 +2501,8 @@ impl LaminarDB {
                     tokio::time::sleep_until(wake).await;
                     retry_delay = retry_delay
                         .checked_mul(2)
-                        .unwrap_or(std::time::Duration::from_millis(250))
-                        .min(std::time::Duration::from_millis(250));
+                        .unwrap_or(Duration::from_millis(250))
+                        .min(Duration::from_millis(250));
                 }
             }
 
