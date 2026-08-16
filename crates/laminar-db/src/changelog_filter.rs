@@ -1,136 +1,208 @@
 #![deny(clippy::disallowed_types)]
 
-//! Filters CDC `RecordBatch`es to positive (I, U+, U) events. Non-CDC batches
-//! (no `_op` column) pass through unchanged.
+//! Fail-closed validation at the weighted-changelog sink boundary.
 
-use std::borrow::Cow;
-use std::sync::Arc;
-
-use arrow::array::{BooleanArray, RecordBatch, StringArray};
+use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::DataType;
+use laminar_core::changelog::WEIGHT_COLUMN;
 
-use crate::error::DbError;
-
-/// Filters a `RecordBatch` to keep only positive events (Insert, Update-After).
-/// If no `_op` column exists, returns the batch unchanged (append-only source).
-pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch, DbError> {
-    let Ok(op_idx) = batch.schema().index_of("_op") else {
-        return Ok(batch.clone());
-    };
-    if !matches!(batch.schema().field(op_idx).data_type(), DataType::Utf8) {
-        return Ok(batch.clone());
+/// Validate one sink-bound batch against the sink's admitted update model.
+///
+/// A weighted batch must carry one exact, trailing, non-null `Int64` `__weight` field whose
+/// values are all non-null and non-zero. It is never collapsed, filtered, or stripped here: only
+/// a `FullChangelog` sink may receive it, unchanged.
+pub(crate) fn validate_sink_input(
+    batch: &RecordBatch,
+    accepts_full_changelog: bool,
+    expects_changelog: bool,
+) -> Result<(), String> {
+    let schema = batch.schema();
+    let mut weight_index = None;
+    for (index, field) in schema.fields().iter().enumerate() {
+        if field.name().eq_ignore_ascii_case(WEIGHT_COLUMN) && weight_index.replace(index).is_some()
+        {
+            return Err(format!(
+                "weighted sink input contains more than one case-insensitive {WEIGHT_COLUMN} field"
+            ));
+        }
     }
-    let op_col = batch
-        .column(op_idx)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| DbError::Pipeline("_op column is not Utf8".into()))?;
-    let mask: BooleanArray = op_col
-        .iter()
-        .map(|v| Some(v.is_some_and(|s| s == "I" || s == "U+" || s == "U")))
-        .collect();
-    arrow::compute::filter_record_batch(batch, &mask)
-        .map_err(|e| DbError::Pipeline(format!("changelog filter: {e}")))
-}
 
-/// Drop rows with non-positive `__weight` and strip the column for non-changelog sinks.
-/// Fail-closed: errors return an empty batch rather than leaking negatives into the sink.
-pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow<'_, RecordBatch> {
-    if changelog_sink {
-        return Cow::Borrowed(batch);
+    let Some(weight_index) = weight_index else {
+        if expects_changelog {
+            return Err(format!(
+                "sink input admitted as a changelog is missing its exact trailing {WEIGHT_COLUMN} field"
+            ));
+        }
+        return Ok(());
+    };
+    let field = schema.field(weight_index);
+    if field.name() != WEIGHT_COLUMN
+        || weight_index + 1 != schema.fields().len()
+        || field.data_type() != &DataType::Int64
+        || field.is_nullable()
+    {
+        return Err(format!(
+            "weighted sink input requires one exact trailing non-null Int64 {WEIGHT_COLUMN} field"
+        ));
     }
-    let Ok(idx) = batch
-        .schema()
-        .index_of(crate::aggregate_state::WEIGHT_COLUMN)
-    else {
-        return Cow::Borrowed(batch);
-    };
-    let stripped_schema = {
-        let fields: Vec<_> = batch
-            .schema()
-            .fields()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx)
-            .map(|(_, f)| f.as_ref().clone())
-            .collect();
-        Arc::new(arrow::datatypes::Schema::new(fields))
-    };
-    let empty = || Cow::Owned(RecordBatch::new_empty(Arc::clone(&stripped_schema)));
-
-    let Some(weights) = batch
-        .column(idx)
+    let weights = batch
+        .column(weight_index)
         .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-    else {
-        tracing::error!(
-            "prepare_for_sink: __weight column is not Int64; dropping batch \
-             to avoid leaking it to an append-only sink"
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| format!("weighted sink input {WEIGHT_COLUMN} array is not Int64"))?;
+    if weights.null_count() != 0 {
+        return Err(format!(
+            "weighted sink input {WEIGHT_COLUMN} contains NULL values"
+        ));
+    }
+    if let Some(row) = weights.values().iter().position(|weight| *weight == 0) {
+        return Err(format!(
+            "weighted sink input {WEIGHT_COLUMN} is zero at row {row}"
+        ));
+    }
+    if !accepts_full_changelog {
+        return Err(
+            "weighted sink input requires a FullChangelog sink; append-only or keyed-upsert semantics would lose retractions"
+                .into(),
         );
-        return empty();
-    };
-    // Keep only rows with positive weight.
-    let mask: BooleanArray = weights.iter().map(|w| Some(w.unwrap_or(0) > 0)).collect();
-    let Ok(filtered) = arrow::compute::filter_record_batch(batch, &mask) else {
-        tracing::error!("prepare_for_sink: filter_record_batch failed; dropping batch");
-        return empty();
-    };
-    // Strip the __weight column.
-    if filtered.num_columns() == 0 {
-        return Cow::Owned(filtered);
     }
-    let indices: Vec<usize> = (0..filtered.num_columns()).filter(|&i| i != idx).collect();
-    if let Ok(projected) = filtered.project(&indices) {
-        Cow::Owned(projected)
-    } else {
-        tracing::error!("prepare_for_sink: failed to strip __weight; dropping batch");
-        empty()
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow::array::{Float64Array, Int64Array};
-    use arrow::datatypes::{Field, Schema};
     use std::sync::Arc;
 
-    fn cdc_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Float64, false),
-            Field::new("_op", DataType::Utf8, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+
+    fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    fn canonical_weighted(weights: Int64Array) -> RecordBatch {
+        batch(
             vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0])),
-                Arc::new(StringArray::from(vec!["I", "D", "U+", "U-"])),
+                Field::new("value", DataType::Utf8, false),
+                Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(weights),
             ],
         )
-        .unwrap()
     }
 
     #[test]
-    fn test_filter_positive_keeps_inserts_and_updates() {
-        let result = filter_positive_events(&cdc_batch()).unwrap();
-        assert_eq!(result.num_rows(), 2); // I and U+
-        let ids = result
-            .column(0)
+    fn plain_rows_are_valid_for_every_sink_mode() {
+        let plain = batch(
+            vec![Field::new("value", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["a"]))],
+        );
+
+        validate_sink_input(&plain, false, false).unwrap();
+        validate_sink_input(&plain, true, false).unwrap();
+        let error = validate_sink_input(&plain, true, true).unwrap_err();
+        assert!(error.contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn canonical_weights_are_preserved_only_for_full_changelog_sinks() {
+        let weighted = canonical_weighted(Int64Array::from(vec![1, -2]));
+
+        validate_sink_input(&weighted, true, true).unwrap();
+        validate_sink_input(&weighted, true, false).unwrap();
+        let error = validate_sink_input(&weighted, false, false).unwrap_err();
+        assert!(error.contains("FullChangelog"), "{error}");
+        let values = weighted
+            .column_by_name(WEIGHT_COLUMN)
+            .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ids.value(0), 1); // I
-        assert_eq!(ids.value(1), 3); // U+
+        assert_eq!(values.values(), &[1, -2]);
     }
 
     #[test]
-    fn test_no_op_column_passthrough() {
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
-        let result = filter_positive_events(&batch).unwrap();
-        assert_eq!(result.num_rows(), 2);
+    fn malformed_weight_envelopes_fail_closed() {
+        let cases = [
+            batch(
+                vec![
+                    Field::new("__WEIGHT", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                ],
+            ),
+            batch(
+                vec![
+                    Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                ],
+            ),
+            batch(
+                vec![
+                    Field::new("value", DataType::Utf8, false),
+                    Field::new(WEIGHT_COLUMN, DataType::Utf8, false),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["1"])) as ArrayRef,
+                ],
+            ),
+            batch(
+                vec![
+                    Field::new("value", DataType::Utf8, false),
+                    Field::new(WEIGHT_COLUMN, DataType::Int64, true),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                ],
+            ),
+            batch(
+                vec![
+                    Field::new("value", DataType::Utf8, false),
+                    Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+                    Field::new("__WEIGHT", DataType::Int64, false),
+                ],
+                vec![
+                    Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+                ],
+            ),
+        ];
+
+        for malformed in cases {
+            assert!(validate_sink_input(&malformed, true, false).is_err());
+            assert!(validate_sink_input(&malformed, false, false).is_err());
+        }
+    }
+
+    #[test]
+    fn null_and_zero_weight_values_fail_closed() {
+        let nullable = batch(
+            vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new(WEIGHT_COLUMN, DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![Some(1), None])),
+            ],
+        );
+        for malformed in [nullable, canonical_weighted(Int64Array::from(vec![1, 0]))] {
+            assert!(validate_sink_input(&malformed, true, false).is_err());
+            assert!(validate_sink_input(&malformed, false, false).is_err());
+        }
     }
 }

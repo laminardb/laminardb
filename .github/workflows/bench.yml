@@ -1,4 +1,4 @@
-name: Benchmarks
+name: Benchmark regression smoke
 
 on:
   push:
@@ -6,15 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  deployments: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   # Reduce criterion sample count for CI (default 100 samples + 5s measurement
-  # per benchmark causes timeouts on GitHub runners). 10 samples with shorter
-  # warmup/measurement is sufficient for regression detection.
+  # per benchmark causes timeouts on GitHub runners). Ten short samples are an
+  # advisory trend smoke only; alerts are intentionally non-gating.
   BENCH_ARGS: "--noplot --sample-size 10 --warm-up-time 1 --measurement-time 3"
 
 jobs:
@@ -182,6 +181,8 @@ jobs:
     name: Publish Results
     needs: [bench-latency, bench-dag, bench-operators, bench-throughput, bench-storage]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v6
 
@@ -206,15 +207,9 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Non-qualifying benchmark regression smoke" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Latency Targets" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Target | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| State lookup | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| Routing lookup | < 50ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| 3-node latency | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| Throughput/core | > 500K/s | See artifacts |" >> $GITHUB_STEP_SUMMARY
+          echo "Hosted-runner Criterion data is trend-only. It is not stateful-operator qualification or production evidence." >> $GITHUB_STEP_SUMMARY
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1

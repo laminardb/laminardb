@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use arrow::compute::take;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
-use arrow_row::{RowConverter, SortField};
 
-use crate::state::{key_hash, NodeId, VnodeAssignmentSnapshot};
+use crate::state::partition_key::{PartitionKeyCodecV1Builder, MAX_PARTITION_KEY_COLUMNS};
+use crate::state::{NodeId, PartitionKeyCodecError, PartitionKeyCodecV1, VnodeAssignmentSnapshot};
 
 /// Target decoded size for one routed batch. This is intentionally below the hard receiver bound
 /// so schema/allocator variance does not turn ordinary skew into a transport failure.
@@ -20,7 +20,11 @@ pub const ROUTE_MAX_BATCH_ROWS: usize = 65_536;
 /// Logical Arrow bytes referenced by this slice, independent of backing-buffer capacity or owner.
 /// This is the stable bound for IPC content; transport reservations account the retained backing
 /// allocation separately.
-pub(crate) fn logical_batch_bytes(batch: &RecordBatch) -> Result<usize, arrow_schema::ArrowError> {
+///
+/// # Errors
+///
+/// Returns an Arrow compute error when buffer-size accounting overflows.
+pub fn logical_batch_bytes(batch: &RecordBatch) -> Result<usize, arrow_schema::ArrowError> {
     batch.columns().iter().try_fold(0usize, |total, column| {
         let data = column.to_data();
         let bytes = data
@@ -77,6 +81,8 @@ pub struct LocalRoute {
     pub vnode: u32,
     /// Rows for that vnode, preserving their input order.
     pub batch: RecordBatch,
+    /// Original input-row indices, aligned one-for-one with `batch`.
+    pub source_rows: Arc<[u32]>,
 }
 
 /// One bounded owner-coalesced remote batch.
@@ -124,6 +130,9 @@ pub enum ShuffleRoutingError {
         /// Rejected Arrow type.
         data_type: arrow_schema::DataType,
     },
+    /// A bounded partition-key ABI invariant failed before row encoding.
+    #[error("shuffle partition-key contract: {0}")]
+    PartitionKeyContract(PartitionKeyCodecError),
     /// Arrow row encoding or slicing failed.
     #[error("shuffle Arrow routing: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -190,60 +199,52 @@ pub fn row_vnodes(
     if vnode_count == 0 {
         return Err(ShuffleRoutingError::EmptyVnodeSpace);
     }
-    let cols: Vec<ArrayRef> = columns
-        .iter()
-        .map(|&index| {
-            let column = batch.columns().get(index).cloned().ok_or(
-                ShuffleRoutingError::KeyColumnOutOfRange {
-                    index,
-                    columns: batch.num_columns(),
-                },
-            )?;
-            if !is_supported_key_type(column.data_type()) {
-                return Err(ShuffleRoutingError::UnsupportedKeyType {
-                    index,
-                    data_type: column.data_type().clone(),
-                });
-            }
-            Ok(column)
-        })
-        .collect::<Result<_, _>>()?;
-    let fields: Vec<SortField> = cols
-        .iter()
-        .map(|column| SortField::new(column.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(&cols)?;
-    (0..batch.num_rows())
-        .map(|row| {
-            u32::try_from(key_hash(rows.row(row).as_ref()) % u64::from(vnode_count))
-                .map_err(|_| ShuffleRoutingError::EmptyVnodeSpace)
-        })
-        .collect()
-}
-
-fn is_supported_key_type(data_type: &arrow_schema::DataType) -> bool {
-    match data_type {
-        // Dictionary indices are an encoding detail. Hash the hydrated scalar
-        // value, but apply the same ABI gate recursively to that value type.
-        arrow_schema::DataType::Dictionary(indices, values) => {
-            matches!(
-                indices.as_ref(),
-                arrow_schema::DataType::Int8
-                    | arrow_schema::DataType::Int16
-                    | arrow_schema::DataType::Int32
-                    | arrow_schema::DataType::Int64
-                    | arrow_schema::DataType::UInt8
-                    | arrow_schema::DataType::UInt16
-                    | arrow_schema::DataType::UInt32
-                    | arrow_schema::DataType::UInt64
-            ) && is_supported_key_type(values)
-        }
-        // Run-end encoding is also representation-level, but is excluded until
-        // equivalence with plain arrays is frozen by vectors.
-        arrow_schema::DataType::RunEndEncoded(_, _) => false,
-        data_type => !data_type.is_floating() && !data_type.is_nested(),
+    if columns.len() > MAX_PARTITION_KEY_COLUMNS {
+        return Err(ShuffleRoutingError::PartitionKeyContract(
+            PartitionKeyCodecError::TooManyKeyColumns {
+                count: columns.len(),
+                limit: MAX_PARTITION_KEY_COLUMNS,
+            },
+        ));
     }
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    let mut builder = PartitionKeyCodecV1Builder::with_capacity(columns.len());
+    for &index in columns {
+        let column = batch.columns().get(index).cloned().ok_or(
+            ShuffleRoutingError::KeyColumnOutOfRange {
+                index,
+                columns: batch.num_columns(),
+            },
+        )?;
+        builder
+            .push(column.data_type().clone())
+            .map_err(|error| match error {
+                PartitionKeyCodecError::EmptyKeySchema => ShuffleRoutingError::EmptyKey,
+                PartitionKeyCodecError::UnsupportedKeyType { data_type, .. } => {
+                    ShuffleRoutingError::UnsupportedKeyType { index, data_type }
+                }
+                PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+                other => ShuffleRoutingError::PartitionKeyContract(other),
+            })?;
+        cols.push(column);
+    }
+    let codec = builder.finish().map_err(|error| match error {
+        PartitionKeyCodecError::EmptyKeySchema => ShuffleRoutingError::EmptyKey,
+        PartitionKeyCodecError::UnsupportedKeyType { index, data_type } => {
+            ShuffleRoutingError::UnsupportedKeyType {
+                index: columns[index],
+                data_type,
+            }
+        }
+        PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+        other => ShuffleRoutingError::PartitionKeyContract(other),
+    })?;
+    let rows = codec.encode_columns(&cols)?;
+    let vnode_count =
+        std::num::NonZeroU32::new(vnode_count).ok_or(ShuffleRoutingError::EmptyVnodeSpace)?;
+    Ok((0..batch.num_rows())
+        .map(|row| PartitionKeyCodecV1::vnode_for_encoded(rows.row(row).as_ref(), vnode_count))
+        .collect())
 }
 
 /// Build a complete local/remote plan from one caller-pinned assignment.
@@ -302,10 +303,11 @@ pub fn route_checkpointed_batch(
 
     let mut plan = CheckpointRoutePlan::default();
     for (vnode, indices) in local_groups {
-        for (_, slice) in bounded_slices(batch, &indices, vnode)? {
+        for (range, slice) in bounded_slices(batch, &indices, vnode)? {
             plan.local.push(LocalRoute {
                 vnode,
                 batch: slice,
+                source_rows: Arc::from(&indices[range]),
             });
         }
     }
@@ -374,6 +376,14 @@ fn bounded_slices(
 }
 
 fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch, ShuffleRoutingError> {
+    if indices.len() == batch.num_rows() && batch.get_array_memory_size() <= ROUTE_MAX_BATCH_BYTES {
+        debug_assert!(indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| u32::try_from(offset).ok() == Some(index)));
+        return Ok(batch.clone());
+    }
+
     let indices = UInt32Array::from(indices.to_vec());
     let columns = batch
         .columns()
@@ -405,6 +415,65 @@ mod tests {
             vec![Arc::new(Int64Array::from(values.to_vec()))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn take_rows_reuses_bounded_identity_and_compacts_retained_backing() {
+        let batch = values(&[10, 20, 30, 40]);
+        let identity = take_rows(&batch, &[0, 1, 2, 3]).unwrap();
+        let contiguous = take_rows(&batch, &[1, 2]).unwrap();
+
+        let backing = Int64Array::from(vec![1; 2_000_000]);
+        let sliced = RecordBatch::try_new(
+            batch.schema(),
+            vec![Arc::new(backing.slice(1, 1)) as ArrayRef],
+        )
+        .unwrap();
+        assert!(sliced.get_array_memory_size() > ROUTE_MAX_BATCH_BYTES);
+        let compacted_identity = take_rows(&sliced, &[0]).unwrap();
+
+        let original = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let identity_values = identity
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let contiguous_values = contiguous
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let sliced_values = sliced
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let compacted_values = compacted_identity
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        assert_eq!(identity_values.values(), &[10, 20, 30, 40]);
+        assert_eq!(contiguous_values.values(), &[20, 30]);
+        assert!(Arc::ptr_eq(batch.column(0), identity.column(0)));
+        assert_eq!(
+            identity_values.values().as_ptr(),
+            original.values().as_ptr()
+        );
+        assert_ne!(
+            contiguous_values.values().as_ptr(),
+            original.values()[1..].as_ptr()
+        );
+        assert_ne!(
+            compacted_values.values().as_ptr(),
+            sliced_values.values().as_ptr()
+        );
+        assert!(compacted_identity.get_array_memory_size() <= ROUTE_MAX_BATCH_BYTES);
     }
 
     #[test]
@@ -558,6 +627,7 @@ mod tests {
 
         assert_eq!(plan.local.len(), 1);
         assert_eq!(plan.local[0].vnode, 1);
+        assert_eq!(plan.local[0].source_rows.as_ref(), &[4]);
         assert_eq!(
             plan.local[0]
                 .batch
@@ -625,6 +695,13 @@ mod tests {
         assert!(matches!(
             row_vnodes(&batch, &[1], 1),
             Err(ShuffleRoutingError::KeyColumnOutOfRange { .. })
+        ));
+        let over_wide = vec![0; MAX_PARTITION_KEY_COLUMNS + 1];
+        assert!(matches!(
+            row_vnodes(&batch, &over_wide, 1),
+            Err(ShuffleRoutingError::PartitionKeyContract(
+                PartitionKeyCodecError::TooManyKeyColumns { .. }
+            ))
         ));
     }
 
@@ -720,6 +797,14 @@ mod tests {
             })
         ));
 
+        assert!(matches!(
+            row_vnodes(&batch, &[0, 1], 257),
+            Err(ShuffleRoutingError::UnsupportedKeyType {
+                index: 0,
+                data_type: DataType::Float64,
+            })
+        ));
+
         let item = Arc::new(Field::new("item", DataType::Int64, true));
         let nested = [
             DataType::List(Arc::clone(&item)),
@@ -749,19 +834,22 @@ mod tests {
         ];
         assert!(nested
             .iter()
-            .all(|data_type| !is_supported_key_type(data_type)));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+            .all(|data_type| PartitionKeyCodecV1::try_new([data_type.clone()]).is_err()));
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Int8),
             Box::new(DataType::Float64),
-        )));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+        )])
+        .is_err());
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Int8),
             Box::new(DataType::List(item)),
-        )));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+        )])
+        .is_err());
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Float64),
             Box::new(DataType::Utf8),
-        )));
+        )])
+        .is_err());
     }
 
     #[test]

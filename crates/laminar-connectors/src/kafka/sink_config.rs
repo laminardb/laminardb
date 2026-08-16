@@ -1,7 +1,7 @@
 //! Kafka sink connector configuration.
 //!
 //! [`KafkaSinkConfig`] encapsulates all tuning knobs for the Kafka producer,
-//! parsed from a SQL `WITH (...)` clause via [`ConnectorConfig`].
+//! parsed from the resolved sink [`ConnectorConfig`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,7 +17,7 @@ const MAX_DELIVERY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Configuration for the Kafka Sink Connector.
 ///
-/// Parsed from SQL `WITH (...)` clause options.
+/// Parsed from resolved sink connector and format options.
 ///
 /// Uses a custom `Debug` impl that redacts `sasl_password` and
 /// `ssl_key_password` to prevent credential leakage in logs.
@@ -81,8 +81,8 @@ pub struct KafkaSinkConfig {
 /// How the sink encodes an updating (changelog) input to Kafka.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SinkEnvelope {
-    /// Append-only: rows are produced as-is. A changelog's retractions are stripped upstream
-    /// (`prepare_for_sink`), so this cannot faithfully carry an aggregate's deletes.
+    /// Append-only: rows are produced as-is. Weighted changelogs are rejected during sink
+    /// admission and again at the runtime boundary because this envelope cannot carry retractions.
     #[default]
     Append,
     /// Upsert: the Z-set changelog is collapsed per key each batch — a live group becomes a keyed
@@ -142,7 +142,7 @@ impl Default for KafkaSinkConfig {
 }
 
 impl KafkaSinkConfig {
-    /// Parses a sink config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a sink config from a resolved [`ConnectorConfig`].
     ///
     /// # Errors
     ///

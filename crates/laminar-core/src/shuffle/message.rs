@@ -17,8 +17,17 @@ pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 /// Logical message carried on a shuffle connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShuffleMessage {
-    /// An aligned checkpoint barrier ordered after preceding checkpointed data.
+    /// An aligned checkpoint barrier ordered after preceding data and frontiers.
     Barrier(CheckpointBarrier),
+    /// Per-stage event-time progress ordered with the stage's data.
+    Frontier {
+        /// Stable stage demultiplexing scope.
+        stage: String,
+        /// Current watermark, or `None` while the channel is uninitialized.
+        watermark: Option<i64>,
+        /// Whether the channel is excluded from downstream watermark minima.
+        idle: bool,
+    },
     /// A stage batch with a non-empty canonical route set.
     Data {
         /// Stable stage demultiplexing scope.

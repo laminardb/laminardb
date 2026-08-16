@@ -3,6 +3,8 @@
 //! [`StorageProvider`] identifies the cloud backend from a table path, enabling
 //! provider-specific credential resolution and validation.
 
+#[cfg(any(test, feature = "delta-lake"))]
+use std::borrow::Cow;
 use std::fmt;
 
 /// Cloud storage provider detected from URI scheme.
@@ -19,6 +21,30 @@ pub enum StorageProvider {
 }
 
 impl StorageProvider {
+    /// Detects a recognized provider URI. Unlike [`Self::detect`], an unknown
+    /// URI scheme is not treated as a local path.
+    #[must_use]
+    pub fn detect_uri(table_path: &str) -> Option<Self> {
+        let (scheme, _) = table_path.split_once("://")?;
+
+        if scheme.eq_ignore_ascii_case("s3") || scheme.eq_ignore_ascii_case("s3a") {
+            return Some(Self::AwsS3);
+        }
+
+        if ["az", "abfs", "abfss", "wasb", "wasbs"]
+            .iter()
+            .any(|candidate| scheme.eq_ignore_ascii_case(candidate))
+        {
+            return Some(Self::AzureAdls);
+        }
+
+        if scheme.eq_ignore_ascii_case("gs") || scheme.eq_ignore_ascii_case("gcs") {
+            return Some(Self::Gcs);
+        }
+
+        scheme.eq_ignore_ascii_case("file").then_some(Self::Local)
+    }
+
     /// Detects the storage provider from a table path URI.
     ///
     /// # Examples
@@ -33,26 +59,36 @@ impl StorageProvider {
     /// ```
     #[must_use]
     pub fn detect(table_path: &str) -> Self {
-        let lower = table_path.to_lowercase();
+        Self::detect_uri(table_path).unwrap_or(Self::Local)
+    }
 
-        if lower.starts_with("s3://") || lower.starts_with("s3a://") {
-            return Self::AwsS3;
+    /// Whether the path names a shared cloud object store.
+    #[must_use]
+    pub fn is_shared_uri(table_path: &str) -> bool {
+        Self::detect_uri(table_path).is_some_and(|provider| provider != Self::Local)
+    }
+
+    /// Whether the path directly names the release-admitted S3 log store.
+    #[must_use]
+    pub fn is_direct_s3_uri(table_path: &str) -> bool {
+        let Some((scheme, _)) = table_path.split_once("://") else {
+            return false;
+        };
+        scheme.eq_ignore_ascii_case("s3") || scheme.eq_ignore_ascii_case("s3a")
+    }
+
+    /// Maps legacy Azure Blob schemes to the Azure URI registered by delta-rs.
+    #[must_use]
+    #[cfg(any(test, feature = "delta-lake"))]
+    pub(crate) fn canonical_uri(table_path: &str) -> Cow<'_, str> {
+        let Some((scheme, rest)) = table_path.split_once("://") else {
+            return Cow::Borrowed(table_path);
+        };
+        if scheme.eq_ignore_ascii_case("wasb") || scheme.eq_ignore_ascii_case("wasbs") {
+            Cow::Owned(format!("az://{rest}"))
+        } else {
+            Cow::Borrowed(table_path)
         }
-
-        if lower.starts_with("az://")
-            || lower.starts_with("abfs://")
-            || lower.starts_with("abfss://")
-            || lower.starts_with("wasb://")
-            || lower.starts_with("wasbs://")
-        {
-            return Self::AzureAdls;
-        }
-
-        if lower.starts_with("gs://") || lower.starts_with("gcs://") {
-            return Self::Gcs;
-        }
-
-        Self::Local
     }
 
     /// Returns true if this provider requires cloud credentials.
@@ -140,6 +176,10 @@ mod tests {
         assert_eq!(
             StorageProvider::detect("wasbs://container@account.blob.core.windows.net/path"),
             StorageProvider::AzureAdls
+        );
+        assert_eq!(
+            StorageProvider::canonical_uri("wasbs://container@account.blob.core.windows.net/path"),
+            "az://container@account.blob.core.windows.net/path"
         );
     }
 

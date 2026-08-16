@@ -34,13 +34,11 @@ LaminarDB is a Rust workspace with 6 crates. Here's what each one does:
 | Crate | What it does |
 |-------|-------------|
 | **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes, checkpoint manifests, and object-store checkpoint persistence. |
-| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF, temporal probe joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
+| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, and bounded joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
 | **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
 | **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
 | **laminar-server** | Standalone server binary with TOML config, Axum HTTP API, hot reload, Prometheus metrics. |
-
-For the full architecture, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Where things live
 
@@ -153,7 +151,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
 feat(connectors): add Redis lookup table source
-fix(sql): handle NULL in ASOF JOIN match condition
+fix(sql): handle NULL in bounded JOIN keys
 test(checkpoint): add barrier alignment integration test
 perf(state): reduce AHashMap lookup from 500ns to 350ns
 docs(contributing): update project structure
@@ -172,7 +170,7 @@ Check out issues labeled [`good first issue`](https://github.com/laminardb/lamin
 Some areas that are especially welcoming to new contributors:
 
 - **Tests** -- We can always use more. Property tests, integration tests, edge cases.
-- **Documentation** -- Config options, connector setup guides, architecture docs.
+- **Documentation** -- Config options, connector setup guides, SQL examples, and API docs.
 - **Connectors** -- Adding a new source or sink is self-contained. The `SourceConnector` and `SinkConnector` traits in `connector.rs` are the interface.
 - **Language bindings** -- Java, Node.js, .NET bindings are all open for contribution. The Python bindings and C FFI layer are the reference implementations.
 

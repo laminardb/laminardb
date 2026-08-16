@@ -235,6 +235,14 @@ impl StreamingParser {
                 Ok(vec![stmt])
             }
             StreamingDdlKind::None => {
+                if let Some(parsed) = join_parser::parse_temporal_probe_query(&tokens)
+                    .map_err(parse_error_to_parser_error)?
+                {
+                    return Ok(vec![StreamingStatement::TemporalProbeQuery {
+                        statement: Box::new(parsed.statement),
+                        analysis: Box::new(parsed.analysis),
+                    }]);
+                }
                 // Standard SQL - check for INSERT INTO and convert
                 let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
                 Ok(statements
@@ -489,8 +497,7 @@ fn parse_create_stream(
     let remaining = collect_remaining_tokens(parser);
     let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
     let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
-
-    let query_sql = query_body_sql(
+    let raw_query_sql = query_body_sql(
         original_sql,
         &query_tokens,
         &emit_tokens,
@@ -499,20 +506,30 @@ fn parse_create_stream(
 
     let stream_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let (query_stmt, normalized_temporal_sql) = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        (
+            StreamingStatement::TemporalProbeQuery {
+                statement: Box::new(parsed.statement),
+                analysis: Box::new(parsed.analysis),
+            },
+            Some(parsed.normalized_sql),
+        )
     } else {
         let mut query_parser = sqlparser::parser::Parser::new(&stream_dialect)
             .with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        (
+            StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query))),
+            None,
+        )
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -908,25 +925,34 @@ fn parse_create_materialized_view(
     // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
-
-    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
+    let raw_query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
 
     let mv_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let (query_stmt, normalized_temporal_sql) = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        (
+            StreamingStatement::TemporalProbeQuery {
+                statement: Box::new(parsed.statement),
+                analysis: Box::new(parsed.analysis),
+            },
+            Some(parsed.normalized_sql),
+        )
     } else {
         let mut query_parser =
             sqlparser::parser::Parser::new(&mv_dialect).with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        (
+            StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query))),
+            None,
+        )
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -1047,6 +1073,18 @@ mod tests {
         stmts.into_iter().next().unwrap()
     }
 
+    fn assert_standard_as_of_query(sql: &str) {
+        let reparsed = StreamingParser::parse_sql(sql).unwrap();
+        let [StreamingStatement::Standard(statement)] = reparsed.as_slice() else {
+            panic!("expected exactly one standard query, got {reparsed:?}");
+        };
+        assert_eq!(
+            crate::temporal::temporal_table_version_count(statement.as_ref()),
+            1,
+            "expected one AS-OF table version in {sql}"
+        );
+    }
+
     #[test]
     fn custom_catalog_parsers_reject_duplicate_options_and_trailing_tokens() {
         let duplicates = [
@@ -1060,8 +1098,8 @@ mod tests {
         }
 
         let trailing = [
-            "CREATE SOURCE events (id BIGINT) WITH ('connector' = 'kafka') TRAILING",
-            "CREATE SINK output FROM events WITH ('topic' = 'a') TRAILING",
+            "CREATE SOURCE events (id BIGINT) WITH ('buffer_size' = '4096') TRAILING",
+            "CREATE SINK output FROM events INTO KAFKA ('topic' = 'a') TRAILING",
             "CREATE LOOKUP TABLE users (id BIGINT, PRIMARY KEY (id)) WITH ('connector' = 'postgres') TRAILING",
         ];
         for sql in trailing {
@@ -1699,53 +1737,107 @@ mod tests {
     }
 
     #[test]
-    fn create_stream_preserves_temporal_probe_join() {
+    fn create_stream_normalizes_temporal_probe_join() {
         let sql = "CREATE STREAM markouts_long AS \
                    SELECT t.s, p.offset_ms FROM trade_probe t \
                    TEMPORAL PROBE JOIN price_ref r \
-                       ON (s) TIMESTAMPS (ts, ts) \
+                       ON (s, venue) TIMESTAMPS (ts, ts) \
                        LIST (0s, 1s, 5s, 30s) AS p";
-        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
+        let StreamingStatement::CreateStream {
+            query, query_sql, ..
+        } = parse_one(sql)
+        else {
             panic!("expected CreateStream");
         };
+        let StreamingStatement::TemporalProbeQuery { analysis, .. } = *query else {
+            panic!("expected normalized temporal probe query");
+        };
+        assert_eq!(
+            analysis
+                .temporal_probe_schedule
+                .as_ref()
+                .unwrap()
+                .offsets_ms(),
+            [0, 1_000, 5_000, 30_000]
+        );
+        assert_eq!(analysis.temporal_probe_alias.as_deref(), Some("p"));
+        assert_eq!(analysis.left_key_column, "s");
+        assert_eq!(analysis.right_key_column, "s");
+        assert_eq!(
+            analysis.additional_key_columns,
+            [("venue".to_string(), "venue".to_string())]
+        );
+        assert!(query_sql.contains("FOR SYSTEM_TIME AS OF"), "{query_sql}");
         assert!(
-            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
-            "got: {query_sql}"
+            query_sql.contains("t.s = r.s AND t.venue = r.venue"),
+            "{query_sql}"
         );
         assert!(
-            query_sql.contains("LIST (0s, 1s, 5s, 30s)"),
-            "got: {query_sql}"
+            query_sql.contains("price_ref FOR SYSTEM_TIME AS OF t.ts AS r"),
+            "{query_sql}"
         );
-        assert!(query_sql.contains("AS p"), "got: {query_sql}");
+        assert!(!query_sql.contains("TEMPORAL PROBE"), "{query_sql}");
+        assert_standard_as_of_query(&query_sql);
     }
 
     #[test]
-    fn create_stream_temporal_probe_range_step_preserved() {
-        let sql = "CREATE STREAM mk AS \
-                   SELECT s FROM trades t TEMPORAL PROBE JOIN prices r \
-                   ON (symbol) TIMESTAMPS (ts, ts) \
-                   RANGE FROM 0s TO 30s STEP 5s AS p";
-        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
-            panic!("expected CreateStream");
-        };
-        assert!(
-            query_sql.contains("RANGE FROM 0s TO 30s STEP 5s"),
-            "got: {query_sql}"
-        );
-    }
-
-    #[test]
-    fn create_mv_preserves_temporal_probe_join() {
-        let sql = "CREATE MATERIALIZED VIEW mv AS \
-                   SELECT t.s FROM trades t TEMPORAL PROBE JOIN prices r \
-                   ON (s) TIMESTAMPS (ts, ts) LIST (0s, 5s) AS p";
+    fn materialized_view_temporal_probe_query_sql_reparses() {
+        let sql = "CREATE MATERIALIZED VIEW markouts AS \
+                   SELECT t.s, p.offset_ms FROM trade_probe t \
+                   TEMPORAL PROBE JOIN price_ref r \
+                       ON (s) TIMESTAMPS (ts, ts) \
+                       LIST (0s, 5s) AS p";
         let StreamingStatement::CreateMaterializedView { query_sql, .. } = parse_one(sql) else {
             panic!("expected CreateMaterializedView");
         };
+
         assert!(
-            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
-            "got: {query_sql}"
+            query_sql.contains("price_ref FOR SYSTEM_TIME AS OF t.ts AS r"),
+            "{query_sql}"
         );
+        assert_standard_as_of_query(&query_sql);
+    }
+
+    #[test]
+    fn temporal_probe_range_is_checked_and_expanded_once() {
+        let sql = "SELECT probe.offset_ms, probe.probe_time FROM trades t \
+                   TEMPORAL PROBE JOIN quotes q ON (symbol) \
+                   TIMESTAMPS (trade_time, quote_time) \
+                   RANGE FROM -5s TO 5s STEP 5s AS probe";
+        let statements = parse_streaming_sql(sql).unwrap();
+        let [StreamingStatement::TemporalProbeQuery { analysis, .. }] = statements.as_slice()
+        else {
+            panic!("expected temporal probe query");
+        };
+        assert_eq!(
+            analysis
+                .temporal_probe_schedule
+                .as_ref()
+                .unwrap()
+                .offsets_ms(),
+            [-5_000, 0, 5_000]
+        );
+
+        for invalid in [
+            "LIST (0s, 0s)",
+            "RANGE FROM 0s TO 256s STEP 1s",
+            "RANGE FROM 0s TO 10s STEP 3s",
+            "LIST (366d)",
+        ] {
+            let sql = format!(
+                "SELECT * FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+                 TIMESTAMPS (trade_time, quote_time) {invalid} AS probe"
+            );
+            assert!(parse_streaming_sql(&sql).is_err(), "accepted: {sql}");
+        }
+
+        for keys in ["", "symbol,", ", symbol", "symbol venue"] {
+            let sql = format!(
+                "SELECT * FROM trades t TEMPORAL PROBE JOIN quotes q ON ({keys}) \
+                 TIMESTAMPS (trade_time, quote_time) LIST (0s) AS probe"
+            );
+            assert!(parse_streaming_sql(&sql).is_err(), "accepted: {sql}");
+        }
     }
 
     #[test]

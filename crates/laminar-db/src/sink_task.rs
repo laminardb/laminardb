@@ -24,8 +24,11 @@ use tokio::time::Instant;
 type SinkCommandTx = MAsyncTx<mpsc::Array<SinkCommand>>;
 type SinkCommandRx = AsyncRx<mpsc::Array<SinkCommand>>;
 
-/// Default capacity for the sink command channel.
-pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+/// Default capacity for the sink command channel. Keep the queue shallow enough that a checkpoint
+/// `Sync` fence cannot sit behind a long tail of individually acknowledged connector writes; the
+/// bounded sender applies backpressure before that latency is transferred wholesale into the
+/// stop-the-world checkpoint barrier.
+pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 32;
 
 /// Default periodic flush interval for sink tasks.
 #[cfg(test)]
@@ -241,6 +244,9 @@ pub(crate) struct SinkCommand {
 
 pub(crate) enum SinkOperation {
     WriteBatch {
+        /// Exact epoch generation admitted by the handle-side write gate. Non-committable sinks
+        /// do not participate in epoch gating and leave this unset.
+        epoch: Option<SinkEpochAdmission>,
         batch: RecordBatch,
     },
     BeginEpoch {
@@ -280,6 +286,54 @@ pub(crate) enum SinkOperation {
     Close {
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
+}
+
+/// Handle-side admission state for checkpoint-committable sink epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SinkEpochGateState {
+    Unopened,
+    Open(SinkEpochAdmission),
+    Sealed(SinkEpochAdmission),
+    Opening(SinkEpochAdmission),
+    Begun(SinkEpochAdmission),
+    Failed { generation: u64 },
+}
+
+/// Exact handle-side generation admitted for one writable sink epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SinkEpochAdmission {
+    pub(crate) epoch: u64,
+    pub(crate) generation: u64,
+}
+
+struct SinkBeginGateGuard {
+    gate: tokio::sync::watch::Sender<SinkEpochGateState>,
+    admission: SinkEpochAdmission,
+    disarmed: bool,
+}
+
+impl SinkBeginGateGuard {
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for SinkBeginGateGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        self.gate.send_if_modified(|state| {
+            if *state == SinkEpochGateState::Opening(self.admission) {
+                *state = SinkEpochGateState::Failed {
+                    generation: self.admission.generation,
+                };
+                true
+            } else {
+                false
+            }
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -548,6 +602,9 @@ pub(crate) struct SinkTaskHandle {
     /// Sticky for the current epoch. Shared with the actor so a write rejected before enqueue
     /// cannot be hidden from the checkpoint protocol.
     epoch_poisoned: Arc<AtomicBool>,
+    /// Checkpoint-committable sinks remain non-writable until the whole sink group has begun the
+    /// same allocator-owned epoch. Every clone observes the same transition stream.
+    epoch_gate: Option<tokio::sync::watch::Sender<SinkEpochGateState>>,
     #[cfg(feature = "cluster")]
     process_authority: Option<Arc<ClusterController>>,
 }
@@ -590,6 +647,9 @@ impl SinkTaskHandle {
         let task_event_tx = event_tx.clone();
         let task_name = name.clone();
         let epoch_poisoned = Arc::new(AtomicBool::new(false));
+        let epoch_gate = contract
+            .is_checkpoint_committable()
+            .then(|| tokio::sync::watch::channel(SinkEpochGateState::Unopened).0);
         let admission = Arc::new(tokio::sync::Mutex::new(()));
         let actor_state = Arc::new(SinkActorState::new());
         let runtime = tokio::runtime::Handle::current();
@@ -632,6 +692,7 @@ impl SinkTaskHandle {
             runtime,
             event_tx,
             epoch_poisoned,
+            epoch_gate,
             #[cfg(feature = "cluster")]
             process_authority,
         }
@@ -654,10 +715,6 @@ impl SinkTaskHandle {
         }
     }
 
-    pub(crate) fn epoch_requires_recovery(&self) -> bool {
-        self.epoch_poisoned.load(Ordering::Acquire)
-    }
-
     fn ensure_open(&self) -> Result<(), ConnectorError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(self.closed_err());
@@ -672,6 +729,244 @@ impl SinkTaskHandle {
             }
         }
         Ok(())
+    }
+
+    fn epoch_gate_error(
+        &self,
+        expected: impl Into<String>,
+        actual: SinkEpochGateState,
+    ) -> ConnectorError {
+        ConnectorError::InvalidState {
+            expected: expected.into(),
+            actual: format!("sink '{}' epoch gate is {actual:?}", self.name),
+        }
+    }
+
+    async fn wait_for_open_epoch_until(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<Option<SinkEpochAdmission>, ConnectorError> {
+        let Some(gate) = self.epoch_gate.as_ref() else {
+            return Ok(None);
+        };
+        let mut state = gate.subscribe();
+        loop {
+            let observed = *state.borrow_and_update();
+            match observed {
+                SinkEpochGateState::Open(admission) => return Ok(Some(admission)),
+                SinkEpochGateState::Failed { .. } => {
+                    return Err(self.epoch_gate_error("a writable sink epoch", observed));
+                }
+                SinkEpochGateState::Unopened
+                | SinkEpochGateState::Sealed(_)
+                | SinkEpochGateState::Opening(_)
+                | SinkEpochGateState::Begun(_) => {}
+            }
+            let changed = state.changed();
+            tokio::pin!(changed);
+            let actor_finished = self.actor_state.finished_notify.notified();
+            tokio::pin!(actor_finished);
+            actor_finished.as_mut().enable();
+            if self.actor_state.finished.load(Ordering::Acquire) {
+                return Err(self.closed_err());
+            }
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        biased;
+                        result = &mut changed => result.map_err(|_| self.closed_err())?,
+                        () = actor_finished.as_mut() => return Err(self.closed_err()),
+                        () = tokio::time::sleep_until(deadline) => {
+                            return Err(command_deadline_error(
+                                &self.name,
+                                "sink epoch gate",
+                                deadline.saturating_duration_since(Instant::now()),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    tokio::select! {
+                        biased;
+                        result = &mut changed => result.map_err(|_| self.closed_err())?,
+                        () = actor_finished.as_mut() => return Err(self.closed_err()),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for the checkpoint-committable sink group to publish a writable epoch. This does not
+    /// take command admission; `write_batch_before` locks and rechecks the exact generation.
+    pub(crate) async fn wait_for_write_gate_until(
+        &self,
+        supplied_deadline: Option<Instant>,
+    ) -> Result<Option<SinkEpochAdmission>, ConnectorError> {
+        self.ensure_open()?;
+        self.wait_for_open_epoch_until(supplied_deadline).await
+    }
+
+    pub(crate) fn begun_epoch_admission(&self, epoch: u64) -> Option<SinkEpochAdmission> {
+        self.epoch_gate
+            .as_ref()
+            .and_then(|gate| match *gate.borrow() {
+                SinkEpochGateState::Begun(admission) if admission.epoch == epoch => Some(admission),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn current_begun_epoch_admission(&self) -> Option<SinkEpochAdmission> {
+        self.epoch_gate
+            .as_ref()
+            .and_then(|gate| match *gate.borrow() {
+                SinkEpochGateState::Begun(admission) => Some(admission),
+                _ => None,
+            })
+    }
+
+    /// Publish only after the coordinator has preflighted the whole group and made its allocator
+    /// reservation Ready. There is deliberately no await or fallible work in this phase.
+    pub(crate) fn publish_open_epoch(
+        &self,
+        admission: SinkEpochAdmission,
+    ) -> Result<(), ConnectorError> {
+        let Some(gate) = self.epoch_gate.as_ref() else {
+            return Ok(());
+        };
+        let changed = gate.send_if_modified(|state| {
+            if *state == SinkEpochGateState::Begun(admission) {
+                *state = SinkEpochGateState::Open(admission);
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            Ok(())
+        } else {
+            Err(self.epoch_gate_error(
+                format!("begun epoch admission {admission:?}"),
+                *gate.borrow(),
+            ))
+        }
+    }
+
+    pub(crate) fn fail_epoch_transition(&self, admission: SinkEpochAdmission) {
+        let Some(gate) = self.epoch_gate.as_ref() else {
+            return;
+        };
+        gate.send_if_modified(|state| {
+            let same_generation = match *state {
+                SinkEpochGateState::Open(current)
+                | SinkEpochGateState::Sealed(current)
+                | SinkEpochGateState::Opening(current)
+                | SinkEpochGateState::Begun(current) => current.generation == admission.generation,
+                SinkEpochGateState::Failed { generation } => generation == admission.generation,
+                SinkEpochGateState::Unopened => false,
+            };
+            if same_generation && !matches!(*state, SinkEpochGateState::Failed { .. }) {
+                *state = SinkEpochGateState::Failed {
+                    generation: admission.generation,
+                };
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) fn fail_epoch_gate(&self) {
+        if let Some(gate) = self.epoch_gate.as_ref() {
+            let generation = match *gate.borrow() {
+                SinkEpochGateState::Unopened => 0,
+                SinkEpochGateState::Open(admission)
+                | SinkEpochGateState::Sealed(admission)
+                | SinkEpochGateState::Opening(admission)
+                | SinkEpochGateState::Begun(admission) => admission.generation,
+                SinkEpochGateState::Failed { generation } => generation,
+            };
+            gate.send_replace(SinkEpochGateState::Failed { generation });
+        }
+    }
+
+    pub(crate) fn open_epoch_admission(
+        &self,
+        epoch: u64,
+    ) -> Result<SinkEpochAdmission, ConnectorError> {
+        let gate = self.epoch_gate.as_ref().ok_or_else(|| {
+            self.epoch_gate_error("checkpoint-committable sink", SinkEpochGateState::Unopened)
+        })?;
+        match *gate.borrow() {
+            SinkEpochGateState::Open(admission) if admission.epoch == epoch => Ok(admission),
+            observed => Err(self.epoch_gate_error(format!("open epoch {epoch}"), observed)),
+        }
+    }
+
+    pub(crate) async fn seal_epoch_until(
+        &self,
+        admission: SinkEpochAdmission,
+        deadline: Instant,
+    ) -> Result<SinkEpochAdmission, ConnectorError> {
+        let Some(gate) = self.epoch_gate.as_ref() else {
+            return Ok(admission);
+        };
+        let _admission = tokio::time::timeout_at(deadline, self.admission.lock())
+            .await
+            .map_err(|_| command_deadline_error(&self.name, "epoch seal", self.write_timeout))?;
+        self.ensure_open()?;
+        let observed = *gate.borrow();
+        if observed != SinkEpochGateState::Open(admission) {
+            return Err(
+                self.epoch_gate_error(format!("open epoch admission {admission:?}"), observed)
+            );
+        }
+        let sealed = SinkEpochAdmission {
+            epoch: admission.epoch,
+            generation: admission.generation.checked_add(1).ok_or_else(|| {
+                ConnectorError::InvalidState {
+                    expected: "non-exhausted sink epoch generation".into(),
+                    actual: format!("sink '{}' generation overflow", self.name),
+                }
+            })?,
+        };
+        gate.send_replace(SinkEpochGateState::Sealed(sealed));
+        Ok(sealed)
+    }
+
+    /// Idempotent protocol seal for coordinator APIs that do not own a callback transition
+    /// guard. It shares write admission, so every accepted write is ordered before the seal.
+    pub(crate) async fn seal_epoch_for_protocol_until(
+        &self,
+        epoch: u64,
+        deadline: Instant,
+    ) -> Result<Option<SinkEpochAdmission>, ConnectorError> {
+        let Some(gate) = self.epoch_gate.as_ref() else {
+            return Ok(None);
+        };
+        let _admission = tokio::time::timeout_at(deadline, self.admission.lock())
+            .await
+            .map_err(|_| command_deadline_error(&self.name, "epoch seal", self.write_timeout))?;
+        self.ensure_open()?;
+        let observed = *gate.borrow();
+        match observed {
+            SinkEpochGateState::Open(admission) if admission.epoch == epoch => {
+                let sealed = SinkEpochAdmission {
+                    epoch,
+                    generation: admission.generation.checked_add(1).ok_or_else(|| {
+                        ConnectorError::InvalidState {
+                            expected: "non-exhausted sink epoch generation".into(),
+                            actual: format!("sink '{}' generation overflow", self.name),
+                        }
+                    })?,
+                };
+                gate.send_replace(SinkEpochGateState::Sealed(sealed));
+                Ok(Some(sealed))
+            }
+            SinkEpochGateState::Sealed(admission) if admission.epoch == epoch => {
+                Ok(Some(admission))
+            }
+            _ => Err(self.epoch_gate_error(format!("open or sealed epoch {epoch}"), observed)),
+        }
     }
 
     async fn request<T>(
@@ -767,12 +1062,7 @@ impl SinkTaskHandle {
 
     /// Send a batch; backpressures when the sink is behind.
     pub async fn write_batch(&self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        self.write_batch_before(
-            batch,
-            operation_deadline(self.write_timeout),
-            self.write_timeout,
-        )
-        .await
+        self.write_batch_before(batch, None).await
     }
 
     /// Send a batch with queue admission and the actor command clamped to the caller's deadline.
@@ -781,50 +1071,75 @@ impl SinkTaskHandle {
         batch: RecordBatch,
         supplied_deadline: Instant,
     ) -> Result<(), ConnectorError> {
-        let started = Instant::now();
-        let deadline = operation_deadline(self.write_timeout).min(supplied_deadline);
-        let effective_timeout = deadline.saturating_duration_since(started);
-        self.write_batch_before(batch, deadline, effective_timeout)
+        self.write_batch_before(batch, Some(supplied_deadline))
             .await
     }
 
     async fn write_batch_before(
         &self,
         batch: RecordBatch,
-        deadline: Instant,
-        effective_timeout: Duration,
+        supplied_deadline: Option<Instant>,
     ) -> Result<(), ConnectorError> {
         let rows = batch.num_rows();
-        if effective_timeout.is_zero() {
-            self.poison_epoch_if_recovery_required();
-            let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
-                sink_id: Arc::clone(&self.sink_id),
-                rows,
-                timeout: effective_timeout,
+        let (admission, admitted_epoch, deadline, effective_timeout) = loop {
+            let expected_epoch = match self.wait_for_open_epoch_until(supplied_deadline).await {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    self.poison_epoch_if_recovery_required();
+                    return Err(error);
+                }
+            };
+            // Waiting on a checkpoint tail is coordination backpressure, not connector work. The
+            // sink's enqueue/I/O budget starts only after a writable generation is observed.
+            let started = Instant::now();
+            let deadline = supplied_deadline.map_or_else(
+                || operation_deadline(self.write_timeout),
+                |supplied| supplied.min(operation_deadline(self.write_timeout)),
+            );
+            let effective_timeout = deadline.saturating_duration_since(started);
+            if effective_timeout.is_zero() {
+                self.poison_epoch_if_recovery_required();
+                let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
+                    sink_id: Arc::clone(&self.sink_id),
+                    rows,
+                    timeout: effective_timeout,
+                });
+                return Err(command_deadline_error(
+                    &self.name,
+                    "write admission",
+                    effective_timeout,
+                ));
+            }
+            let Ok(admission) = tokio::time::timeout_at(deadline, self.admission.lock()).await
+            else {
+                self.poison_epoch_if_recovery_required();
+                let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
+                    sink_id: Arc::clone(&self.sink_id),
+                    rows,
+                    timeout: effective_timeout,
+                });
+                return Err(command_deadline_error(
+                    &self.name,
+                    "write admission",
+                    effective_timeout,
+                ));
+            };
+            self.ensure_open()?;
+            let still_open = self.epoch_gate.as_ref().is_none_or(|gate| {
+                expected_epoch
+                    .is_some_and(|epoch| *gate.borrow() == SinkEpochGateState::Open(epoch))
             });
-            return Err(command_deadline_error(
-                &self.name,
-                "write admission",
-                effective_timeout,
-            ));
-        }
-        let Ok(admission) = tokio::time::timeout_at(deadline, self.admission.lock()).await else {
-            self.poison_epoch_if_recovery_required();
-            let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
-                sink_id: Arc::clone(&self.sink_id),
-                rows,
-                timeout: effective_timeout,
-            });
-            return Err(command_deadline_error(
-                &self.name,
-                "write admission",
-                effective_timeout,
-            ));
+            if still_open {
+                break (admission, expected_epoch, deadline, effective_timeout);
+            }
+            drop(admission);
         };
-        self.ensure_open()?;
         let command = SinkCommand {
             deadline,
-            operation: SinkOperation::WriteBatch { batch },
+            operation: SinkOperation::WriteBatch {
+                epoch: admitted_epoch,
+                batch,
+            },
         };
         match self
             .tx
@@ -878,11 +1193,66 @@ impl SinkTaskHandle {
         epoch: u64,
         deadline: Instant,
     ) -> Result<(), ConnectorError> {
-        self.request_until("begin-epoch", deadline, |ack| SinkOperation::BeginEpoch {
-            epoch,
-            ack,
-        })
-        .await
+        let mut gate_guard = if let Some(gate) = self.epoch_gate.as_ref() {
+            let admission_guard = tokio::time::timeout_at(deadline, self.admission.lock())
+                .await
+                .map_err(|_| {
+                    command_deadline_error(&self.name, "begin-epoch admission", self.write_timeout)
+                })?;
+            self.ensure_open()?;
+            let observed = *gate.borrow();
+            let generation = match observed {
+                SinkEpochGateState::Unopened => Some(0),
+                SinkEpochGateState::Sealed(admission) => Some(admission.generation),
+                SinkEpochGateState::Failed { generation } => generation.checked_add(1),
+                SinkEpochGateState::Open(_)
+                | SinkEpochGateState::Opening(_)
+                | SinkEpochGateState::Begun(_) => None,
+            };
+            let generation = generation.ok_or_else(|| {
+                self.epoch_gate_error(
+                    format!("unopened, sealed, or failed gate before epoch {epoch}"),
+                    observed,
+                )
+            })?;
+            let admission = SinkEpochAdmission { epoch, generation };
+            gate.send_replace(SinkEpochGateState::Opening(admission));
+            drop(admission_guard);
+            Some(SinkBeginGateGuard {
+                gate: gate.clone(),
+                admission,
+                disarmed: false,
+            })
+        } else {
+            None
+        };
+        let result = self
+            .request_until("begin-epoch", deadline, |ack| SinkOperation::BeginEpoch {
+                epoch,
+                ack,
+            })
+            .await;
+        if result.is_ok() {
+            if let Some(guard) = gate_guard.as_mut() {
+                let admission = guard.admission;
+                let transitioned = guard.gate.send_if_modified(|state| {
+                    if *state == SinkEpochGateState::Opening(admission) {
+                        *state = SinkEpochGateState::Begun(admission);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !transitioned {
+                    return Err(self.epoch_gate_error(
+                        format!("opening epoch admission {admission:?}"),
+                        *guard.gate.borrow(),
+                    ));
+                }
+                guard.disarm();
+            }
+        }
+        result
     }
 
     /// Flush the sink's buffer (no transaction). Drives an at-least-once sink's durable landing
@@ -911,6 +1281,9 @@ impl SinkTaskHandle {
         epoch: u64,
         deadline: Instant,
     ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        // Production Begin/PreCommit ownership is serialized by CheckpointCoordinator. Sealing
+        // here closes concurrent writes; no independent Begin may cross the seal/request gap.
+        self.seal_epoch_for_protocol_until(epoch, deadline).await?;
         self.request_until("pre-commit", deadline, |ack| SinkOperation::PreCommit {
             epoch,
             ack,
@@ -1221,6 +1594,20 @@ struct SinkTaskInner {
     admission: Arc<tokio::sync::Mutex<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkActorEpochState {
+    Open(u64),
+    Prepared(u64),
+}
+
+impl SinkActorEpochState {
+    fn epoch(self) -> u64 {
+        match self {
+            Self::Open(epoch) | Self::Prepared(epoch) => epoch,
+        }
+    }
+}
+
 // In replay-required modes, `epoch_poisoned` rejects checkpoint Flush/PreCommit so no durable cut
 // can pass a dropped write. Local best-effort mode reports loss without permanently fencing state.
 async fn run_sink_task(
@@ -1246,7 +1633,7 @@ async fn run_local_sink_task(
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_timer.tick().await; // skip the first immediate tick
 
-    let mut current_epoch: u64 = 0;
+    let mut epoch_state = SinkActorEpochState::Open(0);
     loop {
         tokio::select! {
             cmd = inner.rx.recv() => {
@@ -1258,7 +1645,7 @@ async fn run_local_sink_task(
                     &mut inner,
                     cmd.operation,
                     cmd.deadline,
-                    &mut current_epoch,
+                    &mut epoch_state,
                     epoch_poisoned.as_ref(),
                     actor_state,
                 )
@@ -1268,7 +1655,11 @@ async fn run_local_sink_task(
                 }
             }
             _ = flush_timer.tick() => {
-                if flush_sink_periodically(&mut inner, current_epoch, epoch_poisoned.as_ref()).await {
+                if flush_sink_periodically(
+                    &mut inner,
+                    epoch_state.epoch(),
+                    epoch_poisoned.as_ref(),
+                ).await {
                     actor_state.stop_admission();
                     break;
                 }
@@ -1288,12 +1679,12 @@ async fn run_process_fenced_sink_task(
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_timer.tick().await;
 
-    let mut current_epoch = 0;
+    let mut epoch_state = SinkActorEpochState::Open(0);
     loop {
         if !controller.process_lease_is_live() {
             terminate_after_process_authority_loss(
                 &mut inner,
-                current_epoch,
+                epoch_state.epoch(),
                 epoch_poisoned.as_ref(),
                 None,
             )
@@ -1306,7 +1697,7 @@ async fn run_process_fenced_sink_task(
             () = controller.wait_for_process_lease_loss() => {
                 terminate_after_process_authority_loss(
                     &mut inner,
-                    current_epoch,
+                    epoch_state.epoch(),
                     epoch_poisoned.as_ref(),
                     None,
                 ).await;
@@ -1320,7 +1711,7 @@ async fn run_process_fenced_sink_task(
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,
-                        current_epoch,
+                        epoch_state.epoch(),
                         epoch_poisoned.as_ref(),
                         Some(command.operation),
                     ).await;
@@ -1330,14 +1721,14 @@ async fn run_process_fenced_sink_task(
                     &mut inner,
                     command.operation,
                     command.deadline,
-                    &mut current_epoch,
+                    &mut epoch_state,
                     epoch_poisoned.as_ref(),
                     actor_state,
                 ).await;
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,
-                        current_epoch,
+                        epoch_state.epoch(),
                         epoch_poisoned.as_ref(),
                         None,
                     ).await;
@@ -1350,20 +1741,20 @@ async fn run_process_fenced_sink_task(
             _ = flush_timer.tick() => {
                 let retire = flush_sink_periodically(
                     &mut inner,
-                    current_epoch,
+                    epoch_state.epoch(),
                     epoch_poisoned.as_ref(),
                 ).await;
-                if retire {
-                    actor_state.stop_admission();
-                    return;
-                }
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,
-                        current_epoch,
+                        epoch_state.epoch(),
                         epoch_poisoned.as_ref(),
                         None,
                     ).await;
+                    return;
+                }
+                if retire {
+                    actor_state.stop_admission();
                     return;
                 }
             }
@@ -1477,7 +1868,7 @@ fn reject_unstarted_sink_operation(
     epoch_poisoned: &AtomicBool,
 ) {
     match operation {
-        SinkOperation::WriteBatch { batch } => {
+        SinkOperation::WriteBatch { batch, .. } => {
             let error = process_authority_error(&inner.name, "queued write");
             record_write_error(
                 &inner.name,
@@ -1528,19 +1919,51 @@ async fn handle_sink_command(
     inner: &mut SinkTaskInner,
     operation: SinkOperation,
     deadline: Instant,
-    current_epoch: &mut u64,
+    epoch_state: &mut SinkActorEpochState,
     epoch_poisoned: &AtomicBool,
     actor_state: &SinkActorState,
 ) -> bool {
     let mut retire = false;
     match operation {
-        SinkOperation::WriteBatch { batch } => {
-            retire =
-                handle_write_batch(inner, batch, deadline, *current_epoch, epoch_poisoned).await;
+        SinkOperation::WriteBatch { epoch, batch } => {
+            let current_epoch = epoch_state.epoch();
+            let gate_error = if inner.contract.is_checkpoint_committable() {
+                match (*epoch_state, epoch) {
+                    (SinkActorEpochState::Open(current), Some(admitted))
+                        if current == admitted.epoch =>
+                    {
+                        None
+                    }
+                    (state, _) => Some(ConnectorError::InvalidState {
+                        expected: format!("open sink epoch {current_epoch}"),
+                        actual: format!(
+                            "sink '{}' actor is {state:?} for write admitted as {epoch:?}",
+                            inner.name
+                        ),
+                    }),
+                }
+            } else {
+                None
+            };
+            if let Some(error) = gate_error {
+                record_write_error(
+                    &inner.name,
+                    &inner.sink_id,
+                    inner.requires_recovery_on_error,
+                    &inner.event_tx,
+                    current_epoch,
+                    batch.num_rows(),
+                    &error,
+                    epoch_poisoned,
+                );
+            } else {
+                retire =
+                    handle_write_batch(inner, batch, deadline, current_epoch, epoch_poisoned).await;
+            }
         }
         SinkOperation::BeginEpoch { epoch, ack } => {
             let (result, operation_retired) =
-                begin_sink_epoch(inner, epoch, deadline, current_epoch, epoch_poisoned).await;
+                begin_sink_epoch(inner, epoch, deadline, epoch_state, epoch_poisoned).await;
             if operation_retired {
                 actor_state.stop_admission();
             }
@@ -1549,7 +1972,7 @@ async fn handle_sink_command(
         }
         SinkOperation::Flush { ack } => {
             let (result, operation_retired) =
-                flush_checkpoint_sink(inner, deadline, *current_epoch, epoch_poisoned).await;
+                flush_checkpoint_sink(inner, deadline, epoch_state.epoch(), epoch_poisoned).await;
             if operation_retired {
                 actor_state.stop_admission();
             }
@@ -1557,8 +1980,25 @@ async fn handle_sink_command(
             retire = operation_retired;
         }
         SinkOperation::PreCommit { epoch, ack } => {
-            let (result, operation_retired) =
-                pre_commit_sink(inner, epoch, deadline, epoch_poisoned).await;
+            let (result, operation_retired) = if inner.contract.is_checkpoint_committable() {
+                match *epoch_state {
+                    SinkActorEpochState::Open(current) if current == epoch => {
+                        // Once phase one starts, no queued/private write may cross it. A failed
+                        // pre-commit remains Prepared until rollback begins a successor epoch.
+                        *epoch_state = SinkActorEpochState::Prepared(epoch);
+                        pre_commit_sink(inner, epoch, deadline, epoch_poisoned).await
+                    }
+                    state => (
+                        Err(ConnectorError::InvalidState {
+                            expected: format!("open sink epoch {epoch}"),
+                            actual: format!("sink '{}' actor is {state:?}", inner.name),
+                        }),
+                        false,
+                    ),
+                }
+            } else {
+                pre_commit_sink(inner, epoch, deadline, epoch_poisoned).await
+            };
             if operation_retired {
                 actor_state.stop_admission();
             }
@@ -1632,7 +2072,7 @@ async fn begin_sink_epoch(
     inner: &mut SinkTaskInner,
     epoch: u64,
     deadline: Instant,
-    current_epoch: &mut u64,
+    epoch_state: &mut SinkActorEpochState,
     epoch_poisoned: &AtomicBool,
 ) -> (Result<(), ConnectorError>, bool) {
     let (result, retire) = bounded_connector_operation(
@@ -1646,7 +2086,7 @@ async fn begin_sink_epoch(
     )
     .await;
     if result.is_ok() {
-        *current_epoch = epoch;
+        *epoch_state = SinkActorEpochState::Open(epoch);
         epoch_poisoned.store(false, Ordering::Release);
     }
     (result, retire)

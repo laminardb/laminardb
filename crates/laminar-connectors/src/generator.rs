@@ -11,18 +11,58 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::builder::BinaryBuilder;
+use arrow_array::{Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConfigKeySpec, ConnectorConfig, ConnectorInfo};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourcePosition, SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::registry::ConnectorRegistry;
+
+const GENERATOR_CHECKPOINT_CONNECTOR: &str = "generator";
+const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
+const GENERATOR_CHECKPOINT_VERSION: &str = "2";
+
+fn generator_input_channel(source_name: &str) -> Result<Vec<u8>, ConnectorError> {
+    let source_len = u32::try_from(source_name.len()).map_err(|_| {
+        ConnectorError::ConfigurationError(
+            "generator source identity exceeds the input-channel encoding limit".into(),
+        )
+    })?;
+    let mut channel = Vec::with_capacity(source_name.len() + 8);
+    channel.extend_from_slice(&source_len.to_be_bytes());
+    channel.extend_from_slice(source_name.as_bytes());
+    channel.extend_from_slice(&0_u32.to_be_bytes());
+    Ok(channel)
+}
+
+fn validate_generator_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+    match checkpoint.get_metadata("connector") {
+        Some(GENERATOR_CHECKPOINT_CONNECTOR) => {}
+        Some(connector) => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "generator checkpoint belongs to connector '{connector}'"
+            )));
+        }
+        None => {
+            return Err(ConnectorError::ConfigurationError(
+                "generator checkpoint is missing connector identity".into(),
+            ));
+        }
+    }
+    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(GENERATOR_CHECKPOINT_VERSION) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "generator checkpoint requires {CHECKPOINT_VERSION_METADATA}={GENERATOR_CHECKPOINT_VERSION}"
+        )));
+    }
+    Ok(())
+}
 
 /// Deterministic rate-limited source. See module docs.
 pub struct GeneratorSource {
@@ -30,6 +70,7 @@ pub struct GeneratorSource {
     rows_per_second: u64,
     batch_max: usize,
     max_rows: Option<u64>,
+    input_channel: Vec<u8>,
     /// Next sequence number to emit (== rows emitted so far across
     /// restarts; restored from the checkpoint).
     next_seq: u64,
@@ -80,15 +121,42 @@ impl GeneratorSource {
         )
         .map_err(|e| ConnectorError::ReadError(e.to_string()))
     }
+
+    fn build_row_positions(
+        &self,
+        start: u64,
+        n: usize,
+    ) -> Result<SourceRowPositions, ConnectorError> {
+        let mut partitions =
+            BinaryBuilder::with_capacity(n, self.input_channel.len().saturating_mul(n));
+        let mut order_keys = BinaryBuilder::with_capacity(n, 8_usize.saturating_mul(n));
+        for row in 0..n {
+            let sequence = start
+                .checked_add(u64::try_from(row).map_err(|_| {
+                    ConnectorError::Internal("generator batch row index exceeds u64".into())
+                })?)
+                .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
+            partitions.append_value(&self.input_channel);
+            order_keys.append_value(sequence.to_be_bytes());
+        }
+        SourceRowPositions::try_new(
+            partitions.finish(),
+            order_keys.finish(),
+            UInt32Array::from(vec![0; n]),
+        )
+    }
 }
 
 impl Default for GeneratorSource {
     fn default() -> Self {
+        let input_channel = generator_input_channel("generator")
+            .expect("the built-in generator source identity is valid");
         Self {
             schema: Self::generator_schema(),
             rows_per_second: 1000,
             batch_max: 1024,
             max_rows: None,
+            input_channel,
             next_seq: 0,
             anchor: None,
         }
@@ -98,14 +166,22 @@ impl Default for GeneratorSource {
 #[async_trait]
 impl SourceConnector for GeneratorSource {
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(
-            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton)
-                .with_exact_delivery_certification(),
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
         )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        .with_exact_delivery_certification())
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        let source_name = config
+            .get("laminar.source.name")
+            .filter(|name| !name.is_empty())
+            .unwrap_or("generator");
+        self.input_channel = generator_input_channel(source_name)?;
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -125,6 +201,12 @@ impl SourceConnector for GeneratorSource {
                 attempt,
                 checkpoint,
             } => {
+                validate_generator_checkpoint(&checkpoint)?;
+                if checkpoint.input_channels() != Some(std::slice::from_ref(&self.input_channel)) {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "generator checkpoint {attempt:?} has the wrong input-channel inventory"
+                    )));
+                }
                 let seq = checkpoint.get_offset("seq").ok_or_else(|| {
                     ConnectorError::ConfigurationError(format!(
                         "generator checkpoint {attempt:?} is missing required 'seq' offset"
@@ -168,8 +250,14 @@ impl SourceConnector for GeneratorSource {
             return Ok(None);
         }
         let batch = self.build_batch(self.next_seq, n)?;
-        self.next_seq += n as u64;
-        Ok(Some(SourceBatch::new(batch)))
+        let row_positions = self.build_row_positions(self.next_seq, n)?;
+        self.next_seq =
+            self.next_seq
+                .checked_add(u64::try_from(n).map_err(|_| {
+                    ConnectorError::Internal("generator batch size exceeds u64".into())
+                })?)
+                .ok_or_else(|| ConnectorError::Internal("generator sequence overflow".into()))?;
+        Ok(Some(SourceBatch::positioned(batch, row_positions)?))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -179,6 +267,10 @@ impl SourceConnector for GeneratorSource {
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new();
         cp.set_offset("seq", self.next_seq.to_string());
+        cp.set_metadata("connector", GENERATOR_CHECKPOINT_CONNECTOR);
+        cp.set_metadata(CHECKPOINT_VERSION_METADATA, GENERATOR_CHECKPOINT_VERSION);
+        cp.set_input_channels(vec![self.input_channel.clone()])
+            .expect("the cached generator input-channel identity is valid");
         cp
     }
 
@@ -187,8 +279,7 @@ impl SourceConnector for GeneratorSource {
     }
 }
 
-/// Registers the generator source so
-/// `CREATE SOURCE ... WITH (connector = 'generator')` resolves.
+/// Registers the generator source so `CREATE SOURCE ... FROM GENERATOR (...)` resolves.
 ///
 /// # Errors
 ///
@@ -223,7 +314,7 @@ pub fn register_generator_source(registry: &ConnectorRegistry) -> Result<(), Con
 mod tests {
     use super::*;
     use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
-    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     fn start_request(config: ConnectorConfig, position: SourcePosition) -> SourceStart {
         SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).unwrap()
@@ -237,7 +328,33 @@ mod tests {
             .expect("static generator contract");
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert_eq!(
+            contract.row_positions,
+            SourceRowPositionCapability::OrderedDeterministic
+        );
         assert!(contract.is_exact_delivery_certified());
+    }
+
+    #[test]
+    fn row_positions_bind_source_partition_and_sequence() {
+        let mut source = GeneratorSource::default();
+        source.input_channel = generator_input_channel("prices").unwrap();
+        let positions = source.build_row_positions(7, 2).unwrap();
+        let checkpoint = source.checkpoint();
+        let expected_channel = positions.partition().value(0).to_vec();
+
+        assert_eq!(&positions.partition().value(0)[4..10], b"prices");
+        assert_eq!(
+            positions.partition().value(0),
+            positions.partition().value(1)
+        );
+        assert_eq!(positions.order_key().value(0), 7_u64.to_be_bytes());
+        assert_eq!(positions.order_key().value(1), 8_u64.to_be_bytes());
+        assert_eq!(positions.sub_offset().values(), &[0, 0]);
+        assert_eq!(
+            checkpoint.input_channels(),
+            Some(std::slice::from_ref(&expected_channel))
+        );
     }
 
     #[tokio::test]
@@ -258,6 +375,14 @@ mod tests {
         // Restore a fresh instance from a's checkpoint at seq=8 and
         // verify the next rows equal what `a` produces next.
         let cp = a.checkpoint();
+        assert_eq!(
+            cp.get_metadata("connector"),
+            Some(GENERATOR_CHECKPOINT_CONNECTOR)
+        );
+        assert_eq!(
+            cp.get_metadata(CHECKPOINT_VERSION_METADATA),
+            Some(GENERATOR_CHECKPOINT_VERSION)
+        );
         let mut b = GeneratorSource::default();
         b.start(start_request(
             config,
@@ -293,7 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_resume_fails_before_rate_anchor() {
-        let mut checkpoint = SourceCheckpoint::new();
+        let mut checkpoint = GeneratorSource::default().checkpoint();
         checkpoint.set_offset("seq", "not-a-sequence");
         let mut source = GeneratorSource::default();
         let error = source
@@ -311,11 +436,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_rejects_wrong_checkpoint_identity_or_version() {
+        for (connector, version, expected) in [
+            (
+                "files",
+                GENERATOR_CHECKPOINT_VERSION,
+                "belongs to connector 'files'",
+            ),
+            (
+                GENERATOR_CHECKPOINT_CONNECTOR,
+                "1",
+                "requires checkpoint.version=2",
+            ),
+        ] {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("seq", "8");
+            checkpoint.set_metadata("connector", connector);
+            checkpoint.set_metadata(CHECKPOINT_VERSION_METADATA, version);
+
+            let mut source = GeneratorSource::default();
+            let error = source
+                .start(start_request(
+                    ConnectorConfig::new("generator"),
+                    SourcePosition::Resume {
+                        attempt: CheckpointAttempt::canonical(7),
+                        checkpoint,
+                    },
+                ))
+                .await
+                .expect_err("non-current generator checkpoint must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(source.anchor.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn resume_at_finite_end_remains_exhausted() {
         let mut config = ConnectorConfig::new("generator");
         config.set("rows.per.second", "1000000");
         config.set("max.rows", "8");
-        let mut checkpoint = SourceCheckpoint::new();
+        let mut checkpoint = GeneratorSource::default().checkpoint();
         checkpoint.set_offset("seq", "8");
         let mut source = GeneratorSource::default();
         source

@@ -109,10 +109,10 @@ async fn websocket_source_decodes_nested_json_into_materialized_view() {
         "CREATE SOURCE feed (\
             id BIGINT, kind TEXT, region TEXT, status TEXT, tags ARRAY<TEXT>\
          ) FROM WEBSOCKET (\
-            url = 'ws://127.0.0.1:{port}', format = 'json', \
+            url = 'ws://127.0.0.1:{port}', \
             'json.column.region' = 'meta.region', \
             'json.column.status' = 'meta.status', \
-            'json.column.tags'   = 'tags')"
+            'json.column.tags'   = 'tags') FORMAT JSON"
     ))
     .await
     .unwrap();
@@ -178,9 +178,9 @@ async fn websocket_event_time_uses_typed_json_and_sql_watermark() {
             id BIGINT, ts TIMESTAMP,
             WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
          ) FROM WEBSOCKET (
-            url = 'ws://127.0.0.1:{port}', format = 'json',
+            url = 'ws://127.0.0.1:{port}',
             'json.column.ts' = 'meta.time_us',
-            'json.column.ts.epoch_unit' = 'micros')"
+            'json.column.ts.epoch_unit' = 'micros') FORMAT JSON"
     ))
     .await
     .unwrap();
@@ -245,14 +245,15 @@ async fn websocket_removed_event_time_options_fail_before_network_io() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let db = LaminarDB::open().unwrap();
-        db.execute(&format!(
-            "CREATE SOURCE rejected_{key_suffix} (id BIGINT, ts TIMESTAMP) \
+        let error = db
+            .execute(&format!(
+                "CREATE SOURCE rejected_{key_suffix} (id BIGINT, ts TIMESTAMP) \
              FROM WEBSOCKET (url = 'ws://127.0.0.1:{port}', '{key}' = '{value}')",
-            key_suffix = key.replace('.', "_")
-        ))
-        .await
-        .unwrap();
-        let error = db.start().await.unwrap_err().to_string();
+                key_suffix = key.replace('.', "_")
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
         let connection = tokio::time::timeout(Duration::from_millis(250), listener.accept()).await;
         db.shutdown().await.unwrap();
 

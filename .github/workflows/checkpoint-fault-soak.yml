@@ -60,9 +60,14 @@ jobs:
 
       - name: Kill and restart exact single-node source/state recovery
         # `cluster` compiles the debug-only checkpoint kill gate; runtime mode remains `single`.
-        run: cargo test --profile soak -p laminar-server --no-default-features --features cluster --test cluster_soak local_exact_source_state_kill9_soak -- --ignored --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile soak -p laminar-server --no-default-features --features cluster --test cluster_soak "$SOAK_TEST" -- --ignored --exact --nocapture --color never 2>&1 | tee local-exact-soak.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' local-exact-soak.log
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          SOAK_TEST: local_exact_source_state_kill9_soak
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
@@ -73,18 +78,62 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: local-exact-kill9-logs
-          path: target/tmp/**/soak-local-exact-*/*.log
+          path: |
+            local-exact-soak.log
+            target/tmp/**/soak-local-exact-*/*.log
           if-no-files-found: warn
           retention-days: 14
 
-  cluster-kill9:
-    name: Three-node cluster kill-9 soak (${{ matrix.discovery }})
+  join-validity:
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        discovery: [gossip, static]
+        include:
+          - label: Single-node ALO stateful joins
+            test: single_node_alo_join_kill9_soak
+            features: cluster,kafka
+            delivery: alo
+            topology: single
+            discovery: gossip
+            emulator: "0"
+          - label: Single-node EO stateful joins
+            test: single_node_eo_join_kill9_soak
+            features: cluster,kafka,delta-lake-s3
+            delivery: eo
+            topology: single
+            discovery: gossip
+            emulator: "1"
+          - label: Cluster ALO stateful joins (gossip)
+            test: three_node_alo_join_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster
+            discovery: gossip
+            emulator: "0"
+          - label: Cluster ALO stateful joins (static)
+            test: three_node_alo_join_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster
+            discovery: static
+            emulator: "0"
+          - label: Cluster EO stateful joins (gossip)
+            test: three_node_eo_join_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster
+            discovery: gossip
+            emulator: "1"
+          - label: Cluster EO stateful joins (static)
+            test: three_node_eo_join_kill9_soak
+            features: cluster,aws,kafka,delta-lake-s3
+            delivery: eo
+            topology: cluster
+            discovery: static
+            emulator: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -102,7 +151,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: checkpoint-cluster-kill9-${{ matrix.discovery }}
+          key: checkpoint-join-${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
@@ -114,35 +163,53 @@ jobs:
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
 
       - name: Verify Kafka global source handoff
-        if: matrix.discovery == 'static'
+        if: matrix.discovery == 'static' && matrix.delivery == 'alo'
         run: cargo test --profile soak -p laminar-connectors --no-default-features --features "kafka,testing" --test kafka_global_drain -- --nocapture
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           LAMINAR_KAFKA_BROKERS: 127.0.0.1:19092
 
-      - name: Kill leader and followers during in-flight checkpoints
-        run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka" --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
+      - name: Run stateful join validity soak
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile soak -p laminar-server --no-default-features --features "$SOAK_FEATURES" --test cluster_soak "$SOAK_TEST" -- --ignored --exact --nocapture --color never 2>&1 | tee join-soak.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' join-soak.log
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          SOAK_FEATURES: ${{ matrix.features }}
+          SOAK_TEST: ${{ matrix.test }}
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
+          LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
+          LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
+          LAMINAR_SOAK_JOIN_KEYS: "65536"
+          LAMINAR_SOAK_ZIPF_MILLI: "800"
+          LAMINAR_SOAK_RPS: "400"
+          LAMINAR_SOAK_HOT_P50_MS: "5"
+          LAMINAR_SOAK_HOT_P95_MS: "10"
+          LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
+          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
-          LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/kill9-${{ matrix.discovery }}/checkpoints
-          LAMINAR_SOAK_STATE_URL: s3://laminardb-soak/${{ github.run_id }}/kill9-${{ matrix.discovery }}/state
+          LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}/checkpoints
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
           LAMINAR_SOAK_S3_ACCESS_KEY: laminar
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret
           LAMINAR_SOAK_S3_REGION: us-east-1
+          LAMINAR_SOAK_DELTA_BUCKET: laminardb-soak
+          LAMINAR_SOAK_ALLOW_S3_EMULATOR: ${{ matrix.emulator }}
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
 
-      - name: Upload cluster node logs
+      - name: Upload join soak logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cluster-kill9-${{ matrix.discovery }}-logs
-          path: target/tmp/**/soak-*/*.log
+          name: join-${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}-logs
+          path: |
+            join-soak.log
+            target/tmp/**/soak-*/*.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -195,17 +262,29 @@ jobs:
             'mc alias set local http://127.0.0.1:19000 laminar laminar-test-secret && mc mb --ignore-existing local/laminardb-soak'
 
       - name: Inject a fatal pipeline cycle fault on the ${{ matrix.role }}
-        run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka" --test cluster_soak three_node_kill9_soak -- --ignored --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka" --test cluster_soak "$SOAK_TEST" -- --ignored --exact --nocapture --color never 2>&1 | tee coordinated-recovery-soak.log
+          grep -Eq '^test result: ok\. 1 passed; 0 failed;' coordinated-recovery-soak.log
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          SOAK_TEST: three_node_alo_join_kill9_soak
           LAMINAR_SOAK_KILLS: "0"
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
+          LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
+          LAMINAR_SOAK_JOIN_KEYS: "65536"
+          LAMINAR_SOAK_ZIPF_MILLI: "800"
+          LAMINAR_SOAK_RPS: "400"
+          LAMINAR_SOAK_HOT_P50_MS: "5"
+          LAMINAR_SOAK_HOT_P95_MS: "10"
+          LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
+          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
           LAMINAR_SOAK_FAULT_INJECT_ROLE: ${{ matrix.role }}
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}-${{ matrix.discovery }}/checkpoints
-          LAMINAR_SOAK_STATE_URL: s3://laminardb-soak/${{ github.run_id }}/recovery-${{ matrix.role }}-${{ matrix.discovery }}/state
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
           LAMINAR_SOAK_S3_ACCESS_KEY: laminar
           LAMINAR_SOAK_S3_SECRET_KEY: laminar-test-secret
@@ -217,7 +296,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cluster-recovery-${{ matrix.role }}-${{ matrix.discovery }}-logs
-          path: target/tmp/**/soak-*/*.log
+          path: |
+            coordinated-recovery-soak.log
+            target/tmp/**/soak-*/*.log
           if-no-files-found: warn
           retention-days: 14
 

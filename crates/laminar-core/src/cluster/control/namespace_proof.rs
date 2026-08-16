@@ -10,21 +10,20 @@ use super::ClusterKv;
 use crate::checkpoint::{CheckpointParticipant, MAX_CHECKPOINT_PARTICIPANTS};
 use crate::cluster::discovery::NodeId;
 
-const NAMESPACE_PROOF_KEY: &str = "control:shared-namespace-proof-v1";
+const NAMESPACE_PROOF_KEY: &str = "control:shared-checkpoint-namespace-proof-v1";
 const NAMESPACE_PROOF_VERSION: u8 = 1;
 const NAMESPACE_PROOF_MAX_RECORD_BYTES: usize = 512;
 const NAMESPACE_PROOF_MAX_SENTINEL_BYTES: u64 = 512;
 const NAMESPACE_PROOF_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const NAMESPACE_PROOF_READ_CONCURRENCY: usize = 16;
 
-/// Maximum time allowed for shared checkpoint/state namespace verification.
+/// Maximum time allowed for shared checkpoint namespace verification.
 pub const MAX_SHARED_NAMESPACE_PROOF_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Exact object-store handles admitted by a successful cluster namespace proof.
+/// Exact checkpoint object-store handle admitted by a successful cluster namespace proof.
 #[derive(Clone)]
 pub struct VerifiedClusterNamespaces {
     checkpoint: Arc<dyn ObjectStore>,
-    state: Arc<dyn ObjectStore>,
     local: CheckpointParticipant,
 }
 
@@ -43,12 +42,6 @@ impl VerifiedClusterNamespaces {
         Arc::clone(&self.checkpoint)
     }
 
-    /// Return the exact state store handle covered by the proof.
-    #[must_use]
-    pub fn state_store(&self) -> Arc<dyn ObjectStore> {
-        Arc::clone(&self.state)
-    }
-
     /// Return the process identity that produced this proof.
     #[must_use]
     pub const fn local_participant(&self) -> CheckpointParticipant {
@@ -56,7 +49,7 @@ impl VerifiedClusterNamespaces {
     }
 }
 
-/// Failure to establish one checkpoint/state namespace across the startup roster.
+/// Failure to establish one checkpoint namespace across the startup roster.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct NamespaceProofError {
@@ -72,13 +65,13 @@ impl NamespaceProofError {
 
     fn verification(message: &str) -> Self {
         Self {
-            message: format!("shared checkpoint/state namespace proof failed: {message}"),
+            message: format!("shared checkpoint namespace proof failed: {message}"),
         }
     }
 
     fn timeout(timeout: Duration) -> Self {
         Self {
-            message: format!("shared checkpoint/state namespace proof exceeded {timeout:?}"),
+            message: format!("shared checkpoint namespace proof exceeded {timeout:?}"),
         }
     }
 }
@@ -106,7 +99,7 @@ impl NamespaceProofRecord {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(format!(
-                "node {} published a stale or mismatched shared-namespace proof",
+                "node {} published a stale or mismatched shared checkpoint namespace proof",
                 participant.node_id
             ));
         }
@@ -114,26 +107,11 @@ impl NamespaceProofRecord {
     }
 }
 
-#[derive(Clone, Copy)]
-enum NamespaceProofStore {
-    Checkpoint,
-    State,
-}
-
-impl NamespaceProofStore {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Checkpoint => "checkpoint",
-            Self::State => "state",
-        }
-    }
-}
-
 fn namespace_proof_roster_sha256(participants: &[CheckpointParticipant]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut hash = Sha256::new();
-    hash.update(b"LAMINAR_SHARED_NAMESPACE_ROSTER_V1\0");
+    hash.update(b"LAMINAR_SHARED_CHECKPOINT_NAMESPACE_ROSTER_V1\0");
     hash.update(
         u64::try_from(participants.len())
             .unwrap_or(u64::MAX)
@@ -152,82 +130,66 @@ fn namespace_proof_roster_sha256(participants: &[CheckpointParticipant]) -> Stri
     encoded
 }
 
-fn namespace_proof_path(store: NamespaceProofStore, node_id: u64) -> object_store::path::Path {
+fn namespace_proof_path(node_id: u64) -> object_store::path::Path {
     object_store::path::Path::from(format!(
-        "cluster-namespace-proof/v1/{}/node={node_id}/sentinel",
-        store.name()
+        "cluster-checkpoint-namespace-proof/v1/node={node_id}/sentinel"
     ))
 }
 
-fn namespace_proof_sentinel(
-    store: NamespaceProofStore,
-    record: &NamespaceProofRecord,
-) -> bytes::Bytes {
+fn namespace_proof_sentinel(record: &NamespaceProofRecord) -> bytes::Bytes {
     bytes::Bytes::from(format!(
-        "LAMINAR_SHARED_NAMESPACE_V1\n{}\n{}\n{}\n{}\n{}\n",
-        store.name(),
-        record.node_id,
-        record.boot_incarnation,
-        record.nonce,
-        record.roster_sha256
+        "LAMINAR_SHARED_CHECKPOINT_NAMESPACE_V1\n{}\n{}\n{}\n{}\n",
+        record.node_id, record.boot_incarnation, record.nonce, record.roster_sha256
     ))
 }
 
 async fn write_namespace_proof_sentinel(
     object_store: &Arc<dyn ObjectStore>,
-    store: NamespaceProofStore,
     record: &NamespaceProofRecord,
 ) -> Result<(), String> {
-    let payload = namespace_proof_sentinel(store, record);
+    let payload = namespace_proof_sentinel(record);
     if u64::try_from(payload.len()).unwrap_or(u64::MAX) > NAMESPACE_PROOF_MAX_SENTINEL_BYTES {
-        return Err("shared-namespace sentinel exceeds its fixed size bound".into());
+        return Err("shared checkpoint namespace sentinel exceeds its fixed size bound".into());
     }
     object_store
         .put(
-            &namespace_proof_path(store, record.node_id),
+            &namespace_proof_path(record.node_id),
             object_store::PutPayload::from(payload),
         )
         .await
         .map(|_| ())
-        .map_err(|error| format!("write {} namespace sentinel: {error}", store.name()))
+        .map_err(|error| format!("write checkpoint namespace sentinel: {error}"))
 }
 
 async fn read_namespace_proof_sentinel(
     object_store: &Arc<dyn ObjectStore>,
-    store: NamespaceProofStore,
     record: &NamespaceProofRecord,
 ) -> Result<(), String> {
     let result = object_store
-        .get(&namespace_proof_path(store, record.node_id))
+        .get(&namespace_proof_path(record.node_id))
         .await
         .map_err(|error| {
             format!(
-                "read node {} {} namespace sentinel: {error}",
-                record.node_id,
-                store.name()
+                "read node {} checkpoint namespace sentinel: {error}",
+                record.node_id
             )
         })?;
     if result.meta.size == 0 || result.meta.size > NAMESPACE_PROOF_MAX_SENTINEL_BYTES {
         return Err(format!(
-            "node {} {} namespace sentinel is {} bytes; maximum is {}",
-            record.node_id,
-            store.name(),
-            result.meta.size,
-            NAMESPACE_PROOF_MAX_SENTINEL_BYTES
+            "node {} checkpoint namespace sentinel is {} bytes; maximum is {}",
+            record.node_id, result.meta.size, NAMESPACE_PROOF_MAX_SENTINEL_BYTES
         ));
     }
     let bytes = result.bytes().await.map_err(|error| {
         format!(
-            "read node {} {} namespace sentinel body: {error}",
-            record.node_id,
-            store.name()
+            "read node {} checkpoint namespace sentinel body: {error}",
+            record.node_id
         )
     })?;
-    if bytes != namespace_proof_sentinel(store, record) {
+    if bytes != namespace_proof_sentinel(record) {
         return Err(format!(
-            "node {} {} namespace sentinel does not match its boot proof",
-            record.node_id,
-            store.name()
+            "node {} checkpoint namespace sentinel does not match its boot proof",
+            record.node_id
         ));
     }
     Ok(())
@@ -236,7 +198,6 @@ async fn read_namespace_proof_sentinel(
 async fn verify_namespace_proof_visibility(
     control: &Arc<dyn ClusterKv>,
     checkpoint_store: &Arc<dyn ObjectStore>,
-    state_store: &Arc<dyn ObjectStore>,
     participants: &[CheckpointParticipant],
     local: CheckpointParticipant,
     roster_sha256: &str,
@@ -248,34 +209,29 @@ async fn verify_namespace_proof_visibility(
                 .await?
                 .ok_or_else(|| {
                     format!(
-                        "node {} has not published its shared-namespace proof",
+                        "node {} has not published its shared checkpoint namespace proof",
                         participant.node_id
                     )
                 })?;
             if encoded.len() > NAMESPACE_PROOF_MAX_RECORD_BYTES {
                 return Err(format!(
-                    "node {} shared-namespace proof exceeds {} bytes",
+                    "node {} shared checkpoint namespace proof exceeds {} bytes",
                     participant.node_id, NAMESPACE_PROOF_MAX_RECORD_BYTES
                 ));
             }
             let record: NamespaceProofRecord = serde_json::from_str(&encoded).map_err(|error| {
                 format!(
-                    "decode node {} shared-namespace proof: {error}",
+                    "decode node {} shared checkpoint namespace proof: {error}",
                     participant.node_id
                 )
             })?;
             record.validate_identity(participant)?;
             if participant == local && record.roster_sha256 != roster_sha256 {
-                return Err("local shared-namespace proof has the wrong startup roster".into());
+                return Err(
+                    "local shared checkpoint namespace proof has the wrong startup roster".into(),
+                );
             }
-            tokio::try_join!(
-                read_namespace_proof_sentinel(
-                    checkpoint_store,
-                    NamespaceProofStore::Checkpoint,
-                    &record,
-                ),
-                read_namespace_proof_sentinel(state_store, NamespaceProofStore::State, &record),
-            )?;
+            read_namespace_proof_sentinel(checkpoint_store, &record).await?;
             Ok::<_, String>(())
         })
         .buffer_unordered(NAMESPACE_PROOF_READ_CONCURRENCY);
@@ -289,7 +245,6 @@ async fn verify_namespace_proof_visibility(
 async fn wait_for_namespace_proof_visibility(
     control: &Arc<dyn ClusterKv>,
     checkpoint_store: &Arc<dyn ObjectStore>,
-    state_store: &Arc<dyn ObjectStore>,
     participants: &[CheckpointParticipant],
     local: CheckpointParticipant,
     roster_sha256: &str,
@@ -300,7 +255,7 @@ async fn wait_for_namespace_proof_visibility(
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "shared-namespace peer visibility timed out: {last_failure}"
+                "shared checkpoint namespace peer visibility timed out: {last_failure}"
             ));
         }
         match tokio::time::timeout(
@@ -308,7 +263,6 @@ async fn wait_for_namespace_proof_visibility(
             verify_namespace_proof_visibility(
                 control,
                 checkpoint_store,
-                state_store,
                 participants,
                 local,
                 roster_sha256,
@@ -320,7 +274,7 @@ async fn wait_for_namespace_proof_visibility(
             Ok(Err(error)) => last_failure = error,
             Err(_) => {
                 return Err(format!(
-                    "shared-namespace peer visibility timed out: {last_failure}"
+                    "shared checkpoint namespace peer visibility timed out: {last_failure}"
                 ));
             }
         }
@@ -332,8 +286,8 @@ async fn wait_for_namespace_proof_visibility(
     }
 }
 
-/// Prove that the local process can read every startup participant's retained checkpoint and
-/// state sentinel through its candidate object-store handles.
+/// Prove that the local process can read every startup participant's retained checkpoint
+/// sentinel through its candidate object-store handle.
 ///
 /// # Errors
 ///
@@ -343,7 +297,6 @@ pub async fn prove_shared_object_store_namespaces(
     participants: &[CheckpointParticipant],
     control: Arc<dyn ClusterKv>,
     checkpoint_store: Arc<dyn ObjectStore>,
-    state_store: Arc<dyn ObjectStore>,
     timeout: Duration,
 ) -> Result<VerifiedClusterNamespaces, NamespaceProofError> {
     if participants.is_empty()
@@ -361,13 +314,13 @@ pub async fn prove_shared_object_store_namespaces(
             != 1
     {
         return Err(NamespaceProofError::configuration(
-            "shared-namespace proof requires one canonical exact startup roster",
+            "shared checkpoint namespace proof requires one canonical exact startup roster",
         ));
     }
     let timeout = timeout.min(MAX_SHARED_NAMESPACE_PROOF_TIMEOUT);
     if timeout.is_zero() {
         return Err(NamespaceProofError::configuration(
-            "shared-namespace proof timeout is zero",
+            "shared checkpoint namespace proof timeout is zero",
         ));
     }
     let roster_sha256 = namespace_proof_roster_sha256(participants);
@@ -380,23 +333,17 @@ pub async fn prove_shared_object_store_namespaces(
     };
     let deadline = tokio::time::Instant::now() + timeout;
     let proof = async {
-        tokio::try_join!(
-            write_namespace_proof_sentinel(
-                &checkpoint_store,
-                NamespaceProofStore::Checkpoint,
-                &record,
-            ),
-            write_namespace_proof_sentinel(&state_store, NamespaceProofStore::State, &record),
-        )?;
+        write_namespace_proof_sentinel(&checkpoint_store, &record).await?;
         let encoded = serde_json::to_string(&record).map_err(|error| error.to_string())?;
         if encoded.len() > NAMESPACE_PROOF_MAX_RECORD_BYTES {
-            return Err("local shared-namespace proof exceeds its size bound".to_string());
+            return Err(
+                "local shared checkpoint namespace proof exceeds its size bound".to_string(),
+            );
         }
         control.write_checked(NAMESPACE_PROOF_KEY, encoded).await?;
         wait_for_namespace_proof_visibility(
             &control,
             &checkpoint_store,
-            &state_store,
             participants,
             local,
             &roster_sha256,
@@ -407,7 +354,6 @@ pub async fn prove_shared_object_store_namespaces(
     match tokio::time::timeout(timeout, proof).await {
         Ok(Ok(())) => Ok(VerifiedClusterNamespaces {
             checkpoint: checkpoint_store,
-            state: state_store,
             local,
         }),
         Ok(Err(error)) => Err(NamespaceProofError::verification(&error)),
@@ -483,7 +429,6 @@ mod tests {
         participants: &[CheckpointParticipant; 2],
         controls: &[Arc<dyn ClusterKv>; 2],
         checkpoint_stores: [Arc<dyn ObjectStore>; 2],
-        state_stores: [Arc<dyn ObjectStore>; 2],
         timeout: Duration,
     ) -> [Result<VerifiedClusterNamespaces, NamespaceProofError>; 2] {
         let first = prove_shared_object_store_namespaces(
@@ -491,7 +436,6 @@ mod tests {
             participants,
             Arc::clone(&controls[0]),
             Arc::clone(&checkpoint_stores[0]),
-            Arc::clone(&state_stores[0]),
             timeout,
         );
         let second = prove_shared_object_store_namespaces(
@@ -499,16 +443,14 @@ mod tests {
             participants,
             Arc::clone(&controls[1]),
             Arc::clone(&checkpoint_stores[1]),
-            Arc::clone(&state_stores[1]),
             timeout,
         );
         let (first, second) = tokio::join!(first, second);
         [first, second]
     }
 
-    async fn marker_count(store: &Arc<dyn ObjectStore>, role: NamespaceProofStore) -> usize {
-        let prefix =
-            object_store::path::Path::from(format!("cluster-namespace-proof/v1/{}/", role.name()));
+    async fn marker_count(store: &Arc<dyn ObjectStore>) -> usize {
+        let prefix = object_store::path::Path::from("cluster-checkpoint-namespace-proof/v1/");
         let mut entries = store.list(Some(&prefix));
         let mut count = 0;
         while let Some(entry) = entries.next().await {
@@ -519,16 +461,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proof_retains_bounded_markers_and_exact_handles() {
+    async fn proof_retains_bounded_markers_and_exact_handle() {
         let checkpoint: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let state: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let participants = participants();
         let controls = controls();
         let results = run_two_node_proof(
             &participants,
             &controls,
             [Arc::clone(&checkpoint), Arc::clone(&checkpoint)],
-            [Arc::clone(&state), Arc::clone(&state)],
             Duration::from_secs(2),
         )
         .await;
@@ -536,33 +476,25 @@ mod tests {
 
         let admitted = results[0].as_ref().unwrap();
         assert!(Arc::ptr_eq(&admitted.checkpoint_store(), &checkpoint));
-        assert!(Arc::ptr_eq(&admitted.state_store(), &state));
         assert_eq!(admitted.local_participant(), participants[0]);
         for node_id in [1, 2] {
-            for (store, role) in [
-                (&checkpoint, NamespaceProofStore::Checkpoint),
-                (&state, NamespaceProofStore::State),
-            ] {
-                let marker = store
-                    .get(&namespace_proof_path(role, node_id))
-                    .await
-                    .expect("boot marker must remain available to rolling joiners");
-                assert!(marker.meta.size <= NAMESPACE_PROOF_MAX_SENTINEL_BYTES);
-            }
+            let marker = checkpoint
+                .get(&namespace_proof_path(node_id))
+                .await
+                .expect("boot marker must remain available to rolling joiners");
+            assert!(marker.meta.size <= NAMESPACE_PROOF_MAX_SENTINEL_BYTES);
         }
     }
 
     #[tokio::test]
     async fn rolling_restart_uses_active_peers_retained_markers() {
         let checkpoint: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let state: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let initial = participants();
         let controls = controls();
         let results = run_two_node_proof(
             &initial,
             &controls,
             [Arc::clone(&checkpoint), Arc::clone(&checkpoint)],
-            [Arc::clone(&state), Arc::clone(&state)],
             Duration::from_secs(2),
         )
         .await;
@@ -584,7 +516,6 @@ mod tests {
             &restarted,
             Arc::clone(&controls[0]),
             Arc::clone(&checkpoint),
-            Arc::clone(&state),
             Duration::from_secs(1),
         )
         .await
@@ -594,43 +525,19 @@ mod tests {
             Some(active_peer_record),
             "the active peer must not rerun startup for a rolling joiner"
         );
-        assert_eq!(
-            marker_count(&checkpoint, NamespaceProofStore::Checkpoint).await,
-            2
-        );
-        assert_eq!(marker_count(&state, NamespaceProofStore::State).await, 2);
-    }
-
-    #[tokio::test]
-    async fn proof_rejects_split_state_namespaces() {
-        let checkpoint: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let state_a: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let state_b: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let participants = participants();
-        let controls = controls();
-        let results = run_two_node_proof(
-            &participants,
-            &controls,
-            [Arc::clone(&checkpoint), checkpoint],
-            [state_a, state_b],
-            Duration::from_millis(250),
-        )
-        .await;
-        assert!(results.iter().all(Result::is_err));
+        assert_eq!(marker_count(&checkpoint).await, 2);
     }
 
     #[tokio::test]
     async fn proof_rejects_split_checkpoint_namespaces() {
         let checkpoint_a: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let checkpoint_b: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let state: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let participants = participants();
         let controls = controls();
         let results = run_two_node_proof(
             &participants,
             &controls,
             [checkpoint_a, checkpoint_b],
-            [Arc::clone(&state), state],
             Duration::from_millis(250),
         )
         .await;

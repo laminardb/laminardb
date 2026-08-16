@@ -15,8 +15,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency,
-    SourceContract, SourcePosition, SourceStart, SourceTopology,
+    ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceContract,
+    SourcePosition, SourceStart,
 };
 use crate::error::ConnectorError;
 
@@ -2044,9 +2044,9 @@ impl SourceConnector for PostgresCdcSource {
         } else {
             PostgresCdcConfig::from_config(config)?.validate()?;
         }
-        Ok(SourceContract::new(
-            SourceConsistency::CommitCoupled,
-            SourceTopology::Singleton,
+        Err(ConnectorError::ConfigurationError(
+            "PostgreSQL CDC emits a raw JSON change envelope; canonical primary-keyed row/delete records are required"
+                .into(),
         ))
     }
 

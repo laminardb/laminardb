@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 /// Exact process incarnation that owns one leader term.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaderProofOwner {
     /// Stable cluster node identity.
     pub node_id: u64,
@@ -23,6 +24,7 @@ impl LeaderProofOwner {
 
 /// Authority captured for one exact leader term.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaderProof {
     /// Exact process incarnation that owns the leader term.
     pub owner: LeaderProofOwner,

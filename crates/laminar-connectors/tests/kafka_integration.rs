@@ -52,6 +52,21 @@ fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
     .unwrap()
 }
 
+fn connector_start_config(
+    brokers: &str,
+    group_id: &str,
+    topic: &str,
+    source_name: &str,
+) -> ConnectorConfig {
+    let mut config = ConnectorConfig::new("kafka");
+    config.set("bootstrap.servers", brokers);
+    config.set("group.id", group_id);
+    config.set("topic", topic);
+    config.set("startup.mode", "earliest");
+    config.set("laminar.source.name", source_name);
+    config
+}
+
 async fn produce_messages(brokers: &str, topic: &str, count: usize) {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -258,9 +273,10 @@ async fn roundtrip(brokers: &str) {
 
     produce_messages(brokers, topic, n).await;
 
-    let cfg = make_config(brokers, "test-roundtrip-group", topic);
+    let group_id = "test-roundtrip-group";
+    let cfg = make_config(brokers, group_id, topic);
     let mut source = KafkaSource::new(test_schema(), cfg, None);
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config(brokers, group_id, topic, "test_roundtrip");
     source
         .start(initial_source_start(&connector_cfg))
         .await
@@ -299,9 +315,10 @@ async fn checkpoint_restore(brokers: &str) {
 
     produce_messages(brokers, topic, n).await;
 
-    let mut cfg = make_config(brokers, "test-checkpoint-group", topic);
+    let group_id = "test-checkpoint-group";
+    let mut cfg = make_config(brokers, group_id, topic);
     cfg.startup_mode = laminar_connectors::kafka::StartupMode::Earliest;
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config(brokers, group_id, topic, "test_checkpoint");
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source
@@ -327,7 +344,7 @@ async fn checkpoint_restore(brokers: &str) {
             SourceStart::new(
                 connector_cfg.clone(),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: before_first_record,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -354,7 +371,7 @@ async fn checkpoint_restore(brokers: &str) {
             SourceStart::new(
                 connector_cfg,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint: checkpoint.clone(),
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -385,9 +402,9 @@ async fn checkpoint_restore(brokers: &str) {
     let error = changed
         .start(
             SourceStart::new(
-                ConnectorConfig::new("kafka"),
+                connector_start_config(brokers, group_id, topic, "test_checkpoint"),
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(1, 1),
                     checkpoint,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -429,13 +446,14 @@ async fn poison_pill(brokers: &str) {
             .expect("send failed");
     }
 
+    let group_id = "test-poison-group";
     let cfg = KafkaSourceConfig {
         max_deser_error_rate: 0.5,
-        ..make_config(brokers, "test-poison-group", topic)
+        ..make_config(brokers, group_id, topic)
     };
 
     let mut source = KafkaSource::new(test_schema(), cfg, None);
-    let connector_cfg = ConnectorConfig::new("kafka");
+    let connector_cfg = connector_start_config(brokers, group_id, topic, "test_poison");
     source
         .start(initial_source_start(&connector_cfg))
         .await

@@ -131,10 +131,6 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.persistence.state.enabled }}
-            - name: state
-              mountPath: /var/lib/laminardb/state
-            {{- end }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
             {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
@@ -151,15 +147,6 @@ spec:
             name: {{ include "laminardb.fullname" . }}
         - name: tmp
           emptyDir: {}
-        {{- if and .Values.persistence.state.enabled .Values.persistence.state.useEmptyDir }}
-        # PVC mode supplies `state` via volumeClaimTemplates; the ephemeral
-        # path needs an explicit emptyDir here instead.
-        - name: state
-          emptyDir:
-            {{- if .Values.persistence.state.emptyDirMedium }}
-            medium: {{ .Values.persistence.state.emptyDirMedium }}
-            {{- end }}
-        {{- end }}
         {{- if not .Values.persistence.checkpoints.enabled }}
         # Volatile fallback so the file:// checkpoint path stays writable.
         - name: checkpoints
@@ -189,23 +176,8 @@ spec:
       topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if .Values.persistence.checkpoints.enabled }}
   volumeClaimTemplates:
-    {{- if and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir) }}
-    - metadata:
-        name: state
-        labels:
-          {{- include "laminardb.selectorLabels" . | nindent 10 }}
-      spec:
-        accessModes:
-          {{- toYaml .Values.persistence.state.accessModes | nindent 10 }}
-        {{- if .Values.persistence.state.storageClass }}
-        storageClassName: {{ .Values.persistence.state.storageClass | quote }}
-        {{- end }}
-        resources:
-          requests:
-            storage: {{ .Values.persistence.state.size }}
-    {{- end }}
-    {{- if .Values.persistence.checkpoints.enabled }}
     - metadata:
         name: checkpoints
         labels:
@@ -219,5 +191,5 @@ spec:
         resources:
           requests:
             storage: {{ .Values.persistence.checkpoints.size }}
-    {{- end }}
+  {{- end }}
 {{- end }}

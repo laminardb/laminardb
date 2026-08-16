@@ -12,9 +12,6 @@ bind = "127.0.0.1:8080"
 # but the end-to-end pipeline does not claim replay or exactly-once delivery.
 delivery = "best_effort"
 
-[state]
-backend = "in_process"
-
 [checkpoint]
 interval = "30s"
 

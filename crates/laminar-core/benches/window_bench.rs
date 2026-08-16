@@ -3,6 +3,7 @@
 //! Run with: cargo bench --bench window_bench
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use laminar_core::operator::sliding_window::SlidingWindowAssigner;
 use laminar_core::operator::window::{TumblingWindowAssigner, WindowId};
 use std::hint::black_box;
 
@@ -56,10 +57,31 @@ fn bench_window_assign_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_hopping_assign(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hopping_window_assign");
+    for fanout in [1_u64, 4, 16, 64, 128] {
+        let assigner =
+            SlidingWindowAssigner::from_millis(i64::try_from(fanout * 1_000).unwrap(), 1_000);
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::from_parameter(fanout), &fanout, |b, _| {
+            b.iter(|| {
+                for window in assigner
+                    .try_iter_windows(black_box(1_704_067_200_123))
+                    .unwrap()
+                {
+                    black_box(window);
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_window_assign,
     bench_window_id_key,
     bench_window_assign_batch,
+    bench_hopping_assign,
 );
 criterion_main!(benches);

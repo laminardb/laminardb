@@ -13,7 +13,7 @@ Unified database facade for LaminarDB. The main entry point that wires the SQL p
 - **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump.
 - **`CheckpointCoordinator`** -- Seals source/operator state, records the exact durable decision, and hands coordinated external publication to the designated committer.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
-- **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
+- **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Cluster`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
 - **`DbError`** -- Structured error type with stable `LDB-NNNN` codes.
 
@@ -47,18 +47,8 @@ laminar-db
 | `files` | File source (AutoLoader) and sink (rolling files) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `otel` | OpenTelemetry OTLP/gRPC source |
-| `cluster` | Pre-production distributed mode (gRPC control plane and gossip/static discovery; at-least-once only). |
+| `cluster` | Distributed mode with gRPC control plane, vnode state, and gossip/static discovery; ALO plus capability-gated EO. |
 | `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |
-
-## Internal Architecture
-
-### Core SQL Operator Routing
-
-The `core_window_state` module routes tumbling, hopping, and session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path. Detection is lazy on the first EOWC (Emit On Window Close) cycle, and non-qualifying queries fall through to `IncrementalEowcState` or raw-batch processing.
-
-### EOWC Incremental Accumulators
-
-The `eowc_state` module provides incremental per-window accumulators that maintain running aggregation state. This avoids re-scanning all records when a window closes, instead using the pre-computed accumulator values.
 
 ## Related Crates
 

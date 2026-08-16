@@ -1,10 +1,14 @@
 //! Durable checkpoint identity, ID allocation, and immutable terminal outcomes.
 
-#[cfg(feature = "cluster")]
-use std::collections::BinaryHeap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::checkpoint::CheckpointAttempt;
+pub use crate::checkpoint::CheckpointScope;
+use crate::checkpoint::{
+    CheckpointAssignmentFence, CommittedCheckpointIndex, CommittedCheckpointRef, LeaderProof,
+    PipelineIdentity, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
+};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
@@ -12,14 +16,6 @@ use object_store::{
     GetOptions, GetRange, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
 };
-#[cfg(feature = "cluster")]
-use sha2::{Digest, Sha256};
-
-use crate::checkpoint::{
-    CheckpointAssignmentFence, ClusterRecoveryCapsule, LeaderProof, PipelineIdentity,
-    RecoveryCapsuleRef,
-};
-use crate::state::CheckpointAttempt;
 
 /// Durable checkpoint metadata store.
 pub struct CheckpointDecisionStore {
@@ -32,8 +28,8 @@ pub struct CheckpointDecisionStore {
     local_metadata_rmw_lock: Option<Arc<tokio::sync::Mutex<()>>>,
     /// Last checkpoint-ID head observed by this instance. Shared-store CAS detects stale entries.
     checkpoint_id_head: parking_lot::Mutex<Option<VersionedCheckpointIdHead>>,
-    /// Active immutable reservation block for the certified local single writer.
-    local_reservation: parking_lot::Mutex<LocalReservationState>,
+    /// IDs already covered by the current local durable reservation.
+    local_reservation: parking_lot::Mutex<LocalReservation>,
     deployment_id: tokio::sync::OnceCell<String>,
 }
 
@@ -97,16 +93,6 @@ pub enum DecisionError {
     InventoryChanged(String),
 }
 
-/// Runtime scope of a durable checkpoint outcome.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointScope {
-    /// Embedded or standalone recovery domain.
-    Local,
-    /// Multi-participant cluster recovery domain.
-    Cluster,
-}
-
 /// Irrevocable terminal verdict for one concrete checkpoint attempt.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -119,6 +105,7 @@ pub enum CheckpointVerdict {
 
 /// Single create-once terminal outcome for one epoch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointOutcome {
     /// Outcome payload format.
     pub version: u32,
@@ -134,8 +121,8 @@ pub struct CheckpointOutcome {
     pub assignment_fence: Option<CheckpointAssignmentFence>,
     /// Exact leader authority that selected a cluster outcome.
     pub leader_proof: Option<LeaderProof>,
-    /// Exact global recovery image selected by a cluster Commit.
-    pub recovery_capsule: Option<RecoveryCapsuleRef>,
+    /// Exact global recovery index selected by a Commit.
+    pub committed_checkpoint: Option<CommittedCheckpointRef>,
     /// Create-once terminal verdict.
     pub verdict: CheckpointVerdict,
 }
@@ -154,27 +141,68 @@ pub enum RecordOutcomeResult {
     },
 }
 
-/// Scalar continuity boundary for outcome retention.
-///
-/// This is not a checkpoint recovery target: it deliberately carries neither an assignment fence,
-/// leader proof, verdict, nor manifest owner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutcomeRetentionBoundary {
-    /// Outcomes below this epoch are continuity-only and their raw records may be absent.
-    pub before_epoch: u64,
-    /// Greatest committed checkpoint ID compacted below the horizon, if any.
-    pub committed_checkpoint_id: Option<u64>,
-    /// Greatest terminal epoch compacted below the horizon, including aborts.
-    pub highest_closed_epoch: Option<u64>,
+/// Exact position of a crash-resumable local checkpoint cleanup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRetentionCursor {
+    /// Recovery cut that must remain intact throughout this cleanup.
+    pub protected: CommittedCheckpointRef,
+    /// Expired cut currently being retired.
+    pub current: CommittedCheckpointRef,
+    /// Exact predecessor of `current`.
+    pub next: Option<CommittedCheckpointRef>,
+    /// Exclusive lower boundary of this cleanup.
+    pub stop_before: Option<CommittedCheckpointRef>,
 }
 
-const CHECKPOINT_OUTCOME_VERSION: u32 = 2;
-const CHECKPOINT_OUTCOME_MAX_BYTES: u64 = 64 * 1_024;
-const OUTCOME_GC_FLOOR_MAX_BYTES: u64 = 256 * 1_024;
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES: u64 = 1_024;
+/// Durable phase of local checkpoint retention.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "phase")]
+pub enum CheckpointRetentionState {
+    /// Only this recovery cut is retained and no deletion is pending.
+    Idle {
+        /// Authoritative retained recovery cut.
+        protected: CommittedCheckpointRef,
+    },
+    /// Referenced node-data objects for `current` may be deleted.
+    DeleteData {
+        /// Exact bounded cleanup position.
+        cursor: CheckpointRetentionCursor,
+    },
+    /// Node data is settled; the manifest and then index may be deleted.
+    DeleteMetadata {
+        /// Exact bounded cleanup position.
+        cursor: CheckpointRetentionCursor,
+    },
+}
+
+/// Result of a conditional retention-head transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointRetentionUpdateResult {
+    /// This call durably changed the retention head.
+    Applied(CheckpointRetentionState),
+    /// The requested state was already durable or an active cleanup must resume first.
+    Unchanged(CheckpointRetentionState),
+    /// Another writer changed the retention head.
+    Conflict {
+        /// Durable state observed after the failed transition.
+        current: Option<CheckpointRetentionState>,
+    },
+}
+
+const CHECKPOINT_OUTCOME_VERSION: u32 = 3;
+const CHECKPOINT_DECISION_HEAD_VERSION: u32 = 2;
+const CHECKPOINT_DECISION_HEAD_MAX_BYTES: u64 = 128 * 1_024;
+const CHECKPOINT_RETENTION_HEAD_VERSION: u32 = 1;
+const CHECKPOINT_RETENTION_HEAD_MAX_BYTES: u64 = 64 * 1_024;
+const ABORTED_COMMITTED_CHECKPOINT_SEAL_VERSION: u32 = 1;
+
+#[derive(Debug, serde::Serialize)]
+struct AbortedCommittedCheckpointSeal<'a> {
+    version: u32,
+    deployment_id: &'a str,
+    candidate: &'a CommittedCheckpointRef,
+}
 
 impl CheckpointOutcome {
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
@@ -228,23 +256,13 @@ impl CheckpointOutcome {
                 )));
             }
             (CheckpointScope::Cluster, Some(fence), Some(proof))
-                if fence.is_canonical()
-                    && proof.is_canonical()
-                    && fence.participant_incarnation(proof.owner.node_id)
-                        == Some(proof.owner.boot_id) => {}
+                if fence.is_canonical() && proof.is_canonical() => {}
             (CheckpointScope::Cluster, Some(fence), Some(proof))
                 if !fence.is_canonical() || !proof.is_canonical() =>
             {
                 return Err(DecisionError::Conflict(format!(
                     "cluster outcome for epoch {path_epoch} has a non-canonical assignment fence \
                      or leader proof"
-                )));
-            }
-            (CheckpointScope::Cluster, Some(_), Some(proof)) => {
-                return Err(DecisionError::Conflict(format!(
-                    "cluster outcome for epoch {path_epoch} leader node {} boot {} is absent from \
-                     the assignment fence",
-                    proof.owner.node_id, proof.owner.boot_id
                 )));
             }
             (CheckpointScope::Cluster, _, _) => {
@@ -254,32 +272,45 @@ impl CheckpointOutcome {
                 )));
             }
         }
+        if self.is_commit()
+            && self.scope == CheckpointScope::Cluster
+            && self
+                .assignment_fence
+                .as_ref()
+                .zip(self.leader_proof.as_ref())
+                .is_some_and(|(fence, proof)| {
+                    fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id)
+                })
+        {
+            return Err(DecisionError::Conflict(format!(
+                "cluster Commit for epoch {path_epoch} requires its leader proof in the assignment fence"
+            )));
+        }
 
-        match (self.scope, &self.verdict, self.recovery_capsule.as_ref()) {
-            (CheckpointScope::Local, _, None)
-            | (CheckpointScope::Cluster, CheckpointVerdict::Abort, None) => {}
-            (CheckpointScope::Cluster, CheckpointVerdict::Commit, Some(reference)) => {
+        match (&self.verdict, self.committed_checkpoint.as_ref()) {
+            (CheckpointVerdict::Commit, Some(reference)) => {
                 reference.validate().map_err(|error| {
                     DecisionError::Conflict(format!(
-                        "cluster commit outcome for epoch {path_epoch} has an invalid recovery capsule reference: {error}"
+                        "commit outcome for epoch {path_epoch} has an invalid committed checkpoint reference: {error}"
                     ))
                 })?;
+                if reference.epoch != self.epoch || reference.checkpoint_id != self.checkpoint_id {
+                    return Err(DecisionError::Conflict(format!(
+                        "commit outcome for epoch {path_epoch} names a different committed checkpoint"
+                    )));
+                }
             }
-            (CheckpointScope::Local, _, Some(_)) => {
+            (CheckpointVerdict::Commit, None) => {
                 return Err(DecisionError::Conflict(format!(
-                    "local outcome for epoch {path_epoch} cannot carry a recovery capsule"
+                    "commit outcome for epoch {path_epoch} requires a committed checkpoint reference"
                 )));
             }
-            (CheckpointScope::Cluster, CheckpointVerdict::Commit, None) => {
+            (CheckpointVerdict::Abort, Some(_)) => {
                 return Err(DecisionError::Conflict(format!(
-                    "cluster commit outcome for epoch {path_epoch} requires a recovery capsule"
+                    "abort outcome for epoch {path_epoch} cannot carry a committed checkpoint reference"
                 )));
             }
-            (CheckpointScope::Cluster, CheckpointVerdict::Abort, Some(_)) => {
-                return Err(DecisionError::Conflict(format!(
-                    "cluster abort outcome for epoch {path_epoch} cannot carry a recovery capsule"
-                )));
-            }
+            (CheckpointVerdict::Abort, None) => {}
         }
         Ok(())
     }
@@ -306,7 +337,7 @@ struct DeploymentIdentity {
     allocation_id: String,
 }
 
-const DEPLOYMENT_IDENTITY_VERSION: u32 = 2;
+const DEPLOYMENT_IDENTITY_VERSION: u32 = 3;
 const DEPLOYMENT_IDENTITY_MAX_BYTES: u64 = 1_024;
 
 /// Durable proof that every named checkpoint-committable sink may have opened this attempt.
@@ -396,129 +427,116 @@ struct VersionedCheckpointIdHead {
     update_version: UpdateVersion,
 }
 
-/// In-memory cursor within a durable immutable local ID block. A restarted process always claims
-/// a later block and therefore burns any IDs the previous process did not consume.
 #[derive(Debug, Default)]
-struct LocalReservationState {
-    initialized: bool,
-    highest_block: Option<u64>,
+struct LocalReservation {
     next_id: Option<u64>,
-    block_end: u64,
+    end: u64,
 }
 
-const LOCAL_RESERVATION_BLOCK_SIZE: u64 = 65_536;
+const LOCAL_RESERVATION_SIZE: u64 = 65_536;
 
-/// Monotonic tombstone for terminal outcomes below `before_epoch`.
-///
-/// The terminal and committed anchors are continuity metadata only. Recovery must select a live
-/// commit outcome at or above the floor rather than treating an anchor whose checkpoint artifacts
-/// may have been deleted as a recovery cut. The canonical object is advanced with compare-and-swap
-/// so concurrent retention workers cannot regress either the horizon or its anchors.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct OutcomeGcFloor {
-    version: u32,
-    deployment_id: String,
-    before_epoch: u64,
-    terminal_anchor: Option<CheckpointOutcome>,
-    committed_anchor: Option<CheckpointOutcome>,
-}
-
-const OUTCOME_GC_FLOOR_VERSION: u32 = 4;
-
-#[derive(Debug)]
-struct VersionedOutcomeGcFloor {
-    floor: OutcomeGcFloor,
-    update_version: UpdateVersion,
-}
-
-#[cfg(feature = "cluster")]
+/// Durable inventory for one checkpoint attempt that may have written artifacts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct RecoveryCapsuleGcCursor {
+pub struct CheckpointArtifactInventory {
+    /// Durable deployment incarnation that owns the artifacts.
+    pub deployment_id: String,
+    /// Logical pipeline and recovery-state ABI identity.
+    pub pipeline_identity: PipelineIdentity,
+    /// Exact canonical checkpoint attempt.
+    pub attempt: CheckpointAttempt,
+    /// Exact cluster assignment, absent for local checkpoints.
+    pub assignment_fence: Option<CheckpointAssignmentFence>,
+}
+
+impl CheckpointArtifactInventory {
+    /// Validate the canonical persisted shape.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign format or non-canonical identity.
+    pub fn validate(&self) -> Result<(), String> {
+        let deployment = uuid::Uuid::parse_str(&self.deployment_id)
+            .map_err(|error| format!("invalid deployment identity: {error}"))?;
+        if deployment.is_nil() || deployment.to_string() != self.deployment_id {
+            return Err("deployment identity must be a canonical non-nil UUID".into());
+        }
+        if !self.pipeline_identity.is_canonical() {
+            return Err("pipeline identity is not canonical".into());
+        }
+        if !self.attempt.is_canonical() {
+            return Err("checkpoint attempt is not canonical".into());
+        }
+        if self
+            .assignment_fence
+            .as_ref()
+            .is_some_and(|fence| !fence.is_canonical())
+        {
+            return Err("checkpoint assignment fence is not canonical".into());
+        }
+        Ok(())
+    }
+}
+
+/// Result of a conditional checkpoint artifact-inventory transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointArtifactInventoryUpdateResult {
+    /// This call durably changed the decision head.
+    Applied,
+    /// The exact requested state was already durable.
+    Unchanged,
+    /// Another attempt or terminal transition changed the decision head.
+    Conflict {
+        /// Active inventory observed after the failed transition.
+        current: Option<CheckpointArtifactInventory>,
+    },
+}
+
+/// Exact local recovery cursor and unresolved artifact inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDecisionHead {
+    /// Greatest terminal local outcome.
+    pub latest_terminal: Option<CheckpointOutcome>,
+    /// Greatest committed local outcome, including its exact committed-index reference.
+    pub latest_commit: Option<CheckpointOutcome>,
+    /// Exact unresolved attempt whose artifacts require a terminal decision or cleanup.
+    pub active_artifacts: Option<CheckpointArtifactInventory>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableCheckpointDecisionHead {
     version: u32,
     deployment_id: String,
-    /// Last path examined in the current pass. `None` starts a new pass from the prefix root.
-    offset: Option<String>,
+    latest_terminal: Option<CheckpointOutcome>,
+    latest_commit: Option<CheckpointOutcome>,
+    active_artifacts: Option<CheckpointArtifactInventory>,
 }
 
-#[cfg(feature = "cluster")]
-const RECOVERY_CAPSULE_GC_CURSOR_VERSION: u32 = 1;
-
-#[cfg(feature = "cluster")]
 #[derive(Debug)]
-struct RecoveryCapsuleListCandidate {
-    location: String,
-    meta: object_store::ObjectMeta,
-}
-
-#[cfg(feature = "cluster")]
-enum RecoveryCapsuleObjectWork {
-    Retained,
-    Deleted,
-    Quarantined,
-    Failed,
-}
-
-#[cfg(feature = "cluster")]
-impl PartialEq for RecoveryCapsuleListCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.location == other.location
-    }
-}
-
-#[cfg(feature = "cluster")]
-impl Eq for RecoveryCapsuleListCandidate {}
-
-#[cfg(feature = "cluster")]
-impl PartialOrd for RecoveryCapsuleListCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(feature = "cluster")]
-impl Ord for RecoveryCapsuleListCandidate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.location.cmp(&other.location)
-    }
-}
-
-#[cfg(feature = "cluster")]
-fn retain_lexically_oldest_recovery_capsule(
-    oldest: &mut BinaryHeap<RecoveryCapsuleListCandidate>,
-    meta: object_store::ObjectMeta,
-) {
-    let candidate = RecoveryCapsuleListCandidate {
-        location: meta.location.to_string(),
-        meta,
-    };
-    if oldest.len() < RECOVERY_CAPSULE_GC_BATCH_SIZE {
-        oldest.push(candidate);
-    } else if oldest.peek().is_some_and(|largest| &candidate < largest) {
-        oldest.pop();
-        oldest.push(candidate);
-    }
-}
-
-#[cfg(feature = "cluster")]
-#[derive(Debug)]
-struct VersionedRecoveryCapsuleGcCursor {
-    cursor: RecoveryCapsuleGcCursor,
+struct VersionedCheckpointDecisionHead {
+    head: DurableCheckpointDecisionHead,
     update_version: UpdateVersion,
 }
 
-/// Result of one bounded cluster recovery-capsule maintenance step.
-#[cfg(feature = "cluster")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecoveryCapsuleGcStep {
-    /// Number of active-prefix entries selected and processed in this step.
-    pub examined: usize,
-    /// Number of old unreferenced capsules deleted.
-    pub deleted: usize,
-    /// Number of malformed or corrupt objects moved out of the active prefix.
-    pub quarantined: usize,
-    /// Whether an existing floor requires periodic rescans for delayed or previously failed work.
-    pub pending: bool,
+#[derive(Debug)]
+enum DecisionHeadCasResult {
+    Applied,
+    Unchanged,
+    Conflict(Option<Box<DurableCheckpointDecisionHead>>),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DurableCheckpointRetentionHead {
+    version: u32,
+    deployment_id: String,
+    state: CheckpointRetentionState,
+}
+
+#[derive(Debug)]
+struct VersionedCheckpointRetentionHead {
+    head: DurableCheckpointRetentionHead,
+    update_version: UpdateVersion,
 }
 
 impl CheckpointDecisionStore {
@@ -672,10 +690,8 @@ impl CheckpointDecisionStore {
     /// Returns an I/O error when the directory cannot be created, synchronized, or opened.
     pub fn local_filesystem(root: impl AsRef<FsPath>) -> Result<Self, DecisionError> {
         let root = root.as_ref();
-        let store: Arc<dyn ObjectStore> = Arc::new(
-            crate::durable_local_store::DurableLocalObjectStore::new(root)
-                .map_err(|error| DecisionError::Io(error.to_string()))?,
-        );
+        let store = crate::checkpoint::object_store_builder::durable_local_object_store(root)
+            .map_err(|error| DecisionError::Io(error.to_string()))?;
         let canonical_root =
             std::fs::canonicalize(root).map_err(|error| DecisionError::Io(error.to_string()))?;
         let lock =
@@ -702,73 +718,28 @@ impl CheckpointDecisionStore {
             metadata_write_lock: tokio::sync::Mutex::new(()),
             local_metadata_rmw_lock,
             checkpoint_id_head: parking_lot::Mutex::new(None),
-            local_reservation: parking_lot::Mutex::new(LocalReservationState::default()),
+            local_reservation: parking_lot::Mutex::new(LocalReservation::default()),
             deployment_id: tokio::sync::OnceCell::new(),
         }
     }
 
-    fn outcome_root() -> OsPath {
-        OsPath::from("checkpoint-outcomes/")
-    }
-
-    fn outcome_path(epoch: u64) -> OsPath {
-        OsPath::from(format!("checkpoint-outcomes/epoch={epoch}/outcome"))
-    }
-
-    fn recovery_capsule_path(reference: &RecoveryCapsuleRef) -> OsPath {
+    fn decision_head_path(deployment_id: &str) -> OsPath {
         OsPath::from(format!(
-            "checkpoint-recovery-capsules/epoch={:020}/checkpoint={:020}/sha256={}",
+            "checkpoint-decisions/deployment={deployment_id}/head"
+        ))
+    }
+
+    fn retention_head_path(deployment_id: &str) -> OsPath {
+        OsPath::from(format!(
+            "checkpoint-retention/deployment={deployment_id}/head"
+        ))
+    }
+
+    fn committed_checkpoint_path(reference: &CommittedCheckpointRef) -> OsPath {
+        OsPath::from(format!(
+            "committed-checkpoints/epoch={:020}/checkpoint={:020}/sha256={}",
             reference.epoch, reference.checkpoint_id, reference.sha256
         ))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_root() -> OsPath {
-        OsPath::from("checkpoint-recovery-capsules/")
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_coordinates_from_path(location: &str) -> Option<(u64, u64, &str)> {
-        let suffix = location.strip_prefix("checkpoint-recovery-capsules/epoch=")?;
-        let (epoch, suffix) = suffix.split_once("/checkpoint=")?;
-        let (checkpoint_id, digest) = suffix.split_once("/sha256=")?;
-        if epoch.len() != 20
-            || checkpoint_id.len() != 20
-            || digest.len() != 64
-            || digest.contains('/')
-        {
-            return None;
-        }
-        Some((epoch.parse().ok()?, checkpoint_id.parse().ok()?, digest))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_gc_cursor_path(deployment_id: &str) -> OsPath {
-        OsPath::from(format!(
-            "checkpoint-recovery-capsule-gc/deployment={deployment_id}/cursor"
-        ))
-    }
-
-    #[cfg(feature = "cluster")]
-    fn recovery_capsule_quarantine_path(location: &str) -> OsPath {
-        let digest = format!("{:x}", Sha256::digest(location.as_bytes()));
-        OsPath::from(format!(
-            "checkpoint-recovery-capsule-quarantine/path-sha256={digest}"
-        ))
-    }
-
-    fn outcome_gc_floor_path(deployment_id: &str) -> OsPath {
-        OsPath::from(format!(
-            "checkpoint-outcome-gc/deployment={deployment_id}/floor"
-        ))
-    }
-
-    fn local_reservation_root() -> OsPath {
-        OsPath::from("checkpoint-id-blocks/")
-    }
-
-    fn local_reservation_path(block: u64) -> OsPath {
-        OsPath::from(format!("checkpoint-id-blocks/block={block:020}"))
     }
 
     fn deployment_identity_path() -> OsPath {
@@ -779,122 +750,56 @@ impl CheckpointDecisionStore {
         OsPath::from("checkpoint-sink-open-witness/witness.json")
     }
 
-    #[cfg(feature = "cluster")]
-    async fn read_recovery_capsule_gc_cursor(
+    async fn load_committed_checkpoint_bytes(
         &self,
-        deployment_id: &str,
-    ) -> Result<Option<VersionedRecoveryCapsuleGcCursor>, DecisionError> {
-        let path = Self::recovery_capsule_gc_cursor_path(deployment_id);
+        reference: &CommittedCheckpointRef,
+        expected_len: Option<u64>,
+    ) -> Result<Option<Bytes>, DecisionError> {
+        reference.validate().map_err(DecisionError::Conflict)?;
+        let record = format!("committed checkpoint '{}'", reference.sha256);
         let Some(result) = self
             .get_control_record(
-                &path,
-                "recovery capsule GC cursor",
-                RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+                &Self::committed_checkpoint_path(reference),
+                &record,
+                u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
             )
             .await?
         else {
             return Ok(None);
         };
-        let update_version = UpdateVersion {
-            e_tag: result.meta.e_tag.clone(),
-            version: result.meta.version.clone(),
-        };
-        self.require_native_cas_token("recovery capsule GC cursor", &update_version)?;
-        let bytes = Self::read_control_record_bytes(
+        Self::read_control_record_bytes(
             result,
-            "recovery capsule GC cursor",
-            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
-            None,
+            &record,
+            u64::try_from(MAX_COMMITTED_CHECKPOINT_INDEX_BYTES).unwrap_or(u64::MAX),
+            expected_len,
         )
-        .await?;
-        let cursor: RecoveryCapsuleGcCursor = serde_json::from_slice(&bytes).map_err(|error| {
-            DecisionError::Conflict(format!("recovery capsule GC cursor: {error}"))
-        })?;
-        if cursor.version != RECOVERY_CAPSULE_GC_CURSOR_VERSION
-            || cursor.deployment_id != deployment_id
-            || cursor.offset.as_ref().is_some_and(|offset| {
-                !offset.starts_with("checkpoint-recovery-capsules/")
-                    || OsPath::parse(offset).is_err()
-            })
-        {
-            return Err(DecisionError::Conflict(
-                "recovery capsule GC cursor does not match its path, deployment, or progress"
-                    .into(),
-            ));
-        }
-        let canonical = serde_json::to_vec(&cursor)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
-        if canonical.as_slice() != bytes.as_ref() {
-            return Err(DecisionError::Conflict(
-                "recovery capsule GC cursor does not use its canonical body".into(),
-            ));
-        }
-        Ok(Some(VersionedRecoveryCapsuleGcCursor {
-            cursor,
-            update_version,
-        }))
+        .await
+        .map(Some)
     }
 
-    #[cfg(feature = "cluster")]
-    async fn compare_and_swap_recovery_capsule_gc_cursor(
-        &self,
-        cursor: &RecoveryCapsuleGcCursor,
-        expected: Option<UpdateVersion>,
-    ) -> Result<bool, DecisionError> {
-        let path = Self::recovery_capsule_gc_cursor_path(&cursor.deployment_id);
-        let payload = Self::encode_control_record(
-            "recovery capsule GC cursor",
-            cursor,
-            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
-        )?;
-        let options = PutOptions {
-            mode: expected.map_or(PutMode::Create, PutMode::Update),
-            ..PutOptions::default()
-        };
-        match self
-            .store
-            .put_opts(&path, PutPayload::from(payload), options)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. }
-                | object_store::Error::NotFound { .. },
-            ) => Ok(false),
-            Err(error) => match self
-                .read_recovery_capsule_gc_cursor(&cursor.deployment_id)
-                .await?
-            {
-                Some(current) if current.cursor == *cursor => Ok(true),
-                _ => Err(DecisionError::Io(error.to_string())),
-            },
-        }
-    }
-
-    /// Create the canonical content-addressed body for a cluster recovery capsule.
+    /// Create the canonical content-addressed body for a committed checkpoint index.
     ///
     /// Identical retries converge on the existing immutable body. The returned reference is safe
     /// to publish only after this method succeeds.
     ///
     /// # Errors
-    /// Object-store I/O, malformed capsule content, deployment mismatch, or a conflicting body.
-    pub async fn create_recovery_capsule(
+    /// Object-store I/O, malformed index content, deployment mismatch, or a conflicting body.
+    pub async fn create_committed_checkpoint(
         &self,
-        capsule: &ClusterRecoveryCapsule,
-    ) -> Result<RecoveryCapsuleRef, DecisionError> {
-        let (encoded, reference) = capsule
+        index: &CommittedCheckpointIndex,
+    ) -> Result<CommittedCheckpointRef, DecisionError> {
+        let (encoded, reference) = index
             .encode_and_reference()
             .map_err(DecisionError::Conflict)?;
         let deployment_id = self.load_or_create_deployment_id().await?;
-        if capsule.deployment_id != deployment_id {
+        if index.deployment_id != deployment_id {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
-                capsule.deployment_id
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
             )));
         }
 
-        let path = Self::recovery_capsule_path(&reference);
+        let path = Self::committed_checkpoint_path(&reference);
         let options = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -905,97 +810,236 @@ impl CheckpointDecisionStore {
             .await
         {
             Ok(_) => Ok(reference),
-            Err(put_error) => match self.load_recovery_capsule(&reference).await {
-                Ok(stored) if stored == *capsule => Ok(reference),
+            Err(put_error) => match self.load_committed_checkpoint(&reference).await {
+                Ok(stored) if stored == *index => Ok(reference),
                 Ok(_) => Err(DecisionError::Conflict(format!(
-                    "recovery capsule '{}' differs from the proposed content",
+                    "committed checkpoint '{}' differs from the proposed content",
                     reference.sha256
                 ))),
                 Err(reconcile_error) => Err(DecisionError::Io(format!(
-                    "recovery capsule write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                    "committed checkpoint write failed ({put_error}); reconciliation failed ({reconcile_error})"
                 ))),
             },
         }
     }
 
-    /// Load and verify one exact content-addressed recovery capsule.
+    /// Load and verify one exact content-addressed committed checkpoint index.
     ///
     /// Verification covers the object path, recorded and observed lengths, canonical JSON body,
-    /// SHA-256 reference, deployment identity, and capsule-internal invariants.
+    /// SHA-256 reference, deployment identity, and committed-index invariants.
     ///
     /// # Errors
     /// Object-store I/O, a missing object, malformed content, or any reference mismatch.
-    pub async fn load_recovery_capsule(
+    pub async fn load_committed_checkpoint(
         &self,
-        reference: &RecoveryCapsuleRef,
-    ) -> Result<ClusterRecoveryCapsule, DecisionError> {
-        reference.validate().map_err(DecisionError::Conflict)?;
-        let record = format!("recovery capsule '{}'", reference.sha256);
-        let result = self
-            .get_control_record(
-                &Self::recovery_capsule_path(reference),
-                &record,
-                u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
-            )
+        reference: &CommittedCheckpointRef,
+    ) -> Result<CommittedCheckpointIndex, DecisionError> {
+        self.load_committed_checkpoint_optional(reference)
             .await?
             .ok_or_else(|| {
                 DecisionError::Conflict(format!(
-                    "recovery capsule '{}' is missing",
+                    "committed checkpoint '{}' is missing",
                     reference.sha256
                 ))
-            })?;
-        let bytes = Self::read_control_record_bytes(
-            result,
-            &record,
-            u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
-            Some(reference.len),
-        )
-        .await?;
-        let capsule: ClusterRecoveryCapsule = serde_json::from_slice(&bytes).map_err(|error| {
-            DecisionError::Conflict(format!("recovery capsule '{}': {error}", reference.sha256))
+            })
+    }
+
+    async fn load_committed_checkpoint_optional(
+        &self,
+        reference: &CommittedCheckpointRef,
+    ) -> Result<Option<CommittedCheckpointIndex>, DecisionError> {
+        let Some(bytes) = self
+            .load_committed_checkpoint_bytes(reference, Some(reference.len))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let index: CommittedCheckpointIndex = serde_json::from_slice(&bytes).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "committed checkpoint '{}': {error}",
+                reference.sha256
+            ))
         })?;
-        let (canonical, actual_reference) = capsule
+        let (canonical, actual_reference) = index
             .encode_and_reference()
             .map_err(DecisionError::Conflict)?;
         if actual_reference != *reference || canonical.as_slice() != bytes.as_ref() {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule '{}' does not match its content-addressed reference",
+                "committed checkpoint '{}' does not match its content-addressed reference",
                 reference.sha256
             )));
         }
         let deployment_id = self.load_or_create_deployment_id().await?;
-        if capsule.deployment_id != deployment_id {
+        if index.deployment_id != deployment_id {
             return Err(DecisionError::Conflict(format!(
-                "recovery capsule belongs to deployment {}, current deployment is {deployment_id}",
-                capsule.deployment_id
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
             )));
         }
-        Ok(capsule)
+        Ok(Some(index))
     }
 
-    pub(crate) async fn validate_recovery_capsule_for_outcome(
+    /// Permanently seal the exact content-addressed candidate for an aborted attempt.
+    ///
+    /// The seal occupies the candidate's existing path, so an in-flight conditional create can
+    /// either win and be replaced or lose to the seal. Identical retries converge.
+    ///
+    /// # Errors
+    /// The candidate is malformed or foreign, the path contains different content, or object-store
+    /// I/O cannot be reconciled to the exact seal.
+    pub async fn seal_aborted_committed_checkpoint_candidate(
+        &self,
+        index: &CommittedCheckpointIndex,
+    ) -> Result<(), DecisionError> {
+        let (candidate_bytes, reference) = index
+            .encode_and_reference()
+            .map_err(DecisionError::Conflict)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if index.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "committed checkpoint belongs to deployment {}, current deployment is {deployment_id}",
+                index.deployment_id
+            )));
+        }
+        let seal_bytes = crate::checkpoint::canonical_json_bytes(&AbortedCommittedCheckpointSeal {
+            version: ABORTED_COMMITTED_CHECKPOINT_SEAL_VERSION,
+            deployment_id: &deployment_id,
+            candidate: &reference,
+        })
+        .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let path = Self::committed_checkpoint_path(&reference);
+
+        let observed = self
+            .load_committed_checkpoint_bytes(&reference, None)
+            .await?;
+        let mode = match observed.as_deref() {
+            None => PutMode::Create,
+            Some(bytes) if bytes == seal_bytes.as_slice() => return Ok(()),
+            Some(bytes) if bytes == candidate_bytes.as_slice() => PutMode::Overwrite,
+            Some(_) => {
+                return Err(DecisionError::Conflict(format!(
+                    "committed checkpoint '{}' contains neither the exact candidate nor its abort seal",
+                    reference.sha256
+                )));
+            }
+        };
+        let Err(mut write_error) = self
+            .store
+            .put_opts(
+                &path,
+                PutPayload::from(Bytes::from(seal_bytes.clone())),
+                PutOptions {
+                    mode: mode.clone(),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        let mut reconciled = self
+            .load_committed_checkpoint_bytes(&reference, None)
+            .await?;
+        if reconciled.as_deref() == Some(seal_bytes.as_slice()) {
+            return Ok(());
+        }
+        if matches!(mode, PutMode::Create)
+            && reconciled.as_deref() == Some(candidate_bytes.as_slice())
+        {
+            let Err(error) = self
+                .store
+                .put_opts(
+                    &path,
+                    PutPayload::from(Bytes::from(seal_bytes.clone())),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        ..PutOptions::default()
+                    },
+                )
+                .await
+            else {
+                return Ok(());
+            };
+            write_error = error;
+            reconciled = self
+                .load_committed_checkpoint_bytes(&reference, None)
+                .await?;
+            if reconciled.as_deref() == Some(seal_bytes.as_slice()) {
+                return Ok(());
+            }
+        }
+
+        if reconciled
+            .as_deref()
+            .is_some_and(|bytes| bytes != candidate_bytes.as_slice())
+        {
+            return Err(DecisionError::Conflict(format!(
+                "committed checkpoint '{}' changed to content other than its exact abort seal",
+                reference.sha256
+            )));
+        }
+        Err(DecisionError::Io(format!(
+            "committed checkpoint '{}' abort seal write failed and did not become durable: {write_error}",
+            reference.sha256
+        )))
+    }
+
+    /// Delete one exact committed index after validating any extant body.
+    ///
+    /// Missing objects and ambiguous deletes that removed the object are successful retries.
+    ///
+    /// # Errors
+    /// The reference, extant index, deployment identity, or object-store operation is invalid.
+    pub async fn delete_committed_checkpoint(
+        &self,
+        reference: &CommittedCheckpointRef,
+    ) -> Result<(), DecisionError> {
+        reference.validate().map_err(DecisionError::Conflict)?;
+        if self
+            .load_committed_checkpoint_optional(reference)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let path = Self::committed_checkpoint_path(reference);
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(delete_error) => match self.store.head(&path).await {
+                Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Ok(_) => Err(DecisionError::Io(delete_error.to_string())),
+                Err(reconcile_error) => Err(DecisionError::Io(format!(
+                    "committed checkpoint delete failed ({delete_error}); reconciliation failed ({reconcile_error})"
+                ))),
+            },
+        }
+    }
+
+    pub(crate) async fn validate_committed_checkpoint_for_outcome(
         &self,
         outcome: &CheckpointOutcome,
-    ) -> Result<(), DecisionError> {
+    ) -> Result<CommittedCheckpointIndex, DecisionError> {
         outcome.validate_shape(outcome.epoch)?;
-        let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+        let reference = outcome.committed_checkpoint.as_ref().ok_or_else(|| {
             DecisionError::Conflict(format!(
-                "cluster commit outcome for epoch {} requires a recovery capsule",
+                "commit outcome for epoch {} requires a committed checkpoint",
                 outcome.epoch
             ))
         })?;
-        let capsule = self.load_recovery_capsule(reference).await?;
-        if capsule.attempt.epoch != outcome.epoch
-            || capsule.attempt.checkpoint_id != outcome.checkpoint_id
-            || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
-            || capsule.deployment_id != outcome.deployment_id
+        let index = self.load_committed_checkpoint(reference).await?;
+        if index.epoch != outcome.epoch
+            || index.checkpoint_id != outcome.checkpoint_id
+            || index.scope != outcome.scope
+            || index.assignment_fence.as_ref() != outcome.assignment_fence.as_ref()
+            || index.deployment_id != outcome.deployment_id
         {
             return Err(DecisionError::Conflict(format!(
-                "cluster commit outcome for epoch {} does not match recovery capsule '{}'",
+                "commit outcome for epoch {} does not match committed checkpoint '{}'",
                 outcome.epoch, reference.sha256
             )));
         }
-        Ok(())
+        Ok(index)
     }
 
     fn validate_deployment_identity(
@@ -1164,138 +1208,96 @@ impl CheckpointDecisionStore {
         }
     }
 
-    fn local_reservation_block(location: &str) -> Result<u64, DecisionError> {
-        let value = location
-            .strip_prefix("checkpoint-id-blocks/block=")
-            .ok_or_else(|| {
-                DecisionError::Conflict(format!("malformed checkpoint ID block path: {location}"))
-            })?;
-        if value.len() != 20 || value.contains('/') {
-            return Err(DecisionError::Conflict(format!(
-                "malformed checkpoint ID block path: {location}"
-            )));
-        }
-        let block = value.parse::<u64>().map_err(|_| {
-            DecisionError::Conflict(format!("malformed checkpoint ID block path: {location}"))
-        })?;
-        if Self::local_reservation_path(block).as_ref() != location {
-            return Err(DecisionError::Conflict(format!(
-                "checkpoint ID block path is not canonical: {location}"
-            )));
-        }
-        Self::local_reservation_block_bounds(block)?;
-        Ok(block)
-    }
-
-    const fn local_reservation_block_for(checkpoint_id: u64) -> u64 {
-        (checkpoint_id - 1) / LOCAL_RESERVATION_BLOCK_SIZE
-    }
-
-    fn local_reservation_block_bounds(block: u64) -> Result<(u64, u64), DecisionError> {
-        let start = block
-            .checked_mul(LOCAL_RESERVATION_BLOCK_SIZE)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| {
-                DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
-            })?;
-        let end = start.saturating_add(LOCAL_RESERVATION_BLOCK_SIZE - 1);
-        Ok((start, end))
-    }
-
-    async fn initialize_local_reservation(&self) -> Result<(), DecisionError> {
-        if self.local_reservation.lock().initialized {
-            return Ok(());
-        }
-
-        let mut entries = self.store.list(Some(&Self::local_reservation_root()));
-        let mut highest = None;
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            let block = Self::local_reservation_block(entry.location.as_ref())?;
-            highest = Some(highest.map_or(block, |current: u64| current.max(block)));
-        }
-        let mut state = self.local_reservation.lock();
-        state.initialized = true;
-        state.highest_block = highest;
-        state.next_id = None;
-        state.block_end = 0;
-        Ok(())
-    }
-
     fn consume_local_reservation(&self, minimum: u64) -> Option<u64> {
-        let mut state = self.local_reservation.lock();
-        let next_id = state.next_id?;
-        let checkpoint_id = next_id.max(minimum);
-        if checkpoint_id > state.block_end {
-            state.next_id = None;
+        let mut reservation = self.local_reservation.lock();
+        let checkpoint_id = reservation.next_id?.max(minimum);
+        if checkpoint_id > reservation.end {
+            reservation.next_id = None;
             return None;
         }
-        state.next_id = checkpoint_id
+        reservation.next_id = checkpoint_id
             .checked_add(1)
-            .filter(|next| *next <= state.block_end);
+            .filter(|next| *next <= reservation.end);
         Some(checkpoint_id)
+    }
+
+    fn install_local_reservation(&self, first: u64, end: u64) {
+        let mut reservation = self.local_reservation.lock();
+        reservation.end = end;
+        reservation.next_id = first.checked_add(1).filter(|next| *next <= end);
     }
 
     async fn allocate_local_checkpoint_id_at_least(
         &self,
+        deployment_id: &str,
         minimum: u64,
     ) -> Result<u64, DecisionError> {
-        self.initialize_local_reservation().await?;
         if let Some(checkpoint_id) = self.consume_local_reservation(minimum) {
             return Ok(checkpoint_id);
         }
-
-        let minimum_block = Self::local_reservation_block_for(minimum);
-        let highest_block = self.local_reservation.lock().highest_block;
-        let mut candidate = match highest_block {
-            Some(block) => block
-                .checked_add(1)
-                .map(|next| next.max(minimum_block))
-                .ok_or_else(|| {
-                    DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
-                })?,
-            None => minimum_block,
+        let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+            DecisionError::Conflict(
+                "local decision store is missing its namespace write lock".into(),
+            )
+        })?;
+        let _guard = lock.lock().await;
+        let current = self
+            .read_checkpoint_id_head(deployment_id)
+            .await?
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "checkpoint ID authority for deployment {deployment_id} disappeared"
+                ))
+            })?;
+        let checkpoint_id = current
+            .head
+            .checkpoint_id
+            .checked_add(1)
+            .map(|next| next.max(minimum))
+            .ok_or_else(|| DecisionError::Conflict("checkpoint ID space exhausted u64".into()))?;
+        let reservation_end = checkpoint_id.saturating_add(LOCAL_RESERVATION_SIZE - 1);
+        let head = DeploymentIdentity {
+            version: DEPLOYMENT_IDENTITY_VERSION,
+            id: deployment_id.to_owned(),
+            allocator_mode: self.update_mode,
+            checkpoint_id: reservation_end,
+            allocation_id: uuid::Uuid::now_v7().to_string(),
         };
-
-        loop {
-            let (start, end) = Self::local_reservation_block_bounds(candidate)?;
-            let result = self
-                .store
-                .put_opts(
-                    &Self::local_reservation_path(candidate),
-                    PutPayload::from(Bytes::new()),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..PutOptions::default()
-                    },
-                )
-                .await;
-            match result {
-                Ok(_) => {
-                    let checkpoint_id = start.max(minimum);
-                    let mut state = self.local_reservation.lock();
-                    state.highest_block = Some(
-                        state
-                            .highest_block
-                            .map_or(candidate, |current| current.max(candidate)),
-                    );
-                    state.block_end = end;
-                    state.next_id = checkpoint_id
-                        .checked_add(1)
-                        .filter(|next| *next <= state.block_end);
-                    return Ok(checkpoint_id);
+        let payload = Self::encode_control_record(
+            "deployment identity",
+            &head,
+            DEPLOYMENT_IDENTITY_MAX_BYTES,
+        )?;
+        let result = self
+            .store
+            .put_opts(
+                &Self::deployment_identity_path(),
+                PutPayload::from(payload),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..PutOptions::default()
+                },
+            )
+            .await;
+        match result {
+            Ok(put_result) => {
+                self.cache_checkpoint_id_head(Some(VersionedCheckpointIdHead {
+                    head,
+                    update_version: put_result.into(),
+                }));
+                self.install_local_reservation(checkpoint_id, reservation_end);
+                Ok(checkpoint_id)
+            }
+            Err(error) => {
+                let observed = self.read_checkpoint_id_head(deployment_id).await?;
+                if observed.as_ref().is_some_and(|value| value.head == head) {
+                    self.cache_checkpoint_id_head(observed);
+                    self.install_local_reservation(checkpoint_id, reservation_end);
+                    Ok(checkpoint_id)
+                } else {
+                    self.cache_checkpoint_id_head(observed);
+                    Err(DecisionError::Io(error.to_string()))
                 }
-                Err(
-                    object_store::Error::Precondition { .. }
-                    | object_store::Error::AlreadyExists { .. },
-                ) => {
-                    candidate = candidate.checked_add(1).ok_or_else(|| {
-                        DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
-                    })?;
-                    self.local_reservation.lock().highest_block = Some(candidate - 1);
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => return Err(DecisionError::Io(error.to_string())),
             }
         }
     }
@@ -1460,12 +1462,9 @@ impl CheckpointDecisionStore {
 
     /// Allocate the next globally ordered checkpoint ID at or above `minimum`.
     ///
-    /// Shared stores advance one fixed-size durable high-water object with native compare-and-
-    /// swap. The allocation identity in each proposal reconciles a lost write response without
-    /// returning an ID won by another coordinator. Node-local filesystems claim immutable blocks
-    /// and allocate from the active block in memory. They are cancellation-safe under the
-    /// constructor's exclusive single-writer namespace contract, remove durable I/O from the hot
-    /// path, and burn the unused block tail on restart. Gaps are valid and IDs are never reused.
+    /// Shared stores advance exactly one ID with native compare-and-swap. A certified local single
+    /// writer reserves a durable range in the deployment singleton, consumes it in memory, and
+    /// burns any unused suffix after restart.
     ///
     /// # Errors
     /// Object-store I/O, malformed or foreign durable state, a shared store without conditional
@@ -1488,9 +1487,23 @@ impl CheckpointDecisionStore {
                     .await
             }
             DecisionStoreUpdateMode::LocalSingleWriter => {
-                self.allocate_local_checkpoint_id_at_least(minimum).await
+                self.allocate_local_checkpoint_id_at_least(&deployment_id, minimum)
+                    .await
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn checkpoint_id_reservation_high_watermark(&self) -> Result<u64, DecisionError> {
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        self.read_checkpoint_id_head(&deployment_id)
+            .await?
+            .map(|head| head.head.checkpoint_id)
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "checkpoint ID authority for deployment {deployment_id} disappeared"
+                ))
+            })
     }
 
     #[cfg(test)]
@@ -1945,136 +1958,81 @@ impl CheckpointDecisionStore {
         }
     }
 
-    /// Epoch segment of a canonical create-once terminal outcome object.
-    fn outcome_epoch_segment(loc: &str) -> Option<&str> {
-        let segment = loc
-            .strip_prefix("checkpoint-outcomes/")?
-            .strip_suffix("/outcome")?
-            .strip_prefix("epoch=")?;
-        let epoch = segment.parse::<u64>().ok()?;
-        (epoch != 0 && Self::outcome_path(epoch).as_ref() == loc).then_some(segment)
+    fn validate_retention_state_shape(
+        state: &CheckpointRetentionState,
+    ) -> Result<(), DecisionError> {
+        let cursor = match state {
+            CheckpointRetentionState::Idle { protected } => {
+                protected.validate().map_err(DecisionError::Conflict)?;
+                return Ok(());
+            }
+            CheckpointRetentionState::DeleteData { cursor }
+            | CheckpointRetentionState::DeleteMetadata { cursor } => cursor,
+        };
+        cursor
+            .protected
+            .validate()
+            .map_err(DecisionError::Conflict)?;
+        cursor.current.validate().map_err(DecisionError::Conflict)?;
+        if cursor.protected.epoch <= cursor.current.epoch {
+            return Err(DecisionError::Conflict(
+                "checkpoint retention cursor does not move behind its protected cut".into(),
+            ));
+        }
+        if let Some(next) = &cursor.next {
+            next.validate().map_err(DecisionError::Conflict)?;
+            if next.epoch >= cursor.current.epoch {
+                return Err(DecisionError::Conflict(
+                    "checkpoint retention next cursor is not an older cut".into(),
+                ));
+            }
+        }
+        if let Some(stop_before) = &cursor.stop_before {
+            stop_before.validate().map_err(DecisionError::Conflict)?;
+            if stop_before.epoch >= cursor.current.epoch {
+                return Err(DecisionError::Conflict(
+                    "checkpoint retention boundary is not older than its current cut".into(),
+                ));
+            }
+            let next = cursor.next.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "checkpoint retention crossed its exclusive lower boundary".into(),
+                )
+            })?;
+            if next.epoch < stop_before.epoch
+                || (next.epoch == stop_before.epoch && next != stop_before)
+            {
+                return Err(DecisionError::Conflict(
+                    "checkpoint retention next cursor crossed its exclusive lower boundary".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
-    pub(crate) async fn canonical_outcome(
-        &self,
-        epoch: u64,
-        checkpoint_id: u64,
-        scope: CheckpointScope,
-        assignment_fence: Option<CheckpointAssignmentFence>,
-        leader_proof: Option<LeaderProof>,
-        verdict: CheckpointVerdict,
-        recovery_capsule: Option<RecoveryCapsuleRef>,
-    ) -> Result<CheckpointOutcome, DecisionError> {
-        let outcome = CheckpointOutcome {
-            version: CHECKPOINT_OUTCOME_VERSION,
-            scope,
-            epoch,
-            checkpoint_id,
-            deployment_id: self.load_or_create_deployment_id().await?,
-            assignment_fence,
-            leader_proof,
-            recovery_capsule,
-            verdict,
-        };
-        if outcome.recovery_capsule.is_some() {
-            self.validate_recovery_capsule_for_outcome(&outcome).await?;
-        } else {
-            outcome.validate_shape(epoch)?;
+    fn validate_retention_head_shape(
+        head: &DurableCheckpointRetentionHead,
+        deployment_id: &str,
+    ) -> Result<(), DecisionError> {
+        if head.version != CHECKPOINT_RETENTION_HEAD_VERSION || head.deployment_id != deployment_id
+        {
+            return Err(DecisionError::Conflict(
+                "checkpoint retention head has a foreign deployment or unsupported version".into(),
+            ));
         }
-        Ok(outcome)
+        Self::validate_retention_state_shape(&head.state)
     }
 
-    async fn read_outcome_record(
-        &self,
-        path: &OsPath,
-        epoch: u64,
-    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
-        let record = format!("checkpoint outcome for epoch {epoch}");
-        let Some(result) = self
-            .get_control_record(path, &record, CHECKPOINT_OUTCOME_MAX_BYTES)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let bytes =
-            Self::read_control_record_bytes(result, &record, CHECKPOINT_OUTCOME_MAX_BYTES, None)
-                .await?;
-        let outcome: CheckpointOutcome = serde_json::from_slice(&bytes)
-            .map_err(|error| DecisionError::Conflict(format!("outcome epoch {epoch}: {error}")))?;
-        outcome.validate_shape(epoch)?;
-        if outcome.scope == CheckpointScope::Cluster {
-            return Err(DecisionError::Conflict(format!(
-                "cluster outcome epoch {epoch} is stored outside the shared leader authority"
-            )));
-        }
-        let canonical = serde_json::to_vec(&outcome)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
-        if canonical.as_slice() != bytes.as_ref() {
-            return Err(DecisionError::Conflict(format!(
-                "outcome for epoch {epoch} does not use the canonical body"
-            )));
-        }
-        let expected_deployment = self.load_or_create_deployment_id().await?;
-        if outcome.deployment_id != expected_deployment {
-            return Err(DecisionError::Conflict(format!(
-                "outcome for epoch {epoch} belongs to deployment {}, current deployment is \
-                 {expected_deployment}",
-                outcome.deployment_id
-            )));
-        }
-        Ok(Some(outcome))
-    }
-
-    async fn create_outcome(
-        &self,
-        candidate: CheckpointOutcome,
-    ) -> Result<RecordOutcomeResult, DecisionError> {
-        let path = Self::outcome_path(candidate.epoch);
-        let payload = Self::encode_control_record(
-            "checkpoint outcome",
-            &candidate,
-            CHECKPOINT_OUTCOME_MAX_BYTES,
-        )?;
-        let options = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        let Err(create_error) = self
-            .store
-            .put_opts(&path, PutPayload::from(payload), options)
-            .await
-        else {
-            return Ok(RecordOutcomeResult::Created(candidate));
-        };
-
-        // A failed create response may be ambiguous: read the create-once key before deciding
-        // whether the call failed. Recovery will not proceed past a valid Prepared witness until
-        // this exact epoch has a terminal winner.
-        if let Some(winner) = self.read_outcome_record(&path, candidate.epoch).await? {
-            return if winner == candidate {
-                Ok(RecordOutcomeResult::Unchanged(winner))
-            } else {
-                Ok(RecordOutcomeResult::Conflict { winner })
-            };
-        }
-
-        match create_error {
-            object_store::Error::Precondition { .. }
-            | object_store::Error::AlreadyExists { .. } => Err(DecisionError::Conflict(format!(
-                "outcome for epoch {} disappeared after create conflict",
-                candidate.epoch
-            ))),
-            error => Err(DecisionError::Io(error.to_string())),
-        }
-    }
-
-    async fn read_outcome_gc_floor(
+    async fn read_retention_head(
         &self,
         deployment_id: &str,
-    ) -> Result<Option<VersionedOutcomeGcFloor>, DecisionError> {
-        let path = Self::outcome_gc_floor_path(deployment_id);
+    ) -> Result<Option<VersionedCheckpointRetentionHead>, DecisionError> {
         let Some(result) = self
-            .get_control_record(&path, "outcome GC floor", OUTCOME_GC_FLOOR_MAX_BYTES)
+            .get_control_record(
+                &Self::retention_head_path(deployment_id),
+                "checkpoint retention head",
+                CHECKPOINT_RETENTION_HEAD_MAX_BYTES,
+            )
             .await?
         else {
             return Ok(None);
@@ -2083,195 +2041,857 @@ impl CheckpointDecisionStore {
             e_tag: result.meta.e_tag.clone(),
             version: result.meta.version.clone(),
         };
-        self.require_native_cas_token("outcome GC floor", &update_version)?;
+        self.require_native_cas_token("checkpoint retention head", &update_version)?;
         let bytes = Self::read_control_record_bytes(
             result,
-            "outcome GC floor",
-            OUTCOME_GC_FLOOR_MAX_BYTES,
+            "checkpoint retention head",
+            CHECKPOINT_RETENTION_HEAD_MAX_BYTES,
             None,
         )
         .await?;
-        let floor: OutcomeGcFloor = serde_json::from_slice(&bytes)
-            .map_err(|error| DecisionError::Conflict(format!("outcome GC floor: {error}")))?;
-        let before_epoch = floor.before_epoch;
-        if floor.version != OUTCOME_GC_FLOOR_VERSION
-            || floor.before_epoch == 0
-            || floor.deployment_id != deployment_id
-        {
-            return Err(DecisionError::Conflict(
-                "outcome GC floor does not match its canonical path, deployment, and version"
-                    .to_owned(),
-            ));
-        }
-        if let Some(anchor) = floor.terminal_anchor.as_ref() {
-            anchor.validate_shape(anchor.epoch)?;
-            if anchor.epoch >= floor.before_epoch || anchor.deployment_id != floor.deployment_id {
-                return Err(DecisionError::Conflict(format!(
-                    "outcome GC floor {before_epoch} has invalid terminal anchor epoch {} checkpoint {}",
-                    anchor.epoch, anchor.checkpoint_id
-                )));
-            }
-        }
-        if let Some(anchor) = floor.committed_anchor.as_ref() {
-            anchor.validate_shape(anchor.epoch)?;
-            if !anchor.is_commit()
-                || anchor.epoch >= floor.before_epoch
-                || anchor.deployment_id != floor.deployment_id
-            {
-                return Err(DecisionError::Conflict(format!(
-                    "outcome GC floor {before_epoch} has invalid committed anchor epoch {} checkpoint {}",
-                    anchor.epoch, anchor.checkpoint_id
-                )));
-            }
-            let terminal = floor.terminal_anchor.as_ref().ok_or_else(|| {
-                DecisionError::Conflict(format!(
-                    "outcome GC floor {before_epoch} has a committed anchor without a terminal anchor"
-                ))
+        let head: DurableCheckpointRetentionHead =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                DecisionError::Conflict(format!("checkpoint retention head: {error}"))
             })?;
-            let ordered = if anchor.epoch == terminal.epoch {
-                anchor == terminal
-            } else {
-                anchor.epoch < terminal.epoch && anchor.checkpoint_id < terminal.checkpoint_id
-            };
-            if !ordered {
-                return Err(DecisionError::Conflict(format!(
-                    "outcome GC floor {before_epoch} committed anchor epoch {} checkpoint {} is not ordered before terminal anchor epoch {} checkpoint {}",
-                    anchor.epoch,
-                    anchor.checkpoint_id,
-                    terminal.epoch,
-                    terminal.checkpoint_id
-                )));
-            }
-        }
-        if floor
-            .terminal_anchor
-            .as_ref()
-            .is_some_and(CheckpointOutcome::is_commit)
-            && floor.committed_anchor != floor.terminal_anchor
-        {
-            return Err(DecisionError::Conflict(format!(
-                "outcome GC floor {before_epoch} does not retain its terminal commit as the committed anchor"
-            )));
-        }
-        let canonical = serde_json::to_vec(&floor)
+        Self::validate_retention_head_shape(&head, deployment_id)?;
+        let canonical = serde_json::to_vec(&head)
             .map_err(|error| DecisionError::Conflict(error.to_string()))?;
         if canonical.as_slice() != bytes.as_ref() {
-            return Err(DecisionError::Conflict(format!(
-                "outcome GC floor {before_epoch} does not use its canonical body"
-            )));
+            return Err(DecisionError::Conflict(
+                "checkpoint retention head does not use its canonical body".into(),
+            ));
         }
-        Ok(Some(VersionedOutcomeGcFloor {
-            floor,
+        Ok(Some(VersionedCheckpointRetentionHead {
+            head,
             update_version,
         }))
     }
 
-    async fn current_outcome_gc_floor(&self) -> Result<Option<OutcomeGcFloor>, DecisionError> {
-        let deployment_id = self.load_or_create_deployment_id().await?;
-        Ok(self
-            .read_outcome_gc_floor(&deployment_id)
-            .await?
-            .map(|versioned| versioned.floor))
+    async fn put_retention_head(
+        &self,
+        deployment_id: &str,
+        observed: Option<VersionedCheckpointRetentionHead>,
+        state: CheckpointRetentionState,
+    ) -> Result<CheckpointRetentionUpdateResult, DecisionError> {
+        Self::validate_retention_state_shape(&state)?;
+        let candidate = DurableCheckpointRetentionHead {
+            version: CHECKPOINT_RETENTION_HEAD_VERSION,
+            deployment_id: deployment_id.to_owned(),
+            state: state.clone(),
+        };
+        let mode = match (self.update_mode, observed.as_ref()) {
+            (_, None) => PutMode::Create,
+            (DecisionStoreUpdateMode::NativeCas, Some(current)) => {
+                PutMode::Update(current.update_version.clone())
+            }
+            (DecisionStoreUpdateMode::LocalSingleWriter, Some(_)) => PutMode::Overwrite,
+        };
+        let payload = Self::encode_control_record(
+            "checkpoint retention head",
+            &candidate,
+            CHECKPOINT_RETENTION_HEAD_MAX_BYTES,
+        )?;
+        let result = self
+            .store
+            .put_opts(
+                &Self::retention_head_path(deployment_id),
+                PutPayload::from(payload),
+                PutOptions {
+                    mode,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            return Ok(CheckpointRetentionUpdateResult::Applied(state));
+        }
+
+        let winner = self.read_retention_head(deployment_id).await?;
+        if winner
+            .as_ref()
+            .is_some_and(|winner| winner.head == candidate)
+        {
+            return Ok(CheckpointRetentionUpdateResult::Unchanged(state));
+        }
+        let changed = winner.as_ref().map(|winner| &winner.head)
+            != observed.as_ref().map(|current| &current.head);
+        let error = result.expect_err("failed retention-head write has an error");
+        if changed
+            || matches!(
+                error,
+                object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. }
+            )
+        {
+            return Ok(CheckpointRetentionUpdateResult::Conflict {
+                current: winner.map(|winner| winner.head.state),
+            });
+        }
+        Err(DecisionError::Io(error.to_string()))
     }
 
-    async fn ensure_outcome_not_tombstoned(
+    async fn begin_checkpoint_retention_inner(
         &self,
-        outcome: &CheckpointOutcome,
+        protected: &CommittedCheckpointRef,
+    ) -> Result<CheckpointRetentionUpdateResult, DecisionError> {
+        protected.validate().map_err(DecisionError::Conflict)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        let decision = self
+            .read_decision_head(&deployment_id)
+            .await?
+            .and_then(|head| head.head.latest_commit)
+            .and_then(|outcome| outcome.committed_checkpoint)
+            .ok_or_else(|| {
+                DecisionError::Conflict(
+                    "checkpoint retention requires an authoritative local Commit".into(),
+                )
+            })?;
+        if decision != *protected {
+            return Err(DecisionError::Conflict(
+                "checkpoint retention protected cut is not the authoritative latest Commit".into(),
+            ));
+        }
+
+        let observed = self.read_retention_head(&deployment_id).await?;
+        if let Some(current) = observed.as_ref() {
+            match &current.head.state {
+                CheckpointRetentionState::Idle {
+                    protected: retained,
+                } if retained == protected => {
+                    return Ok(CheckpointRetentionUpdateResult::Unchanged(
+                        current.head.state.clone(),
+                    ));
+                }
+                CheckpointRetentionState::DeleteData { .. }
+                | CheckpointRetentionState::DeleteMetadata { .. } => {
+                    return Ok(CheckpointRetentionUpdateResult::Unchanged(
+                        current.head.state.clone(),
+                    ));
+                }
+                CheckpointRetentionState::Idle { .. } => {}
+            }
+        }
+
+        let protected_index = self.load_committed_checkpoint(protected).await?;
+        if protected_index.scope != CheckpointScope::Local {
+            return Err(DecisionError::Conflict(
+                "local checkpoint retention cannot protect a cluster checkpoint".into(),
+            ));
+        }
+        let stop_before = match observed.as_ref().map(|current| &current.head.state) {
+            Some(CheckpointRetentionState::Idle {
+                protected: retained,
+            }) => {
+                if retained.epoch >= protected.epoch {
+                    return Err(DecisionError::Conflict(
+                        "checkpoint retention cannot replace its retained cut with an older cut"
+                            .into(),
+                    ));
+                }
+                let retained_index = self.load_committed_checkpoint(retained).await?;
+                retained_index.predecessor
+            }
+            None => None,
+            Some(
+                CheckpointRetentionState::DeleteData { .. }
+                | CheckpointRetentionState::DeleteMetadata { .. },
+            ) => unreachable!("active retention returned above"),
+        };
+        let state = match protected_index.predecessor.as_ref() {
+            None if observed.is_none() => CheckpointRetentionState::Idle {
+                protected: protected.clone(),
+            },
+            None => {
+                return Err(DecisionError::Conflict(
+                    "authoritative Commit does not extend the retained checkpoint".into(),
+                ));
+            }
+            Some(current) => {
+                if let Some(CheckpointRetentionState::Idle {
+                    protected: retained,
+                }) = observed.as_ref().map(|head| &head.head.state)
+                {
+                    if current.epoch < retained.epoch
+                        || (current.epoch == retained.epoch && current != retained)
+                    {
+                        return Err(DecisionError::Conflict(
+                            "authoritative Commit does not extend the retained checkpoint".into(),
+                        ));
+                    }
+                }
+                let current_index = self.load_committed_checkpoint(current).await?;
+                protected_index
+                    .validate_predecessor_index(&current_index)
+                    .map_err(DecisionError::Conflict)?;
+                CheckpointRetentionState::DeleteData {
+                    cursor: CheckpointRetentionCursor {
+                        protected: protected.clone(),
+                        current: current.clone(),
+                        next: current_index.predecessor,
+                        stop_before,
+                    },
+                }
+            }
+        };
+        self.put_retention_head(&deployment_id, observed, state)
+            .await
+    }
+
+    /// Start or resume retention for the authoritative latest local Commit.
+    ///
+    /// # Errors
+    /// The protected cut is stale, its chain is invalid, or durable metadata cannot be updated.
+    pub async fn begin_checkpoint_retention(
+        &self,
+        protected: &CommittedCheckpointRef,
+    ) -> Result<CheckpointRetentionUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.begin_checkpoint_retention_inner(protected).await
+        } else {
+            self.begin_checkpoint_retention_inner(protected).await
+        }
+    }
+
+    async fn advance_checkpoint_retention_inner(
+        &self,
+        expected: &CheckpointRetentionState,
+    ) -> Result<CheckpointRetentionUpdateResult, DecisionError> {
+        Self::validate_retention_state_shape(expected)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        let observed = self.read_retention_head(&deployment_id).await?;
+        if observed.as_ref().map(|head| &head.head.state) != Some(expected) {
+            return Ok(CheckpointRetentionUpdateResult::Conflict {
+                current: observed.map(|head| head.head.state),
+            });
+        }
+        let state = match expected {
+            CheckpointRetentionState::Idle { .. } => {
+                return Err(DecisionError::Conflict(
+                    "idle checkpoint retention has no destructive phase to advance".into(),
+                ));
+            }
+            CheckpointRetentionState::DeleteData { cursor } => {
+                CheckpointRetentionState::DeleteMetadata {
+                    cursor: cursor.clone(),
+                }
+            }
+            CheckpointRetentionState::DeleteMetadata { cursor }
+                if cursor.next == cursor.stop_before =>
+            {
+                CheckpointRetentionState::Idle {
+                    protected: cursor.protected.clone(),
+                }
+            }
+            CheckpointRetentionState::DeleteMetadata { cursor } => {
+                let current = cursor.next.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "checkpoint retention ended before its exclusive lower boundary".into(),
+                    )
+                })?;
+                let current_index = self.load_committed_checkpoint(current).await?;
+                CheckpointRetentionState::DeleteData {
+                    cursor: CheckpointRetentionCursor {
+                        protected: cursor.protected.clone(),
+                        current: current.clone(),
+                        next: current_index.predecessor,
+                        stop_before: cursor.stop_before.clone(),
+                    },
+                }
+            }
+        };
+        self.put_retention_head(&deployment_id, observed, state)
+            .await
+    }
+
+    /// Advance one completed retention phase with an exact compare-and-swap.
+    ///
+    /// # Errors
+    /// The expected state is idle or invalid, or durable metadata cannot be updated.
+    pub async fn advance_checkpoint_retention(
+        &self,
+        expected: &CheckpointRetentionState,
+    ) -> Result<CheckpointRetentionUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.advance_checkpoint_retention_inner(expected).await
+        } else {
+            self.advance_checkpoint_retention_inner(expected).await
+        }
+    }
+
+    /// Read the exact local retention state without listing storage.
+    ///
+    /// # Errors
+    /// Object-store I/O or malformed/foreign metadata.
+    pub async fn checkpoint_retention_state(
+        &self,
+    ) -> Result<Option<CheckpointRetentionState>, DecisionError> {
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        Ok(self
+            .read_retention_head(&deployment_id)
+            .await?
+            .map(|head| head.head.state))
+    }
+
+    fn validate_decision_head_shape(
+        head: &DurableCheckpointDecisionHead,
+        deployment_id: &str,
     ) -> Result<(), DecisionError> {
-        if let Some(floor) = self.current_outcome_gc_floor().await? {
-            if outcome.epoch < floor.before_epoch {
-                return Err(DecisionError::Conflict(format!(
-                    "outcome epoch {} checkpoint {} is below durable outcome GC horizon {}",
-                    outcome.epoch, outcome.checkpoint_id, floor.before_epoch
-                )));
+        if head.version != CHECKPOINT_DECISION_HEAD_VERSION || head.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(
+                "checkpoint decision head has a foreign deployment or unsupported version".into(),
+            ));
+        }
+        if head.latest_terminal.is_none() && head.active_artifacts.is_none() {
+            return Err(DecisionError::Conflict(
+                "checkpoint decision head has neither a terminal outcome nor active artifacts"
+                    .into(),
+            ));
+        }
+        if let Some(terminal) = head.latest_terminal.as_ref() {
+            terminal.validate_shape(terminal.epoch)?;
+            if terminal.scope != CheckpointScope::Local || terminal.deployment_id != deployment_id {
+                return Err(DecisionError::Conflict(
+                    "checkpoint decision head contains a non-local terminal outcome".into(),
+                ));
+            }
+        }
+        match head.latest_commit.as_ref() {
+            Some(commit) => {
+                commit.validate_shape(commit.epoch)?;
+                let terminal = head.latest_terminal.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "checkpoint decision head has a Commit but no terminal outcome".into(),
+                    )
+                })?;
+                if commit.scope != CheckpointScope::Local
+                    || commit.deployment_id != deployment_id
+                    || !commit.is_commit()
+                    || commit.epoch > terminal.epoch
+                    || (!terminal.is_commit() && commit.epoch == terminal.epoch)
+                {
+                    return Err(DecisionError::Conflict(
+                        "checkpoint decision head contains an invalid latest Commit".into(),
+                    ));
+                }
+                if terminal.is_commit() && commit != terminal {
+                    return Err(DecisionError::Conflict(
+                        "terminal Commit does not match the decision head's latest Commit".into(),
+                    ));
+                }
+            }
+            None if head
+                .latest_terminal
+                .as_ref()
+                .is_some_and(CheckpointOutcome::is_commit) =>
+            {
+                return Err(DecisionError::Conflict(
+                    "checkpoint decision head lost its terminal Commit".into(),
+                ));
+            }
+            None => {}
+        }
+        if let Some(inventory) = head.active_artifacts.as_ref() {
+            inventory.validate().map_err(|error| {
+                DecisionError::Conflict(format!(
+                    "checkpoint decision head contains invalid active artifacts: {error}"
+                ))
+            })?;
+            if inventory.deployment_id != deployment_id || inventory.assignment_fence.is_some() {
+                return Err(DecisionError::Conflict(
+                    "local checkpoint decision head contains foreign or cluster artifacts".into(),
+                ));
+            }
+            if let Some(terminal) = head.latest_terminal.as_ref() {
+                if inventory.attempt.epoch < terminal.epoch
+                    || (inventory.attempt.epoch == terminal.epoch
+                        && (terminal.is_commit()
+                            || inventory.attempt.checkpoint_id != terminal.checkpoint_id))
+                {
+                    return Err(DecisionError::Conflict(
+                        "active checkpoint artifacts conflict with the latest terminal outcome"
+                            .into(),
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    /// Advance the canonical floor if `expected` still names its current object version.
-    ///
-    /// `false` is ordinary CAS contention and requires the caller to rebuild its candidate from
-    /// the winner. Ambiguous write failures are reconciled by reading the canonical object.
-    async fn compare_and_swap_outcome_gc_floor(
+    async fn read_decision_head(
         &self,
-        floor: &OutcomeGcFloor,
-        expected: Option<UpdateVersion>,
-    ) -> Result<bool, DecisionError> {
-        let path = Self::outcome_gc_floor_path(&floor.deployment_id);
-        let payload =
-            Self::encode_control_record("outcome GC floor", floor, OUTCOME_GC_FLOOR_MAX_BYTES)?;
-        let options = PutOptions {
-            mode: expected.clone().map_or(PutMode::Create, PutMode::Update),
-            ..PutOptions::default()
+        deployment_id: &str,
+    ) -> Result<Option<VersionedCheckpointDecisionHead>, DecisionError> {
+        let path = Self::decision_head_path(deployment_id);
+        let Some(result) = self
+            .get_control_record(
+                &path,
+                "checkpoint decision head",
+                CHECKPOINT_DECISION_HEAD_MAX_BYTES,
+            )
+            .await?
+        else {
+            return Ok(None);
         };
+        let update_version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        self.require_native_cas_token("checkpoint decision head", &update_version)?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            "checkpoint decision head",
+            CHECKPOINT_DECISION_HEAD_MAX_BYTES,
+            None,
+        )
+        .await?;
+        let head: DurableCheckpointDecisionHead =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                DecisionError::Conflict(format!("checkpoint decision head: {error}"))
+            })?;
+        Self::validate_decision_head_shape(&head, deployment_id)?;
+        let canonical = serde_json::to_vec(&head)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(DecisionError::Conflict(
+                "checkpoint decision head does not use its canonical body".into(),
+            ));
+        }
+        Ok(Some(VersionedCheckpointDecisionHead {
+            head,
+            update_version,
+        }))
+    }
+
+    async fn put_decision_head(
+        &self,
+        observed: Option<VersionedCheckpointDecisionHead>,
+        candidate: DurableCheckpointDecisionHead,
+    ) -> Result<DecisionHeadCasResult, DecisionError> {
+        Self::validate_decision_head_shape(&candidate, &candidate.deployment_id)?;
+        let mode = match (self.update_mode, observed.as_ref()) {
+            (_, None) => PutMode::Create,
+            (DecisionStoreUpdateMode::NativeCas, Some(current)) => {
+                PutMode::Update(current.update_version.clone())
+            }
+            (DecisionStoreUpdateMode::LocalSingleWriter, Some(_)) => PutMode::Overwrite,
+        };
+        let payload = Self::encode_control_record(
+            "checkpoint decision head",
+            &candidate,
+            CHECKPOINT_DECISION_HEAD_MAX_BYTES,
+        )?;
         let result = self
             .store
-            .put_opts(&path, PutPayload::from(payload.clone()), options)
-            .await;
-        match result {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::Precondition { .. }
-                | object_store::Error::AlreadyExists { .. }
-                | object_store::Error::NotFound { .. },
-            ) => Ok(false),
-            Err(object_store::Error::NotImplemented { .. })
-                if expected.is_some()
-                    && self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter =>
-            {
-                // LocalFileSystem atomically replaces a file but cannot condition that replace on
-                // an ETag. The runtime topology guarantees one process writer for this namespace;
-                // serialize its read/compare/replace so concurrent maintenance tasks cannot
-                // regress the floor. Shared stores never enter this path.
-                let _guard = self
-                    .local_metadata_rmw_lock
-                    .as_ref()
-                    .expect("local decision store has a namespace RMW lock")
-                    .lock()
-                    .await;
-                let Some(current) = self.read_outcome_gc_floor(&floor.deployment_id).await? else {
-                    return Ok(false);
-                };
-                if current.floor.before_epoch >= floor.before_epoch {
-                    return Ok(true);
-                }
-                if Some(&current.update_version) != expected.as_ref() {
-                    return Ok(false);
-                }
-                let overwrite = PutOptions {
-                    mode: PutMode::Overwrite,
+            .put_opts(
+                &Self::decision_head_path(&candidate.deployment_id),
+                PutPayload::from(payload),
+                PutOptions {
+                    mode,
                     ..PutOptions::default()
-                };
-                match self
-                    .store
-                    .put_opts(&path, PutPayload::from(payload), overwrite)
-                    .await
+                },
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            return Ok(DecisionHeadCasResult::Applied);
+        }
+
+        let winner = self.read_decision_head(&candidate.deployment_id).await?;
+        if winner
+            .as_ref()
+            .is_some_and(|winner| winner.head == candidate)
+        {
+            return Ok(DecisionHeadCasResult::Unchanged);
+        }
+        let changed = winner.as_ref().map(|winner| &winner.head)
+            != observed.as_ref().map(|current| &current.head);
+        let error = result.expect_err("failed decision-head write has an error");
+        if changed
+            || matches!(
+                error,
+                object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. }
+            )
+        {
+            return Ok(DecisionHeadCasResult::Conflict(
+                winner.map(|winner| Box::new(winner.head)),
+            ));
+        }
+        Err(DecisionError::Io(error.to_string()))
+    }
+
+    fn terminal_aborts_inventory(
+        head: &DurableCheckpointDecisionHead,
+        inventory: &CheckpointArtifactInventory,
+    ) -> bool {
+        head.latest_terminal.as_ref().is_some_and(|terminal| {
+            !terminal.is_commit()
+                && terminal.epoch == inventory.attempt.epoch
+                && terminal.checkpoint_id == inventory.attempt.checkpoint_id
+        })
+    }
+
+    async fn begin_checkpoint_artifact_inventory_inner(
+        &self,
+        inventory: CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        inventory.validate().map_err(DecisionError::Conflict)?;
+        if inventory.assignment_fence.is_some() {
+            return Err(DecisionError::Conflict(
+                "local checkpoint artifact inventory cannot carry an assignment fence".into(),
+            ));
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if inventory.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(
+                "checkpoint artifact inventory belongs to a foreign deployment".into(),
+            ));
+        }
+        let observed = self.read_decision_head(&deployment_id).await?;
+        if let Some(active) = observed
+            .as_ref()
+            .and_then(|current| current.head.active_artifacts.as_ref())
+        {
+            return Ok(
+                if active == &inventory
+                    && !observed.as_ref().is_some_and(|current| {
+                        Self::terminal_aborts_inventory(&current.head, &inventory)
+                    })
                 {
-                    Ok(_) => Ok(true),
-                    Err(error) => match self.read_outcome_gc_floor(&floor.deployment_id).await? {
-                        Some(current) if current.floor.before_epoch >= floor.before_epoch => {
-                            Ok(true)
-                        }
-                        _ => Err(DecisionError::Io(error.to_string())),
-                    },
+                    CheckpointArtifactInventoryUpdateResult::Unchanged
+                } else {
+                    CheckpointArtifactInventoryUpdateResult::Conflict {
+                        current: Some(active.clone()),
+                    }
+                },
+            );
+        }
+        if observed
+            .as_ref()
+            .and_then(|current| current.head.latest_terminal.as_ref())
+            .is_some_and(|terminal| terminal.epoch >= inventory.attempt.epoch)
+        {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+        }
+
+        let candidate = DurableCheckpointDecisionHead {
+            version: CHECKPOINT_DECISION_HEAD_VERSION,
+            deployment_id,
+            latest_terminal: observed
+                .as_ref()
+                .and_then(|current| current.head.latest_terminal.clone()),
+            latest_commit: observed
+                .as_ref()
+                .and_then(|current| current.head.latest_commit.clone()),
+            active_artifacts: Some(inventory.clone()),
+        };
+        match self.put_decision_head(observed, candidate).await? {
+            DecisionHeadCasResult::Applied => Ok(CheckpointArtifactInventoryUpdateResult::Applied),
+            DecisionHeadCasResult::Unchanged => {
+                Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+            }
+            DecisionHeadCasResult::Conflict(current) => {
+                let exact_unaborted = current.as_ref().is_some_and(|head| {
+                    head.active_artifacts.as_ref() == Some(&inventory)
+                        && !Self::terminal_aborts_inventory(head, &inventory)
+                });
+                let active = current.and_then(|head| head.active_artifacts);
+                if exact_unaborted {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+                } else {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: active })
                 }
             }
-            Err(error) => match self.read_outcome_gc_floor(&floor.deployment_id).await? {
-                Some(current) if current.floor.before_epoch >= floor.before_epoch => Ok(true),
-                _ => Err(DecisionError::Io(error.to_string())),
-            },
         }
     }
 
-    /// Create or read the one local terminal outcome allowed for an epoch.
+    /// Durably admit one exact local attempt before any checkpoint artifact is written.
     ///
-    /// Identical retries return [`RecordOutcomeResult::Unchanged`]. A different checkpoint,
-    /// authority, assignment, recovery image, or verdict returns the durable winner in
-    /// [`RecordOutcomeResult::Conflict`]; it never overwrites that winner.
+    /// Equal retries converge. A different active attempt or a reused terminal attempt conflicts.
     ///
     /// # Errors
-    /// Object-store I/O, malformed/non-canonical metadata, or any cluster-scoped proposal.
+    /// Object-store I/O or a malformed, cluster, or foreign-deployment inventory.
+    pub async fn begin_checkpoint_artifact_inventory(
+        &self,
+        inventory: CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.begin_checkpoint_artifact_inventory_inner(inventory)
+                .await
+        } else {
+            self.begin_checkpoint_artifact_inventory_inner(inventory)
+                .await
+        }
+    }
+
+    async fn complete_checkpoint_artifact_cleanup_inner(
+        &self,
+        expected: &CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        expected.validate().map_err(DecisionError::Conflict)?;
+        if expected.assignment_fence.is_some() {
+            return Err(DecisionError::Conflict(
+                "local checkpoint artifact inventory cannot carry an assignment fence".into(),
+            ));
+        }
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if expected.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(
+                "checkpoint artifact inventory belongs to a foreign deployment".into(),
+            ));
+        }
+        let observed = self.read_decision_head(&deployment_id).await?;
+        let Some(current) = observed.as_ref() else {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+        };
+        match current.head.active_artifacts.as_ref() {
+            Some(active) if active != expected => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Conflict {
+                    current: Some(active.clone()),
+                });
+            }
+            None if Self::terminal_aborts_inventory(&current.head, expected) => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Unchanged);
+            }
+            None => {
+                return Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: None });
+            }
+            Some(_) => {}
+        }
+        if !Self::terminal_aborts_inventory(&current.head, expected) {
+            return Ok(CheckpointArtifactInventoryUpdateResult::Conflict {
+                current: Some(expected.clone()),
+            });
+        }
+
+        let candidate = DurableCheckpointDecisionHead {
+            version: CHECKPOINT_DECISION_HEAD_VERSION,
+            deployment_id,
+            latest_terminal: current.head.latest_terminal.clone(),
+            latest_commit: current.head.latest_commit.clone(),
+            active_artifacts: None,
+        };
+        match self.put_decision_head(observed, candidate).await? {
+            DecisionHeadCasResult::Applied => Ok(CheckpointArtifactInventoryUpdateResult::Applied),
+            DecisionHeadCasResult::Unchanged => {
+                Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+            }
+            DecisionHeadCasResult::Conflict(current) => {
+                let active = current
+                    .as_ref()
+                    .and_then(|head| head.active_artifacts.clone());
+                if active.is_none()
+                    && current
+                        .as_ref()
+                        .is_some_and(|head| Self::terminal_aborts_inventory(head, expected))
+                {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Unchanged)
+                } else {
+                    Ok(CheckpointArtifactInventoryUpdateResult::Conflict { current: active })
+                }
+            }
+        }
+    }
+
+    /// Clear an exact local artifact inventory after its durable Abort paths are sealed.
+    ///
+    /// # Errors
+    /// Object-store I/O or a malformed, cluster, or foreign-deployment inventory.
+    pub async fn complete_checkpoint_artifact_cleanup(
+        &self,
+        expected: &CheckpointArtifactInventory,
+    ) -> Result<CheckpointArtifactInventoryUpdateResult, DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.complete_checkpoint_artifact_cleanup_inner(expected)
+                .await
+        } else {
+            self.complete_checkpoint_artifact_cleanup_inner(expected)
+                .await
+        }
+    }
+
+    pub(crate) async fn canonical_outcome_with_index(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+        scope: CheckpointScope,
+        assignment_fence: Option<CheckpointAssignmentFence>,
+        leader_proof: Option<LeaderProof>,
+        verdict: CheckpointVerdict,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
+    ) -> Result<(CheckpointOutcome, Option<CommittedCheckpointIndex>), DecisionError> {
+        let outcome = CheckpointOutcome {
+            version: CHECKPOINT_OUTCOME_VERSION,
+            scope,
+            epoch,
+            checkpoint_id,
+            deployment_id: self.load_or_create_deployment_id().await?,
+            assignment_fence,
+            leader_proof,
+            committed_checkpoint,
+            verdict,
+        };
+        outcome.validate_shape(epoch)?;
+        let index = if outcome.is_commit() {
+            Some(
+                self.validate_committed_checkpoint_for_outcome(&outcome)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        Ok((outcome, index))
+    }
+
+    async fn record_outcome_inner(
+        &self,
+        candidate: CheckpointOutcome,
+        committed_index: Option<CommittedCheckpointIndex>,
+    ) -> Result<RecordOutcomeResult, DecisionError> {
+        let observed = self.read_decision_head(&candidate.deployment_id).await?;
+        if let Some(terminal) = observed
+            .as_ref()
+            .and_then(|current| current.head.latest_terminal.as_ref())
+        {
+            if terminal.epoch == candidate.epoch {
+                return if terminal == &candidate {
+                    Ok(RecordOutcomeResult::Unchanged(candidate))
+                } else {
+                    Ok(RecordOutcomeResult::Conflict {
+                        winner: terminal.clone(),
+                    })
+                };
+            }
+            if terminal.epoch > candidate.epoch {
+                return Ok(RecordOutcomeResult::Conflict {
+                    winner: terminal.clone(),
+                });
+            }
+        }
+
+        let active = observed
+            .as_ref()
+            .and_then(|current| current.head.active_artifacts.as_ref());
+        let candidate_attempt = CheckpointAttempt::new(candidate.epoch, candidate.checkpoint_id);
+        if active.is_some_and(|active| active.attempt != candidate_attempt) {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint outcome attempt {} does not match the active artifact inventory",
+                candidate.checkpoint_id
+            )));
+        }
+
+        if candidate.is_commit() {
+            let active = active.ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "checkpoint Commit {} has no durable artifact inventory",
+                    candidate.checkpoint_id
+                ))
+            })?;
+            let index = committed_index.as_ref().ok_or_else(|| {
+                DecisionError::Conflict("Commit has no validated committed checkpoint".into())
+            })?;
+            if index.pipeline_identity != active.pipeline_identity
+                || index.assignment_fence != active.assignment_fence
+            {
+                return Err(DecisionError::Conflict(
+                    "Commit metadata does not match the active checkpoint artifact inventory"
+                        .into(),
+                ));
+            }
+            let expected_predecessor = observed.as_ref().and_then(|current| {
+                current
+                    .head
+                    .latest_commit
+                    .as_ref()
+                    .and_then(|commit| commit.committed_checkpoint.clone())
+            });
+            if index.predecessor != expected_predecessor {
+                return Err(DecisionError::Conflict(format!(
+                    "Commit epoch {} does not extend the authoritative committed checkpoint",
+                    candidate.epoch
+                )));
+            }
+            if let Some(predecessor_ref) = expected_predecessor.as_ref() {
+                let predecessor = self.load_committed_checkpoint(predecessor_ref).await?;
+                index
+                    .validate_predecessor_index(&predecessor)
+                    .map_err(DecisionError::Conflict)?;
+            }
+        }
+
+        let head = DurableCheckpointDecisionHead {
+            version: CHECKPOINT_DECISION_HEAD_VERSION,
+            deployment_id: candidate.deployment_id.clone(),
+            latest_commit: if candidate.is_commit() {
+                Some(candidate.clone())
+            } else {
+                observed
+                    .as_ref()
+                    .and_then(|current| current.head.latest_commit.clone())
+            },
+            latest_terminal: Some(candidate.clone()),
+            active_artifacts: if candidate.is_commit() {
+                None
+            } else {
+                active.cloned()
+            },
+        };
+        match self.put_decision_head(observed, head).await? {
+            DecisionHeadCasResult::Applied => Ok(RecordOutcomeResult::Created(candidate)),
+            DecisionHeadCasResult::Unchanged => Ok(RecordOutcomeResult::Unchanged(candidate)),
+            DecisionHeadCasResult::Conflict(winner) => {
+                if let Some(terminal) = winner.and_then(|head| head.latest_terminal) {
+                    if terminal.epoch >= candidate.epoch {
+                        return if terminal == candidate {
+                            Ok(RecordOutcomeResult::Unchanged(candidate))
+                        } else {
+                            Ok(RecordOutcomeResult::Conflict { winner: terminal })
+                        };
+                    }
+                }
+                Err(DecisionError::Conflict(format!(
+                    "checkpoint decision head contention did not publish epoch {}",
+                    candidate.epoch
+                )))
+            }
+        }
+    }
+
+    /// Publish the authoritative local terminal outcome.
+    ///
+    /// The singleton CAS is the decision: a crash before it leaves the attempt unresolved, while a
+    /// crash after it leaves both the latest terminal and latest Commit directly recoverable.
+    /// Equal retries converge; stale epochs and conflicting outcomes return the durable winner.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed metadata, a forked Commit predecessor, or cluster authority.
     pub async fn record_outcome(
         &self,
         epoch: u64,
@@ -2280,561 +2900,79 @@ impl CheckpointDecisionStore {
         assignment_fence: Option<CheckpointAssignmentFence>,
         leader_proof: Option<LeaderProof>,
         verdict: CheckpointVerdict,
-        recovery_capsule: Option<RecoveryCapsuleRef>,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
     ) -> Result<RecordOutcomeResult, DecisionError> {
         if scope == CheckpointScope::Cluster {
             return Err(DecisionError::Conflict(
                 "cluster outcomes must be admitted through the shared leader authority".into(),
             ));
         }
-        let candidate = self
-            .canonical_outcome(
+        let (candidate, committed_index) = self
+            .canonical_outcome_with_index(
                 epoch,
                 checkpoint_id,
                 scope,
                 assignment_fence,
                 leader_proof,
                 verdict,
-                recovery_capsule,
+                committed_checkpoint,
             )
             .await?;
-        self.ensure_outcome_not_tombstoned(&candidate).await?;
-        let result = self.create_outcome(candidate.clone()).await?;
-        // A floor published while the create was in flight wins. The late raw object is inert and
-        // remains eligible for a later best-effort sweep.
-        self.ensure_outcome_not_tombstoned(&candidate).await?;
-        Ok(result)
+        if self.update_mode == DecisionStoreUpdateMode::LocalSingleWriter {
+            let lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(
+                    "local decision store is missing its namespace write lock".into(),
+                )
+            })?;
+            let _guard = lock.lock().await;
+            self.record_outcome_inner(candidate, committed_index).await
+        } else {
+            self.record_outcome_inner(candidate, committed_index).await
+        }
     }
 
-    /// Load the standalone/local terminal outcome for `epoch`.
-    ///
-    /// `None` means unresolved; it is never evidence of abort.
-    ///
-    /// # Errors
-    /// Object-store I/O or a malformed/conflicting outcome body.
-    pub async fn outcome(&self, epoch: u64) -> Result<Option<CheckpointOutcome>, DecisionError> {
-        const FLOOR_RETRIES: usize = 3;
-        for attempt in 0..FLOOR_RETRIES {
-            let floor_before = self.current_outcome_gc_floor().await?;
-            if floor_before
-                .as_ref()
-                .is_some_and(|floor| epoch < floor.before_epoch)
-            {
-                let floor_after = self.current_outcome_gc_floor().await?;
-                if floor_before == floor_after {
-                    return Ok(None);
-                }
-            } else {
-                let outcome = self
-                    .read_outcome_record(&Self::outcome_path(epoch), epoch)
-                    .await?;
-                let floor_after = self.current_outcome_gc_floor().await?;
-                if floor_before == floor_after {
-                    return Ok(outcome.filter(|outcome| {
-                        floor_after
-                            .as_ref()
-                            .is_none_or(|floor| outcome.epoch >= floor.before_epoch)
-                    }));
-                }
-            }
-            if attempt + 1 < FLOOR_RETRIES {
-                tokio::task::yield_now().await;
-            }
-        }
-        Err(DecisionError::InventoryChanged(
-            "outcome GC floor kept advancing during exact lookup".into(),
-        ))
-    }
-
-    async fn list_outcome_epochs(&self) -> Result<Vec<u64>, DecisionError> {
-        let mut entries = self.store.list(Some(&Self::outcome_root()));
-        let mut epochs = Vec::new();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            let location = entry.location.as_ref();
-            let epoch = Self::outcome_epoch_segment(location)
-                .and_then(|segment| segment.parse::<u64>().ok())
-                .filter(|epoch| *epoch != 0)
-                .ok_or_else(|| {
-                    DecisionError::Conflict(format!(
-                        "malformed checkpoint outcome path: {location}"
-                    ))
-                })?;
-            epochs.push(epoch);
-        }
-        epochs.sort_unstable();
-        if epochs.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(DecisionError::Conflict(
-                "checkpoint outcome inventory contains a duplicate epoch".into(),
-            ));
-        }
-        Ok(epochs)
-    }
-
-    /// Load every live standalone/local outcome in ascending epoch order.
-    ///
-    /// Continuity-only GC anchors are audited internally but never returned to callers because
-    /// their checkpoint artifacts may already have been deleted.
+    /// Read the exact authoritative local decision head without listing storage.
     ///
     /// # Errors
-    /// Object-store I/O, a malformed object name/body, or an inventory that changed during read.
-    pub async fn outcomes(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
-        const FLOOR_RETRIES: usize = 3;
-        for attempt in 0..FLOOR_RETRIES {
-            let floor_before = self.current_outcome_gc_floor().await?;
-            let mut outcomes = self.audited_outcomes().await?;
-            let floor_after = self.current_outcome_gc_floor().await?;
-            if floor_before == floor_after {
-                if let Some(floor) = floor_after {
-                    outcomes.retain(|outcome| outcome.epoch >= floor.before_epoch);
-                }
-                return Ok(outcomes);
-            }
-            if attempt + 1 < FLOOR_RETRIES {
-                tokio::task::yield_now().await;
-            }
-        }
-        Err(DecisionError::InventoryChanged(
-            "outcome GC floor kept advancing while selecting live outcomes".into(),
-        ))
-    }
-
-    /// Anchor-inclusive inventory used for monotonic-history audits and retention metadata.
-    async fn audited_outcomes(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
-        const INVENTORY_RETRIES: usize = 3;
-        for attempt in 0..INVENTORY_RETRIES {
-            match self.outcomes_once().await {
-                Err(DecisionError::InventoryChanged(_)) if attempt + 1 < INVENTORY_RETRIES => {
-                    tokio::task::yield_now().await;
-                }
-                result => return result,
-            }
-        }
-        Err(DecisionError::InventoryChanged(
-            "checkpoint outcome inventory exhausted stability retries".into(),
-        ))
-    }
-
-    async fn outcomes_once(&self) -> Result<Vec<CheckpointOutcome>, DecisionError> {
-        let floor_before = self.current_outcome_gc_floor().await?;
-        let min_epoch = floor_before.as_ref().map_or(0, |floor| floor.before_epoch);
-        let epochs = self
-            .list_outcome_epochs()
+    /// Object-store I/O or malformed/foreign head metadata.
+    pub async fn checkpoint_decision_head(
+        &self,
+    ) -> Result<Option<CheckpointDecisionHead>, DecisionError> {
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        Ok(self
+            .read_decision_head(&deployment_id)
             .await?
-            .into_iter()
-            .filter(|epoch| *epoch >= min_epoch);
-
-        let mut outcomes = Vec::new();
-        if let Some(anchor) = floor_before
-            .as_ref()
-            .and_then(|floor| floor.committed_anchor.as_ref())
-        {
-            outcomes.push(anchor.clone());
-        }
-        if let Some(anchor) = floor_before
-            .as_ref()
-            .and_then(|floor| floor.terminal_anchor.as_ref())
-        {
-            if outcomes.last() != Some(anchor) {
-                outcomes.push(anchor.clone());
-            }
-        }
-        for epoch in epochs {
-            let outcome = self
-                .read_outcome_record(&Self::outcome_path(epoch), epoch)
-                .await?
-                .ok_or_else(|| {
-                    DecisionError::InventoryChanged(format!(
-                        "checkpoint outcome for epoch {epoch} disappeared during inventory"
-                    ))
-                })?;
-            outcomes.push(outcome);
-        }
-        let floor_after = self.current_outcome_gc_floor().await?;
-        if floor_before != floor_after {
-            return Err(DecisionError::InventoryChanged(
-                "outcome GC floor advanced during outcome inventory".into(),
-            ));
-        }
-        for pair in outcomes.windows(2) {
-            let previous = &pair[0];
-            let current = &pair[1];
-            if current.epoch <= previous.epoch || current.checkpoint_id <= previous.checkpoint_id {
-                return Err(DecisionError::Conflict(format!(
-                    "checkpoint outcomes regress from epoch {} checkpoint {} to epoch {} checkpoint {}",
-                    previous.epoch,
-                    previous.checkpoint_id,
-                    current.epoch,
-                    current.checkpoint_id
-                )));
-            }
-        }
-        Ok(outcomes)
+            .map(|versioned| CheckpointDecisionHead {
+                latest_terminal: versioned.head.latest_terminal,
+                latest_commit: versioned.head.latest_commit,
+                active_artifacts: versioned.head.active_artifacts,
+            }))
     }
 
-    /// Greatest terminal outcome, including the continuity anchor when it is the newest closed
-    /// epoch retained by the store.
+    /// Read the latest authoritative local terminal outcome without listing storage.
     ///
     /// # Errors
-    /// Object-store I/O or malformed/conflicting outcome inventory.
-    pub async fn highest_terminal_outcome(
+    /// Object-store I/O or malformed/foreign head metadata.
+    pub async fn latest_terminal_outcome(
         &self,
     ) -> Result<Option<CheckpointOutcome>, DecisionError> {
-        Ok(self.audited_outcomes().await?.pop())
-    }
-
-    /// Greatest durable outcome GC horizon for the current deployment, or zero before pruning.
-    ///
-    /// # Errors
-    /// Object-store I/O or malformed/conflicting floor metadata.
-    pub async fn outcome_gc_floor_horizon(&self) -> Result<u64, DecisionError> {
         Ok(self
-            .current_outcome_gc_floor()
+            .checkpoint_decision_head()
             .await?
-            .map_or(0, |floor| floor.before_epoch))
+            .and_then(|head| head.latest_terminal))
     }
 
-    /// Read scalar continuity metadata for compacted terminal outcomes.
-    ///
-    /// The returned boundary can fence external cursor rollback, but it cannot be used to recover
-    /// a checkpoint. Recovery must select a live commit from [`Self::outcomes`].
+    /// Read the latest authoritative local Commit without listing storage.
     ///
     /// # Errors
-    /// Object-store I/O or malformed/conflicting floor metadata.
-    pub async fn outcome_retention_boundary(
+    /// Object-store I/O or malformed/foreign head metadata.
+    pub async fn latest_committed_outcome(
         &self,
-    ) -> Result<OutcomeRetentionBoundary, DecisionError> {
-        let floor = self.current_outcome_gc_floor().await?;
-        Ok(floor.map_or(
-            OutcomeRetentionBoundary {
-                before_epoch: 0,
-                committed_checkpoint_id: None,
-                highest_closed_epoch: None,
-            },
-            |floor| OutcomeRetentionBoundary {
-                before_epoch: floor.before_epoch,
-                committed_checkpoint_id: floor.committed_anchor.map(|anchor| anchor.checkpoint_id),
-                highest_closed_epoch: floor.terminal_anchor.map(|anchor| anchor.epoch),
-            },
-        ))
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn quarantine_recovery_capsule_object(
-        &self,
-        location: &OsPath,
-    ) -> Result<(), DecisionError> {
-        let quarantine = Self::recovery_capsule_quarantine_path(location.as_ref());
-        match self.store.rename(location, &quarantine).await {
-            Ok(()) => Ok(()),
-            Err(error) => match self.store.head(location).await {
-                Err(object_store::Error::NotFound { .. }) => Ok(()),
-                Ok(_) => Err(DecisionError::Io(format!(
-                    "failed to quarantine recovery capsule '{location}': {error}"
-                ))),
-                Err(head_error) => Err(DecisionError::Io(format!(
-                    "failed to quarantine recovery capsule '{location}' ({error}); reconciliation failed ({head_error})"
-                ))),
-            },
-        }
-    }
-
-    /// Perform one bounded-memory cleanup step for capsule epochs below a durable cluster floor.
-    ///
-    /// Each step full-scans the unordered listing and processes the lexically oldest bounded batch
-    /// after the cursor. The cursor wraps so delayed creates and failed paths are retried.
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn sweep_recovery_capsules_step(
-        &self,
-        before_epoch: u64,
-        known_live_digests: &std::collections::BTreeSet<String>,
-    ) -> Result<RecoveryCapsuleGcStep, DecisionError> {
-        if before_epoch <= 1 {
-            return Ok(RecoveryCapsuleGcStep {
-                examined: 0,
-                deleted: 0,
-                quarantined: 0,
-                pending: false,
-            });
-        }
-
-        let deployment_id = self.load_or_create_deployment_id().await?;
-        let observed = self.read_recovery_capsule_gc_cursor(&deployment_id).await?;
-        let (cursor, update_version) = observed.map_or_else(
-            || {
-                (
-                    RecoveryCapsuleGcCursor {
-                        version: RECOVERY_CAPSULE_GC_CURSOR_VERSION,
-                        deployment_id: deployment_id.clone(),
-                        offset: None,
-                    },
-                    None,
-                )
-            },
-            |observed| (observed.cursor, Some(observed.update_version)),
-        );
-
-        let root = Self::recovery_capsule_root();
-        let mut listed = self.store.list(Some(&root));
-        let mut oldest = BinaryHeap::with_capacity(RECOVERY_CAPSULE_GC_BATCH_SIZE);
-        let mut eligible = 0usize;
-        while let Some(entry) = listed.next().await {
-            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
-            if cursor
-                .offset
-                .as_deref()
-                .is_some_and(|offset| entry.location.as_ref() <= offset)
-            {
-                continue;
-            }
-            eligible = eligible.saturating_add(1);
-            retain_lexically_oldest_recovery_capsule(&mut oldest, entry);
-        }
-        let list_exhausted = eligible <= RECOVERY_CAPSULE_GC_BATCH_SIZE;
-        let entries = oldest
-            .into_sorted_vec()
-            .into_iter()
-            .map(|candidate| candidate.meta)
-            .collect::<Vec<_>>();
-        let examined = entries.len();
-
-        let work = futures::stream::iter(entries.iter().cloned())
-            .map(|entry| async move {
-                let Some((epoch, checkpoint_id, digest)) =
-                    Self::recovery_capsule_coordinates_from_path(entry.location.as_ref())
-                else {
-                    return match self
-                        .quarantine_recovery_capsule_object(&entry.location)
-                        .await
-                    {
-                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
-                        Err(error) => {
-                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    };
-                };
-                if epoch >= before_epoch {
-                    return RecoveryCapsuleObjectWork::Retained;
-                }
-                let reference = RecoveryCapsuleRef {
-                    epoch,
-                    checkpoint_id,
-                    sha256: digest.to_owned(),
-                    len: entry.size,
-                };
-                if reference.validate().is_err() {
-                    return match self
-                        .quarantine_recovery_capsule_object(&entry.location)
-                        .await
-                    {
-                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
-                        Err(error) => {
-                            tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    };
-                }
-                if known_live_digests.contains(&reference.sha256) {
-                    return RecoveryCapsuleObjectWork::Retained;
-                }
-                match self.load_recovery_capsule(&reference).await {
-                    Ok(_) => match self.store.delete(&entry.location).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
-                            RecoveryCapsuleObjectWork::Deleted
-                        }
-                        Err(error) => {
-                            tracing::warn!(epoch, checkpoint_id, %error, "recovery capsule delete failed; retrying on the next scan pass");
-                            RecoveryCapsuleObjectWork::Failed
-                        }
-                    },
-                    Err(DecisionError::Conflict(error)) => {
-                        if matches!(
-                            self.store.head(&entry.location).await,
-                            Err(object_store::Error::NotFound { .. })
-                        ) {
-                            return RecoveryCapsuleObjectWork::Deleted;
-                        }
-                        match self
-                            .quarantine_recovery_capsule_object(&entry.location)
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::warn!(path = %entry.location, %error, "corrupt recovery capsule quarantined");
-                                RecoveryCapsuleObjectWork::Quarantined
-                            }
-                            Err(quarantine_error) => {
-                                tracing::warn!(path = %entry.location, %error, %quarantine_error, "corrupt recovery capsule quarantine failed; retrying on the next scan pass");
-                                RecoveryCapsuleObjectWork::Failed
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %entry.location, %error, "recovery capsule read failed; retrying on the next scan pass");
-                        RecoveryCapsuleObjectWork::Failed
-                    }
-                }
-            })
-            .buffer_unordered(4)
-            .collect::<Vec<_>>()
-            .await;
-
-        let deleted = work
-            .iter()
-            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Deleted))
-            .count();
-        let quarantined = work
-            .iter()
-            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Quarantined))
-            .count();
-
-        let mut updated = cursor.clone();
-        updated.offset = if list_exhausted {
-            None
-        } else {
-            entries.iter().map(|entry| entry.location.to_string()).max()
-        };
-        let cursor_was_absent = update_version.is_none();
-        if updated != cursor
-            && !self
-                .compare_and_swap_recovery_capsule_gc_cursor(&updated, update_version)
-                .await?
-        {
-            return Ok(RecoveryCapsuleGcStep {
-                examined,
-                deleted,
-                quarantined,
-                pending: true,
-            });
-        }
-        if cursor_was_absent && updated == cursor {
-            let _ = self
-                .compare_and_swap_recovery_capsule_gc_cursor(&updated, None)
-                .await?;
-        }
-
-        Ok(RecoveryCapsuleGcStep {
-            examined,
-            deleted,
-            quarantined,
-            // Maintenance intentionally keeps cycling while a floor exists so delayed creates
-            // and previously failed paths cannot be stranded after a quiet pass.
-            pending: true,
-        })
-    }
-
-    /// Advance the outcome GC floor for `epoch < before`, then best-effort delete raw
-    /// tombstoned outcomes.
-    ///
-    /// At least one live commit must remain at or above the effective horizon. The embedded anchors
-    /// preserve terminal and committed-cursor continuity but are never eligible as recovery cuts.
-    /// Concurrent higher floors supersede this request and are included in the same best-effort
-    /// sweep.
-    ///
-    /// # Errors
-    /// Object-store I/O, malformed/conflicting inventory, or a horizon that would remove the last
-    /// recoverable commit outcome.
-    pub async fn prune_outcomes_before(&self, before: u64) -> Result<u64, DecisionError> {
-        if before == 0 {
-            return self.outcome_gc_floor_horizon().await;
-        }
-        let deployment_id = self.load_or_create_deployment_id().await?;
-
-        // A failed CAS means another worker advanced the floor. Rebuild from that winner instead
-        // of publishing anchors derived from an older view: reusing a stale candidate could
-        // discard a terminal outcome admitted between the two floor generations.
-        loop {
-            let observed = self.read_outcome_gc_floor(&deployment_id).await?;
-            if observed
-                .as_ref()
-                .is_some_and(|versioned| versioned.floor.before_epoch >= before)
-            {
-                // The floor may have become durable immediately before its publisher crashed.
-                // Re-enter the idempotent sweep so retries repair any raw outcomes or capsules
-                // left behind by that incomplete retention pass.
-                break;
-            }
-
-            let outcomes = match self.audited_outcomes().await {
-                Err(DecisionError::InventoryChanged(_)) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                result => result?,
-            };
-            if !outcomes
-                .iter()
-                .any(|outcome| outcome.epoch >= before && outcome.is_commit())
-            {
-                return Err(DecisionError::Conflict(format!(
-                    "cannot advance outcome GC floor to {before}: no live commit recovery cut would remain"
-                )));
-            }
-            let floor = OutcomeGcFloor {
-                version: OUTCOME_GC_FLOOR_VERSION,
-                deployment_id: deployment_id.clone(),
-                before_epoch: before,
-                terminal_anchor: outcomes
-                    .iter()
-                    .rev()
-                    .find(|outcome| outcome.epoch < before)
-                    .cloned(),
-                committed_anchor: outcomes
-                    .iter()
-                    .rev()
-                    .find(|outcome| outcome.epoch < before && outcome.is_commit())
-                    .cloned(),
-            };
-            let expected = observed.map(|versioned| versioned.update_version);
-            if self
-                .compare_and_swap_outcome_gc_floor(&floor, expected)
-                .await?
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        let mut swept_horizon = 0;
-        loop {
-            let effective = self.current_outcome_gc_floor().await?.ok_or_else(|| {
-                DecisionError::InventoryChanged(
-                    "outcome GC floor disappeared immediately after publication".into(),
-                )
-            })?;
-            if effective.before_epoch < before || effective.before_epoch < swept_horizon {
-                return Err(DecisionError::InventoryChanged(format!(
-                    "outcome GC floor regressed to {} after publishing {before}",
-                    effective.before_epoch
-                )));
-            }
-            if effective.before_epoch > swept_horizon {
-                let raw_epochs = self.list_outcome_epochs().await?;
-                for epoch in raw_epochs
-                    .into_iter()
-                    .filter(|epoch| *epoch < effective.before_epoch)
-                {
-                    match self.store.delete(&Self::outcome_path(epoch)).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                        Err(error) => tracing::warn!(
-                            epoch,
-                            %error,
-                            "outcome prune: tombstoned outcome delete failed"
-                        ),
-                    }
-                }
-                swept_horizon = effective.before_epoch;
-            }
-            let current = self.current_outcome_gc_floor().await?.ok_or_else(|| {
-                DecisionError::InventoryChanged(
-                    "outcome GC floor disappeared during best-effort sweep".into(),
-                )
-            })?;
-            if current.before_epoch == swept_horizon {
-                return Ok(swept_horizon);
-            }
-            tokio::task::yield_now().await;
-        }
+    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
+        Ok(self
+            .checkpoint_decision_head()
+            .await?
+            .and_then(|head| head.latest_commit))
     }
 }
 

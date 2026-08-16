@@ -2,18 +2,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use laminar_connectors::connector::DeliveryGuarantee;
-use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
-use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
-use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
-fn exact_builder_with_roots(
-    state_dir: &std::path::Path,
+fn exact_builder_for_checkpoint(
     checkpoint_dir: &std::path::Path,
 ) -> crate::builder::LaminarDbBuilder {
-    std::fs::create_dir_all(state_dir).unwrap();
-    let store: Arc<dyn object_store::ObjectStore> =
-        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(state_dir).unwrap());
-    let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 1));
     crate::db::LaminarDB::builder()
         .storage_dir(checkpoint_dir)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
@@ -21,12 +13,10 @@ fn exact_builder_with_roots(
             ..Default::default()
         })
         .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
-        .state_backend(backend)
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(0))))
 }
 
 fn exact_builder(root: &std::path::Path) -> crate::builder::LaminarDbBuilder {
-    exact_builder_with_roots(&root.join("state"), &root.join("checkpoints"))
+    exact_builder_for_checkpoint(&root.join("checkpoints"))
 }
 
 async fn exact_db(root: &std::path::Path) -> Arc<crate::db::LaminarDB> {
@@ -35,8 +25,9 @@ async fn exact_db(root: &std::path::Path) -> Arc<crate::db::LaminarDB> {
 
 async fn install_generator_pipeline(db: &Arc<crate::db::LaminarDB>) {
     db.execute(
-        "CREATE SOURCE generated_source (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-         ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '1')",
+        "CREATE SOURCE generated_source (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, \
+         value VARCHAR NOT NULL) FROM GENERATOR \
+         ('rows.per.second' = '1000', 'max.rows' = '1')",
     )
     .await
     .unwrap();
@@ -54,6 +45,43 @@ async fn wait_for_processing_cycle(db: &Arc<crate::db::LaminarDB>) {
     })
     .await
     .expect("the generator processing cycle must complete");
+}
+
+#[tokio::test]
+async fn recoverable_reference_tables_reject_process_local_sql_dml() {
+    let root = tempfile::tempdir().unwrap();
+    let db = exact_db(root.path()).await;
+    db.execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY, label VARCHAR NOT NULL)")
+        .await
+        .unwrap();
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'process-local')")
+        .await
+        .expect_err("recoverable table state requires versioned snapshot intake");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert_eq!(db.table_store.read().table_row_count("dimensions"), 0);
+
+    crate::db::DbState::Stopped.store(&db.state);
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'stopped')")
+        .await
+        .expect_err("stopping does not make process-local data recoverable");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    db.shutdown().await.unwrap();
+
+    let reopened = exact_db(root.path()).await;
+    reopened
+        .execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY, label VARCHAR NOT NULL)")
+        .await
+        .unwrap();
+    let error = reopened
+        .execute("INSERT INTO dimensions VALUES (1, 'reopened')")
+        .await
+        .expect_err("a reopened recoverable deployment must keep the same DML fence");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    assert_eq!(reopened.table_store.read().table_row_count("dimensions"), 0);
+
+    reopened.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -80,11 +108,11 @@ async fn second_local_exact_process_cannot_share_checkpoint_namespace() {
 #[tokio::test]
 async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
     let root = tempfile::tempdir().unwrap();
-    let max_staged_bytes = 29;
+    let max_node_data_bytes = 29;
     let db = crate::db::LaminarDB::builder()
         .storage_dir(root.path())
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-            max_staged_bytes: Some(max_staged_bytes),
+            max_node_data_bytes: Some(max_node_data_bytes),
             ..Default::default()
         })
         .build()
@@ -97,89 +125,20 @@ async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
         let coordinator = coordinator
             .as_ref()
             .expect("checkpoint configuration must install a coordinator");
-        assert_eq!(coordinator.config().max_staged_bytes, max_staged_bytes);
-        assert_eq!(coordinator.store().max_state_data_bytes(), max_staged_bytes);
+        assert_eq!(
+            coordinator.config().max_node_data_bytes,
+            max_node_data_bytes
+        );
+        assert_eq!(
+            coordinator.store().max_node_data_bytes(),
+            max_node_data_bytes
+        );
     }
     db.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn local_startup_settles_prepared_witness_before_reconciliation() {
-    let root = tempfile::tempdir().unwrap();
-    let checkpoint_dir = root.path().join("checkpoints");
-    let first = exact_db(root.path()).await;
-    install_generator_pipeline(&first).await;
-    first.start().await.unwrap();
-    wait_for_processing_cycle(&first).await;
-    let committed = first.checkpoint().await.unwrap();
-    assert!(committed.success, "{:?}", committed.error);
-    first.shutdown().await.unwrap();
-
-    // Retain committed N and model a crash after a distinct N+1 Prepared manifest became
-    // durable but before its create-once terminal outcome became visible.
-    let manifest_store = FileSystemCheckpointStore::new(&checkpoint_dir);
-    let committed_manifest = manifest_store
-        .load_by_id(committed.checkpoint_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let prepared_id = committed.checkpoint_id + 1;
-    let prepared_epoch = committed.epoch + 1;
-    let mut prepared = committed_manifest.clone();
-    prepared.checkpoint_id = prepared_id;
-    prepared.epoch = prepared_epoch;
-    prepared.durable_phase = DurableCheckpointPhase::Prepared;
-    manifest_store.save(&prepared).await.unwrap();
-
-    let restarted = exact_db(root.path()).await;
-    install_generator_pipeline(&restarted).await;
-    restarted
-        .start()
-        .await
-        .expect("startup recovery must settle the Prepared witness before reconciliation");
-
-    let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-        &checkpoint_dir,
-    )
-    .unwrap();
-    let winner = decisions
-        .outcome(prepared_epoch)
-        .await
-        .unwrap()
-        .expect("recovery must publish a terminal winner");
-    assert_eq!(winner.checkpoint_id, prepared_id);
-    assert_eq!(
-        winner.verdict,
-        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
-    );
-    restarted.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn startup_rejects_a_state_root_from_another_deployment_before_installing_coordinator() {
-    let root = tempfile::tempdir().unwrap();
-    let state_dir = root.path().join("state");
-    let first = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-a"))
-        .build()
-        .await
-        .unwrap();
-    first.start().await.unwrap();
-    first.shutdown().await.unwrap();
-
-    let second = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-b"))
-        .build()
-        .await
-        .unwrap();
-    let error = second.start().await.unwrap_err();
-    assert!(
-        error.to_string().contains("belongs to deployment"),
-        "{error}"
-    );
-    assert!(second.coordinator.lock().await.is_none());
-}
-
-#[tokio::test]
-async fn recovered_global_watermark_floors_a_source_without_a_source_watermark() {
+async fn checkpoint_does_not_invent_a_watermark_for_an_uninitialized_channel() {
     let root = tempfile::tempdir().unwrap();
     let db = exact_builder(root.path())
         .delivery_guarantee(DeliveryGuarantee::BestEffort)
@@ -238,13 +197,13 @@ async fn recovered_global_watermark_floors_a_source_without_a_source_watermark()
 
     assert_eq!(
         db.pipeline_watermark.load(Ordering::Acquire),
-        1_500,
-        "the durable global frontier must seed the rebuilt tracker",
+        i64::MIN,
+        "channel progress, not the process-local aggregate, defines the durable frontier",
     );
     assert_eq!(
         source.source.current_watermark(),
-        1_500,
-        "a source missing a per-source value must inherit the durable frontier",
+        i64::MIN,
+        "an uninitialized source channel must remain uninitialized after recovery",
     );
     db.shutdown().await.unwrap();
 }
@@ -279,8 +238,10 @@ async fn local_exact_file_url_uses_the_durable_locked_namespace() {
     let checkpoint = first.checkpoint().await.unwrap();
     assert!(checkpoint.success, "{:?}", checkpoint.error);
     assert!(object_root
+        .join("nodes")
+        .join("1")
         .join("checkpoints")
-        .join(format!("checkpoint_{:06}", checkpoint.checkpoint_id))
+        .join(format!("{:020}", checkpoint.checkpoint_id))
         .join("manifest.json")
         .is_file());
     let error = second
@@ -352,13 +313,12 @@ async fn local_at_least_once_rejects_an_unfenced_shared_checkpoint_namespace() {
 async fn local_best_effort_cannot_bypass_a_replay_namespace_lock() {
     let root = tempfile::tempdir().unwrap();
     let checkpoint_dir = root.path().join("checkpoints");
-    let best_effort =
-        exact_builder_with_roots(&root.path().join("best-effort-state"), &checkpoint_dir)
-            .delivery_guarantee(DeliveryGuarantee::BestEffort)
-            .build()
-            .await
-            .unwrap();
-    let replay = exact_builder_with_roots(&root.path().join("replay-state"), &checkpoint_dir)
+    let best_effort = exact_builder_for_checkpoint(&checkpoint_dir)
+        .delivery_guarantee(DeliveryGuarantee::BestEffort)
+        .build()
+        .await
+        .unwrap();
+    let replay = exact_builder_for_checkpoint(&checkpoint_dir)
         .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
         .build()
         .await

@@ -83,7 +83,7 @@ pub enum DbError {
     Checkpoint(String),
 
     /// Checkpoint store error (preserves structured source error).
-    CheckpointStore(#[from] laminar_core::storage::checkpoint_store::CheckpointStoreError),
+    CheckpointStore(#[from] laminar_core::checkpoint::checkpoint_store::CheckpointStoreError),
 
     /// Unresolved config variable
     UnresolvedConfigVar(String),
@@ -96,6 +96,9 @@ pub enum DbError {
 
     /// Pipeline error (start/shutdown lifecycle)
     Pipeline(String),
+
+    /// A deterministic record-path failure that retry or checkpoint recovery cannot repair.
+    PipelineTerminal(String),
 
     /// `BackpressurePolicy::Fail` tripped; coordinator halts the pipeline.
     BackpressureFail(String),
@@ -114,10 +117,23 @@ pub enum DbError {
     /// durable cut before replay.
     ShufflePartialSend(String),
 
-    /// A stateful operator admitted input before a later step in the same cycle failed. The graph
-    /// must not replay that input against the mutated local state; recovery rewinds the failure
-    /// domain to its last durable cut.
+    /// A stateful operator may have changed local state before the attempt failed. This denotes an
+    /// indeterminate apply outcome, not proof that exactly a prefix was applied. The graph must not
+    /// replay that input against the possibly changed state; recovery rewinds the failure domain to
+    /// its last durable cut.
     StatefulOperatorPartialApply(String),
+
+    /// Managed working state crossed the configured pipeline-wide charged-byte envelope. The
+    /// current graph generation must halt: replaying the same input against the same limit would
+    /// loop, and a record-path detection may follow state mutation but always precedes output.
+    ManagedStateBudgetExceeded {
+        /// Boundary at which the excess was detected.
+        context: String,
+        /// Combined live, prepared, and retired charged bytes.
+        accounted_bytes: usize,
+        /// Configured pipeline-wide maximum.
+        limit_bytes: usize,
+    },
 
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
@@ -217,11 +233,13 @@ impl DbError {
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
             Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
             Self::Pipeline(_)
+            | Self::PipelineTerminal(_)
             | Self::BackpressureFail(_)
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
+            Self::ManagedStateBudgetExceeded { .. } => error_codes::MANAGED_STATE_BUDGET_EXCEEDED,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
@@ -238,7 +256,13 @@ impl DbError {
     /// `true` when retry or recovery cannot repair the current input and the pipeline must stop.
     #[must_use]
     pub fn requires_pipeline_halt(&self) -> bool {
-        matches!(self, Self::BackpressureFail(_) | Self::ShuffleTerminal(_))
+        matches!(
+            self,
+            Self::PipelineTerminal(_)
+                | Self::BackpressureFail(_)
+                | Self::ShuffleTerminal(_)
+                | Self::ManagedStateBudgetExceeded { .. }
+        )
     }
 
     /// `true` when failure-domain isolation cannot safely keep the current pipeline alive.
@@ -359,6 +383,9 @@ impl std::fmt::Display for DbError {
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())
             }
+            Self::PipelineTerminal(msg) => {
+                write!(f, "[{}] Terminal pipeline error: {msg}", self.code())
+            }
             Self::BackpressureFail(msg) => {
                 write!(f, "[{}] Backpressure fail: {msg}", self.code())
             }
@@ -378,6 +405,15 @@ impl std::fmt::Display for DbError {
                     self.code()
                 )
             }
+            Self::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
+                self.code()
+            ),
             Self::QueryPipeline {
                 context,
                 translated,

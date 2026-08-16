@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::RecordBatch;
-use laminar_core::state::CheckpointAttempt;
+use laminar_core::checkpoint::CheckpointAttempt;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;
 

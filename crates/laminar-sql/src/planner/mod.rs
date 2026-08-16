@@ -32,9 +32,10 @@ use crate::parser::{
     CreateLookupTableStatement, CreateSinkStatement, CreateSourceStatement, EmitClause, SinkFrom,
     StreamingStatement, WindowFunction, WindowRewriter,
 };
+use crate::temporal::temporal_table_version_count;
 use crate::translator::{
-    AnalyticWindowConfig, HavingFilterConfig, JoinOperatorConfig, OrderOperatorConfig,
-    WindowFrameConfig, WindowOperatorConfig,
+    AnalyticWindowConfig, JoinOperatorConfig, OrderOperatorConfig, WindowFrameConfig,
+    WindowOperatorConfig,
 };
 
 /// Information about a registered lookup table.
@@ -73,8 +74,8 @@ pub struct SourceInfo {
     pub name: String,
     /// Watermark column (if configured)
     pub watermark_column: Option<String>,
-    /// Connector options
-    pub options: HashMap<String, String>,
+    /// Declared non-null primary-key columns.
+    pub primary_key: Vec<String>,
 }
 
 /// Information about a registered sink
@@ -84,8 +85,6 @@ pub struct SinkInfo {
     pub name: String,
     /// Source table or query name
     pub from: String,
-    /// Connector options
-    pub options: HashMap<String, String>,
 }
 
 fn is_inline_unnest(factor: &TableFactor) -> bool {
@@ -151,8 +150,6 @@ pub struct QueryPlan {
     pub order_config: Option<OrderOperatorConfig>,
     /// Analytic window function configuration (LAG/LEAD/etc.)
     pub analytic_config: Option<AnalyticWindowConfig>,
-    /// HAVING clause filter configuration
-    pub having_config: Option<HavingFilterConfig>,
     /// Window frame configuration (ROWS BETWEEN / RANGE BETWEEN)
     pub frame_config: Option<WindowFrameConfig>,
     /// Emit strategy
@@ -161,12 +158,12 @@ pub struct QueryPlan {
     pub statement: Box<Statement>,
 }
 
-/// Exact one-call admission for a database-certified state-backed join.
+/// Exact one-call admission for database-certified changelog-to-static enrichment.
 ///
 /// The certificate is matched against the planner's independent parse, so it
 /// cannot authorize another relation pair, key mapping, or join type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateBackedJoinAdmission {
+pub struct ChangelogEnrichAdmission {
     left_table: String,
     right_table: String,
     left_keys: Vec<String>,
@@ -174,8 +171,8 @@ pub struct StateBackedJoinAdmission {
     join_type: JoinType,
 }
 
-impl StateBackedJoinAdmission {
-    /// Construct an exact INNER or LEFT state-backed join admission.
+impl ChangelogEnrichAdmission {
+    /// Construct an exact INNER or LEFT changelog enrichment admission.
     ///
     /// # Errors
     /// Returns an error for empty relations/keys or a mismatched key arity.
@@ -189,13 +186,13 @@ impl StateBackedJoinAdmission {
         let left_table = left_table.into();
         let right_table = right_table.into();
         if left_table.is_empty() || right_table.is_empty() {
-            return Err("state-backed join relations cannot be empty".into());
+            return Err("changelog enrichment relations cannot be empty".into());
         }
         if left_keys.is_empty()
             || left_keys.len() != right_keys.len()
             || left_keys.iter().chain(&right_keys).any(String::is_empty)
         {
-            return Err("state-backed join keys must be non-empty with matching arity".into());
+            return Err("changelog enrichment keys must be non-empty with matching arity".into());
         }
         Ok(Self {
             left_table,
@@ -224,8 +221,7 @@ impl StateBackedJoinAdmission {
             && self.join_type == step.join_type
             && self.left_keys.iter().map(String::as_str).eq(left_keys)
             && self.right_keys.iter().map(String::as_str).eq(right_keys)
-            && !step.is_asof_join
-            && !step.is_temporal_join
+            && !step.is_temporal_join()
             && step.time_bound.is_none()
     }
 }
@@ -251,18 +247,18 @@ impl StreamingPlanner {
         self.plan_internal(statement, None)
     }
 
-    /// Plan one query whose unbounded join shape has already been certified by
-    /// the database as a durable state-backed incremental join.
+    /// Plan one query whose unbounded join shape has been certified as
+    /// changelog-to-static enrichment by the database.
     ///
     /// This does not relax multi-way, join-type, temporal, or implicit-join
     /// validation. Raw stream callers must use [`Self::plan`].
     ///
     /// # Errors
     /// Returns `PlanningError` if the statement fails the remaining streaming checks.
-    pub fn plan_state_backed_join(
+    pub fn plan_changelog_enrich(
         &mut self,
         statement: &StreamingStatement,
-        admission: &StateBackedJoinAdmission,
+        admission: &ChangelogEnrichAdmission,
     ) -> Result<StreamingPlan, PlanningError> {
         if !matches!(
             statement,
@@ -270,7 +266,7 @@ impl StreamingPlanner {
                 | StreamingStatement::CreateStream { .. }
         ) {
             return Err(PlanningError::InvalidQuery(
-                "state-backed join admission is valid only for a named streaming query".into(),
+                "changelog enrichment admission is valid only for a named streaming query".into(),
             ));
         }
         self.plan_internal(statement, Some(admission))
@@ -279,7 +275,7 @@ impl StreamingPlanner {
     fn plan_internal(
         &mut self,
         statement: &StreamingStatement,
-        state_backed_join: Option<&StateBackedJoinAdmission>,
+        changelog_enrich: Option<&ChangelogEnrichAdmission>,
     ) -> Result<StreamingPlan, PlanningError> {
         match statement {
             StreamingStatement::CreateSource(source) => self.plan_create_source(source),
@@ -295,8 +291,12 @@ impl StreamingPlanner {
                 query,
                 emit_clause,
                 ..
-            } => self.plan_continuous_query(name, query, emit_clause.as_ref(), state_backed_join),
-            StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt),
+            } => self.plan_continuous_query(name, query, emit_clause.as_ref(), changelog_enrich),
+            StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt, None),
+            StreamingStatement::TemporalProbeQuery {
+                statement,
+                analysis,
+            } => self.plan_standard_statement(statement, Some(analysis)),
             StreamingStatement::CreateLookupTable(lt) => self.plan_create_lookup_table(lt),
             StreamingStatement::DropLookupTable { name, if_exists } => {
                 self.plan_drop_lookup_table(name, *if_exists)
@@ -373,7 +373,11 @@ impl StreamingPlanner {
         let info = SourceInfo {
             name: name.clone(),
             watermark_column,
-            options: source.with_options.clone(),
+            primary_key: source
+                .primary_key
+                .iter()
+                .map(|column| column.value.clone())
+                .collect(),
         };
 
         // Register the source
@@ -406,7 +410,6 @@ impl StreamingPlanner {
         let info = SinkInfo {
             name: name.clone(),
             from,
-            options: sink.with_options.clone(),
         };
 
         // Register the sink
@@ -421,11 +424,15 @@ impl StreamingPlanner {
         name: &ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&EmitClause>,
-        state_backed_join: Option<&StateBackedJoinAdmission>,
+        changelog_enrich: Option<&ChangelogEnrichAdmission>,
     ) -> Result<StreamingPlan, PlanningError> {
         // The query inside should be a standard SELECT
-        let stmt = match query {
-            StreamingStatement::Standard(stmt) => stmt.as_ref().clone(),
+        let (stmt, temporal_probe) = match query {
+            StreamingStatement::Standard(stmt) => (stmt.as_ref().clone(), None),
+            StreamingStatement::TemporalProbeQuery {
+                statement,
+                analysis,
+            } => (statement.as_ref().clone(), Some(analysis.as_ref())),
             _ => {
                 return Err(PlanningError::InvalidQuery(
                     "Continuous query must contain a SELECT statement".to_string(),
@@ -434,7 +441,8 @@ impl StreamingPlanner {
         };
 
         // Analyze the query for streaming features
-        let query_plan = self.analyze_query(&stmt, emit_clause, state_backed_join)?;
+        let query_plan =
+            self.analyze_query(&stmt, emit_clause, changelog_enrich, temporal_probe)?;
 
         // Keep planner classification in sync with catalog rollback/drop. A windowed query is the
         // only query shape for which the planner retains classification after planning.
@@ -451,7 +459,6 @@ impl StreamingPlanner {
             join_config: query_plan.join_config,
             order_config: query_plan.order_config,
             analytic_config: query_plan.analytic_config,
-            having_config: query_plan.having_config,
             frame_config: query_plan.frame_config,
             emit_clause: emit_clause.cloned(),
             statement: Box::new(stmt),
@@ -460,7 +467,11 @@ impl StreamingPlanner {
 
     /// Plans a standard SQL statement.
     #[allow(clippy::unused_self)] // Will use planner state for plan optimization
-    fn plan_standard_statement(&self, stmt: &Statement) -> Result<StreamingPlan, PlanningError> {
+    fn plan_standard_statement(
+        &self,
+        stmt: &Statement,
+        temporal_probe: Option<&JoinAnalysis>,
+    ) -> Result<StreamingPlan, PlanningError> {
         // Check if it's a query that might have streaming features
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
@@ -474,11 +485,24 @@ impl StreamingPlanner {
                 let window_function = Self::extract_window_from_select(select);
 
                 // Check for joins (multi-way)
-                let join_analysis = analyze_joins(select).map_err(|e| {
+                let mut join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })?;
 
-                if let Some(ref multi) = join_analysis {
+                validate_temporal_version_shape(
+                    stmt,
+                    join_analysis.as_ref().map_or(0, |multi| {
+                        multi
+                            .joins
+                            .iter()
+                            .filter(|join| join.is_temporal_join())
+                            .count()
+                    }),
+                )?;
+
+                if let Some(ref mut multi) = join_analysis {
+                    apply_temporal_probe_analysis(multi, temporal_probe)?;
+                    self.resolve_temporal_source_contracts(multi)?;
                     validate_streaming_joins(multi, &self.lookup_tables, None)?;
                 }
 
@@ -492,9 +516,7 @@ impl StreamingPlanner {
                 let analytic_config =
                     analytic_analysis.map(|a| AnalyticWindowConfig::from_analysis(&a));
 
-                // Check for HAVING clause
-                let agg_analysis = analyze_aggregates(stmt);
-                let having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
+                let has_having = analyze_aggregates(stmt).has_having;
 
                 // Check for window frame functions (ROWS BETWEEN / RANGE BETWEEN)
                 let frame_analysis = analyze_window_frames(stmt);
@@ -518,7 +540,7 @@ impl StreamingPlanner {
                     || join_analysis.is_some()
                     || order_config.is_some()
                     || analytic_config.is_some()
-                    || having_config.is_some()
+                    || has_having
                     || frame_config.is_some();
 
                 if has_streaming_features {
@@ -530,8 +552,10 @@ impl StreamingPlanner {
                         None => None,
                     };
 
-                    let join_config =
-                        join_analysis.map(|m| JoinOperatorConfig::from_multi_analysis(&m));
+                    let join_config = join_analysis
+                        .map(|m| JoinOperatorConfig::from_multi_analysis(&m))
+                        .transpose()
+                        .map_err(PlanningError::InvalidQuery)?;
 
                     return Ok(StreamingPlan::Query(QueryPlan {
                         name: None,
@@ -539,7 +563,6 @@ impl StreamingPlanner {
                         join_config,
                         order_config,
                         analytic_config,
-                        having_config,
                         frame_config,
                         emit_clause: None,
                         statement: Box::new(stmt.clone()),
@@ -547,6 +570,8 @@ impl StreamingPlanner {
                 }
             }
         }
+
+        validate_temporal_version_shape(stmt, 0)?;
 
         // Pass through standard SQL
         Ok(StreamingPlan::Standard(Box::new(stmt.clone())))
@@ -557,9 +582,11 @@ impl StreamingPlanner {
         &self,
         stmt: &Statement,
         emit_clause: Option<&EmitClause>,
-        state_backed_join: Option<&StateBackedJoinAdmission>,
+        changelog_enrich: Option<&ChangelogEnrichAdmission>,
+        temporal_probe: Option<&JoinAnalysis>,
     ) -> Result<QueryAnalysis, PlanningError> {
         let mut analysis = QueryAnalysis::default();
+        let mut recognized_temporal_versions = 0;
 
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
@@ -585,14 +612,29 @@ impl StreamingPlanner {
                 }
 
                 // Extract join info (multi-way)
-                if let Some(multi) = analyze_joins(select).map_err(|e| {
+                let join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
-                })? {
-                    validate_streaming_joins(&multi, &self.lookup_tables, state_backed_join)?;
-                    analysis.join_config = Some(JoinOperatorConfig::from_multi_analysis(&multi));
+                })?;
+                recognized_temporal_versions = join_analysis.as_ref().map_or(0, |multi| {
+                    multi
+                        .joins
+                        .iter()
+                        .filter(|join| join.is_temporal_join())
+                        .count()
+                });
+                if let Some(mut multi) = join_analysis {
+                    apply_temporal_probe_analysis(&mut multi, temporal_probe)?;
+                    self.resolve_temporal_source_contracts(&mut multi)?;
+                    validate_streaming_joins(&multi, &self.lookup_tables, changelog_enrich)?;
+                    analysis.join_config = Some(
+                        JoinOperatorConfig::from_multi_analysis(&multi)
+                            .map_err(PlanningError::InvalidQuery)?,
+                    );
                 }
             }
         }
+
+        validate_temporal_version_shape(stmt, recognized_temporal_versions)?;
 
         // Extract ORDER BY info
         let order_analysis = analyze_order_by(stmt);
@@ -603,10 +645,6 @@ impl StreamingPlanner {
         if let Some(analytic) = analyze_analytic_functions(stmt) {
             analysis.analytic_config = Some(AnalyticWindowConfig::from_analysis(&analytic));
         }
-
-        // Extract HAVING clause
-        let agg_analysis = analyze_aggregates(stmt);
-        analysis.having_config = agg_analysis.having_expr.map(HavingFilterConfig::new);
 
         // Extract window frame functions (ROWS BETWEEN / RANGE BETWEEN)
         if let Some(frame_analysis) = analyze_window_frames(stmt) {
@@ -735,6 +773,79 @@ impl StreamingPlanner {
         self.sources.values().collect()
     }
 
+    fn resolve_temporal_source_contracts(
+        &self,
+        multi: &mut MultiJoinAnalysis,
+    ) -> Result<(), PlanningError> {
+        for step in &mut multi.joins {
+            if !step.is_temporal_join() {
+                continue;
+            }
+            let (_, right_key_columns) = temporal_key_columns(step)?;
+            let left = self.sources.get(&step.left_table).ok_or_else(|| {
+                PlanningError::SourceNotFound(format!(
+                    "{} (temporal left input must be a registered event-time source)",
+                    step.left_table
+                ))
+            })?;
+            let left_time = step.left_time_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(
+                    "temporal join is missing its explicit left event-time column".into(),
+                )
+            })?;
+            let left_watermark = left.watermark_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(format!(
+                    "temporal left source '{}' must declare WATERMARK FOR {}",
+                    step.left_table, left_time
+                ))
+            })?;
+            if left_watermark != left_time {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal left timestamp '{}' does not match WATERMARK FOR {} on source '{}'",
+                    left_time, left_watermark, step.left_table
+                )));
+            }
+            let right = self.sources.get(&step.right_table).ok_or_else(|| {
+                PlanningError::SourceNotFound(format!(
+                    "{} (temporal right input must be a registered source)",
+                    step.right_table
+                ))
+            })?;
+            if !right
+                .primary_key
+                .iter()
+                .map(String::as_str)
+                .eq(right_key_columns.iter().copied())
+            {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal right source '{}' must declare PRIMARY KEY ({}) matching the join key",
+                    step.right_table,
+                    right_key_columns.join(", ")
+                )));
+            }
+            let right_time = right.watermark_column.as_ref().ok_or_else(|| {
+                PlanningError::InvalidQuery(format!(
+                    "temporal right source '{}' must declare WATERMARK FOR its version column",
+                    step.right_table
+                ))
+            })?;
+            if step
+                .right_time_column
+                .as_ref()
+                .is_some_and(|column| column != right_time)
+            {
+                return Err(PlanningError::InvalidQuery(format!(
+                    "temporal right timestamp '{}' does not match WATERMARK FOR {} on source '{}'",
+                    step.right_time_column.as_deref().unwrap_or_default(),
+                    right_time,
+                    step.right_table
+                )));
+            }
+            step.right_time_column = Some(right_time.clone());
+        }
+        Ok(())
+    }
+
     /// Lists all registered sinks.
     #[must_use]
     pub fn list_sinks(&self) -> Vec<&SinkInfo> {
@@ -799,7 +910,6 @@ struct QueryAnalysis {
     join_config: Option<Vec<JoinOperatorConfig>>,
     order_config: Option<OrderOperatorConfig>,
     analytic_config: Option<AnalyticWindowConfig>,
-    having_config: Option<HavingFilterConfig>,
     frame_config: Option<WindowFrameConfig>,
 }
 
@@ -811,11 +921,75 @@ fn object_name_to_string(name: &ObjectName) -> String {
     }
 }
 
+fn temporal_key_columns(step: &JoinAnalysis) -> Result<(Vec<&str>, Vec<&str>), PlanningError> {
+    let mut left = Vec::with_capacity(1 + step.additional_key_columns.len());
+    let mut right = Vec::with_capacity(1 + step.additional_key_columns.len());
+    left.push(step.left_key_column.as_str());
+    right.push(step.right_key_column.as_str());
+    for (left_column, right_column) in &step.additional_key_columns {
+        left.push(left_column);
+        right.push(right_column);
+    }
+    if left.is_empty()
+        || left.len() != right.len()
+        || left.iter().chain(&right).any(|column| column.is_empty())
+    {
+        return Err(PlanningError::InvalidQuery(
+            "temporal join equality keys must be non-empty and have matching cardinality".into(),
+        ));
+    }
+    Ok((left, right))
+}
+
+fn apply_temporal_probe_analysis(
+    multi: &mut MultiJoinAnalysis,
+    temporal_probe: Option<&JoinAnalysis>,
+) -> Result<(), PlanningError> {
+    let Some(temporal_probe) = temporal_probe else {
+        return Ok(());
+    };
+    let [normalized] = multi.joins.as_slice() else {
+        return Err(PlanningError::InvalidQuery(
+            "TEMPORAL PROBE JOIN requires one explicitly named two-way stage".into(),
+        ));
+    };
+    let (normalized_left_keys, normalized_right_keys) = temporal_key_columns(normalized)?;
+    let (probe_left_keys, probe_right_keys) = temporal_key_columns(temporal_probe)?;
+    if !normalized.is_temporal_join()
+        || normalized.left_table != temporal_probe.left_table
+        || normalized.right_table != temporal_probe.right_table
+        || normalized_left_keys != probe_left_keys
+        || normalized_right_keys != probe_right_keys
+        || normalized.left_time_column != temporal_probe.left_time_column
+        || normalized.join_type != temporal_probe.join_type
+    {
+        return Err(PlanningError::InvalidQuery(
+            "TEMPORAL PROBE JOIN metadata does not match its normalized AS-OF plan".into(),
+        ));
+    }
+    multi.joins[0] = temporal_probe.clone();
+    Ok(())
+}
+
+fn validate_temporal_version_shape(
+    statement: &Statement,
+    recognized_versions: usize,
+) -> Result<(), PlanningError> {
+    let ast_versions = temporal_table_version_count(statement);
+    if ast_versions != recognized_versions {
+        return Err(PlanningError::InvalidQuery(
+            "FOR SYSTEM_TIME AS OF is supported only on the right input of one direct two-input temporal join; nested and set-operation temporal joins are unsupported"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fail closed on stream-join shapes whose state/output semantics are not implemented.
 fn validate_streaming_joins(
     multi: &MultiJoinAnalysis,
     lookup_tables: &HashMap<String, LookupTableInfo>,
-    state_backed_join: Option<&StateBackedJoinAdmission>,
+    changelog_enrich: Option<&ChangelogEnrichAdmission>,
 ) -> Result<(), PlanningError> {
     if multi.joins.len() != 1 {
         return Err(PlanningError::InvalidQuery(
@@ -828,23 +1002,13 @@ fn validate_streaming_joins(
                 "streaming interval joins require a positive finite time bound".to_string(),
             ));
         }
-        if step.time_bound.is_some()
-            && !step.is_asof_join
-            && !step.is_temporal_join
-            && !matches!(step.join_type, JoinType::Inner)
-        {
-            return Err(PlanningError::InvalidQuery(format!(
-                "streaming interval joins support only INNER joins; {:?} requires durable per-row matched metadata",
-                step.join_type,
-            )));
-        }
         if step.is_bounded() {
             continue;
         }
         let left_lookup = lookup_tables.contains_key(&step.left_table);
         let right_lookup = lookup_tables.contains_key(&step.right_table);
         if !left_lookup && !right_lookup {
-            if state_backed_join.is_some_and(|admission| admission.matches(step)) {
+            if changelog_enrich.is_some_and(|admission| admission.matches(step)) {
                 continue;
             }
             return Err(PlanningError::InvalidQuery(format!(
@@ -895,6 +1059,16 @@ impl std::fmt::Display for PlanningError {
 mod tests {
     use super::*;
     use crate::parser::StreamingParser;
+
+    fn register_temporal_sources(planner: &mut StreamingPlanner) {
+        for sql in [
+            "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+            "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+        ] {
+            let statement = StreamingParser::parse_sql(sql).unwrap();
+            planner.plan(&statement[0]).unwrap();
+        }
+    }
 
     #[test]
     fn test_plan_create_source() {
@@ -1052,7 +1226,8 @@ mod tests {
     fn test_plan_query_with_join() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
-            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id \
+            "SELECT * FROM orders o JOIN payments p \
+             ON o.tenant_id = p.account_id AND o.order_id = p.payment_order_id \
              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
         )
         .unwrap();
@@ -1063,8 +1238,8 @@ mod tests {
                 assert!(query_plan.join_config.is_some());
                 let configs = query_plan.join_config.unwrap();
                 assert_eq!(configs.len(), 1);
-                assert_eq!(configs[0].left_key(), "order_id");
-                assert_eq!(configs[0].right_key(), "order_id");
+                assert_eq!(configs[0].left_keys(), ["tenant_id", "order_id"]);
+                assert_eq!(configs[0].right_keys(), ["account_id", "payment_order_id"]);
             }
             _ => panic!("Expected Query plan"),
         }
@@ -1100,13 +1275,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_state_backed_certificate_allows_only_its_join() {
+    fn changelog_enrich_certificate_allows_only_its_join() {
         let statements = StreamingParser::parse_sql(
             "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
              ON o.order_id = p.order_id",
         )
         .unwrap();
-        let admission = StateBackedJoinAdmission::try_new(
+        let admission = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["order_id".into()],
@@ -1115,10 +1290,10 @@ mod tests {
         )
         .unwrap();
         StreamingPlanner::new()
-            .plan_state_backed_join(&statements[0], &admission)
+            .plan_changelog_enrich(&statements[0], &admission)
             .unwrap();
 
-        let wrong_key = StateBackedJoinAdmission::try_new(
+        let wrong_key = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["tenant_id".into()],
@@ -1127,19 +1302,19 @@ mod tests {
         )
         .unwrap();
         let error = StreamingPlanner::new()
-            .plan_state_backed_join(&statements[0], &wrong_key)
+            .plan_changelog_enrich(&statements[0], &wrong_key)
             .unwrap_err();
         assert!(error.to_string().contains("unbounded join"));
     }
 
     #[test]
-    fn composite_state_backed_certificate_binds_ordered_key_mapping() {
+    fn composite_changelog_enrichment_is_rejected_until_operator_supports_it() {
         let statements = StreamingParser::parse_sql(
             "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
              ON o.tenant_id = p.account_id AND o.order_id = p.payment_order_id",
         )
         .unwrap();
-        let exact = StateBackedJoinAdmission::try_new(
+        let exact = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["tenant_id".into(), "order_id".into()],
@@ -1147,29 +1322,10 @@ mod tests {
             false,
         )
         .unwrap();
-        StreamingPlanner::new()
-            .plan_state_backed_join(&statements[0], &exact)
-            .unwrap();
-
-        for (left_keys, right_keys) in [
-            (
-                vec!["order_id".into(), "tenant_id".into()],
-                vec!["payment_order_id".into(), "account_id".into()],
-            ),
-            (
-                vec!["tenant_id".into(), "order_id".into()],
-                vec!["account_id".into(), "order_id".into()],
-            ),
-        ] {
-            let mismatch = StateBackedJoinAdmission::try_new(
-                "orders", "payments", left_keys, right_keys, false,
-            )
-            .unwrap();
-            let error = StreamingPlanner::new()
-                .plan_state_backed_join(&statements[0], &mismatch)
-                .unwrap_err();
-            assert!(error.to_string().contains("unbounded join"));
-        }
+        let error = StreamingPlanner::new()
+            .plan_changelog_enrich(&statements[0], &exact)
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly one equality key"));
     }
 
     #[test]
@@ -1179,7 +1335,7 @@ mod tests {
              ON o.order_id = p.order_id",
         )
         .unwrap();
-        let left = StateBackedJoinAdmission::try_new(
+        let left = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["order_id".into()],
@@ -1188,10 +1344,10 @@ mod tests {
         )
         .unwrap();
         StreamingPlanner::new()
-            .plan_state_backed_join(&statements[0], &left)
+            .plan_changelog_enrich(&statements[0], &left)
             .unwrap();
 
-        let inner = StateBackedJoinAdmission::try_new(
+        let inner = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["order_id".into()],
@@ -1200,13 +1356,13 @@ mod tests {
         )
         .unwrap();
         assert!(StreamingPlanner::new()
-            .plan_state_backed_join(&statements[0], &inner)
+            .plan_changelog_enrich(&statements[0], &inner)
             .is_err());
     }
 
     #[test]
-    fn state_backed_certificate_does_not_relax_right_or_multiway_joins() {
-        let admission = StateBackedJoinAdmission::try_new(
+    fn changelog_enrich_certificate_does_not_relax_right_or_multiway_joins() {
+        let admission = ChangelogEnrichAdmission::try_new(
             "orders",
             "payments",
             vec!["order_id".into()],
@@ -1222,7 +1378,7 @@ mod tests {
         ] {
             let statements = StreamingParser::parse_sql(sql).unwrap();
             assert!(StreamingPlanner::new()
-                .plan_state_backed_join(&statements[0], &admission)
+                .plan_changelog_enrich(&statements[0], &admission)
                 .is_err());
         }
     }
@@ -1269,28 +1425,33 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_rejects_non_inner_interval_joins() {
-        for join_type in [
-            "LEFT",
-            "RIGHT",
-            "FULL",
-            "LEFT SEMI",
-            "LEFT ANTI",
-            "RIGHT SEMI",
-            "RIGHT ANTI",
+    fn test_plan_allows_all_bounded_equi_join_kinds() {
+        for (sql_join_type, expected) in [
+            ("INNER", JoinType::Inner),
+            ("LEFT", JoinType::Left),
+            ("RIGHT", JoinType::Right),
+            ("FULL", JoinType::Full),
+            ("LEFT SEMI", JoinType::LeftSemi),
+            ("LEFT ANTI", JoinType::LeftAnti),
+            ("RIGHT SEMI", JoinType::RightSemi),
+            ("RIGHT ANTI", JoinType::RightAnti),
         ] {
             let sql = format!(
-                "SELECT * FROM orders o {join_type} JOIN payments p \
+                "SELECT * FROM orders o {sql_join_type} JOIN payments p \
                  ON o.order_id = p.order_id \
                  AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
             );
             let statements = StreamingParser::parse_sql(&sql).unwrap();
-            let error = StreamingPlanner::new().plan(&statements[0]).unwrap_err();
-            let message = error.to_string();
-            assert!(
-                message.contains("only INNER joins"),
-                "{join_type} interval join was not rejected: {message}"
-            );
+            let plan = StreamingPlanner::new().plan(&statements[0]).unwrap();
+            let StreamingPlan::Query(query) = plan else {
+                panic!("{sql_join_type} interval join did not produce a query plan");
+            };
+            let Some(JoinOperatorConfig::StreamStream(config)) =
+                query.join_config.and_then(|mut configs| configs.pop())
+            else {
+                panic!("{sql_join_type} interval join did not produce a stream-join config");
+            };
+            assert_eq!(config.join_type, expected);
         }
     }
 
@@ -1339,32 +1500,8 @@ mod tests {
         match plan {
             StreamingPlan::Query(query_plan) => {
                 assert!(query_plan.window_config.is_some());
-                assert!(query_plan.having_config.is_some());
-                let config = query_plan.having_config.unwrap();
-                assert!(
-                    config.predicate().contains("COUNT(*)"),
-                    "predicate was: {}",
-                    config.predicate()
-                );
             }
-            _ => panic!("Expected Query plan with having config"),
-        }
-    }
-
-    #[test]
-    fn test_plan_query_without_having() {
-        let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT COUNT(*) FROM events GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE)",
-        )
-        .unwrap();
-
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(query_plan) => {
-                assert!(query_plan.having_config.is_none());
-            }
-            _ => panic!("Expected Query plan"),
+            _ => panic!("Expected windowed Query plan"),
         }
     }
 
@@ -1380,31 +1517,9 @@ mod tests {
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
             StreamingPlan::Query(query_plan) => {
-                assert!(query_plan.having_config.is_some());
                 assert!(query_plan.window_config.is_none());
             }
             _ => panic!("Expected Query plan for HAVING-only query"),
-        }
-    }
-
-    #[test]
-    fn test_plan_having_compound_predicate() {
-        let mut planner = StreamingPlanner::new();
-        let statements = StreamingParser::parse_sql(
-            "SELECT symbol, COUNT(*) AS cnt, SUM(vol) AS total \
-             FROM trades GROUP BY symbol \
-             HAVING COUNT(*) >= 5 AND SUM(vol) > 10000",
-        )
-        .unwrap();
-
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(query_plan) => {
-                let config = query_plan.having_config.unwrap();
-                let pred = config.predicate();
-                assert!(pred.contains("AND"), "predicate was: {pred}");
-            }
-            _ => panic!("Expected Query plan"),
         }
     }
 
@@ -1493,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_backward_compat_no_join() {
+    fn test_plan_non_join_query() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql("SELECT * FROM orders").unwrap();
 
@@ -1502,6 +1617,183 @@ mod tests {
             StreamingPlan::Standard(_) => {} // No join → pass-through
             _ => panic!("Expected Standard plan for simple SELECT"),
         }
+    }
+
+    #[test]
+    fn temporal_as_of_resolves_both_event_time_contracts() {
+        let mut planner = StreamingPlanner::new();
+        register_temporal_sources(&mut planner);
+        let statement = StreamingParser::parse_sql(
+            "SELECT t.symbol, q.price FROM trades t \
+             JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+             ON t.symbol = q.symbol",
+        )
+        .unwrap();
+        let StreamingPlan::Query(plan) = planner.plan(&statement[0]).unwrap() else {
+            panic!("expected temporal query plan");
+        };
+        let Some(JoinOperatorConfig::Temporal(config)) =
+            plan.join_config.and_then(|mut configs| configs.pop())
+        else {
+            panic!("expected canonical temporal config");
+        };
+        assert_eq!(config.left_time_column, "trade_time");
+        assert_eq!(config.right_time_column, "quote_time");
+        assert_eq!(config.join_kind, crate::temporal::TemporalJoinKind::Inner);
+        assert_eq!(config.probe_schedule.offsets_ms(), [0]);
+    }
+
+    #[test]
+    fn temporal_as_of_preserves_composite_key_order_and_requires_exact_primary_key() {
+        for (primary_key, accepted) in [
+            ("tenant, symbol", true),
+            ("symbol, tenant", false),
+            ("tenant", false),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            for sql in [
+                "CREATE SOURCE trades (tenant VARCHAR, symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)".to_string(),
+                format!(
+                    "CREATE SOURCE quotes (tenant VARCHAR NOT NULL, symbol VARCHAR NOT NULL, quote_time TIMESTAMP, PRIMARY KEY ({primary_key}), WATERMARK FOR quote_time)"
+                ),
+            ] {
+                let statement = StreamingParser::parse_sql(&sql).unwrap();
+                planner.plan(&statement[0]).unwrap();
+            }
+
+            let statement = StreamingParser::parse_sql(
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.tenant = q.tenant AND t.symbol = q.symbol",
+            )
+            .unwrap();
+            let plan_result = planner.plan(&statement[0]);
+            if accepted {
+                let StreamingPlan::Query(plan) = plan_result.unwrap() else {
+                    panic!("expected temporal query plan");
+                };
+                let Some(JoinOperatorConfig::Temporal(config)) =
+                    plan.join_config.and_then(|mut configs| configs.pop())
+                else {
+                    panic!("expected canonical temporal config");
+                };
+                assert_eq!(config.left_key_columns, ["tenant", "symbol"]);
+                assert_eq!(config.right_key_columns, ["tenant", "symbol"]);
+            } else {
+                let error = plan_result.unwrap_err().to_string();
+                assert!(error.contains("PRIMARY KEY (tenant, symbol)"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn temporal_as_of_rejects_invalid_equality_expressions() {
+        for (query, expected) in [
+            (
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON LOWER(t.symbol) = q.symbol",
+                "qualified column references",
+            ),
+            (
+                "SELECT * FROM trades AS quotes \
+                 JOIN quotes FOR SYSTEM_TIME AS OF trades.trade_time AS q \
+                 ON quotes.symbol = q.symbol",
+                "names both inputs",
+            ),
+            (
+                "SELECT * FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol AND q.quote_time BETWEEN t.trade_time AND t.trade_time + INTERVAL '1' SECOND",
+                "additional time-bound",
+            ),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            register_temporal_sources(&mut planner);
+            let statement = StreamingParser::parse_sql(query).unwrap();
+            let error = planner.plan(&statement[0]).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn temporal_probe_list_uses_the_as_of_config() {
+        let mut planner = StreamingPlanner::new();
+        for sql in [
+            "CREATE SOURCE trades (symbol VARCHAR, venue VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+            "CREATE SOURCE quotes (symbol VARCHAR NOT NULL, venue VARCHAR NOT NULL, quote_time TIMESTAMP, PRIMARY KEY (symbol, venue), WATERMARK FOR quote_time)",
+        ] {
+            let statement = StreamingParser::parse_sql(sql).unwrap();
+            planner.plan(&statement[0]).unwrap();
+        }
+        let statement = StreamingParser::parse_sql(
+            "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
+             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol, venue) \
+             TIMESTAMPS (trade_time, quote_time) LIST (-1s, 0s, 5s) AS probe",
+        )
+        .unwrap();
+        let StreamingPlan::Query(plan) = planner.plan(&statement[0]).unwrap() else {
+            panic!("expected temporal probe query plan");
+        };
+        let Some(JoinOperatorConfig::Temporal(config)) =
+            plan.join_config.and_then(|mut configs| configs.pop())
+        else {
+            panic!("expected canonical temporal config");
+        };
+        assert_eq!(config.left_key_columns, ["symbol", "venue"]);
+        assert_eq!(config.right_key_columns, ["symbol", "venue"]);
+        assert_eq!(config.probe_schedule.offsets_ms(), [-1_000, 0, 5_000]);
+        assert_eq!(config.probe_alias.as_deref(), Some("probe"));
+    }
+
+    #[test]
+    fn temporal_join_requires_source_watermarks_and_matching_right_key() {
+        for (left, right, expected) in [
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP)",
+                "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+                "temporal left source 'trades' must declare WATERMARK",
+            ),
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+                "CREATE SOURCE quotes (symbol VARCHAR, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+                "must declare PRIMARY KEY (symbol)",
+            ),
+            (
+                "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+                "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, quote_time TIMESTAMP)",
+                "must declare WATERMARK FOR its version column",
+            ),
+        ] {
+            let mut planner = StreamingPlanner::new();
+            for sql in [left, right] {
+                let statement = StreamingParser::parse_sql(sql).unwrap();
+                planner.plan(&statement[0]).unwrap();
+            }
+            let query = StreamingParser::parse_sql(
+                "SELECT * FROM trades t JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol",
+            )
+            .unwrap();
+            let error = planner.plan(&query[0]).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn nested_temporal_versions_fail_closed() {
+        let mut planner = StreamingPlanner::new();
+        register_temporal_sources(&mut planner);
+        let statement = StreamingParser::parse_sql(
+            "WITH matched AS (\
+                 SELECT t.symbol FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol\
+             ) SELECT * FROM matched",
+        )
+        .unwrap();
+        let error = planner.plan(&statement[0]).unwrap_err().to_string();
+        assert!(error.contains("nested and set-operation"), "{error}");
     }
 
     // -- Window Frame planner tests --

@@ -33,6 +33,108 @@ fn test_batch(n: usize) -> RecordBatch {
     .unwrap()
 }
 
+async fn create_cdf_table(table_path: &str, schema: &SchemaRef) -> DeltaTable {
+    use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
+    use deltalake::TableProperty;
+
+    let delta_schema: deltalake::kernel::StructType = schema.as_ref().try_into_kernel().unwrap();
+    let url = path_to_url(table_path).unwrap();
+    DeltaTable::try_from_url_with_storage_options(url, HashMap::new())
+        .await
+        .unwrap()
+        .create()
+        .with_columns(delta_schema.fields().cloned())
+        .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
+        .await
+        .unwrap()
+}
+
+fn cdf_batch(change_types: Vec<Option<&str>>) -> RecordBatch {
+    let rows = change_types.len();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_change_type", DataType::Utf8, true),
+            Field::new("_commit_version", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(StringArray::from(change_types)),
+            Arc::new(Int64Array::from_value(7, rows)),
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn cdf_changelog_preserves_every_row_class_as_signed_weight() {
+    let output = map_cdf_to_changelog(&cdf_batch(vec![
+        Some("insert"),
+        Some("delete"),
+        Some("update_preimage"),
+        Some("update_postimage"),
+    ]))
+    .unwrap();
+
+    assert_eq!(output.num_rows(), 4);
+    assert!(output.schema().index_of("_change_type").is_err());
+    assert!(output.schema().index_of("_commit_version").is_err());
+    let weight = laminar_core::changelog::WEIGHT_COLUMN;
+    let schema = output.schema();
+    let field = schema.field_with_name(weight).unwrap();
+    assert_eq!(field.data_type(), &DataType::Int64);
+    assert!(!field.is_nullable());
+    assert_eq!(
+        output
+            .column_by_name(weight)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[1, -1, -1, 1]
+    );
+}
+
+#[test]
+fn cdf_changelog_rejects_null_and_unknown_change_types() {
+    for change_types in [vec![None], vec![Some("truncate")]] {
+        assert!(map_cdf_to_changelog(&cdf_batch(change_types)).is_err());
+    }
+
+    let collision = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("__WEIGHT", DataType::Int64, false),
+            Field::new("_change_type", DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["insert"])),
+        ],
+    )
+    .unwrap();
+    assert!(map_cdf_to_changelog(&collision).is_err());
+}
+
+#[test]
+fn cdf_contract_failures_are_terminal() {
+    let unavailable =
+        map_cdf_scan_build_error(deltalake::DeltaTableError::ChangeDataNotEnabled { version: 0 });
+    assert!(!unavailable.is_transient());
+    assert!(unavailable.to_string().contains("CDF is unavailable"));
+
+    let batch = cdf_batch(vec![Some("insert"), Some("delete")]);
+    let row_error = checked_cdf_commit_usage(0, 0, &batch, 1, usize::MAX).unwrap_err();
+    assert!(!row_error.is_transient());
+    assert!(row_error.to_string().contains("hard row limit"));
+
+    let byte_error =
+        checked_cdf_commit_usage(0, 0, &batch, usize::MAX, batch.get_array_memory_size() - 1)
+            .unwrap_err();
+    assert!(!byte_error.is_transient());
+    assert!(byte_error.to_string().contains("hard byte limit"));
+}
+
 #[test]
 fn only_proven_optimistic_collisions_are_retryable_conflicts() {
     use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
@@ -176,6 +278,12 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
         &s3_environment,
     )
     .unwrap();
+    assert!(validate_coordinated_storage_preflight_with_env(
+        "unknown://bucket/table",
+        &HashMap::new(),
+        &no_environment,
+    )
+    .is_err());
     let conditional_environment = HashMap::from([("AWS_CONDITIONAL_PUT", "dynamo:commits")]);
     let conditional_environment =
         |key: &str| conditional_environment.get(key).map(ToString::to_string);
@@ -194,6 +302,16 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
         &azure_environment,
     )
     .is_err());
+    for path in [
+        "az://container/table",
+        "abfs://container/table",
+        "abfss://container/table",
+        "wasb://container/table",
+        "wasbs://container/table",
+    ] {
+        validate_coordinated_storage_preflight_with_env(path, &HashMap::new(), &no_environment)
+            .unwrap();
+    }
 
     for options in [
         HashMap::from([(
@@ -585,6 +703,8 @@ async fn test_sink_source_roundtrip() {
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
 
+    create_cdf_table(table_path, &test_schema()).await;
+
     // Write data via sink.
     let sink_config = DeltaLakeSinkConfig::new(table_path);
     let mut sink = DeltaLakeSink::with_schema(sink_config, test_schema());
@@ -598,7 +718,7 @@ async fn test_sink_source_roundtrip() {
 
     // Read data via source.
     let mut source_config = DeltaSourceConfig::new(table_path);
-    source_config.starting_version = Some(0);
+    source_config.starting_version = Some(1);
     let mut source = DeltaSource::new(source_config, None);
     let source_connector_config = ConnectorConfig::new("delta-lake");
     source
@@ -641,9 +761,7 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
 
     // Create table and write 2 versions.
     let schema = test_schema();
-    let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-        .await
-        .unwrap();
+    let table = create_cdf_table(table_path, &schema).await;
 
     let (table, _) = write_batches(
         table,
@@ -668,10 +786,9 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
     .await
     .unwrap();
 
-    // Open source starting from version 0. The source jumps to the
-    // latest version (2) in a single poll, reading the full snapshot.
+    // Consume both data commits in order from the first data version.
     let mut source_config = DeltaSourceConfig::new(table_path);
-    source_config.starting_version = Some(0);
+    source_config.starting_version = Some(1);
     let mut source = DeltaSource::new(source_config.clone(), None);
     let connector_config = ConnectorConfig::new("delta-lake");
     source
@@ -686,7 +803,7 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
         .await
         .unwrap();
 
-    // Poll to consume latest version (2).
+    // Drain data commits 1 and 2.
     let _ = source.poll_batch(10000).await.unwrap();
     // Drain buffered.
     while let Ok(Some(_)) = source.poll_batch(10000).await {}
@@ -703,7 +820,7 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
             SourceStart::new(
                 connector_config,
                 SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(2, 2),
+                    attempt: laminar_core::checkpoint::CheckpointAttempt::new(2, 2),
                     checkpoint: cp,
                 },
                 DeliveryGuarantee::AtLeastOnce,
@@ -970,8 +1087,8 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -1005,7 +1122,7 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
         target: first_attempt,
         entries: vec![CoordinatedCommitPayload {
             attempt: first_attempt,
-            participant_id: 0,
+            participant_id: 1,
             payload: Some(first_descriptor.clone()),
         }],
     };
@@ -1031,12 +1148,12 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: first_attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(first_descriptor),
             },
             CoordinatedCommitPayload {
                 attempt: second_attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(second_descriptor),
             },
         ],
@@ -1112,8 +1229,8 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -1149,7 +1266,7 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         target: second,
         entries: vec![CoordinatedCommitPayload {
             attempt: second,
-            participant_id: 0,
+            participant_id: 1,
             payload: Some(pending_descriptor.clone()),
         }],
     };
@@ -1164,12 +1281,12 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: second,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(pending_descriptor),
             },
             CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(higher_descriptor),
             },
         ],
@@ -1223,8 +1340,8 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitNamespace, CoordinatedCommitPayload,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
@@ -1248,7 +1365,7 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
         target,
         entries: vec![CoordinatedCommitPayload {
             attempt: target,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };

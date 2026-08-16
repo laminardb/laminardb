@@ -67,8 +67,8 @@ pub trait LookupSourceFactory: Send + Sync {
 type LookupSourceRegistration = (ConnectorInfo, Arc<dyn LookupSourceFactory>);
 
 /// Registry of available connector implementations. Connectors register
-/// a factory per type string; the runtime looks up by the `connector`
-/// property in `CREATE SOURCE/SINK` DDL.
+/// a factory per type string; the runtime resolves the connector named by
+/// `FROM` in `CREATE SOURCE` or `INTO` in `CREATE SINK`.
 #[derive(Clone)]
 pub struct ConnectorRegistry {
     sources: Arc<RwLock<HashMap<String, (ConnectorInfo, SourceFactory)>>>,
@@ -198,8 +198,8 @@ impl ConnectorRegistry {
 
     /// Creates a new source connector instance.
     ///
-    /// The factory creates a default-configured connector. The caller must
-    /// subsequently call `open(config)` to forward WITH clause properties.
+    /// The factory creates a default-configured connector. The caller forwards
+    /// the resolved `FROM` and `FORMAT` configuration in the startup request.
     ///
     /// If a `prometheus::Registry` is provided, the connector will register
     /// its metrics on it so they appear in the scrape output.

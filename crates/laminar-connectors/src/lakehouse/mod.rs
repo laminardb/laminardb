@@ -48,7 +48,7 @@ pub use delta_metrics::DeltaLakeSinkMetrics;
 #[cfg(feature = "delta-lake")]
 pub use delta_reference::DeltaReferenceTableSource;
 pub use delta_source::DeltaSource;
-pub use delta_source_config::{DeltaReadMode, DeltaSourceConfig, SchemaEvolutionAction};
+pub use delta_source_config::DeltaSourceConfig;
 pub use metrics::LakehouseSinkMetrics;
 
 // Re-export Iceberg types at module level.
@@ -501,33 +501,13 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "starting.version",
-            "Starting version to read from (default: latest)",
+            "First version to read (default: only versions committed after startup)",
             "",
         ),
         ConfigKeySpec::optional(
             "poll.interval.ms",
             "How often to poll for new versions (ms)",
             "1000",
-        ),
-        ConfigKeySpec::optional(
-            "read.mode",
-            "Read mode: 'incremental' (changes only) or 'snapshot' (full re-read)",
-            "incremental",
-        ),
-        ConfigKeySpec::optional(
-            "partition.filter",
-            "SQL predicate for partition filter pushdown (e.g. \"date = '2024-01-01'\")",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "schema.evolution.action",
-            "Action on schema change: 'warn' or 'error'",
-            "warn",
-        ),
-        ConfigKeySpec::optional(
-            "cdf.enabled",
-            "Use Change Data Feed for incremental reads (requires CDF on table)",
-            "false",
         ),
         // ── Catalog configuration ──
         ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),

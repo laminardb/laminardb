@@ -56,6 +56,79 @@ impl LaminarDB {
         self.engine_metrics.lock().clone()
     }
 
+    /// Read one bounded, process-bound page of local cluster checkpoint barrier timings.
+    ///
+    /// This is an in-memory diagnostic read. It performs no checkpoint, state-backend, network,
+    /// filesystem, or object-store operation. A continuation cursor is the pair of
+    /// `expected_process` and `after_sequence`; callers must retain both from the prior page.
+    /// Snapshot counters may advance immediately after this call, so certification must finish
+    /// with a quiescent repeated read rather than treating one page as a stable cut.
+    ///
+    /// # Errors
+    /// Returns an error when a continuation omits or mismatches its process identity, live process
+    /// authority cannot be sampled without waiting, authority changes during the read, or the
+    /// bounded ledger snapshot rejects its cursor/page request.
+    #[cfg(feature = "cluster")]
+    pub fn checkpoint_barrier_timing_snapshot(
+        &self,
+        expected_process: Option<laminar_core::cluster::control::LocalProcessAuthorityIdentity>,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<
+        crate::checkpoint_timing::CheckpointBarrierTimingPage,
+        crate::checkpoint_timing::CheckpointBarrierTimingReadError,
+    > {
+        use crate::checkpoint_timing::{
+            CheckpointBarrierTimingPage, CheckpointBarrierTimingReadError,
+        };
+
+        if after_sequence != 0 && expected_process.is_none() {
+            return Err(CheckpointBarrierTimingReadError::ProcessIdentityRequired);
+        }
+        let controller = self
+            .cluster_controller
+            .try_lock()
+            .and_then(|controller| controller.clone())
+            .ok_or(CheckpointBarrierTimingReadError::ProcessIdentityUnavailable)?;
+        let before = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|_| CheckpointBarrierTimingReadError::ProcessIdentityUnavailable)?;
+        if let Some(expected) = expected_process {
+            if expected != before {
+                return Err(CheckpointBarrierTimingReadError::ProcessIdentityMismatch {
+                    expected,
+                    actual: before,
+                });
+            }
+        }
+
+        let snapshot = self
+            .checkpoint_barrier_timings
+            .snapshot_after(after_sequence, limit)?;
+        let after = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|_| CheckpointBarrierTimingReadError::ProcessIdentityUnavailable)?;
+        if before != after {
+            return Err(CheckpointBarrierTimingReadError::ProcessIdentityChanged { before, after });
+        }
+        if let Some(actual) = snapshot.process {
+            if actual != before {
+                return Err(CheckpointBarrierTimingReadError::LedgerProcessMismatch {
+                    expected: before,
+                    actual,
+                });
+            }
+        }
+        debug_assert!(snapshot
+            .records
+            .iter()
+            .all(|record| record.process == before));
+        Ok(CheckpointBarrierTimingPage {
+            process: before,
+            snapshot,
+        })
+    }
+
     /// Get the current pipeline state as a string.
     pub fn pipeline_state(&self) -> &'static str {
         match DbState::load(&self.state) {
@@ -253,6 +326,91 @@ impl LaminarDB {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cluster")]
+    async fn cluster_db_with_live_process() -> (
+        Arc<LaminarDB>,
+        laminar_core::cluster::control::LocalProcessAuthorityIdentity,
+    ) {
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, LeaseDeadline, ProcessLeaseAuthority, ProcessLeaseOutcome,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+
+        let node = NodeId(71);
+        let boot = uuid::Uuid::from_u128(71);
+        let kv: Arc<dyn ClusterKv> =
+            Arc::new(laminar_core::cluster::control::InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&kv),
+            kv,
+            None,
+            members_rx,
+            boot,
+        ));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )))
+            .unwrap();
+        let authority = Arc::new(
+            ProcessLeaseAuthority::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(lease) = authority
+            .store_for(node)
+            .try_acquire(boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("empty process authority must grant the test process");
+        };
+        controller.set_process_lease_authority(authority).unwrap();
+        controller
+            .publish_leased_recovery_incarnation(&lease)
+            .await
+            .unwrap();
+        let process = controller
+            .try_live_local_process_authority_identity()
+            .unwrap();
+
+        let db = Arc::new(
+            LaminarDB::open_with_config_and_vars_and_rules(
+                crate::config::LaminarConfig::default(),
+                std::collections::HashMap::new(),
+                &[],
+                None,
+                crate::db::RuntimeMode::Cluster,
+            )
+            .unwrap(),
+        );
+        db.set_cluster_controller(controller).unwrap();
+        (db, process)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn timing_observation(
+        process: laminar_core::cluster::control::LocalProcessAuthorityIdentity,
+        checkpoint_id: u64,
+    ) -> crate::checkpoint_timing::CheckpointBarrierTimingObservation {
+        crate::checkpoint_timing::CheckpointBarrierTimingObservation {
+            process,
+            attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(checkpoint_id),
+            role: crate::checkpoint_timing::CheckpointBarrierRole::Follower,
+            assignment_version: 3,
+            assignment_digest: [9; 32],
+            pipeline_stall_ns: 100,
+            local_barrier_ns: 60,
+            aligned_resume_ns: Some(20),
+            durable_tail_handoff: true,
+            deadline_exhausted: false,
+        }
+    }
+
     #[test]
     fn prometheus_registry_is_single_assignment() {
         let db = LaminarDB::open().unwrap();
@@ -299,5 +457,63 @@ mod tests {
 
         DbState::Created.store(&db.state);
         assert!(error.contains("Created"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpoint_timing_cursor_is_bound_to_the_live_process() {
+        use crate::checkpoint_timing::CheckpointBarrierTimingReadError;
+
+        let (db, process) = cluster_db_with_live_process().await;
+        assert!(db
+            .checkpoint_barrier_timings
+            .try_record(timing_observation(process, 1)));
+        assert!(db
+            .checkpoint_barrier_timings
+            .try_record(timing_observation(process, 2)));
+
+        assert_eq!(
+            db.checkpoint_barrier_timing_snapshot(None, 1, 1),
+            Err(CheckpointBarrierTimingReadError::ProcessIdentityRequired)
+        );
+        let mut stale_process = process;
+        stale_process.process_term += 1;
+        assert_eq!(
+            db.checkpoint_barrier_timing_snapshot(Some(stale_process), 1, 1),
+            Err(CheckpointBarrierTimingReadError::ProcessIdentityMismatch {
+                expected: stale_process,
+                actual: process,
+            })
+        );
+
+        let first = db.checkpoint_barrier_timing_snapshot(None, 0, 1).unwrap();
+        assert_eq!(first.process, process);
+        assert_eq!(first.snapshot.process, Some(process));
+        assert_eq!(first.snapshot.records[0].sequence, 1);
+        let second = db
+            .checkpoint_barrier_timing_snapshot(Some(process), 1, 1)
+            .unwrap();
+        assert_eq!(second.snapshot.records[0].sequence, 2);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpoint_timing_read_rejects_a_foreign_ledger_domain() {
+        use crate::checkpoint_timing::CheckpointBarrierTimingReadError;
+
+        let (db, process) = cluster_db_with_live_process().await;
+        let mut foreign = process;
+        foreign.process_term += 1;
+        assert!(db
+            .checkpoint_barrier_timings
+            .try_record(timing_observation(foreign, 1)));
+
+        assert_eq!(
+            db.checkpoint_barrier_timing_snapshot(None, 0, 1),
+            Err(CheckpointBarrierTimingReadError::LedgerProcessMismatch {
+                expected: process,
+                actual: foreign,
+            })
+        );
     }
 }

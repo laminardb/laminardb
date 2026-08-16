@@ -1,5 +1,74 @@
 use super::*;
 
+async fn try_from_sql_local(
+    ctx: &SessionContext,
+    sql: &str,
+    emit_changelog: bool,
+) -> Result<Option<IncrementalAggState>, DbError> {
+    try_from_sql_for_key_groups(
+        ctx,
+        sql,
+        emit_changelog,
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+    )
+    .await
+}
+
+async fn try_from_sql_for_key_groups(
+    ctx: &SessionContext,
+    sql: &str,
+    emit_changelog: bool,
+    key_group_count: KeyGroupCount,
+) -> Result<Option<IncrementalAggState>, DbError> {
+    IncrementalAggState::try_from_sql(ctx, sql, emit_changelog, key_group_count).await
+}
+
+#[test]
+fn managed_checkpoint_scalar_type_gate_preserves_supported_encodings() {
+    use arrow::datatypes::{IntervalUnit, TimeUnit};
+
+    for data_type in [
+        DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8View)),
+        DataType::BinaryView,
+        DataType::FixedSizeBinary(0),
+        DataType::FixedSizeBinary(16),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        DataType::Duration(TimeUnit::Microsecond),
+        DataType::Interval(IntervalUnit::MonthDayNano),
+        DataType::Decimal32(9, 2),
+        DataType::Decimal64(18, 4),
+        DataType::Decimal128(38, 8),
+        DataType::Decimal256(76, 16),
+    ] {
+        assert!(
+            is_managed_checkpoint_scalar_type(&data_type, true),
+            "{data_type:?}"
+        );
+    }
+
+    let item = Arc::new(Field::new("item", DataType::Int64, true));
+    for data_type in [
+        DataType::List(Arc::clone(&item)),
+        DataType::LargeList(Arc::clone(&item)),
+        DataType::FixedSizeList(item, 2),
+        DataType::Struct(vec![Field::new("item", DataType::Int64, true)].into()),
+        DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(DataType::Dictionary(
+                Box::new(DataType::Int16),
+                Box::new(DataType::Utf8),
+            )),
+        ),
+        DataType::FixedSizeBinary(-1),
+        DataType::Time32(TimeUnit::Nanosecond),
+    ] {
+        assert!(
+            !is_managed_checkpoint_scalar_type(&data_type, true),
+            "{data_type:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let ctx = laminar_sql::create_session_context();
@@ -20,19 +89,27 @@ async fn test_try_from_sql_rejects_post_aggregate_projection() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    // SUM(a)/SUM(b) collapses 2 aggregates into 1 derived column →
-    // top_schema fields != agg_schema fields → should return None.
-    let result = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(
-        result.is_none(),
-        "Post-aggregate projection should return None"
-    );
+    for sql in [
+        "SELECT name, SUM(a) * 2 AS doubled FROM events GROUP BY name",
+        "SELECT name, SUM(a) AS total FROM events GROUP BY name \
+         UNION ALL SELECT name, SUM(a) AS total FROM events GROUP BY name",
+        "SELECT name, doubled FROM (SELECT name, SUM(a) * 2 AS doubled \
+         FROM events GROUP BY name) q",
+        "SELECT name, a, total FROM (SELECT name, a, SUM(b) AS total \
+         FROM events GROUP BY name, a) q",
+        "SELECT name, SUM(a) AS total FROM events GROUP BY name \
+         ORDER BY total DESC LIMIT 1",
+    ] {
+        let error = match try_from_sql_local(&ctx, sql, false).await {
+            Err(error) => error,
+            Ok(_) => panic!("unsafe post-aggregate plan was admitted: {sql}"),
+        };
+        assert!(
+            error.to_string().contains("post-aggregate projection")
+                || error.to_string().contains("one aggregate stage"),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -112,7 +189,7 @@ async fn test_try_from_sql_non_aggregate() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(&ctx, "SELECT * FROM events", false)
+    let result = try_from_sql_local(&ctx, "SELECT * FROM events", false)
         .await
         .unwrap();
     assert!(result.is_none(), "Non-aggregate query should return None");
@@ -136,7 +213,7 @@ async fn test_try_from_sql_with_group_by() {
     let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    let result = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) as total FROM events GROUP BY name",
         false,
@@ -147,6 +224,70 @@ async fn test_try_from_sql_with_group_by() {
     let state = result.unwrap();
     assert_eq!(state.num_group_cols, 1);
     assert_eq!(state.agg_specs.len(), 1);
+    assert_eq!(
+        state.key_group_count(),
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
+    );
+}
+
+#[tokio::test]
+async fn embedded_float_grouping_remains_supported_without_partition_codec_gate() {
+    let ctx = laminar_sql::create_session_context();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bucket", DataType::Float64, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+    let dummy = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+        ],
+    )
+    .unwrap();
+    let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
+    ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+    let mut state = try_from_sql_local(
+        &ctx,
+        "SELECT bucket, SUM(value) AS total FROM events GROUP BY bucket",
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("embedded aggregate planning must continue to accept float keys");
+
+    let pre_agg = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("bucket", DataType::Float64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ])),
+        vec![
+            Arc::new(arrow::array::Float64Array::from(vec![1.5, 2.5, 1.5])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
+        ],
+    )
+    .unwrap();
+    state.process_batch(&pre_agg, i64::MIN).unwrap();
+
+    let output = state.emit().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    let keys = output[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let totals = output[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let actual = (0..output[0].num_rows())
+        .map(|row| (keys.value(row).to_bits(), totals.value(row)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(actual[&1.5f64.to_bits()], 40.0);
+    assert_eq!(actual[&2.5f64.to_bits()], 20.0);
 }
 
 #[tokio::test]
@@ -171,7 +312,7 @@ async fn test_incremental_aggregation_across_batches() {
             .unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) as total FROM events GROUP BY name",
         false,
@@ -257,6 +398,19 @@ async fn setup_agg_state_with_changelog(
     sql: &str,
     emit_changelog: bool,
 ) -> (SessionContext, IncrementalAggState) {
+    setup_agg_state_for_key_groups(
+        sql,
+        emit_changelog,
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+    )
+    .await
+}
+
+async fn setup_agg_state_for_key_groups(
+    sql: &str,
+    emit_changelog: bool,
+    key_group_count: KeyGroupCount,
+) -> (SessionContext, IncrementalAggState) {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -273,7 +427,7 @@ async fn setup_agg_state_with_changelog(
     let mem_table =
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
-    let state = IncrementalAggState::try_from_sql(&ctx, sql, emit_changelog)
+    let state = try_from_sql_for_key_groups(&ctx, sql, emit_changelog, key_group_count)
         .await
         .unwrap()
         .expect("expected aggregate state");
@@ -294,14 +448,133 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+fn capture_all_vnodes(
+    state: &mut IncrementalAggState,
+) -> Result<Vec<(u32, AggStateCheckpoint)>, DbError> {
+    state.force_full_vnode_capture();
+    let vnode_count = u32::from(state.key_group_count().get());
+    state.checkpoint_vnodes(&(0..vnode_count).collect::<Vec<_>>(), vnode_count)
+}
+
 fn checkpoint_bytes(state: &mut IncrementalAggState) -> Vec<u8> {
-    rkyv::to_bytes::<rkyv::rancor::Error>(&state.checkpoint_groups().unwrap())
+    rkyv::to_bytes::<rkyv::rancor::Error>(&capture_all_vnodes(state).unwrap())
         .unwrap()
         .to_vec()
 }
 
 #[tokio::test]
-async fn test_distinct_flag_extracted() {
+async fn retained_state_accounting_tracks_groups_without_drifting_on_fixed_size_updates() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state(sql).await;
+    let empty_bytes = state.accounted_state_bytes();
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state
+        .process_batch(&sum_pre_agg_batch(&["a"], &[1.0]), 10)
+        .unwrap();
+    let one_group_bytes = state.accounted_state_bytes();
+    assert!(one_group_bytes > empty_bytes);
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state
+        .process_batch(&sum_pre_agg_batch(&["a"], &[2.0]), 20)
+        .unwrap();
+    assert_eq!(
+        state.accounted_state_bytes(),
+        one_group_bytes,
+        "a fixed-size accumulator update must replace, not accumulate, its charge"
+    );
+    assert!(state.cached_usage_matches_structural_recompute());
+
+    state.emit().unwrap();
+    assert!(state.cached_usage_matches_structural_recompute());
+    let reconciled_bytes = state.accounted_state_bytes();
+    assert!(reconciled_bytes >= one_group_bytes);
+}
+
+#[tokio::test]
+async fn retained_state_accounting_includes_topology_and_changelog_lifecycle() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, smaller_topology) =
+        setup_agg_state_for_key_groups(sql, false, KeyGroupCount::try_from(1_u32).unwrap()).await;
+    let (_, larger_topology) =
+        setup_agg_state_for_key_groups(sql, false, KeyGroupCount::try_from(16_u32).unwrap()).await;
+    assert!(
+        larger_topology.accounted_state_bytes() > smaller_topology.accounted_state_bytes(),
+        "a larger immutable vnode address space must carry a larger topology charge"
+    );
+
+    let (_, mut changelog) = setup_agg_state_with_changelog(sql, true).await;
+    let empty_bytes = changelog.accounted_state_bytes();
+    changelog
+        .process_batch(
+            &sum_pre_agg_batch(&["retained-key-a", "retained-key-b"], &[1.0, 2.0]),
+            10,
+        )
+        .unwrap();
+    assert!(changelog.accounted_state_bytes() > empty_bytes);
+    assert!(changelog.cached_usage_matches_structural_recompute());
+
+    changelog.emit().unwrap();
+    assert!(changelog.accounted_state_bytes() > empty_bytes);
+    assert!(changelog.cached_usage_matches_structural_recompute());
+
+    assert!(changelog.cached_usage_matches_structural_recompute());
+}
+
+#[tokio::test]
+async fn local_keyed_state_routes_across_common_vnodes() {
+    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state(sql).await;
+    let batch = sum_pre_agg_batch(&["a", "b", "a"], &[1.0, 2.0, 3.0]);
+    let rows = state
+        .row_converter
+        .convert_columns(&[Arc::clone(batch.column(0))])
+        .unwrap();
+    let mut expected_vnodes = (0..batch.num_rows())
+        .map(|row| {
+            IncrementalAggState::vnode_for_group_key(
+                state.num_group_cols,
+                &rows.row(row).owned(),
+                state.routing_vnode_count(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expected_vnodes.sort_unstable();
+    expected_vnodes.dedup();
+    assert_eq!(expected_vnodes.len(), 2);
+
+    state.process_batch(&batch, 42).unwrap();
+
+    assert_eq!(
+        state.key_group_count(),
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
+    );
+    assert_eq!(state.logical_group_count_for_test(), 2);
+    assert_eq!(state.active_vnodes_for_test(), expected_vnodes);
+
+    let mut totals = std::collections::BTreeMap::new();
+    for batch in state.emit().unwrap() {
+        let names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("group name output");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("aggregate total output");
+        for row in 0..batch.num_rows() {
+            totals.insert(names.value(row).to_owned(), values.value(row));
+        }
+    }
+    assert_eq!(totals.get("a"), Some(&4.0));
+    assert_eq!(totals.get("b"), Some(&2.0));
+}
+
+#[tokio::test]
+async fn distinct_aggregates_are_rejected_at_admission() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -319,87 +592,17 @@ async fn test_distinct_flag_extracted() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let error = match try_from_sql_local(
         &ctx,
         "SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name",
         false,
     )
     .await
-    .unwrap()
-    .expect("expected aggregate state");
-    assert!(state.agg_specs[0].distinct, "DISTINCT flag should be set");
-}
-
-#[tokio::test]
-async fn test_distinct_count_produces_correct_result() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name")
-            .await;
-
-    // Pre-agg schema: name, __agg_input_1
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-
-    // Feed duplicates: value 10 appears 3 times for group "a"
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a", "a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![
-                10.0, 10.0, 10.0, 20.0,
-            ])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    let result = state.emit().unwrap();
-    assert_eq!(result.len(), 1);
-    let count_col = result[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .expect("count should be Int64");
-    // DISTINCT count: {10.0, 20.0} = 2
-    assert_eq!(count_col.value(0), 2, "COUNT(DISTINCT) should be 2");
-}
-
-#[tokio::test]
-async fn test_distinct_sum_produces_correct_result() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(DISTINCT value) as total FROM events GROUP BY name")
-            .await;
-
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-
-    // Feed duplicates: 10 appears twice
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "a", "a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![10.0, 10.0, 20.0])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    let result = state.emit().unwrap();
-    let total_col = result[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .expect("sum should be Float64");
-    // DISTINCT sum: 10 + 20 = 30 (not 10+10+20=40)
-    assert!(
-        (total_col.value(0) - 30.0).abs() < f64::EPSILON,
-        "SUM(DISTINCT) should be 30, got {}",
-        total_col.value(0)
-    );
+    {
+        Err(error) => error,
+        Ok(_) => panic!("DISTINCT aggregate was admitted"),
+    };
+    assert!(error.to_string().contains("DISTINCT aggregates"));
 }
 
 #[tokio::test]
@@ -421,7 +624,7 @@ async fn test_filter_clause_extracted() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(value) FILTER (WHERE value > 0) as pos_sum FROM events GROUP BY name",
         false,
@@ -497,7 +700,7 @@ async fn test_filter_clause_applied() {
 }
 
 #[tokio::test]
-async fn test_having_clause_detected() {
+async fn aliased_having_filters_emitted_batch() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
@@ -515,18 +718,38 @@ async fn test_having_clause_detected() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
-        "SELECT name, SUM(value) as total FROM events GROUP BY name HAVING SUM(value) > 100",
+        "SELECT name, COUNT(*) AS row_count, COUNT(value) AS value_count, \
+         SUM(value) AS total FROM events GROUP BY name \
+         HAVING name = 'high' AND COUNT(*) = 2 \
+         AND COUNT(value) = 2 AND SUM(value) > 100",
         false,
     )
     .await
     .unwrap()
     .expect("expected aggregate state");
-    assert!(
-        state.having_sql.is_some(),
-        "HAVING predicate should be extracted"
-    );
+    assert!(state.having_filter().is_some());
+
+    let emitted = RecordBatch::try_new(
+        Arc::clone(&state.output_schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["low", "high"])),
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
+            Arc::new(arrow::array::Float64Array::from(vec![50.0, 150.0])),
+        ],
+    )
+    .unwrap();
+    let filtered = apply_compiled_having(&[emitted], state.having_filter().unwrap()).unwrap();
+
+    assert_eq!(filtered.len(), 1);
+    let names = filtered[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "high");
 }
 
 #[tokio::test]
@@ -570,7 +793,7 @@ async fn test_sum_int32_input_is_coerced_before_accumulator_update() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("orders", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, SUM(amount) as total FROM orders GROUP BY name",
         false,
@@ -631,7 +854,7 @@ async fn test_avg_float32_input_is_coerced_before_accumulator_update() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("products", Arc::new(mem_table)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT name, AVG(price) as avg_price FROM products GROUP BY name",
         false,
@@ -692,7 +915,7 @@ async fn test_type_inference_literal_expr() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT name, MIN(value) as min_val FROM events GROUP BY name",
         false,
@@ -855,7 +1078,6 @@ fn test_expr_to_sql_like() {
 
 #[test]
 fn test_expr_to_sql_aggregate_function() {
-    // AggregateFunction in expr_to_sql is used for HAVING
     use datafusion_expr::Expr;
     let sum_udf = datafusion::functions_aggregate::sum::sum_udaf();
     let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
@@ -871,24 +1093,6 @@ fn test_expr_to_sql_aggregate_function() {
     let sql = expr_to_sql(&e);
     assert!(sql.contains("sum"), "should contain sum: {sql}");
     assert!(sql.contains("\"x\""), "should contain arg: {sql}");
-}
-
-#[test]
-fn test_expr_to_sql_aggregate_distinct() {
-    use datafusion_expr::Expr;
-    let count_udf = datafusion::functions_aggregate::count::count_udaf();
-    let e = Expr::AggregateFunction(datafusion_expr::expr::AggregateFunction {
-        func: count_udf,
-        params: datafusion_expr::expr::AggregateFunctionParams {
-            args: vec![datafusion_expr::col("id")],
-            distinct: true,
-            filter: None,
-            order_by: vec![],
-            null_treatment: None,
-        },
-    });
-    let sql = expr_to_sql(&e);
-    assert!(sql.contains("DISTINCT"), "should contain DISTINCT: {sql}");
 }
 
 #[tokio::test]
@@ -910,7 +1114,7 @@ async fn test_group_by_expression_scalar_function() {
         datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
     ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-    let state = IncrementalAggState::try_from_sql(
+    let state = try_from_sql_local(
         &ctx,
         "SELECT upper(name), SUM(value) as total FROM events GROUP BY upper(name)",
         false,
@@ -949,7 +1153,7 @@ async fn test_group_by_simple_column_still_works() {
 async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     let (_, mut state) =
         setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    state.max_groups = 2;
+    state.set_max_groups_for_test(2);
     state
         .process_batch(&sum_pre_agg_batch(&["a", "b"], &[10.0, 20.0]), 1)
         .unwrap();
@@ -964,956 +1168,12 @@ async fn group_cardinality_limit_rejects_the_whole_batch_and_retry() {
     }
 }
 
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn replay_rejects_changelog_state_without_its_group() {
-    async fn changelog_sum_state(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
-            ctx,
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-            true,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-    }
-
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["x"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let input_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-    let input = RecordBatch::try_new(
-        input_schema,
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![10.0])),
-        ],
-    )
-    .unwrap();
-    let mut source = changelog_sum_state(&ctx).await;
-    source.process_batch(&input, 1_000).unwrap();
-    source.emit().unwrap();
-    let emitted = source.checkpoint_groups().unwrap().last_emitted;
-    assert!(!emitted.is_empty());
-
-    let mut empty_checkpoint = changelog_sum_state(&ctx).await.checkpoint_groups().unwrap();
-    empty_checkpoint.last_emitted = emitted;
-
-    let mut restored = changelog_sum_state(&ctx).await;
-    let error = restored
-        .restore_groups(&empty_checkpoint)
-        .expect_err("whole-state restore must reject orphaned changelog state");
-    assert!(error.to_string().contains("non-canonical empty"));
-    assert!(restored.groups.is_empty());
-    assert!(restored.last_emitted.is_empty());
-
-    let mut merged = changelog_sum_state(&ctx).await;
-    let error = merged.merge_groups(&empty_checkpoint).unwrap_err();
-    assert!(error.to_string().contains("non-canonical empty"));
-    assert!(merged.groups.is_empty());
-
-    let delta = AggVnodeDelta {
-        changed: empty_checkpoint,
-    };
-    let mut applied = changelog_sum_state(&ctx).await;
-    let error = applied.apply_delta(&delta).unwrap_err();
-    assert!(error.to_string().contains("non-canonical empty"));
-    assert!(applied.groups.is_empty());
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
-    const VNODES: u32 = 4;
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    state.set_delta_enabled(true);
-
-    // First per-vnode capture establishes the delta baseline and starts a window.
-    state.checkpoint_groups_by_vnode(VNODES).unwrap();
-    assert!(state.dirty_keys_by_vnode.is_empty());
-
-    let pre_agg = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        pre_agg,
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
-            Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, 1000).unwrap();
-
-    // Every mutated key is recorded, bucketed by vnode.
-    let tracked: usize = state.dirty_keys_by_vnode.values().map(|s| s.len()).sum();
-    assert_eq!(tracked, 3, "all mutated keys tracked in the delta window");
-
-    // The next capture resets the window.
-    state.checkpoint_groups_by_vnode(VNODES).unwrap();
-    assert!(
-        state.dirty_keys_by_vnode.is_empty(),
-        "capture resets the per-vnode dirty set",
-    );
-}
-
-/// FULL base + an ordered chain of deltas, replayed via `apply_vnode_chain`, reproduces the
-/// producer exactly — and a chain re-bases to FULL once it reaches `chain_bound`.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn delta_chain_replay_reproduces_full_baseline() {
-    use std::collections::BTreeMap;
-    const V: u32 = 1; // single vnode → every key lands in vnode 0
-
-    fn pre_agg_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]))
-    }
-    fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
-        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
-        let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
-        let batch = RecordBatch::try_new(
-            pre_agg_schema(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(names)),
-                Arc::new(arrow::array::Float64Array::from(vals)),
-            ],
-        )
-        .unwrap();
-        state.process_batch(&batch, ts).unwrap();
-    }
-    fn group_vals(state: &mut IncrementalAggState) -> BTreeMap<Vec<u8>, String> {
-        state
-            .groups
-            .iter_mut()
-            .map(|(k, v)| {
-                (
-                    k.as_ref().to_vec(),
-                    format!("{:?}", v.accs[0].evaluate().unwrap()),
-                )
-            })
-            .collect()
-    }
-    // Non-changelog agg: `checkpoint_delta_by_vnode` emits deltas (a changelog agg re-bases FULL).
-    async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
-            ctx,
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-    }
-    fn delta_for_vnode0(cap: std::collections::HashMap<u32, VnodeCapture>) -> AggVnodeDelta {
-        match cap.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c) {
-            Some(VnodeCapture::Delta(d)) => d,
-            _ => panic!("expected a DELTA for vnode 0"),
-        }
-    }
-
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["x"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-        ],
-    )
-    .unwrap();
-    let mem =
-        datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let mut producer = agg(&ctx).await;
-    producer.set_delta_enabled(true);
-
-    // Epoch 0: seed a,b,c — first capture re-bases FULL and opens the delta window.
-    feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
-    let cap0 = producer.checkpoint_delta_by_vnode(V, 8).unwrap();
-    let Some(VnodeCapture::Full(base)) = cap0.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c)
-    else {
-        panic!("first capture must be FULL");
-    };
-
-    // Epoch 1: change a → DELTA. Epoch 2: change b + add e → DELTA.
-    feed(&mut producer, &[("a", 10.0)], 2000);
-    let d1 = delta_for_vnode0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
-    feed(&mut producer, &[("b", 20.0), ("e", 5.0)], 3000);
-    let d2 = delta_for_vnode0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
-
-    // Replay FULL base + ordered deltas into a fresh consumer.
-    let mut consumer = agg(&ctx).await;
-    consumer.apply_vnode_chain(&base, &[d1, d2]).unwrap();
-    assert_eq!(
-        group_vals(&mut consumer),
-        group_vals(&mut producer),
-        "FULL base + ordered delta chain must reproduce the producer state",
-    );
-
-    // chain_bound = 1: the chain re-bases to FULL on the next capture.
-    feed(&mut producer, &[("a", 11.0)], 4000);
-    let rebased = producer.checkpoint_delta_by_vnode(V, 1).unwrap();
-    assert!(
-        matches!(rebased.get(&0), Some(VnodeCapture::Full(_))),
-        "a chain at the bound must re-base to FULL",
-    );
-}
-
-/// `force_full_rebase` makes the next capture re-base FULL even below `chain_bound`, so a failed
-/// epoch's dirty-set clear can't silently drop its changes.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn force_full_rebase_recaptures_full_after_failed_epoch() {
-    const V: u32 = 1; // single vnode → every key lands in vnode 0
-    fn pre_agg_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]))
-    }
-    fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
-        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
-        let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
-        let batch = RecordBatch::try_new(
-            pre_agg_schema(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(names)),
-                Arc::new(arrow::array::Float64Array::from(vals)),
-            ],
-        )
-        .unwrap();
-        state.process_batch(&batch, ts).unwrap();
-    }
-    async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
-            ctx,
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-    }
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["x"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-        ],
-    )
-    .unwrap();
-    let mem =
-        datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let mut producer = agg(&ctx).await;
-    producer.set_delta_enabled(true);
-
-    // Epoch 0 → FULL base; epoch 1 (well below chain_bound=8) → DELTA.
-    feed(&mut producer, &[("a", 1.0), ("b", 2.0)], 1000);
-    assert!(matches!(
-        producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
-        Some(VnodeCapture::Full(_))
-    ));
-    feed(&mut producer, &[("a", 10.0)], 2000);
-    assert!(
-        matches!(
-            producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
-            Some(VnodeCapture::Delta(_))
-        ),
-        "below the chain bound, a normal capture is a DELTA",
-    );
-
-    // Simulate the failed epoch's recovery hook: the next capture must re-base FULL.
-    producer.force_full_rebase();
-    feed(&mut producer, &[("b", 20.0)], 3000);
-    assert!(
-        matches!(
-            producer.checkpoint_delta_by_vnode(V, 8).unwrap().get(&0),
-            Some(VnodeCapture::Full(_))
-        ),
-        "force_full_rebase must re-base the next capture FULL, not chain a gapped delta",
-    );
-}
-
-/// A changelog aggregate's delta chain must reproduce BOTH the group state and the
-/// `last_emitted` dedup map, so the first post-recovery emit re-emits nothing and a
-/// later change emits identically.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn delta_chain_replay_reproduces_changelog_last_emitted() {
-    use std::collections::BTreeMap;
-    const V: u32 = 1; // single vnode → every key lands in vnode 0
-
-    fn pre_agg_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]))
-    }
-    fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
-        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
-        let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
-        let batch = RecordBatch::try_new(
-            pre_agg_schema(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(names)),
-                Arc::new(arrow::array::Float64Array::from(vals)),
-            ],
-        )
-        .unwrap();
-        state.process_batch(&batch, ts).unwrap();
-    }
-    // (groups, last_emitted) as comparable string maps.
-    fn snapshot(
-        state: &mut IncrementalAggState,
-    ) -> (BTreeMap<Vec<u8>, String>, BTreeMap<Vec<u8>, String>) {
-        let groups = state
-            .groups
-            .iter_mut()
-            .map(|(k, v)| {
-                (
-                    k.as_ref().to_vec(),
-                    format!("{:?}", v.accs[0].evaluate().unwrap()),
-                )
-            })
-            .collect();
-        let emitted = state
-            .last_emitted
-            .iter()
-            .map(|(k, v)| (k.as_ref().to_vec(), format!("{v:?}")))
-            .collect();
-        (groups, emitted)
-    }
-    async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
-            ctx,
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-            true, // emit_changelog
-        )
-        .await
-        .unwrap()
-        .unwrap()
-    }
-    fn delta0(cap: std::collections::HashMap<u32, VnodeCapture>) -> AggVnodeDelta {
-        match cap.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c) {
-            Some(VnodeCapture::Delta(d)) => d,
-            _ => panic!("expected a DELTA for vnode 0"),
-        }
-    }
-
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["x"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-        ],
-    )
-    .unwrap();
-    let mem =
-        datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let mut producer = agg(&ctx).await;
-    producer.set_delta_enabled(true);
-
-    // Epoch 0: seed + emit a,b,c, then FULL re-base (must carry last_emitted).
-    feed(&mut producer, &[("a", 1.0), ("b", 2.0), ("c", 3.0)], 1000);
-    producer.emit().unwrap();
-    let Some(VnodeCapture::Full(base)) = producer
-        .checkpoint_delta_by_vnode(V, 8)
-        .unwrap()
-        .into_iter()
-        .find(|(v, _)| *v == 0)
-        .map(|(_, c)| c)
-    else {
-        panic!("first capture must be FULL");
-    };
-    assert!(
-        !base.last_emitted.is_empty(),
-        "a changelog FULL re-base must carry the dedup map",
-    );
-
-    // Epoch 1: change a, emit → DELTA carries a's updated last_emitted.
-    feed(&mut producer, &[("a", 10.0)], 2000);
-    producer.emit().unwrap();
-    let d1 = delta0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
-
-    // Epoch 2: change b + add d, emit → DELTA.
-    feed(&mut producer, &[("b", 20.0), ("d", 4.0)], 3000);
-    producer.emit().unwrap();
-    let d2 = delta0(producer.checkpoint_delta_by_vnode(V, 8).unwrap());
-
-    // Replay FULL base + ordered deltas into a fresh consumer.
-    let mut consumer = agg(&ctx).await;
-    consumer.set_delta_enabled(true);
-    consumer.apply_vnode_chain(&base, &[d1, d2]).unwrap();
-
-    let (pg, pe) = snapshot(&mut producer);
-    let (cg, ce) = snapshot(&mut consumer);
-    assert_eq!(cg, pg, "groups must match after chain replay");
-    assert_eq!(
-        ce, pe,
-        "last_emitted dedup map must match after chain replay"
-    );
-
-    // No new input → the recovered dedup map must re-emit NOTHING (no duplicates).
-    let drained: usize = consumer
-        .emit()
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    assert_eq!(
-        drained, 0,
-        "recovered changelog state must not re-emit unchanged groups"
-    );
-
-    // A genuine change emits identically on both.
-    feed(&mut producer, &[("a", 100.0)], 4000);
-    feed(&mut consumer, &[("a", 100.0)], 4000);
-    let pr: usize = producer
-        .emit()
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    let cr: usize = consumer
-        .emit()
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
-    assert_eq!(
-        cr, pr,
-        "post-recovery emit must produce identical changelog output"
-    );
-}
-
-/// A global (no-GROUP-BY) changelog aggregate with delta checkpoints must capture without
-/// panicking on the empty group key (`row_to_scalar_key_with_types` on the global sentinel),
-/// and the captured slice must restore to the same value.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn global_changelog_delta_checkpoint_roundtrips() {
-    async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(ctx, "SELECT SUM(value) as total FROM events", true)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Float64,
-        false,
-    )]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(arrow::array::Float64Array::from(vec![0.0]))],
-    )
-    .unwrap();
-    let mem =
-        datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let pre = Arc::new(Schema::new(vec![Field::new(
-        "__agg_input_1",
-        DataType::Float64,
-        true,
-    )]));
-    let feed = |state: &mut IncrementalAggState, vals: Vec<f64>, ts: i64| {
-        let batch = RecordBatch::try_new(
-            Arc::clone(&pre),
-            vec![Arc::new(arrow::array::Float64Array::from(vals))],
-        )
-        .unwrap();
-        state.process_batch(&batch, ts).unwrap();
-    };
-
-    let mut state = agg(&ctx).await;
-    state.set_delta_enabled(true);
-    feed(&mut state, vec![1.0, 2.0, 3.0], 1000);
-    state.emit().unwrap();
-
-    // Before the fix this panicked: the empty global key hit convert_rows on a 0-field converter.
-    let caps = state.checkpoint_delta_by_vnode(1, 8).unwrap();
-    assert!(
-        caps.contains_key(&0),
-        "the global group is captured under vnode 0"
-    );
-
-    // Restore into a fresh aggregate; the single global group must total 6.0.
-    let mut restored = agg(&ctx).await;
-    match caps.get(&0).expect("vnode-0 capture") {
-        VnodeCapture::Full(cp) => {
-            restored.merge_groups(cp).unwrap();
-        }
-        VnodeCapture::Delta(d) => {
-            restored.apply_delta(d).unwrap();
-        }
-    }
-    let value = restored
-        .groups
-        .get_mut(&global_aggregate_key())
-        .expect("global group restored")
-        .accs[0]
-        .evaluate()
-        .unwrap();
-    assert_eq!(value, ScalarValue::Float64(Some(6.0)));
-}
-
-/// `drop_vnodes` purges ALL state for a revoked vnode — resident groups, `last_emitted`, the
-/// per-vnode delta maps, and the chain length — while a sibling vnode is untouched and
-/// `last_emitted ⊆ groups` still holds. This prevents stale keys from surviving rehydration.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn drop_vnodes_purges_revoked_keeps_sibling() {
-    use arrow::array::ArrayRef;
-    const VC: u32 = 8;
-
-    fn pre_agg_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]))
-    }
-    fn feed(state: &mut IncrementalAggState, rows: &[(&str, f64)], ts: i64) {
-        let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
-        let vals: Vec<f64> = rows.iter().map(|(_, v)| *v).collect();
-        let batch = RecordBatch::try_new(
-            pre_agg_schema(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(names)),
-                Arc::new(arrow::array::Float64Array::from(vals)),
-            ],
-        )
-        .unwrap();
-        state.process_batch(&batch, ts).unwrap();
-    }
-    async fn agg(ctx: &SessionContext) -> IncrementalAggState {
-        IncrementalAggState::try_from_sql(
-            ctx,
-            "SELECT name, SUM(value) as total FROM events GROUP BY name",
-            true,
-        )
-        .await
-        .unwrap()
-        .unwrap()
-    }
-
-    let ctx = laminar_sql::create_session_context();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-    ]));
-    let dummy = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["x"])),
-            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-        ],
-    )
-    .unwrap();
-    let mem =
-        datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]]).unwrap();
-    ctx.register_table("events", Arc::new(mem)).unwrap();
-
-    let mut state = agg(&ctx).await;
-    state.set_delta_enabled(true);
-
-    let row_of = |state: &IncrementalAggState, key: &str| -> arrow::row::OwnedRow {
-        let cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::StringArray::from(vec![key]))];
-        state
-            .row_converter
-            .convert_columns(&cols)
-            .unwrap()
-            .row(0)
-            .owned()
-    };
-    let vnode_of = |state: &IncrementalAggState, key: &str| {
-        state.delta_vnode_of(row_of(state, key).as_ref(), VC)
-    };
-
-    // A vnode `y` with two keys and a distinct vnode `x`.
-    let cands: Vec<String> = (0..64).map(|i| format!("k{i}")).collect();
-    let mut by_v: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
-    for c in &cands {
-        by_v.entry(vnode_of(&state, c)).or_default().push(c.clone());
-    }
-    let vy = *by_v
-        .iter()
-        .find(|(_, ks)| ks.len() >= 2)
-        .map(|(v, _)| v)
-        .expect("a vnode with two keys");
-    let vx = *by_v
-        .keys()
-        .find(|v| **v != vy)
-        .expect("a second distinct vnode");
-    let (y_first, y_second) = (by_v[&vy][0].clone(), by_v[&vy][1].clone());
-    let x_key = by_v[&vx][0].clone();
-
-    feed(
-        &mut state,
-        &[(&y_first, 1.0), (&y_second, 2.0), (&x_key, 3.0)],
-        1000,
-    );
-    state.emit().unwrap();
-    let _ = state.checkpoint_delta_by_vnode(VC, 8).unwrap(); // chain_len[vx]=[vy]=0
-
-    let y_second_row = row_of(&state, &y_second);
-
-    // Re-dirty both vnodes so the per-vnode delta maps are populated at drop time.
-    feed(&mut state, &[(&y_first, 5.0), (&x_key, 7.0)], 2000);
-
-    let y_first_row = row_of(&state, &y_first);
-    let x_row = row_of(&state, &x_key);
-    assert!(
-        state.groups.contains_key(&y_first_row),
-        "precondition: first y group present"
-    );
-    assert!(
-        state.groups.contains_key(&x_row),
-        "precondition: x resident"
-    );
-
-    // Revoke vy.
-    let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
-    state.drop_vnodes(&revoked, VC);
-
-    // Every vy entry is gone.
-    assert!(
-        !state.groups.contains_key(&y_first_row),
-        "revoked first group dropped"
-    );
-    assert!(
-        !state.groups.contains_key(&y_second_row),
-        "revoked second group dropped"
-    );
-    assert!(
-        !state.last_emitted.contains_key(&y_first_row),
-        "revoked last_emitted dropped"
-    );
-    assert!(!state.dirty_keys_by_vnode.contains_key(&vy));
-    assert!(!state.last_emitted_dirty_by_vnode.contains_key(&vy));
-    assert!(!state.delta_chain_len.contains_key(&vy));
-
-    // The sibling vnode is untouched.
-    assert!(
-        state.groups.contains_key(&x_row),
-        "sibling resident group kept"
-    );
-    assert!(
-        state.delta_chain_len.contains_key(&vx),
-        "sibling chain kept"
-    );
-
-    // Invariant preserved: the dedup map stays a subset of resident groups.
-    for k in state.last_emitted.keys() {
-        assert!(
-            state.groups.contains_key(k),
-            "last_emitted must remain a subset of groups",
-        );
-    }
-}
-
-#[tokio::test]
-async fn empty_restore_rejects_every_noncanonical_payload() {
-    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
-    let (_, mut state) = setup_agg_state(sql).await;
-    let empty = state.checkpoint_groups().unwrap();
-    assert!(empty.last_updated_ms.is_empty());
-
-    let mut keys_only = empty.clone();
-    keys_only.keys_ipc = vec![1];
-    let mut accumulators_only = empty.clone();
-    accumulators_only.acc_state_ipc = vec![vec![1]];
-    let mut changelog_only = empty;
-    changelog_only.last_emitted = vec![EmittedCheckpoint {
-        key: vec![1],
-        values: vec![1],
-    }];
-
-    for checkpoint in [keys_only, accumulators_only, changelog_only] {
-        let error = state.restore_groups(&checkpoint).unwrap_err();
-        assert!(error.to_string().contains("non-canonical empty"));
-        assert!(state.groups.is_empty());
-        assert!(state.last_emitted.is_empty());
-    }
-}
-
-#[tokio::test]
-async fn restore_rejects_malformed_changelog_values_before_mutation() {
-    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
-    let (_, mut donor) = setup_agg_state_with_changelog(sql, true).await;
-    donor
-        .process_batch(&sum_pre_agg_batch(&["a"], &[10.0]), 1)
-        .unwrap();
-    donor.emit().unwrap();
-    let valid = donor.checkpoint_groups().unwrap();
-    assert_eq!(valid.last_emitted.len(), 1);
-
-    let corruptions = [
-        (Vec::new(), "arity mismatch"),
-        (
-            scalars_to_ipc(&[ScalarValue::Utf8(Some("wrong".into()))]).unwrap(),
-            "type mismatch",
-        ),
-        (
-            scalars_to_ipc(&[
-                ScalarValue::Float64(Some(10.0)),
-                ScalarValue::Float64(Some(20.0)),
-            ])
-            .unwrap(),
-            "arity mismatch",
-        ),
-    ];
-
-    for (values, expected) in corruptions {
-        let (_, mut target) = setup_agg_state_with_changelog(sql, true).await;
-        target
-            .process_batch(&sum_pre_agg_batch(&["z"], &[9.0]), 1)
-            .unwrap();
-        target.emit().unwrap();
-        let before = checkpoint_bytes(&mut target);
-
-        let mut malformed = valid.clone();
-        malformed.last_emitted[0].values = values;
-        let error = target.restore_groups(&malformed).unwrap_err();
-        assert!(error.to_string().contains(expected), "{error}");
-        assert_eq!(checkpoint_bytes(&mut target), before);
-    }
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn vnode_replay_rejects_malformed_changelog_values_before_mutation() {
-    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
-    let (_, mut donor) = setup_agg_state_with_changelog(sql, true).await;
-    donor
-        .process_batch(&sum_pre_agg_batch(&["a"], &[10.0]), 1)
-        .unwrap();
-    donor.emit().unwrap();
-    let valid = donor.checkpoint_groups().unwrap();
-
-    let (_, mut target) = setup_agg_state_with_changelog(sql, true).await;
-    target
-        .process_batch(&sum_pre_agg_batch(&["z"], &[9.0]), 1)
-        .unwrap();
-    target.emit().unwrap();
-    let before = checkpoint_bytes(&mut target);
-
-    let mut wrong_type = valid.clone();
-    wrong_type.last_emitted[0].values =
-        scalars_to_ipc(&[ScalarValue::Utf8(Some("wrong".into()))]).unwrap();
-    let error = target.merge_groups(&wrong_type).unwrap_err();
-    assert!(error.to_string().contains("type mismatch"), "{error}");
-    assert_eq!(checkpoint_bytes(&mut target), before);
-
-    let mut wrong_arity = valid;
-    wrong_arity.last_emitted[0].values = scalars_to_ipc(&[
-        ScalarValue::Float64(Some(10.0)),
-        ScalarValue::Float64(Some(20.0)),
-    ])
-    .unwrap();
-    let error = target
-        .apply_delta(&AggVnodeDelta {
-            changed: wrong_arity,
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("arity mismatch"), "{error}");
-    assert_eq!(checkpoint_bytes(&mut target), before);
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn bulk_merge_and_restore_reject_duplicate_group_keys() {
-    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
-    let (_, mut donor) = setup_agg_state(sql).await;
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![1.0])),
-        ],
-    )
-    .unwrap();
-    donor.process_batch(&batch, i64::MIN).unwrap();
-    let one_group = donor.checkpoint_groups().unwrap();
-    let encoded = bytes::Bytes::from(
-        rkyv::to_bytes::<rkyv::rancor::Error>(&one_group)
-            .unwrap()
-            .to_vec(),
-    );
-    let error = merge_serialized_agg_cps(&[encoded.clone(), encoded]).unwrap_err();
-    assert!(error.to_string().contains("not disjoint"));
-
-    // Construct a corrupt duplicate image directly so every live restore/apply entry point is
-    // still covered independently of the fail-closed bulk merge helper.
-    let mut duplicated = one_group.clone();
-    duplicated.keys_ipc = concat_columnar_ipc(&duplicated.keys_ipc, &one_group.keys_ipc).unwrap();
-    for (dst, src) in duplicated
-        .acc_state_ipc
-        .iter_mut()
-        .zip(&one_group.acc_state_ipc)
-    {
-        *dst = concat_columnar_ipc(dst, src).unwrap();
-    }
-    duplicated.last_updated_ms.extend(one_group.last_updated_ms);
-    duplicated.last_emitted.extend(one_group.last_emitted);
-
-    let (_, mut restored) = setup_agg_state(sql).await;
-    let error = restored.restore_groups(&duplicated).unwrap_err();
-    assert!(error.to_string().contains("duplicate group key"));
-    assert!(restored.groups.is_empty());
-
-    let (_, mut merged) = setup_agg_state(sql).await;
-    let error = merged.merge_groups(&duplicated).unwrap_err();
-    assert!(error.to_string().contains("duplicate group key"));
-    assert!(merged.groups.is_empty());
-
-    let (_, mut applied) = setup_agg_state(sql).await;
-    let error = applied
-        .apply_delta(&AggVnodeDelta {
-            changed: duplicated,
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("duplicate group key"));
-    assert!(applied.groups.is_empty());
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn vnode_chain_failure_is_atomic_and_successful_retry_is_idempotent() {
-    let sql = "SELECT name, SUM(value) as total FROM events GROUP BY name";
-    let (ctx, mut live) = setup_agg_state(sql).await;
-    let batch = |name: &str, value: f64| {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, true),
-                Field::new("__agg_input_1", DataType::Float64, true),
-            ])),
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec![name])),
-                Arc::new(arrow::array::Float64Array::from(vec![value])),
-            ],
-        )
-        .unwrap()
-    };
-    live.process_batch(&batch("a", 10.0), 1).unwrap();
-
-    let mut base_donor = IncrementalAggState::try_from_sql(&ctx, sql, false)
-        .await
-        .unwrap()
-        .unwrap();
-    base_donor.process_batch(&batch("a", 1.0), 2).unwrap();
-    let base = base_donor.checkpoint_groups().unwrap();
-
-    let mut delta_donor = IncrementalAggState::try_from_sql(&ctx, sql, false)
-        .await
-        .unwrap()
-        .unwrap();
-    delta_donor.process_batch(&batch("b", 5.0), 3).unwrap();
-    let valid_changed = delta_donor.checkpoint_groups().unwrap();
-    let mut invalid_changed = valid_changed.clone();
-    invalid_changed.last_emitted.push(EmittedCheckpoint {
-        key: scalars_to_ipc(&[ScalarValue::Utf8(Some("missing".into()))]).unwrap(),
-        values: scalars_to_ipc(&[ScalarValue::Float64(Some(99.0))]).unwrap(),
-    });
-    let invalid_late_delta = AggVnodeDelta {
-        changed: invalid_changed,
-    };
-
-    let before = rkyv::to_bytes::<rkyv::rancor::Error>(&live.checkpoint_groups().unwrap())
-        .unwrap()
-        .to_vec();
-    let error = live
-        .apply_vnode_chain(&base, &[invalid_late_delta])
-        .unwrap_err();
-    assert!(error.to_string().contains("missing group"));
-    let after = rkyv::to_bytes::<rkyv::rancor::Error>(&live.checkpoint_groups().unwrap())
-        .unwrap()
-        .to_vec();
-    assert_eq!(
-        after, before,
-        "failed chain changed the live checkpoint image"
-    );
-
-    let valid_delta = AggVnodeDelta {
-        changed: valid_changed,
-    };
-    live.apply_vnode_chain(&base, std::slice::from_ref(&valid_delta))
-        .unwrap();
-    let mut first_values: Vec<f64> = live
-        .groups
-        .values_mut()
-        .map(|entry| match entry.accs[0].evaluate().unwrap() {
-            ScalarValue::Float64(Some(value)) => value,
-            other => panic!("unexpected aggregate value {other:?}"),
-        })
-        .collect();
-    first_values.sort_by(f64::total_cmp);
-    assert_eq!(first_values, vec![1.0, 5.0]);
-
-    live.apply_vnode_chain(&base, std::slice::from_ref(&valid_delta))
-        .unwrap();
-    let mut retry_values: Vec<f64> = live
-        .groups
-        .values_mut()
-        .map(|entry| match entry.accs[0].evaluate().unwrap() {
-            ScalarValue::Float64(Some(value)) => value,
-            other => panic!("unexpected aggregate value {other:?}"),
-        })
-        .collect();
-    retry_values.sort_by(f64::total_cmp);
-    assert_eq!(retry_values, first_values);
-}
-
 #[tokio::test]
 async fn group_cardinality_existing_groups_update_at_the_limit() {
     let (_, mut state) =
         setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
 
-    state.max_groups = 2;
+    state.set_max_groups_for_test(2);
 
     let pre_agg_schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, true),
@@ -1992,202 +1252,6 @@ fn test_extract_clauses_multiple_joins() {
 }
 
 #[tokio::test]
-async fn test_agg_checkpoint_roundtrip_single_group() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-
-    // Feed data
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a", "a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    // Checkpoint
-    let cp = state.checkpoint_groups().unwrap();
-    assert_eq!(cp.last_updated_ms.len(), 1);
-
-    // Create a fresh state and restore
-    let (_, mut state2) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    let restored = state2.restore_groups(&cp).unwrap();
-    assert_eq!(restored, 1);
-
-    // Emit and verify value matches
-    let result = state2.emit().unwrap();
-    assert_eq!(result.len(), 1);
-    let total = result[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .unwrap();
-    assert!(
-        (total.value(0) - 30.0).abs() < f64::EPSILON,
-        "Restored SUM should be 30, got {}",
-        total.value(0)
-    );
-}
-
-#[tokio::test]
-async fn test_agg_checkpoint_roundtrip_multi_group() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec![
-                "a", "b", "a", "b", "c",
-            ])),
-            Arc::new(arrow::array::Float64Array::from(vec![
-                10.0, 20.0, 30.0, 40.0, 50.0,
-            ])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-
-    let cp = state.checkpoint_groups().unwrap();
-    assert_eq!(cp.last_updated_ms.len(), 3);
-
-    let (_, mut state2) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    let restored = state2.restore_groups(&cp).unwrap();
-    assert_eq!(restored, 3);
-
-    let result = state2.emit().unwrap();
-    assert_eq!(result[0].num_rows(), 3);
-}
-
-/// Columnar checkpoint round-trip with a mix of accumulator shapes
-/// (SUM, COUNT(*), MAX) across several groups: restored emit must equal
-/// the original emit row-for-row.
-#[tokio::test]
-async fn test_agg_checkpoint_roundtrip_mixed_accumulators() {
-    let sql = "SELECT name, SUM(value) AS s, COUNT(*) AS c, MAX(value) AS m \
-               FROM events GROUP BY name";
-    let (_, mut state) = setup_agg_state(sql).await;
-
-    // Pre-agg layout for [name] + SUM(value), COUNT(*), MAX(value):
-    // group col, then __agg_input_1 (SUM), __agg_input_2 (COUNT* dummy bool), __agg_input_3 (MAX).
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-        Field::new("__agg_input_2", DataType::Boolean, true),
-        Field::new("__agg_input_3", DataType::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec![
-                "a", "b", "a", "b", "c", "a",
-            ])),
-            Arc::new(arrow::array::Float64Array::from(vec![
-                10.0, 20.0, 30.0, 40.0, 50.0, 5.0,
-            ])),
-            Arc::new(arrow::array::BooleanArray::from(vec![true; 6])),
-            Arc::new(arrow::array::Float64Array::from(vec![
-                10.0, 20.0, 30.0, 40.0, 50.0, 5.0,
-            ])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-    let original = state.emit().unwrap();
-
-    let cp = state.checkpoint_groups().unwrap();
-    assert_eq!(cp.last_updated_ms.len(), 3);
-
-    let (_, mut state2) = setup_agg_state(sql).await;
-    assert_eq!(state2.restore_groups(&cp).unwrap(), 3);
-    let restored = state2.emit().unwrap();
-
-    // Compare as (name -> (s, c, m)) maps so HashMap iteration order is irrelevant.
-    let collect = |batches: &[RecordBatch]| {
-        let mut out: std::collections::BTreeMap<String, (f64, i64, f64)> =
-            std::collections::BTreeMap::new();
-        for b in batches {
-            let names = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
-            let s = b
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap();
-            let c = b
-                .column(2)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap();
-            let m = b
-                .column(3)
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap();
-            for i in 0..b.num_rows() {
-                out.insert(
-                    names.value(i).to_string(),
-                    (s.value(i), c.value(i), m.value(i)),
-                );
-            }
-        }
-        out
-    };
-    assert_eq!(collect(&original), collect(&restored));
-}
-
-#[tokio::test]
-async fn test_restore_fingerprint_mismatch_errors() {
-    let (_, mut state) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-
-    // Feed data and checkpoint
-    let pre_agg_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, true),
-        Field::new("__agg_input_1", DataType::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&pre_agg_schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["a"])),
-            Arc::new(arrow::array::Float64Array::from(vec![10.0])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&batch, i64::MIN).unwrap();
-    let mut cp = state.checkpoint_groups().unwrap();
-
-    // Tamper with fingerprint
-    cp.fingerprint = 999_999;
-
-    // Restore should fail
-    let (_, mut state2) =
-        setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
-    let result = state2.restore_groups(&cp);
-    assert!(result.is_err(), "Fingerprint mismatch should error");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("fingerprint mismatch"),
-        "Error should mention fingerprint: {err}"
-    );
-}
-
-#[tokio::test]
 async fn test_changelog_delta_emit() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
@@ -2205,7 +1269,7 @@ async fn test_changelog_delta_emit() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("t", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol",
         true, // changelog mode
@@ -2279,93 +1343,6 @@ async fn test_changelog_delta_emit() {
 }
 
 #[tokio::test]
-async fn changelog_restore_emits_no_duplicates_then_resumes() {
-    // After recovery, restored groups are already reflected downstream (last_emitted
-    // is restored in lockstep with groups), so the first post-restore emit must be
-    // empty — re-emitting would duplicate. A later change must still emit normally.
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-    ]));
-    let seed = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![seed]]).unwrap();
-    ctx.register_table("t", Arc::new(mem)).unwrap();
-
-    let sql = "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol";
-    let mut state = IncrementalAggState::try_from_sql(&ctx, sql, true)
-        .await
-        .unwrap()
-        .unwrap();
-
-    let pre_agg = Arc::new(Schema::new(vec![
-        Field::new("symbol", DataType::Utf8, true),
-        Field::new("price", DataType::Int64, true),
-    ]));
-    let b1 = RecordBatch::try_new(
-        Arc::clone(&pre_agg),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
-            Arc::new(arrow::array::Int64Array::from(vec![100, 200])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    assert_eq!(
-        state
-            .emit()
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        2
-    ); // AAPL +1, GOOG +1
-
-    // Recover into a fresh state from the post-emit checkpoint.
-    let cp = state.checkpoint_groups().unwrap();
-    let mut restored = IncrementalAggState::try_from_sql(&ctx, sql, true)
-        .await
-        .unwrap()
-        .unwrap();
-    restored.restore_groups(&cp).unwrap();
-
-    // First emit after restore: nothing new → empty (no duplicate inserts).
-    let r0 = restored.emit().unwrap();
-    assert!(
-        r0.is_empty() || r0.iter().all(|b| b.num_rows() == 0),
-        "restored groups must not be re-emitted"
-    );
-
-    // A real change resumes normally: AAPL 100 -> 150 emits retract + insert.
-    let b2 = RecordBatch::try_new(
-        pre_agg,
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
-            Arc::new(arrow::array::Int64Array::from(vec![50])),
-        ],
-    )
-    .unwrap();
-    restored.process_batch(&b2, 2000).unwrap();
-    assert_eq!(
-        restored
-            .emit()
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>(),
-        2,
-        "post-restore change must emit retract+insert"
-    );
-}
-
-#[tokio::test]
 async fn test_cascaded_agg_retract_batch() {
     // Simulate a downstream aggregate consuming upstream changelog output
     // with a __weight column. Negative weights should trigger retract_batch.
@@ -2387,7 +1364,7 @@ async fn test_cascaded_agg_retract_batch() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT symbol, SUM(total) AS grand_total FROM upstream GROUP BY symbol",
         false,
@@ -2455,8 +1432,7 @@ async fn test_cascaded_agg_retract_batch() {
 }
 
 #[tokio::test]
-async fn test_min_accepted_over_changelog_upstream() {
-    // MIN is now supported over changelog streams via retractable accumulators.
+async fn weighted_min_and_max_are_rejected_at_admission() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
@@ -2475,18 +1451,16 @@ async fn test_min_accepted_over_changelog_upstream() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT symbol, MIN(price) AS low FROM upstream GROUP BY symbol",
-        false,
-    )
-    .await;
-    assert!(result.is_ok(), "MIN should be accepted over changelog");
+    for sql in [
+        "SELECT symbol, MIN(price) AS value FROM upstream GROUP BY symbol",
+        "SELECT symbol, MAX(price) AS value FROM upstream GROUP BY symbol",
+    ] {
+        assert!(try_from_sql_local(&ctx, sql, false).await.is_err(), "{sql}");
+    }
 }
 
 #[tokio::test]
-async fn test_unsupported_agg_rejected_over_changelog() {
-    // STDDEV is NOT supported over changelog streams.
+async fn unsupported_aggregate_is_rejected_at_admission() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("symbol", DataType::Utf8, false),
@@ -2505,19 +1479,13 @@ async fn test_unsupported_agg_rejected_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let result = IncrementalAggState::try_from_sql(
+    assert!(try_from_sql_local(
         &ctx,
         "SELECT symbol, STDDEV(price) AS sd FROM upstream GROUP BY symbol",
         false,
     )
-    .await;
-    match result {
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(msg.contains("Cannot compute"), "got: {msg}");
-        }
-        Ok(_) => panic!("expected error for STDDEV over changelog upstream"),
-    }
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -2540,7 +1508,7 @@ async fn test_cascaded_count_star_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
         false,
@@ -2550,6 +1518,8 @@ async fn test_cascaded_count_star_over_changelog() {
     .unwrap();
 
     assert!(state.weight_col_idx.is_some());
+    assert!(!state.output_schema.field(0).is_nullable());
+    assert!(!state.output_schema.field(1).is_nullable());
 
     // Cycle 1: insert 3 rows.
     // Pre-agg schema for COUNT(*): [region, TRUE (dummy bool), __weight].
@@ -2606,11 +1576,7 @@ async fn test_cascaded_count_star_over_changelog() {
 }
 
 #[tokio::test]
-async fn changelog_retractable_survives_checkpoint() {
-    // checkpoint_groups() rebuilds each live accumulator from its snapshot.
-    // For a changelog (`__weight`) aggregate the live accumulator is the
-    // retractable variant; rebuilding it as a plain one would silently drop
-    // retraction. Prove a retract still works *after* a mid-stream checkpoint.
+async fn pending_group_deletion_survives_vnode_checkpoint() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![
         Field::new("region", DataType::Utf8, false),
@@ -2629,14 +1595,8 @@ async fn changelog_retractable_survives_checkpoint() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let sql = "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region";
+    let mut state = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
     assert!(state.weight_col_idx.is_some());
 
     let pre_agg_schema = Arc::new(Schema::new(vec![
@@ -2657,36 +1617,56 @@ async fn changelog_retractable_survives_checkpoint() {
         .unwrap()
     };
 
-    state
-        .process_batch(&mk(vec!["US", "US", "EU"], vec![1, 1, 1]), 1000)
-        .unwrap();
+    state.process_batch(&mk(vec!["US"], vec![1]), 1000).unwrap();
     let _ = state.emit().unwrap();
+    let vnode = state.active_vnodes_for_test()[0];
+    let vnode_count = u32::from(state.key_group_count().get());
+    assert_eq!(
+        state
+            .checkpoint_vnodes(&[vnode], vnode_count)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(state
+        .checkpoint_vnodes(&[vnode], vnode_count)
+        .unwrap()
+        .is_empty());
 
-    // Mid-stream checkpoint — must keep the live accumulators retractable.
-    let _ = state.checkpoint_groups().unwrap();
-
-    // Retract one US row; a downgraded plain accumulator could not.
     state
         .process_batch(&mk(vec!["US"], vec![-1]), 2000)
         .unwrap();
-    let r = state.emit().unwrap();
-    let regions = r[0]
+    let mut captured = state.checkpoint_vnodes(&[vnode], vnode_count).unwrap();
+    assert_eq!(captured.len(), 1);
+    let (captured_vnode, checkpoint) = captured.pop().unwrap();
+    assert_eq!(captured_vnode, vnode);
+
+    let mut restored = try_from_sql_local(&ctx, sql, true).await.unwrap().unwrap();
+    restored
+        .restore_vnode(vnode, vnode_count, checkpoint)
+        .unwrap();
+    let output = restored.emit().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    let regions = output[0]
         .column(0)
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .unwrap();
-    let counts = r[0]
+    let counts = output[0]
         .column(1)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .unwrap();
-    for i in 0..r[0].num_rows() {
-        match regions.value(i) {
-            "US" => assert_eq!(counts.value(i), 1, "US count must be 1 after retract"),
-            "EU" => assert_eq!(counts.value(i), 1),
-            other => panic!("unexpected region: {other}"),
-        }
-    }
+    let weights = output[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(regions.value(0), "US");
+    assert_eq!(counts.value(0), 1);
+    assert_eq!(weights.value(0), -1);
+    assert_eq!(restored.logical_group_count_for_test(), 0);
 }
 
 #[tokio::test]
@@ -2709,7 +1689,7 @@ async fn test_cascaded_avg_over_changelog() {
     let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
     ctx.register_table("upstream", Arc::new(mem)).unwrap();
 
-    let mut state = IncrementalAggState::try_from_sql(
+    let mut state = try_from_sql_local(
         &ctx,
         "SELECT region, AVG(price) AS avg_price FROM upstream GROUP BY region",
         false,
@@ -2722,12 +1702,12 @@ async fn test_cascaded_avg_over_changelog() {
     let b1 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
             Field::new(WEIGHT_COLUMN, DataType::Int64, false),
         ])),
         vec![
             Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
             Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
         ],
     )
@@ -2745,12 +1725,12 @@ async fn test_cascaded_avg_over_changelog() {
     let b2 = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
             Field::new(WEIGHT_COLUMN, DataType::Int64, false),
         ])),
         vec![
             Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0])),
             Arc::new(arrow::array::Int64Array::from(vec![-1])),
         ],
     )
@@ -2766,300 +1746,6 @@ async fn test_cascaded_avg_over_changelog() {
         (avg2.value(0) - 25.0).abs() < 0.001,
         "avg should be 25.0 after retraction"
     );
-}
-
-#[tokio::test]
-async fn test_cascaded_min_over_changelog() {
-    // Single MIN aggregate — pre-agg schema: [region, price, __weight]
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let mut state = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT region, MIN(price) AS lo FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    // Insert 10, 20, 30
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    let mins = r1[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(mins.value(0), 10);
-
-    // Retract current min (10) -> new min = 20
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    let mins2 = r2[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(mins2.value(0), 20, "min should be 20 after retracting 10");
-
-    // Retract 20, retract 30 -> empty -> NULL
-    let b3 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1, -1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b3, 3000).unwrap();
-    let r3 = state.emit().unwrap();
-    assert!(
-        r3[0].column(1).is_null(0),
-        "min should be NULL after all values retracted"
-    );
-}
-
-#[tokio::test]
-async fn test_cascaded_max_retract_over_changelog() {
-    // Single MAX aggregate — pre-agg schema: [region, price, __weight]
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("price", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let mut state = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT region, MAX(price) AS hi FROM upstream GROUP BY region",
-        false,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    // Insert 10, 20, 30
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    let maxs = r1[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(maxs.value(0), 30);
-
-    // Retract current max (30) -> new max = 20
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("price", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![30])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    let maxs2 = r2[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(maxs2.value(0), 20, "max should be 20 after retracting 30");
-}
-
-#[tokio::test]
-async fn test_cascaded_mixed_aggregates_over_changelog() {
-    // Mixed: SUM + COUNT(*) + AVG + MIN + MAX on same column.
-    // Pre-agg schema: [region, amount(SUM), TRUE(COUNT), amount(AVG),
-    //                   amount(MIN), amount(MAX), __weight] = 7 columns.
-    let ctx = SessionContext::new();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("region", DataType::Utf8, false),
-        Field::new("amount", DataType::Int64, false),
-        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["X"])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-            Arc::new(arrow::array::Int64Array::from(vec![1])),
-        ],
-    )
-    .unwrap();
-    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
-    ctx.register_table("upstream", Arc::new(mem)).unwrap();
-
-    let result = IncrementalAggState::try_from_sql(
-        &ctx,
-        "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt, \
-         AVG(amount) AS avg_amt, MIN(amount) AS lo, MAX(amount) AS hi \
-         FROM upstream GROUP BY region",
-        false,
-    )
-    .await;
-    assert!(result.is_ok(), "mixed aggregates should be accepted");
-    let mut state = result.unwrap().unwrap();
-
-    // Pre-agg has 7 cols: [region, amt, TRUE, amt, amt, amt, __weight].
-    // Build matching batch.
-    let b1 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Int64, true),
-            Field::new("__agg_input_2", DataType::Boolean, true),
-            Field::new("__agg_input_3", DataType::Int64, true),
-            Field::new("__agg_input_4", DataType::Int64, true),
-            Field::new("__agg_input_5", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // SUM input
-            Arc::new(arrow::array::BooleanArray::from(vec![true, true, true])), // COUNT(*)
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // AVG input
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // MIN input
-            Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])), // MAX input
-            Arc::new(arrow::array::Int64Array::from(vec![1, 1, 1])),    // weight
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b1, 1000).unwrap();
-    let r1 = state.emit().unwrap();
-    assert_eq!(r1[0].num_rows(), 1);
-
-    // Retract 10, insert 40.
-    let b2 = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Int64, true),
-            Field::new("__agg_input_2", DataType::Boolean, true),
-            Field::new("__agg_input_3", DataType::Int64, true),
-            Field::new("__agg_input_4", DataType::Int64, true),
-            Field::new("__agg_input_5", DataType::Int64, true),
-            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
-        ])),
-        vec![
-            Arc::new(arrow::array::StringArray::from(vec!["US", "US"])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::BooleanArray::from(vec![true, true])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![10, 40])),
-            Arc::new(arrow::array::Int64Array::from(vec![-1, 1])),
-        ],
-    )
-    .unwrap();
-    state.process_batch(&b2, 2000).unwrap();
-    let r2 = state.emit().unwrap();
-    // {20, 30, 40}: SUM=90, COUNT=3, AVG=30, MIN=20, MAX=40
-    let b = &r2[0];
-    let sum_col = b
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let cnt_col = b
-        .column(2)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let avg_col = b
-        .column(3)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .unwrap();
-    let min_col = b
-        .column(4)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    let max_col = b
-        .column(5)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    assert_eq!(sum_col.value(0), 90, "SUM should be 90");
-    assert_eq!(cnt_col.value(0), 3, "COUNT should be 3");
-    assert!((avg_col.value(0) - 30.0).abs() < 0.001, "AVG should be 30");
-    assert_eq!(min_col.value(0), 20, "MIN should be 20");
-    assert_eq!(max_col.value(0), 40, "MAX should be 40");
 }
 
 fn round_trip(sv: &ScalarValue) -> ScalarValue {
@@ -3113,76 +1799,4 @@ fn binary_scalar_roundtrips_exactly() {
     // "STR" fallback. Arrow IPC preserves Binary natively.
     let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
     assert_eq!(round_trip(&sv), sv);
-}
-
-/// Profiling (not a correctness test): measures the on-task whole-node
-/// `checkpoint_groups` capture cost vs group count — the cost an incremental
-/// (dirty-only) capture would shrink. Reports total time, ns/group,
-/// and serialized size, so the incremental win for a given dirty ratio is
-/// `ns/group * dirty_count`. `#[ignore]`d; run in release:
-/// `cargo test -p laminar-db --release profile_checkpoint_capture -- --ignored --nocapture`
-#[tokio::test]
-#[ignore = "profiling; run with --release --ignored --nocapture"]
-async fn profile_checkpoint_capture_cost() {
-    for &n in &[10_000usize, 100_000, 1_000_000] {
-        let ctx = SessionContext::new();
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Float64, false),
-        ]));
-        let dummy = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(vec![0i64])),
-                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-            ],
-        )
-        .unwrap();
-        let mem = datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
-            .unwrap();
-        ctx.register_table("events", Arc::new(mem)).unwrap();
-        let mut state = IncrementalAggState::try_from_sql(
-            &ctx,
-            "SELECT id, SUM(value) AS total FROM events GROUP BY id",
-            false,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-
-        let pre = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]));
-        let ids: Vec<i64> = (0_i64..).take(n).collect();
-        let mut values = Vec::with_capacity(n);
-        let mut value = 0.0;
-        for _ in 0..n {
-            values.push(value);
-            value += 1.0;
-        }
-        let batch = RecordBatch::try_new(
-            pre,
-            vec![
-                Arc::new(arrow::array::Int64Array::from(ids)),
-                Arc::new(arrow::array::Float64Array::from(values)),
-            ],
-        )
-        .unwrap();
-        state.process_batch(&batch, 0).unwrap();
-
-        let t0 = std::time::Instant::now();
-        let cp = state.checkpoint_groups().unwrap();
-        let elapsed = t0.elapsed();
-
-        let bytes: usize = cp.keys_ipc.len()
-            + cp.acc_state_ipc.iter().map(Vec::len).sum::<usize>()
-            + cp.last_updated_ms.len() * 8;
-        let ns_per_group = elapsed.as_secs_f64() * 1_000_000_000.0 / value;
-        println!(
-            "checkpoint_groups: {n:>9} groups -> {elapsed:>11.2?}  ({ns_per_group:6.0} ns/group)  ~{} KiB",
-            bytes / 1024
-        );
-        assert_eq!(cp.last_updated_ms.len(), n);
-    }
 }

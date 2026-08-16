@@ -11,7 +11,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::row::{RowConverter, SortField};
 
 use crate::error::DbError;
-use crate::table_backend::TableBackend;
+use crate::table_rows::TableRows;
 
 pub(crate) const REFERENCE_TABLE_CHECKPOINT_KEY: &str = "__laminar_reference_tables";
 const REFERENCE_TABLE_CHECKPOINT_VERSION: u16 = 2;
@@ -56,7 +56,7 @@ impl ReferenceTableCheckpointCapture {
         self.estimated_bytes
     }
 
-    pub(crate) fn encode(self, max_encoded_bytes: u64) -> Result<bytes::Bytes, DbError> {
+    pub(crate) fn encode(self, max_encoded_bytes: u64) -> Result<(bytes::Bytes, u64), DbError> {
         let max_encoded_bytes = max_encoded_bytes.min(MAX_REFERENCE_TABLE_CHECKPOINT_BYTES as u64);
         let mut entries = Vec::with_capacity(self.tables.len());
         let mut retained_payload_bytes = 0u64;
@@ -182,7 +182,9 @@ impl ReferenceTableCheckpointCapture {
         debug_assert!(
             retained_payload_bytes.saturating_add(encoded.capacity() as u64) <= max_encoded_bytes
         );
-        Ok(bytes::Bytes::from(encoded))
+        let retained_bytes = u64::try_from(encoded.capacity())
+            .map_err(|_| DbError::Checkpoint("reference-table checkpoint size overflow".into()))?;
+        Ok((bytes::Bytes::from(encoded), retained_bytes))
     }
 }
 
@@ -192,7 +194,7 @@ struct TableState {
     primary_key: String,
     pk_index: usize,
     key_converter: RowConverter,
-    backend: TableBackend,
+    rows: TableRows,
     row_count: usize,
     ready: bool,
     connector: Option<String>,
@@ -208,7 +210,7 @@ pub(crate) struct PreparedTableSnapshot {
     table_identity: std::sync::Arc<TableIdentity>,
     schema: SchemaRef,
     primary_key: String,
-    backend: TableBackend,
+    rows: TableRows,
     row_count: usize,
 }
 
@@ -340,7 +342,7 @@ impl TableStore {
                 primary_key: primary_key.to_string(),
                 pk_index,
                 key_converter,
-                backend: TableBackend::in_memory(),
+                rows: TableRows::new(),
                 row_count: 0,
                 ready: false,
                 connector: None,
@@ -410,26 +412,27 @@ impl TableStore {
         for batch in batches {
             validate_batch_contract(name, state, batch)?;
         }
-        let backend = TableBackend::from_batches(batches, state.pk_index, &state.key_converter)
-            .map_err(|error| {
+        let rows = TableRows::from_batches(batches, state.pk_index, &state.key_converter).map_err(
+            |error| {
                 DbError::Storage(format!(
                     "reference-table '{name}' snapshot key validation failed: {error}"
                 ))
-            })?;
-        let row_count = backend.row_count();
+            },
+        )?;
+        let row_count = rows.row_count();
 
         Ok(PreparedTableSnapshot {
             name: name.to_string(),
             table_identity: std::sync::Arc::clone(&state.identity),
             schema: state.schema.clone(),
             primary_key: state.primary_key.clone(),
-            backend,
+            rows,
             row_count,
         })
     }
 
     /// Atomically install validated startup snapshots. Every table name and
-    /// captured contract is checked before any live backend is replaced.
+    /// captured contract is checked before any live rows are replaced.
     pub(crate) fn install_prepared_snapshots(
         &mut self,
         snapshots: Vec<PreparedTableSnapshot>,
@@ -464,7 +467,7 @@ impl TableStore {
                     snapshot.name
                 )));
             }
-            if snapshot.backend.row_count() != snapshot.row_count {
+            if snapshot.rows.row_count() != snapshot.row_count {
                 return Err(DbError::Storage(format!(
                     "reference-table '{}' prepared snapshot row count is inconsistent",
                     snapshot.name
@@ -477,7 +480,7 @@ impl TableStore {
                 .tables
                 .get_mut(&snapshot.name)
                 .expect("prepared snapshot table contracts were validated before installation");
-            state.backend = snapshot.backend;
+            state.rows = snapshot.rows;
             state.row_count = snapshot.row_count;
             state.ready = true;
         }
@@ -502,7 +505,7 @@ impl TableStore {
                     state.row_count
                 )));
             }
-            if state.backend.row_count() != state.row_count {
+            if state.rows.row_count() != state.row_count {
                 return Err(DbError::Checkpoint(format!(
                     "reference-table '{name}' row-count metadata is inconsistent"
                 )));
@@ -518,13 +521,13 @@ impl TableStore {
                 add_checkpoint_capture_bytes(&mut bytes, key.len(), name)?;
                 add_checkpoint_capture_bytes(&mut bytes, value.len(), name)?;
             }
-            let backend_bytes = state.backend.checkpoint_capture_estimated_bytes()?;
+            let row_bytes = state.rows.checkpoint_capture_estimated_bytes()?;
             // The immutable row slices remain live while one bounded concat chunk is assembled.
-            // Reserving the full captured backend size is conservative and covers even one
+            // Reserving the full captured row size is conservative and covers even one
             // pathological variable-width row without a second user-facing tuning option.
             bytes = bytes
-                .checked_add(backend_bytes)
-                .and_then(|bytes| bytes.checked_add(backend_bytes))
+                .checked_add(row_bytes)
+                .and_then(|bytes| bytes.checked_add(row_bytes))
                 .ok_or_else(|| checkpoint_capture_size_overflow(name))?;
         }
         Ok(bytes)
@@ -559,7 +562,7 @@ impl TableStore {
                     state.row_count
                 )));
             }
-            let rows = state.backend.checkpoint_rows();
+            let rows = state.rows.checkpoint_rows();
             if rows.len() != state.row_count {
                 return Err(DbError::Checkpoint(format!(
                     "reference-table '{name}' row-count metadata is inconsistent"
@@ -580,7 +583,7 @@ impl TableStore {
     }
 
     /// Restore an exact table inventory atomically. Every archive entry is
-    /// decoded into a replacement backend before any live table is changed.
+    /// decoded into replacement rows before any live table is changed.
     /// `Ok(true)` means the checkpoint covered the complete non-empty catalog.
     pub(crate) fn restore_checkpoint(&mut self, encoded: &[u8]) -> Result<bool, DbError> {
         if encoded.is_empty() || encoded.len() > MAX_REFERENCE_TABLE_CHECKPOINT_BYTES {
@@ -718,23 +721,22 @@ impl TableStore {
                     }
                 }
             }
-            let backend =
-                TableBackend::from_batches(&batches, state.pk_index, &state.key_converter)
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "reference-table '{}' checkpoint key validation failed: {error}",
-                            entry.name
-                        ))
-                    })?;
-            replacements.insert(entry.name, (backend, row_count));
+            let rows = TableRows::from_batches(&batches, state.pk_index, &state.key_converter)
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "reference-table '{}' checkpoint key validation failed: {error}",
+                        entry.name
+                    ))
+                })?;
+            replacements.insert(entry.name, (rows, row_count));
         }
 
         debug_assert_eq!(replacements.len(), self.tables.len());
         for (name, state) in &mut self.tables {
-            let (backend, row_count) = replacements
+            let (rows, row_count) = replacements
                 .remove(name)
                 .expect("checkpoint inventory was validated before installation");
-            state.backend = backend;
+            state.rows = rows;
             state.row_count = row_count;
             state.ready = true;
         }
@@ -766,7 +768,7 @@ impl TableStore {
 
         for i in 0..count {
             let row = batch.slice(i, 1);
-            let existed = state.backend.put(keys.row(i).owned(), row);
+            let existed = state.rows.put(keys.row(i).owned(), row);
             if !existed {
                 state.row_count += 1;
             }
@@ -779,7 +781,7 @@ impl TableStore {
         let Some(state) = self.tables.get(name) else {
             return Ok(None);
         };
-        state.backend.to_record_batch(&state.schema)
+        state.rows.to_record_batch(&state.schema)
     }
 }
 
@@ -843,6 +845,7 @@ mod tests {
             .expect("non-empty table inventory")
             .encode(u64::MAX)
             .unwrap()
+            .0
     }
 
     fn rewrite_archive(
@@ -1329,7 +1332,8 @@ mod tests {
         store
             .upsert("t", &make_batch(&[1], &["new"], &[2.0]))
             .unwrap();
-        let encoded = capture.encode(u64::MAX).unwrap();
+        let (encoded, retained_bytes) = capture.encode(u64::MAX).unwrap();
+        assert!(retained_bytes >= encoded.len() as u64);
         let mut restored = TableStore::new();
         restored.create_table("t", test_schema(), "id").unwrap();
         restored.restore_checkpoint(&encoded).unwrap();
@@ -1450,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_prepares_every_backend_before_installing_any() {
+    fn restore_prepares_every_table_before_installing_any() {
         let mut source = TableStore::new();
         source.create_table("a", test_schema(), "id").unwrap();
         source.create_table("b", test_schema(), "id").unwrap();

@@ -370,24 +370,20 @@ async fn scenario_1_kafka_roundtrip() {
 
     let db = LaminarDB::open().expect("open db");
     let ddl_src = format!(
-        "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
-             'connector' = 'kafka', \
+        "CREATE SOURCE input (id BIGINT, value BIGINT) FROM KAFKA (\
              'bootstrap.servers' = '{brokers}', \
              'topic' = '{in_topic}', \
              'group.id' = 'laminar_s1', \
-             'format' = 'json', \
-             'auto.offset.reset' = 'earliest')"
+             'auto.offset.reset' = 'earliest') FORMAT JSON"
     );
     db.execute(&ddl_src).await.expect("create source");
     db.execute("CREATE STREAM projected AS SELECT id, value FROM input")
         .await
         .expect("create stream");
     let ddl_sink = format!(
-        "CREATE SINK out FROM projected WITH (\
-             'connector' = 'kafka', \
+        "CREATE SINK out FROM projected INTO KAFKA (\
              'bootstrap.servers' = '{brokers}', \
-             'topic' = '{out_topic}', \
-             'format' = 'json')"
+             'topic' = '{out_topic}') FORMAT JSON"
     );
     db.execute(&ddl_sink).await.expect("create sink");
     db.start().await.expect("start");
@@ -437,24 +433,20 @@ async fn scenario_2_broker_outage_between_batches_reconnect_smoke() {
     let storage = tempfile::tempdir().expect("tempdir");
     let db = LaminarDB::open_with_config(at_least_once_config(storage.path())).expect("open db");
     let ddl_src = format!(
-        "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
-             'connector' = 'kafka', \
+        "CREATE SOURCE input (id BIGINT, value BIGINT) FROM KAFKA (\
              'bootstrap.servers' = '{brokers}', \
              'topic' = '{in_topic}', \
              'group.id' = 'laminar_s2', \
-             'format' = 'json', \
-             'startup.mode' = 'earliest')"
+             'startup.mode' = 'earliest') FORMAT JSON"
     );
     db.execute(&ddl_src).await.expect("create source");
     db.execute("CREATE STREAM projected AS SELECT id, value FROM input")
         .await
         .expect("create stream");
     let ddl_sink = format!(
-        "CREATE SINK out FROM projected WITH (\
-             'connector' = 'kafka', \
+        "CREATE SINK out FROM projected INTO KAFKA (\
              'bootstrap.servers' = '{brokers}', \
-             'topic' = '{out_topic}', \
-             'format' = 'json')"
+             'topic' = '{out_topic}') FORMAT JSON"
     );
     db.execute(&ddl_sink).await.expect("create sink");
     db.start().await.expect("start");
@@ -529,24 +521,20 @@ async fn scenario_3_at_least_once_has_no_loss_after_db_restart() {
         let config = at_least_once_config(storage.path());
         let db = LaminarDB::open_with_config(config).expect("open");
         let ddl = format!(
-            "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
-                 'connector' = 'kafka', \
+            "CREATE SOURCE input (id BIGINT, value BIGINT) FROM KAFKA (\
                  'bootstrap.servers' = '{brokers}', \
                  'topic' = '{in_topic}', \
                  'group.id' = 'laminar_s3', \
-                 'format' = 'json', \
-                 'startup.mode' = 'earliest')"
+                 'startup.mode' = 'earliest') FORMAT JSON"
         );
         db.execute(&ddl).await.expect("src");
         db.execute("CREATE STREAM out_stream AS SELECT id, value FROM input")
             .await
             .expect("stream");
         let ddl_sink = format!(
-            "CREATE SINK sink_a FROM out_stream WITH (\
-                 'connector' = 'kafka', \
+            "CREATE SINK sink_a FROM out_stream INTO KAFKA (\
                  'bootstrap.servers' = '{brokers}', \
-                 'topic' = '{out_topic}', \
-                 'format' = 'json')"
+                 'topic' = '{out_topic}') FORMAT JSON"
         );
         db.execute(&ddl_sink).await.expect("sink");
         db.start().await.expect("start");
@@ -587,24 +575,20 @@ async fn scenario_3_at_least_once_has_no_loss_after_db_restart() {
         let config = at_least_once_config(storage.path());
         let db = LaminarDB::open_with_config(config).expect("reopen");
         let ddl = format!(
-            "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
-                 'connector' = 'kafka', \
+            "CREATE SOURCE input (id BIGINT, value BIGINT) FROM KAFKA (\
                  'bootstrap.servers' = '{brokers}', \
                  'topic' = '{in_topic}', \
                  'group.id' = 'laminar_s3', \
-                 'format' = 'json', \
-                 'startup.mode' = 'earliest')"
+                 'startup.mode' = 'earliest') FORMAT JSON"
         );
         db.execute(&ddl).await.expect("src");
         db.execute("CREATE STREAM out_stream AS SELECT id, value FROM input")
             .await
             .expect("stream");
         let ddl_sink = format!(
-            "CREATE SINK sink_a FROM out_stream WITH (\
-                 'connector' = 'kafka', \
+            "CREATE SINK sink_a FROM out_stream INTO KAFKA (\
                  'bootstrap.servers' = '{brokers}', \
-                 'topic' = '{out_topic}', \
-                 'format' = 'json')"
+                 'topic' = '{out_topic}') FORMAT JSON"
         );
         db.execute(&ddl_sink).await.expect("sink");
         db.start().await.expect("restart");
@@ -661,14 +645,16 @@ async fn scenario_3_at_least_once_has_no_loss_after_db_restart() {
 
 fn kv_batch(ks: &[i64], vs: &[i64]) -> arrow::array::RecordBatch {
     use std::sync::Arc;
-    arrow::array::RecordBatch::try_from_iter(vec![
+    arrow::array::RecordBatch::try_from_iter_with_nullable(vec![
         (
             "k",
             Arc::new(arrow::array::Int64Array::from(ks.to_vec())) as _,
+            true,
         ),
         (
             "v",
             Arc::new(arrow::array::Int64Array::from(vs.to_vec())) as _,
+            true,
         ),
     ])
     .unwrap()
@@ -718,13 +704,11 @@ async fn run_upsert_scenario(
         db.execute(ddl).await.expect("extra stream ddl");
     }
     let ddl_sink = format!(
-        "CREATE SINK out FROM {sink_from} WITH (\
-             'connector' = 'kafka', \
+        "CREATE SINK out FROM {sink_from} INTO KAFKA (\
              'bootstrap.servers' = '{brokers}', \
              'topic' = '{out_topic}', \
-             'format' = 'json', \
              'key.column' = 'k', \
-             'envelope' = 'upsert')"
+             'envelope' = 'upsert') FORMAT JSON"
     );
     db.execute(&ddl_sink).await.expect("upsert sink");
     db.start().await.expect("start");

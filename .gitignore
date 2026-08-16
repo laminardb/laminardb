@@ -49,20 +49,17 @@ data/
 checkpoints/
 wal/
 /tools/*
+!/tools/independent-soak-contract/
+!/tools/kafka-transaction-probe/
 
-# Private configs (symlinked from private repo)
+# Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md
 .claude/
-docs/features/
-docs/research/
-docs/audits/
+docs/architecture/
 docs/adr/
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
-/examples/binance-markout/target
-/examples/binance-markout/Cargo.lock
-/examples/binance-markout/smoke-report.txt
 
 # Private internal docs (formerly a git submodule; kept local-only, untracked)
 /private/

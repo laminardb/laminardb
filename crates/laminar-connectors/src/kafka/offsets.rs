@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use laminar_core::checkpoint::ConnectorCheckpoint;
 use rdkafka::Offset;
 use rdkafka::TopicPartitionList;
 
@@ -17,6 +16,8 @@ use crate::error::ConnectorError;
 /// Reserved source-offset key prefix for a partition's durable numeric next-to-read baseline.
 /// `@` and `:` are invalid in Kafka topic names, so a real topic-partition key cannot collide.
 pub(super) const KAFKA_PARTITION_BASELINE_PREFIX: &str = "@laminar.kafka.next.v1:";
+pub(super) const KAFKA_CHECKPOINT_VERSION_KEY: &str = "checkpoint.version";
+pub(super) const KAFKA_CHECKPOINT_VERSION: &str = "2";
 
 /// Tracks consumed offsets per topic-partition.
 ///
@@ -109,34 +110,25 @@ impl OffsetTracker {
     /// Returns a configuration error when the connector identity, partition
     /// key, or offset value is malformed.
     pub fn try_from_checkpoint(cp: &SourceCheckpoint) -> Result<Self, ConnectorError> {
-        if let Some(connector) = cp.get_metadata("connector") {
-            if connector != "kafka" {
+        match cp.get_metadata("connector") {
+            Some("kafka") => {}
+            Some(connector) => {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "Kafka checkpoint belongs to connector '{connector}'"
                 )));
             }
+            None => {
+                return Err(ConnectorError::ConfigurationError(
+                    "Kafka checkpoint is missing connector identity".into(),
+                ));
+            }
+        }
+        if cp.get_metadata(KAFKA_CHECKPOINT_VERSION_KEY) != Some(KAFKA_CHECKPOINT_VERSION) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Kafka checkpoint requires {KAFKA_CHECKPOINT_VERSION_KEY}={KAFKA_CHECKPOINT_VERSION}"
+            )));
         }
         Self::try_from_offset_map(cp.offsets())
-    }
-
-    /// Strictly restores offset state from a committed cluster handoff.
-    ///
-    /// Unlike connector-local startup checkpoints, cluster handoff state must
-    /// carry an explicit connector identity. The handoff is shared through a
-    /// connector-agnostic registry, so accepting a missing identity could apply
-    /// another connector's cursor to Kafka after a catalog or assignment bug.
-    pub fn try_from_connector_checkpoint(
-        checkpoint: &ConnectorCheckpoint,
-    ) -> Result<Self, ConnectorError> {
-        match checkpoint.metadata.get("connector").map(String::as_str) {
-            Some("kafka") => Self::try_from_offset_map(&checkpoint.offsets),
-            Some(connector) => Err(ConnectorError::ConfigurationError(format!(
-                "Kafka checkpoint belongs to connector '{connector}'"
-            ))),
-            None => Err(ConnectorError::ConfigurationError(
-                "Kafka cluster handoff checkpoint is missing connector identity".into(),
-            )),
-        }
     }
 
     /// Strictly builds a tracker from a raw `"{topic}:{partition}" -> offset`
@@ -249,6 +241,7 @@ impl OffsetTracker {
         }
         let mut cp = SourceCheckpoint::with_offsets(offsets);
         cp.set_metadata("connector", "kafka");
+        cp.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, KAFKA_CHECKPOINT_VERSION);
         cp
     }
 }
@@ -365,25 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_handoff_requires_explicit_kafka_identity() {
-        let offsets = HashMap::from([("events:0".to_string(), "41".to_string())]);
-
-        let missing = ConnectorCheckpoint::with_offsets(offsets.clone());
-        assert!(OffsetTracker::try_from_connector_checkpoint(&missing).is_err());
-
-        let mut wrong = ConnectorCheckpoint::with_offsets(offsets.clone());
-        wrong
-            .metadata
-            .insert("connector".into(), "postgres-cdc".into());
-        assert!(OffsetTracker::try_from_connector_checkpoint(&wrong).is_err());
-
-        let mut kafka = ConnectorCheckpoint::with_offsets(offsets);
-        kafka.metadata.insert("connector".into(), "kafka".into());
-        let restored = OffsetTracker::try_from_connector_checkpoint(&kafka).unwrap();
-        assert_eq!(restored.get("events", 0), Some(41));
-    }
-
-    #[test]
     fn try_from_offset_map_rejects_malformed_entries() {
         for (key, value) in [
             ("bad-partition:x", "10"),
@@ -399,7 +373,7 @@ mod tests {
             let map = HashMap::from([(key.to_string(), value.to_string())]);
             assert!(
                 OffsetTracker::try_from_offset_map(&map).is_err(),
-                "malformed handoff entry {key}={value} was accepted"
+                "malformed offset entry {key}={value} was accepted"
             );
         }
     }
@@ -456,6 +430,15 @@ mod tests {
         let tracker = OffsetTracker::new();
         let cp = tracker.to_checkpoint_for_partitions(std::iter::empty());
         assert_eq!(cp.get_metadata("connector"), Some("kafka"));
+        assert_eq!(
+            cp.get_metadata(KAFKA_CHECKPOINT_VERSION_KEY),
+            Some(KAFKA_CHECKPOINT_VERSION)
+        );
+
+        let mut previous = cp;
+        previous.set_metadata(KAFKA_CHECKPOINT_VERSION_KEY, "1");
+        let error = OffsetTracker::try_from_checkpoint(&previous).unwrap_err();
+        assert!(error.to_string().contains("checkpoint.version=2"));
     }
 
     #[test]

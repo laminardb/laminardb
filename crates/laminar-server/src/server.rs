@@ -21,8 +21,6 @@ use crate::http;
 use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(test)]
-use laminar_core::state::StateBackendConfig;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub struct ServerHandle {
@@ -180,8 +178,22 @@ pub async fn run_server(
     // Validate independently of config-file loading: cluster startup acquires durable leases and
     // starts discovery before constructing LaminarDB, and programmatic callers can bypass the
     // TOML validator entirely.
-    resolved_checkpoint_state_bytes(&config.checkpoint)
-        .map_err(|error| ServerError::Build(format!("checkpoint.max_staged_bytes: {error}")))?;
+    crate::config::validate_http_auth(&config)
+        .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
+    let temporal_join_idle_history_retention = config
+        .server
+        .validated_temporal_join_idle_history_retention()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    let source_idle_timeout = config
+        .server
+        .validated_source_idle_timeout()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    let event_time_max_future_skew = config
+        .server
+        .validated_event_time_max_future_skew()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    resolved_checkpoint_node_data_bytes(&config.checkpoint)
+        .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
 
     // Cluster mode: gated behind the `cluster` feature flag.
     #[cfg(feature = "cluster")]
@@ -212,30 +224,24 @@ pub async fn run_server(
     if let Some(ref token) = config.server.console_token {
         builder = builder.http_auth_token(token.expose());
     }
-    let storage_dir = config.state.local_storage_dir();
-    if let Some(path) = storage_dir {
-        builder = builder.storage_dir(path);
-    }
-
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
+    if let Some(retention) = temporal_join_idle_history_retention {
+        builder = builder.temporal_join_idle_history_retention(retention);
+    }
+    if let Some(timeout) = source_idle_timeout {
+        builder = builder.source_idle_timeout(timeout);
+    }
+    builder = builder.event_time_max_future_skew(event_time_max_future_skew);
     builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
-    // Build the state backend + single-owner vnode registry from config so
-    // the checkpoint coordinator's durability gate runs with real markers.
     let key_groups = config.server.resolved_key_groups();
-    let state_backend = config
-        .state
-        .build(key_groups)
-        .map_err(|e| ServerError::Build(format!("state backend: {e}")))?;
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
         u32::from(key_groups),
-        laminar_core::state::NodeId(0),
+        laminar_core::state::LOCAL_NODE_ID,
     ));
-    builder = builder
-        .state_backend(state_backend)
-        .vnode_registry(vnode_registry);
+    builder = builder.vnode_registry(vnode_registry);
 
     // Build the AI subsystem from `[ai]`/`[models]` and install it. Without
     // configured models this is a no-op and `ai_*` functions fail at plan time.
@@ -364,9 +370,9 @@ pub async fn run_server(
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CheckpointConfigurationError {
     #[error(transparent)]
-    Storage(#[from] laminar_core::storage::object_store_builder::ObjectStoreBuilderError),
-    #[error("checkpoint.max_staged_bytes: {0}")]
-    StateBudget(laminar_core::storage::checkpoint_store::CheckpointStoreError),
+    Storage(#[from] laminar_core::checkpoint::object_store_builder::ObjectStoreBuilderError),
+    #[error("checkpoint.max_node_data_bytes: {0}")]
+    NodeDataBudget(laminar_core::checkpoint::CheckpointStoreError),
 }
 
 /// Apply local-runtime checkpoint settings to a `LaminarDB` builder.
@@ -375,21 +381,13 @@ pub(crate) fn apply_local_checkpoint_config(
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    let data_dir = if checkpoint_url.starts_with("file://") {
-        Some(laminar_core::storage::object_store_builder::file_url_path(
-            checkpoint_url,
-        )?)
-    } else {
-        None
-    };
-    builder = apply_checkpoint_settings(builder, checkpoint, data_dir)?;
-
-    let is_file = checkpoint_url.starts_with("file://");
-    if !checkpoint_url.is_empty() && !is_file {
-        builder = builder.object_store_url(checkpoint_url.to_string());
-        if !checkpoint.storage.is_empty() {
-            builder = builder.object_store_options(checkpoint.storage.clone());
-        }
+    if checkpoint_url.starts_with("file://") {
+        laminar_core::checkpoint::object_store_builder::file_url_path(checkpoint_url)?;
+    }
+    builder = apply_checkpoint_settings(builder, checkpoint)?;
+    builder = builder.object_store_url(checkpoint_url.to_string());
+    if !checkpoint.storage.is_empty() {
+        builder = builder.object_store_options(checkpoint.storage.clone());
     }
 
     Ok(builder)
@@ -401,37 +399,34 @@ pub(crate) fn apply_verified_cluster_checkpoint_config(
     checkpoint: &crate::config::CheckpointSection,
     namespaces: laminar_core::cluster::control::VerifiedClusterNamespaces,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    Ok(apply_checkpoint_settings(builder, checkpoint, None)?
-        .verified_cluster_namespaces(namespaces))
+    Ok(apply_checkpoint_settings(builder, checkpoint)?.verified_cluster_namespaces(namespaces))
 }
 
 fn apply_checkpoint_settings(
     builder: laminar_db::LaminarDbBuilder,
     checkpoint: &crate::config::CheckpointSection,
-    data_dir: Option<PathBuf>,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    let max_state_data_bytes = resolved_checkpoint_state_bytes(checkpoint)
-        .map_err(CheckpointConfigurationError::StateBudget)?;
+    let max_node_data_bytes = resolved_checkpoint_node_data_bytes(checkpoint)
+        .map_err(CheckpointConfigurationError::NodeDataBudget)?;
     Ok(builder.checkpoint(StreamCheckpointConfig {
         interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
         timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
-        data_dir,
-        max_retained: Some(checkpoint.max_retained),
-        max_staged_bytes: Some(max_state_data_bytes),
+        data_dir: None,
+        max_node_data_bytes: Some(max_node_data_bytes),
     }))
 }
 
 /// Resolve the one capture and recovery admission budget used by every server checkpoint store.
-pub(crate) fn resolved_checkpoint_state_bytes(
+pub(crate) fn resolved_checkpoint_node_data_bytes(
     checkpoint: &crate::config::CheckpointSection,
-) -> Result<u64, laminar_core::storage::checkpoint_store::CheckpointStoreError> {
-    let max_state_data_bytes = checkpoint
-        .max_staged_bytes
-        .unwrap_or(laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES);
-    laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
-        max_state_data_bytes,
+) -> Result<u64, laminar_core::checkpoint::CheckpointStoreError> {
+    let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
+        laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
+    );
+    laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
+        max_node_data_bytes,
     )?;
-    Ok(max_state_data_bytes)
+    Ok(max_node_data_bytes)
 }
 
 /// Execute DDL for all config sections (sources, lookups, pipelines, sinks, raw SQL).
@@ -601,6 +596,7 @@ pub(crate) async fn prepare_http_api(
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<PreparedHttpApi, ServerError> {
     let bind = config.server.bind.clone();
+    let auth_policy = http::HttpAuthPolicy::from_server(&config.server);
 
     let server_metrics = ServerMetrics::new(&registry);
 
@@ -611,6 +607,9 @@ pub(crate) async fn prepare_http_api(
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,
+        auth_policy,
+        #[cfg(feature = "cluster")]
+        diagnostic_reads: http::DiagnosticReadGate::new(),
         ws_slots: http::ws_connection_slots(),
         serving_gate,
         #[cfg(feature = "cluster")]
@@ -651,10 +650,6 @@ pub(crate) fn spawn_config_watcher(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // DDL generation
 // ---------------------------------------------------------------------------
 
@@ -671,6 +666,10 @@ fn connector_sql_identifier(connector: &str) -> String {
     }
 }
 
+fn connector_option_key_sql(key: &str) -> String {
+    format!("\"{}\"", key.replace('"', "\"\""))
+}
+
 pub fn source_to_ddl(source: &SourceConfig) -> String {
     let mut parts = Vec::new();
     parts.push(format!("CREATE SOURCE {}", source.name));
@@ -684,6 +683,9 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
             format!("{} {}{}", c.name, c.data_type, nullability)
         })
         .collect();
+    if !source.primary_key.is_empty() {
+        col_defs.push(format!("PRIMARY KEY ({})", source.primary_key.join(", ")));
+    }
 
     // Watermark clause
     if let Some(wm) = &source.watermark {
@@ -700,18 +702,26 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
 
     // FROM CONNECTOR (...) clause
     let connector_keyword = connector_sql_identifier(&source.connector);
-    let mut opts = Vec::new();
-    opts.push(format!("format = '{}'", source.format));
-    for (key, value) in &source.properties {
-        // Quote keys that contain dots (e.g. kafka.session.timeout.ms)
-        // to prevent SQL parser errors with dotted identifiers.
-        if key.contains('.') {
-            opts.push(format!("\"{}\" = '{}'", key, toml_value_to_sql(value)));
-        } else {
-            opts.push(format!("{} = '{}'", key, toml_value_to_sql(value)));
-        }
+    let opts: Vec<String> = source
+        .properties
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{} = '{}'",
+                connector_option_key_sql(key),
+                toml_value_to_sql(value)
+            )
+        })
+        .collect();
+    if opts.is_empty() {
+        parts.push(format!("FROM {connector_keyword}"));
+    } else {
+        parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
     }
-    parts.push(format!("FROM {} ({})", connector_keyword, opts.join(", ")));
+    parts.push(format!(
+        "FORMAT {}",
+        connector_sql_identifier(&source.format)
+    ));
 
     parts.join(" ")
 }
@@ -726,15 +736,15 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
         .properties
         .iter()
         .map(|(key, value)| {
-            if key.contains('.') {
-                format!("\"{}\" = '{}'", key, toml_value_to_sql(value))
-            } else {
-                format!("{} = '{}'", key, toml_value_to_sql(value))
-            }
+            format!(
+                "{} = '{}'",
+                connector_option_key_sql(key),
+                toml_value_to_sql(value)
+            )
         })
         .collect();
 
-    if opts.is_empty() {
+    let mut ddl = if opts.is_empty() {
         format!(
             "CREATE SINK {} FROM {} INTO {}",
             sink.name, sink.pipeline, connector_keyword
@@ -747,7 +757,12 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
             connector_keyword,
             opts.join(", ")
         )
+    };
+    if let Some(format) = &sink.format {
+        ddl.push_str(" FORMAT ");
+        ddl.push_str(&connector_sql_identifier(format));
     }
+    ddl
 }
 
 #[allow(clippy::result_large_err)]
@@ -866,13 +881,13 @@ mod tests {
     fn checkpoint_state_budget_has_one_default_and_honours_an_override() {
         let mut checkpoint = CheckpointSection::default();
         assert_eq!(
-            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
-            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES
+            resolved_checkpoint_node_data_bytes(&checkpoint).unwrap(),
+            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES
         );
 
-        checkpoint.max_staged_bytes = Some(8 * 1024 * 1024);
+        checkpoint.max_node_data_bytes = Some(8 * 1024 * 1024);
         assert_eq!(
-            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
+            resolved_checkpoint_node_data_bytes(&checkpoint).unwrap(),
             8 * 1024 * 1024
         );
     }
@@ -880,13 +895,13 @@ mod tests {
     #[test]
     fn checkpoint_state_budget_rejects_zero_and_unaddressable_limits() {
         let mut checkpoint = CheckpointSection {
-            max_staged_bytes: Some(0),
+            max_node_data_bytes: Some(0),
             ..CheckpointSection::default()
         };
-        assert!(resolved_checkpoint_state_bytes(&checkpoint).is_err());
+        assert!(resolved_checkpoint_node_data_bytes(&checkpoint).is_err());
 
-        checkpoint.max_staged_bytes = Some((isize::MAX as u64) + 1);
-        let error = resolved_checkpoint_state_bytes(&checkpoint).unwrap_err();
+        checkpoint.max_node_data_bytes = Some((isize::MAX as u64) + 1);
+        let error = resolved_checkpoint_node_data_bytes(&checkpoint).unwrap_err();
         assert!(error
             .to_string()
             .contains("exceeds this process address space"));
@@ -897,17 +912,59 @@ mod tests {
         for mode in [ServerMode::Single, ServerMode::Cluster] {
             let mut config: ServerConfig = toml::from_str("").unwrap();
             config.server.mode = mode;
-            config.checkpoint.max_staged_bytes = Some(0);
+            config.checkpoint.max_node_data_bytes = Some(0);
 
             let result = run_server(config, PathBuf::from("unused.toml")).await;
             let Err(error) = result else {
                 panic!("invalid checkpoint state budget was admitted in {mode:?} mode");
             };
             assert!(
-                error.to_string().contains("checkpoint.max_staged_bytes"),
+                error.to_string().contains("checkpoint.max_node_data_bytes"),
                 "{error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn server_entry_rejects_invalid_temporal_retention_in_both_modes() {
+        for mode in [ServerMode::Single, ServerMode::Cluster] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.temporal_join_idle_history_retention =
+                Some(std::time::Duration::from_nanos(999_999));
+
+            let result = run_server(config, PathBuf::from("unused.toml")).await;
+            let Err(error) = result else {
+                panic!("invalid temporal retention was admitted in {mode:?} mode");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("temporal_join_idle_history_retention must be at least 1ms"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_entry_rejects_programmatic_diagnostic_auth_before_other_startup_work() {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.diagnostic_read_token = Some(Secret::new("invalid"));
+        // This second invalid value makes the test terminate safely even if authentication
+        // validation is accidentally moved later; authentication must still win.
+        config.checkpoint.max_node_data_bytes = Some(0);
+
+        let result = run_server(config, PathBuf::from("unused.toml")).await;
+        let Err(error) = result else {
+            panic!("invalid programmatic diagnostic authentication was admitted");
+        };
+        let message = error.to_string();
+        assert!(message.contains("HTTP authentication"), "{message}");
+        assert!(message.contains("diagnostic_read_token"), "{message}");
+        assert!(
+            !message.contains("checkpoint.max_node_data_bytes"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -918,7 +975,6 @@ mod tests {
         };
         let config = ServerConfig {
             server,
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -1037,6 +1093,7 @@ mod tests {
                     nullable: true,
                 },
             ],
+            primary_key: vec![],
             watermark: None,
         }
     }
@@ -1102,22 +1159,14 @@ mod tests {
                 &[participant],
                 kv,
                 Arc::clone(&object_store),
-                Arc::clone(&object_store),
                 std::time::Duration::from_secs(1),
             )
             .await
             .unwrap();
-        let state_backend: Arc<dyn laminar_core::state::StateBackend> =
-            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
-                verified_namespaces.state_store(),
-                node.to_string(),
-                1,
-            ));
         let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
         let db = LaminarDB::builder()
             .cluster_controller(controller)
             .verified_cluster_namespaces(verified_namespaces)
-            .state_backend(state_backend)
             .vnode_registry(vnode_registry)
             .catalog_manifest_store(Arc::clone(&manifest_store))
             .build()
@@ -1128,13 +1177,15 @@ mod tests {
 
     #[test]
     fn test_source_to_ddl_basic() {
-        let source = make_source("events", "kafka");
+        let mut source = make_source("events", "kafka");
+        source.primary_key = vec!["id".to_string()];
         let ddl = source_to_ddl(&source);
         assert!(ddl.starts_with("CREATE SOURCE events"));
         assert!(ddl.contains("id BIGINT NOT NULL"));
         assert!(ddl.contains("name VARCHAR"));
-        assert!(ddl.contains("FROM KAFKA"));
-        assert!(ddl.contains("format = 'json'"));
+        assert!(ddl.contains("PRIMARY KEY (id)"));
+        assert!(ddl.contains("FROM KAFKA FORMAT JSON"));
+        assert!(!ddl.contains("format ="));
     }
 
     /// Columnless OTel source + WATERMARK FOR must compose: the OTel
@@ -1149,6 +1200,7 @@ mod tests {
             format: "json".to_string(),
             properties: toml::Table::new(),
             schema: vec![],
+            primary_key: vec![],
             watermark: Some(WatermarkConfig {
                 column: "_laminar_received_at".to_string(),
                 max_out_of_orderness: std::time::Duration::from_secs(10),
@@ -1166,7 +1218,6 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1203,7 +1254,6 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1238,7 +1288,6 @@ mod tests {
         );
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![source],
@@ -1266,7 +1315,6 @@ mod tests {
 
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -1320,9 +1368,39 @@ mod tests {
             "topic".to_string(),
             toml::Value::String("events".to_string()),
         );
+        source.properties.insert(
+            "client-id".to_string(),
+            toml::Value::String("source-client".to_string()),
+        );
+        source.properties.insert(
+            "vendor\"option".to_string(),
+            toml::Value::String("quoted-key".to_string()),
+        );
         let ddl = source_to_ddl(&source);
         assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
-        assert!(ddl.contains("topic = 'events'"));
+        assert!(ddl.contains("\"topic\" = 'events'"));
+        assert!(ddl.contains("\"client-id\" = 'source-client'"));
+        assert!(ddl.contains("\"vendor\"\"option\" = 'quoted-key'"));
+        assert!(ddl.ends_with(") FORMAT JSON"));
+
+        let statements = laminar_sql::parser::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::parser::StreamingStatement::CreateSource(parsed) = &statements[0] else {
+            panic!("expected CREATE SOURCE")
+        };
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("client-id")
+                .map(String::as_str),
+            Some("source-client")
+        );
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("vendor\"option")
+                .map(String::as_str),
+            Some("quoted-key")
+        );
     }
 
     #[test]
@@ -1349,18 +1427,38 @@ mod tests {
             "bootstrap.servers".to_string(),
             toml::Value::String("localhost:9092".to_string()),
         );
+        props.insert(
+            "oauthbearer-token".to_string(),
+            toml::Value::String("token".to_string()),
+        );
         let sink = SinkConfig {
             name: "output_sink".to_string(),
             pipeline: "vwap".to_string(),
             connector: "kafka".to_string(),
+            format: Some("json".to_string()),
             properties: props,
         };
         let ddl = sink_to_ddl(&sink);
         assert!(ddl.starts_with("CREATE SINK output_sink FROM vwap INTO KAFKA"));
-        assert!(ddl.contains("topic = 'output'"));
+        assert!(ddl.contains("\"topic\" = 'output'"));
         assert!(ddl.contains("\"bootstrap.servers\" = 'localhost:9092'"));
+        assert!(ddl.contains("\"oauthbearer-token\" = 'token'"));
+        assert!(ddl.ends_with(") FORMAT JSON"));
+        assert!(!ddl.contains("format ="));
         // Delivery is injected from the pipeline-wide engine contract at connector build time.
         assert!(!ddl.contains("delivery"));
+
+        let statements = laminar_sql::parser::parse_streaming_sql(&ddl).unwrap();
+        let laminar_sql::parser::StreamingStatement::CreateSink(parsed) = &statements[0] else {
+            panic!("expected CREATE SINK")
+        };
+        assert_eq!(
+            parsed
+                .connector_options
+                .get("oauthbearer-token")
+                .map(String::as_str),
+            Some("token")
+        );
     }
 
     #[test]
@@ -1369,6 +1467,7 @@ mod tests {
             name: "out".to_string(),
             pipeline: "p".to_string(),
             connector: "kafka".to_string(),
+            format: None,
             properties: toml::Table::new(),
         };
         let ddl = sink_to_ddl(&sink);

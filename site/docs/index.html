@@ -47,7 +47,7 @@
           "Lookup Sources",
           "Join Semantics"
         ],
-        "keywords": "streaming SQL, LaminarDB configuration, Kafka connector, CDC, Delta Lake, Iceberg, OpenTelemetry, ASOF join, temporal probe join, exactly-once, barrier checkpoint"
+        "keywords": "streaming SQL, LaminarDB configuration, Kafka connector, CDC, Delta Lake, Iceberg, OpenTelemetry, bounded join, exactly-once, barrier checkpoint"
       },
       {
         "@type": "BreadcrumbList",
@@ -498,7 +498,6 @@
       <h4>Server</h4>
       <a href="#server-config">Server Config</a>
       <a href="#cluster-config">Cluster Config</a>
-      <a href="#state-config">State Store</a>
       <a href="#checkpoint-config">Checkpoints</a>
       <a href="#console-ui-api">Console UI &amp; Control API</a>
       <a href="#rest-api">REST API</a>
@@ -527,8 +526,6 @@
 
       <h4>Joins</h4>
       <a href="#join-interval">Interval Join</a>
-      <a href="#join-asof">ASOF Join</a>
-      <a href="#join-temporal-probe">Temporal Probe Join</a>
       <a href="#join-temporal">Temporal Join</a>
       <a href="#join-lookup">Lookup Join</a>
 
@@ -581,7 +578,6 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
           <tr><td class="field-name">--config &lt;FILE&gt;</td><td class="field-default">laminardb.toml</td><td>TOML configuration file path</td></tr>
           <tr><td class="field-name">--log-level &lt;LEVEL&gt;</td><td class="field-default">info</td><td>trace, debug, info, warn, error</td></tr>
           <tr><td class="field-name">--admin-bind &lt;ADDR&gt;</td><td></td><td>Override HTTP bind address from config</td></tr>
-          <tr><td class="field-name">--validate-checkpoints</td><td></td><td>Validate all stored checkpoints and exit</td></tr>
         </tbody>
       </table>
 
@@ -608,8 +604,8 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
           <tr>
             <td class="field-name">key_groups</td>
             <td class="field-type">u16</td>
-            <td class="field-default">256 (cluster)</td>
-            <td>Stable hash partitions for cluster placement and rescaling. Optional in cluster mode; rejected in single mode, which always uses one key group.</td>
+            <td class="field-default">256</td>
+            <td>Stable hash partitions for keyed aggregates and interval joins. A single-node runtime owns all of them; a cluster distributes them across nodes.</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>
@@ -720,8 +716,7 @@ mode = "single"
 bind = "0.0.0.0:8080"
 console_token = "supersecret"
 pgwire_bind = "0.0.0.0:5433"
-pgwire_allow_remote = true
-log_level = "info"</code></pre>
+pgwire_allow_remote = true</code></pre>
       </div>
 
       <!-- ============================================================ -->
@@ -732,10 +727,10 @@ log_level = "info"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
 
       <p>
-        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared state store; there is no separate <code>[coordination]</code> section or embedded Raft service.
+        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared checkpoint object store; there is no separate <code>[coordination]</code> section or embedded Raft service.
       </p>
       <p>
-        Cluster mode requires <code>delivery = "at_least_once"</code> and cluster-shared state on S3, GCS, or Azure. Cluster exactly-once fails closed with <code>[LDB-0013]</code>: checkpoint decisions are term-fenced, but supported connectors do not yet have certified term-fenced source handoff and external sink cursors. Local paths and <code>file://</code> state are rejected because peers cannot recover them.
+        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated; the current admitted composition is exact-certified Kafka input with direct S3/S3A append-mode Delta Lake, pending the production soak gate. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
       </p>
 
       <h3>[discovery]</h3>
@@ -784,45 +779,6 @@ advertise_host = "10.0.0.1"
 seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
       </div>
 
-      <!-- STATE -->
-      <h2 id="state-config">[state]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/state/config.rs" target="_blank" rel="noopener">crates/laminar-core/src/state/config.rs:43</a></div>
-
-      <p>
-        The <code>[state]</code> section configures storage for per-vnode checkpoint artifacts and exact-attempt durability seals. Hot aggregate, join, and window state remains in the operator runtime; this setting does not provide an incremental disk-backed keyed-state engine. It is a tagged union using the <code>backend</code> key.
-      </p>
-
-      <h3>In-Process State (Non-durable, in-memory)</h3>
-      <p>Configure with <code>backend = "in_process"</code> (the default).</p>
-
-      <h3>Local State (Node-durable filesystem)</h3>
-      <p>Configure with <code>backend = "local"</code>. This survives a same-node process restart and is valid for embedded/single-node exactly-once, but it is not visible to another cluster node.</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">path</td>
-            <td class="field-type">String</td>
-            <td class="field-required">required</td>
-            <td>Local directory path where state partitions are stored.</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <h3>Object Store State (Failure scope determined by URL)</h3>
-      <p>Configure with <code>backend = "object_store"</code>. S3, GCS, and Azure URLs are cluster-shared; a <code>file://</code> URL remains node-durable only. Cluster mode requires one of the shared cloud schemes.</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">url</td>
-            <td class="field-type">String</td>
-            <td class="field-required">required</td>
-            <td>State URL: <code>s3://</code>, <code>gs://</code>, <code>az://</code>/<code>abfs://</code>, or node-local <code>file://</code>.</td>
-          </tr>
-        </tbody>
-      </table>
-
       <!-- CHECKPOINT -->
       <h2 id="checkpoint-config">[checkpoint]</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:255</a></div>
@@ -834,7 +790,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
             <td class="field-default">OS temp/laminardb</td>
-            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>. Use an explicit durable location in production.</td>
+            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>/<code>abfss://</code>. R2 and MinIO use <code>s3://</code> with an endpoint option. Use an explicit durable location in production.</td>
           </tr>
           <tr>
             <td class="field-name">interval</td>
@@ -849,19 +805,13 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td>One absolute end-to-end deadline spanning admission, alignment, capture, durable publication, and completion delivery.</td>
           </tr>
           <tr>
-            <td class="field-name">max_retained</td>
-            <td class="field-type">usize</td>
-            <td class="field-default">10</td>
-            <td>Number of finalized checkpoints retained for recovery and fallback.</td>
-          </tr>
-          <tr>
             <td class="field-name">storage</td>
             <td class="field-type">Map</td>
             <td class="field-default">{}</td>
             <td>Cloud storage credentials. Keys: aws_access_key_id, aws_region, etc.</td>
           </tr>
           <tr>
-            <td class="field-name">max_staged_bytes</td>
+            <td class="field-name">max_node_data_bytes</td>
             <td class="field-type">u64</td>
             <td class="field-default">none</td>
             <td>Bound on captured state bytes awaiting durable upload (runtime default 512 MiB).</td>
@@ -1068,7 +1018,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </p>
 
       <p><strong>What reloads without restart:</strong> sources, pipelines, sinks, lookups (add, remove, or change).</p>
-      <p><strong>What requires restart:</strong> <code>[server]</code>, <code>[state]</code>, <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
+      <p><strong>What requires restart:</strong> <code>[server]</code> and <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         Reload order: remove changed/deleted sinks &rarr; pipelines &rarr; lookups &rarr; sources,
@@ -1163,9 +1113,9 @@ connector = "kafka"
 format = "json"
 
 [source.properties]
-bootstrap.servers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
 topic = "market-trades"
-group.id = "laminar-analytics"
+"group.id" = "laminar-analytics"
 
 [[source.schema]]
 name = "symbol"
@@ -1598,7 +1548,7 @@ max_out_of_orderness = "5s"</code></pre>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode in embedded/single-node runtime; production exactly-once certification remains a release fault/soak gate. Alternate log stores and custom object-store endpoints fail closed. Its coordinated transaction namespace is internal.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode. Cluster exact admission is limited to direct S3/S3A and remains a native-cloud fault/soak gate. Alternate log stores and custom production endpoints fail closed.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
@@ -1681,42 +1631,31 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
       <p>
-        LaminarDB supports five join types. All are stateful and operate on
-        streaming data. Join types are detected from SQL syntax automatically.
+        Bounded interval joins are the stateful stream-stream joins.
+        Temporal and lookup joins are local dimension enrichments; cluster admission
+        rejects unsupported join shapes before execution.
       </p>
 
       <table class="config-table">
-        <thead><tr><th>Join Type</th><th>Time Bound</th><th>Match</th><th>Use Case</th></tr></thead>
+        <thead><tr><th>Join Type</th><th>State</th><th>Scope</th><th>Match</th></tr></thead>
         <tbody>
           <tr>
-            <td class="field-name" style="color: var(--text);">Interval</td>
-            <td>Required</td>
+            <td class="field-name" style="color: var(--text);">Bounded interval</td>
+            <td>Keyed stream state</td>
+            <td>Single node and cluster</td>
             <td>All pairs within window</td>
-            <td>Stream-stream correlation</td>
-          </tr>
-          <tr>
-            <td class="field-name" style="color: var(--text);">ASOF</td>
-            <td>Optional tolerance</td>
-            <td>One closest per key (backward / forward / nearest)</td>
-            <td>Trade/quote enrichment</td>
-          </tr>
-          <tr>
-            <td class="field-name" style="color: var(--text);">Temporal Probe</td>
-            <td>Explicit offsets</td>
-            <td>N rows per left event at fixed offsets</td>
-            <td>Impact curves, lagged feature lookups</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">Temporal</td>
-            <td>Implicit (version time)</td>
+            <td>Versioned dimension</td>
+            <td>Local</td>
             <td>Point-in-time lookup</td>
-            <td>Versioned dimension tables</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">Lookup</td>
-            <td>None</td>
+            <td>Reference dimension</td>
+            <td>Local</td>
             <td>Key equality</td>
-            <td>Static reference enrichment</td>
           </tr>
         </tbody>
       </table>
@@ -1732,7 +1671,7 @@ max_out_of_orderness = "5s"</code></pre>
         watermark advances past the bound.
       </p>
 
-      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT SEMI, LEFT ANTI, RIGHT SEMI, RIGHT ANTI</p>
+      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT/RIGHT SEMI, LEFT/RIGHT ANTI</p>
 
       <div class="toml-block">
         <div class="toml-header">Interval join — match orders to payments within 1 hour</div>
@@ -1741,16 +1680,7 @@ SELECT o.order_id, o.amount, p.status
 FROM orders o
 INNER JOIN payments p
     ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">Semi join — orders that have at least one payment</div>
-        <pre><code class="language-sql">SELECT o.order_id, o.amount
-FROM orders o
-LEFT SEMI JOIN payments p
-    ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+    AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR;</code></pre>
       </div>
 
       <p style="font-size: 0.82rem;">
@@ -1760,106 +1690,6 @@ LEFT SEMI JOIN payments p
         right state; new right rows probe only old left state (avoids double-emit).
         Checkpointed via Arrow IPC serialization.
       </p>
-
-      <!-- ASOF JOIN -->
-      <h3 id="join-asof">ASOF Join</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/asof_batch.rs" target="_blank" rel="noopener">asof_batch.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">join_parser.rs</a></div>
-
-      <p>
-        For each left row, finds the <strong>one</strong> closest right row by timestamp
-        within the same key partition. Uses Snowflake-compatible <code>MATCH_CONDITION</code> syntax.
-      </p>
-
-      <p><strong>Supported types:</strong> INNER, LEFT</p>
-
-      <h4>Three directions</h4>
-      <table class="config-table">
-        <thead><tr><th>Direction</th><th>Syntax</th><th>Behavior</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">Backward</td>
-            <td><code>t.ts &gt;= q.ts</code></td>
-            <td>Most recent prior right event</td>
-          </tr>
-          <tr>
-            <td class="field-name">Forward</td>
-            <td><code>t.ts &lt;= q.ts</code></td>
-            <td>Next future right event</td>
-          </tr>
-          <tr>
-            <td class="field-name">Nearest</td>
-            <td><code>NEAREST(t.ts, q.ts)</code></td>
-            <td>Closest by absolute time difference</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF backward — enrich trades with most recent quote</div>
-        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts >= q.ts)
-    ON t.symbol = q.symbol;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF with tolerance — max 5 second gap</div>
-        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= INTERVAL '5' SECOND)
-    ON t.symbol = q.symbol;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF nearest — closest event by absolute time</div>
-        <pre><code class="language-sql">SELECT s.sensor_id, s.reading, c.calibration
-FROM sensor_data s
-ASOF JOIN calibrations c
-    MATCH_CONDITION(NEAREST(s.ts, c.ts))
-    ON s.sensor_id = c.sensor_id;</code></pre>
-      </div>
-
-      <p style="font-size: 0.82rem;">
-        <strong>State:</strong> Right-side events stored in per-key
-        <code>BTreeMap&lt;timestamp, Vec&lt;row_index&gt;&gt;</code> for O(log n) temporal lookups.
-        Multiple rows at the same timestamp are handled correctly.
-        Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
-      </p>
-
-      <!-- TEMPORAL PROBE JOIN -->
-      <h3 id="join-temporal-probe">Temporal Probe Join</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/translator/temporal_probe.rs" target="_blank" rel="noopener">translator/temporal_probe.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/operator/temporal_probe_join.rs" target="_blank" rel="noopener">operator/temporal_probe_join.rs</a></div>
-
-      <p>
-        For each left event, produces N output rows by probing the right stream at
-        a fixed list of time offsets. Each probe returns the ASOF-matched right
-        value at <code>left.event_time + offset</code>. Useful for lagged feature
-        lookups and impact curves.
-      </p>
-
-      <h4>Offset specification</h4>
-      <table class="config-table">
-        <thead><tr><th>Syntax</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">RANGE FROM &lt;start&gt; TO &lt;end&gt; STEP &lt;step&gt;</td>
-            <td>Uniform range (all in milliseconds)</td>
-          </tr>
-          <tr>
-            <td class="field-name">LIST (&lt;ms&gt;, &lt;ms&gt;, ...)</td>
-            <td>Explicit list of offsets in milliseconds</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <p style="font-size: 0.82rem;">
-        <strong>Directions:</strong> <code>Backward</code>, <code>Forward</code>,
-        and <code>Nearest</code>. Each probed offset is resolved using the same
-        semantics as a standalone ASOF join in that direction.
-      </p>
-
       <!-- TEMPORAL JOIN -->
       <h3 id="join-temporal">Temporal Join (FOR SYSTEM_TIME AS OF)</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/operator/temporal_join.rs" target="_blank" rel="noopener">operator/temporal_join.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">parser/join_parser.rs</a></div>
@@ -1937,9 +1767,9 @@ LEFT JOIN products p
       <div class="toml-block">
         <div class="toml-header">Environment variable examples</div>
         <pre><code class="language-toml">[source.properties]
-bootstrap.servers = "${KAFKA_BROKERS:-localhost:9092}"
-sasl.username = "${KAFKA_USER}"
-sasl.password = "${KAFKA_PASSWORD}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:9092}"
+"sasl.username" = "${KAFKA_USER}"
+"sasl.password" = "${KAFKA_PASSWORD}"
 
 [checkpoint]
 url = "s3://${S3_BUCKET}/checkpoints"
@@ -1963,12 +1793,12 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">at_least_once</td>
             <td>Default. Recovery resumes replayable sources from the finalized checkpoint cut, so some records may be processed again.</td>
-            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires cluster-shared state.</td>
+            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires a cluster-shared checkpoint URL.</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut, and a coordinated sink. In the standalone server, a <code>file://</code> checkpoint URL selects that locked local store. Append-mode Delta Lake is the only implemented checkpoint-committable external sink and remains release-gated by its integration and fault/soak suite; Apache Iceberg is durable at-least-once. Local Kafka source ownership and recoverable Kafka sink transactions are not yet certified. Shared-object-store local exact deployments and library-injected object or decision stores fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only.</td>
+            <td>Single-node currently requires an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode requires a shared checkpoint URL, exact-certified Kafka input, and direct S3/S3A append-mode Delta Lake; production certification remains release-soak gated. Kafka output and Apache Iceberg remain durable at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
@@ -1977,8 +1807,8 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         Delivery is one pipeline-wide setting. Per-connector delivery fields are rejected, and
         incompatible connectors fail before external I/O. For example, WebSocket, OTLP, and NATS
         Core sources are non-replayable and therefore require <code>best_effort</code>. Cluster
-        <code>exactly_once</code> fails closed with <code>[LDB-0013]</code> until connector handoff and
-        external sink cursor publication consume the leader term end to end.
+        <code>exactly_once</code> admits only exact-certified Kafka input with direct S3/S3A
+        append-mode Delta Lake; other combinations fail closed before connector I/O.
       </p>
 
       <!-- Full example -->
@@ -1990,13 +1820,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
 mode = "single"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://my-bucket/laminardb/state"
-
-[state.storage]
-aws_region = "us-east-1"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -2013,11 +1836,11 @@ connector = "kafka"
 format = "avro"
 
 [source.properties]
-bootstrap.servers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "market-trades"
-group.id = "laminar-vwap"
-schema.registry.url = "${SCHEMA_REGISTRY_URL}"
-startup.mode = "earliest"
+"group.id" = "laminar-vwap"
+"schema.registry.url" = "${SCHEMA_REGISTRY_URL}"
+"startup.mode" = "earliest"
 
 [[source.schema]]
 name = "symbol"
@@ -2079,13 +1902,13 @@ EMIT ON WINDOW CLOSE
 name = "kafka_output"
 pipeline = "vwap"
 connector = "kafka"
+format = "json"
 
 [sink.properties]
-bootstrap.servers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "vwap-1m"
-format = "json"
-key.column = "symbol"
-compression.type = "lz4"
+"key.column" = "symbol"
+"compression.type" = "lz4"
 
 [[sink]]
 name = "lake"
@@ -2093,8 +1916,8 @@ pipeline = "vwap"
 connector = "delta-lake"
 
 [sink.properties]
-table.path = "s3://my-bucket/delta/vwap"
-partition.columns = "exchange"</code></pre>
+"table.path" = "s3://my-bucket/delta/vwap"
+"partition.columns" = "exchange"</code></pre>
       </div>
 
       </article>

@@ -6,8 +6,10 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{DFSchema, ScalarValue};
-use datafusion_expr::LogicalPlan;
+use datafusion_expr::{ExprSchemable, LogicalPlan};
+use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use super::AggFuncSpec;
 use crate::error::DbError;
@@ -16,6 +18,7 @@ pub(crate) struct AggregateInfo {
     pub(crate) group_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) aggr_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) schema: Arc<Schema>,
+    pub(crate) df_schema: Arc<DFSchema>,
     pub(crate) input_schema: Arc<Schema>,
     pub(crate) having_predicate: Option<datafusion_expr::Expr>,
     pub(crate) input_df_schema: Arc<DFSchema>,
@@ -30,6 +33,7 @@ pub(crate) type ExprCompiler<'a> =
 /// EOWC aggregate-state builders.
 pub(crate) struct PreAggBuilder<'a> {
     input_schema: &'a Schema,
+    input_df_schema: &'a DFSchema,
     pub(crate) compile_ok: bool,
     pub(crate) next_col_idx: usize,
     pub(crate) compiled_exprs: Vec<Arc<dyn PhysicalExpr>>,
@@ -39,9 +43,15 @@ pub(crate) struct PreAggBuilder<'a> {
 }
 
 impl<'a> PreAggBuilder<'a> {
-    pub(crate) fn new(input_schema: &'a Schema, num_group_cols: usize, compile_ok: bool) -> Self {
+    pub(crate) fn new(
+        input_schema: &'a Schema,
+        input_df_schema: &'a DFSchema,
+        num_group_cols: usize,
+        compile_ok: bool,
+    ) -> Self {
         Self {
             input_schema,
+            input_df_schema,
             compile_ok,
             next_col_idx: num_group_cols,
             compiled_exprs: Vec::new(),
@@ -96,20 +106,35 @@ impl<'a> PreAggBuilder<'a> {
         self.push_compiled_column(&name, group_expr, DataType::Utf8, true, compile);
     }
 
-    /// `false` if `expr` is not an aggregate function (caller bails to the
-    /// interpreted path).
+    /// `Ok(false)` if `expr` is not an aggregate function.
     pub(crate) fn push_aggregate(
         &mut self,
         expr: &datafusion_expr::Expr,
         output_name: String,
-        agg_field: &Field,
         compile: &ExprCompiler<'_>,
-    ) -> bool {
+    ) -> Result<bool, DbError> {
         let datafusion_expr::Expr::AggregateFunction(agg_func) = expr else {
-            return false;
+            return Ok(false);
         };
+        if agg_func.params.distinct {
+            return Err(DbError::Unsupported(format!(
+                "[{}] DISTINCT aggregates are not supported by managed streaming state",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        if !agg_func.params.order_by.is_empty() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] ordered aggregates are not supported by managed streaming state",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        if agg_func.params.null_treatment.is_some() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] aggregate NULL treatment clauses are not supported by managed streaming state",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
         let udf = Arc::clone(&agg_func.func);
-        let is_distinct = agg_func.params.distinct;
 
         let mut input_col_indices = Vec::new();
         let mut input_types = Vec::new();
@@ -134,9 +159,14 @@ impl<'a> PreAggBuilder<'a> {
                 .args
                 .iter()
                 .map(|arg_expr| {
-                    resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type())
+                    arg_expr.get_type(self.input_df_schema).map_err(|error| {
+                        DbError::Pipeline(format!(
+                            "aggregate '{}' input type resolution failed: {error}",
+                            udf.name()
+                        ))
+                    })
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             let input_fields: Vec<Arc<Field>> = raw_types
                 .iter()
                 .enumerate()
@@ -144,39 +174,34 @@ impl<'a> PreAggBuilder<'a> {
                     Arc::new(Field::new(format!("arg_{i}"), data_type.clone(), true))
                 })
                 .collect();
-            let Ok(coerced_fields) = datafusion_expr::type_coercion::functions::fields_with_udf(
+            let coerced_fields = datafusion_expr::type_coercion::functions::fields_with_udf(
                 &input_fields,
                 udf.as_ref(),
-            ) else {
-                return false;
-            };
+            )
+            .map_err(|error| {
+                DbError::Unsupported(format!(
+                    "[{}] aggregate '{}' input coercion is unsupported: {error}",
+                    laminar_core::error_codes::SQL_UNSUPPORTED,
+                    udf.name()
+                ))
+            })?;
 
-            for (arg_expr, coerced_field) in agg_func.params.args.iter().zip(coerced_fields) {
+            for ((arg_expr, raw_type), coerced_field) in agg_func
+                .params
+                .args
+                .iter()
+                .zip(raw_types)
+                .zip(coerced_fields)
+            {
                 let col_idx = self.next_col_idx;
                 self.next_col_idx += 1;
                 let dt = coerced_field.data_type().clone();
 
-                // FILTER: wrap with CASE WHEN so filtered rows become NULL.
-                let projected_expr = if let Some(filter_expr) = &agg_func.params.filter {
-                    let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
-                        expr: None,
-                        when_then_expr: vec![(
-                            Box::new(filter_expr.as_ref().clone()),
-                            Box::new(arg_expr.clone()),
-                        )],
-                        else_expr: Some(Box::new(datafusion_expr::lit(ScalarValue::Null))),
-                    });
-                    case_expr
-                } else {
-                    arg_expr.clone()
-                };
-                let raw_type =
-                    resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type());
                 let projected_expr = if raw_type == dt {
-                    projected_expr
+                    arg_expr.clone()
                 } else {
                     datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast {
-                        expr: Box::new(projected_expr),
+                        expr: Box::new(arg_expr.clone()),
                         data_type: dt.clone(),
                     })
                 };
@@ -203,9 +228,13 @@ impl<'a> PreAggBuilder<'a> {
             .as_ref()
             .map(|filter_expr| self.push_filter_column(filter_expr, compile));
 
-        let return_type = udf
-            .return_type(&input_types)
-            .unwrap_or_else(|_| agg_field.data_type().clone());
+        let return_type = udf.return_type(&input_types).map_err(|error| {
+            DbError::Unsupported(format!(
+                "[{}] aggregate '{}' return type is unsupported: {error}",
+                laminar_core::error_codes::SQL_UNSUPPORTED,
+                udf.name()
+            ))
+        })?;
 
         self.agg_specs.push(AggFuncSpec {
             udf,
@@ -213,11 +242,10 @@ impl<'a> PreAggBuilder<'a> {
             input_col_indices,
             output_name,
             return_type,
-            distinct: is_distinct,
             is_count_star: agg_func.params.args.is_empty(),
             filter_col_index,
         });
-        true
+        Ok(true)
     }
 
     fn push_filter_column(
@@ -254,6 +282,73 @@ pub(crate) fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {
     find_aggregate_inner(plan, None)
 }
 
+/// Returns the sole logical projection on the unary path above the sole aggregate.
+///
+/// Schema equality cannot prove that a projection is an identity: a derived expression or a
+/// same-typed reorder can retain the aggregate's arity and types. Callers use the actual plan node
+/// to either compile the projection or prove that it is a positional identity. Branching plans or
+/// stacked projections are rejected because neither managed state implementation can represent
+/// their composition safely.
+pub(crate) fn find_post_aggregate_projection(
+    plan: &LogicalPlan,
+) -> Result<Option<&datafusion_expr::logical_plan::Projection>, ()> {
+    fn aggregate_stage_count(plan: &LogicalPlan) -> usize {
+        usize::from(matches!(plan, LogicalPlan::Aggregate(_)))
+            + plan
+                .inputs()
+                .into_iter()
+                .map(aggregate_stage_count)
+                .sum::<usize>()
+    }
+
+    if aggregate_stage_count(plan) != 1 {
+        return Err(());
+    }
+    match plan {
+        LogicalPlan::Aggregate(_) => Ok(None),
+        LogicalPlan::Filter(filter)
+            if matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)) =>
+        {
+            Ok(None)
+        }
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::Aggregate(_) => Ok(Some(projection)),
+            LogicalPlan::Filter(filter)
+                if matches!(filter.input.as_ref(), LogicalPlan::Aggregate(_)) =>
+            {
+                Ok(Some(projection))
+            }
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// Proves that a post-aggregate projection only forwards each input column in place, optionally
+/// through aliases. This is the only projection shape the running aggregate state can execute.
+pub(crate) fn post_aggregate_projection_is_positional_identity(
+    projection: &datafusion_expr::logical_plan::Projection,
+) -> bool {
+    if projection.expr.len() != projection.input.schema().fields().len() {
+        return false;
+    }
+
+    projection.expr.iter().enumerate().all(|(index, expr)| {
+        let mut expr = expr;
+        while let datafusion_expr::Expr::Alias(alias) = expr {
+            expr = alias.expr.as_ref();
+        }
+        let datafusion_expr::Expr::Column(column) = expr else {
+            return false;
+        };
+        projection
+            .input
+            .schema()
+            .index_of_column(column)
+            .is_ok_and(|resolved| resolved == index)
+    })
+}
+
 fn find_aggregate_inner(
     plan: &LogicalPlan,
     parent_filter: Option<&datafusion_expr::Expr>,
@@ -261,6 +356,7 @@ fn find_aggregate_inner(
     match plan {
         LogicalPlan::Aggregate(agg) => {
             let schema = Arc::new(agg.schema.as_arrow().clone());
+            let df_schema = Arc::clone(&agg.schema);
             let input_schema = Arc::new(agg.input.schema().as_arrow().clone());
             let input_df_schema = Arc::clone(agg.input.schema());
             let where_predicate = extract_where_predicate(&agg.input);
@@ -268,6 +364,7 @@ fn find_aggregate_inner(
                 group_exprs: agg.group_expr.clone(),
                 aggr_exprs: agg.aggr_expr.clone(),
                 schema,
+                df_schema,
                 input_schema,
                 having_predicate: parent_filter.cloned(),
                 input_df_schema,
@@ -486,8 +583,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     }
 }
 
-/// Pre-compiled projection: evaluates pre-agg expressions via `PhysicalExpr::evaluate`
-/// instead of re-planning SQL each cycle.
+/// Compiled projection and optional filter evaluated directly against Arrow batches.
 pub(crate) struct CompiledProjection {
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
@@ -569,13 +665,22 @@ pub(crate) fn apply_compiled_having(
 pub(crate) fn compile_having_filter(
     ctx: &SessionContext,
     having_predicate: Option<&datafusion_expr::Expr>,
-    output_schema: &SchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    let having_pred = having_predicate?;
-    let df_schema = DFSchema::try_from(output_schema.as_ref().clone()).ok()?;
+    aggregate_schema: &DFSchema,
+) -> Result<Option<Arc<dyn PhysicalExpr>>, DbError> {
+    let Some(having_pred) = having_predicate else {
+        return Ok(None);
+    };
+    let mut coercer = TypeCoercionRewriter::new(aggregate_schema);
+    let having_pred = having_pred
+        .clone()
+        .rewrite(&mut coercer)
+        .map_err(|e| DbError::Pipeline(format!("HAVING type coercion: {e}")))?
+        .data;
     let state = ctx.state();
     let props = state.execution_props();
-    create_physical_expr(having_pred, &df_schema, props).ok()
+    create_physical_expr(&having_pred, aggregate_schema, props)
+        .map(Some)
+        .map_err(|e| DbError::Pipeline(format!("HAVING compilation: {e}")))
 }
 
 pub(crate) struct SqlClauses {
@@ -664,38 +769,6 @@ fn extract_where_clause_heuristic(sql: &str) -> String {
         .min()
         .unwrap_or(rest.len());
     format!(" {}", rest[..end].trim())
-}
-
-pub(crate) fn resolve_expr_type(
-    expr: &datafusion_expr::Expr,
-    input_schema: &Schema,
-    fallback_type: &DataType,
-) -> DataType {
-    match expr {
-        datafusion_expr::Expr::Column(col) => input_schema
-            .field_with_name(&col.name)
-            .map_or_else(|_| fallback_type.clone(), |f| f.data_type().clone()),
-        datafusion_expr::Expr::Literal(sv, _) => sv.data_type(),
-        datafusion_expr::Expr::Cast(cast) => cast.data_type.clone(),
-        datafusion_expr::Expr::TryCast(cast) => cast.data_type.clone(),
-        datafusion_expr::Expr::BinaryExpr(bin) => {
-            // Approximate: resolve the left operand's type.
-            resolve_expr_type(&bin.left, input_schema, fallback_type)
-        }
-        datafusion_expr::Expr::ScalarFunction(func) => {
-            let arg_types: Vec<DataType> = func
-                .args
-                .iter()
-                .map(|a| resolve_expr_type(a, input_schema, fallback_type))
-                .collect();
-            func.func
-                .return_type(&arg_types)
-                .unwrap_or_else(|_| fallback_type.clone())
-        }
-        #[allow(deprecated)]
-        datafusion_expr::Expr::Wildcard { .. } => DataType::Boolean,
-        _ => fallback_type.clone(),
-    }
 }
 
 #[cfg(test)]

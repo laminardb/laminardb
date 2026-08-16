@@ -60,7 +60,6 @@ mod aggregate_state;
 pub mod ai;
 mod ai_catalog;
 mod ai_worker;
-mod asof_batch;
 mod builder;
 mod catalog;
 mod catalog_connector;
@@ -68,19 +67,18 @@ mod changelog_filter;
 /// Unified checkpoint coordination.
 #[doc(hidden)]
 pub mod checkpoint_coordinator;
+/// Bounded process-local evidence for cluster checkpoint barrier pauses.
 #[cfg(feature = "cluster")]
-mod cluster_recovery_capsule;
+pub mod checkpoint_timing;
 mod config;
 mod connector_manager;
 mod connector_task_fence;
-mod coordinated_committer;
 #[cfg(feature = "cluster")]
 mod coordinated_recovery;
 mod core_window_state;
 mod db;
 /// Prometheus metrics for the streaming engine.
 pub mod engine_metrics;
-mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
 /// FFI-friendly API for language bindings.
 ///
@@ -117,18 +115,20 @@ pub mod profile;
 pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
-mod retractable_accumulator;
 mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
 /// External named-subscription substrate: byte-bounded shared logs and cursor portals.
 pub mod subscription;
-mod table_backend;
 mod table_provider;
+mod table_rows;
 mod table_store;
-mod temporal_probe;
-mod vnode_partial;
+mod temporal_join_state;
+#[cfg(test)]
+mod temporal_test_source;
+#[cfg(feature = "cluster")]
+mod vnode_transition_staging;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
 // In-crate (not tests/) so it can drive the OperatorGraph directly.
@@ -152,7 +152,9 @@ pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
-pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
+pub use config::{
+    BackpressurePolicy, LaminarConfig, RestartPolicy, DEFAULT_MAX_MANAGED_STATE_BYTES,
+};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
@@ -164,11 +166,11 @@ pub use handle::{
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
-pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
+pub use recovery_manager::{RecoveredState, RecoveryManager};
 
-/// Rebalance-driven state-rehydration types (cluster mode).
+/// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
-pub use db::{ClusterStartupDisposition, RehydratedVnode, SnapshotAdoption};
+pub use db::{ClusterStartupDisposition, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

@@ -1,8 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Gauge, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry,
 };
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
@@ -41,6 +41,12 @@ pub struct EngineMetrics {
     pub stream_watermark_ms: IntGaugeVec,
     /// Per-stream input-port buffered bytes. Label: `stream`.
     pub input_buf_bytes: IntGaugeVec,
+    /// Operator-reported retained managed-state charge. Labels: `operator`, `phase`.
+    /// `live` is current at sampling; transient `prepared`/`retired` values are the maximum
+    /// observed since the prior sample. Current aggregate values are lower bounds between cold
+    /// reconciliation points and exclude hash buckets, nested/shared payloads, allocator overhead,
+    /// and process RSS.
+    pub managed_state_accounted_bytes: IntGaugeVec,
     /// Per-stream rows shed by the `ShedOldest` policy. Label: `stream`.
     pub shed_records_total: IntCounterVec,
     /// Completed checkpoints.
@@ -60,8 +66,8 @@ pub struct EngineMetrics {
     /// Rows dropped because the sink's WHERE filter failed to compile to
     /// a `PhysicalExpr` (fail-closed). Label: `sink`.
     pub sink_filter_rejected_rows: IntCounterVec,
-    /// Rows dropped at operator level past `allowed_lateness` (distinct
-    /// from `events_dropped`, which is source-side).
+    /// Window assignments dropped past `allowed_lateness`. A hopping-window row can contribute
+    /// more than one assignment.
     pub window_late_dropped: IntCounter,
     /// Source rows dropped because the event-time column was null.
     pub events_null_timestamp: IntCounter,
@@ -75,11 +81,22 @@ pub struct EngineMetrics {
     pub temporal_filter_dropped: IntCounter,
     /// Per-cycle processing duration.
     pub cycle_duration: Histogram,
+    /// SQL operator-graph execution within successful normal cycles.
+    pub cycle_execute_duration: Histogram,
+    /// Materialized-view and subscription-stream publication within successful normal cycles.
+    pub cycle_output_store_duration: Histogram,
+    /// Sink command admission within successful normal cycles.
+    pub cycle_sink_enqueue_duration: Histogram,
+    /// Per-operator processing duration. Labels: `operator`, `mode` (`normal` or
+    /// `checkpoint_drain`).
+    pub operator_process_duration: HistogramVec,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
-    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, and the
-    /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
-    /// resume at Aligned while that tail remains supervised in the background.
+    /// Synchronous mutable checkpoint-state capture duration.
+    pub checkpoint_state_capture_duration: Histogram,
+    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, durable-tail
+    /// handoff, and the Aligned resume gate. Every durable tail remains supervised in the
+    /// background; committable sink writes wait on its exact successor-epoch gate.
     pub checkpoint_pipeline_stall_duration: Histogram,
     /// Local barrier work while the pipeline is paused: sink fencing, shuffle alignment, state
     /// capture, and construction of the immutable durable-tail handoff.
@@ -87,18 +104,6 @@ pub struct EngineMetrics {
     /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
     /// Embedded and single-node runtimes do not observe this metric.
     pub checkpoint_aligned_resume_wait: Histogram,
-    /// Time the leader's restorable gate spends polling for vnode
-    /// partials (failed gates that burn the timeout are observed too).
-    /// When this dominates restorable latency at production cadence,
-    /// the push-driven upload-completion-ack follow-up is worth
-    /// building.
-    pub checkpoint_restorable_gate_wait: Histogram,
-    /// Vnode partials written as references to an unchanged base
-    /// instead of re-uploading state.
-    pub checkpoint_unchanged_vnodes: IntCounter,
-    /// Sealed-but-not-yet-externally-committed epochs for coordinated sinks
-    /// (designated-committer lag). Rising = the committer can't keep up.
-    pub coordinated_committer_lag_epochs: IntGauge,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
@@ -156,7 +161,11 @@ impl EngineMetrics {
             )
             .unwrap()),
             events_dropped: reg!(IntCounter::new("events_dropped_total", "Events dropped").unwrap()),
-            cycles: reg!(IntCounter::new("cycles_total", "Processing cycles completed").unwrap()),
+            cycles: reg!(IntCounter::new(
+                "cycles_total",
+                "Normal processing cycles completed (excludes checkpoint graph drains)"
+            )
+            .unwrap()),
             batches: reg!(IntCounter::new("batches_total", "Batches processed").unwrap()),
             queries_compiled: reg!(IntCounter::new(
                 "queries_compiled_total",
@@ -208,6 +217,15 @@ impl EngineMetrics {
                 &["stream"],
             )
             .unwrap()),
+            // Operator names are catalog-bound and phase is one of live/prepared/retired.
+            managed_state_accounted_bytes: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "managed_state_accounted_bytes",
+                    "Operator-reported retained-state charge; current aggregate values are lower bounds between checkpoint/lifecycle reconciliation and exclude hash buckets, nested/shared payloads, allocator overhead, and RSS",
+                ),
+                &["operator", "phase"],
+            )
+            .unwrap()),
             shed_records_total: reg!(IntCounterVec::new(
                 Opts::new("shed_records_total", "Rows shed by ShedOldest policy"),
                 &["stream"],
@@ -256,7 +274,7 @@ impl EngineMetrics {
             .unwrap()),
             window_late_dropped: reg!(IntCounter::new(
                 "window_late_dropped_total",
-                "Rows dropped by window operators past allowed_lateness"
+                "Window assignments dropped past allowed_lateness"
             )
             .unwrap()),
             events_null_timestamp: reg!(IntCounter::new(
@@ -285,11 +303,57 @@ impl EngineMetrics {
             )
             .unwrap()),
             cycle_duration: reg!(Histogram::with_opts(
-                HistogramOpts::new("cycle_duration_seconds", "Per-cycle processing duration")
-                    .buckets(vec![
+                HistogramOpts::new(
+                    "cycle_duration_seconds",
+                    "Normal processing-cycle duration (excludes checkpoint graph drains)",
+                )
+                .buckets(vec![
                         1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
                         1e-1, 5e-1, 1.0,
                     ]),
+            )
+            .unwrap()),
+            cycle_execute_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_execute_duration_seconds",
+                    "SQL operator-graph execution within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            cycle_output_store_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_output_store_duration_seconds",
+                    "Materialized-view and subscription-stream publication within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            cycle_sink_enqueue_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "cycle_sink_enqueue_duration_seconds",
+                    "Sink publication preparation and command admission within successful normal processing cycles",
+                )
+                .buckets(vec![
+                    1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                    1e-1, 5e-1, 1.0,
+                ]),
+            )
+            .unwrap()),
+            // Operator names are catalog-bound and mode has exactly two values.
+            operator_process_duration: reg!(HistogramVec::new(
+                HistogramOpts::new(
+                    "operator_process_duration_seconds",
+                    "Operator processing duration by catalog operator and execution mode",
+                )
+                .buckets(prometheus::exponential_buckets(0.0001, 4.0, 10).unwrap()),
+                &["operator", "mode"],
             )
             .unwrap()),
             // Checkpoint: serialization_timeout=120s, so max bucket must cover that.
@@ -297,6 +361,14 @@ impl EngineMetrics {
             checkpoint_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("checkpoint_duration_seconds", "Checkpoint cycle duration")
                     .buckets(prometheus::exponential_buckets(0.01, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_state_capture_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_state_capture_duration_seconds",
+                    "Synchronous mutable checkpoint-state capture duration",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
             // Stall target is sub-second; the resume gate is bounded at
@@ -323,25 +395,6 @@ impl EngineMetrics {
                     "Cluster-shuffle pause waiting for the global Aligned release",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
-            )
-            .unwrap()),
-            // Gate timeout default 10s. 0.001 * 2^14 = 16.38s.
-            checkpoint_restorable_gate_wait: reg!(Histogram::with_opts(
-                HistogramOpts::new(
-                    "checkpoint_restorable_gate_wait_seconds",
-                    "Restorable-gate poll wait per epoch (vnode-partial presence)",
-                )
-                .buckets(prometheus::exponential_buckets(0.001, 2.0, 15).unwrap()),
-            )
-            .unwrap()),
-            coordinated_committer_lag_epochs: reg!(IntGauge::new(
-                "coordinated_committer_lag_epochs",
-                "Sealed epochs not yet externally committed by the designated committer",
-            )
-            .unwrap()),
-            checkpoint_unchanged_vnodes: reg!(IntCounter::new(
-                "checkpoint_unchanged_vnodes_total",
-                "Vnode partials written as unchanged-base references"
             )
             .unwrap()),
             // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.
@@ -387,7 +440,7 @@ impl EngineMetrics {
             .unwrap()),
             placement_blast_radius_ratio: reg!(Gauge::new(
                 "placement_blast_radius_ratio",
-                "Largest single domain's share of all vnodes (0-1); state that goes Restoring if it fails"
+                "Largest single domain's share of all vnodes (0-1); state affected if it fails"
             )
             .unwrap()),
             pipeline_faults_total: reg!(IntCounter::new(

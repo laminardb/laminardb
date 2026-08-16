@@ -10,12 +10,13 @@ pub mod transport;
 
 pub use message::ShuffleMessage;
 pub use routing::{
-    route_checkpointed_batch, row_vnodes, CheckpointRoutePlan, LocalRoute, RemoteRoute,
-    ShuffleRoutingError, ROUTE_MAX_BATCH_BYTES, ROUTE_MAX_BATCH_ROWS, ROUTE_TARGET_BATCH_BYTES,
+    logical_batch_bytes, route_checkpointed_batch, row_vnodes, CheckpointRoutePlan, LocalRoute,
+    RemoteRoute, ShuffleRoutingError, ROUTE_MAX_BATCH_BYTES, ROUTE_MAX_BATCH_ROWS,
+    ROUTE_TARGET_BATCH_BYTES,
+};
+pub use transport::{
+    is_scope_cancelled, ReceivedBatch, ReceivedFrontierCut, ReceivedShuffle, ShuffleBatchAdmission,
+    ShufflePeerId, ShuffleReceiver, ShuffleSender,
 };
 #[cfg(feature = "cluster")]
-pub use transport::SHUFFLE_ADDR_KEY;
-pub use transport::{
-    is_scope_cancelled, ReceivedBatch, ReceivedShuffle, ShuffleBatchAdmission, ShufflePeerId,
-    ShuffleReceiver, ShuffleSender,
-};
+pub use transport::{shuffle_send_may_have_been_admitted, SHUFFLE_ADDR_KEY};

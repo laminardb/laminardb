@@ -1028,6 +1028,153 @@ async fn exactly_once_task_never_periodically_or_implicitly_flushes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn durable_at_least_once_output_has_no_checkpoint_epoch_gate() {
+    let (sink, writes, _flushes) = CountingSink::new();
+    let (event_tx, _event_rx) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "alo-ungated".into(),
+        sink_id: Arc::from("alo-ungated"),
+        connector: Box::new(sink),
+        contract: at_least_once_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_millis(25),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+
+    let started = Instant::now();
+    assert_eq!(
+        handle
+            .wait_for_write_gate_until(Some(started + Duration::from_secs(5)))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(Instant::now(), started);
+    handle.write_batch(test_batch()).await.unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    handle.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn sealed_write_waits_through_begin_until_successor_group_publication() {
+    let (sink, writes, _flushes) = CountingSink::new();
+    let (event_tx, _event_rx) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "epoch-gated".into(),
+        sink_id: Arc::from("epoch-gated"),
+        connector: Box::new(sink),
+        contract: checkpoint_committable_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_millis(25),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    handle.begin_epoch_until(7, deadline).await.unwrap();
+    let initial = handle.begun_epoch_admission(7).unwrap();
+    handle.publish_open_epoch(initial).unwrap();
+    handle.write_batch(test_batch()).await.unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+
+    let sealed = handle.seal_epoch_until(initial, deadline).await.unwrap();
+    let pending = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.write_batch(test_batch()).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!pending.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !pending.is_finished(),
+        "checkpoint gate wait must not consume the 25ms connector write budget"
+    );
+
+    // A connector Begin ack is preparation only. The group publication is the write boundary.
+    handle.begin_epoch_until(19, deadline).await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!pending.is_finished());
+    assert_eq!(writes.load(Ordering::SeqCst), 1);
+    let successor = handle.begun_epoch_admission(19).unwrap();
+    assert_eq!(successor.generation, sealed.generation);
+    handle.publish_open_epoch(successor).unwrap();
+
+    pending.await.unwrap().unwrap();
+    handle.sync().await.unwrap();
+    assert_eq!(writes.load(Ordering::SeqCst), 2);
+    handle.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn actor_rejects_private_write_after_successful_pre_commit() {
+    let (sink, writes, _flushes) = CountingSink::new();
+    let (event_tx, mut events) =
+        laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+        name: "prepared-write".into(),
+        sink_id: Arc::from("prepared-write"),
+        connector: Box::new(sink),
+        contract: checkpoint_committable_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    handle.begin_epoch_until(23, deadline).await.unwrap();
+    let admission = handle.begun_epoch_admission(23).unwrap();
+    handle.publish_open_epoch(admission).unwrap();
+    handle.pre_commit_until(23, deadline).await.unwrap();
+
+    handle
+        .tx
+        .send_with_timer(
+            SinkCommand {
+                deadline,
+                operation: SinkOperation::WriteBatch {
+                    epoch: Some(admission),
+                    batch: test_batch(),
+                },
+            },
+            tokio::time::sleep_until(deadline),
+        )
+        .await
+        .unwrap();
+    handle.sync().await.unwrap();
+
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        SinkEvent::WriteError {
+            epoch: 23,
+            rows: 3,
+            error,
+            ..
+        } if error.contains("Prepared")
+    ));
+    handle.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn periodic_flush_failure_poison_rejects_durable_checkpoint_flush() {
     let (handle, mut events, flushes) = spawn_fail_first_periodic_flush(true);
 
@@ -1692,8 +1839,7 @@ impl CoordinatedCommitter for QueueCommitDeadlineSink {
 #[tokio::test(start_paused = true)]
 async fn queued_coordinated_commit_receives_only_its_remaining_budget() {
     use laminar_connectors::connector::{CoordinatedCommitNamespace, CoordinatedCommitPayload};
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::{CheckpointAttempt, PipelineIdentity};
 
     let write_started = Arc::new(AtomicBool::new(false));
     let write_gate = Arc::new(tokio::sync::Notify::new());
@@ -1720,6 +1866,10 @@ async fn queued_coordinated_commit_receives_only_its_remaining_budget() {
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
+    let epoch_deadline = Instant::now() + Duration::from_secs(1);
+    handle.begin_epoch_until(101, epoch_deadline).await.unwrap();
+    let admission = handle.begun_epoch_admission(101).unwrap();
+    handle.publish_open_epoch(admission).unwrap();
     handle.write_batch(test_batch()).await.unwrap();
     while !write_started.load(Ordering::Acquire) {
         tokio::task::yield_now().await;
@@ -2003,6 +2153,7 @@ async fn write_enqueue_timeout_poison_rejects_checkpoint_flush() {
         runtime: tokio::runtime::Handle::current(),
         event_tx,
         epoch_poisoned: Arc::clone(&epoch_poisoned),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2083,6 +2234,7 @@ async fn cancelled_actor_is_retained_until_uncooperative_join_is_terminal() {
         runtime: tokio::runtime::Handle::current(),
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2152,6 +2304,7 @@ async fn connector_child_task_holds_replacement_fence_after_actor_exit() {
         runtime,
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2276,6 +2429,7 @@ async fn cancelled_terminal_supervisor_cannot_publish_false_terminal() {
         runtime: tokio::runtime::Handle::current(),
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2346,6 +2500,7 @@ async fn close_driver_panic_is_sticky_but_terminal_proof_remains_observable() {
         runtime: runtime.clone(),
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };
@@ -2436,6 +2591,7 @@ async fn test_sink_task_channel_closed_emits_event() {
         runtime: tokio::runtime::Handle::current(),
         event_tx,
         epoch_poisoned: Arc::new(AtomicBool::new(false)),
+        epoch_gate: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     };

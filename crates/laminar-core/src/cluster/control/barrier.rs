@@ -11,11 +11,11 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::CheckpointAttempt;
 use crate::checkpoint::CheckpointWatermark;
 use crate::cluster::discovery::NodeId;
 #[cfg(feature = "cluster")]
-use crate::cluster::discovery::{NodeInfo, NodeState};
-use crate::state::CheckpointAttempt;
+use crate::cluster::discovery::NodeInfo;
 #[cfg(feature = "cluster")]
 use tokio::sync::watch;
 
@@ -195,8 +195,8 @@ const PREPARE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
-    /// Align the shuffle, capture state locally, ack. The durable tail
-    /// (sink pre-commit, manifest, uploads) runs after the ack.
+    /// Align the shuffle, capture state locally, and transfer the immutable cut to a supervised
+    /// tail before acknowledging capture. Durable preparation continues in that tail.
     Prepare,
     /// Every node has aligned + captured this epoch (full-membership
     /// capture quorum). Pipelines may resume the next epoch; the epoch
@@ -221,17 +221,15 @@ pub struct BarrierAnnouncement {
     pub checkpoint_id: u64,
     /// Exact clustered assignment cut captured when this attempt was admitted. Required on every
     /// clustered `Prepare` and retained on terminal phases for exact follower validation.
-    #[serde(default)]
     pub assignment_fence: Option<super::CheckpointAssignmentFence>,
     /// Exact durable leader term that issued this announcement. Clustered reversible phases
     /// (`Prepare` and `Aligned`) are rejected unless this proof is present and still live.
     /// Terminal notifications carry it only for diagnostics; their authority comes from the
     /// immutable durable checkpoint outcome.
-    #[serde(default)]
     pub leader_proof: Option<super::LeaderProof>,
     /// Phase this announcement signals.
     pub phase: Phase,
-    /// Reserved for unaligned/other flags.
+    /// Checkpoint behavior flags from [`crate::checkpoint::flags`].
     pub flags: u64,
 }
 
@@ -445,36 +443,66 @@ fn validate_scanned_announcements(
         })
 }
 
-/// Follower ack. `ok = false` forces the leader to abort instead of wait.
+/// Follower checkpoint-prepare disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BarrierAckDisposition {
+    /// Legacy durable-prepare acknowledgement. It is deliberately not accepted as a capture
+    /// acknowledgement without an explicit mixed-version capability negotiation.
+    Prepared,
+    /// Legacy durable-prepare acknowledgement retaining handoff replay work.
+    PreparedWithReplay,
+    /// Local checkpoint preparation failed and requires normal failure handling.
+    Failed,
+    /// Local alignment and capture completed, the sink epoch is sealed, and a supervised tail
+    /// owns the exact immutable cut. Durable preparation may still be running.
+    Captured,
+    /// Capture ownership completed and the captured cut retains handoff replay work.
+    CapturedWithReplay,
+}
+
+impl BarrierAckDisposition {
+    const fn precedence(self) -> u8 {
+        match self {
+            Self::Prepared => 0,
+            Self::PreparedWithReplay => 1,
+            Self::Captured => 2,
+            Self::CapturedWithReplay => 3,
+            Self::Failed => 4,
+        }
+    }
+}
+
+/// Follower acknowledgement for one exact announcement identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAck {
     /// Canonical checkpoint ID retained in the wire field named `epoch`.
     pub epoch: u64,
     /// The same nonzero coordinator-assigned checkpoint ID being acknowledged.
-    #[serde(default)]
     pub checkpoint_id: u64,
     /// SHA-256 binding of the announcement's assignment certificate.
-    #[serde(default)]
     pub assignment_digest: Option<[u8; 32]>,
-    /// `false` = snapshot failed locally; leader should abort.
-    pub ok: bool,
-    /// Free-text error; populated when `ok = false`.
+    /// Exact behavior flags echoed from the announcement.
+    pub flags: u64,
+    /// Typed local capture/prepare result.
+    pub disposition: BarrierAckDisposition,
+    /// Free-text reason; populated when preparation fails.
     pub error: Option<String>,
     /// Follower event-time state at ack time. Uninitialized inputs block advancement; only
     /// explicitly idle inputs are excluded from the active cluster minimum.
-    #[serde(default)]
     pub watermark: CheckpointWatermark,
 }
 
 /// Outcome of `wait_for_quorum`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuorumOutcome {
-    /// All expected peers acked with `ok = true`.
+    /// All expected peers prepared successfully.
     Reached {
         /// Peers that acked successfully.
         acks: Vec<NodeId>,
         /// Safe aggregate across all required followers.
         follower_watermark: CheckpointWatermark,
+        /// At least one follower retained replay in the prepared handoff cut.
+        handoff_replay_pending: bool,
     },
     /// Deadline expired with at least one peer silent.
     TimedOut {
@@ -483,7 +511,7 @@ pub enum QuorumOutcome {
         /// Peers that didn't.
         missing: Vec<NodeId>,
     },
-    /// At least one peer acked `ok = false`.
+    /// At least one peer reported a fatal prepare failure.
     Failed {
         /// `(peer, error_message)` for every failed ack.
         failures: Vec<(NodeId, String)>,
@@ -598,6 +626,7 @@ type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 struct BarrierIdentity {
     attempt: CheckpointAttempt,
     assignment_digest: Option<[u8; 32]>,
+    flags: u64,
 }
 
 #[cfg(feature = "cluster")]
@@ -609,6 +638,7 @@ impl BarrierIdentity {
                 .assignment_fence
                 .as_ref()
                 .map(super::CheckpointAssignmentFence::digest),
+            flags: ann.flags,
         }
     }
 
@@ -616,6 +646,7 @@ impl BarrierIdentity {
         Self {
             attempt: CheckpointAttempt::new(ack.epoch, ack.checkpoint_id),
             assignment_digest: ack.assignment_digest,
+            flags: ack.flags,
         }
     }
 }
@@ -707,7 +738,7 @@ impl PrepareAckState {
         let cached = match self.completed.entry(identity) {
             Entry::Vacant(entry) => entry.insert(ack.clone()),
             Entry::Occupied(mut entry) => {
-                if entry.get().ok && !ack.ok {
+                if ack.disposition.precedence() > entry.get().disposition.precedence() {
                     entry.insert(ack.clone());
                 }
                 entry.into_mut()
@@ -788,7 +819,6 @@ struct GrpcState {
     clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    advertise_addr: String,
     local_process: Arc<std::sync::OnceLock<BarrierProcessIdentity>>,
 }
 
@@ -977,6 +1007,23 @@ fn checkpoint_watermark_from_wire(
 }
 
 #[cfg(feature = "cluster")]
+fn ack_disposition_to_wire(disposition: BarrierAckDisposition) -> i32 {
+    use barrier_v1::BarrierAckDisposition as WireDisposition;
+
+    match disposition {
+        BarrierAckDisposition::Prepared => WireDisposition::BarrierAckPrepared as i32,
+        BarrierAckDisposition::PreparedWithReplay => {
+            WireDisposition::BarrierAckPreparedWithReplay as i32
+        }
+        BarrierAckDisposition::Failed => WireDisposition::BarrierAckFailed as i32,
+        BarrierAckDisposition::Captured => WireDisposition::BarrierAckCaptured as i32,
+        BarrierAckDisposition::CapturedWithReplay => {
+            WireDisposition::BarrierAckCapturedWithReplay as i32
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
 fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
     use barrier_v1::CheckpointWatermarkStatus as WireStatus;
 
@@ -991,7 +1038,7 @@ fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
     };
     barrier_v1::Ack {
         epoch: ack.epoch,
-        ok: ack.ok,
+        disposition: ack_disposition_to_wire(ack.disposition),
         error: ack.error,
         local_watermark_ms,
         checkpoint_id: ack.checkpoint_id,
@@ -999,6 +1046,30 @@ fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
             .assignment_digest
             .map_or_else(Vec::new, |digest| digest.to_vec()),
         watermark_status,
+        flags: ack.flags,
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn ack_disposition_from_wire(value: i32) -> Result<BarrierAckDisposition, String> {
+    use barrier_v1::BarrierAckDisposition as WireDisposition;
+
+    match WireDisposition::try_from(value) {
+        Ok(WireDisposition::BarrierAckUnspecified) => {
+            Err("barrier acknowledgement disposition is unspecified".into())
+        }
+        Ok(WireDisposition::BarrierAckPrepared) => Ok(BarrierAckDisposition::Prepared),
+        Ok(WireDisposition::BarrierAckPreparedWithReplay) => {
+            Ok(BarrierAckDisposition::PreparedWithReplay)
+        }
+        Ok(WireDisposition::BarrierAckFailed) => Ok(BarrierAckDisposition::Failed),
+        Ok(WireDisposition::BarrierAckCaptured) => Ok(BarrierAckDisposition::Captured),
+        Ok(WireDisposition::BarrierAckCapturedWithReplay) => {
+            Ok(BarrierAckDisposition::CapturedWithReplay)
+        }
+        Err(_) => Err(format!(
+            "unknown barrier acknowledgement disposition {value}"
+        )),
     }
 }
 
@@ -1013,6 +1084,7 @@ fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Resul
         .map(super::CheckpointAssignmentFence::digest);
     if ack.epoch != ann.epoch
         || ack.checkpoint_id != ann.checkpoint_id
+        || ack.flags != ann.flags
         || ack.assignment_digest.as_slice()
             != expected_digest
                 .as_ref()
@@ -1020,11 +1092,11 @@ fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Resul
     {
         return Err("Barrier phase acknowledgement identity mismatch".into());
     }
-    if !ack.ok {
+    if ack_disposition_from_wire(ack.disposition)? != BarrierAckDisposition::Prepared {
         return Err(ack
             .error
             .clone()
-            .unwrap_or_else(|| "Barrier phase was rejected by follower".into()));
+            .unwrap_or_else(|| "Barrier phase was rejected by follower with no reason".into()));
     }
     Ok(())
 }
@@ -1226,6 +1298,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         let identity = BarrierIdentity {
             attempt,
             assignment_digest,
+            flags: req.flags,
         };
 
         self.require_live_process_lease()?;
@@ -1283,6 +1356,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         if ack.epoch != attempt.epoch
             || ack.checkpoint_id != attempt.checkpoint_id
             || ack.assignment_digest != assignment_digest
+            || ack.flags != req.flags
         {
             return Err(tonic::Status::failed_precondition(
                 "Follower acknowledgement identity mismatch",
@@ -1326,7 +1400,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1334,6 +1408,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 
@@ -1365,7 +1440,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1373,6 +1448,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 
@@ -1404,7 +1480,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
-            ok: true,
+            disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
             error: None,
             local_watermark_ms: None,
             checkpoint_id: req.checkpoint_id,
@@ -1412,6 +1488,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 .as_ref()
                 .map_or_else(Vec::new, |fence| fence.digest().to_vec()),
             watermark_status: 0,
+            flags: req.flags,
         }))
     }
 }
@@ -1688,15 +1765,16 @@ fn send_local_phase_notification(
     Ok(())
 }
 
-/// Typed prepare-failure classification for the quorum wait:
-/// `Unreachable` counts toward `TimedOut{missing}` (the peer cannot
-/// participate), `Nack` toward `Failed` (a live follower answered
-/// `ok = false`).
+/// Typed prepare-failure classification for the quorum wait.
 #[cfg(feature = "cluster")]
+#[derive(Debug)]
 enum PeerFailure {
     Unreachable,
     Nack(String),
 }
+
+#[cfg(feature = "cluster")]
+type PrepareTaskResult = Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)>;
 
 /// Exact announcement and participant roster bound to one eager Prepare round.
 #[cfg(feature = "cluster")]
@@ -1704,27 +1782,36 @@ struct PrepareFanoutBatch {
     announcement: BarrierAnnouncement,
     expected: Vec<NodeId>,
     // `JoinSet` aborts all remaining tasks when the batch or quorum future is dropped.
-    tasks: tokio::task::JoinSet<Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)>>,
+    tasks: tokio::task::JoinSet<PrepareTaskResult>,
 }
 
 #[cfg(feature = "cluster")]
 #[derive(Clone, Copy)]
 struct PrepareFanoutBudget {
-    total: Duration,
+    deadline: tokio::time::Instant,
     per_attempt: Duration,
 }
 
+#[cfg(not(feature = "cluster"))]
+type PrepareFanoutBudget = ();
+
 #[cfg(feature = "cluster")]
-fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget, String> {
-    if quorum_window.is_zero() {
+fn prepare_fanout_budget(
+    attempt_deadline: tokio::time::Instant,
+    retry_window: Duration,
+) -> Result<PrepareFanoutBudget, String> {
+    if attempt_deadline <= tokio::time::Instant::now() {
+        return Err("Prepare fan-out attempt deadline must be in the future".into());
+    }
+    if retry_window.is_zero() {
         return Err("Prepare quorum window must be greater than zero".into());
     }
-    let per_attempt = quorum_window / 2;
+    let per_attempt = retry_window / 2;
     if per_attempt.is_zero() {
         return Err("Prepare quorum window is too small to divide into retry attempts".into());
     }
     Ok(PrepareFanoutBudget {
-        total: PREPARE_RPC_TIMEOUT.max(quorum_window),
+        deadline: attempt_deadline,
         per_attempt,
     })
 }
@@ -1733,7 +1820,7 @@ fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget,
 enum PrepareFanoutState {
     Pending(PrepareFanoutBatch),
     Claimed(BarrierAnnouncement),
-    QuorumReached(BarrierAnnouncement),
+    CaptureQuorumReached(BarrierAnnouncement),
 }
 
 #[cfg(feature = "cluster")]
@@ -1741,7 +1828,7 @@ impl PrepareFanoutState {
     const fn announcement(&self) -> &BarrierAnnouncement {
         match self {
             Self::Pending(batch) => &batch.announcement,
-            Self::Claimed(announcement) | Self::QuorumReached(announcement) => announcement,
+            Self::Claimed(announcement) | Self::CaptureQuorumReached(announcement) => announcement,
         }
     }
 }
@@ -1836,7 +1923,7 @@ fn clustered_phase_roster(
 #[cfg(feature = "cluster")]
 fn prepare_fanout_plan(
     announcement: &BarrierAnnouncement,
-    quorum_window: Option<Duration>,
+    budget: Option<PrepareFanoutBudget>,
 ) -> Result<(Option<Vec<NodeId>>, Option<PrepareFanoutBudget>), String> {
     if announcement.phase != Phase::Prepare {
         return Ok((None, None));
@@ -1845,12 +1932,10 @@ fn prepare_fanout_plan(
     let budget = roster
         .as_ref()
         .map(|_| {
-            quorum_window.ok_or_else(|| {
+            budget.ok_or_else(|| {
                 "assignment-certified Prepare has no quorum retry window".to_string()
             })
         })
-        .transpose()?
-        .map(prepare_fanout_budget)
         .transpose()?;
     Ok((roster, budget))
 }
@@ -1876,7 +1961,7 @@ fn install_prepare_fanout(
     budget: PrepareFanoutBudget,
 ) {
     let mut pending = state.prepare_fanout.lock();
-    let rpc_deadline = tokio::time::Instant::now() + budget.total;
+    let rpc_deadline = budget.deadline;
     let mut tasks = tokio::task::JoinSet::new();
     for &peer in &expected {
         let clients_pool = Arc::clone(&state.clients);
@@ -1928,7 +2013,7 @@ fn preflight_prepare_fanout(
             PrepareFanoutState::Claimed(_) => {
                 Err("Prepare cannot be republished while its quorum is being collected".into())
             }
-            PrepareFanoutState::QuorumReached(_) => {
+            PrepareFanoutState::CaptureQuorumReached(_) => {
                 Err("Prepare cannot regress an exact quorum-ready checkpoint".into())
             }
         },
@@ -1942,14 +2027,14 @@ fn preflight_prepare_fanout(
 }
 
 #[cfg(feature = "cluster")]
-fn mark_prepare_quorum_reached(
+fn mark_capture_quorum_reached(
     state: &GrpcState,
     prepare: &BarrierAnnouncement,
 ) -> Result<(), String> {
     let mut fanout = state.prepare_fanout.lock();
     match fanout.take() {
         Some(PrepareFanoutState::Claimed(claimed)) if claimed == *prepare => {
-            *fanout = Some(PrepareFanoutState::QuorumReached(claimed));
+            *fanout = Some(PrepareFanoutState::CaptureQuorumReached(claimed));
             Ok(())
         }
         Some(other) => {
@@ -1963,8 +2048,8 @@ fn mark_prepare_quorum_reached(
 #[cfg(feature = "cluster")]
 fn require_aligned_quorum(state: &GrpcState, aligned: &BarrierAnnouncement) -> Result<(), String> {
     let fanout = state.prepare_fanout.lock();
-    let Some(PrepareFanoutState::QuorumReached(prepare)) = fanout.as_ref() else {
-        return Err("clustered Aligned requires a successful exact Prepare quorum".into());
+    let Some(PrepareFanoutState::CaptureQuorumReached(prepare)) = fanout.as_ref() else {
+        return Err("clustered Aligned requires a successful exact capture quorum".into());
     };
     if !same_announcement_identity(prepare, aligned) {
         return Err("clustered Aligned does not match the exact reached Prepare quorum".into());
@@ -2027,14 +2112,15 @@ fn prepare_rpc_request(
 }
 
 #[cfg(feature = "cluster")]
-fn validate_prepare_ack(
+fn validate_capture_ack(
     peer: NodeId,
     prepare: &BarrierAnnouncement,
     assignment_digest: Option<&[u8; 32]>,
-    ack: barrier_v1::Ack,
-) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+    ack: &barrier_v1::Ack,
+) -> Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)> {
     if ack.epoch != prepare.epoch
         || ack.checkpoint_id != prepare.checkpoint_id
+        || ack.flags != prepare.flags
         || ack.assignment_digest.as_slice()
             != assignment_digest.map_or(&[][..], <[u8; 32]>::as_slice)
     {
@@ -2043,17 +2129,40 @@ fn validate_prepare_ack(
             PeerFailure::Nack("Prepare acknowledgement identity mismatch".into()),
         ));
     }
-    if !ack.ok {
-        return Err((
-            peer,
-            PeerFailure::Nack(
-                ack.error
-                    .unwrap_or_else(|| "Unknown prepare failure".to_string()),
-            ),
-        ));
-    }
+    let reason = || {
+        ack.error
+            .clone()
+            .unwrap_or_else(|| "Prepare acknowledgement has no reason".to_string())
+    };
+    let handoff_replay_pending = match ack_disposition_from_wire(ack.disposition) {
+        Ok(BarrierAckDisposition::Captured) => false,
+        Ok(BarrierAckDisposition::CapturedWithReplay) => {
+            if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
+                return Err((
+                    peer,
+                    PeerFailure::Nack(
+                        "Prepare acknowledgement retained replay without the HANDOFF flag".into(),
+                    ),
+                ));
+            }
+            true
+        }
+        Ok(BarrierAckDisposition::Prepared | BarrierAckDisposition::PreparedWithReplay) => {
+            return Err((
+                peer,
+                PeerFailure::Nack(
+                    "Prepare requires an explicit Captured acknowledgement from every participant"
+                        .into(),
+                ),
+            ));
+        }
+        Ok(BarrierAckDisposition::Failed) => {
+            return Err((peer, PeerFailure::Nack(reason())));
+        }
+        Err(error) => return Err((peer, PeerFailure::Nack(error))),
+    };
     checkpoint_watermark_from_wire(ack.watermark_status, ack.local_watermark_ms)
-        .map(|watermark| (peer, watermark))
+        .map(|watermark| (peer, watermark, handoff_replay_pending))
         .map_err(|error| (peer, PeerFailure::Nack(error)))
 }
 
@@ -2082,7 +2191,7 @@ async fn prepare_peer_until_deadline(
     prepare: BarrierAnnouncement,
     deadline: tokio::time::Instant,
     max_attempt_duration: Duration,
-) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+) -> Result<(NodeId, CheckpointWatermark, bool), (NodeId, PeerFailure)> {
     let assignment = assignment_fence_to_wire(prepare.assignment_fence.as_ref());
     let assignment_digest = prepare
         .assignment_fence
@@ -2145,11 +2254,11 @@ async fn prepare_peer_until_deadline(
 
         match tokio::time::timeout_at(attempt_deadline, client.prepare(request)).await {
             Ok(Ok(response)) => {
-                return validate_prepare_ack(
+                return validate_capture_ack(
                     peer,
                     &prepare,
                     assignment_digest.as_ref(),
-                    response.into_inner(),
+                    &response.into_inner(),
                 );
             }
             Ok(Err(status)) => {
@@ -2187,6 +2296,11 @@ pub struct BarrierCoordinator {
     publication: tokio::sync::Mutex<AnnouncementPublicationState>,
     #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
+    /// First local observation time for each exact Prepare identity. Direct gRPC receipt is the
+    /// preferred clock, while this transport-independent registry gives the gossip fallback the
+    /// same non-refreshing attempt deadline across repeated observations.
+    #[cfg(feature = "cluster")]
+    prepare_observed_at: parking_lot::Mutex<FxHashMap<BarrierIdentity, std::time::Instant>>,
     #[cfg(feature = "cluster")]
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
     #[cfg(feature = "cluster")]
@@ -2228,6 +2342,8 @@ impl BarrierCoordinator {
             publication: tokio::sync::Mutex::new(AnnouncementPublicationState::default()),
             #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            prepare_observed_at: parking_lot::Mutex::new(FxHashMap::default()),
             #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -2441,14 +2557,8 @@ impl BarrierCoordinator {
         *self.leader_election.lock() = Some((instance_id, members_rx, leader_eligible));
     }
 
-    /// Local monotonic receipt time for this exact gRPC Prepare.
     #[cfg(feature = "cluster")]
-    #[must_use]
-    pub fn prepare_received_at(&self, prepare: &BarrierAnnouncement) -> Option<std::time::Instant> {
-        if prepare.phase != Phase::Prepare {
-            return None;
-        }
-        let identity = BarrierIdentity::from_announcement(prepare);
+    fn direct_prepare_received_at(&self, identity: BarrierIdentity) -> Option<std::time::Instant> {
         self.grpc.lock().as_ref().and_then(|state| {
             state
                 .prepare_acks
@@ -2457,6 +2567,97 @@ impl BarrierCoordinator {
                 .get(&identity)
                 .copied()
         })
+    }
+
+    /// Preserve the first local clock for an exact Prepare across retries and across direct or
+    /// gossip delivery. A direct accepted receipt wins when it predates local gossip observation.
+    #[cfg(feature = "cluster")]
+    pub(super) fn prepare_received_at_or_insert(
+        &self,
+        prepare: &BarrierAnnouncement,
+        observed_at: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        if prepare.phase != Phase::Prepare {
+            return None;
+        }
+        let identity = BarrierIdentity::from_announcement(prepare);
+        let candidate = self
+            .direct_prepare_received_at(identity)
+            .map_or(observed_at, |received_at| received_at.min(observed_at));
+        let mut observations = self.prepare_observed_at.lock();
+        if !observations.contains_key(&identity) {
+            while observations.len() >= MAX_RETAINED_BARRIER_IDENTITIES {
+                let Some(oldest) = observations
+                    .iter()
+                    .min_by_key(|(_, observed_at)| **observed_at)
+                    .map(|(identity, _)| *identity)
+                else {
+                    break;
+                };
+                observations.remove(&oldest);
+            }
+        }
+        let retained = *observations
+            .entry(identity)
+            .and_modify(|retained| *retained = (*retained).min(candidate))
+            .or_insert(candidate);
+        Some(retained)
+    }
+
+    /// Local monotonic receipt or first-observation time for this exact Prepare.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn prepare_received_at(&self, prepare: &BarrierAnnouncement) -> Option<std::time::Instant> {
+        if prepare.phase != Phase::Prepare {
+            return None;
+        }
+        let identity = BarrierIdentity::from_announcement(prepare);
+        match (
+            self.direct_prepare_received_at(identity),
+            self.prepare_observed_at.lock().get(&identity).copied(),
+        ) {
+            (Some(direct), Some(observed)) => Some(direct.min(observed)),
+            (Some(received), None) | (None, Some(received)) => Some(received),
+            (None, None) => None,
+        }
+    }
+
+    /// Install one direct Prepare receipt through the real relay for deterministic controller
+    /// observation tests. Production direct delivery records the same clock before enqueueing.
+    ///
+    /// # Errors
+    /// Rejects malformed/non-Prepare input, a missing or closed relay, or a relay that does not
+    /// publish the injected value.
+    #[cfg(all(test, feature = "cluster"))]
+    pub(super) async fn inject_direct_prepare_observation_for_test(
+        &self,
+        prepare: BarrierAnnouncement,
+        received_at: std::time::Instant,
+    ) -> Result<(), String> {
+        validate_announcement_attempt(&prepare)?;
+        if prepare.phase != Phase::Prepare {
+            return Err("direct Prepare test observation requires Prepare phase".into());
+        }
+        let state = self.grpc.lock().clone().ok_or_else(|| {
+            "direct Prepare test observation requires a started server".to_string()
+        })?;
+        let identity = BarrierIdentity::from_announcement(&prepare);
+        state
+            .prepare_acks
+            .lock()
+            .received_at
+            .entry(identity)
+            .or_insert(received_at);
+        if state.incoming_tx.send(prepare.clone()).await.is_err() {
+            return Err("direct Prepare test relay is closed".into());
+        }
+        for _ in 0..1_024 {
+            if state.latest_rx.borrow().as_ref() == Some(&prepare) {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err("direct Prepare test observation was not relayed".into())
     }
 
     /// Bind and run the follower's direct gRPC barrier sync server.
@@ -2564,7 +2765,6 @@ impl BarrierCoordinator {
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
-            advertise_addr: advertise_addr.clone(),
             local_process: Arc::clone(&local_process),
         });
 
@@ -2690,59 +2890,41 @@ impl BarrierCoordinator {
         ann: &BarrierAnnouncement,
         quorum_window: Duration,
     ) -> Result<(), String> {
+        let attempt_deadline = tokio::time::Instant::now() + PREPARE_RPC_TIMEOUT.max(quorum_window);
+        self.announce_prepare_until(ann, attempt_deadline, quorum_window)
+            .await
+    }
+
+    /// Publish Prepare with an exact absolute attempt deadline and an independent short retry
+    /// window. Durable admission/publication latency therefore cannot refresh fan-out lifetime.
+    ///
+    /// # Errors
+    /// Rejects an expired attempt deadline or invalid retry window in addition to
+    /// [`Self::announce_prepare`] errors.
+    #[cfg(feature = "cluster")]
+    pub async fn announce_prepare_until(
+        &self,
+        ann: &BarrierAnnouncement,
+        attempt_deadline: tokio::time::Instant,
+        retry_window: Duration,
+    ) -> Result<(), String> {
         if ann.phase != Phase::Prepare || ann.assignment_fence.is_none() {
             return Err("explicit Prepare fan-out requires an assignment certificate".into());
         }
-        self.announce_inner(ann, Some(quorum_window)).await
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn discover_assignment_less_phase_peers(&self, local_address: &str) -> Vec<NodeId> {
-        let live: Option<FxHashSet<NodeId>> =
-            self.leader_election
-                .lock()
-                .clone()
-                .map(|(_, members_rx, _)| {
-                    members_rx
-                        .borrow()
-                        .iter()
-                        .filter(|member| {
-                            matches!(member.state, NodeState::Active | NodeState::Draining)
-                        })
-                        .map(|member| member.id)
-                        .collect()
-                });
-        let mut discovered = Vec::new();
-        for (node_id, raw_endpoint) in self.kv.scan(BARRIER_ADDR_KEY).await {
-            let address = match decode_barrier_endpoint(&raw_endpoint) {
-                Ok((address, None)) => address,
-                Ok((_, Some(_))) => continue,
-                Err(error) => {
-                    tracing::warn!(peer = node_id.0, %error, "ignoring invalid cluster control endpoint");
-                    continue;
-                }
-            };
-            if address == local_address {
-                continue;
-            }
-            if live.as_ref().is_some_and(|live| !live.contains(&node_id)) {
-                continue;
-            }
-            discovered.push(node_id);
-        }
-        discovered
+        let budget = prepare_fanout_budget(attempt_deadline, retry_window)?;
+        self.announce_inner(ann, Some(budget)).await
     }
 
     async fn announce_inner(
         &self,
         ann: &BarrierAnnouncement,
-        prepare_quorum_window: Option<Duration>,
+        prepare_budget: Option<PrepareFanoutBudget>,
     ) -> Result<(), String> {
         validate_announcement_attempt(ann)?;
         #[cfg(feature = "cluster")]
         {
             self.validate_reversible_announcement(ann).await?;
-            let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_quorum_window)?;
+            let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_budget)?;
             let grpc_opt = self.grpc.lock().clone();
             let process_bound = self.local_process.get().is_some();
             match (process_bound, ann.assignment_fence.is_some()) {
@@ -2898,17 +3080,10 @@ impl BarrierCoordinator {
                     drop(publication);
                 } else {
                     drop(publication);
-                    let expected = if let Some(roster) = phase_roster {
-                        // The checkpoint certificate, not mutable membership, is the phase roster.
-                        // This also removes a discovery/object-store scan from the clustered hot
-                        // path and excludes Active processes outside the frozen cut.
-                        roster
-                    } else {
-                        // Feature-enabled embedded and single-node use remains assignment-less.
-                        // Only that compatibility path discovers direct peers from membership.
-                        self.discover_assignment_less_phase_peers(&state.advertise_addr)
-                            .await
-                    };
+                    // The checkpoint certificate, not mutable membership, is the phase roster.
+                    // This also removes a discovery/object-store scan from the clustered hot
+                    // path and excludes Active processes outside the frozen cut.
+                    let expected = phase_roster.unwrap_or_default();
 
                     let results = send_phase_notifications(&state, &self.kv, ann, expected).await;
                     for res in results {
@@ -2944,7 +3119,7 @@ impl BarrierCoordinator {
 
         #[cfg(not(feature = "cluster"))]
         {
-            let _ = prepare_quorum_window;
+            let _ = prepare_budget;
             let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
             let mut publication = self.publication.lock().await;
             if !publication.initialized {
@@ -3089,6 +3264,21 @@ impl BarrierCoordinator {
             .assignment_fence
             .as_ref()
             .map(super::CheckpointAssignmentFence::digest);
+        if prepare.assignment_fence.is_none() {
+            if expected.is_empty() {
+                return QuorumOutcome::Reached {
+                    acks: Vec::new(),
+                    follower_watermark: CheckpointWatermark::Uninitialized,
+                    handoff_replay_pending: false,
+                };
+            }
+            return QuorumOutcome::Failed {
+                failures: vec![(
+                    expected[0],
+                    "remote checkpoint quorum requires an assignment certificate".into(),
+                )],
+            };
+        }
         #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
@@ -3104,7 +3294,7 @@ impl BarrierCoordinator {
                         };
                     }
                 };
-                let eager_batch = if prepare.assignment_fence.is_some() {
+                let mut batch = {
                     let mut pending = state.prepare_fanout.lock();
                     match pending.take() {
                         Some(PrepareFanoutState::Pending(batch))
@@ -3112,7 +3302,7 @@ impl BarrierCoordinator {
                                 && batch.expected == expected_roster =>
                         {
                             *pending = Some(PrepareFanoutState::Claimed(prepare.clone()));
-                            Some(batch)
+                            batch
                         }
                         Some(state @ PrepareFanoutState::Pending(_))
                             if state.announcement() != prepare =>
@@ -3146,7 +3336,7 @@ impl BarrierCoordinator {
                         }
                         Some(
                             state @ (PrepareFanoutState::Claimed(_)
-                            | PrepareFanoutState::QuorumReached(_)),
+                            | PrepareFanoutState::CaptureQuorumReached(_)),
                         ) => {
                             let exact = state.announcement() == prepare;
                             *pending = Some(state);
@@ -3177,52 +3367,42 @@ impl BarrierCoordinator {
                             };
                         }
                     }
-                } else {
-                    None
                 };
 
                 let prepare_deadline = tokio::time::Instant::now() + deadline;
-                let results = if let Some(mut batch) = eager_batch {
-                    debug_assert_eq!(batch.tasks.len(), expected_roster.len());
-                    let mut results = Vec::with_capacity(expected_roster.len());
-                    loop {
-                        match tokio::time::timeout_at(prepare_deadline, batch.tasks.join_next())
-                            .await
-                        {
-                            Ok(Some(Ok(result))) => results.push(result),
-                            Ok(Some(Err(error))) => results.push(Err((
-                                NodeId::UNASSIGNED,
-                                PeerFailure::Nack(format!("Prepare RPC task failed: {error}")),
-                            ))),
-                            Ok(None) | Err(_) => break,
+                debug_assert_eq!(batch.tasks.len(), expected_roster.len());
+                let mut results = Vec::with_capacity(expected_roster.len());
+                loop {
+                    match tokio::time::timeout_at(prepare_deadline, batch.tasks.join_next()).await {
+                        Ok(Some(Ok(Err((peer, PeerFailure::Nack(message)))))) => {
+                            return QuorumOutcome::Failed {
+                                failures: vec![(peer, message)],
+                            };
                         }
+                        Ok(Some(Ok(result))) => results.push(result),
+                        Ok(Some(Err(error))) => {
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    NodeId::UNASSIGNED,
+                                    format!("Prepare RPC task failed: {error}"),
+                                )],
+                            };
+                        }
+                        Ok(None) | Err(_) => break,
                     }
-                    results
-                } else {
-                    // Embedded/single-node use with the cluster feature and legacy direct tests
-                    // have no assignment certificate. Keep their on-demand direct path intact.
-                    let futures = expected.iter().map(|&peer| {
-                        prepare_peer_until_deadline(
-                            peer,
-                            Arc::clone(&state.clients),
-                            Arc::clone(&self.kv),
-                            prepare.clone(),
-                            prepare_deadline,
-                            deadline / 2,
-                        )
-                    });
-                    futures::future::join_all(futures).await
-                };
+                }
 
                 let mut successful = Vec::new();
                 let mut failures = Vec::new();
                 let mut follower_watermark = None;
+                let mut handoff_replay_pending = false;
                 let mut timed_out = Vec::new();
 
                 for res in results {
                     match res {
-                        Ok((peer, wm)) => {
+                        Ok((peer, wm, replay_pending)) => {
                             successful.push(peer);
+                            handoff_replay_pending |= replay_pending;
                             follower_watermark = Some(follower_watermark.map_or(wm, |current| {
                                 CheckpointWatermark::cluster_min(current, wm)
                             }));
@@ -3250,11 +3430,10 @@ impl BarrierCoordinator {
                 if !failures.is_empty() {
                     return QuorumOutcome::Failed { failures };
                 }
-
-                if !timed_out.is_empty() || successful.len() < expected.len() {
+                if !timed_out.is_empty() || successful.len() < expected_roster.len() {
                     let got = successful;
                     let mut missing = timed_out;
-                    for &peer in expected {
+                    for &peer in &expected_roster {
                         if !got.contains(&peer) && !missing.contains(&peer) {
                             missing.push(peer);
                         }
@@ -3264,7 +3443,7 @@ impl BarrierCoordinator {
                 }
 
                 if prepare.assignment_fence.is_some() {
-                    if let Err(error) = mark_prepare_quorum_reached(&state, prepare) {
+                    if let Err(error) = mark_capture_quorum_reached(&state, prepare) {
                         return QuorumOutcome::Failed {
                             failures: vec![(
                                 expected_roster
@@ -3281,6 +3460,7 @@ impl BarrierCoordinator {
                     acks: successful,
                     follower_watermark: follower_watermark
                         .unwrap_or(CheckpointWatermark::Uninitialized),
+                    handoff_replay_pending,
                 };
             }
         }
@@ -3290,11 +3470,13 @@ impl BarrierCoordinator {
         let mut successful: Vec<NodeId> = Vec::new();
         let mut failures: Vec<(NodeId, String)> = Vec::new();
         let mut follower_watermark: Option<CheckpointWatermark>;
+        let mut handoff_replay_pending: bool;
 
         loop {
             successful.clear();
             failures.clear();
             follower_watermark = None;
+            handoff_replay_pending = false;
 
             for (from, json) in self.kv.scan(ACK_KEY).await {
                 if !expected_set.contains(&from) {
@@ -3306,32 +3488,69 @@ impl BarrierCoordinator {
                 if ack.epoch != epoch
                     || ack.checkpoint_id != checkpoint_id
                     || ack.assignment_digest != assignment_digest
+                    || ack.flags != prepare.flags
                 {
                     continue;
                 }
-                if ack.ok {
-                    if let Err(error) = ack.watermark.validate() {
-                        failures.push((from, error));
-                    } else {
-                        successful.push(from);
-                        follower_watermark =
-                            Some(follower_watermark.map_or(ack.watermark, |current| {
-                                current.cluster_min(ack.watermark)
-                            }));
+                match ack.disposition {
+                    BarrierAckDisposition::Captured => {
+                        if let Err(error) = ack.watermark.validate() {
+                            failures.push((from, error));
+                        } else {
+                            successful.push(from);
+                            follower_watermark =
+                                Some(follower_watermark.map_or(ack.watermark, |current| {
+                                    current.cluster_min(ack.watermark)
+                                }));
+                        }
                     }
-                } else {
-                    failures.push((from, ack.error.unwrap_or_default()));
+                    BarrierAckDisposition::CapturedWithReplay => {
+                        if prepare.flags & crate::checkpoint::flags::HANDOFF == 0 {
+                            failures.push((
+                                from,
+                                "Prepare acknowledgement retained replay without the HANDOFF flag"
+                                    .into(),
+                            ));
+                        } else if let Err(error) = ack.watermark.validate() {
+                            failures.push((from, error));
+                        } else {
+                            handoff_replay_pending = true;
+                            successful.push(from);
+                            follower_watermark =
+                                Some(follower_watermark.map_or(ack.watermark, |current| {
+                                    current.cluster_min(ack.watermark)
+                                }));
+                        }
+                    }
+                    BarrierAckDisposition::Failed => {
+                        failures.push((
+                            from,
+                            ack.error.unwrap_or_else(|| {
+                                "Prepare acknowledgement has no reason".to_string()
+                            }),
+                        ));
+                    }
+                    BarrierAckDisposition::Prepared | BarrierAckDisposition::PreparedWithReplay => {
+                        failures.push((
+                            from,
+                            "Prepare requires an explicit Captured acknowledgement from every participant"
+                                .into(),
+                        ));
+                    }
                 }
             }
 
             if !failures.is_empty() {
+                failures.sort_unstable_by_key(|(peer, _)| peer.0);
                 return QuorumOutcome::Failed { failures };
             }
             if successful.len() == expected.len() {
+                successful.sort_unstable_by_key(|peer| peer.0);
                 return QuorumOutcome::Reached {
                     acks: successful,
                     follower_watermark: follower_watermark
                         .unwrap_or(CheckpointWatermark::Uninitialized),
+                    handoff_replay_pending,
                 };
             }
             if start.elapsed() >= deadline {
@@ -3341,10 +3560,9 @@ impl BarrierCoordinator {
                     .copied()
                     .filter(|n| !got.contains(n))
                     .collect();
-                return QuorumOutcome::TimedOut {
-                    got: successful,
-                    missing,
-                };
+                let mut got = got.into_iter().collect::<Vec<_>>();
+                got.sort_unstable_by_key(|peer| peer.0);
+                return QuorumOutcome::TimedOut { got, missing };
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

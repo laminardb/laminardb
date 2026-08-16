@@ -6,10 +6,12 @@
 //! Supported syntax:
 //! ```sql
 //! CREATE [OR REPLACE] SOURCE [IF NOT EXISTS] name (
-//!     column1 TYPE [NOT NULL] [DEFAULT expr],
+//!     column1 TYPE [NOT NULL] [DEFAULT expr] [PRIMARY KEY],
 //!     column2 TYPE,
+//!     PRIMARY KEY (column1, column2),
 //!     WATERMARK FOR time_col AS time_col - INTERVAL 'n' UNIT
-//! ) [WITH ('key' = 'value', ...)];
+//! ) [FROM connector (...)] [FORMAT format [WITH (...)]]
+//! [WITH ('buffer_size' = value)];
 //! ```
 
 #[allow(clippy::disallowed_types)] // cold path: SQL parsing
@@ -73,9 +75,8 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
         } else {
             SourceBody {
                 columns: vec![],
+                primary_key: vec![],
                 watermark: None,
-                has_wildcard: false,
-                wildcard_prefix: None,
             }
         }
     };
@@ -93,13 +94,49 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
         }
     }
 
-    // WITH options (optional) — contains watermark config like event_time, watermark_delay
+    if format.is_some() && connector_type.is_none() {
+        return Err(ParseError::StreamingError(
+            "CREATE SOURCE FORMAT requires an explicit FROM connector".into(),
+        ));
+    }
+    if connector_options
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("format"))
+        || format.as_ref().is_some_and(|format| {
+            format
+                .options
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("format"))
+        })
+    {
+        return Err(ParseError::StreamingError(
+            "CREATE SOURCE option 'format' is unsupported; declare the format with the FORMAT clause"
+                .into(),
+        ));
+    }
+
+    // WITH options (optional) — source runtime configuration only. Connector
+    // and format configuration has exactly one syntax: FROM / FORMAT.
     let with_options = parse_with_options(parser)?;
+    if let Some(option) = with_options
+        .keys()
+        .filter(|option| !option.eq_ignore_ascii_case("buffer_size"))
+        .min_by(|left, right| {
+            left.to_ascii_lowercase()
+                .cmp(&right.to_ascii_lowercase())
+                .then_with(|| left.cmp(right))
+        })
+    {
+        return Err(ParseError::StreamingError(format!(
+            "CREATE SOURCE trailing WITH supports only 'buffer_size'; put connector options in FROM (...) and format options in FORMAT ... WITH (...); unsupported option '{option}'"
+        )));
+    }
     expect_statement_end(parser)?;
 
     Ok(CreateSourceStatement {
         name,
         columns: body.columns,
+        primary_key: body.primary_key,
         watermark: body.watermark,
         with_options,
         or_replace,
@@ -107,17 +144,14 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
         connector_type,
         connector_options,
         format,
-        has_wildcard: body.has_wildcard,
-        wildcard_prefix: body.wildcard_prefix,
     })
 }
 
-/// Result of parsing the source body (column list, watermark, wildcard info).
+/// Result of parsing the source body.
 struct SourceBody {
     columns: Vec<sqlparser::ast::ColumnDef>,
+    primary_key: Vec<sqlparser::ast::Ident>,
     watermark: Option<WatermarkDef>,
-    has_wildcard: bool,
-    wildcard_prefix: Option<String>,
 }
 
 /// Parse the column list and optional WATERMARK clause inside parentheses.
@@ -126,34 +160,19 @@ struct SourceBody {
 /// SQL data types (including parameterized types like `DECIMAL(10,2)`,
 /// `VARCHAR(255)`, `ARRAY<INT>`, etc.) and column constraints (`NOT NULL`,
 /// `DEFAULT`, `PRIMARY KEY`, etc.).
-///
-/// Supports wildcard `*` for schema inference expansion:
-/// ```sql
-/// CREATE SOURCE events (
-///     id BIGINT,
-///     *,                       -- infer remaining columns
-///     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
-/// )
-/// CREATE SOURCE events (
-///     id BIGINT,
-///     * PREFIX 'src_'          -- prefix inferred columns
-/// )
-/// ```
 fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
     // If no opening paren, no columns defined
     if !parser.consume_token(&Token::LParen) {
         return Ok(SourceBody {
             columns: vec![],
+            primary_key: vec![],
             watermark: None,
-            has_wildcard: false,
-            wildcard_prefix: None,
         });
     }
 
     let mut columns = Vec::new();
+    let mut primary_key = None;
     let mut watermark = None;
-    let mut has_wildcard = false;
-    let mut wildcard_prefix = None;
 
     loop {
         // Check for closing paren (empty list)
@@ -161,29 +180,32 @@ fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
             break;
         }
 
-        // Check for wildcard `*`
-        if parser.consume_token(&Token::Mul) {
-            if has_wildcard {
-                return Err(ParseError::StreamingError(
-                    "duplicate wildcard `*` in column list".into(),
-                ));
-            }
-            has_wildcard = true;
-
-            // Optional PREFIX 'string'
-            if try_parse_custom_keyword(parser, "PREFIX") {
-                let tok = parser.next_token();
-                match tok.token {
-                    Token::SingleQuotedString(s) | Token::DoubleQuotedString(s) => {
-                        wildcard_prefix = Some(s);
-                    }
-                    other => {
-                        return Err(ParseError::StreamingError(format!(
-                            "expected quoted string after PREFIX, found {other}"
-                        )));
-                    }
+        if parser.parse_keywords(&[Keyword::PRIMARY, Keyword::KEY]) {
+            parser
+                .expect_token(&Token::LParen)
+                .map_err(ParseError::SqlParseError)?;
+            let mut key_columns = Vec::new();
+            loop {
+                key_columns.push(
+                    parser
+                        .parse_identifier()
+                        .map_err(ParseError::SqlParseError)?,
+                );
+                if !parser.consume_token(&Token::Comma) {
+                    break;
                 }
             }
+            parser
+                .expect_token(&Token::RParen)
+                .map_err(ParseError::SqlParseError)?;
+            set_primary_key(&mut primary_key, key_columns)?;
+        // Schema discovery is all-or-nothing. Mixing declared and inferred
+        // columns otherwise produces different schemas in local and cluster mode.
+        } else if parser.consume_token(&Token::Mul) {
+            return Err(ParseError::StreamingError(
+                "CREATE SOURCE does not support wildcard schema merging; omit the column list for connector discovery or declare the complete schema"
+                    .into(),
+            ));
         // Peek to check for WATERMARK keyword
         } else if try_parse_custom_keyword(parser, "WATERMARK") {
             watermark = Some(parse_watermark_def(parser)?);
@@ -192,6 +214,48 @@ fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
             let col = parser
                 .parse_column_def()
                 .map_err(ParseError::SqlParseError)?;
+            let inline_primary_keys: Vec<_> = col
+                .options
+                .iter()
+                .filter(|option| {
+                    matches!(
+                        &option.option,
+                        sqlparser::ast::ColumnOption::Unique {
+                            is_primary: true,
+                            ..
+                        }
+                    )
+                })
+                .collect();
+            match inline_primary_keys.as_slice() {
+                [] => {}
+                [option] => {
+                    if option.name.is_some() {
+                        return Err(ParseError::StreamingError(
+                            "CREATE SOURCE does not support named PRIMARY KEY constraints".into(),
+                        ));
+                    }
+                    let sqlparser::ast::ColumnOption::Unique {
+                        characteristics, ..
+                    } = &option.option
+                    else {
+                        unreachable!("filtered to inline primary-key options")
+                    };
+                    if characteristics.is_some() {
+                        return Err(ParseError::StreamingError(
+                            "CREATE SOURCE does not support PRIMARY KEY constraint characteristics"
+                                .into(),
+                        ));
+                    }
+                    set_primary_key(&mut primary_key, vec![col.name.clone()])?;
+                }
+                _ => {
+                    return Err(ParseError::StreamingError(format!(
+                        "CREATE SOURCE column '{}' repeats PRIMARY KEY",
+                        col.name
+                    )));
+                }
+            }
             columns.push(col);
         }
 
@@ -206,10 +270,22 @@ fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
 
     Ok(SourceBody {
         columns,
+        primary_key: primary_key.unwrap_or_default(),
         watermark,
-        has_wildcard,
-        wildcard_prefix,
     })
+}
+
+fn set_primary_key(
+    primary_key: &mut Option<Vec<sqlparser::ast::Ident>>,
+    columns: Vec<sqlparser::ast::Ident>,
+) -> Result<(), ParseError> {
+    if primary_key.is_some() {
+        return Err(ParseError::StreamingError(
+            "CREATE SOURCE accepts at most one PRIMARY KEY declaration".into(),
+        ));
+    }
+    *primary_key = Some(columns);
+    Ok(())
 }
 
 /// Parse WATERMARK FOR column [AS expression].
@@ -386,31 +462,21 @@ mod tests {
     }
 
     #[test]
-    fn test_create_source_with_options() {
+    fn test_create_source_with_runtime_options() {
         let source = parse(
             "CREATE SOURCE kafka_events (
                 id BIGINT,
                 data TEXT
             ) WITH (
-                'connector' = 'kafka',
-                'topic' = 'events',
-                'bootstrap.servers' = 'localhost:9092'
+                'buffer_size' = '4096'
             )",
         );
         assert_eq!(source.name.to_string(), "kafka_events");
         assert_eq!(source.columns.len(), 2);
-        assert_eq!(source.with_options.len(), 3);
+        assert_eq!(source.with_options.len(), 1);
         assert_eq!(
-            source.with_options.get("connector"),
-            Some(&"kafka".to_string())
-        );
-        assert_eq!(
-            source.with_options.get("topic"),
-            Some(&"events".to_string())
-        );
-        assert_eq!(
-            source.with_options.get("bootstrap.servers"),
-            Some(&"localhost:9092".to_string())
+            source.with_options.get("buffer_size"),
+            Some(&"4096".to_string())
         );
     }
 
@@ -423,16 +489,12 @@ mod tests {
                 amount DECIMAL(10,2),
                 order_time TIMESTAMP,
                 WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
-            ) WITH (
-                'connector' = 'kafka',
-                'topic' = 'orders',
-                'format' = 'json'
-            )",
+            ) FROM KAFKA (topic = 'orders') FORMAT JSON",
         );
         assert_eq!(source.name.to_string(), "orders");
         assert_eq!(source.columns.len(), 4);
         assert!(source.watermark.is_some());
-        assert_eq!(source.with_options.len(), 3);
+        assert!(source.with_options.is_empty());
         assert!(source.if_not_exists);
         assert!(!source.or_replace);
     }
@@ -590,14 +652,13 @@ mod tests {
                 ts TIMESTAMP,
                 WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
             ) WITH (
-                'event_time' = 'ts',
-                'watermark_delay' = '5 seconds'
+                'buffer_size' = '4096'
             )",
         );
         assert_eq!(source.connector_type, Some("KAFKA".to_string()));
         assert!(source.watermark.is_some());
         assert_eq!(source.columns.len(), 3);
-        assert_eq!(source.with_options.len(), 2);
+        assert_eq!(source.with_options.len(), 1);
     }
 
     #[test]
@@ -617,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backward_compat_no_connector() {
+    fn test_in_memory_source_without_connector() {
         let source = parse("CREATE SOURCE events (id BIGINT, name VARCHAR)");
         assert!(source.connector_type.is_none());
         assert!(source.connector_options.is_empty());
@@ -663,9 +724,8 @@ mod tests {
                 'bootstrap.servers' = 'localhost:19092',
                 topic = 'market-ticks',
                 'group.id' = 'laminar-demo',
-                format = 'json',
                 'auto.offset.reset' = 'earliest'
-            )",
+            ) FORMAT JSON",
         );
         assert_eq!(source.name.to_string(), "market_ticks");
         assert_eq!(source.connector_type, Some("KAFKA".to_string()));
@@ -682,7 +742,7 @@ mod tests {
             source.connector_options.get("group.id"),
             Some(&"laminar-demo".to_string())
         );
-        assert_eq!(source.connector_options.len(), 5);
+        assert_eq!(source.connector_options.len(), 4);
     }
 
     #[test]
@@ -701,91 +761,69 @@ mod tests {
         assert_eq!(source.format.as_ref().unwrap().format_type, "JSON");
     }
 
-    // ── Wildcard inference tests ────────────────────────────
-
     #[test]
-    fn test_wildcard_only() {
-        let source = parse("CREATE SOURCE events (*)");
-        assert!(source.has_wildcard);
-        assert!(source.wildcard_prefix.is_none());
-        assert_eq!(source.columns.len(), 0);
-    }
-
-    #[test]
-    fn test_wildcard_with_columns() {
-        let source = parse(
-            "CREATE SOURCE events (
-                id BIGINT,
-                *
-            )",
-        );
-        assert!(source.has_wildcard);
-        assert_eq!(source.columns.len(), 1);
-        assert_eq!(source.columns[0].name.to_string(), "id");
-    }
-
-    #[test]
-    fn test_wildcard_with_prefix() {
-        let source = parse(
-            "CREATE SOURCE events (
-                id BIGINT,
-                * PREFIX 'src_'
-            )",
-        );
-        assert!(source.has_wildcard);
-        assert_eq!(source.wildcard_prefix.as_deref(), Some("src_"));
-        assert_eq!(source.columns.len(), 1);
-    }
-
-    #[test]
-    fn test_wildcard_with_watermark() {
-        let source = parse(
-            "CREATE SOURCE events (
-                id BIGINT,
-                ts TIMESTAMP,
-                *,
-                WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
-            )",
-        );
-        assert!(source.has_wildcard);
-        assert_eq!(source.columns.len(), 2);
-        assert!(source.watermark.is_some());
-    }
-
-    #[test]
-    fn test_wildcard_from_kafka() {
-        let source = parse(
-            "CREATE SOURCE events FROM KAFKA (
-                'topic' = 'events'
-            ) FORMAT JSON SCHEMA (
-                id BIGINT,
-                * PREFIX 'raw_'
-            )",
-        );
-        assert!(source.has_wildcard);
-        assert_eq!(source.wildcard_prefix.as_deref(), Some("raw_"));
-        assert_eq!(source.connector_type, Some("KAFKA".to_string()));
-    }
-
-    #[test]
-    fn test_duplicate_wildcard_error() {
+    fn format_requires_connector() {
         let dialect = LaminarDialect::default();
         let mut parser = Parser::new(&dialect)
-            .try_with_sql("CREATE SOURCE events (id BIGINT, *, *)")
+            .try_with_sql("CREATE SOURCE events (id BIGINT) FORMAT JSON")
             .unwrap();
-        let result = parse_create_source(&mut parser);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("duplicate wildcard"));
+        let error = parse_create_source(&mut parser).unwrap_err().to_string();
+        assert!(
+            error.contains("requires an explicit FROM connector"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn test_no_wildcard_backward_compat() {
-        let source = parse("CREATE SOURCE events (id BIGINT, name VARCHAR)");
-        assert!(!source.has_wildcard);
-        assert!(source.wildcard_prefix.is_none());
+    fn connector_local_format_is_rejected() {
+        let dialect = LaminarDialect::default();
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("CREATE SOURCE events (id BIGINT) FROM KAFKA (format = 'json')")
+            .unwrap();
+        let error = parse_create_source(&mut parser).unwrap_err().to_string();
+        assert!(
+            error.contains("declare the format with the FORMAT clause"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn trailing_with_accepts_only_buffer_size() {
+        for option in [
+            "'connector' = 'kafka'",
+            "'FORMAT' = 'json'",
+            "'format.schema.registry.url' = 'http://registry'",
+            "'topic' = 'other-events'",
+            "'buffer-size' = '4096'",
+            "'buffersize' = '4096'",
+            "'backpressure' = 'block'",
+            "'wait_strategy' = 'park'",
+            "'waitstrategy' = 'park'",
+            "'track_stats' = 'true'",
+            "'trackstats' = 'true'",
+            "'stats' = 'true'",
+        ] {
+            for prefix in [
+                "CREATE SOURCE events (id BIGINT)",
+                "CREATE SOURCE events FROM KAFKA (topic = 'events') SCHEMA (id BIGINT)",
+            ] {
+                let sql = format!("{prefix} WITH ({option})");
+                let dialect = LaminarDialect::default();
+                let mut parser = Parser::new(&dialect).try_with_sql(&sql).unwrap();
+                let error = parse_create_source(&mut parser).unwrap_err().to_string();
+                assert!(error.contains("supports only 'buffer_size'"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_schema_merging_is_rejected() {
+        let dialect = LaminarDialect::default();
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("CREATE SOURCE events (id BIGINT, *)")
+            .unwrap();
+        let error = parse_create_source(&mut parser).unwrap_err().to_string();
+        assert!(error.contains("omit the column list"), "{error}");
     }
 
     // ── Dotted option key tests ────────────────────────────
@@ -797,10 +835,9 @@ mod tests {
                 s VARCHAR, p DOUBLE
             ) FROM WEBSOCKET (
                 url = 'wss://example.com/ws',
-                format = 'json',
                 json.path = 'data',
                 json.explode = 'price,qty'
-            )",
+            ) FORMAT JSON",
         );
         assert_eq!(source.connector_type, Some("WEBSOCKET".to_string()));
         assert_eq!(

@@ -1,3 +1,10 @@
+{{- $checkpointUrl := .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" -}}
+{{- if and (eq .Values.laminardb.mode "cluster") (eq .Values.laminardb.delivery "best_effort") -}}
+{{- fail "cluster mode requires laminardb.delivery=at_least_once or exactly_once" -}}
+{{- end -}}
+{{- if and (ne .Values.laminardb.delivery "best_effort") (hasPrefix "file://" $checkpointUrl) (not .Values.persistence.checkpoints.enabled) -}}
+{{- fail "at_least_once/exactly_once with a file:// checkpoint URL requires persistence.checkpoints.enabled=true" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -19,11 +26,7 @@ data:
     mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
     delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
-    {{- if $isCluster }}
-    key_groups = {{ $cluster.keyGroups }}
-    {{- end }}
-    workers = {{ .Values.laminardb.workers }}
-    log_level = "{{ .Values.laminardb.logLevel }}"
+    key_groups = {{ .Values.laminardb.keyGroups }}
     {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
     # Resolved from the pod env at config load; the token never enters the ConfigMap.
     console_token = "${LAMINAR_CONSOLE_TOKEN}"
@@ -54,16 +57,8 @@ data:
     {{- end }}
     {{- end }}
 
-    [state]
-    backend = "{{ .Values.laminardb.state.backend }}"
-    {{- if eq .Values.laminardb.state.backend "local" }}
-    path = "{{ .Values.laminardb.state.path }}"
-    {{- else if eq .Values.laminardb.state.backend "object_store" }}
-    url = "{{ .Values.laminardb.state.url }}"
-    {{- end }}
-
     [checkpoint]
-    url = "{{ .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" }}"
+    url = "{{ $checkpointUrl }}"
     interval = "{{ .Values.laminardb.checkpoint.interval }}"
     timeout = "{{ .Values.laminardb.checkpoint.timeout }}"
 

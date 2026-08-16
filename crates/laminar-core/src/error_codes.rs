@@ -87,6 +87,8 @@ pub const STATE_KEY_MISSING: &str = "LDB-4005";
 pub const STATE_CORRUPTION: &str = "LDB-4006";
 /// A cluster query shape has no vnode-keyed checkpoint and rebalance lifecycle.
 pub const CLUSTER_STATE_LIFECYCLE_UNSUPPORTED: &str = "LDB-4007";
+/// Managed operator state exceeded the configured pipeline working-state budget.
+pub const MANAGED_STATE_BUDGET_EXCEEDED: &str = "LDB-4008";
 // ── Connector / I/O (LDB-5xxx) ──
 
 /// Connector failed to establish a connection.
@@ -127,6 +129,10 @@ pub const EXACTLY_ONCE_PROTOCOL_INCOMPLETE: &str = "LDB-5035";
 pub const DELIVERY_STATE_DURABILITY_MISMATCH: &str = "LDB-5036";
 /// A replayable source has not passed production exactly-once certification.
 pub const EXACTLY_ONCE_SOURCE_UNCERTIFIED: &str = "LDB-5037";
+/// A keyed-upsert source has no declared relational key.
+pub const SOURCE_PRIMARY_KEY_REQUIRED: &str = "LDB-5038";
+/// A mutation source cannot yet enter the canonical changelog path.
+pub const SOURCE_MUTATION_NOT_ADMITTED: &str = "LDB-5039";
 
 // ── Checkpoint / Recovery (LDB-6xxx) ──
 
@@ -148,23 +154,8 @@ pub const WAL_CHECKSUM_MISMATCH: &str = "LDB-6007";
 pub const MANIFEST_PERSIST_FAILED: &str = "LDB-6008";
 /// Checkpoint prune (old checkpoint cleanup) failed.
 pub const CHECKPOINT_PRUNE_FAILED: &str = "LDB-6009";
-/// Sidecar state data missing or corrupted.
-pub const SIDECAR_CORRUPTION: &str = "LDB-6010";
 /// Source offset metadata missing during recovery.
 pub const OFFSET_METADATA_MISSING: &str = "LDB-6011";
-/// State durability gate returned false before sink commit. One or more
-/// vnodes had not persisted their partials for the epoch. The coordinator
-/// rolls back sinks and retries on the next checkpoint.
-pub const DURABILITY_GATE_MISS: &str = "LDB-6020";
-/// Sink rollback failed after a durability-gate miss. Sinks may be in an
-/// inconsistent state; recovery uses the exact durable commit decision to resolve.
-pub const DURABILITY_GATE_ROLLBACK_FAILED: &str = "LDB-6021";
-/// State backend returned an error during the durability gate (backend
-/// unreachable, permission denied). Treated as a gate miss; sinks rolled
-/// back and the next checkpoint retries.
-pub const DURABILITY_GATE_BACKEND_ERROR: &str = "LDB-6022";
-/// Sink rollback failed after a durability-gate backend error.
-pub const DURABILITY_GATE_ROLLBACK_ON_ERROR_FAILED: &str = "LDB-6023";
 
 // ── DataFusion / Arrow Interop (LDB-7xxx) ──
 
@@ -310,7 +301,10 @@ mod tests {
     fn error_codes_are_stable_strings() {
         assert_eq!(INVALID_CONFIG, "LDB-0001");
         assert_eq!(SERIALIZATION_FAILED, "LDB-4001");
+        assert_eq!(MANAGED_STATE_BUDGET_EXCEEDED, "LDB-4008");
         assert_eq!(EXACTLY_ONCE_SOURCE_UNCERTIFIED, "LDB-5037");
+        assert_eq!(SOURCE_PRIMARY_KEY_REQUIRED, "LDB-5038");
+        assert_eq!(SOURCE_MUTATION_NOT_ADMITTED, "LDB-5039");
         assert_eq!(CHECKPOINT_FAILED, "LDB-6001");
         assert_eq!(INTERNAL, "LDB-8001");
     }

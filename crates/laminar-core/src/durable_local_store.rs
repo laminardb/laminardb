@@ -126,11 +126,6 @@ pub(crate) struct DurableLocalObjectStore {
     ownership_lock: Option<Arc<File>>,
 }
 
-#[async_trait]
-pub(crate) trait EmptyPrefixCleanup: Send + Sync {
-    async fn cleanup_empty_prefix(&self, prefix: &Path) -> object_store::Result<()>;
-}
-
 impl DurableLocalObjectStore {
     /// Open a store rooted at `root`, creating the root when necessary.
     ///
@@ -142,6 +137,7 @@ impl DurableLocalObjectStore {
     }
 
     /// Open a store with one live process owner for protocols that use local overwrites.
+    #[cfg(test)]
     pub(crate) fn new_exclusive(
         root: impl AsRef<FsPath>,
         lock_name: &str,
@@ -407,22 +403,6 @@ impl ObjectStore for DurableLocalObjectStore {
     }
 }
 
-#[async_trait]
-impl EmptyPrefixCleanup for DurableLocalObjectStore {
-    async fn cleanup_empty_prefix(&self, prefix: &Path) -> object_store::Result<()> {
-        let prefix = self.filesystem_path(prefix)?;
-        let root = Arc::clone(&self.root);
-        let domain = Arc::clone(&self.domain);
-        let ownership_lock = self.ownership_lock.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ownership_lock = ownership_lock;
-            cleanup_empty_directory_tree(root.as_ref(), domain.as_ref(), &prefix)
-                .map_err(generic_io_error)
-        })
-        .await?
-    }
-}
-
 #[cfg(unix)]
 fn delete_local_object(
     root: &FsPath,
@@ -533,61 +513,7 @@ fn remove_empty_ancestor_directories(root: &FsPath, domain: &RootDomain, object:
     }
 }
 
-fn cleanup_empty_directory_tree(
-    root: &FsPath,
-    domain: &RootDomain,
-    prefix: &FsPath,
-) -> io::Result<()> {
-    let prefix = match std::fs::canonicalize(prefix) {
-        Ok(prefix) => prefix,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if prefix == root || !prefix.starts_with(root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "empty-prefix cleanup resolves outside its store root",
-        ));
-    }
-
-    let mut pending = vec![prefix];
-    let mut directories = Vec::new();
-    while let Some(directory) = pending.pop() {
-        directories.push(directory.clone());
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if file_type.is_dir() {
-                pending.push(entry.path());
-            } else if file_type.is_file() && is_internal_artifact_name(&entry.file_name()) {
-                match std::fs::remove_file(entry.path()) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-    }
-
-    for directory in directories.into_iter().rev() {
-        try_remove_empty_directory(root, domain, &directory);
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn is_internal_artifact_name(name: &std::ffi::OsStr) -> bool {
     name.to_str()
         .and_then(|name| name.strip_prefix(TEMP_PREFIX))
@@ -820,7 +746,6 @@ mod tests {
     use object_store::ObjectStoreExt;
 
     use super::*;
-    use crate::checkpoint_decision::{CheckpointDecisionStore, CheckpointScope, CheckpointVerdict};
 
     #[tokio::test]
     async fn create_is_exclusive_and_keeps_the_winner() {
@@ -853,8 +778,8 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             store.put_opts(
-                &Path::from("state/vnode=1/partial.bin"),
-                PutPayload::from_static(b"partial"),
+                &Path::from("objects/chunk=1/data.bin"),
+                PutPayload::from_static(b"data"),
                 PutMode::Create.into(),
             ),
         )
@@ -870,8 +795,8 @@ mod tests {
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
         store
             .put_opts(
-                &Path::from("state/epoch=1/object"),
-                PutPayload::from_static(b"state"),
+                &Path::from("objects/generation=1/object"),
+                PutPayload::from_static(b"data"),
                 PutMode::Create.into(),
             )
             .await
@@ -880,16 +805,19 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let listed = store
-                .list(Some(&Path::from("state")))
+                .list(Some(&Path::from("objects")))
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
             assert_eq!(listed.len(), 1);
             let delimited = store
-                .list_with_delimiter(Some(&Path::from("state")))
+                .list_with_delimiter(Some(&Path::from("objects")))
                 .await
                 .unwrap();
-            assert_eq!(delimited.common_prefixes, vec![Path::from("state/epoch=1")]);
+            assert_eq!(
+                delimited.common_prefixes,
+                vec![Path::from("objects/generation=1")]
+            );
         })
         .await
         .expect("namespace inventory was serialized behind a mutation");
@@ -930,13 +858,13 @@ mod tests {
     async fn delete_cleans_empty_ancestors_preserves_siblings_and_allows_recreate() {
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let retired = Path::from("state/epoch=1/checkpoint=1/vnode=0/partial.bin");
-        let retained = Path::from("state/epoch=2/checkpoint=2/vnode=0/partial.bin");
+        let retired = Path::from("objects/generation=1/chunk=0/data.bin");
+        let retained = Path::from("objects/generation=2/chunk=0/data.bin");
         for path in [&retired, &retained] {
             store
                 .put_opts(
                     path,
-                    PutPayload::from_static(b"state"),
+                    PutPayload::from_static(b"data"),
                     PutMode::Create.into(),
                 )
                 .await
@@ -945,10 +873,10 @@ mod tests {
 
         store.delete(&retired).await.unwrap();
 
-        assert!(!directory.path().join("state/epoch=1").exists());
+        assert!(!directory.path().join("objects/generation=1").exists());
         assert!(directory
             .path()
-            .join("state/epoch=2/checkpoint=2/vnode=0/partial.bin")
+            .join("objects/generation=2/chunk=0/data.bin")
             .is_file());
         store
             .put_opts(
@@ -968,8 +896,8 @@ mod tests {
     async fn immutable_create_survives_concurrent_empty_ancestor_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let retired = Path::from("state/epoch=1/retired.bin");
-        let live = Path::from("state/epoch=1/live.bin");
+        let retired = Path::from("objects/generation=1/retired.bin");
+        let live = Path::from("objects/generation=1/live.bin");
         store
             .put_opts(
                 &retired,
@@ -1006,7 +934,11 @@ mod tests {
         let deleting_path = retired.clone();
         let deleting = tokio::spawn(async move { deleting_store.delete(&deleting_path).await });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while directory.path().join("state/epoch=1/retired.bin").exists() {
+            while directory
+                .path()
+                .join("objects/generation=1/retired.bin")
+                .exists()
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -1026,11 +958,11 @@ mod tests {
     async fn delete_stream_can_consume_a_listing_from_the_same_store() {
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let prefix = Path::from("state/epoch=1");
-        for vnode in 0..3 {
+        let prefix = Path::from("objects/generation=1");
+        for chunk in 0..3 {
             store
                 .put_opts(
-                    &Path::from(format!("state/epoch=1/vnode={vnode}")),
+                    &Path::from(format!("objects/generation=1/chunk={chunk}")),
                     PutPayload::from_static(b"retired"),
                     PutMode::Create.into(),
                 )
@@ -1063,9 +995,9 @@ mod tests {
     async fn delete_stream_releases_mutation_order_between_objects() {
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let retired_a = Path::from("state/epoch=1/a");
-        let retired_b = Path::from("state/epoch=1/b");
-        let live = Path::from("state/prune-floor");
+        let retired_a = Path::from("objects/generation=1/a");
+        let retired_b = Path::from("objects/generation=1/b");
+        let live = Path::from("metadata/prune-floor");
         for path in [&retired_a, &retired_b, &live] {
             store
                 .put_opts(
@@ -1269,7 +1201,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new_exclusive(directory.path(), LOCK).unwrap();
-        let path = Path::from("state/retired");
+        let path = Path::from("objects/retired");
         store
             .put_opts(
                 &path,
@@ -1408,45 +1340,6 @@ mod tests {
         assert_eq!(delimited.objects.len(), 1);
         assert_eq!(delimited.objects[0].location, Path::from("nested/visible"));
         assert!(temporary_path.is_file());
-    }
-
-    #[tokio::test]
-    async fn reopen_hides_leftover_delete_tombstone_from_outcome_inventory() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
-        let object_store: Arc<dyn ObjectStore> = Arc::new(store);
-        let decisions = CheckpointDecisionStore::new(Arc::clone(&object_store));
-        for epoch in 1..=2 {
-            decisions
-                .record_outcome(
-                    epoch,
-                    epoch,
-                    CheckpointScope::Local,
-                    None,
-                    None,
-                    CheckpointVerdict::Commit,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-
-        let deleted = directory.path().join("checkpoint-outcomes/epoch=1/outcome");
-        let tombstone = internal_artifact_path(deleted.parent().unwrap());
-        durable_rename(&deleted, &tombstone, DurableRenameMode::NoReplace).unwrap();
-        assert!(tombstone.is_file());
-        drop(decisions);
-        drop(object_store);
-
-        let reopened: Arc<dyn ObjectStore> =
-            Arc::new(DurableLocalObjectStore::new(directory.path()).unwrap());
-        let outcomes = CheckpointDecisionStore::new(reopened)
-            .outcomes()
-            .await
-            .unwrap();
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].epoch, 2);
-        assert!(tombstone.is_file());
     }
 
     #[tokio::test]

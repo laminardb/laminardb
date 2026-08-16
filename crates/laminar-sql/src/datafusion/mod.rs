@@ -73,8 +73,7 @@ pub use json_udf::{
 pub use live_source::{LiveSourceHandle, LiveSourceProvider};
 pub use lookup_join_exec::{
     LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
-    PartialLookupJoinExec, PartialLookupState, RegisteredLookup, VersionedLookupJoinExec,
-    VersionedLookupState,
+    PartialLookupJoinExec, PartialLookupState, RegisteredLookup,
 };
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};

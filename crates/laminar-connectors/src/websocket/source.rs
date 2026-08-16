@@ -24,7 +24,7 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourceTopology,
 };
 use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
@@ -614,6 +614,7 @@ impl SourceConnector for WebSocketSource {
         Ok(SourceContract::new(
             SourceConsistency::Ephemeral,
             SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
         ))
     }
 

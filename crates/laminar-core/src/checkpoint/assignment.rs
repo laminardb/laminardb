@@ -9,11 +9,12 @@ use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 ///
 /// Every receiver admits one persistent stream from each of the other 128 participants; the
 /// receiver itself does not consume an inbound peer stream. Assignment certificates above this
-/// bound cannot seal a cluster-wide shuffle barrier and therefore fail admission.
+/// bound cannot establish a cluster-wide shuffle barrier and therefore fail admission.
 pub const MAX_CHECKPOINT_PARTICIPANTS: usize = 128 + 1;
 
 /// One exact process participating in a checkpoint cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointParticipant {
     /// Stable logical node identifier.
     pub node_id: u64,
@@ -21,7 +22,8 @@ pub struct CheckpointParticipant {
     pub boot_incarnation: Uuid,
 }
 
-/// One process's exact adopted assignment identity, published into its control-plane slot.
+/// One process's exact adopted assignment identity and local vnode-state readiness, published into
+/// its control-plane slot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "UncheckedCheckpointAssignmentAdoption")]
 pub struct CheckpointAssignmentAdoption {
@@ -35,15 +37,20 @@ pub struct CheckpointAssignmentAdoption {
     pub vnode_count: u32,
     /// Digest of the adopted partitioning ABI and ordered vnode-owner map.
     pub assignment_digest: [u8; 32],
+    /// Whether every vnode transition for this assignment has completed semantic graph install.
+    /// Transport activation intentionally does not require this bit; assignment rotation does.
+    pub vnode_state_ready: bool,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedCheckpointAssignmentAdoption {
     participant: CheckpointParticipant,
     assignment_version: u64,
     partitioning_abi_version: u16,
     vnode_count: u32,
     assignment_digest: [u8; 32],
+    vnode_state_ready: bool,
 }
 
 impl TryFrom<UncheckedCheckpointAssignmentAdoption> for CheckpointAssignmentAdoption {
@@ -56,6 +63,7 @@ impl TryFrom<UncheckedCheckpointAssignmentAdoption> for CheckpointAssignmentAdop
             partitioning_abi_version: unchecked.partitioning_abi_version,
             vnode_count: unchecked.vnode_count,
             assignment_digest: unchecked.assignment_digest,
+            vnode_state_ready: unchecked.vnode_state_ready,
         };
         adoption
             .is_canonical()
@@ -105,6 +113,7 @@ pub struct CheckpointAssignmentFence {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedCheckpointAssignmentFence {
     assignment_version: u64,
     partitioning_abi_version: u16,
@@ -180,25 +189,45 @@ impl CheckpointAssignmentFence {
     /// Stable digest of the current partitioning ABI and a canonical ordered vnode-owner map.
     #[must_use]
     pub fn owner_map_digest(vnode_count: u32, owners: &[u64]) -> [u8; 32] {
-        Self::owner_map_digest_for_abi(PARTITIONING_ABI_VERSION, vnode_count, owners)
+        Self::owner_map_digest_iter(vnode_count, owners.iter().copied())
     }
 
+    /// Allocation-free stable digest of the current partitioning ABI and an exact-size ordered
+    /// vnode-owner iterator.
+    #[must_use]
+    pub fn owner_map_digest_iter(
+        vnode_count: u32,
+        owners: impl ExactSizeIterator<Item = u64>,
+    ) -> [u8; 32] {
+        Self::owner_map_digest_iter_for_abi(PARTITIONING_ABI_VERSION, vnode_count, owners)
+    }
+
+    #[cfg(test)]
     fn owner_map_digest_for_abi(
         partitioning_abi_version: u16,
         vnode_count: u32,
         owners: &[u64],
     ) -> [u8; 32] {
+        Self::owner_map_digest_iter_for_abi(
+            partitioning_abi_version,
+            vnode_count,
+            owners.iter().copied(),
+        )
+    }
+
+    fn owner_map_digest_iter_for_abi(
+        partitioning_abi_version: u16,
+        vnode_count: u32,
+        owners: impl ExactSizeIterator<Item = u64>,
+    ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
+        let owner_count = owners.len();
         let mut hash = Sha256::new();
         hash.update(b"laminardb-vnode-owner-map-v2\0");
         hash.update(partitioning_abi_version.to_le_bytes());
         hash.update(vnode_count.to_le_bytes());
-        hash.update(
-            u64::try_from(owners.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
+        hash.update(u64::try_from(owner_count).unwrap_or(u64::MAX).to_le_bytes());
         for owner in owners {
             hash.update(owner.to_le_bytes());
         }
@@ -326,6 +355,7 @@ pub struct AssignmentDrainTransition {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UncheckedAssignmentDrainTransition {
     predecessor: CheckpointAssignmentFence,
     target: CheckpointAssignmentFence,
@@ -517,6 +547,7 @@ mod tests {
             partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnode_count: fence.vnode_count,
             assignment_digest: fence.assignment_digest,
+            vnode_state_ready: true,
         };
         assert!(adoption.is_canonical());
         assert!(adoption.matches_fence(&fence));
@@ -527,6 +558,13 @@ mod tests {
             .unwrap()
             .remove("partitioning_abi_version");
         assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(missing_adoption).is_err());
+
+        let mut missing_readiness = serde_json::to_value(&adoption).unwrap();
+        missing_readiness
+            .as_object_mut()
+            .unwrap()
+            .remove("vnode_state_ready");
+        assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(missing_readiness).is_err());
 
         let mut wrong_adoption = adoption;
         wrong_adoption.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;

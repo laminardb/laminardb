@@ -58,11 +58,11 @@ parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 uuid = { version = "1.23", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
-ahash = "0.8"  # Fast hashing for state stores
+ahash = "0.8"  # Fast hashing for auxiliary caches and indexes
 quick_cache = "0.6"  # Lightweight in-memory cache (S3-FIFO eviction, pure Rust, see ADR-006)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 lz4_flex = "0.12"  # Pure Rust LZ4 compression (fastest decompression for recovery)
-zstd = "0.13"  # Zstd compression for archival storage tiers (warm/cold)
+zstd = "0.13"  # Zstd compression for checkpoint artifacts
 regex = "1.12"
 humantime-serde = "1.1"
 notify = "8"
@@ -82,6 +82,7 @@ arrow-select = "=57.2.0"
 datafusion = "52.3"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
+datafusion-functions-aggregate-common = "52.3"
 datafusion-sql = "52.0"
 datafusion-optimizer = "52.0"
 # `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used

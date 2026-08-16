@@ -1,7 +1,7 @@
 //! `PostgreSQL` sink connector configuration.
 //!
 //! [`PostgresSinkConfig`] encapsulates all settings for writing Arrow
-//! `RecordBatch` data to `PostgreSQL`, parsed from SQL `WITH (...)` clauses.
+//! `RecordBatch` data to `PostgreSQL`, parsed from resolved connector options.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,7 +37,7 @@ const ALLOWED_CONFIG_KEYS: &[&str] = &[
 
 /// Configuration for the `PostgreSQL` sink connector.
 ///
-/// Parsed from SQL `WITH (...)` clause options via [`from_config`](Self::from_config).
+/// Parsed from resolved sink connector options via [`from_config`](Self::from_config).
 #[derive(Debug, Clone)]
 pub struct PostgresSinkConfig {
     /// `PostgreSQL` hostname.
@@ -124,7 +124,7 @@ impl PostgresSinkConfig {
         }
     }
 
-    /// Parses a sink config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a sink config from a resolved [`ConnectorConfig`].
     ///
     /// # Required keys
     ///

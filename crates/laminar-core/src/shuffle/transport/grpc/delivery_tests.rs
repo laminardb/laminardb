@@ -42,6 +42,18 @@ fn deliver(
     Ok(true)
 }
 
+#[test]
+fn ordered_delivery_suppresses_duplicates_and_reports_gaps() {
+    let tracker = DeliveryTracker::default();
+    let stream = fence(1, 10, 100, 1);
+    tracker.observe_hello(stream).unwrap();
+
+    assert!(deliver(&tracker, &stream, 0).unwrap());
+    assert!(!deliver(&tracker, &stream, 0).unwrap());
+    assert!(deliver(&tracker, &stream, 2).unwrap());
+    assert_eq!(tracker.delivery_loss_incidents.load(ACQUIRE), 1);
+}
+
 fn admitted_test_budget() -> InboundReservation {
     let bytes = crate::shuffle::message::MAX_PAYLOAD_BYTES;
     let permits = u32::try_from(bytes).unwrap();
@@ -265,9 +277,11 @@ async fn barrier_loss_is_visible_before_the_barrier_can_be_dequeued() {
     let cancel = CancellationToken::new();
     let process_lease = live_process_lease();
     let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+    let work_ready = tokio::sync::Notify::new();
     let holdover = Holdover::new(1);
     let publish = publish_barrier(
         &tx,
+        &work_ready,
         &barrier_arrivals,
         &holdover,
         &assignment,
@@ -305,6 +319,7 @@ async fn transport_rejects_retired_checkpoint_id_with_a_different_assignment() {
     let cancel = CancellationToken::new();
     let process_lease = live_process_lease();
     let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+    let work_ready = tokio::sync::Notify::new();
     let holdover = Holdover::new(1);
     holdover
         .retire_checkpoint_attempt(CheckpointAttempt::canonical(7), [1; 32])
@@ -312,6 +327,7 @@ async fn transport_rejects_retired_checkpoint_id_with_a_different_assignment() {
 
     let error = publish_barrier(
         &tx,
+        &work_ready,
         &barrier_arrivals,
         &holdover,
         &assignment,
@@ -422,6 +438,7 @@ async fn coalesced_multi_vnode_frame_has_one_atomic_queue_admission() {
     let decoded_bytes = InboundBudget::validate_decoded(std::slice::from_ref(&batch)).unwrap();
     let budget = admitted_test_budget();
     let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+    let work_ready = tokio::sync::Notify::new();
     let owners = [10, 10];
     let assignment_fence = CheckpointAssignmentFence::from_owner_map(
         1,
@@ -437,6 +454,7 @@ async fn coalesced_multi_vnode_frame_has_one_atomic_queue_admission() {
             .unwrap();
     assert!(forward_routed_batch(
         &tx,
+        &work_ready,
         stream,
         10,
         &assignment,
@@ -495,6 +513,7 @@ async fn foreign_route_is_rejected_before_queue_publication() {
         InstalledAssignment::for_process(&assignment_fence, &owners, 10, Uuid::from_u128(10))
             .unwrap();
     let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+    let work_ready = tokio::sync::Notify::new();
     let batch = RecordBatch::try_new(
         Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
             "value",
@@ -509,6 +528,7 @@ async fn foreign_route_is_rejected_before_queue_publication() {
 
     let error = forward_routed_batch(
         &tx,
+        &work_ready,
         stream,
         10,
         &assignment,
@@ -569,9 +589,11 @@ async fn coalesced_batch_with_any_foreign_vnode_is_rejected_atomically() {
     let decoded_bytes = InboundBudget::validate_decoded(std::slice::from_ref(&batch)).unwrap();
     let budget = admitted_test_budget();
     let (tx, rx) = mpsc::bounded_async::<Inbound>(2);
+    let work_ready = tokio::sync::Notify::new();
 
     let error = forward_routed_batch(
         &tx,
+        &work_ready,
         stream,
         10,
         &assignment,

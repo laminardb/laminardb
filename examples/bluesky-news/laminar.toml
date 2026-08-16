@@ -1,5 +1,5 @@
 # Bluesky trending-hashtag detection.
-# Jetstream firehose -> live trending hashtags + spike detection, all in SQL,
+# Jetstream firehose -> live trending hashtags, all in SQL,
 # SUBSCRIBE-able over pgwire on 5432. No auth, no Docker.
 #
 # Windows are event-time, keyed on Jetstream's `time_us` (epoch microseconds,
@@ -24,7 +24,6 @@ CREATE SOURCE bsky_jetstream_raw (
     WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
 ) FROM WEBSOCKET (
     url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
-    format = 'json',
     'json.column.event_time'            = 'time_us',
     'json.column.event_time.epoch_unit' = 'micros',
     'json.column.author_did'            = 'did',
@@ -33,7 +32,7 @@ CREATE SOURCE bsky_jetstream_raw (
     'json.column.kind'                  = 'kind',
     'json.column.operation'             = 'commit.operation',
     'json.column.collection'            = 'commit.collection'
-);
+) FORMAT JSON;
 
 -- Subscribable raw feed: English post creates.
 CREATE STREAM bsky_posts AS
@@ -56,27 +55,6 @@ FROM (
 WHERE regexp_like(tag, '^#[a-z][a-z0-9_]{1,29}$')
 GROUP BY TUMBLE(event_time, INTERVAL '5' SECOND), tag
 EMIT ON WINDOW CLOSE;
-
--- 5-minute per-hashtag baseline, normalized to an expected count per 5s bucket.
-CREATE MATERIALIZED VIEW bsky_hashtag_baseline AS
-SELECT TUMBLE(event_time, INTERVAL '5' MINUTE) AS win, tag,
-       CAST(COUNT(*) AS DOUBLE) / 60.0 AS expected_per_5s
-FROM (
-    SELECT event_time, unnest(string_to_array(lower(text), ' ')) AS tag
-    FROM bsky_jetstream_raw
-    WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
-)
-WHERE regexp_like(tag, '^#[a-z][a-z0-9_]{1,29}$')
-GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE), tag
-EMIT ON WINDOW CLOSE;
-
--- Spiking hashtags: each 5s bucket vs the latest baseline for its tag.
--- (Baseline warms up over the first 5 minutes; spikes get a ratio after that.)
-CREATE MATERIALIZED VIEW bsky_hashtag_spikes AS
-SELECT c.bucket, c.tag, c.uses, c.authors,
-       CAST(c.uses AS DOUBLE) / NULLIF(b.expected_per_5s, 0) AS spike_ratio
-FROM bsky_hashtags_5s c ASOF JOIN bsky_hashtag_baseline b
-  MATCH_CONDITION(c.bucket >= b.win) ON c.tag = b.tag;
 """
 
 [server]

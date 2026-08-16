@@ -6,14 +6,37 @@
 use super::*;
 
 #[test]
-fn control_runtime_stack_override_is_cluster_only() {
+fn managed_state_budget_default_is_resolved_at_database_construction() {
+    let db = LaminarDB::open().unwrap();
+
     assert_eq!(
-        DbControlRuntime::new(RuntimeMode::Local).worker_stack_bytes,
-        None
+        db.config.pipeline_max_managed_state_bytes,
+        Some(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES)
     );
+}
+
+#[test]
+fn zero_managed_state_budget_is_rejected_as_configuration() {
+    let result = LaminarDB::open_with_config(LaminarConfig {
+        pipeline_max_managed_state_bytes: Some(0),
+        ..Default::default()
+    });
+    let error = match result {
+        Ok(_) => panic!("a zero managed-state budget must be rejected"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(&error, DbError::Config(_)));
+    assert!(error
+        .to_string()
+        .contains("pipeline_max_managed_state_bytes must be greater than zero"));
+}
+
+#[test]
+fn control_runtime_stack_is_explicit_and_bounded() {
     assert_eq!(
-        DbControlRuntime::new(RuntimeMode::Cluster).worker_stack_bytes,
-        Some(CLUSTER_IO_WORKER_STACK_BYTES)
+        DbControlRuntime::new().worker_stack_bytes,
+        DB_IO_WORKER_STACK_BYTES
     );
 }
 
@@ -27,7 +50,351 @@ fn local_runtime_ignores_cluster_authority_revocation() {
 
     assert!(!db.cluster_intake_fenced());
 }
-use crate::ddl::extract_connector_from_with_options;
+
+#[cfg(feature = "cluster")]
+#[test]
+fn nonzero_assignment_requires_an_exact_installed_state_binding() {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, PipelineIdentity,
+    };
+
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(1),
+    };
+    let predecessor =
+        CheckpointAssignmentFence::from_owner_map(4, &[1], vec![participant]).unwrap();
+    let identity = PipelineIdentity::empty();
+
+    assert!(local_state_lacks_exact_predecessor_binding(
+        predecessor.assignment_version,
+        Some(&predecessor),
+        Some(&identity),
+        None,
+    ));
+
+    let installed = crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+        predecessor.clone(),
+        identity.clone(),
+    )
+    .unwrap();
+    assert!(!local_state_lacks_exact_predecessor_binding(
+        predecessor.assignment_version,
+        Some(&predecessor),
+        Some(&identity),
+        Some(&installed),
+    ));
+
+    let different_identity = PipelineIdentity {
+        canonical_version: identity.canonical_version,
+        sha256: "00".repeat(32),
+    };
+    assert!(local_state_lacks_exact_predecessor_binding(
+        predecessor.assignment_version,
+        Some(&predecessor),
+        Some(&different_identity),
+        Some(&installed),
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn assignment_zero_pending_target_has_no_predecessor_readiness_to_withdraw() {
+    assert!(!predecessor_readiness_withdrawal_required(true, 0));
+    assert!(predecessor_readiness_withdrawal_required(true, 1));
+    assert!(!predecessor_readiness_withdrawal_required(false, 1));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn vnode_state_readiness_requires_the_bound_pipeline_and_exact_assignment() {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, PipelineIdentity,
+    };
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    let db = LaminarDB::open().unwrap();
+    let registry = VnodeRegistry::single_owner(1, NodeId(1));
+    let participant = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: uuid::Uuid::from_u128(1),
+    };
+    let assignment = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[1],
+        vec![participant],
+    )
+    .unwrap();
+
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+    DbState::Running.store(&db.state);
+    assert!(db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+
+    let wrong_owner = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: uuid::Uuid::from_u128(2),
+    };
+    let wrong_owner_assignment = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[2],
+        vec![wrong_owner],
+    )
+    .unwrap();
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &wrong_owner_assignment)
+        .await
+        .unwrap());
+
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        test_checkpoint_store(),
+    )
+    .unwrap();
+    let pipeline_identity = PipelineIdentity::empty();
+    coordinator
+        .bind_pipeline_identity(pipeline_identity.clone())
+        .unwrap();
+    *db.coordinator.lock().await = Some(coordinator);
+
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            assignment.clone(),
+            pipeline_identity,
+        )
+        .unwrap(),
+    );
+    assert!(db
+        .local_vnode_state_is_ready(&registry, &assignment)
+        .await
+        .unwrap());
+
+    let successor = CheckpointAssignmentFence::from_owner_map(
+        assignment.assignment_version + 1,
+        &[1],
+        vec![participant],
+    )
+    .unwrap();
+    assert!(!db
+        .local_vnode_state_is_ready(&registry, &successor)
+        .await
+        .unwrap());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_controller_identity_is_fixed_for_the_graph_generation() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+
+    fn controller(node: ClusterNodeId) -> Arc<ClusterController> {
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        Arc::new(ClusterController::new(node, kv, None, members_rx))
+    }
+
+    let installed = controller(ClusterNodeId(1));
+    let replacement = controller(ClusterNodeId(1));
+    install_test_process_deadline(&installed);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&installed))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .build()
+        .await
+        .unwrap();
+
+    db.set_cluster_controller(Arc::clone(&installed)).unwrap();
+    let error = db
+        .set_cluster_controller(replacement)
+        .expect_err("a different controller could retain old-incarnation operator heap");
+    assert!(error.to_string().contains("new LaminarDB graph generation"));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_zero_cannot_publish_a_predecessor_process_certificate() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let current_boot = Uuid::from_u128(22);
+    let predecessor_boot = Uuid::from_u128(11);
+    let (authority_store, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(ClusterNodeId(self_id.0)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        ClusterNodeId(self_id.0),
+        Arc::clone(&kv),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+        current_boot,
+    ));
+    install_test_process_deadline(&controller);
+    let retained = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: predecessor_boot,
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&retained).await.unwrap();
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let intake_was_fenced = db.cluster_intake_fenced();
+
+    let error = db
+        .adopt_assignment_snapshot(
+            retained,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a replacement process must not inherit its predecessor certificate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("target assignment does not bind local ownership"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), 0);
+    assert!(registry
+        .snapshot()
+        .iter()
+        .all(|owner| *owner == NodeId::UNASSIGNED));
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert_eq!(db.cluster_intake_fenced(), intake_was_fenced);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn pending_final_owner_exit_binds_exact_transition_and_process() {
+    use laminar_core::checkpoint::{
+        AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+        LeaderProofOwner, PipelineIdentity,
+    };
+    use laminar_core::state::NodeId;
+    use uuid::Uuid;
+
+    use crate::rebalance::AuditedCommittedDrainTransition;
+    use crate::vnode_transition_staging::{PendingVnodeTransition, VnodeTransitionKind};
+
+    let local = CheckpointParticipant {
+        node_id: 1,
+        boot_incarnation: Uuid::from_u128(11),
+    };
+    let successor = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: Uuid::from_u128(22),
+    };
+    let predecessor_owners = [NodeId(local.node_id), NodeId(local.node_id)];
+    let target_owners = [NodeId(successor.node_id), NodeId(successor.node_id)];
+    let transition = AssignmentDrainTransition::new(
+        CheckpointAssignmentFence::from_owner_map(2, &[1, 1], vec![local]).unwrap(),
+        CheckpointAssignmentFence::from_owner_map(3, &[2, 2], vec![successor]).unwrap(),
+        LeaderProof {
+            owner: LeaderProofOwner {
+                node_id: local.node_id,
+                boot_id: local.boot_incarnation,
+                process_term: 1,
+            },
+            fencing_token: 1,
+        },
+    )
+    .unwrap();
+
+    let revocation = PendingVnodeTransition::assignment_change(
+        transition.predecessor.clone(),
+        &predecessor_owners,
+        transition.target.clone(),
+        &target_owners,
+        local,
+        PipelineIdentity::empty(),
+        Vec::new(),
+        Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(revocation.revoked_vnodes(), &[0, 1]);
+    assert!(matches!(
+        revocation.kind(),
+        VnodeTransitionKind::CommittedFinalOwnerExit(committed) if committed == &transition
+    ));
+
+    let skipped_predecessor =
+        CheckpointAssignmentFence::from_owner_map(1, &[1, 1], vec![local]).unwrap();
+    let skipped_generation = PendingVnodeTransition::assignment_change(
+        skipped_predecessor,
+        &predecessor_owners,
+        transition.target.clone(),
+        &target_owners,
+        local,
+        PipelineIdentity::empty(),
+        Vec::new(),
+        Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition.clone()).unwrap()),
+    )
+    .expect_err("an identical owner map must not hide a skipped predecessor generation");
+    assert!(
+        skipped_generation.to_string().contains("must be adjacent"),
+        "{skipped_generation}"
+    );
+
+    let wrong_process = CheckpointParticipant {
+        boot_incarnation: Uuid::from_u128(111),
+        ..local
+    };
+    assert!(PendingVnodeTransition::assignment_change(
+        transition.predecessor.clone(),
+        &predecessor_owners,
+        transition.target.clone(),
+        &target_owners,
+        wrong_process,
+        PipelineIdentity::empty(),
+        Vec::new(),
+        Some(AuditedCommittedDrainTransition::from_canonical_for_test(transition).unwrap()),
+    )
+    .is_err());
+
+    let unchanged_target =
+        CheckpointAssignmentFence::from_owner_map(3, &[1, 1], vec![local]).unwrap();
+    let topology_only = PendingVnodeTransition::assignment_change(
+        CheckpointAssignmentFence::from_owner_map(2, &[1, 1], vec![local]).unwrap(),
+        &predecessor_owners,
+        unchanged_target,
+        &predecessor_owners,
+        local,
+        PipelineIdentity::empty(),
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(topology_only.revoked_vnodes().is_empty());
+}
 use laminar_core::catalog::CatalogObjectKind;
 #[cfg(feature = "cluster")]
 use object_store::ObjectStoreExt;
@@ -35,6 +402,41 @@ use object_store::ObjectStoreExt;
 #[cfg(feature = "cluster")]
 fn test_cluster_checkpoint_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(object_store::memory::InMemory::new())
+}
+
+#[cfg(feature = "cluster")]
+fn test_checkpoint_store() -> Box<dyn laminar_core::checkpoint::CheckpointStore> {
+    Box::new(laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+        test_cluster_checkpoint_store(),
+        "",
+    ))
+}
+
+#[cfg(feature = "cluster")]
+fn test_assignment_history() -> (
+    Arc<dyn object_store::ObjectStore>,
+    Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+) {
+    let objects = test_cluster_checkpoint_store();
+    let assignments = Arc::new(
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&objects)),
+    );
+    (objects, assignments)
+}
+
+#[cfg(feature = "cluster")]
+async fn persist_test_assignment_pair(
+    assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
+    predecessor: &laminar_core::cluster::control::AssignmentSnapshot,
+    target: &laminar_core::cluster::control::AssignmentSnapshot,
+) {
+    assert_eq!(predecessor.version, 1);
+    assert_eq!(target.version, predecessor.version + 1);
+    assignments.save_if_absent(predecessor).await.unwrap();
+    assignments
+        .save_if_version(target, predecessor.version)
+        .await
+        .unwrap();
 }
 
 #[cfg(feature = "cluster")]
@@ -65,13 +467,20 @@ async fn install_test_process_and_leader_authority(
     let boot = controller.recovery_incarnation();
     let process_authority =
         Arc::new(ProcessLeaseAuthority::new(Arc::clone(&store), process_lease_duration).unwrap());
-    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+    let process_lease = match process_authority
         .store_for(node)
         .try_acquire(boot, 0)
         .await
         .unwrap()
-    else {
-        panic!("empty process authority must grant the local test process");
+    {
+        ProcessLeaseOutcome::Acquired(lease) => lease,
+        ProcessLeaseOutcome::Held(lease) if lease.owner == boot => lease,
+        ProcessLeaseOutcome::Held(lease) => {
+            panic!(
+                "process authority is held by unexpected test incarnation {}",
+                lease.owner
+            )
+        }
     };
     controller
         .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
@@ -110,6 +519,822 @@ async fn install_test_process_and_leader_authority(
         .unwrap();
     controller.set_leader_lease_store(leader_authority);
     proof
+}
+
+#[cfg(feature = "cluster")]
+struct VnodeRevocationProbe(Arc<parking_lot::Mutex<Vec<u32>>>);
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for VnodeRevocationProbe {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_vnode_state()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<arrow::record_batch::RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn drop_owned_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>) -> Result<(), DbError> {
+        let mut revoked = revoked.iter().copied().collect::<Vec<_>>();
+        revoked.sort_unstable();
+        *self.0.lock() = revoked;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn complete_audited_vnode_revocation(final_owner_exit: bool) {
+    use laminar_core::checkpoint::{CheckpointParticipant, PipelineIdentity};
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+        RotateOutcome,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{KeyGroupCount, NodeId, VnodeRegistry};
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let (authority_store, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(ClusterNodeId(self_id.0)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        ClusterNodeId(self_id.0),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    let leader = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let local = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let successor = CheckpointParticipant {
+        node_id: successor_id.0,
+        boot_incarnation: uuid::Uuid::from_u128(22),
+    };
+    let predecessor = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local],
+        )
+        .unwrap();
+    assignments.save_if_absent(&predecessor).await.unwrap();
+    let target_owners = if final_owner_exit {
+        vec![successor_id, successor_id]
+    } else {
+        vec![self_id, successor_id]
+    };
+    let target_participants = if final_owner_exit {
+        vec![successor]
+    } else {
+        vec![local, successor]
+    };
+    let draining = predecessor
+        .next_draining(
+            AssignmentSnapshot::vnodes_from_vec(&target_owners),
+            target_participants,
+            leader.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        assignments
+            .save_if_version(&draining, predecessor.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+    let target = draining.committed_target().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let transition = draining.drain_transition.as_ref().unwrap();
+    let handoff = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &transition.predecessor,
+        &transition.leader,
+    )
+    .await;
+    let decision = AssignmentDrainDecision::commit(transition, leader, handoff).unwrap();
+    authority
+        .record_assignment_drain_decision(&transition.leader, decision)
+        .await
+        .unwrap();
+    assignments
+        .finalize_drain(&draining, &target)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(VnodeRegistry::single_owner(2, self_id));
+    assert_eq!(registry.assignment_version(), predecessor.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    let identity = PipelineIdentity::empty();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        test_checkpoint_store(),
+    )
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    coordinator.set_assignment_version(predecessor.version);
+    coordinator.set_vnode_set(vec![0, 1]);
+    *db.coordinator.lock().await = Some(coordinator);
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            predecessor.assignment_fence().unwrap(),
+            identity.clone(),
+        )
+        .unwrap(),
+    );
+
+    let adoption = db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(adoption.adopted);
+    let pending = db.pending_vnode_transition.lock().clone().unwrap();
+    assert_eq!(
+        pending.predecessor(),
+        &predecessor.assignment_fence().unwrap()
+    );
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|installed| installed.matches(pending.predecessor(), &identity)));
+
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(
+            self_id.0,
+            "127.0.0.1:0".parse().unwrap(),
+            local.boot_incarnation,
+        )
+        .await
+        .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(self_id.0, local.boot_incarnation));
+    let process_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(30),
+    ));
+    receiver
+        .install_process_lease_deadline(Arc::clone(&process_deadline))
+        .unwrap();
+    sender
+        .install_process_lease_deadline(process_deadline)
+        .unwrap();
+    let target_fence = target.assignment_fence().unwrap();
+    if !final_owner_exit {
+        let owners = [self_id.0, successor_id.0];
+        receiver
+            .install_assignment_fence(&target_fence, &owners)
+            .unwrap();
+        sender
+            .install_assignment_fence(&target_fence, &owners)
+            .unwrap();
+    }
+
+    let observed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut graph =
+        crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(KeyGroupCount::try_from(2_u32).unwrap());
+    graph.push_test_node(
+        "revocation-probe",
+        Box::new(VnodeRevocationProbe(Arc::clone(&observed))),
+    );
+    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+        registry,
+        sender,
+        receiver,
+        self_id,
+    });
+    graph.set_pipeline_identity(identity.clone());
+    graph.set_pending_vnode_transition_handle(Arc::clone(&db.pending_vnode_transition));
+    graph.set_installed_vnode_state_handle(Arc::clone(&db.installed_vnode_state));
+    graph.set_rotation_execution_fence(Arc::clone(&db.rotation_execution_fence));
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    let expected_revoked: &[u32] = if final_owner_exit { &[0, 1] } else { &[1] };
+    assert_eq!(observed.lock().as_slice(), expected_revoked);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    if final_owner_exit {
+        assert!(db.installed_vnode_state.lock().is_none());
+    } else {
+        assert!(db
+            .installed_vnode_state
+            .lock()
+            .as_ref()
+            .is_some_and(|installed| installed.matches(&target_fence, &identity)));
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn audited_vnode_revoke_preserves_predecessor_binding_until_graph_publication() {
+    complete_audited_vnode_revocation(false).await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn audited_final_owner_exit_preserves_predecessor_binding_until_graph_publication() {
+    complete_audited_vnode_revocation(true).await;
+}
+
+#[cfg(feature = "cluster")]
+struct VnodeAcquisitionProbe {
+    live: Arc<parking_lot::Mutex<std::collections::BTreeMap<u32, Vec<u8>>>>,
+    prepared: Option<std::collections::BTreeMap<u32, Vec<u8>>>,
+    whole: Arc<parking_lot::Mutex<Option<Vec<u8>>>>,
+    prepared_whole: Option<Vec<u8>>,
+    prepare_count: Arc<std::sync::atomic::AtomicUsize>,
+    publish_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for VnodeAcquisitionProbe {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::keyed_sql_aggregate()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<arrow::record_batch::RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: crate::operator_graph::ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        if self.prepared.is_some() {
+            return Err(DbError::Checkpoint(
+                "acquisition probe received an invalid prepared transition".into(),
+            ));
+        }
+        let mut prepared = self.live.lock().clone();
+        for vnode in transition.revoked {
+            prepared.remove(vnode);
+        }
+        for restore in transition.restores {
+            prepared.insert(restore.vnode, restore.state.to_vec());
+        }
+        let prepared_whole = match transition.whole_restores {
+            [] => self.whole.lock().clone(),
+            [restore] if restore.participant_id == 2 && restore.state == b"donor-whole" => {
+                Some(restore.state.to_vec())
+            }
+            _ => {
+                return Err(DbError::Checkpoint(
+                    "acquisition probe did not receive the exact donor whole frame".into(),
+                ));
+            }
+        };
+        self.prepared = Some(prepared);
+        self.prepared_whole = prepared_whole;
+        self.prepare_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn abort_vnode_transition(&mut self) {
+        self.prepared = None;
+        self.prepared_whole = None;
+    }
+
+    fn publish_vnode_transition(&mut self) {
+        *self.live.lock() = self
+            .prepared
+            .take()
+            .expect("acquisition probe transition must be prepared");
+        *self.whole.lock() = self.prepared_whole.take();
+        self.publish_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn record_two_vnode_acquisition_checkpoint(
+    authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    objects: &Arc<dyn object_store::ObjectStore>,
+    fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    proof: &laminar_core::checkpoint::LeaderProof,
+    pipeline_identity: &laminar_core::checkpoint::PipelineIdentity,
+) -> laminar_core::checkpoint::CommittedCheckpointRef {
+    use laminar_core::checkpoint::{
+        checkpoint_sha256, ByteRange, CheckpointAttempt, CheckpointManifest, CheckpointScope,
+        CheckpointStore, CommittedCheckpointIndex, CommittedParticipantRef,
+        ObjectStoreCheckpointStore, StateFrame, StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    };
+    use laminar_core::checkpoint_decision::{
+        CheckpointArtifactInventory, CheckpointDecisionStore, CheckpointVerdict,
+    };
+    use laminar_core::state::KeyGroupCount;
+
+    let key_groups = KeyGroupCount::try_from(fence.vnode_count).unwrap();
+    let deployment_id = CheckpointDecisionStore::new(Arc::clone(objects))
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    authority
+        .begin_cluster_checkpoint_artifacts(
+            proof,
+            CheckpointArtifactInventory {
+                deployment_id: deployment_id.clone(),
+                pipeline_identity: pipeline_identity.clone(),
+                attempt: CheckpointAttempt::canonical(1),
+                assignment_fence: Some(fence.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let mut participants = Vec::new();
+    for (participant_id, vnode, state) in [
+        (1_u64, 0_u16, b"retained-state".as_slice()),
+        (2_u64, 1_u16, b"acquired-state".as_slice()),
+    ] {
+        let store = ObjectStoreCheckpointStore::new(Arc::clone(objects), "")
+            .with_key_group_count(key_groups)
+            .with_participant_id(participant_id);
+        let whole = (participant_id == 2).then_some(b"donor-whole".as_slice());
+        let mut payload_bytes =
+            Vec::with_capacity(state.len() + whole.as_ref().map_or(0, |whole| whole.len()));
+        if let Some(whole) = whole {
+            payload_bytes.extend_from_slice(whole);
+        }
+        payload_bytes.extend_from_slice(state);
+        let payload = bytes::Bytes::from(payload_bytes);
+        let mut manifest = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
+        manifest.bind_participant(participant_id);
+        manifest.pipeline_identity = pipeline_identity.clone();
+        manifest.deployment_id.clone_from(&deployment_id);
+        manifest.assignment_fence = Some(fence.clone());
+        manifest.reassignment_portable = true;
+        manifest.owned_vnodes = vec![vnode];
+        if let Some(whole) = whole {
+            manifest.state_frames.push(StateFrame {
+                key: StateFrameKey::OperatorWhole {
+                    operator_id: "graph:acquisition-probe".into(),
+                },
+                chunk: manifest.node_data.chunk,
+                range: ByteRange {
+                    offset: 0,
+                    length: whole.len() as u64,
+                },
+                sha256: checkpoint_sha256(whole),
+            });
+        }
+        manifest.state_frames.push(StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "graph:acquisition-probe".into(),
+                vnode,
+            },
+            chunk: manifest.node_data.chunk,
+            range: ByteRange {
+                offset: whole.map_or(0, <[u8]>::len) as u64,
+                length: state.len() as u64,
+            },
+            sha256: checkpoint_sha256(state),
+        });
+        manifest.node_data.object_length = payload.len() as u64;
+        manifest.node_data.sha256 = checkpoint_sha256(&payload);
+        let manifest_bytes = store
+            .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+            .await
+            .unwrap();
+        participants
+            .push(CommittedParticipantRef::from_manifest(&manifest, &manifest_bytes).unwrap());
+    }
+
+    let index = CommittedCheckpointIndex {
+        version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+        deployment_id,
+        pipeline_identity: pipeline_identity.clone(),
+        epoch: 1,
+        checkpoint_id: 1,
+        scope: CheckpointScope::Cluster,
+        vnode_count: key_groups.get(),
+        assignment_fence: Some(fence.clone()),
+        reassignment_portable: true,
+        predecessor: None,
+        participants,
+        source_names: Vec::new(),
+        source_offsets: Default::default(),
+        channel_progress: Vec::new(),
+        source_watermarks: Default::default(),
+        checkpoint_watermark: None,
+    };
+    let reference = authority.create_committed_checkpoint(&index).await.unwrap();
+    authority
+        .record_cluster_outcome(
+            proof,
+            index.epoch,
+            index.checkpoint_id,
+            fence.clone(),
+            CheckpointVerdict::Commit,
+            Some(reference.clone()),
+        )
+        .await
+        .unwrap();
+    reference
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
+    use laminar_core::checkpoint::{CheckpointParticipant, ObjectStoreCheckpointStore};
+    use laminar_core::checkpoint_decision::CheckpointDecisionStore;
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+        RotateOutcome,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{KeyGroupCount, NodeId, VnodeRegistry};
+
+    let self_id = NodeId(1);
+    let donor_id = NodeId(2);
+    let (objects, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(ClusterNodeId(self_id.0)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        ClusterNodeId(self_id.0),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    let leader = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&objects),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let local = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let donor = CheckpointParticipant {
+        node_id: donor_id.0,
+        boot_incarnation: uuid::Uuid::from_u128(22),
+    };
+    let predecessor = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, donor_id]),
+            vec![local, donor],
+        )
+        .unwrap();
+    assignments.save_if_absent(&predecessor).await.unwrap();
+    let draining = predecessor
+        .next_draining(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local],
+            leader.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        assignments
+            .save_if_version(&draining, predecessor.version)
+            .await
+            .unwrap(),
+        RotateOutcome::Rotated
+    ));
+
+    let identity = laminar_core::checkpoint::PipelineIdentity::empty();
+    let predecessor_fence = predecessor.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let handoff = record_two_vnode_acquisition_checkpoint(
+        &authority,
+        &objects,
+        &predecessor_fence,
+        &leader,
+        &identity,
+    )
+    .await;
+    let transition = draining.drain_transition.as_ref().unwrap();
+    authority
+        .record_assignment_drain_decision(
+            &transition.leader,
+            AssignmentDrainDecision::commit(transition, leader, handoff.clone()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let target = draining.committed_target().unwrap();
+    assignments
+        .finalize_drain(&draining, &target)
+        .await
+        .unwrap();
+
+    let key_groups = KeyGroupCount::try_from(2_u32).unwrap();
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(Arc::from([self_id, donor_id]), predecessor.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::clone(&objects))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(Arc::clone(&assignments))
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    let checkpoint_store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "")
+        .with_key_group_count(key_groups)
+        .with_participant_id(self_id.0);
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(checkpoint_store),
+    )
+    .unwrap();
+    coordinator
+        .bind_durable_decision_store(Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects))))
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    coordinator.set_assignment_version(predecessor.version);
+    coordinator.set_vnode_set(vec![0]);
+    coordinator.set_last_committed_ref_for_test(handoff.clone());
+    *db.coordinator.lock().await = Some(coordinator);
+    *db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            predecessor_fence.clone(),
+            identity.clone(),
+        )
+        .unwrap(),
+    );
+
+    let exact_adoption = db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(!exact_adoption.recovery_required);
+    let pending = db.pending_vnode_transition.lock().clone().unwrap();
+    assert_eq!(pending.acquired_vnodes(), &[1]);
+    assert_eq!(pending.state_frames().len(), 2);
+    let pending_vnode = pending
+        .state_frames()
+        .iter()
+        .find(|frame| {
+            matches!(
+                &frame.key,
+                laminar_core::checkpoint::StateFrameKey::Vnode { .. }
+            )
+        })
+        .unwrap();
+    let pending_whole = pending
+        .state_frames()
+        .iter()
+        .find(|frame| {
+            matches!(
+                &frame.key,
+                laminar_core::checkpoint::StateFrameKey::OperatorWhole { .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(pending_vnode.participant_id, donor_id.0);
+    assert_eq!(
+        &pending_vnode.key,
+        &laminar_core::checkpoint::StateFrameKey::Vnode {
+            operator_id: "graph:acquisition-probe".into(),
+            vnode: 1,
+        }
+    );
+    assert_eq!(pending_vnode.payload, b"acquired-state".as_slice());
+    assert_eq!(pending_whole.participant_id, donor_id.0);
+    assert_eq!(
+        &pending_whole.key,
+        &laminar_core::checkpoint::StateFrameKey::OperatorWhole {
+            operator_id: "graph:acquisition-probe".into(),
+        }
+    );
+    assert_eq!(pending_whole.payload, b"donor-whole".as_slice());
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|binding| binding.matches(&predecessor_fence, &identity)));
+
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(
+            self_id.0,
+            "127.0.0.1:0".parse().unwrap(),
+            local.boot_incarnation,
+        )
+        .await
+        .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(self_id.0, local.boot_incarnation));
+    let process_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(30),
+    ));
+    receiver
+        .install_process_lease_deadline(Arc::clone(&process_deadline))
+        .unwrap();
+    sender
+        .install_process_lease_deadline(process_deadline)
+        .unwrap();
+    let target_fence = target.assignment_fence().unwrap();
+    sender
+        .install_assignment_fence(&target_fence, &[self_id.0, self_id.0])
+        .unwrap();
+    receiver
+        .install_assignment_fence(&target_fence, &[self_id.0, self_id.0])
+        .unwrap();
+
+    let live = Arc::new(parking_lot::Mutex::new(
+        [(0_u32, b"live-state".to_vec())]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    ));
+    let prepare_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let publish_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let whole = Arc::new(parking_lot::Mutex::new(None));
+    let mut graph =
+        crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(key_groups);
+    graph.push_test_node(
+        "acquisition-probe",
+        Box::new(VnodeAcquisitionProbe {
+            live: Arc::clone(&live),
+            prepared: None,
+            whole: Arc::clone(&whole),
+            prepared_whole: None,
+            prepare_count: Arc::clone(&prepare_count),
+            publish_count: Arc::clone(&publish_count),
+        }),
+    );
+    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+        registry: Arc::clone(&registry),
+        sender: Arc::clone(&sender),
+        receiver: Arc::clone(&receiver),
+        self_id,
+    });
+    graph.set_pipeline_identity(identity.clone());
+    graph.set_pending_vnode_transition_handle(Arc::clone(&db.pending_vnode_transition));
+    graph.set_installed_vnode_state_handle(Arc::clone(&db.installed_vnode_state));
+    graph.set_rotation_execution_fence(Arc::clone(&db.rotation_execution_fence));
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    assert_eq!(
+        live.lock().clone(),
+        [
+            (0_u32, b"live-state".to_vec()),
+            (1, b"acquired-state".to_vec())
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|binding| binding.matches(&target_fence, &identity)));
+    assert_eq!(prepare_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(whole.lock().as_deref(), Some(b"donor-whole".as_slice()));
+
+    let owners = [self_id, self_id];
+    let owner_ids = [self_id.0, self_id.0];
+    let topology_target = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        target_fence.assignment_version + 1,
+        &owner_ids,
+        vec![local],
+    )
+    .unwrap();
+    let topology_only = crate::vnode_transition_staging::PendingVnodeTransition::assignment_change(
+        target_fence,
+        &owners,
+        topology_target.clone(),
+        &owners,
+        local,
+        identity.clone(),
+        Vec::new(),
+        None,
+    )
+    .unwrap();
+    assert!(topology_only.revoked_vnodes().is_empty());
+    assert!(topology_only.acquired_vnodes().is_empty());
+    *db.pending_vnode_transition.lock() = Some(Arc::new(topology_only));
+    registry.set_assignment_and_version(Arc::from(owners), topology_target.assignment_version);
+    sender
+        .install_assignment_fence(&topology_target, &owner_ids)
+        .unwrap();
+    receiver
+        .install_assignment_fence(&topology_target, &owner_ids)
+        .unwrap();
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    assert_eq!(prepare_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(publish_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db
+        .installed_vnode_state
+        .lock()
+        .as_ref()
+        .is_some_and(|binding| binding.matches(&topology_target, &identity)));
+
+    // A replacement whose complete resident cut does not exactly match the handoff must publish
+    // only the target topology. Importing donor vnode frames into that source/runtime generation
+    // would mix checkpoint cuts and can regress a managed operator frontier on the next barrier.
+    let lagging_registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    lagging_registry
+        .set_assignment_and_version(Arc::from([self_id, donor_id]), predecessor.version);
+    let lagging_db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::clone(&objects))
+        .vnode_registry(Arc::clone(&lagging_registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&lagging_db.state);
+    let lagging_store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "")
+        .with_key_group_count(key_groups)
+        .with_participant_id(self_id.0);
+    let mut lagging_coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        Box::new(lagging_store),
+    )
+    .unwrap();
+    lagging_coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    lagging_coordinator.set_assignment_version(predecessor.version);
+    lagging_coordinator.set_vnode_set(vec![0]);
+    let mut different_cut = handoff.clone();
+    different_cut.sha256 = "00".repeat(32);
+    assert_ne!(different_cut, handoff);
+    lagging_coordinator.set_last_committed_ref_for_test(different_cut);
+    *lagging_db.coordinator.lock().await = Some(lagging_coordinator);
+    *lagging_db.installed_vnode_state.lock() = Some(
+        crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+            predecessor_fence,
+            identity,
+        )
+        .unwrap(),
+    );
+
+    let lagging_adoption = lagging_db
+        .adopt_assignment_snapshot(
+            target.clone(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    assert!(lagging_adoption.adopted);
+    assert!(lagging_adoption.recovery_required);
+    assert_eq!(lagging_registry.assignment_version(), target.version);
+    assert!(lagging_db.pending_vnode_transition.lock().is_none());
+    assert!(lagging_db.installed_vnode_state.lock().is_none());
+    assert!(lagging_db.cluster_intake_fenced());
+    assert!(lagging_db.coordinated_recovery_in_progress());
+    assert!(controller.is_recovering());
+    assert!(controller.checkpoint_assignment_watch().borrow().is_none());
+    assert!(controller.checkpoint_drain_transition().is_none());
+    assert!(!lagging_db
+        .local_vnode_state_is_ready(&lagging_registry, &target.assignment_fence().unwrap())
+        .await
+        .unwrap());
+    assert_ne!(
+        lagging_db
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -263,7 +1488,7 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let node_id = NodeId(1);
     let boot = uuid::Uuid::from_u128(11);
@@ -313,7 +1538,6 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(authority_store)
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(Arc::clone(&receiver))
@@ -442,7 +1666,7 @@ async fn db_with_fresh_shuffle(
     Arc<laminar_core::shuffle::ShuffleReceiver>,
 ) {
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
     let node = controller.instance_id();
     let boot = controller.recovery_incarnation();
@@ -455,7 +1679,6 @@ async fn db_with_fresh_shuffle(
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(
             1,
             StateNodeId(node.0),
@@ -885,7 +2108,12 @@ async fn test_open_default() {
     assert!(db.sinks().is_empty());
     assert_eq!(
         db.checkpoint_key_groups(),
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+        laminar_core::state::DEFAULT_KEY_GROUP_COUNT
+    );
+    let registry = db.vnode_registry.lock().clone().unwrap();
+    assert_eq!(
+        laminar_core::state::owned_vnodes(&registry, laminar_core::state::LOCAL_NODE_ID).len(),
+        usize::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get())
     );
 }
 
@@ -1109,6 +2337,157 @@ async fn manual_checkpoint_before_start_fails_closed() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn admitted_manual_checkpoint_wait_is_bounded_until_exact_attempt_reservation() {
+    let db = LaminarDB::open_with_config(LaminarConfig {
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    DbState::Running.store(&db.state);
+    let (force_tx, force_rx) = crossfire::mpsc::bounded_async::<ForceCheckpointRequest>(1);
+    *db.force_ckpt_tx.lock() = Some(force_tx);
+
+    let checkpoint = db.checkpoint_with_timeout(std::time::Duration::from_secs(1));
+    tokio::pin!(checkpoint);
+    let mut held_request = tokio::select! {
+        result = &mut checkpoint => panic!(
+            "checkpoint completed before its accepted request could be observed: {result:?}"
+        ),
+        request = force_rx.recv() => request.expect("manual checkpoint sender remained live"),
+    };
+    assert!(held_request.reservation_claim.is_some());
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let result = futures::poll!(checkpoint.as_mut());
+    let std::task::Poll::Ready(result) = result else {
+        panic!("an accepted but never-reserved request remained pending past its deadline");
+    };
+    let error = result.unwrap_err();
+    assert!(
+        matches!(&error, DbError::Checkpoint(message)
+            if message.contains("deadline expired before exact attempt reservation")),
+        "unexpected pre-reservation deadline result: {error:?}"
+    );
+    assert!(
+        !held_request
+            .reservation_claim
+            .take()
+            .expect("request must retain its unclaimed reservation token")
+            .try_claim(),
+        "the coordinator claimed ownership after the caller's deadline won"
+    );
+
+    drop(held_request);
+    *db.force_ckpt_tx.lock() = None;
+    DbState::Created.store(&db.state);
+}
+
+#[tokio::test(start_paused = true)]
+async fn reserved_manual_checkpoint_waits_for_terminal_reply_past_deadline() {
+    let db = LaminarDB::open_with_config(LaminarConfig {
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .unwrap();
+    DbState::Running.store(&db.state);
+    let (force_tx, force_rx) = crossfire::mpsc::bounded_async::<ForceCheckpointRequest>(1);
+    *db.force_ckpt_tx.lock() = Some(force_tx);
+
+    let checkpoint = db.checkpoint_with_timeout(std::time::Duration::from_secs(1));
+    tokio::pin!(checkpoint);
+    let mut request = tokio::select! {
+        result = &mut checkpoint => panic!(
+            "checkpoint completed before its accepted request could be observed: {result:?}"
+        ),
+        request = force_rx.recv() => request.expect("manual checkpoint sender remained live"),
+    };
+    let reservation_claim = request
+        .reservation_claim
+        .take()
+        .expect("request must carry one reservation claim");
+    assert!(
+        reservation_claim.try_claim(),
+        "coordinator must win bounded reservation ownership"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(
+        futures::poll!(checkpoint.as_mut()).is_pending(),
+        "a reserved request returned before exact-attempt cleanup became terminal"
+    );
+    assert_eq!(
+        reservation_claim.attach(tokio::time::Instant::now(), tokio::time::Instant::now(),),
+        ForceCheckpointReservationAttachment::Attached
+    );
+    request.reply.send(Err(DbError::Checkpoint(
+        "exact attempt cleanup completed".into(),
+    )));
+    let error = checkpoint.await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("exact attempt cleanup completed"));
+
+    *db.force_ckpt_tx.lock() = None;
+    DbState::Created.store(&db.state);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn forwarded_manual_checkpoint_never_reforwards_from_a_non_leader() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{
+        NodeId as ClusterNodeId, NodeInfo, NodeMetadata, NodeState,
+    };
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let node = ClusterNodeId(2);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let leader = NodeInfo {
+        id: ClusterNodeId(1),
+        name: "leader".into(),
+        rpc_address: "127.0.0.1:1".into(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![leader]);
+    let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+    install_test_process_deadline(&controller);
+    assert_eq!(controller.current_leader(), Some(ClusterNodeId(1)));
+    assert!(!controller.is_leader());
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(
+            1,
+            StateNodeId(node.0),
+        )))
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+
+    let error = db
+        .checkpoint_forwarded_with_timeout(std::time::Duration::from_secs(1))
+        .await
+        .expect_err("a forwarded request must never make a second network hop");
+    assert!(
+        error.to_string().contains("no longer the cluster leader"),
+        "{error}"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
@@ -1116,7 +2495,7 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
     use uuid::Uuid;
 
     let node_id = NodeId(1);
@@ -1180,7 +2559,6 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(Arc::clone(&receiver))
@@ -1213,7 +2591,7 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
     use uuid::Uuid;
 
     let node_id = NodeId(1);
@@ -1254,7 +2632,6 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(Arc::clone(&authority_store))
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
         .shuffle_receiver(Arc::clone(&receiver))
@@ -1360,7 +2737,7 @@ async fn assignment_activation_revalidates_recovery_admission_after_mesh_wait() 
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
     use uuid::Uuid;
 
     let local_id = NodeId(1);
@@ -1371,7 +2748,6 @@ async fn assignment_activation_revalidates_recovery_admission_after_mesh_wait() 
         id: peer_id,
         name: "peer".into(),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -1440,7 +2816,6 @@ async fn assignment_activation_revalidates_recovery_admission_after_mesh_wait() 
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(authority_store)
-        .state_backend(Arc::new(InProcessBackend::new(2)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&local_sender))
         .shuffle_receiver(Arc::clone(&local_receiver))
@@ -1697,6 +3072,7 @@ async fn source_drain_validation_requires_a_vnode_registry() {
     use uuid::Uuid;
 
     let db = LaminarDB::builder().build().await.unwrap();
+    *db.vnode_registry.lock() = None;
     let participant = CheckpointParticipant {
         node_id: 1,
         boot_incarnation: Uuid::from_u128(11),
@@ -1728,13 +3104,468 @@ async fn source_drain_validation_requires_a_vnode_registry() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn final_owner_exit_without_audited_commit_fails_before_local_mutation() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let cluster_self_id = ClusterNodeId(self_id.0);
+    let (authority_store, assignments) = test_assignment_history();
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_self_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        cluster_self_id,
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let current = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: controller.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+    let successor = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[successor_id]),
+            vec![CheckpointParticipant {
+                node_id: successor_id.0,
+                boot_incarnation: Uuid::from_u128(22),
+            }],
+        )
+        .unwrap();
+    persist_test_assignment_pair(&assignments, &current, &successor).await;
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let intake_was_fenced = db.cluster_intake_fenced();
+    let authority_revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let error = db
+        .adopt_assignment_snapshot(
+            successor,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("an unaudited direct adoption must not revoke the final local vnode");
+
+    assert!(
+        error
+            .to_string()
+            .contains("has no drain transition or recovery authority decision"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert_eq!(db.cluster_intake_fenced(), intake_was_fenced);
+    assert_eq!(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+        authority_revision
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn recovery_authority_cannot_revoke_the_final_local_vnode() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentRecoveryDecision, AssignmentSnapshot, AssignmentSnapshotStore, ClusterController,
+        ClusterKv, InMemoryKv, ProcessLeaseAuthority,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let cluster_self_id = ClusterNodeId(self_id.0);
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&authority_store)));
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_self_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        cluster_self_id,
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+    ));
+    let leader_proof = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+
+    let local = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let current = AssignmentSnapshot::empty()
+        .next_for_participants(AssignmentSnapshot::vnodes_from_vec(&[self_id]), vec![local])
+        .unwrap();
+    assignments.save_if_absent(&current).await.unwrap();
+    let successor = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[successor_id]),
+            vec![CheckpointParticipant {
+                node_id: successor_id.0,
+                boot_incarnation: Uuid::from_u128(22),
+            }],
+        )
+        .unwrap();
+    let proposal = assignments
+        .stage_recovery_proposal(&successor)
+        .await
+        .unwrap();
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(
+            Arc::clone(&authority_store),
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap(),
+    );
+    let process_fence = process_authority
+        .fence_incarnation(
+            local,
+            process_authority
+                .fencing_deadline(std::time::Duration::from_secs(1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let predecessor_fence = current.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let recovery_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &predecessor_fence,
+        &leader_proof,
+    )
+    .await;
+    let decision = AssignmentRecoveryDecision::new(
+        predecessor_fence,
+        successor.assignment_fence().unwrap(),
+        proposal,
+        vec![process_fence],
+        recovery_checkpoint,
+        leader_proof.clone(),
+    )
+    .unwrap();
+    controller
+        .record_assignment_recovery_decision(
+            &leader_proof,
+            decision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assignments
+        .save_if_version(&successor, current.version)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let intake_was_fenced = db.cluster_intake_fenced();
+    let authority_revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let error = db
+        .adopt_assignment_snapshot(
+            successor,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("recovery authority must not run old-process final-owner callbacks");
+
+    assert!(
+        error.to_string().contains("audited committed drain"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert_eq!(db.cluster_intake_fenced(), intake_was_fenced);
+    assert_eq!(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+        authority_revision
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn replacement_process_stages_and_publishes_zero_owner_topology() {
+    use laminar_core::checkpoint::{
+        AssignmentDrainTransition, CheckpointParticipant, PipelineIdentity,
+    };
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentRecoveryDecision, AssignmentSnapshot,
+        AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv, LeaseDeadline,
+        ProcessLeaseAuthority, ProcessLeaseOutcome,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{KeyGroupCount, NodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let successor_id = NodeId(2);
+    let cluster_self_id = ClusterNodeId(self_id.0);
+    let current_boot = Uuid::from_u128(11);
+    let predecessor_process = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: Uuid::from_u128(1),
+    };
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&authority_store)));
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_self_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        cluster_self_id,
+        Arc::clone(&kv),
+        kv,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+        current_boot,
+    ));
+    let process_authority = ProcessLeaseAuthority::new(
+        Arc::clone(&authority_store),
+        std::time::Duration::from_millis(1),
+    )
+    .unwrap();
+    let process_store = process_authority.store_for(cluster_self_id);
+    let ProcessLeaseOutcome::Acquired(predecessor_lease) = process_store
+        .try_acquire(predecessor_process.boot_incarnation, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty process authority must admit the predecessor process");
+    };
+    let predecessor_observation = process_store.observe_rival(&predecessor_lease).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let ProcessLeaseOutcome::Acquired(_current_lease) = process_store
+        .try_takeover(current_boot, &predecessor_observation, 2)
+        .await
+        .unwrap()
+    else {
+        panic!("current process must take over the expired predecessor lease");
+    };
+    let process_fence = process_authority
+        .fence_incarnation(
+            predecessor_process,
+            process_authority
+                .fencing_deadline(std::time::Duration::from_secs(1))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let leader_proof = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+
+    let base = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: current_boot,
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&base).await.unwrap();
+    let current = base
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id]),
+            vec![predecessor_process],
+        )
+        .unwrap();
+    assignments
+        .save_if_version(&current, base.version)
+        .await
+        .unwrap();
+    let base_fence = base.assignment_fence().unwrap();
+    let current_fence = current.assignment_fence().unwrap();
+    let authority = controller.checkpoint_authority().unwrap();
+    let recovery_checkpoint = crate::rebalance::record_assignment_checkpoint_for_test(
+        &authority,
+        &authority_store,
+        &base_fence,
+        &leader_proof,
+    )
+    .await;
+    let transition =
+        AssignmentDrainTransition::new(base_fence, current_fence.clone(), leader_proof.clone())
+            .unwrap();
+    let drain = AssignmentDrainDecision::commit(
+        &transition,
+        leader_proof.clone(),
+        recovery_checkpoint.clone(),
+    )
+    .unwrap();
+    authority
+        .record_assignment_drain_decision(&leader_proof, drain)
+        .await
+        .unwrap();
+    let successor = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[successor_id]),
+            vec![CheckpointParticipant {
+                node_id: successor_id.0,
+                boot_incarnation: Uuid::from_u128(22),
+            }],
+        )
+        .unwrap();
+    let proposal = assignments
+        .stage_recovery_proposal(&successor)
+        .await
+        .unwrap();
+    let decision = AssignmentRecoveryDecision::new(
+        current_fence,
+        successor.assignment_fence().unwrap(),
+        proposal,
+        vec![process_fence],
+        recovery_checkpoint,
+        leader_proof.clone(),
+    )
+    .unwrap();
+    controller
+        .record_assignment_recovery_decision(
+            &leader_proof,
+            decision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assignments
+        .save_if_version(&successor, current.version)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    registry.set_assignment_and_version(Arc::from([self_id]), current.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    let identity = PipelineIdentity::empty();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        test_checkpoint_store(),
+    )
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(identity.clone())
+        .unwrap();
+    coordinator.set_assignment_version(current.version);
+    coordinator.set_vnode_set(Vec::new());
+    *db.coordinator.lock().await = Some(coordinator);
+
+    let adoption = db
+        .adopt_assignment_snapshot(
+            successor,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("the replacement process has no predecessor heap state to revoke");
+
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    let pending = db.pending_vnode_transition.lock().clone().unwrap();
+    assert!(!pending.requires_predecessor_binding());
+    assert!(pending.acquired_vnodes().is_empty());
+    assert!(pending.revoked_vnodes().is_empty());
+    assert!(pending.state_frames().is_empty());
+    assert!(db.installed_vnode_state.lock().is_none());
+
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(
+            self_id.0,
+            "127.0.0.1:0".parse().unwrap(),
+            controller.recovery_incarnation(),
+        )
+        .await
+        .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(
+        self_id.0,
+        controller.recovery_incarnation(),
+    ));
+    let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30)));
+    receiver
+        .install_process_lease_deadline(Arc::clone(&deadline))
+        .unwrap();
+    sender.install_process_lease_deadline(deadline).unwrap();
+
+    let mut graph =
+        crate::operator_graph::OperatorGraph::new(laminar_sql::create_session_context());
+    graph.set_key_group_count(KeyGroupCount::try_from(1_u32).unwrap());
+    graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+        registry,
+        sender,
+        receiver,
+        self_id,
+    });
+    graph.set_pipeline_identity(identity);
+    graph.set_pending_vnode_transition_handle(Arc::clone(&db.pending_vnode_transition));
+    graph.set_installed_vnode_state_handle(Arc::clone(&db.installed_vnode_state));
+    graph.set_rotation_execution_fence(Arc::clone(&db.rotation_execution_fence));
+
+    assert!(graph.complete_pending_vnode_transition().await.unwrap());
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
     use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof, LeaderProofOwner};
     use laminar_core::cluster::control::{
         AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
     };
     use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
-    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId, VnodeRegistry};
     use uuid::Uuid;
 
     let cluster_node_id = ClusterNodeId(1);
@@ -1751,7 +3582,6 @@ async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .state_backend(Arc::new(InProcessBackend::new(2)))
         .vnode_registry(registry)
         .build()
         .await
@@ -1817,6 +3647,109 @@ async fn test_create_source() {
 }
 
 #[tokio::test]
+async fn create_source_routes_composite_primary_key_to_catalog() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE keyed_events (
+            tenant VARCHAR,
+            event_id BIGINT,
+            payload VARCHAR,
+            PRIMARY KEY (tenant, event_id)
+        )",
+    )
+    .await
+    .unwrap();
+
+    let entry = db.catalog.get_source("keyed_events").unwrap();
+    assert_eq!(entry.primary_key, ["tenant", "event_id"]);
+    assert!(!entry
+        .schema
+        .field_with_name("tenant")
+        .unwrap()
+        .is_nullable());
+    assert!(!entry
+        .schema
+        .field_with_name("event_id")
+        .unwrap()
+        .is_nullable());
+    assert!(entry
+        .schema
+        .field_with_name("payload")
+        .unwrap()
+        .is_nullable());
+
+    let handle = db.source_untyped("keyed_events").unwrap();
+    let reserved_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("tenant", DataType::Utf8, false),
+            Field::new("event_id", DataType::Int64, false),
+            Field::new("__weight", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["acme"])),
+            Arc::new(arrow_array::Int64Array::from(vec![1_i64])),
+            Arc::new(StringArray::from(vec!["payload"])),
+        ],
+    )
+    .unwrap();
+    let error = handle.push_arrow(reserved_batch).unwrap_err();
+    assert!(error.to_string().contains("schema mismatch"));
+}
+
+#[tokio::test]
+async fn create_source_rejects_invalid_primary_key_declarations() {
+    let cases = [
+        (
+            "CREATE SOURCE invalid (id BIGINT PRIMARY KEY, PRIMARY KEY (id))",
+            "at most one PRIMARY KEY declaration",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, PRIMARY KEY (missing))",
+            "does not exist",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, PRIMARY KEY (id, id))",
+            "repeats column",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT NULL, PRIMARY KEY (id))",
+            "cannot be declared NULL",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT, ID BIGINT, PRIMARY KEY (id))",
+            "is ambiguous",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT CONSTRAINT pk PRIMARY KEY)",
+            "does not support named PRIMARY KEY constraints",
+        ),
+        (
+            "CREATE SOURCE invalid (id BIGINT PRIMARY KEY DEFERRABLE)",
+            "does not support PRIMARY KEY constraint characteristics",
+        ),
+        (
+            "CREATE SOURCE invalid (_op VARCHAR)",
+            "reserved mutation metadata",
+        ),
+        (
+            "CREATE SOURCE invalid (__op VARCHAR)",
+            "reserved mutation metadata",
+        ),
+        (
+            "CREATE SOURCE invalid (__weight BIGINT)",
+            "full-changelog metadata",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        let db = LaminarDB::open().unwrap();
+        let error = db.execute(sql).await.unwrap_err();
+        assert!(error.to_string().contains(expected), "{sql}: {error}");
+        assert!(db.catalog.get_source("invalid").is_none());
+    }
+}
+
+#[tokio::test]
 async fn test_create_source_with_watermark() {
     let db = LaminarDB::open().unwrap();
     db.execute(
@@ -1828,6 +3761,59 @@ async fn test_create_source_with_watermark() {
     let sources = db.sources();
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].watermark_column, Some("ts".to_string()));
+}
+
+#[tokio::test]
+async fn temporal_query_entrypoints_and_retention_fail_closed() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE trades (symbol VARCHAR, trade_time TIMESTAMP, WATERMARK FOR trade_time)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE quotes (symbol VARCHAR PRIMARY KEY, price DOUBLE, quote_time TIMESTAMP, WATERMARK FOR quote_time)",
+    )
+    .await
+    .unwrap();
+
+    let direct = db
+        .execute(
+            "SELECT t.symbol, q.price FROM trades t \
+             JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+             ON t.symbol = q.symbol",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(direct, DbError::Unsupported(_)), "{direct}");
+
+    let nested = db
+        .execute(
+            "WITH matched AS (\
+                 SELECT t.symbol FROM trades t \
+                 JOIN quotes FOR SYSTEM_TIME AS OF t.trade_time AS q \
+                 ON t.symbol = q.symbol\
+             ) SELECT * FROM matched",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(nested, DbError::Unsupported(_)), "{nested}");
+
+    let unconfigured = db
+        .execute(
+            "CREATE STREAM markouts AS SELECT probe.offset_ms, probe.probe_time, q.price \
+             FROM trades t TEMPORAL PROBE JOIN quotes q ON (symbol) \
+             TIMESTAMPS (trade_time, quote_time) LIST (5s, 15s) AS probe",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        unconfigured
+            .to_string()
+            .contains("temporal_join_idle_history_retention must be configured"),
+        "{unconfigured}"
+    );
+    assert!(db.catalog.get_stream_entry("markouts").is_none());
 }
 
 #[tokio::test]
@@ -2953,6 +4939,126 @@ async fn create_stream_planner_rejection_does_not_enter_registries() {
 }
 
 #[tokio::test]
+async fn interval_join_ddl_enforces_runtime_key_and_time_types() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE int_left (id INT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE int_right (id INT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+
+    let error = db
+        .execute(
+            "CREATE STREAM invalid_interval AS \
+             SELECT l.id FROM int_left l JOIN int_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("same Utf8 or Int64 type"),
+        "unexpected rejection: {error}"
+    );
+    assert!(db.catalog.get_stream_entry("invalid_interval").is_none());
+
+    db.execute(
+        "CREATE SOURCE bigint_left (id BIGINT, partition_id BIGINT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE bigint_right (id BIGINT, partition_id BIGINT, ts TIMESTAMP NOT NULL, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE STREAM valid_interval AS \
+         SELECT l.id AS id FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    assert!(db.catalog.get_stream_entry("valid_interval").is_some());
+
+    let error = db
+        .execute(
+            "CREATE STREAM unaliased_interval AS \
+             SELECT l.id FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("explicit alias"));
+    assert!(db.catalog.get_stream_entry("unaliased_interval").is_none());
+
+    db.execute(
+        "CREATE STREAM composite_interval AS \
+         SELECT l.id AS id FROM bigint_left l JOIN bigint_right r \
+         ON l.id = r.id AND l.partition_id = r.partition_id \
+         AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+    )
+    .await
+    .unwrap();
+    assert!(db.catalog.get_stream_entry("composite_interval").is_some());
+
+    db.execute("CREATE SOURCE no_watermark (id BIGINT, ts TIMESTAMP NOT NULL)")
+        .await
+        .unwrap();
+    let error = db
+        .execute(
+            "CREATE STREAM unwatermarked_interval AS \
+             SELECT l.id FROM no_watermark l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("event-time watermark"));
+    assert!(db
+        .catalog
+        .get_stream_entry("unwatermarked_interval")
+        .is_none());
+
+    let error = db
+        .execute(
+            "CREATE STREAM aggregate_interval AS \
+             SELECT l.id AS id, COUNT(*) AS n FROM bigint_left l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND GROUP BY l.id",
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("cannot contain an aggregate stage"));
+    assert!(db.catalog.get_stream_entry("aggregate_interval").is_none());
+
+    db.execute(
+        "CREATE SOURCE nullable_time (id BIGINT, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+    let error = db
+        .execute(
+            "CREATE STREAM nullable_interval AS \
+             SELECT l.id FROM nullable_time l JOIN bigint_right r ON l.id = r.id \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '1' SECOND",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be declared NOT NULL"));
+    assert!(db.catalog.get_stream_entry("nullable_interval").is_none());
+}
+
+#[tokio::test]
 async fn test_show_streams() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE STREAM a AS SELECT 1 FROM events")
@@ -3161,20 +5267,8 @@ async fn test_create_source_with_connector_rejected_when_running() {
     db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
     db.start().await.unwrap();
 
-    // WITH syntax
     let result = db
-        .execute("CREATE SOURCE events (id INT) WITH ('connector' = 'kafka', 'topic' = 'x')")
-        .await;
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("LDB-6043"),
-        "expected pipeline-running error, got: {err}"
-    );
-
-    // FROM syntax (what server mode generates via source_to_ddl)
-    let result = db
-        .execute("CREATE SOURCE events2 (id INT) FROM KAFKA (topic = 'x')")
+        .execute("CREATE SOURCE events (id INT) FROM KAFKA (topic = 'x')")
         .await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -3182,6 +5276,40 @@ async fn test_create_source_with_connector_rejected_when_running() {
         err.contains("LDB-6043"),
         "expected pipeline-running error for FROM syntax, got: {err}"
     );
+}
+
+#[tokio::test]
+async fn insert_into_reference_table_is_fenced_while_pipeline_runs() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
+    db.execute("CREATE TABLE dimensions (id INT PRIMARY KEY, label VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO dimensions VALUES (1, 'before')")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let error = db
+        .execute("INSERT INTO dimensions VALUES (1, 'after')")
+        .await
+        .expect_err("a running pipeline must retain its reference-table snapshot");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    let snapshot = db
+        .table_store
+        .read()
+        .to_record_batch("dimensions")
+        .unwrap()
+        .unwrap();
+    let labels = snapshot
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(labels.value(0), "before");
+
+    db.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "kafka")]
@@ -3194,9 +5322,9 @@ async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
                  'bootstrap.servers' = 'localhost:9092', \
                  'group.id' = 'g', \
                  'topic' = 't', \
-                 'format' = 'avro', \
-                 'schema.registry.url' = 'http://localhost:8081', \
                  'broker.commit.interval.ms' = '5000' \
+             ) FORMAT AVRO WITH ( \
+                 'schema.registry.url' = 'http://localhost:8081' \
              )",
         )
         .await;
@@ -3234,7 +5362,7 @@ async fn test_create_sink_with_connector_rejected_when_running() {
     let result = db
         .execute(
             "CREATE SINK output FROM events \
-             WITH ('connector' = 'kafka', 'topic' = 'out')",
+             INTO KAFKA ('topic' = 'out')",
         )
         .await;
     assert!(result.is_err());
@@ -3424,7 +5552,7 @@ async fn test_sql_create_source_auto_discovers_map_column() {
 
     let (db, _) = fake_source_db("fake-avro", Some(Arc::clone(&map_schema))).await;
     db.execute(
-        "CREATE SOURCE events WITH ('connector' = 'fake-avro', \
+        "CREATE SOURCE events FROM \"fake-avro\" (\
          'schema.registry.url' = 'http://irrelevant', 'topic' = 'events')",
     )
     .await
@@ -3453,12 +5581,12 @@ async fn test_sql_create_source_if_not_exists_skips_discovery() {
     )]));
     let (db, counter) = fake_source_db("counting-fake", Some(discovered)).await;
 
-    db.execute("CREATE SOURCE events WITH ('connector' = 'counting-fake')")
+    db.execute("CREATE SOURCE events FROM \"counting-fake\"")
         .await
         .unwrap();
     assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    db.execute("CREATE SOURCE IF NOT EXISTS events WITH ('connector' = 'counting-fake')")
+    db.execute("CREATE SOURCE IF NOT EXISTS events FROM \"counting-fake\"")
         .await
         .unwrap();
     assert_eq!(
@@ -3474,7 +5602,7 @@ async fn test_sql_create_source_if_not_exists_skips_discovery() {
 async fn test_sql_create_source_errors_when_discovery_yields_empty() {
     let (db, _) = fake_source_db("empty-fake", None).await;
     let err = db
-        .execute("CREATE SOURCE events WITH ('connector' = 'empty-fake')")
+        .execute("CREATE SOURCE events FROM \"empty-fake\"")
         .await
         .unwrap_err();
     assert!(
@@ -3494,8 +5622,8 @@ async fn fake_source_db(
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::ConnectorInfo;
     use laminar_connectors::connector::{
-        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart,
-        SourceTopology,
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
     };
     use laminar_connectors::error::ConnectorError;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3538,6 +5666,7 @@ async fn fake_source_db(
             Ok(SourceContract::new(
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
             ))
         }
         async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -3583,7 +5712,10 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
     use async_trait::async_trait;
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::ConnectorInfo;
-    use laminar_connectors::connector::{SourceBatch, SourceConnector, SourceStart};
+    use laminar_connectors::connector::{
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
+    };
     use laminar_connectors::error::ConnectorError;
 
     struct GatedSource {
@@ -3595,6 +5727,17 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
 
     #[async_trait]
     impl SourceConnector for GatedSource {
+        fn contract(
+            &self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<SourceContract, ConnectorError> {
+            Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
+            ))
+        }
+
         async fn start(&mut self, _: SourceStart) -> Result<(), ConnectorError> {
             Ok(())
         }
@@ -3668,7 +5811,7 @@ async fn paused_schema_discovery_serializes_pipeline_start() {
     let create = {
         let db = Arc::clone(&db);
         tokio::spawn(async move {
-            db.execute("CREATE SOURCE discovered WITH ('connector' = 'gated-source')")
+            db.execute("CREATE SOURCE discovered FROM \"gated-source\"")
                 .await
         })
     };
@@ -3743,6 +5886,26 @@ async fn paused_stream_planning_serializes_pipeline_stop() {
         .unwrap();
     assert_eq!(DbState::load(&db.state), DbState::Created);
     assert!(db.catalog.get_stream_entry("planned").is_none());
+}
+
+#[tokio::test]
+async fn managed_aggregate_plans_against_a_catalog_bridged_source_before_recovery() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (key VARCHAR, value BIGINT)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE STREAM totals AS \
+         SELECT key, SUM(value) AS total FROM events GROUP BY key",
+    )
+    .await
+    .unwrap();
+
+    db.start()
+        .await
+        .expect("managed aggregate startup must see catalog-only source schemas");
+    assert_eq!(DbState::load(&db.state), DbState::Running);
+    db.stop_pipeline().await.unwrap();
 }
 
 #[tokio::test]
@@ -3998,7 +6161,7 @@ async fn multiway_incremental_mv_is_rejected_without_partial_registration() {
         .unwrap_err();
     assert!(error
         .to_string()
-        .contains("atomic batch topology admission"));
+        .contains("multi-way streaming joins require explicitly named two-way stages"));
     assert!(db.mv_registry.lock().get("abc").is_none());
     assert!(!db.ctx.table_exist("abc").unwrap());
     assert!(db.connector_manager.lock().get_ddl("abc").is_none());
@@ -4410,7 +6573,7 @@ async fn test_pipeline_topology_full_pipeline() {
     db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
         .await
         .unwrap();
-    db.execute("CREATE STREAM agg AS SELECT COUNT(*) as cnt FROM events GROUP BY id")
+    db.execute("CREATE STREAM agg AS SELECT id, COUNT(*) as cnt FROM events GROUP BY id")
         .await
         .unwrap();
     db.execute("CREATE SINK output FROM agg").await.unwrap();
@@ -4580,6 +6743,41 @@ async fn create_table_rejects_invalid_key_contract_before_mutation() {
         assert!(!db.connector_manager.lock().tables().contains_key(name));
         assert!(db.connector_manager.lock().get_ddl(name).is_none());
     }
+}
+
+#[tokio::test]
+async fn reserved_mutation_metadata_cannot_be_spoofed_by_tables_or_plain_streams() {
+    let db = LaminarDB::open().unwrap();
+
+    for column in ["_op", "__op", "__WEIGHT"] {
+        let name = format!("reserved_{}", column.trim_start_matches('_').to_lowercase());
+        let error = db
+            .execute(&format!(
+                "CREATE TABLE {name} (id INT PRIMARY KEY, {column} BIGINT)"
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reserved engine mutation metadata"),
+            "{error}"
+        );
+        assert!(!db.catalog_namespace.lock().contains_key(&name));
+    }
+
+    db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+    let error = db
+        .execute("CREATE STREAM spoofed AS SELECT id AS __WEIGHT FROM events")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not a certified changelog producer"),
+        "{error}"
+    );
+    assert!(!db.catalog_namespace.lock().contains_key("spoofed"));
 }
 
 #[tokio::test]
@@ -5467,7 +7665,7 @@ async fn test_multi_join_mixed_types() {
 }
 
 #[tokio::test]
-async fn test_multi_join_single_backward_compat() {
+async fn single_join_executes() {
     let db = LaminarDB::open().unwrap();
 
     db.ctx
@@ -5485,7 +7683,6 @@ async fn test_multi_join_single_backward_compat() {
         .await
         .unwrap();
 
-    // Single join still works
     let df = db
         .ctx
         .sql(
@@ -6362,6 +8559,301 @@ fn test_filter_late_rows_filters_correctly() {
 }
 
 #[test]
+fn recovered_input_channels_hold_the_logical_watermark_during_skewed_replay() {
+    use arrow::array::{BinaryArray, TimestampMillisecondArray};
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    let recovered_inventory: Arc<[Vec<u8>]> =
+        Arc::from([b"fast".to_vec(), b"slow".to_vec(), b"stale".to_vec()]);
+    let recovered = rustc_hash::FxHashMap::from_iter([
+        (
+            Box::<[u8]>::from(&b"slow"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(10),
+                idle: false,
+            },
+        ),
+        (
+            Box::<[u8]>::from(&b"fast"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(100),
+                idle: false,
+            },
+        ),
+        (
+            Box::<[u8]>::from(&b"stale"[..]),
+            RecoveredInputChannelProgress {
+                watermark: Some(1_000),
+                idle: true,
+            },
+        ),
+    ]);
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        recovered,
+        Some(recovered_inventory),
+    );
+    state
+        .install_input_channels(
+            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
+            i64::MIN,
+        )
+        .unwrap();
+    let partitioned = state.partitioned.as_ref().unwrap();
+    assert!(partitioned.recovered.is_empty());
+    assert!(partitioned.recovered_inventory.is_none());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
+            DataType::Binary,
+            false,
+        ),
+    ]));
+    let batch = |timestamp, input_channel: &'static [u8]| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![timestamp])),
+                Arc::new(BinaryArray::from(vec![input_channel])),
+            ],
+        )
+        .unwrap()
+    };
+
+    state
+        .observe_input_channels(&batch(200, b"fast"), 10)
+        .unwrap();
+    assert_eq!(state.generator.current_watermark(), 10);
+
+    let slow = filter_late_rows(&batch(12, b"slow"), "ts", 10)
+        .unwrap()
+        .expect("the slow channel row is still on time");
+    state.observe_input_channels(&slow, 10).unwrap();
+    assert_eq!(state.generator.current_watermark(), 12);
+
+    state
+        .install_input_channels(Some(Arc::from([b"slow".to_vec()])), 1)
+        .unwrap();
+    let retained = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(retained[0].watermark, Some(12));
+
+    state
+        .install_input_channels(
+            Some(Arc::from([
+                b"fast".to_vec(),
+                b"slow".to_vec(),
+                b"stale".to_vec(),
+            ])),
+            1,
+        )
+        .unwrap();
+    let reassigned = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(reassigned[0].watermark, Some(12));
+    assert_eq!(reassigned[1].watermark, Some(12));
+    assert_eq!(reassigned[2].watermark, Some(12));
+    assert!(!reassigned[2].idle);
+
+    {
+        let channels = &mut state.partitioned.as_mut().unwrap().channels;
+        channels.get_mut(&b"slow"[..]).unwrap().idle = true;
+        channels.get_mut(&b"stale"[..]).unwrap().idle = true;
+    }
+    state
+        .observe_input_channels(&batch(200, b"fast"), 1)
+        .unwrap();
+    assert_eq!(state.generator.current_watermark(), 200);
+
+    state
+        .observe_input_channels(&batch(13, b"slow"), 1)
+        .unwrap();
+    let resumed = state.input_channel_progress().unwrap().unwrap();
+    assert_eq!(resumed[1].watermark, Some(200));
+    assert!(!resumed[1].idle);
+}
+
+#[test]
+fn null_event_time_does_not_advance_a_physical_input_channel() {
+    use arrow::array::{BinaryArray, TimestampMillisecondArray};
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
+    state
+        .install_input_channels(Some(Arc::from([b"p0".to_vec()])), i64::MIN)
+        .unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                laminar_connectors::connector::SOURCE_PARTITION_COLUMN,
+                DataType::Binary,
+                false,
+            ),
+        ])),
+        vec![
+            Arc::new(TimestampMillisecondArray::from(vec![None])),
+            Arc::new(BinaryArray::from(vec![&b"p0"[..]])),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        state.observe_input_channels(&batch, i64::MIN).unwrap(),
+        None
+    );
+    assert_eq!(state.generator.current_watermark(), i64::MIN);
+    assert_eq!(
+        state.input_channel_progress().unwrap().unwrap()[0].watermark,
+        None
+    );
+}
+
+#[test]
+fn recovered_input_channels_are_not_idle_before_inventory_reconciliation() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    let inventory: Arc<[Vec<u8>]> = Arc::from([b"slow".to_vec()]);
+    let recovered = rustc_hash::FxHashMap::from_iter([(
+        Box::<[u8]>::from(&b"slow"[..]),
+        RecoveredInputChannelProgress {
+            watermark: Some(10),
+            idle: false,
+        },
+    )]);
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        0,
+        None,
+        recovered,
+        Some(Arc::clone(&inventory)),
+    );
+    state.generator.restore_watermark_for_recovery(10);
+    assert_eq!(state.input_channels_all_idle(), Some(false));
+
+    let mut tracker = laminar_core::time::WatermarkTracker::new(2);
+    tracker.update_source(0, 10);
+    tracker.update_source(1, 100);
+    let advanced = tracker.update_source(0, state.generator.current_watermark());
+    if state.input_channels_all_idle() == Some(true) {
+        let _ = tracker.mark_idle(0).or(advanced);
+    }
+    assert_eq!(
+        tracker
+            .current_watermark()
+            .map(|watermark| watermark.timestamp()),
+        Some(10),
+        "an uninstalled recovered source must hold the combined frontier"
+    );
+
+    state
+        .install_input_channels(Some(Arc::from([])), 10)
+        .unwrap();
+    assert_eq!(state.input_channels_all_idle(), Some(true));
+}
+
+#[test]
+fn input_channel_idle_tick_keeps_active_minimum_and_idle_maximum_semantics() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+        "ts".into(),
+    )
+    .with_input_channels(Duration::ZERO, 0, None, Default::default(), None);
+    state
+        .install_input_channels(
+            Some(Arc::from([b"fast".to_vec(), b"slow".to_vec()])),
+            i64::MIN,
+        )
+        .unwrap();
+    let channels = &mut state.partitioned.as_mut().unwrap().channels;
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
+        &mut channels.get_mut(&b"fast"[..]).unwrap().generator,
+        20,
+    );
+    laminar_core::time::WatermarkGenerator::restore_watermark_for_recovery(
+        &mut channels.get_mut(&b"slow"[..]).unwrap().generator,
+        10,
+    );
+
+    assert_eq!(state.tick_input_channel_idleness(), (Some(10), false));
+    state
+        .partitioned
+        .as_mut()
+        .unwrap()
+        .channels
+        .get_mut(&b"slow"[..])
+        .unwrap()
+        .idle = true;
+    assert_eq!(state.tick_input_channel_idleness(), (Some(20), false));
+    state
+        .partitioned
+        .as_mut()
+        .unwrap()
+        .channels
+        .get_mut(&b"fast"[..])
+        .unwrap()
+        .idle = true;
+    assert_eq!(state.tick_input_channel_idleness(), (None, true));
+}
+
+#[test]
+fn rejected_external_watermark_is_not_checkpointed_as_a_partition_floor() {
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor};
+
+    let mut state = SourceWatermarkState::new(
+        EventTimeExtractor::from_column("ts"),
+        Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(1)),
+        "ts".into(),
+    )
+    .with_input_channels(
+        Duration::ZERO,
+        1,
+        None,
+        rustc_hash::FxHashMap::default(),
+        None,
+    );
+    state
+        .install_input_channels(Some(Arc::from([b"partition".to_vec()])), i64::MIN)
+        .unwrap();
+
+    assert_eq!(state.advance_external_watermark(i64::MAX), None);
+    assert_eq!(state.generator.current_watermark(), i64::MIN);
+    assert_eq!(
+        state.input_channel_progress().unwrap().unwrap()[0].watermark,
+        None
+    );
+}
+
+#[test]
 fn test_filter_late_rows_all_late() {
     use arrow::array::{Int64Array, TimestampMillisecondArray};
 
@@ -6533,6 +9025,25 @@ async fn test_retracting_temporal_filter_emits_insert_then_retract() {
         vec![(-1, 5000), (1, 18_000)],
         "aged-out row retracts (-1) while the fresh row inserts (+1)"
     );
+}
+
+#[tokio::test]
+async fn first_temporal_filter_mv_uses_multiset_storage() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW recent_mv AS SELECT * FROM events \
+         WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        db.mv_store.read().storage_mode_for_test("recent_mv"),
+        Some(crate::mv_store::MvStorageMode::Multiset)
+    ));
 }
 
 /// The production path: a `WATERMARK FOR ts` stream where the frontier
@@ -6835,11 +9346,12 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         CatalogManifestStore, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseStore,
     };
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId, VnodeRegistry};
     use object_store::ObjectStore;
 
     async fn one_owner_cluster() -> Arc<LaminarDB> {
         let node = NodeId(1);
+        let temporal_source_control = crate::temporal_test_source::TemporalTestSourceControl::new();
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
         let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
@@ -6861,8 +9373,16 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .catalog_manifest_store(catalog_store)
             .shuffle_sender(Arc::new(ShuffleSender::new(node.0, process_incarnation)))
             .shuffle_receiver(receiver)
-            .state_backend(Arc::new(InProcessBackend::new(8)))
             .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, node)))
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: Some(3_600_000),
+                ..Default::default()
+            })
+            .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+            .temporal_join_idle_history_retention(std::time::Duration::from_secs(60))
+            .register_connector(move |registry| {
+                crate::temporal_test_source::register(registry, &temporal_source_control)
+            })
             .build()
             .await
             .unwrap()
@@ -6881,19 +9401,25 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         assert!(!db.ctx.table_exist(name).unwrap());
     }
 
-    async fn assert_cluster_rejection(db: &LaminarDB, name: &str, ddl: &str) {
+    async fn assert_cluster_rejection(db: &LaminarDB, name: &str, ddl: &str) -> String {
         let error = db
             .execute(ddl)
             .await
             .expect_err("unsupported cluster query shape must fail closed");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("LDB-4007"),
+            message.contains("LDB-4007"),
             "unexpected rejection for {name}: {error}"
         );
         assert_no_query_residue(db, name);
+        message
     }
 
     let db = one_owner_cluster().await;
+    assert_eq!(
+        db.checkpoint_key_groups(),
+        laminar_core::state::KeyGroupCount::try_from(8_u32).unwrap()
+    );
     let persisted_unsafe = std::collections::HashMap::from([(
         "persisted_final".to_string(),
         crate::connector_manager::StreamRegistration {
@@ -6939,36 +9465,232 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
     super::CATALOG_MANIFEST_REPLAY
         .scope((), async {
             db.execute(
-                "CREATE SOURCE left_events (id BIGINT, value DOUBLE, ts TIMESTAMP, \
-                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+                "CREATE SOURCE left_events (id BIGINT, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM GENERATOR ('max.rows' = '1')",
             )
             .await
             .unwrap();
             db.execute(
-                "CREATE SOURCE right_events (id BIGINT, value DOUBLE, ts TIMESTAMP, \
-                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+                "CREATE SOURCE right_events (id BIGINT PRIMARY KEY, shard BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM GENERATOR ('max.rows' = '1')",
             )
             .await
             .unwrap();
+            db.execute(
+                "CREATE SOURCE unwatermarked_events (id BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL) \
+                 FROM GENERATOR ('max.rows' = '1')",
+            )
+            .await
+            .unwrap();
+            let temporal_connector = crate::temporal_test_source::CONNECTOR_NAME;
+            db.execute(&format!(
+                "CREATE SOURCE temporal_left (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM \"{temporal_connector}\" ('mode' = 'append')"
+            ))
+            .await
+            .unwrap();
+            db.execute(&format!(
+                "CREATE SOURCE temporal_right (id BIGINT PRIMARY KEY, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, \
+                 WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) \
+                 FROM \"{temporal_connector}\" ('mode' = 'upsert')"
+            ))
+            .await
+            .unwrap();
 
-            assert_cluster_rejection(
-                &db,
-                "rejected_eowc_stream",
-                "CREATE STREAM rejected_eowc_stream AS \
+            db.execute(
+                "CREATE STREAM managed_eowc_stream AS \
                  SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
                  FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
                  EMIT ON WINDOW CLOSE",
             )
-            .await;
+            .await
+            .expect("static event-time CoreWindow state is cluster-safe");
+            assert!(db.catalog.get_stream_entry("managed_eowc_stream").is_some());
+            let managed_window =
+                db.connector_manager.lock().streams()["managed_eowc_stream"].clone();
+            assert!(db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    managed_window.name.clone(),
+                    managed_window,
+                )]))
+                .await
+                .expect("persisted CoreWindow plans must retain managed-vnode admission"));
+            for (name, ddl) in [
+                (
+                    "managed_hop_stream",
+                    "CREATE STREAM managed_hop_stream AS \
+                     SELECT id, HOP(ts, INTERVAL '10' SECOND, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, HOP(ts, INTERVAL '10' SECOND, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "managed_session_stream",
+                    "CREATE STREAM managed_session_stream AS \
+                     SELECT id, SESSION(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, SESSION(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "managed_global_tumble",
+                    "CREATE STREAM managed_global_tumble AS \
+                     SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+            ] {
+                db.execute(ddl)
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} should use managed CoreWindow: {error}"));
+                assert!(db.catalog.get_stream_entry(name).is_some());
+            }
             assert_cluster_rejection(
                 &db,
-                "rejected_interval",
-                "CREATE STREAM rejected_interval AS \
-                 SELECT l.id, l.value AS left_value, r.value AS right_value \
+                "rejected_dynamic_eowc",
+                "CREATE STREAM rejected_dynamic_eowc AS \
+                 SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                 FROM left_events WHERE ts > now() - INTERVAL '10' MINUTE \
+                 GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) EMIT ON WINDOW CLOSE",
+            )
+            .await;
+            for (name, ddl) in [
+                (
+                    "rejected_ordered_eowc",
+                    "CREATE STREAM rejected_ordered_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     ORDER BY COUNT(*) + 0 EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_limited_eowc",
+                    "CREATE STREAM rejected_limited_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     LIMIT 1 EMIT ON WINDOW CLOSE",
+                ),
+            ] {
+                let error = db
+                    .execute(ddl)
+                    .await
+                    .expect_err("unsupported managed aggregate shape must fail before mutation");
+                let message = error.to_string();
+                assert!(
+                    message.contains("managed SQL windows require one aggregate stage")
+                        || message.contains(
+                            "managed CoreWindow execution requires one direct source",
+                        ),
+                    "unexpected rejection for {name}: {error}"
+                );
+                assert_no_query_residue(&db, name);
+            }
+            for (name, ddl) in [
+                (
+                    "rejected_indirect_eowc",
+                    "CREATE STREAM rejected_indirect_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            (SELECT MAX(value) FROM right_events) AS other, COUNT(*) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_unwatermarked_eowc",
+                    "CREATE STREAM rejected_unwatermarked_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(*) AS n \
+                     FROM unwatermarked_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_nested_ai_eowc",
+                    "CREATE STREAM rejected_nested_ai_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            COUNT(ai_sentiment(CAST(id AS VARCHAR))) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_random_eowc",
+                    "CREATE STREAM rejected_random_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+                            SUM(value + random()) AS total \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+                (
+                    "rejected_uuid_eowc",
+                    "CREATE STREAM rejected_uuid_eowc AS \
+                     SELECT id, TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, COUNT(uuid()) AS n \
+                     FROM left_events GROUP BY id, TUMBLE(ts, INTERVAL '1' MINUTE) \
+                     EMIT ON WINDOW CLOSE",
+                ),
+            ] {
+                assert_cluster_rejection(&db, name, ddl).await;
+            }
+            db.execute(
+                "CREATE STREAM interval_ok AS \
+                 SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
                  FROM left_events l JOIN right_events r ON l.id = r.id \
                  AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
             )
-            .await;
+            .await
+            .expect("bounded watermarked interval join is cluster-safe");
+            assert!(db.catalog.get_stream_entry("interval_ok").is_some());
+
+            let mut persisted_invalid =
+                db.connector_manager.lock().streams()["interval_ok"].clone();
+            persisted_invalid.name = "persisted_invalid_interval".into();
+            let Some(laminar_sql::translator::JoinOperatorConfig::StreamStream(join)) =
+                persisted_invalid
+                    .join_config
+                    .as_mut()
+                    .and_then(|joins| joins.first_mut())
+            else {
+                panic!("interval stream registration lost its join plan");
+            };
+            join.left_keys = vec!["value".into()];
+            join.right_keys = vec!["value".into()];
+            let error = db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    persisted_invalid.name.clone(),
+                    persisted_invalid,
+                )]))
+                .await
+                .expect_err("persisted interval joins must repeat DDL schema admission");
+            assert!(
+                error
+                    .to_string()
+                    .contains("key pairs must have the same Utf8 or Int64 type"),
+                "{error}"
+            );
+
+            db.execute(
+                "CREATE STREAM composite_interval_ok AS \
+                 SELECT l.id AS id, l.value AS left_value, r.value AS right_value \
+                 FROM left_events l JOIN right_events r ON l.id = r.id AND l.shard = r.shard \
+                 AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
+            )
+            .await
+            .expect("ordered composite interval keys are cluster-safe");
+            assert!(db
+                .catalog
+                .get_stream_entry("composite_interval_ok")
+                .is_some());
+            db.execute(
+                "CREATE STREAM temporal_ok AS \
+                 SELECT l.id AS id, r.value AS right_value FROM temporal_left l \
+                 LEFT JOIN temporal_right FOR SYSTEM_TIME AS OF l.ts AS r ON l.id = r.id",
+            )
+            .await
+            .expect("managed temporal vnode state is cluster-safe");
+            let temporal = db.connector_manager.lock().streams()["temporal_ok"].clone();
+            assert!(db
+                .revalidate_persisted_cluster_query_shapes(&std::collections::HashMap::from([(
+                    temporal.name.clone(),
+                    temporal,
+                )]))
+                .await
+                .expect("persisted temporal plans must retain managed-vnode admission"));
             assert_cluster_rejection(
                 &db,
                 "rejected_temporal_filter",
@@ -6976,6 +9698,25 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  FROM left_events WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
             )
             .await;
+            db.execute(
+                "CREATE STREAM keyed_aggregate_ok AS \
+                 SELECT id, SUM(value) AS total FROM left_events GROUP BY id",
+            )
+            .await
+            .expect("bounded vnode-keyed aggregate state is cluster-safe");
+            assert!(db.catalog.get_stream_entry("keyed_aggregate_ok").is_some());
+            let global_window_error = assert_cluster_rejection(
+                &db,
+                "rejected_global_window",
+                "CREATE STREAM rejected_global_window AS \
+                 SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, SUM(value) AS total \
+                 FROM left_events GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
+            )
+            .await;
+            assert!(
+                global_window_error.contains("window"),
+                "unexpected global window rejection: {global_window_error}"
+            );
             assert_cluster_rejection(
                 &db,
                 "rejected_keyed_window",
@@ -7040,6 +9781,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .await
             .expect("a constructible global incremental aggregate is cluster-safe");
             assert!(db.catalog.get_stream_entry("global_sum_ok").is_some());
+            db.execute(
+                "CREATE STREAM global_count_ok AS \
+                 SELECT COUNT(*) AS total FROM right_events",
+            )
+            .await
+            .expect("global aggregate admission is per query, not per cluster graph");
+            assert!(db.catalog.get_stream_entry("global_count_ok").is_some());
         })
         .await;
 
@@ -7089,7 +9837,7 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
     use laminar_core::cluster::control::{
         CatalogManifestStore, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseStore,
     };
-    use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
+    use laminar_core::state::{NodeId, VnodeRegistry};
     use object_store::ObjectStore;
 
     let cluster_id = NodeId(1);
@@ -7106,7 +9854,6 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(object_store)
         .catalog_manifest_store(manifest_store)
-        .state_backend(Arc::new(InProcessBackend::new(4)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(4, cluster_id)))
         .build()
         .await
@@ -7123,10 +9870,8 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
     super::CATALOG_MANIFEST_REPLAY
         .scope(
             (),
-            cluster.execute(
-                "CREATE SOURCE replayed (id INT) WITH \
-                 ('connector' = 'generator', 'topic' = 'manifest')",
-            ),
+            cluster
+                .execute("CREATE SOURCE replayed (id INT) FROM GENERATOR ('topic' = 'manifest')"),
         )
         .await
         .expect("internal manifest replay must rebuild connector catalog entries during startup");
@@ -7139,7 +9884,6 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
 
     // Source DDL has no live coordinator wiring even in a local single-node runtime.
     let single_owner = LaminarDB::builder()
-        .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
         .build()
         .await
@@ -7715,7 +10459,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
 
     let error = db
         .execute(&format!(
-            "CREATE SOURCE rejected (id INT) WITH ('password' = '{PASSWORD}')"
+            "CREATE SOURCE rejected (id INT) FROM GENERATOR ('password' = '{PASSWORD}')"
         ))
         .await
         .unwrap_err();
@@ -7723,7 +10467,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
     assert!(db.catalog.get_source("rejected").is_none());
     let token_error = db
         .execute(&format!(
-            "CREATE SOURCE rejected_token (id INT) WITH ('token' = '{TOKEN}')"
+            "CREATE SOURCE rejected_token (id INT) FROM GENERATOR ('token' = '{TOKEN}')"
         ))
         .await
         .unwrap_err();
@@ -7733,7 +10477,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
     assert!(db.catalog.get_source("rejected_token").is_none());
     let signed_url_error = db
         .execute(
-            "CREATE SOURCE rejected_url (id INT) WITH \
+            "CREATE SOURCE rejected_url (id INT) FROM GENERATOR \
              ('connection' = 'https://example.test/data?X-Amz%2DSignature=signed-secret')",
         )
         .await
@@ -7742,11 +10486,11 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
         .to_string()
         .contains("cannot persist secret property"));
     for ddl in [
-        "CREATE SOURCE rejected_exact_url (id INT) WITH \
+        "CREATE SOURCE rejected_exact_url (id INT) FROM GENERATOR \
          ('url' = 'wss://user:socket-secret@example.test/events')",
-        "CREATE SOURCE rejected_sas_uri (id INT) WITH \
+        "CREATE SOURCE rejected_sas_uri (id INT) FROM GENERATOR \
          ('uri' = 'https://blob.test/data?sv=1&sig=sas-secret')",
-        "CREATE SOURCE rejected_uri_list (id INT) WITH \
+        "CREATE SOURCE rejected_uri_list (id INT) FROM GENERATOR \
          ('endpoints' = 'wss://public.test, wss://user:list-secret@private.test')",
     ] {
         let error = db.execute(ddl).await.unwrap_err();
@@ -7764,7 +10508,7 @@ async fn cluster_manifest_never_persists_literal_connector_secrets() {
         .contains("cannot persist SQL comments"));
     let default_error = db
         .execute(
-            "CREATE SOURCE rejected_default (id INT) WITH \
+            "CREATE SOURCE rejected_default (id INT) FROM GENERATOR \
              ('password' = '${LDB_PASSWORD:-unsafe-default}')",
         )
         .await
@@ -7802,18 +10546,20 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
     use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
     use laminar_connectors::connector::{
-        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart,
-        SourceTopology,
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourceStart, SourceTopology,
     };
     use laminar_connectors::error::ConnectorError;
-    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
-    use laminar_core::cluster::control::{CatalogManifest, CatalogManifestEntry};
-    use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifest, CatalogManifestEntry,
+    };
+    use laminar_core::state::{NodeId, VnodeRegistry};
     use object_store::ObjectStore;
 
     const VARIABLE: &str = "LDB_TEST_CLUSTER_CONNECTOR_PASSWORD";
     const PASSWORD: &str = "resolved-only-on-this-node";
-    const DDL: &str = "CREATE SOURCE secured (id INT) WITH ('connector' = 'capture-secret', \
+    const DDL: &str = "CREATE SOURCE secured (id INT) FROM \"capture-secret\" (\
         'password' = '${LDB_TEST_CLUSTER_CONNECTOR_PASSWORD}')";
 
     struct CapturingSource {
@@ -7854,6 +10600,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
             Ok(SourceContract::new(
                 SourceConsistency::Replayable,
                 SourceTopology::Splittable,
+                SourceInputMode::AppendOnly,
             ))
         }
 
@@ -7881,28 +10628,27 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
         .unwrap();
     let controller = Arc::clone(&authority.controller);
     controller.publish_recovery_incarnation().await.unwrap();
-    controller.publish_checkpoint_assignment_fence(Some(
-        CheckpointAssignmentFence::from_owner_map(
-            1,
-            &[1],
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(
+        &authority.checkpoint_store,
+    )));
+    let assignment = AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, NodeId(1))]),
             vec![CheckpointParticipant {
                 node_id: 1,
                 boot_incarnation: controller.recovery_incarnation(),
             }],
         )
-        .unwrap(),
-    ));
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment.assignment_fence().unwrap()));
     controller.set_active(true);
-    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
-        .state_backend(Arc::new(ObjectStoreBackend::cluster_shared(
-            Arc::clone(&authority.checkpoint_store),
-            "node-1",
-            1,
-        )))
         .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .assignment_snapshot_store(assignment_store)
         .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: Some(3_600_000),
             ..Default::default()
@@ -7954,7 +10700,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
     use laminar_core::cluster::control::{CatalogManifest, CatalogManifestEntry};
     use object_store::ObjectStore;
 
-    const DDL: &str = "CREATE SOURCE unstable WITH ('connector' = 'changing-discovery')";
+    const DDL: &str = "CREATE SOURCE unstable FROM \"changing-discovery\"";
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let authority = test_catalog_authority(object_store).await;
     let manifest_store = Arc::clone(&authority.manifest_store);
@@ -8025,7 +10771,6 @@ async fn stopped_cluster_follower_cannot_publish_while_a_peer_is_active() {
         id: NodeId(1),
         name: "active".into(),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -8431,96 +11176,25 @@ async fn alter_source_properties_are_rejected_without_mutation() {
     assert_eq!(db.get_session_property("events.batch.size"), None);
 }
 
-#[test]
-fn test_extract_connector_from_with_options_basic() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "kafka".to_string());
-    opts.insert("topic".to_string(), "events".to_string());
-    opts.insert(
-        "bootstrap.servers".to_string(),
-        "localhost:9092".to_string(),
-    );
-    opts.insert("format".to_string(), "json".to_string());
-
-    let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
-
-    // 'connector' and 'format' are extracted, not in connector_options
-    assert!(!conn_opts.contains_key("connector"));
-    assert!(!conn_opts.contains_key("format"));
-    assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
-    assert_eq!(
-        conn_opts.get("bootstrap.servers"),
-        Some(&"localhost:9092".to_string())
-    );
-    assert_eq!(format, Some("json".to_string()));
-    assert!(fmt_opts.is_empty());
-}
-
-#[test]
-fn test_extract_connector_filters_streaming_keys() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "websocket".to_string());
-    opts.insert("url".to_string(), "wss://feed.example.com".to_string());
-    opts.insert("buffer_size".to_string(), "4096".to_string());
-    opts.insert("backpressure".to_string(), "block".to_string());
-    opts.insert("watermark_delay".to_string(), "5s".to_string());
-
-    let (conn_opts, _, _) = extract_connector_from_with_options(&opts);
-
-    // Streaming keys should NOT be in connector_options
-    assert!(!conn_opts.contains_key("buffer_size"));
-    assert!(!conn_opts.contains_key("backpressure"));
-    assert!(!conn_opts.contains_key("watermark_delay"));
-    // Connector-specific key should be present
-    assert_eq!(
-        conn_opts.get("url"),
-        Some(&"wss://feed.example.com".to_string())
-    );
-}
-
-#[test]
-fn test_extract_connector_format_options() {
-    let mut opts = HashMap::new();
-    opts.insert("connector".to_string(), "kafka".to_string());
-    opts.insert("format".to_string(), "avro".to_string());
-    opts.insert(
-        "format.schema.registry.url".to_string(),
-        "http://localhost:8081".to_string(),
-    );
-    opts.insert("topic".to_string(), "events".to_string());
-
-    let (conn_opts, format, fmt_opts) = extract_connector_from_with_options(&opts);
-
-    assert_eq!(format, Some("avro".to_string()));
-    assert_eq!(
-        fmt_opts.get("schema.registry.url"),
-        Some(&"http://localhost:8081".to_string())
-    );
-    assert_eq!(conn_opts.get("topic"), Some(&"events".to_string()));
-    assert!(!conn_opts.contains_key("format.schema.registry.url"));
-}
-
 #[tokio::test]
-async fn test_create_source_with_connector_option() {
-    // Verify that WITH ('connector' = '...') is accepted at the DDL level.
+async fn test_create_source_with_explicit_connector() {
+    // Verify that FROM routes the source to the connector registry.
     // The actual connector won't be instantiated because the type isn't
     // registered in the default embedded registry, so we just check
     // that the error is "Unknown source connector type" (meaning the
-    // WITH clause was correctly routed) rather than silently ignored.
+    // FROM clause was correctly routed) rather than silently ignored.
     let db = LaminarDB::open().unwrap();
     let result = db
         .execute(
-            "CREATE SOURCE ws_feed (id BIGINT, data TEXT) WITH (
-                'connector' = 'websocket',
-                'url' = 'wss://feed.example.com',
-                'format' = 'json'
-            )",
+            "CREATE SOURCE ws_feed (id BIGINT, data TEXT) FROM WEBSOCKET (
+                'url' = 'wss://feed.example.com'
+            ) FORMAT JSON",
         )
         .await;
 
     // Without the websocket feature, the connector type won't be registered,
     // so we expect an "Unknown source connector type" error — which proves
-    // the WITH clause WAS routed to the connector registry.
+    // the FROM clause was routed to the connector registry.
     if let Err(e) = result {
         let msg = e.to_string();
         assert!(
@@ -8822,6 +11496,57 @@ async fn test_connectorless_source_does_not_break_pipeline() {
 }
 
 #[tokio::test]
+async fn explicit_connector_and_format_options_reach_registrations() {
+    let db = LaminarDB::builder()
+        .register_connector(|registry| {
+            laminar_connectors::testing::register_mock_source(registry)?;
+            laminar_connectors::testing::register_mock_sink(registry)
+        })
+        .build()
+        .await
+        .unwrap();
+
+    db.execute(
+        "CREATE SOURCE input (id BIGINT) \
+         FROM MOCK ('source.option' = 'source-value') \
+         FORMAT JSON WITH ('compression' = 'gzip')",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SINK output FROM input \
+         INTO MOCK ('sink.option' = 'sink-value') \
+         FORMAT JSON WITH ('compression' = 'zstd')",
+    )
+    .await
+    .unwrap();
+
+    let manager = db.connector_manager.lock();
+    let source = manager.sources().get("input").unwrap();
+    assert_eq!(
+        source.connector_options,
+        std::collections::HashMap::from([(
+            "source.option".to_string(),
+            "source-value".to_string(),
+        )])
+    );
+    assert_eq!(
+        source.format_options,
+        std::collections::HashMap::from([("compression".to_string(), "gzip".to_string(),)])
+    );
+
+    let sink = manager.sinks().get("output").unwrap();
+    assert_eq!(
+        sink.connector_options,
+        std::collections::HashMap::from([("sink.option".to_string(), "sink-value".to_string(),)])
+    );
+    assert_eq!(
+        sink.format_options,
+        std::collections::HashMap::from([("compression".to_string(), "zstd".to_string(),)])
+    );
+}
+
+#[tokio::test]
 async fn connector_options_resolve_vars() {
     // `${VAR}` resolves in connector option values (config vars, then env) for
     // both sources and sinks — and only there, not elsewhere in the statement.
@@ -8830,11 +11555,9 @@ async fn connector_options_resolve_vars() {
         .build()
         .await
         .unwrap();
-    db.execute(
-        "CREATE SOURCE s (id BIGINT) WITH ('connector' = 'generator', 'topic' = '${TOPIC}')",
-    )
-    .await
-    .unwrap();
+    db.execute("CREATE SOURCE s (id BIGINT) FROM GENERATOR ('topic' = '${TOPIC}')")
+        .await
+        .unwrap();
     {
         let mgr = db.connector_manager.lock();
         let opts = &mgr.sources().get("s").unwrap().connector_options;
@@ -8843,7 +11566,7 @@ async fn connector_options_resolve_vars() {
     // Sinks go through the same resolver — an unresolved option errors (raised
     // before the unknown-connector check), proving the sink path is wired.
     let err = db
-        .execute("CREATE SINK snk FROM s WITH ('connector' = 'noop', 'topic' = '${MISSING_X9Q}')")
+        .execute("CREATE SINK snk FROM s INTO NOOP ('topic' = '${MISSING_X9Q}')")
         .await
         .unwrap_err();
     assert!(
@@ -9207,178 +11930,40 @@ async fn windowed_aggregate_over_lateral_unnest_emits() {
         "windowed aggregate over lateral UNNEST should emit"
     );
 }
-
-/// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
-/// each left row to the latest right row at-or-before its timestamp (per key).
-/// `DataFusion` can't lower `AsOf`, so schema resolution rewrites it to a plain
-/// join; execution uses the ASOF operator.
 #[tokio::test]
-async fn asof_join_in_materialized_view_emits_backward_match() {
+async fn distinct_aggregates_are_rejected_at_create() {
     let db = LaminarDB::open().unwrap();
-    db.execute(
-        "CREATE SOURCE quotes (sym VARCHAR, price DOUBLE, qts TIMESTAMP, \
-         WATERMARK FOR qts AS qts - INTERVAL '0' SECOND)",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE SOURCE trades (sym VARCHAR, tts TIMESTAMP, \
-         WATERMARK FOR tts AS tts - INTERVAL '0' SECOND)",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW enriched AS \
-         SELECT t.sym, q.price \
-         FROM trades t ASOF JOIN quotes q \
-         MATCH_CONDITION(t.tts >= q.qts) \
-         ON t.sym = q.sym",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-
-    let q = db.source_untyped("quotes").unwrap();
-    q.push_arrow(
-        RecordBatch::try_new(
-            q.schema().clone(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["x", "x", "x"])),
-                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
-                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                    1_000_000, 5_000_000, 8_000_000,
-                ])),
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    let t = db.source_untyped("trades").unwrap();
-    t.push_arrow(
-        RecordBatch::try_new(
-            t.schema().clone(),
-            vec![
-                // trade@3s -> latest quote qts<=3s = 10.0; trade@7s -> 20.0.
-                Arc::new(arrow::array::StringArray::from(vec!["x", "x"])),
-                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                    3_000_000, 7_000_000,
-                ])),
-            ],
-        )
-        .unwrap(),
-    )
-    .unwrap();
-
-    assert!(
-        poll_mv(&db, "enriched", 2).await >= 2,
-        "ASOF join in an MV should emit matches"
-    );
-    let batches = db
-        .ctx
-        .sql("SELECT price FROM enriched ORDER BY price")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    let prices: Vec<f64> = batches
-        .iter()
-        .flat_map(|b| {
-            let col = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Float64Array>()
-                .unwrap();
-            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
-        })
-        .collect();
-    assert_eq!(
-        prices,
-        vec![10.0, 20.0],
-        "backward ASOF should pick the latest quote at-or-before each trade"
-    );
-}
-
-/// Regression: `COUNT(DISTINCT)` must survive a checkpoint that lands while a
-/// window is still open. `Accumulator::state()` drains the DISTINCT set, and
-/// the window-checkpoint path calls it on the *live* accumulator — so before
-/// the rebuild-from-snapshot fix, a window spanning a checkpoint lost every
-/// distinct value seen before it (`COUNT(*)` was unaffected).
-#[tokio::test]
-async fn count_distinct_survives_midwindow_checkpoint() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = crate::LaminarConfig {
-        storage_dir: Some(dir.path().to_path_buf()),
-        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
-            interval_ms: None,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let db = LaminarDB::open_with_config(cfg).unwrap();
     db.execute(
         "CREATE SOURCE src (author VARCHAR, ts TIMESTAMP, \
          WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
     )
     .await
     .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW ct AS \
+    let error = db
+        .execute(
+            "CREATE STREAM distinct_authors AS \
+             SELECT COUNT(DISTINCT author) AS uniq FROM src",
+        )
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("DISTINCT aggregates are not supported"));
+    assert!(db.catalog.get_stream_entry("distinct_authors").is_none());
+
+    let error = db
+        .execute(
+            "CREATE MATERIALIZED VIEW ct AS \
          SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, \
          COUNT(*) AS n, COUNT(DISTINCT author) AS uniq \
          FROM src GROUP BY TUMBLE(ts, INTERVAL '5' SECOND) EMIT ON WINDOW CLOSE",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-    let h = db.source_untyped("src").unwrap();
-    let schema = h.schema().clone();
-    let push = |author: &str, ts: i64| {
-        h.push_arrow(
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(arrow::array::StringArray::from(vec![author])),
-                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts])),
-                ],
-            )
-            .unwrap(),
         )
-        .unwrap();
-    };
-    // author a, then a checkpoint mid-window, then author b; tick@6s closes
-    // [0,5s). The window [0,5s) saw two distinct authors across the checkpoint.
-    push("a", 100_000);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    db.checkpoint().await.unwrap();
-    push("b", 200_000);
-    push("z", 6_000_000);
-    poll_mv(&db, "ct", 1).await;
-    let batches = db
-        .ctx
-        .sql("SELECT n, uniq FROM ct WHERE n > 1")
         .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    let uniq: i64 = batches
-        .iter()
-        .flat_map(|b| {
-            let u = b
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .unwrap();
-            (0..b.num_rows()).map(|i| u.value(i)).collect::<Vec<_>>()
-        })
-        .max()
-        .expect("the [0,5s) window must emit");
-    assert_eq!(
-        uniq, 2,
-        "checkpoint must not drop distinct values seen before it"
-    );
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("DISTINCT aggregates are not supported"));
 }
 
 /// Regression: a windowed aggregate over a SELECT-list `UNNEST` (in a
@@ -9558,6 +12143,18 @@ async fn open_subscription_resolves_named_stream() {
     .expect("portal must produce a Batch within 2s")
     .expect("batch frame");
     assert_eq!(batch.num_rows(), 1);
+
+    // Publication appends to the subscription log before updating metrics. A receiver on another
+    // worker can therefore observe the batch in the narrow interval between those operations.
+    // Wait boundedly for the post-publication accounting instead of requiring the independent
+    // metric atomics to be transactionally visible with the portal frame.
+    let metrics_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while (db.stream_metrics("all_trades").unwrap().total_events != 1
+        || prom.events_emitted.get() != 1)
+        && std::time::Instant::now() < metrics_deadline
+    {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(db.stream_metrics("all_trades").unwrap().total_events, 1);
     assert_eq!(prom.events_emitted.get(), 1);
     assert_eq!(prom.events_dropped.get(), 0);

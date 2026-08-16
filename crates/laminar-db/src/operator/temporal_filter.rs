@@ -19,9 +19,7 @@ use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::TemporalFilterConfig;
 
 /// Live buffer encoded as one Arrow IPC batch.
-#[derive(
-    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct TemporalFilterCheckpoint {
     fingerprint: u64,
     last_frontier: i64,
@@ -184,8 +182,6 @@ pub(crate) struct TemporalFilterOperator {
     time_idx: usize,
     state: TfState,
     prom: Option<Arc<EngineMetrics>>,
-    // Reads LAMINAR_TEMPORAL_FILTER_HORIZON_MS (or LAMINAR_MAX_FUTURE_SKEW_MS); 0 disables.
-    max_future_ms: i64,
 }
 
 impl TemporalFilterOperator {
@@ -195,14 +191,6 @@ impl TemporalFilterOperator {
         cfg: TemporalFilterConfig,
         prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
-        let max_future_ms = match std::env::var("LAMINAR_TEMPORAL_FILTER_HORIZON_MS")
-            .or_else(|_| std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS"))
-        {
-            Ok(v) => v
-                .parse::<i64>()
-                .unwrap_or(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS),
-            Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
-        };
         Self {
             op_name: Arc::from(name),
             sql: sql.to_string(),
@@ -214,7 +202,6 @@ impl TemporalFilterOperator {
             time_idx: usize::MAX,
             state: TfState::default(),
             prom,
-            max_future_ms,
         }
     }
 
@@ -379,14 +366,6 @@ impl TemporalFilterOperator {
                 *dropped += 1; // already aged out
                 continue;
             }
-            if has_frontier
-                && self.max_future_ms > 0
-                && enter_key != i64::MIN
-                && enter_key > w.saturating_add(self.max_future_ms)
-            {
-                *dropped += 1; // beyond future horizon
-                continue;
-            }
             let row = BufferedRow {
                 batch: Arc::clone(&shared),
                 row_idx: u32::try_from(r).unwrap_or(u32::MAX),
@@ -489,6 +468,12 @@ impl TemporalFilterOperator {
 
 #[async_trait]
 impl GraphOperator for TemporalFilterOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::TemporalFilter,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -680,6 +665,12 @@ impl RejectingOperator {
 
 #[async_trait]
 impl GraphOperator for RejectingOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::Rejecting,
+        )
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -905,39 +896,6 @@ mod tests {
         assert_eq!(weights(&out), vec![1]);
         let out = op.process(&[vec![]], &[10_000_000]).await.unwrap();
         assert!(out.is_empty(), "upper-only bound never retracts");
-    }
-
-    #[tokio::test]
-    async fn future_horizon_bounds_the_buffer() {
-        // Upper bound only ⇒ far-future rows would otherwise pile up.
-        // Default LAMINAR_MAX_FUTURE_SKEW_MS = 5 min (300_000 ms).
-        let cfg = TemporalFilterConfig {
-            source_table: "s".into(),
-            time_col: "evt".into(),
-            proj_cols: Vec::new(),
-            lower: None,
-            upper: Some(TemporalBound {
-                off_ms: 0,
-                strict: true,
-            }),
-        };
-        let mut op = TemporalFilterOperator::new("tf", "SELECT * FROM s", cfg, None);
-        let s = src_schema();
-        // Frontier 1_000_000. Row 100s ahead is kept; row 600s ahead is
-        // beyond the 300s horizon and dropped un-emitted.
-        let out = op
-            .process(
-                &[vec![batch_evt(&s, &[1_100_000, 1_600_000])]],
-                &[1_000_000],
-            )
-            .await
-            .unwrap();
-        assert!(out.is_empty(), "neither has entered yet");
-        assert_eq!(
-            op.state.buffered_rows(),
-            1,
-            "only the in-horizon row is kept"
-        );
     }
 
     #[tokio::test]

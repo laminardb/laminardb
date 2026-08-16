@@ -54,8 +54,14 @@ impl std::io::Write for BoundedBytesWriter {
                 )
             })?;
         if next_len > self.bytes.capacity() {
+            let target_capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(next_len)
+                .min(self.limit);
             self.bytes
-                .try_reserve_exact(next_len - self.bytes.len())
+                .try_reserve_exact(target_capacity - self.bytes.len())
                 .map_err(std::io::Error::other)?;
             if self.bytes.capacity() < next_len || self.bytes.capacity() > self.limit {
                 return Err(std::io::Error::new(
@@ -302,6 +308,30 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
         assert_eq!(writer.bytes.len(), 8);
         assert!(writer.bytes.capacity() <= 8);
+    }
+
+    #[test]
+    fn bounded_writer_grows_geometrically_without_changing_bytes() {
+        const LIMIT: usize = 4096;
+        let expected: Vec<u8> = (0..LIMIT).map(|value| (value % 251) as u8).collect();
+        let mut writer = BoundedBytesWriter::new(LIMIT);
+        let mut capacity = writer.bytes.capacity();
+        let mut capacity_changes = 0;
+
+        for byte in &expected {
+            writer.write_all(std::slice::from_ref(byte)).unwrap();
+            if writer.bytes.capacity() != capacity {
+                capacity = writer.bytes.capacity();
+                capacity_changes += 1;
+            }
+            assert!(capacity <= LIMIT);
+        }
+
+        assert_eq!(writer.bytes, expected);
+        assert!(
+            capacity_changes <= 16,
+            "capacity changed {capacity_changes} times"
+        );
     }
 
     #[test]

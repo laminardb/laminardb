@@ -47,6 +47,24 @@ pub(crate) async fn compile(
     filter_sql: &str,
     schema: &SchemaRef,
 ) -> Result<Arc<dyn PhysicalExpr>, DbError> {
+    compile_inner(ctx, filter_sql, schema, false).await
+}
+
+/// Compile a sink predicate whose decisions must be identical when a row is later retracted.
+pub(crate) async fn compile_replay_immutable(
+    ctx: &SessionContext,
+    filter_sql: &str,
+    schema: &SchemaRef,
+) -> Result<Arc<dyn PhysicalExpr>, DbError> {
+    compile_inner(ctx, filter_sql, schema, true).await
+}
+
+async fn compile_inner(
+    ctx: &SessionContext,
+    filter_sql: &str,
+    schema: &SchemaRef,
+    require_replay_immutable: bool,
+) -> Result<Arc<dyn PhysicalExpr>, DbError> {
     let scoped = ScopedTable::new(ctx, schema)?;
     let sql = format!("SELECT * FROM {} WHERE {filter_sql}", scoped.name);
     let plan = ctx
@@ -55,6 +73,11 @@ pub(crate) async fn compile(
         .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}': {e}")))?
         .logical_plan()
         .clone();
+    if require_replay_immutable && !crate::sql_analysis::planned_functions_are_immutable(&plan) {
+        return Err(DbError::Pipeline(format!(
+            "filter '{filter_sql}' contains a planned function that is not replay-immutable"
+        )));
+    }
     // Capture the temp-table qualifier into the DFSchema before dropping `scoped`.
     let df_schema = DFSchema::try_from_qualified_schema(scoped.name.as_str(), schema.as_ref())
         .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (df_schema): {e}")))?;

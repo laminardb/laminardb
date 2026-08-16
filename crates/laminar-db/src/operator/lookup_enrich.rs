@@ -12,6 +12,7 @@ use arrow::compute::{concat, take};
 use arrow::row::RowConverter;
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
+use crossfire::AsyncTxTrait as _;
 use datafusion::prelude::SessionContext;
 use rustc_hash::FxHashMap;
 use tokio::runtime::Handle;
@@ -27,7 +28,7 @@ use laminar_sql::datafusion::{LookupTableRegistry, PartialLookupState, Registere
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{GraphOperator, InputFrontier, OperatorCheckpoint};
 
 const SUBMIT_CAPACITY: usize = 256;
 const RESULT_CAPACITY: usize = 256;
@@ -595,6 +596,12 @@ fn output_schema(
 
 #[async_trait]
 impl GraphOperator for LookupEnrichOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::LookupEnrich,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -664,16 +671,32 @@ impl GraphOperator for LookupEnrichOperator {
         Ok(())
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        self.pending
-            .values()
-            .map(|batch| batch.ingest_watermark)
-            .chain(self.replay.iter().map(|(watermark, _)| *watermark))
-            .min()
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(
+            self.pending
+                .values()
+                .map(|batch| batch.ingest_watermark)
+                .chain(self.replay.iter().map(|(watermark, _)| *watermark))
+                .min(),
+        )
     }
 
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        let resolved = self.resolved.as_ref();
+        let submit_ready = !self.unsubmitted.is_empty()
+            && resolved
+                .and_then(|resolved| resolved.submit_tx.as_ref())
+                .is_some_and(|sender| !sender.is_full());
+        let result_ready = resolved
+            .and_then(|resolved| resolved.result_rx.as_ref())
+            .is_some_and(|receiver| !receiver.is_empty());
+        let replay_ready =
+            !self.replay.is_empty() && self.retained_pending_rows() < self.max_in_flight;
+        submit_ready || result_ready || replay_ready
     }
 }
 
@@ -854,7 +877,12 @@ mod tests {
                 .sum::<usize>(),
             3
         );
-        assert_eq!(op.watermark_hold(), Some(42));
+        let frontier = op.output_frontier(InputFrontier {
+            watermark: Some(100),
+            idle: true,
+        });
+        assert_eq!(frontier.watermark, Some(42));
+        assert!(!frontier.idle);
         assert!(!op.wants_input());
     }
 

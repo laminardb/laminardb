@@ -1,5 +1,36 @@
 use super::*;
 
+#[tokio::test]
+async fn cluster_entry_rejects_invalid_temporal_retention_before_discovery() {
+    let mut config: ServerConfig = toml::from_str(
+        r#"
+node_id = "node-a"
+
+[server]
+mode = "cluster"
+
+[discovery]
+strategy = "static"
+seeds = ["node-a:7946"]
+"#,
+    )
+    .unwrap();
+    config.server.temporal_join_idle_history_retention =
+        Some(std::time::Duration::from_nanos(999_999));
+    let cluster_config = ClusterConfig::from_server_config(&config).unwrap().unwrap();
+
+    let error = match start_cluster(config, cluster_config, PathBuf::from("unused.toml")).await {
+        Ok(_) => panic!("invalid temporal retention reached cluster discovery"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("temporal_join_idle_history_retention must be at least 1ms"),
+        "{error}"
+    );
+}
+
 struct DelayedControlPutStore {
     inner: Arc<dyn object_store::ObjectStore>,
     blocked_path: parking_lot::Mutex<Option<object_store::path::Path>>,
@@ -343,16 +374,64 @@ fn test_formation_timeout_includes_counts() {
 async fn terminal_process_signal_preempts_the_os_shutdown_wait() {
     let terminal = tokio_util::sync::CancellationToken::new();
     terminal.cancel();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(std::future::pending::<()>());
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(std::future::pending::<()>());
 
     let trigger = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        wait_for_cluster_shutdown_trigger(&terminal),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
     )
     .await
     .expect("terminal process signal must wake shutdown promptly")
     .unwrap();
 
     assert_eq!(trigger, ClusterShutdownTrigger::ProcessLeaseLost);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+}
+
+#[tokio::test]
+async fn exited_http_api_triggers_cluster_runtime_shutdown() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(std::future::pending::<()>());
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(async {});
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
+    )
+    .await
+    .expect("an exited HTTP API task must wake cluster shutdown")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::HttpApiExited);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+}
+
+#[tokio::test]
+async fn exited_leader_lease_manager_triggers_cluster_runtime_shutdown() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(async {});
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(std::future::pending::<()>());
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &[]),
+    )
+    .await
+    .expect("an exited leader lease manager must wake cluster shutdown")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::LeaderLeaseExited);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
 }
 
 #[tokio::test]
@@ -390,6 +469,31 @@ async fn process_lease_terminal_monitor_observes_the_monotonic_deadline() {
         .await
         .expect("monotonic expiry must publish terminal lease loss");
     monitor.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_process_terminal_is_synchronously_not_live() {
+    let node = NodeId(48);
+    let owner = uuid::Uuid::from_u128(488);
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let acquired = acquire_test_process_lease(store, node, owner, 10_000).await;
+    let (_live_tx, live_rx) = watch::channel(true);
+    let terminal = tokio_util::sync::CancellationToken::new();
+    let mut process_lease = ProcessLeaseRuntime {
+        acquired,
+        deadline: live_test_process_deadline(),
+        live_rx,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        terminal: terminal.clone(),
+        renewal_task: tokio::spawn(std::future::pending::<()>()),
+        terminal_task: tokio::spawn(std::future::pending::<()>()),
+        fence_task: None,
+    };
+
+    assert!(process_lease.is_live());
+    terminal.cancel();
+    assert!(!process_lease.is_live());
+    assert!(!process_lease.disarm_for_shutdown());
 }
 
 #[tokio::test]
@@ -431,8 +535,8 @@ async fn intentional_process_lease_disarm_cannot_run_the_loss_fence() {
     };
 
     assert!(process_lease.disarm_for_shutdown());
-    deadline_observer.fence();
-    terminal_observer.cancel();
+    assert!(!deadline_observer.is_live());
+    assert!(terminal_observer.is_cancelled());
 
     let tasks = [terminal_abort, fence_abort, renewal_abort];
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -463,6 +567,42 @@ async fn rebalance_tasks_receive_a_graceful_shutdown_before_abort() {
 
     assert!(tasks.is_empty());
     assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn bootstrap_rebalance_stop_joins_every_task_after_abort() {
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let task_dropped = Arc::clone(&dropped);
+    let pending = tokio::spawn(async move {
+        let _drop_flag = DropFlag(task_dropped);
+        let _ = started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    started_rx.await.unwrap();
+
+    let failed = tokio::spawn(async {
+        panic!("intentional bootstrap task failure");
+    });
+    while !failed.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let mut tasks = vec![failed, pending];
+
+    assert!(
+        !stop_bootstrap_rebalance_tasks(&mut tasks, &shutdown, std::time::Duration::ZERO).await
+    );
+    assert!(tasks.is_empty());
+    assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -503,16 +643,10 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         &[participant],
         Arc::clone(&control),
         Arc::clone(&store),
-        Arc::clone(&store),
         std::time::Duration::from_secs(1),
     )
     .await
     .unwrap();
-    let state_backend = cluster_state_backend(
-        verified_namespaces.state_store(),
-        node,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
-    );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
@@ -530,7 +664,6 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .verified_cluster_namespaces(verified_namespaces)
-        .state_backend(state_backend)
         .vnode_registry(vnode_registry)
         .build()
         .await
@@ -542,7 +675,6 @@ async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
         id: node,
         name: "drop-test".into(),
         rpc_address: "127.0.0.1:0".into(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -664,16 +796,10 @@ async fn process_lease_loss_revokes_http_controller_and_database_authority() {
         &[participant],
         Arc::clone(&control),
         Arc::clone(&store),
-        Arc::clone(&store),
         std::time::Duration::from_secs(1),
     )
     .await
     .unwrap();
-    let state_backend = cluster_state_backend(
-        verified_namespaces.state_store(),
-        node,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
-    );
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
@@ -702,7 +828,6 @@ async fn process_lease_loss_revokes_http_controller_and_database_authority() {
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .verified_cluster_namespaces(verified_namespaces)
-        .state_backend(state_backend)
         .vnode_registry(vnode_registry)
         .build()
         .await
@@ -778,7 +903,6 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     let config = ServerConfig {
         server: server_config,
-        state: laminar_core::state::StateBackendConfig::default(),
         checkpoint: crate::config::CheckpointSection::default(),
         supervision: Default::default(),
         sources: Vec::new(),
@@ -817,36 +941,6 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     assert!(matches!(error, ClusterStartupError::HttpStartup(_)));
     assert!(!controller.live_instances().contains(&node));
-}
-
-#[tokio::test]
-async fn cluster_state_seal_records_runtime_node_id() {
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let node_id = NodeId(73);
-    let backend = cluster_state_backend(
-        Arc::clone(&store),
-        node_id,
-        laminar_core::state::LOCAL_KEY_GROUP_COUNT,
-    );
-    let attempt = laminar_core::state::CheckpointAttempt::canonical(17);
-
-    backend
-        .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"state"))
-        .await
-        .unwrap();
-    assert!(backend
-        .seal_checkpoint(attempt, None, &[0], &[])
-        .await
-        .unwrap());
-
-    let path = object_store::path::Path::from(format!(
-        "state-v2/epoch={}/checkpoint={}/_SEAL",
-        attempt.epoch, attempt.checkpoint_id
-    ));
-    let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
-    let seal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let expected = node_id.to_string();
-    assert_eq!(seal["instance_id"].as_str(), Some(expected.as_str()));
 }
 
 #[tokio::test]
@@ -1031,7 +1125,8 @@ async fn superseded_process_phase_cannot_clobber_replacement_release() {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
     use laminar_core::cluster::control::{
         ClusterController, ClusterKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome,
-        ProcessLeaseAuthority, RecoverPhase, RecoveryAnnouncement, RecoveryFault, RecoveryRound,
+        ProcessLeaseAuthority, RecoverPhase, RecoveryAnnouncement, RecoveryFaultReportOutcome,
+        RecoveryRound,
     };
 
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -1092,6 +1187,18 @@ async fn superseded_process_phase_cannot_clobber_replacement_release() {
         .set_leader_lease_watch(old_leader_rx, old_owner, old_deadline)
         .unwrap();
     old_controller.set_leader_lease_store(Arc::clone(&authority));
+    let old_fault_request = old_controller.next_recovery_fault_request().unwrap();
+    assert_eq!(
+        old_controller
+            .report_fault(old_fault_request)
+            .await
+            .unwrap(),
+        RecoveryFaultReportOutcome::Active
+    );
+    let old_fault_inventory = old_controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap();
 
     let old_participant = CheckpointParticipant {
         node_id: node.0,
@@ -1102,11 +1209,8 @@ async fn superseded_process_phase_cannot_clobber_replacement_release() {
         old_leader.proof(),
         CheckpointAssignmentFence::from_owner_map(7, &[node.0], vec![old_participant]).unwrap(),
         Vec::new(),
-        61,
-        vec![RecoveryFault {
-            reporter: node,
-            sequence: 1,
-        }],
+        old_fault_inventory.revision(),
+        old_fault_inventory.faults().to_vec(),
     )
     .unwrap();
     old_controller.publish_checkpoint_assignment_fence(Some(old_round.assignment_fence.clone()));
@@ -1186,6 +1290,20 @@ async fn superseded_process_phase_cannot_clobber_replacement_release() {
         )
         .unwrap();
     replacement_controller.set_leader_lease_store(authority);
+    let replacement_fault_request = replacement_controller
+        .next_recovery_fault_request()
+        .unwrap();
+    assert_eq!(
+        replacement_controller
+            .report_fault(replacement_fault_request)
+            .await
+            .unwrap(),
+        RecoveryFaultReportOutcome::Active
+    );
+    let replacement_fault_inventory = replacement_controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap();
 
     let replacement_participant = CheckpointParticipant {
         node_id: node.0,
@@ -1197,11 +1315,8 @@ async fn superseded_process_phase_cannot_clobber_replacement_release() {
         CheckpointAssignmentFence::from_owner_map(8, &[node.0], vec![replacement_participant])
             .unwrap(),
         Vec::new(),
-        62,
-        vec![RecoveryFault {
-            reporter: node,
-            sequence: 2,
-        }],
+        replacement_fault_inventory.revision(),
+        replacement_fault_inventory.faults().to_vec(),
     )
     .unwrap();
     replacement_controller
@@ -1418,7 +1533,6 @@ async fn object_store_control_scan_bounds_concurrency_and_preserves_order() {
             id: NodeId(u64::try_from(raw_id).unwrap()),
             name: format!("node-{raw_id}"),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state: NodeState::Active,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,
@@ -1847,7 +1961,6 @@ async fn assignment_seed_rejects_peer_tag_that_is_not_durable_lease_owner() {
         id: peer_id,
         name: "peer".into(),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Joining,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -1898,7 +2011,6 @@ async fn initial_assignment_roster_excludes_zero_vnode_workers() {
             id: *node,
             name: format!("node-{}", node.0),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state: NodeState::Joining,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,
@@ -1929,6 +2041,178 @@ async fn initial_assignment_roster_excludes_zero_vnode_workers() {
         2,
         "one vnode across three live workers must leave two workers idle"
     );
+}
+
+#[tokio::test]
+async fn same_formation_three_node_genesis_is_preinstalled_but_owner_replacement_is_not() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+
+    let nodes = [NodeId(1), NodeId(2), NodeId(3)];
+    let creator_peers: Vec<NodeInfo> = nodes[1..]
+        .iter()
+        .map(|node| NodeInfo {
+            id: *node,
+            name: format!("node-{}", node.0),
+            rpc_address: String::new(),
+            state: NodeState::Joining,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        })
+        .collect();
+    let participants: Vec<_> = nodes
+        .iter()
+        .map(|node| CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node.0)),
+        })
+        .collect();
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let deadline =
+        laminar_core::cluster::control::LeaseDeadline::live_for(std::time::Duration::from_secs(30));
+
+    let (creator, snapshots) = resolve_vnode_assignment(
+        nodes[0],
+        &creator_peers,
+        64,
+        Arc::clone(&store),
+        &participants,
+        &deadline,
+    )
+    .await
+    .unwrap();
+    let stored = snapshots.load().await.unwrap().unwrap();
+    assert_eq!(creator.assignment_version(), 1);
+
+    let mut different_timestamp = stored.clone();
+    different_timestamp.updated_at_ms = different_timestamp.updated_at_ms.saturating_add(1);
+    assert!(is_same_formation_genesis(&different_timestamp, &stored));
+
+    let observer_peers: Vec<NodeInfo> = [nodes[0], nodes[2]]
+        .into_iter()
+        .map(|node| NodeInfo {
+            id: node,
+            name: format!("node-{}", node.0),
+            rpc_address: String::new(),
+            state: NodeState::Joining,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        })
+        .collect();
+    let (peer, _) = resolve_vnode_assignment(
+        nodes[1],
+        &observer_peers,
+        64,
+        Arc::clone(&store),
+        &participants,
+        &deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(peer.assignment_version(), stored.version);
+    assert_eq!(peer.snapshot().as_ref(), creator.snapshot().as_ref());
+
+    let replaced_node = stored.participants[0].node_id;
+    let mut replacement_participants = participants.clone();
+    replacement_participants
+        .iter_mut()
+        .find(|participant| participant.node_id == replaced_node)
+        .unwrap()
+        .boot_incarnation = uuid::Uuid::from_u128(10_000 + u128::from(replaced_node));
+    let (replacement, _) = resolve_vnode_assignment(
+        nodes[1],
+        &observer_peers,
+        64,
+        store,
+        &replacement_participants,
+        &deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replacement.assignment_version(), 0);
+    assert!(replacement
+        .snapshot()
+        .iter()
+        .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED));
+
+    let mut changed_map = stored.clone();
+    *changed_map.vnodes.get_mut(&0).unwrap() = laminar_core::state::NodeId(999);
+    assert!(!is_same_formation_genesis(&changed_map, &stored));
+    let mut changed_process = stored.clone();
+    changed_process.participants[0].boot_incarnation = uuid::Uuid::from_u128(99_999);
+    assert!(!is_same_formation_genesis(&changed_process, &stored));
+    let mut later_generation = stored.clone();
+    later_generation.version = 2;
+    assert!(!is_same_formation_genesis(&later_generation, &stored));
+}
+
+#[tokio::test]
+async fn initial_assignment_cas_loser_does_not_preinstall_a_different_formation() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+
+    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let delayed = Arc::new(DelayedControlPutStore::new(inner));
+    delayed.block_once(object_store::path::Path::from(
+        "control/assignment-snapshots/v00000000000000000001.json",
+    ));
+
+    let loser_node = NodeId(1);
+    let loser_participants = vec![CheckpointParticipant {
+        node_id: loser_node.0,
+        boot_incarnation: uuid::Uuid::from_u128(11),
+    }];
+    let loser_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(30),
+    ));
+    let loser_store: Arc<dyn object_store::ObjectStore> = delayed.clone();
+    let loser = tokio::spawn(async move {
+        resolve_vnode_assignment(
+            loser_node,
+            &[],
+            1,
+            loser_store,
+            &loser_participants,
+            loser_deadline.as_ref(),
+        )
+        .await
+        .unwrap()
+    });
+    delayed.wait_until_blocked().await;
+
+    let winner_node = NodeId(2);
+    let winner_participants = [CheckpointParticipant {
+        node_id: winner_node.0,
+        boot_incarnation: uuid::Uuid::from_u128(22),
+    }];
+    let winner_deadline =
+        laminar_core::cluster::control::LeaseDeadline::live_for(std::time::Duration::from_secs(30));
+    let winner_store: Arc<dyn object_store::ObjectStore> = delayed.clone();
+    let (winner, _) = resolve_vnode_assignment(
+        winner_node,
+        &[],
+        1,
+        winner_store,
+        &winner_participants,
+        &winner_deadline,
+    )
+    .await
+    .unwrap();
+    assert_eq!(winner.assignment_version(), 1);
+    assert_eq!(
+        winner.snapshot().as_ref(),
+        &[laminar_core::state::NodeId(2)]
+    );
+
+    delayed.release();
+    let (loser, snapshots) = loser.await.unwrap();
+    assert_eq!(
+        snapshots.load().await.unwrap().unwrap().participants,
+        winner_participants
+    );
+    assert_eq!(loser.assignment_version(), 0);
+    assert!(loser
+        .snapshot()
+        .iter()
+        .all(|owner| *owner == laminar_core::state::NodeId::UNASSIGNED));
 }
 
 #[tokio::test]
@@ -1989,7 +2273,7 @@ async fn startup_waits_for_exact_local_assignment_certificate() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        wait_for_startup_assignment_fence(&controller, &registry),
+        wait_for_startup_assignment_fence(&controller, &registry, &[]),
     )
     .await
     .expect("startup wait did not observe the assignment certificate")
@@ -2011,7 +2295,6 @@ async fn startup_rechecks_assignment_certificate_when_membership_becomes_active(
         id: peer,
         name: "peer".into(),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Joining,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -2040,7 +2323,7 @@ async fn startup_rechecks_assignment_certificate_when_membership_becomes_active(
         .unwrap(),
     ));
 
-    let wait = wait_for_startup_assignment_fence(&controller, &registry);
+    let wait = wait_for_startup_assignment_fence(&controller, &registry, &[]);
     tokio::pin!(wait);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
@@ -2212,7 +2495,6 @@ async fn remote_startup_requires_a_live_exact_process_proof_and_resets_with_the_
             id: node,
             name: format!("node-{}", node.0),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state: NodeState::Active,
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,

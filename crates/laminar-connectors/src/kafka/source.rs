@@ -1,9 +1,10 @@
 //! Kafka source connector: consumes topics via rdkafka's `StreamConsumer`,
 //! deserializes with pluggable formats, and yields Arrow `RecordBatch`es.
 
-use arrow_schema::SchemaRef;
+use arrow_array::builder::BinaryBuilder;
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, StringArray, UInt32Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
-use laminar_core::checkpoint::CommittedSourceHandoff;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::Message;
@@ -16,12 +17,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tracing::{debug, info, warn};
 
-use crate::checkpoint::SourceCheckpoint;
+use crate::checkpoint::{SourceCheckpoint, SourceCheckpointDelta};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
-    SourceDrainResolution, SourcePosition, SourceStart, SourceTopology,
+    SourceDrainResolution, SourceInputMode, SourceMutation, SourcePosition,
+    SourceRowPositionCapability, SourceRowPositions, SourceStart, SourceTopology,
 };
 use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
@@ -178,7 +180,6 @@ const KAFKA_BACKGROUND_CLOSE_BUDGET: std::time::Duration = std::time::Duration::
 const KAFKA_DRAIN_EXECUTION_PENDING: u8 = 0;
 const KAFKA_DRAIN_EXECUTION_STARTED: u8 = 1;
 const KAFKA_DRAIN_EXECUTION_CANCELLED: u8 = 2;
-const KAFKA_PARTITION_INVENTORY_METADATA: &str = "kafka.partition.inventory.v1";
 const KAFKA_POSITION_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
 
@@ -433,7 +434,7 @@ struct KafkaStartPlan {
     config: KafkaSourceConfig,
     delivery: DeliveryGuarantee,
     is_resume: bool,
-    resume_inventory: Option<KafkaPartitionSet>,
+    resume_input_channels: Option<Vec<Vec<u8>>>,
     resume_baselines: KafkaPartitionBaselines,
 }
 type KafkaPartitionRoutes = std::collections::HashMap<Arc<str>, Arc<[u32]>>;
@@ -567,11 +568,10 @@ fn kafka_bootstrap_is_unassigned(
         super::vnode_routing::validate_owner_map(published.owners(), self_id)?;
         return Ok(false);
     }
-    if published.has_committed_handoff()
-        || !published
-            .owners()
-            .iter()
-            .all(laminar_core::state::NodeId::is_unassigned)
+    if !published
+        .owners()
+        .iter()
+        .all(laminar_core::state::NodeId::is_unassigned)
     {
         return Err(ConnectorError::ConfigurationError(
             "Kafka vnode assignment version 0 must be the fully unassigned bootstrap publication"
@@ -824,43 +824,11 @@ async fn resolve_kafka_reader_drain(
     Ok(())
 }
 
-fn decode_committed_kafka_handoff(
-    handoff: &CommittedSourceHandoff,
-    source: &str,
-) -> Result<(OffsetTracker, KafkaPartitionBaselines), ConnectorError> {
-    let source_state = handoff.source(source).ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "committed checkpoint {:?} has no handoff state for Kafka source '{source}'",
-            handoff.attempt()
-        ))
-    })?;
-    let checkpoint = source_state.checkpoint();
-    let assignment_version = checkpoint.source_assignment_version.ok_or_else(|| {
-        ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff is missing its source assignment version"
-        ))
-    })?;
-    let checkpoint_assignment_version = NonZeroU64::new(handoff.checkpoint_assignment_version())
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "Kafka source '{source}' handoff has a zero checkpoint assignment version"
-            ))
-        })?;
-    if assignment_version != checkpoint_assignment_version {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka source '{source}' handoff assignment version {assignment_version} does not match checkpoint fence {checkpoint_assignment_version}",
-        )));
-    }
-
-    let offsets = OffsetTracker::try_from_connector_checkpoint(checkpoint)?;
-    let baselines = decode_partition_baselines_from_offsets(&checkpoint.offsets)?;
-    Ok((offsets, baselines))
-}
-
 #[derive(Clone, Default)]
 struct KafkaAssignmentPublication {
     assignment_version: u64,
     owned_partitions: Arc<KafkaPartitionSet>,
+    input_channels: Arc<[Vec<u8>]>,
     baselines: KafkaRotationBaselines,
 }
 
@@ -868,11 +836,13 @@ impl KafkaAssignmentPublication {
     fn new(
         assignment_version: u64,
         owned_partitions: Arc<KafkaPartitionSet>,
+        input_channels: Arc<[Vec<u8>]>,
         baselines: KafkaRotationBaselines,
     ) -> Self {
         Self {
             assignment_version,
             owned_partitions,
+            input_channels,
             baselines,
         }
     }
@@ -1042,6 +1012,8 @@ pub struct KafkaSource {
     /// Canonical non-vnode manual assignment used by local guaranteed, specific, and timestamp
     /// starts. Checkpointing trusts this engine-owned inventory, never a fallible broker query.
     manual_topic_partitions: KafkaPartitionSet,
+    /// Cached physical-channel inventory for stable engine-owned local assignments.
+    manual_input_channels: Arc<[Vec<u8>]>,
     /// Concrete next-to-read position captured before intake for every engine-owned partition.
     /// It remains authoritative until that partition has an accepted-record offset.
     manual_partition_baselines: KafkaPartitionBaselines,
@@ -1054,6 +1026,8 @@ pub struct KafkaSource {
     /// Baseline publication is immutable within one assignment version, so this
     /// keeps that cleanup off the steady-state poll path.
     applied_rotation_baseline_version: Option<u64>,
+    /// Assignment whose complete batch cursor has already been produced.
+    batch_cursor_assignment_version: Option<u64>,
     /// Assignment version whose Kafka consumer rebind and durable cursor
     /// validation have completed. Barriers stay fenced while this trails the
     /// registry's atomically published version.
@@ -1174,12 +1148,14 @@ impl KafkaSource {
             vnode_assignment: None,
             vnode_partition_routes: KafkaPartitionRoutes::new(),
             manual_topic_partitions: std::collections::HashSet::new(),
+            manual_input_channels: Arc::from([]),
             manual_partition_baselines: std::collections::HashMap::new(),
             assignment_publication: Arc::new(Mutex::new(Arc::new(
                 KafkaAssignmentPublication::default(),
             ))),
             rotation_partition_baseline_count: Arc::new(AtomicUsize::new(0)),
             applied_rotation_baseline_version: None,
+            batch_cursor_assignment_version: None,
             reconciled_assignment_version: Arc::new(AtomicU64::new(0)),
             last_avro_schema: None,
             poll_payloads: Vec::new(),
@@ -1436,7 +1412,7 @@ impl KafkaSource {
                         // A source can miss an intermediate self→other→self publication while
                         // fenced (for example consecutive dead-node shedding). The latest owner
                         // set then matches the live Kafka assignment even though the partition
-                        // must be unassigned and re-seeked to the latest durable handoff.
+                        // must be unassigned and re-seeked to its durable checkpoint position.
                         let current_set = match kafka_partition_set(&current) {
                             Ok(current) => current,
                             Err(error) => {
@@ -1475,29 +1451,6 @@ impl KafkaSource {
                         }
 
                         let offsets = lock_or_recover(&reassign_snapshot).clone();
-                        let (resume, resume_baselines) = if let Some(handoff) =
-                            published.committed_source_handoff()
-                        {
-                            match decode_committed_kafka_handoff(handoff, source_name.as_ref()) {
-                                Ok(state) => state,
-                                Err(error) => {
-                                    warn!(
-                                        version,
-                                        source = source_name.as_ref(),
-                                        error = %error,
-                                        "Kafka source rejected durable checkpoint handoff"
-                                    );
-                                    publish_reader_fault(
-                                        &reader_fault,
-                                        &data_ready,
-                                        format!("invalid durable checkpoint handoff: {error}"),
-                                    );
-                                    return;
-                                }
-                            }
-                        } else {
-                            (OffsetTracker::new(), KafkaPartitionBaselines::new())
-                        };
                         let mut to_add = TopicPartitionList::new();
                         let mut acquired_positions = KafkaPartitionBaselines::new();
                         for (topic, partition) in owned_set
@@ -1506,13 +1459,10 @@ impl KafkaSource {
                         {
                             let p = *partition;
                             let offset = if let Some(next) = match acquired_numeric_position(
-                                &resume,
-                                &resume_baselines,
                                 &offsets,
                                 &reassign_baselines,
                                 topic.as_str(),
                                 p,
-                                !require_durable_baselines || !published.has_committed_handoff(),
                             ) {
                                 Ok(position) => position,
                                 Err(error) => {
@@ -1520,12 +1470,12 @@ impl KafkaSource {
                                         topic = topic.as_str(),
                                         partition = p,
                                         %error,
-                                        "Kafka source rejected an invalid handoff position"
+                                    "Kafka source rejected an invalid checkpoint position"
                                     );
                                     publish_reader_fault(
                                         &reader_fault,
                                         &data_ready,
-                                        format!("invalid handoff position: {error}"),
+                                        format!("invalid checkpoint position: {error}"),
                                     );
                                     return;
                                 }
@@ -1569,7 +1519,7 @@ impl KafkaSource {
                                 warn!(
                                     topic = topic.as_str(),
                                     partition = p,
-                                    "acquired partition has no handoff or local offset; \
+                                    "acquired partition has no checkpoint or local offset; \
                                          falling back to the startup default"
                                 );
                                 reassign_default_offset
@@ -1593,8 +1543,19 @@ impl KafkaSource {
                         }
 
                         let owned_set = Arc::new(owned_set);
+                        let input_channels = match kafka_input_channels(&source_name, &owned_set) {
+                            Ok(input_channels) => input_channels,
+                            Err(error) => {
+                                publish_reader_fault(
+                                    &reader_fault,
+                                    &data_ready,
+                                    format!("invalid rotated Kafka input channels: {error}"),
+                                );
+                                return;
+                            }
+                        };
 
-                        // Registry ownership is already committed. Publish the handoff cut before
+                        // Registry ownership is already committed. Publish the assignment cut before
                         // the first await so a concurrent checkpoint cannot resurrect a stale
                         // position from this node's earlier ownership stint.
                         {
@@ -1608,6 +1569,7 @@ impl KafkaSource {
                             *current = Arc::new(KafkaAssignmentPublication::new(
                                 version,
                                 Arc::clone(&owned_set),
+                                input_channels,
                                 updated,
                             ));
                             rotation_baseline_count.store(count, Ordering::Release);
@@ -1628,7 +1590,7 @@ impl KafkaSource {
                                     warn!(
                                         version,
                                         %error,
-                                        "Kafka source could not validate acquired handoff positions; rotation will retry"
+                                        "Kafka source could not validate acquired positions; rotation will retry"
                                     );
                                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                                     continue;
@@ -1643,12 +1605,12 @@ impl KafkaSource {
                                 warn!(
                                     version,
                                     %error,
-                                    "Kafka source rejected an expired handoff position"
+                                    "Kafka source rejected an expired checkpoint position"
                                 );
                                 publish_reader_fault(
                                     &reader_fault,
                                     &data_ready,
-                                    format!("expired handoff position: {error}"),
+                                    format!("expired checkpoint position: {error}"),
                                 );
                                 return;
                             }
@@ -2467,6 +2429,7 @@ impl KafkaSource {
             &publication.baselines,
             &publication.owned_partitions,
         );
+        checkpoint.set_input_channels(Arc::clone(&publication.input_channels))?;
         let assignment_version =
             NonZeroU64::new(publication.assignment_version).ok_or_else(|| {
                 ConnectorError::InvalidState {
@@ -2478,7 +2441,60 @@ impl KafkaSource {
         Ok(checkpoint)
     }
 
-    fn capture_non_vnode_checkpoint(&self) -> SourceCheckpoint {
+    fn capture_vnode_checkpoint_delta(
+        &self,
+        publication: &KafkaAssignmentPublication,
+    ) -> Result<SourceCheckpointDelta, ConnectorError> {
+        let assignment_version =
+            NonZeroU64::new(publication.assignment_version).ok_or_else(|| {
+                ConnectorError::InvalidState {
+                    expected: "a positive vnode assignment version".into(),
+                    actual: publication.assignment_version.to_string(),
+                }
+            })?;
+        let mut touched = rustc_hash::FxHashMap::<(&str, i32), i64>::default();
+        touched.reserve(self.poll_staged_offsets.len());
+        for (topic, partition, offset) in &self.poll_staged_offsets {
+            touched
+                .entry((topic.as_ref(), *partition))
+                .and_modify(|current| *current = (*current).max(*offset))
+                .or_insert(*offset);
+        }
+        let mut changes = std::collections::HashMap::with_capacity(touched.len());
+        for ((topic, partition), accepted_offset) in touched {
+            let offset = self.offsets.get(topic, partition).ok_or_else(|| {
+                ConnectorError::Internal(format!(
+                    "accepted Kafka partition '{topic}-{partition}' has no tracked offset"
+                ))
+            })?;
+            changes.insert(format!("{topic}:{partition}"), Some(offset.to_string()));
+
+            let previous_rotation =
+                rotation_partition_baseline(&publication.baselines, topic, partition);
+            let current_rotation = previous_rotation.filter(|next| accepted_offset < *next);
+            if previous_rotation != current_rotation {
+                let manual = self
+                    .manual_partition_baselines
+                    .get(&(topic.to_owned(), partition))
+                    .copied();
+                let previous_baseline = previous_rotation.or(manual);
+                let current_baseline = current_rotation.or(manual);
+                if previous_baseline != current_baseline {
+                    changes.insert(
+                        partition_baseline_key(topic, partition),
+                        current_baseline.map(|next| next.to_string()),
+                    );
+                }
+            }
+        }
+        SourceCheckpointDelta::new(
+            assignment_version,
+            Arc::clone(&publication.input_channels),
+            changes,
+        )
+    }
+
+    fn capture_non_vnode_checkpoint(&self) -> Result<SourceCheckpoint, ConnectorError> {
         if !self.manual_topic_partitions.is_empty() {
             let mut checkpoint = self.offsets.to_checkpoint_for_partitions(
                 self.manual_topic_partitions
@@ -2490,24 +2506,26 @@ impl KafkaSource {
                 &self.manual_partition_baselines,
                 &self.manual_topic_partitions,
             );
-            checkpoint.set_metadata(
-                KAFKA_PARTITION_INVENTORY_METADATA,
-                encode_partition_inventory(&self.manual_topic_partitions),
-            );
-            return checkpoint;
+            checkpoint.set_input_channels(Arc::clone(&self.manual_input_channels))?;
+            return Ok(checkpoint);
         }
         let assigned = lock_or_recover(&self.rebalance_state).assignment_snapshot();
-        self.offsets.to_checkpoint_for_partitions(
+        let mut checkpoint = self.offsets.to_checkpoint_for_partitions(
             assigned
                 .iter()
                 .map(|(topic, partition)| (topic.as_str(), *partition)),
-        )
+        );
+        checkpoint.set_input_channels(kafka_input_channels(
+            self.source_name.as_ref(),
+            assigned.as_ref(),
+        )?)?;
+        Ok(checkpoint)
     }
 
     fn try_capture_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
         self.check_reader_health("capturing a checkpoint cursor")?;
         let Some((registry, _)) = &self.vnode_assignment else {
-            return Ok(Some(self.capture_non_vnode_checkpoint()));
+            return self.capture_non_vnode_checkpoint().map(Some);
         };
         // Cursor serialization runs outside the registry and publication locks. A final fence
         // check discards the candidate if ownership rotates while offsets are being encoded.
@@ -2533,20 +2551,13 @@ fn tpl_of<'a>(parts: impl Iterator<Item = &'a (Arc<str>, i32)>) -> TopicPartitio
 /// Partition list for the initial `start()` assignment of a vnode-assigned source.
 /// Owned partitions start at their checkpointed offset + 1, otherwise at
 /// `default_offset`. Rotations rebind incrementally in the reader loop.
-#[derive(Clone, Copy)]
-struct VnodeResumeCursors<'a> {
-    local_offsets: &'a OffsetTracker,
-    handoff_offsets: &'a OffsetTracker,
-    local_baselines: &'a KafkaPartitionBaselines,
-    handoff_baselines: &'a KafkaPartitionBaselines,
-}
-
 fn build_vnode_assignment_tpl(
     source_identity: &str,
     assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
     topic_meta: &[(Arc<str>, i32)],
-    cursors: VnodeResumeCursors<'_>,
+    offsets: &OffsetTracker,
+    baselines: &KafkaPartitionBaselines,
     default_offset: rdkafka::Offset,
 ) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
@@ -2558,13 +2569,7 @@ fn build_vnode_assignment_tpl(
             assignment,
             self_id,
         )? {
-            let offset = match cursors
-                .local_offsets
-                .get(topic.as_ref(), partition)
-                // No local offset → handed to us in a rotation; fall back to the
-                // previous owner's staged position, not auto.offset.reset.
-                .or_else(|| cursors.handoff_offsets.get(topic.as_ref(), partition))
-            {
+            let offset = match offsets.get(topic.as_ref(), partition) {
                 Some(offset) => {
                     rdkafka::Offset::Offset(offset.checked_add(1).ok_or_else(|| {
                         ConnectorError::ConfigurationError(format!(
@@ -2572,10 +2577,8 @@ fn build_vnode_assignment_tpl(
                         ))
                     })?)
                 }
-                None => cursors
-                    .handoff_baselines
+                None => baselines
                     .get(&(topic.to_string(), partition))
-                    .or_else(|| cursors.local_baselines.get(&(topic.to_string(), partition)))
                     .map_or(default_offset, |next| rdkafka::Offset::Offset(*next)),
             };
             tpl.add_partition_offset(topic.as_ref(), partition, offset)
@@ -2589,42 +2592,23 @@ fn build_vnode_assignment_tpl(
     Ok(tpl)
 }
 
-/// Resolves the numeric next-to-read position for an acquired vnode partition.
-/// Durable handoff state always outranks a stale cursor from this node's prior
-/// ownership stint. Guaranteed delivery never falls back to that local cursor.
+/// Resolves the numeric next-to-read position for an acquired vnode partition from this
+/// process's durable checkpoint state.
 fn acquired_numeric_position(
-    handoff: &OffsetTracker,
-    handoff_baselines: &KafkaPartitionBaselines,
     local: &OffsetTracker,
     local_baselines: &KafkaPartitionBaselines,
     topic: &str,
     partition: i32,
-    allow_local: bool,
 ) -> Result<Option<i64>, ConnectorError> {
-    if let Some(offset) = handoff.get(topic, partition) {
+    if let Some(offset) = local.get(topic, partition) {
         return offset.checked_add(1).map(Some).ok_or_else(|| {
             ConnectorError::ConfigurationError(format!(
-                "Kafka handoff offset overflow for '{topic}-{partition}'"
+                "Kafka local offset overflow for '{topic}-{partition}'"
             ))
         });
     }
-    if let Some(next) = handoff_baselines
-        .get(&(topic.to_string(), partition))
-        .copied()
-    {
-        return Ok(Some(next));
-    }
-    if allow_local {
-        if let Some(offset) = local.get(topic, partition) {
-            return offset.checked_add(1).map(Some).ok_or_else(|| {
-                ConnectorError::ConfigurationError(format!(
-                    "Kafka local offset overflow for '{topic}-{partition}'"
-                ))
-            });
-        }
-        if let Some(next) = local_baselines.get(&(topic.to_string(), partition)) {
-            return Ok(Some(*next));
-        }
+    if let Some(next) = local_baselines.get(&(topic.to_string(), partition)) {
+        return Ok(Some(*next));
     }
     Ok(None)
 }
@@ -2704,48 +2688,27 @@ fn deterministic_initial_offset(mode: &StartupMode, reset: OffsetReset) -> Optio
     }
 }
 
-fn encode_partition_inventory(inventory: &KafkaPartitionSet) -> String {
-    let mut canonical: Vec<_> = inventory.iter().cloned().collect();
-    canonical.sort_unstable();
-    serde_json::to_string(&canonical).expect("Kafka partition inventory is serializable")
-}
-
-fn decode_partition_inventory(
-    checkpoint: &SourceCheckpoint,
-) -> Result<Option<KafkaPartitionSet>, ConnectorError> {
-    let Some(encoded) = checkpoint.get_metadata(KAFKA_PARTITION_INVENTORY_METADATA) else {
-        return Ok(None);
-    };
-    let canonical: Vec<(String, i32)> = serde_json::from_str(encoded).map_err(|error| {
-        ConnectorError::ConfigurationError(format!(
-            "invalid Kafka checkpoint partition inventory: {error}"
-        ))
-    })?;
-    if canonical
-        .iter()
-        .any(|(topic, partition)| topic.is_empty() || *partition < 0)
-        || canonical.windows(2).any(|pair| pair[0] >= pair[1])
-    {
-        return Err(ConnectorError::ConfigurationError(
-            "invalid Kafka checkpoint partition inventory: entries must be canonical, unique, and non-negative"
-                .into(),
-        ));
-    }
-    Ok(Some(canonical.into_iter().collect()))
-}
-
-fn validate_resume_inventory(
-    checkpoint: Option<&KafkaPartitionSet>,
+fn validate_resume_input_channels(
+    source_name: &str,
+    checkpoint: Option<&[Vec<u8>]>,
     current: &KafkaPartitionSet,
 ) -> Result<(), ConnectorError> {
     let checkpoint = checkpoint.ok_or_else(|| {
         ConnectorError::ConfigurationError(
-            "Kafka engine-owned resume checkpoint has no partition inventory".into(),
+            "Kafka engine-owned resume checkpoint has no input-channel inventory".into(),
         )
     })?;
-    if checkpoint != current {
+    let current = kafka_input_channels(source_name, current)?;
+    if checkpoint != current.as_ref() {
+        let first_difference = checkpoint
+            .iter()
+            .zip(current.iter())
+            .position(|(saved, discovered)| saved != discovered)
+            .unwrap_or_else(|| checkpoint.len().min(current.len()));
         return Err(ConnectorError::ConfigurationError(format!(
-            "Kafka partition inventory changed across recovery: checkpoint={checkpoint:?}, current={current:?}"
+            "Kafka input-channel inventory changed across recovery: checkpoint has {} channels, current assignment has {}; first difference at index {first_difference}",
+            checkpoint.len(),
+            current.len()
         )));
     }
     Ok(())
@@ -2904,21 +2867,17 @@ fn retire_accepted_rotation_baselines(
     baselines: &mut KafkaRotationBaselines,
     accepted_offsets: &[(Arc<str>, i32, i64)],
 ) {
-    let mut accepted = std::collections::HashMap::<(&str, i32), i64>::new();
     for (topic, partition, offset) in accepted_offsets {
-        accepted
-            .entry((topic.as_ref(), *partition))
-            .and_modify(|current| *current = (*current).max(*offset))
-            .or_insert(*offset);
-    }
-    baselines.retain(|topic, partitions| {
-        partitions.retain(|partition, next| {
-            accepted
-                .get(&(topic.as_ref(), *partition))
-                .is_none_or(|offset| offset < next)
+        let remove_topic = baselines.get_mut(topic.as_ref()).is_some_and(|partitions| {
+            if partitions.get(partition).is_some_and(|next| offset >= next) {
+                partitions.remove(partition);
+            }
+            partitions.is_empty()
         });
-        !partitions.is_empty()
-    });
+        if remove_topic {
+            baselines.remove(topic.as_ref());
+        }
+    }
 }
 
 fn validate_partition_baselines(
@@ -3037,6 +2996,277 @@ fn consumer_creation_error(error: &KafkaError) -> ConnectorError {
     ))
 }
 
+fn encode_kafka_input_channel(
+    output: &mut Vec<u8>,
+    source_name: &str,
+    topic: &str,
+    partition: i32,
+) -> Result<(), ConnectorError> {
+    if source_name.is_empty() {
+        return Err(ConnectorError::ConfigurationError(
+            "Kafka input channels require a canonical Laminar source name".into(),
+        ));
+    }
+    let source_len = u32::try_from(source_name.len()).map_err(|_| {
+        ConnectorError::Internal(
+            "Kafka source name exceeds the input-channel encoding limit".into(),
+        )
+    })?;
+    let topic_len = u32::try_from(topic.len()).map_err(|_| {
+        ConnectorError::Internal("Kafka topic exceeds the input-channel encoding limit".into())
+    })?;
+    if partition < 0 {
+        return Err(ConnectorError::Internal(format!(
+            "Kafka input channel has invalid partition '{topic}-{partition}'"
+        )));
+    }
+    output.clear();
+    output.extend_from_slice(&source_len.to_be_bytes());
+    output.extend_from_slice(source_name.as_bytes());
+    output.extend_from_slice(&topic_len.to_be_bytes());
+    output.extend_from_slice(topic.as_bytes());
+    output.extend_from_slice(&partition.to_be_bytes());
+    Ok(())
+}
+
+fn kafka_input_channels(
+    source_name: &str,
+    inventory: &KafkaPartitionSet,
+) -> Result<Arc<[Vec<u8>]>, ConnectorError> {
+    let mut channels = Vec::with_capacity(inventory.len());
+    let mut encoded = Vec::new();
+    for (topic, partition) in inventory {
+        encode_kafka_input_channel(&mut encoded, source_name, topic, *partition)?;
+        channels.push(encoded.clone());
+    }
+    channels.sort_unstable();
+    Ok(channels.into())
+}
+
+fn kafka_row_positions(
+    source_name: &str,
+    positions: &[(Arc<str>, i32, i64)],
+    good_indices: Option<&[usize]>,
+) -> Result<SourceRowPositions, ConnectorError> {
+    let row_count = good_indices.map_or(positions.len(), <[usize]>::len);
+    let partition_bytes = match good_indices {
+        Some(indices) => indices.iter().try_fold(0_usize, |total, &index| {
+            let (topic, _, _) = positions.get(index).ok_or_else(|| {
+                ConnectorError::Internal(
+                    "Kafka decoded-row index is outside the staged position batch".into(),
+                )
+            })?;
+            Ok::<_, ConnectorError>(total.saturating_add(source_name.len() + topic.len() + 12))
+        })?,
+        None => positions.iter().fold(0_usize, |total, (topic, _, _)| {
+            total.saturating_add(source_name.len() + topic.len() + 12)
+        }),
+    };
+    let mut partitions = BinaryBuilder::with_capacity(row_count, partition_bytes);
+    let mut order_keys = BinaryBuilder::with_capacity(row_count, row_count.saturating_mul(8));
+    let mut encoded_partition = Vec::new();
+    let mut append = |(topic, partition, offset): &(Arc<str>, i32, i64)| {
+        if *offset < 0 {
+            return Err(ConnectorError::Internal(format!(
+                "Kafka emitted invalid row position '{}-{partition}@{offset}'",
+                topic.as_ref()
+            )));
+        }
+        encode_kafka_input_channel(
+            &mut encoded_partition,
+            source_name,
+            topic.as_ref(),
+            *partition,
+        )?;
+        partitions.append_value(&encoded_partition);
+
+        let mut ordered_offset = offset.to_be_bytes();
+        ordered_offset[0] ^= 0x80;
+        order_keys.append_value(ordered_offset);
+        Ok::<_, ConnectorError>(())
+    };
+
+    match good_indices {
+        Some(indices) => {
+            for &index in indices {
+                append(positions.get(index).ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "Kafka decoded-row index is outside the staged position batch".into(),
+                    )
+                })?)?;
+            }
+        }
+        None => {
+            for position in positions {
+                append(position)?;
+            }
+        }
+    }
+
+    SourceRowPositions::try_new(
+        partitions.finish(),
+        order_keys.finish(),
+        UInt32Array::from(vec![0; row_count]),
+    )
+}
+
+const KAFKA_METADATA_COLUMNS: [&str; 3] = ["_partition", "_offset", "_timestamp"];
+const KAFKA_HEADERS_COLUMN: &str = "_headers";
+
+fn validate_kafka_output_schema(
+    payload_schema: &SchemaRef,
+    include_metadata: bool,
+    include_headers: bool,
+) -> Result<(), ConnectorError> {
+    let collision = payload_schema.fields().iter().find(|field| {
+        (include_metadata
+            && KAFKA_METADATA_COLUMNS
+                .iter()
+                .any(|name| field.name().eq_ignore_ascii_case(name)))
+            || (include_headers && field.name().eq_ignore_ascii_case(KAFKA_HEADERS_COLUMN))
+    });
+    if let Some(field) = collision {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "Kafka payload schema contains configured connector metadata column '{}'",
+            field.name()
+        )));
+    }
+    Ok(())
+}
+
+fn kafka_output_schema(
+    payload_schema: &SchemaRef,
+    include_metadata: bool,
+    include_headers: bool,
+) -> SchemaRef {
+    if !include_metadata && !include_headers {
+        return Arc::clone(payload_schema);
+    }
+    let mut fields = payload_schema.fields().to_vec();
+    if include_metadata {
+        fields.extend([
+            Arc::new(Field::new("_partition", DataType::Int32, false)),
+            Arc::new(Field::new("_offset", DataType::Int64, false)),
+            Arc::new(Field::new(
+                "_timestamp",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            )),
+        ]);
+    }
+    if include_headers {
+        fields.push(Arc::new(Field::new(
+            KAFKA_HEADERS_COLUMN,
+            DataType::Utf8,
+            true,
+        )));
+    }
+    Arc::new(Schema::new_with_metadata(
+        fields,
+        payload_schema.metadata().clone(),
+    ))
+}
+
+type NormalizedDebeziumBatch = (RecordBatch, Option<Box<[SourceMutation]>>);
+
+fn normalize_kafka_debezium_batch(
+    records: &RecordBatch,
+    visible_schema: &SchemaRef,
+) -> Result<NormalizedDebeziumBatch, ConnectorError> {
+    let operation_index = visible_schema.fields().len();
+    let timestamp_index = operation_index + 1;
+    let records_schema = records.schema();
+    if records.num_columns() != timestamp_index + 1
+        || records_schema.fields()[..operation_index] != visible_schema.fields()[..]
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium decoder output does not match the configured visible schema".into(),
+        ));
+    }
+    let operation_field = records_schema.field(operation_index);
+    let timestamp_field = records_schema.field(timestamp_index);
+    if operation_field.name() != "__op"
+        || operation_field.data_type() != &DataType::Utf8
+        || operation_field.is_nullable()
+        || timestamp_field.name() != "__ts_ms"
+        || timestamp_field.data_type() != &DataType::Int64
+        || timestamp_field.is_nullable()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium decoder control columns are malformed or misplaced".into(),
+        ));
+    }
+    let operations = records
+        .column(operation_index)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch("Kafka Debezium __op column must be Utf8".into())
+        })?;
+    let mutations = decode_debezium_mutations(operations, records.num_rows())?;
+    if records.column(timestamp_index).null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "Kafka Debezium __ts_ms column must not contain nulls".into(),
+        ));
+    }
+
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    let visible = RecordBatch::try_new_with_options(
+        Arc::clone(visible_schema),
+        records.columns()[..operation_index].to_vec(),
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!(
+            "failed to remove Kafka Debezium decoder control columns: {error}"
+        ))
+    })?;
+    Ok((visible, mutations))
+}
+
+fn decode_debezium_mutations(
+    operations: &StringArray,
+    row_count: usize,
+) -> Result<Option<Box<[SourceMutation]>>, ConnectorError> {
+    if operations.len() != row_count {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "Kafka Debezium operation count {} does not match decoded row count {}",
+            operations.len(),
+            row_count
+        )));
+    }
+
+    let mut mutations: Option<Vec<SourceMutation>> = None;
+    for (row, operation) in operations.iter().enumerate() {
+        let operation = operation.ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "Kafka Debezium __op is null at decoded row {row}"
+            ))
+        })?;
+        match operation {
+            "c" | "u" | "r" => {
+                if let Some(mutations) = mutations.as_mut() {
+                    mutations.push(SourceMutation::Put);
+                }
+            }
+            "d" => {
+                let mutations = mutations.get_or_insert_with(|| {
+                    let mut mutations = Vec::with_capacity(row_count);
+                    mutations.resize(row, SourceMutation::Put);
+                    mutations
+                });
+                mutations.push(SourceMutation::Tombstone);
+            }
+            unknown => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "Kafka Debezium __op has unknown value '{unknown}' at decoded row {row}"
+                )));
+            }
+        }
+    }
+    Ok(mutations.map(Vec::into_boxed_slice))
+}
+
 async fn fetch_explicit_topic_metadata(
     blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
@@ -3092,17 +3322,28 @@ async fn fetch_partition_low_watermarks(
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     partitions: &KafkaPartitionSet,
 ) -> Result<KafkaPartitionBaselines, ConnectorError> {
+    fetch_partition_watermarks(blocking_tasks, consumer, partitions)
+        .await
+        .map(|(low, _)| low)
+}
+
+async fn fetch_partition_watermarks(
+    blocking_tasks: KafkaBlockingTasks,
+    consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
+    partitions: &KafkaPartitionSet,
+) -> Result<(KafkaPartitionBaselines, KafkaPartitionBaselines), ConnectorError> {
     let deadline = tokio::time::Instant::now() + KAFKA_POSITION_LOOKUP_BUDGET;
     let mut remaining = partitions.iter().cloned();
     let mut jobs = tokio::task::JoinSet::new();
-    let mut baselines = KafkaPartitionBaselines::with_capacity(partitions.len());
+    let mut low_watermarks = KafkaPartitionBaselines::with_capacity(partitions.len());
+    let mut high_watermarks = KafkaPartitionBaselines::with_capacity(partitions.len());
 
     loop {
         while jobs.len() < KAFKA_POSITION_LOOKUP_CONCURRENCY {
             let Some((topic, partition)) = remaining.next() else {
                 break;
             };
-            jobs.spawn(fetch_partition_low_watermark(
+            jobs.spawn(fetch_partition_watermark(
                 blocking_tasks.clone(),
                 Arc::clone(&consumer),
                 topic,
@@ -3113,22 +3354,23 @@ async fn fetch_partition_low_watermarks(
         let Some(result) = jobs.join_next().await else {
             break;
         };
-        let ((topic, partition), low) = result.map_err(|error| {
+        let ((topic, partition), low, high) = result.map_err(|error| {
             ConnectorError::Internal(format!("Kafka watermark worker failed: {error}"))
         })??;
-        baselines.insert((topic, partition), low);
+        low_watermarks.insert((topic.clone(), partition), low);
+        high_watermarks.insert((topic, partition), high);
     }
 
-    Ok(baselines)
+    Ok((low_watermarks, high_watermarks))
 }
 
-async fn fetch_partition_low_watermark(
+async fn fetch_partition_watermark(
     blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     topic: String,
     partition: i32,
     deadline: tokio::time::Instant,
-) -> Result<((String, i32), i64), ConnectorError> {
+) -> Result<((String, i32), i64, i64), ConnectorError> {
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         return Err(ConnectorError::Timeout(
@@ -3146,9 +3388,13 @@ async fn fetch_partition_low_watermark(
             })
     });
     match tokio::time::timeout_at(deadline, task).await {
-        Ok(Ok(Ok((low, _high)))) if (0..i64::MAX).contains(&low) => Ok(((topic, partition), low)),
-        Ok(Ok(Ok((low, _)))) => Err(ConnectorError::ConnectionFailed(format!(
-            "Kafka returned invalid low watermark {low} for '{topic}-{partition}'"
+        Ok(Ok(Ok((low, high))))
+            if (0..i64::MAX).contains(&low) && (0..i64::MAX).contains(&high) && low <= high =>
+        {
+            Ok(((topic, partition), low, high))
+        }
+        Ok(Ok(Ok((low, high)))) => Err(ConnectorError::ConnectionFailed(format!(
+            "Kafka returned invalid watermark range {low}..{high} for '{topic}-{partition}'"
         ))),
         Ok(Ok(Err(error))) => Err(error),
         Ok(Err(error)) => Err(ConnectorError::Internal(format!(
@@ -3424,44 +3670,48 @@ impl KafkaSource {
             }
         }
 
-        // Append metadata columns if configured.
-        let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();
-        let needs_headers = include_headers && !self.poll_meta_headers.is_empty();
-        let batch = if needs_meta || needs_headers {
-            use arrow_schema::{DataType, Field};
+        let rows = batch.num_rows();
+        let metadata_aligned = !include_metadata
+            || (self.poll_meta_partitions.len() == rows
+                && self.poll_meta_offsets.len() == rows
+                && self.poll_meta_timestamps.len() == rows);
+        let headers_aligned = !include_headers || self.poll_meta_headers.len() == rows;
+        if !metadata_aligned || !headers_aligned {
+            return Err(terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                ConnectorError::Internal(
+                    "Kafka connector metadata is not aligned with the decoded rows".into(),
+                ),
+            ));
+        }
 
-            let mut fields = batch.schema().fields().to_vec();
+        let batch = if include_metadata || include_headers {
+            let output_schema =
+                kafka_output_schema(&batch.schema(), include_metadata, include_headers);
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
 
-            if needs_meta {
+            if include_metadata {
                 use arrow_array::{Int32Array, Int64Array, TimestampMillisecondArray};
-                use arrow_schema::TimeUnit;
-                fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
                 columns.push(Arc::new(Int32Array::from(std::mem::take(
                     &mut self.poll_meta_partitions,
                 ))));
-                fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
                 columns.push(Arc::new(Int64Array::from(std::mem::take(
                     &mut self.poll_meta_offsets,
                 ))));
-                fields.push(Arc::new(Field::new(
-                    "_timestamp",
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    true,
-                )));
                 columns.push(Arc::new(TimestampMillisecondArray::from(std::mem::take(
                     &mut self.poll_meta_timestamps,
                 ))));
             }
-            if needs_headers {
-                fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
+            if include_headers {
                 columns.push(Arc::new(arrow_array::StringArray::from(std::mem::take(
                     &mut self.poll_meta_headers,
                 ))));
             }
 
-            let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
-            arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {
+            arrow_array::RecordBatch::try_new(output_schema, columns).map_err(|e| {
                 terminalize_guaranteed_poll_error(
                     self.delivery,
                     &mut self.state,
@@ -3489,7 +3739,7 @@ impl KafkaSource {
         } else {
             KafkaSourceConfig::from_config(&config)?
         };
-        let (installed_offsets, resume_attempt, is_resume, resume_inventory, resume_baselines) =
+        let (installed_offsets, resume_attempt, is_resume, resume_input_channels, resume_baselines) =
             match position {
                 SourcePosition::Initial => (
                     OffsetTracker::new(),
@@ -3502,13 +3752,13 @@ impl KafkaSource {
                     attempt,
                     checkpoint,
                 } => {
-                    let inventory = decode_partition_inventory(&checkpoint)?;
+                    let input_channels = checkpoint.input_channels().map(<[Vec<u8>]>::to_vec);
                     let baselines = decode_partition_baselines(&checkpoint)?;
                     (
                         OffsetTracker::try_from_checkpoint(&checkpoint)?,
                         Some(attempt),
                         true,
-                        inventory,
+                        input_channels,
                         baselines,
                     )
                 }
@@ -3560,15 +3810,12 @@ impl KafkaSource {
             ));
         }
         if delivery != DeliveryGuarantee::BestEffort
-            && matches!(
-                &kafka_config.startup_mode,
-                StartupMode::Latest | StartupMode::Timestamp(_)
-            )
+            && matches!(&kafka_config.startup_mode, StartupMode::Latest)
         {
             return Err(ConnectorError::ConfigurationError(
                 "Kafka guaranteed delivery requires a stable unrecorded-partition start; latest \
-                 and timestamp-with-no-match can move forward across recovery. Use earliest or \
-                 explicit specific offsets until checkpointed partition baselines are available"
+                 can move forward across recovery. Use earliest, timestamp, or explicit specific \
+                 offsets"
                     .into(),
             ));
         }
@@ -3598,12 +3845,14 @@ impl KafkaSource {
         self.delivery = delivery;
         self.offsets = installed_offsets;
         self.manual_topic_partitions.clear();
+        self.manual_input_channels = Arc::from([]);
         self.manual_partition_baselines.clear();
         *lock_or_recover(&self.assignment_publication) =
             Arc::new(KafkaAssignmentPublication::default());
         self.rotation_partition_baseline_count
             .store(0, Ordering::Release);
         self.applied_rotation_baseline_version = None;
+        self.batch_cursor_assignment_version = None;
         self.reconciled_assignment_version
             .store(0, Ordering::Release);
         lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
@@ -3652,6 +3901,11 @@ impl KafkaSource {
             );
             self.schema = schema;
         }
+        validate_kafka_output_schema(
+            &self.schema,
+            kafka_config.include_metadata,
+            kafka_config.include_headers,
+        )?;
 
         info!(
             brokers = %kafka_config.bootstrap_servers,
@@ -3666,7 +3920,7 @@ impl KafkaSource {
             config: kafka_config,
             delivery,
             is_resume,
-            resume_inventory,
+            resume_input_channels,
             resume_baselines,
         })
     }
@@ -3763,10 +4017,6 @@ impl KafkaSource {
                 } else {
                     startup_default_offset(&config.startup_mode)
                 };
-                // start() already loaded committed offsets into self.offsets, so
-                // there are no rotation handoff offsets at initial assignment.
-                let no_resume = OffsetTracker::new();
-                let no_resume_baselines = KafkaPartitionBaselines::new();
                 // Pin the final ownership publication only across synchronous librdkafka calls.
                 // Metadata and watermark I/O above must not delay assignment writers.
                 let published = registry.read_assignment();
@@ -3780,12 +4030,8 @@ impl KafkaSource {
                         published.owners(),
                         self_id,
                         &topic_meta,
-                        VnodeResumeCursors {
-                            local_offsets: &self.offsets,
-                            handoff_offsets: &no_resume,
-                            local_baselines: &self.manual_partition_baselines,
-                            handoff_baselines: &no_resume_baselines,
-                        },
+                        &self.offsets,
+                        &self.manual_partition_baselines,
                         default_offset,
                     )?
                 };
@@ -3813,10 +4059,13 @@ impl KafkaSource {
                 validate_kafka_assignment(&owned_partitions, &active)
                     .map_err(ConnectorError::ConnectionFailed)?;
                 self.vnode_partition_routes = partition_routes;
+                let input_channels =
+                    kafka_input_channels(self.source_name.as_ref(), &owned_partitions)?;
                 *lock_or_recover(&self.assignment_publication) =
                     Arc::new(KafkaAssignmentPublication::new(
                         assignment_version,
                         Arc::clone(&owned_partitions),
+                        input_channels,
                         KafkaRotationBaselines::new(),
                     ));
                 self.reconciled_assignment_version
@@ -3853,7 +4102,7 @@ impl KafkaSource {
         delivery: DeliveryGuarantee,
         vnode_assigned: bool,
         is_resume: bool,
-        resume_inventory: Option<&KafkaPartitionSet>,
+        resume_input_channels: Option<&[Vec<u8>]>,
         resume_baselines: &KafkaPartitionBaselines,
     ) -> Result<bool, ConnectorError> {
         let local_guaranteed_assignment = delivery != DeliveryGuarantee::BestEffort
@@ -3900,7 +4149,11 @@ impl KafkaSource {
             )
             .await?;
             let baselines = if is_resume {
-                validate_resume_inventory(resume_inventory, &assigned_set)?;
+                validate_resume_input_channels(
+                    self.source_name.as_ref(),
+                    resume_input_channels,
+                    &assigned_set,
+                )?;
                 validate_partition_baselines(resume_baselines, &assigned_set)?;
                 resume_baselines.clone()
             } else {
@@ -3919,6 +4172,8 @@ impl KafkaSource {
                     "failed to install local guaranteed Kafka assignment: {error}"
                 ))
             })?;
+            self.manual_input_channels =
+                kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
             self.manual_topic_partitions = assigned_set;
             self.manual_partition_baselines = baselines;
             info!(
@@ -3999,11 +4254,25 @@ impl SourceConnector for KafkaSource {
         Some(self.task_tracker.clone())
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let format = if config.properties().is_empty() {
+            self.config.validate()?;
+            self.config.format
+        } else {
+            KafkaSourceConfig::from_config(config)?.format
+        };
+        let input_mode = if format == Format::Debezium {
+            SourceInputMode::KeyedUpsert
+        } else {
+            SourceInputMode::AppendOnly
+        };
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Splittable,
-        ))
+            input_mode,
+        )
+        .with_row_positions(SourceRowPositionCapability::OrderedDeterministic)
+        .with_exact_delivery_certification())
     }
 
     fn set_vnode_assignment(
@@ -4271,7 +4540,7 @@ impl SourceConnector for KafkaSource {
             config: kafka_config,
             delivery,
             is_resume,
-            resume_inventory,
+            resume_input_channels,
             resume_baselines,
         } = self.prepare_start(request)?;
         let mut rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
@@ -4322,7 +4591,7 @@ impl SourceConnector for KafkaSource {
                 delivery,
                 vnode_assigned,
                 is_resume,
-                resume_inventory.as_ref(),
+                resume_input_channels.as_deref(),
                 &resume_baselines,
             )
             .await?;
@@ -4387,7 +4656,11 @@ impl SourceConnector for KafkaSource {
                         })
                         .collect();
                     let baselines = if is_resume {
-                        validate_resume_inventory(resume_inventory.as_ref(), &assigned_set)?;
+                        validate_resume_input_channels(
+                            self.source_name.as_ref(),
+                            resume_input_channels.as_deref(),
+                            &assigned_set,
+                        )?;
                         validate_partition_baselines(&resume_baselines, &assigned_set)?;
                         if resume_baselines != configured_baselines {
                             return Err(ConnectorError::ConfigurationError(
@@ -4423,6 +4696,8 @@ impl SourceConnector for KafkaSource {
                             "failed to assign specific offsets: {e}"
                         ))
                     })?;
+                    self.manual_input_channels =
+                        kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
                     self.manual_topic_partitions = assigned_set;
                     self.manual_partition_baselines = baselines;
                     info!(
@@ -4442,92 +4717,128 @@ impl SourceConnector for KafkaSource {
                         topics.clone(),
                     )
                     .await?;
-                    let mut tpl = rdkafka::TopicPartitionList::new();
-                    for (topic, partition_count) in &topic_meta {
-                        for partition in 0..*partition_count {
-                            tpl.add_partition_offset(
-                                topic,
-                                partition,
-                                rdkafka::Offset::Offset(*ts_ms),
-                            )
-                            .map_err(|error| {
-                                ConnectorError::Internal(format!(
-                                    "failed to build timestamp lookup for '{topic}-{partition}': {error}"
-                                ))
-                            })?;
-                        }
-                    }
-                    if tpl.count() == 0 {
+                    let assigned: Vec<(String, i32)> = topic_meta
+                        .iter()
+                        .flat_map(|(topic, partition_count)| {
+                            (0..*partition_count)
+                                .map(move |partition| (topic.to_string(), partition))
+                        })
+                        .collect();
+                    if assigned.is_empty() {
                         return Err(ConnectorError::ConfigurationError(
                             "Kafka timestamp startup discovered no partitions".into(),
                         ));
                     }
-                    let resolved = resolve_timestamp_offsets(
-                        self.blocking_tasks.clone(),
-                        Arc::clone(&consumer),
-                        tpl,
-                    )
-                    .await?;
-                    let mut positioned = TopicPartitionList::new();
-                    let mut restored = 0usize;
-                    for elem in resolved.elements() {
-                        if let Err(e) = elem.error() {
-                            return Err(ConnectorError::ConnectionFailed(format!(
-                                "timestamp lookup failed for '{}-{}': {e}",
-                                elem.topic(),
-                                elem.partition()
-                            )));
-                        }
-                        let offset = if let Some(checkpointed) =
-                            self.offsets.get(elem.topic(), elem.partition())
-                        {
-                            restored += 1;
-                            rdkafka::Offset::Offset(checkpointed.checked_add(1).ok_or_else(
-                                || {
-                                    ConnectorError::ConfigurationError(format!(
-                                        "Kafka checkpoint offset overflow for '{}-{}'",
-                                        elem.topic(),
-                                        elem.partition()
+                    let assigned_set: KafkaPartitionSet = assigned.iter().cloned().collect();
+                    let baselines = if is_resume {
+                        validate_resume_input_channels(
+                            self.source_name.as_ref(),
+                            resume_input_channels.as_deref(),
+                            &assigned_set,
+                        )?;
+                        validate_partition_baselines(&resume_baselines, &assigned_set)?;
+                        let low_watermarks = fetch_partition_low_watermarks(
+                            self.blocking_tasks.clone(),
+                            Arc::clone(&consumer),
+                            &assigned_set,
+                        )
+                        .await?;
+                        validate_positions_not_expired(
+                            &self.offsets,
+                            &resume_baselines,
+                            &low_watermarks,
+                            &assigned_set,
+                        )?;
+                        resume_baselines.clone()
+                    } else {
+                        // Capture the broker end before timestamp resolution. If no matching record
+                        // exists, this numeric high watermark is the exact activation cut; a later
+                        // append must be consumed rather than skipped by a symbolic `End` seek.
+                        let (low_watermarks, high_watermarks) = fetch_partition_watermarks(
+                            self.blocking_tasks.clone(),
+                            Arc::clone(&consumer),
+                            &assigned_set,
+                        )
+                        .await?;
+                        let mut requested = TopicPartitionList::new();
+                        for (topic, partition) in &assigned {
+                            requested
+                                .add_partition_offset(
+                                    topic,
+                                    *partition,
+                                    rdkafka::Offset::Offset(*ts_ms),
+                                )
+                                .map_err(|error| {
+                                    ConnectorError::Internal(format!(
+                                        "failed to build timestamp lookup for '{topic}-{partition}': {error}"
                                     ))
-                                },
-                            )?)
-                        } else if elem.offset() == rdkafka::Offset::Invalid {
-                            // No record at/after the timestamp is a deterministic
-                            // start at the current end, not a broker group cursor.
-                            rdkafka::Offset::End
-                        } else {
-                            elem.offset()
-                        };
-                        positioned
-                            .add_partition_offset(elem.topic(), elem.partition(), offset)
-                            .map_err(|e| {
-                                ConnectorError::Internal(format!(
-                                    "failed to build timestamp assignment for '{}-{}': {e}",
-                                    elem.topic(),
-                                    elem.partition()
-                                ))
-                            })?;
-                    }
-                    if restored != self.offsets.partition_count() {
-                        return Err(ConnectorError::ConfigurationError(
-                            "Kafka resume checkpoint references a partition absent from timestamp metadata"
-                                .into(),
-                        ));
-                    }
+                                })?;
+                        }
+                        let resolved = resolve_timestamp_offsets(
+                            self.blocking_tasks.clone(),
+                            Arc::clone(&consumer),
+                            requested,
+                        )
+                        .await?;
+                        let mut baselines = KafkaPartitionBaselines::with_capacity(assigned.len());
+                        for element in resolved.elements() {
+                            if let Err(error) = element.error() {
+                                return Err(ConnectorError::ConnectionFailed(format!(
+                                    "timestamp lookup failed for '{}-{}': {error}",
+                                    element.topic(),
+                                    element.partition()
+                                )));
+                            }
+                            let partition = (element.topic().to_string(), element.partition());
+                            let next = match element.offset() {
+                                rdkafka::Offset::Offset(next) if (0..i64::MAX).contains(&next) => {
+                                    next
+                                }
+                                rdkafka::Offset::Invalid | rdkafka::Offset::End => {
+                                    *high_watermarks.get(&partition).ok_or_else(|| {
+                                        ConnectorError::ConnectionFailed(format!(
+                                            "Kafka watermark response omitted partition '{}-{}'",
+                                            partition.0, partition.1
+                                        ))
+                                    })?
+                                }
+                                offset => {
+                                    return Err(ConnectorError::ConnectionFailed(format!(
+                                        "Kafka timestamp lookup returned non-numeric offset {offset:?} for '{}-{}'",
+                                        partition.0, partition.1
+                                    )));
+                                }
+                            };
+                            baselines.insert(partition, next);
+                        }
+                        validate_partition_baselines(&baselines, &assigned_set)?;
+                        validate_positions_not_expired(
+                            &self.offsets,
+                            &baselines,
+                            &low_watermarks,
+                            &assigned_set,
+                        )?;
+                        baselines
+                    };
+                    let positioned = assignment_seek_tpl(
+                        &self.offsets,
+                        &assigned,
+                        Some(&baselines),
+                        None,
+                        true,
+                    )?;
                     consumer.assign(&positioned).map_err(|e| {
                         ConnectorError::ConnectionFailed(format!(
                             "failed to assign timestamp/checkpoint offsets: {e}"
                         ))
                     })?;
-                    self.manual_topic_partitions = positioned
-                        .elements()
-                        .iter()
-                        .map(|entry| (entry.topic().to_string(), entry.partition()))
-                        .collect();
+                    self.manual_input_channels =
+                        kafka_input_channels(self.source_name.as_ref(), &assigned_set)?;
+                    self.manual_topic_partitions = assigned_set;
+                    self.manual_partition_baselines = baselines;
                     info!(
                         timestamp_ms = ts_ms,
                         partition_count = positioned.count(),
-                        restored_partitions = restored,
                         "assigned consumer to exact checkpoint/timestamp offsets"
                     );
                 }
@@ -4642,7 +4953,7 @@ impl SourceConnector for KafkaSource {
         // Pin one ownership publication only while draining the non-awaiting
         // payload queue. An assignment writer waits for this short read-side
         // critical section, so one cut cannot mix ownership publications.
-        let (drained_assignment_version, retires_rotation_baseline) = {
+        let (drained_assignment, retires_rotation_baseline) = {
             let vnode_registry = self
                 .vnode_assignment
                 .as_ref()
@@ -4657,19 +4968,24 @@ impl SourceConnector for KafkaSource {
                 }
             }
 
+            let assignment = match vnode_publication.as_ref() {
+                Some((published, _)) => {
+                    let assignment = Arc::clone(&lock_or_recover(&self.assignment_publication));
+                    if assignment.assignment_version != published.version() {
+                        return Ok(None);
+                    }
+                    Some(assignment)
+                }
+                None => None,
+            };
+
             // A vnode acquired after rehydration may also have a stale local cursor from an earlier
             // ownership stint. Keep the durable handoff baseline authoritative until this instance
             // has actually accepted a record from the acquired assignment.
-            let rotation_baselines = if self
-                .rotation_partition_baseline_count
-                .load(Ordering::Acquire)
-                == 0
-            {
-                None
-            } else {
-                Some(Arc::clone(&lock_or_recover(&self.assignment_publication)))
-            };
-            if let Some(publication) = rotation_baselines.as_deref() {
+            let rotation_baselines = assignment
+                .as_deref()
+                .filter(|publication| !publication.baselines.is_empty());
+            if let Some(publication) = rotation_baselines {
                 if self.applied_rotation_baseline_version != Some(publication.assignment_version) {
                     let mut snapshot = lock_or_recover(&self.offset_snapshot);
                     for (topic, partitions) in &publication.baselines {
@@ -4728,7 +5044,7 @@ impl SourceConnector for KafkaSource {
                                 .as_ref()
                                 .map(|(assignment, self_id)| (*assignment, *self_id)),
                             kp.partition_vnode,
-                            rotation_baselines.as_deref().and_then(|publication| {
+                            rotation_baselines.and_then(|publication| {
                                 rotation_partition_baseline(
                                     &publication.baselines,
                                     kp.topic.as_ref(),
@@ -4766,10 +5082,7 @@ impl SourceConnector for KafkaSource {
                     }
                 }
             }
-            let assignment_version = vnode_publication
-                .as_ref()
-                .map(|(published, _)| published.version());
-            let retires_baseline = rotation_baselines.as_deref().is_some_and(|publication| {
+            let retires_baseline = rotation_baselines.is_some_and(|publication| {
                 self.poll_payloads.iter().any(|payload| {
                     rotation_partition_baseline(
                         &publication.baselines,
@@ -4779,11 +5092,10 @@ impl SourceConnector for KafkaSource {
                     .is_some_and(|next| payload.offset >= next)
                 })
             });
-            (assignment_version, retires_baseline)
+            (assignment, retires_baseline)
         };
-        // Schema Registry resolution and decode can await or consume substantial CPU. They do not
-        // inspect ownership, so release the publication before either operation; otherwise a slow
-        // registry request would stall assignment activation for the full network timeout.
+        // Schema Registry resolution and decode can await or consume substantial CPU. Retain the
+        // immutable cut by value while releasing its locks so assignment activation cannot stall.
         for kp in self.poll_payloads.drain(..) {
             total_bytes += kp.data.len() as u64;
             let start = self.poll_payload_buf.len();
@@ -4835,6 +5147,33 @@ impl SourceConnector for KafkaSource {
         }
 
         let (batch, good_indices) = self.decode_polled_payloads().await?;
+        let (batch, mutations) = if self.config.format == Format::Debezium {
+            normalize_kafka_debezium_batch(&batch, &self.schema).map_err(|error| {
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    error,
+                )
+            })?
+        } else {
+            (batch, None)
+        };
+        let row_positions = kafka_row_positions(
+            self.source_name.as_ref(),
+            &self.poll_staged_offsets,
+            good_indices.as_deref(),
+        )
+        .map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })?;
 
         let batch = self.append_metadata_columns(
             batch,
@@ -4845,7 +5184,28 @@ impl SourceConnector for KafkaSource {
         // Construct the complete output before publishing its cursor. In particular,
         // metadata/header column validation above is fallible and must not retire a rotation
         // baseline or advance the recovery position for a batch that cannot be returned.
-        let output = SourceBatch::new(batch);
+        let output = SourceBatch::positioned(batch, row_positions).map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })?;
+        let output = if let Some(mutations) = mutations {
+            output.with_mutations(mutations).map_err(|error| {
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    error,
+                )
+            })?
+        } else {
+            output
+        };
         let num_rows = output.num_rows();
 
         if !self.poll_staged_offsets.is_empty() {
@@ -4856,23 +5216,71 @@ impl SourceConnector for KafkaSource {
                     snapshot.update_arc(topic, *partition, *offset);
                 }
             }
-            if retires_rotation_baseline {
-                if let Some(version) = drained_assignment_version {
+        }
+
+        let output = match drained_assignment {
+            Some(assignment)
+                if self.batch_cursor_assignment_version == Some(assignment.assignment_version) =>
+            {
+                let assignment_version = assignment.assignment_version;
+                match self.capture_vnode_checkpoint_delta(&assignment) {
+                    Err(error) => Err(error),
+                    Ok(delta) => {
+                        drop(assignment);
+                        if retires_rotation_baseline {
+                            let mut published = lock_or_recover(&self.assignment_publication);
+                            if published.assignment_version == assignment_version {
+                                let publication = Arc::make_mut(&mut published);
+                                retire_accepted_rotation_baselines(
+                                    &mut publication.baselines,
+                                    &self.poll_staged_offsets,
+                                );
+                                let count = rotation_baselines_len(&publication.baselines);
+                                self.rotation_partition_baseline_count
+                                    .store(count, Ordering::Release);
+                            }
+                        }
+                        Ok(output.with_checkpoint_delta(delta))
+                    }
+                }
+            }
+            Some(assignment) => {
+                let accepted = if retires_rotation_baseline {
+                    let mut accepted = (*assignment).clone();
+                    retire_accepted_rotation_baselines(
+                        &mut accepted.baselines,
+                        &self.poll_staged_offsets,
+                    );
+                    Arc::new(accepted)
+                } else {
+                    assignment
+                };
+                if retires_rotation_baseline {
                     let mut published = lock_or_recover(&self.assignment_publication);
-                    if published.assignment_version == version {
-                        let publication = Arc::make_mut(&mut published);
-                        retire_accepted_rotation_baselines(
-                            &mut publication.baselines,
-                            &self.poll_staged_offsets,
-                        );
-                        let count = rotation_baselines_len(&publication.baselines);
+                    if published.assignment_version == accepted.assignment_version {
+                        *published = Arc::clone(&accepted);
+                        let count = rotation_baselines_len(&accepted.baselines);
                         self.rotation_partition_baseline_count
                             .store(count, Ordering::Release);
                     }
                 }
+                self.capture_vnode_checkpoint(&accepted).map(|checkpoint| {
+                    self.batch_cursor_assignment_version = Some(accepted.assignment_version);
+                    output.with_checkpoint(checkpoint)
+                })
             }
-            self.poll_staged_offsets.clear();
+            None => Ok(output),
         }
+        .map_err(|error| {
+            terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            )
+        })?;
+        self.poll_staged_offsets.clear();
 
         self.metrics.record_poll(num_rows as u64, total_bytes);
 
@@ -4886,7 +5294,11 @@ impl SourceConnector for KafkaSource {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        kafka_output_schema(
+            &self.schema,
+            self.config.include_metadata,
+            self.config.include_headers,
+        )
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {

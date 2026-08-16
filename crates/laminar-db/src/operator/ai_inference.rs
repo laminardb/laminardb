@@ -14,6 +14,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
+use crossfire::AsyncTxTrait as _;
 use datafusion::prelude::SessionContext;
 use rustc_hash::FxHashMap;
 use tokio::runtime::Handle;
@@ -28,7 +29,7 @@ use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stre
 use crate::ai_worker::{run_worker, MissRow, WorkItem, WorkResult, WorkerContext};
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
-use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
+use crate::operator_graph::{GraphOperator, InputFrontier, OperatorCheckpoint};
 
 /// Must match `sql_analysis::AI_TMP_TABLE` — `projection_sql` reads from this name.
 const AI_TMP_TABLE: &str = "__ai_tmp";
@@ -310,6 +311,12 @@ impl AiInferenceOperator {
 
 #[async_trait]
 impl GraphOperator for AiInferenceOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::AiInference,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -372,12 +379,18 @@ impl GraphOperator for AiInferenceOperator {
         Ok(())
     }
 
-    fn watermark_hold(&self) -> Option<i64> {
-        self.pending.values().map(|pb| pb.ingest_watermark).min()
+    fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
+        input.held_at(self.pending.values().map(|pb| pb.ingest_watermark).min())
     }
 
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
+    }
+
+    fn deferred_work_is_runnable(&self) -> bool {
+        (!self.unsubmitted.is_empty() && !self.submit_tx.is_full())
+            || !self.replay.is_empty()
+            || !self.result_rx.is_empty()
     }
 }
 
@@ -534,6 +547,13 @@ mod tests {
         )
     }
 
+    fn idle_frontier(watermark: i64) -> InputFrontier {
+        InputFrontier {
+            watermark: Some(watermark),
+            idle: true,
+        }
+    }
+
     #[tokio::test]
     async fn late_checkpoint_decode_failure_preserves_replay_state() {
         let mut op = operator(Arc::new(Failing));
@@ -656,7 +676,9 @@ mod tests {
         let _ = restored.process(&[], &[10_000]).await.unwrap();
         // The recovered row must still hold the watermark at its original ingest
         // time (100), not the current one, or a downstream window drops it late.
-        assert_eq!(restored.watermark_hold(), Some(100));
+        let output = restored.output_frontier(idle_frontier(10_000));
+        assert_eq!(output.watermark, Some(100));
+        assert!(!output.idle);
         tokio::time::sleep(Duration::from_millis(250)).await;
         let out = restored.process(&[], &[10_000]).await.unwrap();
         assert_eq!(out.len(), 1);
@@ -681,27 +703,38 @@ mod tests {
             .await
             .unwrap();
         assert!(!op.wants_input(), "over the in-flight cap → refuses input");
+        assert!(!op.deferred_work_is_runnable());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watermark_is_held_while_in_flight() {
+    async fn frontier_is_held_while_in_flight() {
         let mut op = operator(Arc::new(SlowEcho {
             delay: Duration::from_millis(50),
             calls: Arc::new(AtomicU64::new(0)),
         }));
-        assert_eq!(op.watermark_hold(), None, "no hold with nothing in flight");
+        assert_eq!(
+            op.output_frontier(idle_frontier(5)),
+            idle_frontier(5),
+            "no hold with nothing in flight"
+        );
 
         // Ingest a cache miss at watermark 1000 — held there while in flight.
         let _ = op
             .process(&[vec![text_batch(&["x"])]], &[1000])
             .await
             .unwrap();
-        assert_eq!(op.watermark_hold(), Some(1000));
+        let output = op.output_frontier(idle_frontier(5_000));
+        assert_eq!(output.watermark, Some(1000));
+        assert!(!output.idle);
 
         // After the worker resolves and the row is emitted, the hold is released
         // even though the input watermark has since advanced.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let _ = op.process(&[], &[5000]).await.unwrap();
-        assert_eq!(op.watermark_hold(), None, "released after emission");
+        assert_eq!(
+            op.output_frontier(idle_frontier(5_000)),
+            idle_frontier(5_000),
+            "released after emission"
+        );
     }
 }

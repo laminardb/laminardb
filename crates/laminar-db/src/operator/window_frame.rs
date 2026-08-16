@@ -157,6 +157,12 @@ impl WindowFrameOperator {
 
 #[async_trait]
 impl GraphOperator for WindowFrameOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::WindowFrame,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -181,8 +187,10 @@ impl GraphOperator for WindowFrameOperator {
         };
 
         let enriched = self.enrich(&new, &buffer)?;
-        self.history = Some(Self::tail(&buffer, self.config.retain));
-        self.projection.apply(vec![enriched]).await
+        let next_history = Self::tail(&buffer, self.config.retain);
+        let output = self.projection.apply(vec![enriched]).await?;
+        self.history = Some(next_history);
+        Ok(output)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -330,5 +338,34 @@ mod tests {
             .unwrap();
         // Rows 3,4,5 are perfectly correlated → r = 1.0, unaffected by rows 1,2.
         assert!((last_stat(&out).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn projection_failure_does_not_advance_frame_history() {
+        let mut op = operator_with(MomentFn::Corr, 2);
+        op.process(&[vec![batch(&[1, 2], &[1.0, 2.0], &[2.0, 4.0])]], &[0])
+            .await
+            .unwrap();
+
+        op.projection = ProjectingJoinState::new(
+            "stat_test",
+            laminar_sql::create_session_context(),
+            Some(Arc::from("SELECT missing FROM __frame_tmp")),
+            FRAME_TMP_TABLE,
+        );
+        let error = op
+            .process(&[vec![batch(&[3], &[3.0], &[6.0])]], &[0])
+            .await
+            .expect_err("invalid residual projection must fail");
+
+        assert!(!error.requires_pipeline_recovery());
+        let history = op.history.as_ref().expect("prior history must remain");
+        let buckets = history
+            .column_by_name("bucket")
+            .expect("bucket history")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i64 buckets");
+        assert_eq!(buckets.values().as_ref(), &[1, 2]);
     }
 }

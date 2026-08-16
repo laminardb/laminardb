@@ -505,6 +505,7 @@ impl WatermarkTracker {
             return None;
         }
 
+        let was_idle = self.idle_sources[source_id];
         // Mark source as active
         self.idle_sources[source_id] = false;
         self.last_activity[source_id] = Instant::now();
@@ -512,6 +513,8 @@ impl WatermarkTracker {
         // Update source watermark
         if watermark > self.source_watermarks[source_id] {
             self.source_watermarks[source_id] = watermark;
+            self.update_combined()
+        } else if was_idle {
             self.update_combined()
         } else {
             None

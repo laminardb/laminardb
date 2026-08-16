@@ -126,7 +126,7 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 | `laminardb.mode` | `single` (standalone) or `cluster` (multi-node) |
 | `laminardb.checkpoint` | Checkpoint interval, storage URL, strategy |
 | `sources` / `sinks` / `pipelines` | Streaming pipeline definitions (rendered to TOML) |
-| `persistence` | PVC sizes for state and checkpoints |
+| `persistence` | Optional local checkpoint PVC settings |
 | `serviceMonitor` | Prometheus Operator integration |
 
 ### CI test values

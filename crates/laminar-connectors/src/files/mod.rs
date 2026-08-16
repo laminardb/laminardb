@@ -22,8 +22,8 @@ pub use text_decoder::TextLineDecoder;
 /// Registers the file source connector in the registry.
 ///
 /// This is called by `LaminarDB::register_builtin_connectors()` when the
-/// `files` feature is enabled, and makes `connector = 'files'` available
-/// in `CREATE SOURCE` statements.
+/// `files` feature is enabled, and makes `FROM FILES (...)` available in
+/// `CREATE SOURCE` statements.
 ///
 /// # Errors
 ///
@@ -65,7 +65,7 @@ pub fn register_file_source(
 
 /// Registers the file sink connector in the registry.
 ///
-/// Makes `connector = 'files'` available in `CREATE SINK` statements.
+/// Makes `INTO FILES (...)` available in `CREATE SINK` statements.
 ///
 /// # Errors
 ///

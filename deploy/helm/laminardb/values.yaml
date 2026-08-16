@@ -33,27 +33,15 @@ testConnection:
 laminardb:
   # -- Server mode: "single" (standalone) or "cluster" (multi-node clustering)
   mode: single
-  # -- Pipeline-wide delivery contract. Cluster mode currently requires at_least_once.
-  delivery: at_least_once
+  # -- Pipeline-wide delivery contract. Durable modes require a persistent checkpoint URL.
+  delivery: best_effort
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
   # -- HTTP API bind address
   httpBind: "0.0.0.0:8080"
-  # -- Number of worker threads (0 = auto-detect)
-  workers: 0
-  # -- Prometheus metrics endpoint
-  metrics:
-    enabled: true
-    bind: "0.0.0.0:8080"
+  # -- Stable key groups used by every deployment tier
+  keyGroups: 256
 
-  # -- State storage configuration
-  state:
-    # -- Backend type: "in_process", "local", or "object_store"
-    backend: local
-    # -- Path for persistent state (required when backend=local)
-    path: /var/lib/laminardb/state
-    # -- URL for shared storage (required when backend=object_store, e.g. "s3://bucket/prefix")
-    url: ""
   # -- Checkpoint configuration
   checkpoint:
     # -- Checkpoint interval (Go/humantime duration)
@@ -111,8 +99,6 @@ laminardb:
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
-    # -- Stable key groups distributed across cluster nodes
-    keyGroups: 256
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip
@@ -245,21 +231,8 @@ resources: {}
 #   cpu: "2"
 #   memory: 4Gi
 
-# -- Persistence for state and checkpoints
+# -- Local checkpoint persistence. Prefer an object-store checkpoint URL in production.
 persistence:
-  state:
-    # -- Enable persistent state storage
-    enabled: true
-    # -- Storage class (empty = default)
-    storageClass: ""
-    # -- Access modes
-    accessModes: [ReadWriteOnce]
-    # -- Volume size
-    size: 10Gi
-    # -- Use emptyDir instead of PVC (volatile)
-    useEmptyDir: false
-    # -- emptyDir medium (set to "Memory" for tmpfs)
-    emptyDirMedium: ""
   checkpoints:
     # -- Provision a dedicated checkpoints PVC. Off by default — prefer an object
     # store (laminardb.checkpoint.url); the local fallback path then uses a

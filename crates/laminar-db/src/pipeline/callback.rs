@@ -10,10 +10,10 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::connector::{SourceConnector, SourceContract, SourcePosition};
+use laminar_connectors::connector::{SourceConnector, SourcePosition};
+use laminar_core::checkpoint::{CheckpointAttempt, CheckpointAttemptRelation};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use laminar_core::cluster::control::CheckpointAssignmentFence;
-use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 #[cfg(feature = "cluster")]
@@ -256,6 +256,8 @@ pub(crate) enum CheckpointCompletion {
         result: crate::checkpoint_coordinator::CheckpointResult,
         /// Per-source positions persisted by that exact attempt.
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        /// The committed handoff cut retained aligned replay and is not yet the final cut.
+        handoff_replay_pending: bool,
     },
     /// The admitted attempt terminated without a durable commit.
     Failed {
@@ -281,6 +283,7 @@ pub enum CheckpointControlOutcome {
     Started {
         attempt: CheckpointAttempt,
         captured: bool,
+        flags: u64,
     },
     /// The exact leader-prepared attempt was authoritatively aborted before capture.
     Aborted { attempt: CheckpointAttempt },
@@ -298,7 +301,13 @@ pub enum CheckpointControlOutcome {
 #[derive(Debug)]
 pub enum CheckpointAssignmentAdmission {
     /// Admission may continue with a local cut or the exact certified cluster assignment.
-    Ready(Option<CheckpointAssignmentFence>),
+    Ready {
+        assignment_fence: Option<CheckpointAssignmentFence>,
+        flags: u64,
+        /// Retains the cluster assignment linearization boundary until the exact Prepare and
+        /// source-barrier commands are installed. `None` outside a clustered runtime.
+        assignment_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    },
     /// Topology is transitioning; retry later without faulting or reserving an attempt.
     Deferred(String),
     /// Assignment authority is invalid or unavailable and the pipeline must fail closed.
@@ -312,6 +321,7 @@ impl CheckpointCompletion {
     pub(crate) fn new(
         attempt: CheckpointAttempt,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        handoff_replay_pending: bool,
     ) -> Self {
         Self::Committed {
             attempt,
@@ -324,6 +334,7 @@ impl CheckpointCompletion {
                 failure_disposition: None,
             },
             source_checkpoints,
+            handoff_replay_pending,
         }
     }
 
@@ -332,6 +343,7 @@ impl CheckpointCompletion {
         admitted: CheckpointAttempt,
         result: crate::checkpoint_coordinator::CheckpointResult,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+        handoff_replay_pending: bool,
     ) -> Result<Self, String> {
         let completed = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
         if completed != admitted {
@@ -345,6 +357,7 @@ impl CheckpointCompletion {
             attempt: admitted,
             result,
             source_checkpoints,
+            handoff_replay_pending,
         })
     }
 
@@ -419,8 +432,6 @@ pub struct SourceRegistration {
     pub connector: Box<dyn SourceConnector>,
     /// Connector config included in the atomic startup request.
     pub config: ConnectorConfig,
-    /// Durability and placement semantics resolved from the connector configuration.
-    pub contract: SourceContract,
     /// The runtime installed cluster vnode ownership for this source instance.
     ///
     /// This is an engine-owned admission fact, not a connector capability switch.
@@ -444,6 +455,17 @@ pub trait PipelineCallback: Send + 'static {
         Ok(())
     }
 
+    /// Pin decision-bound source frontiers before a new source-admission cycle begins.
+    ///
+    /// The coordinator does not call this while graph-owned deferred input is replaying, so one
+    /// snapshot covers source filtering, initial execution, and every retained replay pass.
+    ///
+    /// # Errors
+    /// Returns an error when the frontier snapshot cannot be installed.
+    fn pin_source_frontiers_for_new_cycle(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Execute a SQL cycle over the accumulated source batches. `Err` is a whole-cycle
     /// failure (all domains, or a backpressure halt); per-domain faults surface in
     /// [`CycleOutcome`] so healthy domains still commit.
@@ -453,11 +475,28 @@ pub trait PipelineCallback: Send + 'static {
         watermark: i64,
     ) -> Result<CycleOutcome, CycleError>;
 
+    /// Complete assignment-scoped vnode lifecycle work without admitting source input.
+    ///
+    /// Recovery can close intake before a predecessor transition has run. Implementations return
+    /// `true` only when pending work completed; `false` means idle or waiting for its exact
+    /// assignment certificate.
+    async fn complete_pending_vnode_transition(&mut self) -> Result<bool, CycleError>;
+
     /// Drain every graph input that belongs to the frozen checkpoint cut.
     ///
-    /// Implementations must deliver each drain pass's outputs before returning and must not
-    /// cancel an in-progress graph pass: operators may temporarily own their input buffers across
-    /// an await. The absolute deadline is checked between complete passes.
+    /// Implementations must deliver each drain pass's outputs before returning. The returned
+    /// future is one owner transaction: its caller must await an explicit result or destroy the
+    /// complete callback/coordinator generation. It must not drop the future while retaining that
+    /// generation. Operators may temporarily own graph input across an await, and a completed graph
+    /// pass may have partially published materialized-view, stream, or sink output.
+    ///
+    /// An implementation may cancel a nested operation for its absolute deadline or process lease
+    /// only when it regains control and records or returns a disposition that prevents checkpoint
+    /// capture from passing incomplete publication. A future caller that needs an outer timeout,
+    /// `select!`, or task abort must first add a coordinator-owned attempt transaction covering
+    /// graph/output publication, source-barrier ownership, and attempt cleanup. The current
+    /// implementation checks its absolute deadline between complete graph passes and inside
+    /// sink-publication awaits whose outcomes are consumed before capture.
     async fn drain_checkpoint_edges_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -497,10 +536,38 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Result<(), CycleError>;
 
     /// Extract watermark from a batch for a given source.
-    fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source batch has invalid event-time metadata.
+    fn extract_watermark(
+        &mut self,
+        source_name: &str,
+        batch: &RecordBatch,
+        admission_floor: i64,
+    ) -> Result<(), CycleError>;
 
-    /// Filter late rows from a batch.
-    fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch>;
+    /// Install the exact input-channel inventory carried by a source cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inventory is invalid or conflicts with recovered progress.
+    fn reconcile_source_input_channels(
+        &mut self,
+        source_name: &str,
+        input_channels: Option<Arc<[Vec<u8>]>>,
+    ) -> Result<(), CycleError>;
+
+    /// Filter late rows while preserving any validated hidden source metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when hidden metadata is malformed or the batch cannot be filtered.
+    fn filter_late_rows(
+        &self,
+        source_name: &str,
+        batch: &RecordBatch,
+    ) -> Result<Option<RecordBatch>, CycleError>;
 
     /// Current pipeline watermark.
     fn current_watermark(&self) -> i64;
@@ -522,6 +589,13 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// Take a pending deterministic pipeline halt. A halt is permanent for the current
+    /// deployment and therefore takes precedence over consistency faults that would otherwise
+    /// trigger recovery of the same poison input.
+    fn take_pipeline_halt(&mut self) -> Option<String> {
+        None
+    }
+
     /// Take a pending consistency fault from checkpointing or a poisoned sink epoch. The
     /// coordinator stops intake so recovery can replay from the last committed cut.
     fn take_pipeline_fault(&mut self) -> Option<String> {
@@ -539,12 +613,9 @@ pub trait PipelineCallback: Send + 'static {
     /// Record a failure before an exact checkpoint attempt could be reserved.
     fn record_checkpoint_admission_failure(&mut self, _reason: &str) {}
 
-    /// Join tracked asynchronous checkpoint tails before connector teardown. When `abort` is
-    /// true, request cancellation and detach them because the bounded graceful-drain budget has
-    /// expired and cancellation may be cooperative.
+    /// Join tracked asynchronous checkpoint tails before connector teardown.
     fn settle_checkpoint_tail_tasks(
         &mut self,
-        _abort: bool,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         std::future::ready(Ok(()))
     }
@@ -555,19 +626,21 @@ pub trait PipelineCallback: Send + 'static {
     /// reservation may be abandoned, but its ID is permanently burned.
     fn reserve_checkpoint_attempt(
         &mut self,
-        _attempt_started: std::time::Instant,
+        _deadline: tokio::time::Instant,
     ) -> impl std::future::Future<Output = Result<CheckpointAttempt, String>> + Send {
         std::future::ready(Err(
             "checkpoint coordinator has no durable attempt allocator".into(),
         ))
     }
 
-    /// Publish the certified cluster `Prepare` for an exact reserved attempt before any source or
-    /// shuffle barrier is injected. Local runtimes have no cluster control record.
+    /// Durably admit exact checkpoint artifacts, then publish the certified cluster `Prepare`,
+    /// before any source or shuffle barrier is injected.
     fn publish_checkpoint_prepare(
         &mut self,
         _attempt: CheckpointAttempt,
         _attempt_started: std::time::Instant,
+        _deadline: tokio::time::Instant,
+        _flags: u64,
         _assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
         std::future::ready(Ok(()))
@@ -579,6 +652,7 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         _attempt: CheckpointAttempt,
         _reason: &str,
+        _flags: u64,
         _assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
 
@@ -610,13 +684,23 @@ pub trait PipelineCallback: Send + 'static {
     /// Capture the exact assignment certificate for a new attempt.
     fn checkpoint_assignment_for_admission(
         &mut self,
+        _deadline: tokio::time::Instant,
     ) -> impl std::future::Future<Output = CheckpointAssignmentAdmission> + Send {
-        std::future::ready(CheckpointAssignmentAdmission::Ready(None))
+        std::future::ready(CheckpointAssignmentAdmission::Ready {
+            assignment_fence: None,
+            flags: laminar_core::checkpoint::flags::NONE,
+            assignment_guard: None,
+        })
     }
 
     /// Wake the coordinator for leader-originated checkpoint control. `None` keeps local
     /// runtimes free of cluster polling.
     fn checkpoint_control_wake(&self) -> Option<CheckpointControlWake> {
+        None
+    }
+
+    /// Wake the coordinator when inbound data or deferred shuffle work becomes ready.
+    fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
         None
     }
 
@@ -638,11 +722,17 @@ pub trait PipelineCallback: Send + 'static {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
         attempt: CheckpointAttempt,
         attempt_started: std::time::Instant,
+        deadline: tokio::time::Instant,
+        flags: u64,
         assignment_fence: Option<CheckpointAssignmentFence>,
     ) -> BarrierOutcome;
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
+
+    /// Record the three timed phases of one successfully published normal cycle. Checkpoint graph
+    /// drains use a separate execution path and must not call this hook.
+    fn record_cycle_phases(&self, _execute_ns: u64, _output_store_ns: u64, _sink_enqueue_ns: u64) {}
 
     /// Count a fatal cycle error that was dropped-and-continued (at-least-once only).
     fn note_cycle_error(&self) {}
@@ -665,6 +755,11 @@ pub trait PipelineCallback: Send + 'static {
     /// `true` when deferred operators have pending input to drain.
     fn has_deferred_input(&self) -> bool {
         false
+    }
+
+    /// `true` when retained work can run now without waiting for an external wake.
+    fn has_runnable_deferred_input(&self) -> bool {
+        self.has_deferred_input()
     }
 
     /// Reserve each subscription log's cursor at the aligned checkpoint cut.

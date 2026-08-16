@@ -8,6 +8,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
+#[cfg(test)]
 use arrow::ipc::writer::StreamWriter;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use datafusion_common::ScalarValue;
@@ -823,6 +824,11 @@ impl MvStore {
         self.entries.contains_key(name)
     }
 
+    #[cfg(test)]
+    pub(crate) fn storage_mode_for_test(&self, name: &str) -> Option<MvStorageMode> {
+        self.entries.get(name).map(|entry| entry.mode.clone())
+    }
+
     #[cfg(feature = "cluster")]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -1026,9 +1032,10 @@ impl MvStore {
     }
 }
 
-/// Prefix for MV entries in the `operator_states` checkpoint map.
+/// Prefix for materialized-view checkpoint frame identifiers.
 pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
 
+#[cfg(test)]
 pub(crate) fn batches_to_ipc<'a, I>(schema: &SchemaRef, batches: I) -> Result<Vec<u8>, DbError>
 where
     I: IntoIterator<Item = &'a RecordBatch>,
@@ -1062,10 +1069,6 @@ where
         max_bytes,
     )
     .map_err(|error| DbError::Storage(format!("IPC write: {error}")))
-}
-
-pub(crate) fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
-    ipc_to_schema_and_batches(bytes).map(|(_, batches)| batches)
 }
 
 fn ipc_to_schema_and_batches(
@@ -2135,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn multiset_restore_rejects_legacy_expanded_snapshot_atomically() {
+    fn multiset_restore_rejects_expanded_snapshot_atomically() {
         let mut store = MvStore::new();
         store
             .create_mv("m", one_col_schema(), MvStorageMode::Multiset)
@@ -2144,8 +2147,8 @@ mod tests {
         let before = multiset_values(&store, "m");
         let before_bytes = store.total_bytes();
 
-        let legacy = plain_one_col_batch(&[20, 20]);
-        let bytes = batches_to_ipc(&legacy.schema(), std::iter::once(&legacy)).unwrap();
+        let expanded = plain_one_col_batch(&[20, 20]);
+        let bytes = batches_to_ipc(&expanded.schema(), std::iter::once(&expanded)).unwrap();
         let error = store.restore_from_ipc("m", &bytes).unwrap_err();
         assert!(error.to_string().contains("schema or format mismatch"));
         assert_eq!(multiset_values(&store, "m"), before);

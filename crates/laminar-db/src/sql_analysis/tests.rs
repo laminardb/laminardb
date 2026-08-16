@@ -1,5 +1,120 @@
 use super::*;
 
+#[test]
+fn weighted_projection_rewrite_is_ast_owned_and_wildcard_safe() {
+    let rewritten =
+        projection_sql_preserving_weight("SELECT value + 1 AS adjusted FROM changes WHERE id > 1")
+            .unwrap();
+    assert!(rewritten.contains(", __weight AS __weight FROM changes WHERE"));
+    assert_eq!(rewritten.matches("__weight").count(), 2);
+
+    for wildcard in [
+        "SELECT * FROM changes WHERE id > 1",
+        "SELECT c.* FROM changes AS c WHERE id > 1",
+        "SELECT id AS copy, * FROM changes WHERE id > 1",
+    ] {
+        assert_eq!(
+            projection_sql_preserving_weight(wildcard).as_deref(),
+            Some(wildcard)
+        );
+    }
+    for noncanonical in [
+        "SELECT *, id AS copy FROM changes WHERE id > 1",
+        "SELECT c.*, id AS copy FROM changes AS c WHERE id > 1",
+        "SELECT *, c.* FROM changes AS c WHERE id > 1",
+    ] {
+        assert!(projection_sql_preserving_weight(noncanonical).is_none());
+    }
+    assert!(
+        projection_sql_preserving_weight("SELECT value AS __weight FROM changes WHERE id > 1")
+            .is_none()
+    );
+    assert!(
+        projection_sql_preserving_weight("SELECT value FROM changes WHERE __WEIGHT > 0").is_none()
+    );
+}
+
+#[test]
+fn sink_predicate_weight_reference_is_case_insensitive_and_fail_closed() {
+    for predicate in ["__weight > 0", "row.__WEIGHT < 0", "(__Weight) = 1"] {
+        assert!(predicate_references_weight(predicate), "{predicate}");
+    }
+    assert!(!predicate_references_weight(
+        "value > 0 AND note = '__weight'"
+    ));
+    assert!(predicate_references_weight("("));
+}
+
+#[test]
+fn mutable_changelog_modifier_scan_rejects_row_set_and_ordering_semantics() {
+    assert!(!mutable_changelog_has_unsafe_modifiers(
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id WHERE l.id > 0"
+    ));
+    for query in [
+        "SELECT DISTINCT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id ORDER BY id LIMIT 1",
+        "SELECT l.id AS id FROM left_events l JOIN right_events r ON l.id = r.id FETCH FIRST 1 ROW ONLY",
+        "SELECT ROW_NUMBER() OVER (ORDER BY l.id) AS row_num FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS id, EXISTS (SELECT 1 FROM other_events o WHERE o.id = l.id) AS present FROM left_events l JOIN right_events r ON l.id = r.id",
+        "(",
+    ] {
+        assert!(mutable_changelog_has_unsafe_modifiers(query), "{query}");
+    }
+}
+
+#[test]
+fn query_weight_reference_scan_allows_only_implicit_wildcards() {
+    assert!(!query_references_weight(
+        "SELECT l.* FROM left_events l JOIN right_events r ON l.id = r.id"
+    ));
+    for query in [
+        "SELECT l.__weight AS weight_copy FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id AS __WEIGHT FROM left_events l JOIN right_events r ON l.id = r.id",
+        "SELECT l.id FROM left_events l JOIN right_events r ON l.id = r.id WHERE r.__Weight > 0",
+        "(",
+    ] {
+        assert!(query_references_weight(query), "{query}");
+    }
+}
+
+#[test]
+fn changelog_enrich_static_wildcard_still_selects_the_left_weight() {
+    let incremental = FxHashSet::from_iter(["changes".to_string()]);
+    let static_tables = FxHashSet::from_iter(["dimension".to_string()]);
+    let detected = detect_changelog_enrich_query(
+        "SELECT d.* FROM changes c JOIN dimension d ON c.id = d.id",
+        &incremental,
+        &static_tables,
+    )
+    .unwrap();
+
+    assert!(detected.projection_sql.contains("d.*, c.\"__weight\""));
+    for unsupported in [
+        "SELECT * FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.*, d.name FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.* EXCLUDE (name) FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.name AS __WEIGHT FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.__weight AS copied FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT \"c\".* FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT d.name FROM changes AS \"left input\" JOIN dimension d ON \"left input\".id = d.id",
+        "SELECT \"C\".* FROM changes AS \"c\" JOIN dimension AS \"C\" ON \"c\".id = \"C\".id",
+        "SELECT c.id AS id, ROW_NUMBER() OVER (ORDER BY c.id) AS row_num FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT TOP 1 c.id AS id FROM changes c JOIN dimension d ON c.id = d.id",
+        "SELECT c.id AS id FROM changes c JOIN dimension d ON c.id = d.id QUALIFY ROW_NUMBER() OVER (ORDER BY c.id) = 1",
+        "SELECT c.id AS id, EXISTS (SELECT 1 FROM other_stream o WHERE o.id = c.id) AS present FROM changes c JOIN dimension d ON c.id = d.id",
+    ] {
+        assert!(detect_changelog_enrich_query(unsupported, &incremental, &static_tables).is_none());
+    }
+
+    let left = detect_changelog_enrich_query(
+        "SELECT d.name, c.* FROM changes c JOIN dimension d ON c.id = d.id",
+        &incremental,
+        &static_tables,
+    )
+    .unwrap();
+    assert!(!left.projection_sql.contains("c.\"__weight\""));
+}
+
 fn lookup_fixtures() -> (FxHashMap<String, Vec<String>>, FxHashMap<String, SchemaRef>) {
     use arrow::datatypes::{DataType, Field, Schema};
     let mut partial = FxHashMap::default();
@@ -117,76 +232,11 @@ fn extract_table_refs_plain() {
     let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
     assert_eq!(refs.len(), 1);
     assert!(refs.contains("events"));
-}
 
-#[test]
-fn test_temporal_probe_strips_quoted_timestamp_columns() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (\"T\", \"E\") \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("temporal probe detected");
-    assert_eq!(config.left_time_column, "T");
-    assert_eq!(config.right_time_column, "E");
-}
-
-#[test]
-fn test_temporal_probe_ignores_literal_in_where() {
-    let sql = "SELECT * FROM trades WHERE msg = 'TEMPORAL PROBE JOIN'";
-    let (config, _) = detect_temporal_probe_query(sql);
-    assert!(
-        config.is_none(),
-        "must not detect a probe join inside a string literal"
+    let refs = extract_table_references(
+        "WITH hidden AS (SELECT * FROM right_events) SELECT * FROM hidden",
     );
-}
-
-#[test]
-fn test_temporal_probe_ignores_block_comment_literal() {
-    let sql = "SELECT * FROM trades WHERE comment = '/* TEMPORAL PROBE JOIN */'";
-    let (config, _) = detect_temporal_probe_query(sql);
-    assert!(config.is_none());
-}
-
-#[test]
-fn test_temporal_probe_through_block_comments() {
-    let sql = "SELECT t.s FROM trades t \
-               /* outer */ TEMPORAL PROBE JOIN /* inner */ book r \
-               ON (s) TIMESTAMPS (ts, ts) \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("block comments must not block detection");
-    assert_eq!(config.left_table, "trades");
-    assert_eq!(config.right_table, "book");
-}
-
-#[test]
-fn test_temporal_probe_qualified_quoted_timestamps() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (t.\"T\", r.\"E\") \
-               LIST (0s, 1s) AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("qualified quoted idents must resolve");
-    assert_eq!(config.left_time_column, "T");
-    assert_eq!(config.right_time_column, "E");
-}
-
-#[test]
-fn test_temporal_probe_range_spec() {
-    let sql = "SELECT t.s FROM trades t \
-               TEMPORAL PROBE JOIN book r \
-               ON (s) TIMESTAMPS (ts, ts) \
-               RANGE FROM 0s TO 30s STEP 5s AS p";
-    let (config, _) = detect_temporal_probe_query(sql);
-    let config = config.expect("range spec must parse");
-    // 0,5,10,15,20,25,30 = 7 offsets
-    assert_eq!(
-        config.expanded_offsets_ms.len(),
-        7,
-        "got {:?}",
-        config.expanded_offsets_ms
-    );
+    assert_eq!(refs, FxHashSet::from_iter(["right_events".to_string()]));
 }
 
 #[test]
@@ -220,17 +270,6 @@ fn inline_unnest_is_not_a_second_stream_or_join() {
 }
 
 #[test]
-fn extract_table_refs_temporal_probe_join() {
-    let refs = extract_table_references(
-        "SELECT t.s FROM trades t \
-         TEMPORAL PROBE JOIN prices r ON (s) TIMESTAMPS (ts, ts) \
-         LIST (0s, 5s) AS p",
-    );
-    assert!(refs.contains("trades"), "got {refs:?}");
-    assert!(refs.contains("prices"), "got {refs:?}");
-}
-
-#[test]
 fn single_source_tumble() {
     let name = single_source_table("SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)");
     assert_eq!(name.as_deref(), Some("trades"));
@@ -243,4 +282,176 @@ fn is_window_tvf_case_insensitive() {
     assert!(is_window_tvf("Hop"));
     assert!(is_window_tvf("SESSION"));
     assert!(!is_window_tvf("my_func"));
+}
+
+fn temporal_projection_config() -> TemporalJoinTranslatorConfig {
+    TemporalJoinTranslatorConfig {
+        left_table: "trades".into(),
+        right_table: "quotes".into(),
+        left_key_columns: vec!["symbol".into()],
+        right_key_columns: vec!["symbol".into()],
+        left_time_column: "trade_time".into(),
+        right_time_column: "quote_time".into(),
+        join_kind: laminar_sql::temporal::TemporalJoinKind::Left,
+        probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+        probe_alias: None,
+    }
+}
+
+const TEMPORAL_FROM: &str = "FROM trades t LEFT JOIN quotes \
+    FOR SYSTEM_TIME AS OF t.trade_time AS q ON t.symbol = q.symbol";
+
+#[test]
+fn temporal_projection_rewrites_supported_scalar_select_and_filter() {
+    let sql = format!(
+        "SELECT t.trade_id AS id, q.price * 2 AS doubled {TEMPORAL_FROM} \
+         WHERE q.price > 0 AND t.trade_id IN (1, 2)"
+    );
+    let projection = temporal_projection_sql(&sql, &temporal_projection_config()).unwrap();
+    assert_eq!(
+        projection,
+        "SELECT trade_id AS id, price_quotes * 2 AS doubled FROM __temporal_tmp AS \
+         __temporal_projection_input \
+         WHERE price_quotes > 0 AND trade_id IN (1, 2)"
+    );
+
+    let mut probe_config = temporal_projection_config();
+    probe_config.probe_schedule =
+        laminar_sql::temporal::TemporalProbeSchedule::list(vec![5_000, 15_000]).unwrap();
+    probe_config.probe_alias = Some("probe".into());
+    let probe_sql = format!("SELECT probe.offset_ms, probe.probe_time, q.price {TEMPORAL_FROM}");
+    assert_eq!(
+        temporal_projection_sql(&probe_sql, &probe_config).unwrap(),
+        "SELECT offset_ms, probe_time, price_quotes FROM __temporal_tmp AS \
+         __temporal_projection_input"
+    );
+    let error = temporal_projection_sql(&format!("SELECT probe.id {TEMPORAL_FROM}"), &probe_config)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("probe qualifier exposes only offset_ms and probe_time"),
+        "{error}"
+    );
+}
+
+#[test]
+fn temporal_projection_matches_unquoted_qualifiers_case_insensitively() {
+    let sql = format!("SELECT T.trade_id, Q.price {TEMPORAL_FROM} WHERE Q.price > 0");
+    assert_eq!(
+        temporal_projection_sql(&sql, &temporal_projection_config()).unwrap(),
+        "SELECT trade_id, price_quotes FROM __temporal_tmp AS __temporal_projection_input \
+         WHERE price_quotes > 0"
+    );
+}
+
+#[test]
+fn temporal_projection_rejects_probe_and_join_qualifier_collision() {
+    let mut config = temporal_projection_config();
+    config.probe_schedule =
+        laminar_sql::temporal::TemporalProbeSchedule::list(vec![5_000]).unwrap();
+    config.probe_alias = Some("Q".into());
+
+    let error =
+        temporal_projection_sql(&format!("SELECT q.price {TEMPORAL_FROM}"), &config).unwrap_err();
+    assert!(error.to_string().contains("qualifiers must be distinct"));
+}
+
+#[test]
+fn temporal_projection_rejects_unpreserved_sql_shapes() {
+    let cases = [
+        (
+            "distinct",
+            format!("SELECT DISTINCT t.trade_id {TEMPORAL_FROM}"),
+            "SELECT modifiers",
+        ),
+        (
+            "grouping",
+            format!(
+                "SELECT t.symbol, COUNT(q.price) {TEMPORAL_FROM} \
+                 GROUP BY t.symbol HAVING COUNT(q.price) > 1"
+            ),
+            "SELECT modifiers",
+        ),
+        (
+            "ordering and limit",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} ORDER BY t.trade_id LIMIT 1"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "fetch",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} FETCH FIRST 1 ROW ONLY"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "window function",
+            format!(
+                "SELECT ROW_NUMBER() OVER (PARTITION BY t.symbol ORDER BY t.trade_time) AS rn \
+                 {TEMPORAL_FROM}"
+            ),
+            "function calls",
+        ),
+        (
+            "qualify",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} QUALIFY q.price > 0"),
+            "SELECT modifiers",
+        ),
+        (
+            "qualified wildcard",
+            format!("SELECT t.* {TEMPORAL_FROM}"),
+            "qualified wildcards",
+        ),
+        (
+            "wildcard modifier",
+            format!("SELECT * EXCLUDE (trade_time) {TEMPORAL_FROM}"),
+            "invalid SQL",
+        ),
+        (
+            "scalar function",
+            format!("SELECT ABS(q.price) {TEMPORAL_FROM}"),
+            "function calls",
+        ),
+        (
+            "unsupported expression",
+            format!("SELECT t.trade_id {TEMPORAL_FROM} WHERE q.symbol LIKE 'A%'"),
+            "expression form",
+        ),
+        (
+            "subquery",
+            format!("SELECT (SELECT 1) AS one {TEMPORAL_FROM}"),
+            "subqueries",
+        ),
+        (
+            "unqualified column",
+            format!("SELECT trade_id {TEMPORAL_FROM}"),
+            "unqualified column",
+        ),
+        (
+            "additional join",
+            format!(
+                "SELECT t.trade_id {TEMPORAL_FROM} \
+                 LEFT JOIN venues v ON q.venue = v.venue"
+            ),
+            "exactly one direct temporal join",
+        ),
+        (
+            "cte",
+            format!("WITH seed AS (SELECT 1) SELECT t.trade_id {TEMPORAL_FROM}"),
+            "WITH, ORDER BY",
+        ),
+        (
+            "multiple statements",
+            format!("SELECT t.trade_id {TEMPORAL_FROM}; SELECT 1"),
+            "exactly one SELECT statement",
+        ),
+    ];
+
+    let config = temporal_projection_config();
+    for (name, sql, expected) in cases {
+        let error = temporal_projection_sql(&sql, &config).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "{name}: expected {expected:?}, got {error}"
+        );
+    }
 }

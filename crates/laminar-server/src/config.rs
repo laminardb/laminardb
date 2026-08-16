@@ -7,10 +7,10 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use laminar_core::state::{
-    KeyGroupCount, StateBackendConfig, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
-    LOCAL_KEY_GROUP_COUNT,
-};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
+use laminar_core::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT};
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
@@ -26,6 +26,12 @@ const MIN_PGWIRE_PASSWORD_LEN: usize = 12;
 /// Minimum length for the console bearer token (HTTP control-plane auth).
 const MIN_CONSOLE_TOKEN_LEN: usize = 8;
 
+/// Both HTTP bearer credentials use a full 256 bits when observer access is enabled.
+const HTTP_AUTH_TOKEN_BYTES: usize = 32;
+
+/// Unpadded base64url length of a 32-byte credential.
+const HTTP_AUTH_TOKEN_ENCODED_LEN: usize = 43;
+
 /// Load, parse, and validate a LaminarDB configuration file.
 pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
@@ -34,11 +40,15 @@ pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     })?;
 
     let substituted = substitute_env_vars(&raw)?;
-    let config: ServerConfig =
-        toml::from_str(&substituted).map_err(|e| ConfigError::ParseError {
+    let config: ServerConfig = toml::from_str(&substituted).map_err(|mut source| {
+        // `toml::de::Error` retains and renders its input. The substituted document can
+        // contain credentials, so detach it before the error crosses this boundary.
+        source.set_input(None);
+        ConfigError::ParseError {
             path: path.to_path_buf(),
-            source: e,
-        })?;
+            source,
+        }
+    })?;
 
     validate_config(&config)?;
     Ok(config)
@@ -72,6 +82,99 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result.replace(ESCAPED_OPEN, "${"))
 }
 
+/// Validate the startup-bound HTTP authentication boundary.
+///
+/// This is separate from full file validation so programmatic startup paths can enforce the
+/// same credential and bind invariants before creating any externally visible resources.
+pub(crate) fn validate_http_auth(config: &ServerConfig) -> Result<(), ConfigError> {
+    let mut errors = Vec::new();
+    collect_http_auth_errors(config, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationErrors { errors })
+    }
+}
+
+fn collect_http_auth_errors(config: &ServerConfig, errors: &mut Vec<String>) {
+    let bind = match config.server.bind.parse::<std::net::SocketAddr>() {
+        Ok(bind) => Some(bind),
+        Err(_) => {
+            errors.push(format!(
+                "invalid server bind address: '{}'",
+                config.server.bind
+            ));
+            None
+        }
+    };
+
+    let Some(diagnostic_token) = &config.server.diagnostic_read_token else {
+        if let Some(console_token) = &config.server.console_token {
+            if console_token.len() < MIN_CONSOLE_TOKEN_LEN {
+                errors.push(format!(
+                    "server.console_token must be at least {MIN_CONSOLE_TOKEN_LEN} characters"
+                ));
+            }
+        }
+        return;
+    };
+
+    if config.server.mode != ServerMode::Cluster {
+        errors.push("server.diagnostic_read_token requires server.mode = \"cluster\"".to_string());
+    }
+
+    match bind {
+        Some(bind) if !bind.ip().is_loopback() => errors.push(
+            "server.diagnostic_read_token requires server.bind to be a loopback socket address"
+                .to_string(),
+        ),
+        Some(_) | None => {}
+    }
+
+    if !is_canonical_http_auth_token(diagnostic_token) {
+        errors.push(format!(
+            "server.diagnostic_read_token must be the canonical unpadded base64url encoding of \
+             exactly {HTTP_AUTH_TOKEN_BYTES} bytes ({HTTP_AUTH_TOKEN_ENCODED_LEN} characters)"
+        ));
+    }
+
+    match &config.server.console_token {
+        None => errors.push(
+            "server.diagnostic_read_token requires server.console_token to be configured"
+                .to_string(),
+        ),
+        Some(console_token) => {
+            if !is_canonical_http_auth_token(console_token) {
+                errors.push(format!(
+                    "server.console_token must be the canonical unpadded base64url encoding of \
+                     exactly {HTTP_AUTH_TOKEN_BYTES} bytes ({HTTP_AUTH_TOKEN_ENCODED_LEN} \
+                     characters) when server.diagnostic_read_token is configured"
+                ));
+            }
+            if console_token == diagnostic_token {
+                errors.push(
+                    "server.diagnostic_read_token must differ from server.console_token"
+                        .to_string(),
+                );
+            }
+        }
+    }
+}
+
+fn is_canonical_http_auth_token(token: &Secret) -> bool {
+    let encoded = token.expose();
+    if encoded.len() != HTTP_AUTH_TOKEN_ENCODED_LEN {
+        return false;
+    }
+
+    match URL_SAFE_NO_PAD.decode(encoded) {
+        Ok(decoded) if decoded.len() == HTTP_AUTH_TOKEN_BYTES => {
+            URL_SAFE_NO_PAD.encode(decoded) == encoded
+        }
+        Ok(_) | Err(_) => false,
+    }
+}
+
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
@@ -84,6 +187,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 sink.name, sink.pipeline
             ));
         }
+        if sink
+            .properties
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("format"))
+        {
+            errors.push(format!(
+                "sink '{}': format must be configured as a top-level sink field, not under sink.properties",
+                sink.name
+            ));
+        }
+        collect_connector_property_errors("sink", &sink.name, &sink.properties, &mut errors);
     }
 
     let mut seen_sources = HashSet::new();
@@ -91,6 +205,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if !seen_sources.insert(&source.name) {
             errors.push(format!("duplicate source name: '{}'", source.name));
         }
+        if source
+            .properties
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("format"))
+        {
+            errors.push(format!(
+                "source '{}': format must be configured as a top-level source field, not under source.properties",
+                source.name
+            ));
+        }
+        collect_connector_property_errors("source", &source.name, &source.properties, &mut errors);
     }
 
     let mut seen_pipelines = HashSet::new();
@@ -114,12 +239,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.bind.parse::<std::net::SocketAddr>().is_err() {
-        errors.push(format!(
-            "invalid server bind address: '{}'",
-            config.server.bind
-        ));
-    }
+    collect_http_auth_errors(config, &mut errors);
+
     if let Some(addr) = &config.server.pgwire_bind {
         match addr.parse::<std::net::SocketAddr>() {
             Ok(addr) if !addr.ip().is_loopback() && config.server.pgwire_tls_cert.is_none() => {
@@ -195,14 +316,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if let Some(token) = &config.server.console_token {
-        if token.len() < MIN_CONSOLE_TOKEN_LEN {
-            errors.push(format!(
-                "server.console_token must be at least {MIN_CONSOLE_TOKEN_LEN} characters"
-            ));
-        }
-    }
-
     // CORS origins become `Access-Control-Allow-Origin` values; reject invalid header values.
     if let Some(origins) = &config.server.console_cors_allowed_origins {
         for origin in origins {
@@ -215,13 +328,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.mode == ServerMode::Single && config.server.key_groups.is_some() {
-        errors.push(
-            "server.key_groups is cluster-only; single mode always uses exactly 1 key group"
-                .to_string(),
-        );
-    }
-
     if config.server.mode == ServerMode::Cluster {
         match config.server.delivery {
             DeliveryGuarantee::BestEffort => errors.push(
@@ -229,14 +335,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                  rebalance/state-loss contract"
                     .to_string(),
             ),
-            DeliveryGuarantee::AtLeastOnce => {}
-            DeliveryGuarantee::ExactlyOnce => errors.push(
-                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
-                 term-fenced, but supported connectors do not yet provide a certified \
-                 term-fenced source handoff and external sink cursor commit. Use cluster \
-                 at_least_once, or exactly_once in embedded/single-node mode"
-                    .to_string(),
-            ),
+            DeliveryGuarantee::AtLeastOnce | DeliveryGuarantee::ExactlyOnce => {}
         }
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
@@ -251,16 +350,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 config.checkpoint.interval,
             ));
         }
-        let scope = config.state.durability_scope();
-        if !scope.satisfies(StateBackendDurability::ClusterShared) {
-            errors.push(format!(
-                "mode = \"cluster\" requires ClusterShared [state] storage; configured scope is \
-                 {scope:?}. Use s3://, gs://, or az:// storage; local paths and file:// are \
-                 node-local"
-            ));
-        }
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::ClusterShared) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope != CheckpointStorageScope::ClusterShared {
             errors.push(format!(
                 "mode = \"cluster\" requires ClusterShared [checkpoint] storage for manifests \
                  and decisions; configured scope is {checkpoint_scope:?}. Use s3://, gs://, or \
@@ -276,23 +367,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                     .to_string(),
             );
         }
-        let scope = config.state.durability_scope();
-        if !scope.satisfies(StateBackendDurability::NodeDurable) {
-            errors.push(format!(
-                "exactly-once delivery requires at least NodeDurable [state] storage; configured \
-                 scope is {scope:?}"
-            ));
-        }
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope == CheckpointStorageScope::Volatile {
             errors.push(format!(
                 "exactly-once delivery requires at least NodeDurable [checkpoint] storage; \
                  configured scope is {checkpoint_scope:?}"
             ));
         }
     } else if config.server.delivery == DeliveryGuarantee::AtLeastOnce {
-        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
-        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+        let checkpoint_scope = CheckpointStorageScope::for_url(&config.checkpoint.url);
+        if checkpoint_scope == CheckpointStorageScope::Volatile {
             errors.push(format!(
                 "at-least-once delivery requires at least NodeDurable [checkpoint] storage \
                  before source acknowledgements can advance; configured scope is \
@@ -307,11 +391,20 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     if config.checkpoint.timeout.is_zero() {
         errors.push("checkpoint.timeout must be > 0".to_string());
     }
-    if config.checkpoint.max_staged_bytes == Some(0) {
-        errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
+    if config.checkpoint.max_node_data_bytes == Some(0) {
+        errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());
     }
-    if config.checkpoint.max_retained == 0 {
-        errors.push("checkpoint.max_retained must be > 0".to_string());
+    if let Err(error) = config
+        .server
+        .validated_temporal_join_idle_history_retention()
+    {
+        errors.push(format!("server.{error}"));
+    }
+    if let Err(error) = config.server.validated_source_idle_timeout() {
+        errors.push(format!("server.{error}"));
+    }
+    if let Err(error) = config.server.validated_event_time_max_future_skew() {
+        errors.push(format!("server.{error}"));
     }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
@@ -327,14 +420,35 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn collect_connector_property_errors(
+    kind: &str,
+    name: &str,
+    properties: &toml::Table,
+    errors: &mut Vec<String>,
+) {
+    for (key, value) in properties {
+        if !connector_property_is_flat(value) {
+            errors.push(format!(
+                "{kind} '{name}': property '{key}' is nested; connector properties must be flat (quote dotted keys such as \"bootstrap.servers\")"
+            ));
+        }
+    }
+}
+
+fn connector_property_is_flat(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(_) => false,
+        toml::Value::Array(values) => values.iter().all(connector_property_is_flat),
+        _ => true,
+    }
+}
+
 /// Top-level server configuration deserialized from `laminardb.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
-    #[serde(default)]
-    pub state: StateBackendConfig,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     /// `[supervision]` — auto-restart policy on a fatal fault (single-node only).
@@ -378,7 +492,7 @@ pub enum ServerMode {
 pub struct ServerSection {
     #[serde(default)]
     pub mode: ServerMode,
-    /// Stable hash partitions. Configurable only in cluster mode.
+    /// Stable hash partitions used by every deployment mode.
     #[serde(default)]
     pub key_groups: Option<KeyGroupCount>,
     #[serde(default = "default_bind")]
@@ -389,6 +503,19 @@ pub struct ServerSection {
     /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
     #[serde(default = "default_incremental_emit")]
     pub incremental_emit: bool,
+    /// Right-side history retained while a temporal join input is idle.
+    #[serde(default, with = "humantime_serde")]
+    pub temporal_join_idle_history_retention: Option<Duration>,
+    /// Mark inactive watermarked sources and input channels idle after this duration.
+    #[serde(default, with = "humantime_serde")]
+    pub source_idle_timeout: Option<Duration>,
+    /// Event timestamps farther ahead of wall clock do not advance source watermarks.
+    /// Zero disables the guard.
+    #[serde(
+        default = "default_event_time_max_future_skew",
+        with = "humantime_serde"
+    )]
+    pub event_time_max_future_skew: Duration,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
@@ -419,6 +546,9 @@ pub struct ServerSection {
     /// Bearer token gating the HTTP console API; `None` leaves it unauthenticated (loopback/dev only).
     #[serde(default)]
     pub console_token: Option<Secret>,
+    /// Read-only bearer token for cluster diagnostics; enables the split diagnostic boundary.
+    #[serde(default)]
+    pub diagnostic_read_token: Option<Secret>,
     /// CORS allow-list of console origins; `None` falls back to a permissive policy (dev only).
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
@@ -444,6 +574,9 @@ impl Default for ServerSection {
             bind: default_bind(),
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
+            temporal_join_idle_history_retention: None,
+            source_idle_timeout: None,
+            event_time_max_future_skew: default_event_time_max_future_skew(),
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -454,20 +587,58 @@ impl Default for ServerSection {
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
+            diagnostic_read_token: None,
             console_cors_allowed_origins: None,
         }
     }
 }
 
 impl ServerSection {
-    /// Key-group topology selected by the runtime mode.
+    /// Configured key-group topology, or the common deployment default.
     #[must_use]
     pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
-        match self.mode {
-            ServerMode::Single => LOCAL_KEY_GROUP_COUNT,
-            ServerMode::Cluster => self.key_groups.unwrap_or(DEFAULT_CLUSTER_KEY_GROUP_COUNT),
-        }
+        self.key_groups.unwrap_or(DEFAULT_KEY_GROUP_COUNT)
     }
+
+    pub(crate) fn validated_temporal_join_idle_history_retention(
+        &self,
+    ) -> Result<Option<Duration>, &'static str> {
+        let Some(retention) = self.temporal_join_idle_history_retention else {
+            return Ok(None);
+        };
+        let retention_ms = i64::try_from(retention.as_millis()).map_err(|_| {
+            "temporal_join_idle_history_retention exceeds the supported millisecond range"
+        })?;
+        if retention_ms == 0 {
+            return Err("temporal_join_idle_history_retention must be at least 1ms");
+        }
+        Ok(Some(retention))
+    }
+
+    pub(crate) fn validated_source_idle_timeout(&self) -> Result<Option<Duration>, &'static str> {
+        let Some(timeout) = self.source_idle_timeout else {
+            return Ok(None);
+        };
+        let timeout_ms = u64::try_from(timeout.as_millis())
+            .map_err(|_| "source_idle_timeout exceeds the supported millisecond range")?;
+        if timeout_ms == 0 {
+            return Err("source_idle_timeout must be at least 1ms");
+        }
+        Ok(Some(Duration::from_millis(timeout_ms)))
+    }
+
+    pub(crate) fn validated_event_time_max_future_skew(&self) -> Result<Duration, &'static str> {
+        let skew_ms = i64::try_from(self.event_time_max_future_skew.as_millis())
+            .map_err(|_| "event_time_max_future_skew exceeds the supported millisecond range")?;
+        if !self.event_time_max_future_skew.is_zero() && skew_ms == 0 {
+            return Err("event_time_max_future_skew must be zero or at least 1ms");
+        }
+        Ok(Duration::from_millis(skew_ms.unsigned_abs()))
+    }
+}
+
+fn default_event_time_max_future_skew() -> Duration {
+    Duration::from_millis(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs())
 }
 
 /// `[supervision]` — auto-restart policy; unset fields fall back to engine defaults.
@@ -537,17 +708,13 @@ pub struct CheckpointSection {
     /// One end-to-end checkpoint-attempt deadline.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
-    /// Number of predecessor checkpoints retained alongside the current recovery cut.
-    /// Predecessors keep reference/delta chains resolvable.
-    #[serde(default = "default_max_retained")]
-    pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
     /// Cap on captured-state bytes held by in-flight epochs awaiting
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
-    pub max_staged_bytes: Option<u64>,
+    pub max_node_data_bytes: Option<u64>,
 }
 
 impl Default for CheckpointSection {
@@ -556,9 +723,8 @@ impl Default for CheckpointSection {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
             timeout: default_checkpoint_timeout(),
-            max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
-            max_staged_bytes: None,
+            max_node_data_bytes: None,
         }
     }
 }
@@ -570,7 +736,6 @@ impl std::fmt::Debug for CheckpointSection {
             .field("url", &self.url)
             .field("interval", &self.interval)
             .field("timeout", &self.timeout)
-            .field("max_retained", &self.max_retained)
             .field(
                 "storage",
                 &self
@@ -579,7 +744,7 @@ impl std::fmt::Debug for CheckpointSection {
                     .map(|k| (k, "[REDACTED]"))
                     .collect::<Vec<_>>(),
             )
-            .field("max_staged_bytes", &self.max_staged_bytes)
+            .field("max_node_data_bytes", &self.max_node_data_bytes)
             .finish()
     }
 }
@@ -775,6 +940,7 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
 
 /// `[[source]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceConfig {
     pub name: String,
     /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
@@ -785,6 +951,8 @@ pub struct SourceConfig {
     pub properties: toml::Table,
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
     pub watermark: Option<WatermarkConfig>,
 }
 
@@ -857,12 +1025,16 @@ pub struct SinkConfig {
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
+    /// Optional serialization format, emitted as a `FORMAT` clause.
+    #[serde(default)]
+    pub format: Option<String>,
     #[serde(default)]
     pub properties: toml::Table,
 }
 
 /// `[discovery]` section: cluster node discovery.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiscoverySection {
     pub strategy: String,
     #[serde(default)]
@@ -924,9 +1096,6 @@ fn default_checkpoint_url() -> String {
         format!("file:///{path_str}")
     }
 }
-fn default_max_retained() -> usize {
-    10
-}
 fn default_incremental_emit() -> bool {
     true
 }
@@ -968,6 +1137,59 @@ fn default_gossip_port() -> u16 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shipped_server_configs_deserialize() {
+        for (name, input) in [
+            (
+                "minimal",
+                include_str!("../../../examples/laminardb-minimal.toml"),
+            ),
+            (
+                "standalone",
+                include_str!("../../../examples/laminardb.toml"),
+            ),
+            (
+                "cluster",
+                include_str!("../../../examples/laminardb-cluster.toml"),
+            ),
+            (
+                "binance-1",
+                include_str!("../../../examples/binance-cluster-node1.toml"),
+            ),
+            (
+                "binance-2",
+                include_str!("../../../examples/binance-cluster-node2.toml"),
+            ),
+            (
+                "bluesky-firehose",
+                include_str!("../../../examples/bluesky-firehose/laminar.toml"),
+            ),
+            (
+                "bluesky-news",
+                include_str!("../../../examples/bluesky-news/laminar.toml"),
+            ),
+            (
+                "aiops",
+                include_str!("../../../examples/claude-code-aiops/config.toml"),
+            ),
+            (
+                "iceberg",
+                include_str!("../../../examples/kafka-iceberg-timeseries/laminar.toml"),
+            ),
+            (
+                "nats",
+                include_str!("../../../examples/nats-payments/config.toml"),
+            ),
+            (
+                "server-demo",
+                include_str!("../../../examples/server-demo/laminardb.toml"),
+            ),
+        ] {
+            toml::from_str::<ServerConfig>(input)
+                .unwrap_or_else(|error| panic!("{name} config does not deserialize: {error}"));
+        }
+    }
+
     const AI_TOML: &str = r#"
 [server]
 
@@ -998,6 +1220,29 @@ task = ["classify", "extract", "complete"]
 classify = "finbert"
 complete = "haiku"
 "#;
+
+    fn canonical_http_auth_secret(byte: u8) -> Secret {
+        Secret::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]))
+    }
+
+    fn diagnostic_auth_config(
+        diagnostic_read_token: Secret,
+        console_token: Option<Secret>,
+    ) -> ServerConfig {
+        let mut config: ServerConfig = toml::from_str("[server]\n").unwrap();
+        config.server.mode = ServerMode::Cluster;
+        config.server.bind = "127.0.0.1:8080".to_string();
+        config.server.console_token = console_token;
+        config.server.diagnostic_read_token = Some(diagnostic_read_token);
+        config
+    }
+
+    fn http_auth_errors(config: &ServerConfig) -> Vec<String> {
+        match validate_http_auth(config).unwrap_err() {
+            ConfigError::ValidationErrors { errors } => errors,
+            error => panic!("expected validation errors, got {error:?}"),
+        }
+    }
 
     #[test]
     fn parses_ai_section_and_models() {
@@ -1100,6 +1345,32 @@ task = "classify"
     }
 
     #[test]
+    fn parse_error_does_not_retain_substituted_input() {
+        const SENTINEL: &str = "LDB_PARSE_SECRET_SENTINEL_4f8757d46e";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("invalid-secret.toml");
+        let input =
+            format!("[server]\nconsole_token = ${{LDB_PARSE_REDACTION_TEST_TOKEN:-{SENTINEL}}}\n");
+        std::fs::write(&path, input).unwrap();
+
+        let error = load_config(&path).expect_err("the unquoted substituted token is invalid TOML");
+        assert!(matches!(&error, ConfigError::ParseError { .. }));
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!format!("{error:?}").contains(SENTINEL));
+
+        let mut source = std::error::Error::source(&error);
+        assert!(
+            source.is_some(),
+            "parse errors must retain their typed source"
+        );
+        while let Some(cause) = source {
+            assert!(!cause.to_string().contains(SENTINEL));
+            assert!(!format!("{cause:?}").contains(SENTINEL));
+            source = cause.source();
+        }
+    }
+
+    #[test]
     fn test_server_mode_rejects_unknown_values() {
         let error = toml::from_str::<ServerConfig>("[server]\nmode = \"cluser\"\n")
             .expect_err("a mistyped runtime mode must not fall back to single-node mode");
@@ -1135,14 +1406,21 @@ task = "classify"
     }
 
     #[test]
+    fn test_removed_discovery_key_is_rejected() {
+        let error = toml::from_str::<ServerConfig>(
+            "[server]\nmode = \"cluster\"\n[discovery]\nstrategy = \"gossip\"\nraft_address = \"127.0.0.1:9001\"\n",
+        )
+        .expect_err("retired discovery settings must not be silently ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("raft_address"), "{error}");
+    }
+
+    #[test]
     fn test_parse_full_single_config() {
         let toml = r#"
 [server]
 mode = "single"
 bind = "127.0.0.1:8080"
-
-[state]
-backend = "in_process"
 
 [checkpoint]
 url = "file:///tmp/checkpoints"
@@ -1175,6 +1453,7 @@ sql = "SELECT symbol, SUM(price) FROM trades GROUP BY symbol"
 name = "output"
 pipeline = "vwap"
 connector = "kafka"
+format = "json"
 [sink.properties]
 "bootstrap.servers" = "localhost:9092"
 topic = "vwap_output"
@@ -1204,6 +1483,7 @@ topic = "vwap_output"
         assert_eq!(config.pipelines.len(), 1);
         assert_eq!(config.sinks.len(), 1);
         assert_eq!(config.sinks[0].pipeline, "vwap");
+        assert_eq!(config.sinks[0].format.as_deref(), Some("json"));
         assert_eq!(
             config.sinks[0]
                 .properties
@@ -1216,6 +1496,59 @@ topic = "vwap_output"
     }
 
     #[test]
+    fn test_format_is_not_a_connector_property() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+[source.properties]
+FoRmAt = "json"
+
+[[pipeline]]
+name = "events"
+sql = "SELECT 1"
+
+[[sink]]
+name = "output"
+pipeline = "events"
+connector = "kafka"
+[sink.properties]
+format = "json"
+"#,
+        )
+        .unwrap();
+
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("top-level source field"), "{error}");
+        assert!(error.contains("top-level sink field"), "{error}");
+
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+formt = "json"
+"#,
+        )
+        .expect_err("misspelled source runtime fields must fail closed");
+        assert!(error.to_string().contains("formt"), "{error}");
+
+        let config: ServerConfig = toml::from_str(
+            r#"
+[[source]]
+name = "input"
+connector = "kafka"
+[source.properties]
+bootstrap.servers = "localhost:9092"
+"#,
+        )
+        .unwrap();
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("quote dotted keys"), "{error}");
+    }
+
+    #[test]
     fn test_parse_full_cluster_config() {
         let toml = r#"
 node_id = "star-1"
@@ -1225,10 +1558,6 @@ mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
 key_groups = 256
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1262,13 +1591,9 @@ connector = "kafka"
         assert_eq!(config.server.mode, ServerMode::Cluster);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert_eq!(config.server.resolved_key_groups().get(), 256);
-        assert!(matches!(
-            &config.state,
-            StateBackendConfig::ObjectStore { .. }
-        ));
         assert_eq!(
-            config.state.durability_scope(),
-            StateBackendDurability::ClusterShared
+            CheckpointStorageScope::for_url(&config.checkpoint.url),
+            CheckpointStorageScope::ClusterShared
         );
         assert!(config.discovery.is_some());
 
@@ -1283,22 +1608,11 @@ connector = "kafka"
     }
 
     #[test]
-    fn test_runtime_durability_scope_is_fail_closed() {
-        let local_exact: ServerConfig = toml::from_str(
-            r#"
-[server]
-delivery = "exactly_once"
-
-[state]
-backend = "in_process"
-"#,
-        )
-        .unwrap();
-        let ConfigError::ValidationErrors { errors } = validate_config(&local_exact).unwrap_err()
-        else {
-            panic!("expected validation errors");
-        };
-        assert!(errors.iter().any(|error| error.contains("NodeDurable")));
+    fn checkpoint_storage_scope_is_fail_closed() {
+        let local_exact: ServerConfig =
+            toml::from_str("[server]\ndelivery = \"exactly_once\"\n").unwrap();
+        validate_config(&local_exact)
+            .expect("the default durable checkpoint URL is sufficient for local exactly-once");
 
         let local_cluster: ServerConfig = toml::from_str(
             r#"
@@ -1306,10 +1620,6 @@ node_id = "node-1"
 
 [server]
 mode = "cluster"
-
-[state]
-backend = "local"
-path = "/tmp/laminar-state"
 
 [discovery]
 strategy = "static"
@@ -1322,7 +1632,9 @@ seeds = ["node-1:7946"]
         else {
             panic!("expected validation errors");
         };
-        assert!(errors.iter().any(|error| error.contains("ClusterShared")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("ClusterShared [checkpoint]")));
 
         let cluster_exact: ServerConfig = toml::from_str(
             r#"
@@ -1331,10 +1643,6 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 delivery = "exactly_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [discovery]
 strategy = "static"
@@ -1347,10 +1655,30 @@ seeds = ["node-1:7946"]
         else {
             panic!("expected validation errors");
         };
-        assert!(errors.iter().any(|error| error.contains("[LDB-0013]")));
         assert!(errors
             .iter()
             .any(|error| { error.contains("ClusterShared [checkpoint]") }));
+
+        let cluster_exact_complete: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "exactly_once"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+"#,
+        )
+        .unwrap();
+        validate_config(&cluster_exact_complete)
+            .expect("connector contracts, not the server mode, gate cluster exact delivery");
 
         let cluster_best_effort: ServerConfig = toml::from_str(
             r#"
@@ -1359,10 +1687,6 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 delivery = "best_effort"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1407,10 +1731,6 @@ url = "memory://checkpoint"
 [server]
 delivery = "exactly_once"
 
-[state]
-backend = "local"
-path = "/tmp/laminar-state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 "#,
@@ -1422,20 +1742,6 @@ url = "s3://bucket/checkpoints"
             panic!("expected validation errors");
         };
         assert!(errors.iter().any(|error| error.contains("[LDB-0014]")));
-    }
-
-    #[test]
-    fn removed_managed_state_options_are_rejected() {
-        for option in [
-            "state_memory_budget_bytes = 1073741824",
-            "state_tier_dir = \"/data/tier\"",
-            "state_tier_group_demotion = true",
-        ] {
-            let input = format!("[server]\nmode = \"single\"\n{option}\n");
-            let error = toml::from_str::<ServerConfig>(&input)
-                .expect_err("removed managed-state options must not be ignored");
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
     }
 
     #[test]
@@ -1608,10 +1914,6 @@ mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
 
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
-
 [checkpoint]
 url = "s3://bucket/checkpoints"
 
@@ -1634,10 +1936,6 @@ node_id = "node-1"
 mode = "cluster"
 bind = "127.0.0.1:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1677,10 +1975,6 @@ node_id = "node-1"
 mode = "cluster"
 bind = "127.0.0.1:8080"
 delivery = "at_least_once"
-
-[state]
-backend = "object_store"
-url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1883,6 +2177,195 @@ console_cors_allowed_origins = ["https://console.example.com", "http://localhost
     }
 
     #[test]
+    fn legacy_console_only_token_remains_compatible() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[server]
+console_token = "supersecret-token"
+"#,
+        )
+        .unwrap();
+
+        validate_http_auth(&config).expect("legacy console-only credentials remain valid");
+    }
+
+    #[test]
+    fn diagnostic_token_requires_console_token() {
+        let config = diagnostic_auth_config(canonical_http_auth_secret(1), None);
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires server.console_token")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_rejects_weak_diagnostic_credential() {
+        let config =
+            diagnostic_auth_config(Secret::new("weak"), Some(canonical_http_auth_secret(2)));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.diagnostic_read_token") && error.contains("exactly 32 bytes")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_rejects_noncanonical_base64url() {
+        let mut noncanonical = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3_u8; 32]);
+        noncanonical.replace_range(HTTP_AUTH_TOKEN_ENCODED_LEN - 1.., "B");
+        assert_eq!(noncanonical.len(), HTTP_AUTH_TOKEN_ENCODED_LEN);
+
+        let config = diagnostic_auth_config(
+            Secret::new(noncanonical),
+            Some(canonical_http_auth_secret(4)),
+        );
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.diagnostic_read_token") && error.contains("canonical")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_strong_console_credential() {
+        let config =
+            diagnostic_auth_config(canonical_http_auth_secret(5), Some(Secret::new("weak")));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("server.console_token") && error.contains("exactly 32 bytes")
+            }),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_and_console_tokens_must_be_distinct() {
+        let token = canonical_http_auth_secret(6);
+        let config = diagnostic_auth_config(token.clone(), Some(token));
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| error.contains("must differ")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_cluster_mode() {
+        let mut config = diagnostic_auth_config(
+            canonical_http_auth_secret(7),
+            Some(canonical_http_auth_secret(8)),
+        );
+        config.server.mode = ServerMode::Single;
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("requires server.mode = \"cluster\"")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_requires_loopback_http_bind() {
+        let mut config = diagnostic_auth_config(
+            canonical_http_auth_secret(9),
+            Some(canonical_http_auth_secret(10)),
+        );
+        config.server.bind = "0.0.0.0:8080".to_string();
+        let errors = http_auth_errors(&config);
+
+        assert!(
+            errors.iter().any(|error| error.contains("loopback")),
+            "errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostic_token_accepts_valid_split_credentials() {
+        let diagnostic = canonical_http_auth_secret(11);
+        let console = canonical_http_auth_secret(12);
+        let diagnostic_value = diagnostic.expose().to_string();
+        let console_value = console.expose().to_string();
+        let config = diagnostic_auth_config(diagnostic, Some(console));
+
+        validate_http_auth(&config).expect("valid split diagnostic credentials must pass");
+        let debug = format!("{:?}", config.server);
+        assert!(
+            !debug.contains(&diagnostic_value),
+            "diagnostic token leaked"
+        );
+        assert!(!debug.contains(&console_value), "console token leaked");
+    }
+
+    #[test]
+    fn file_loader_uses_the_shared_diagnostic_auth_validator() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("diagnostic-auth.toml");
+        let diagnostic = canonical_http_auth_secret(13);
+        let console = canonical_http_auth_secret(14);
+        let invalid = format!(
+            "[server]\nconsole_token = \"{}\"\ndiagnostic_read_token = \"{}\"\n",
+            console.expose(),
+            diagnostic.expose()
+        );
+        std::fs::write(&path, invalid).unwrap();
+        let error = load_config(&path).expect_err("single-node diagnostic auth must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("diagnostic_read_token requires server.mode"),
+            "{error}"
+        );
+
+        let valid = format!(
+            r#"node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+console_token = "{}"
+diagnostic_read_token = "{}"
+
+[checkpoint]
+url = "az://laminardb-test/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = []
+gossip_port = 7946
+"#,
+            console.expose(),
+            diagnostic.expose()
+        );
+        std::fs::write(&path, valid).unwrap();
+        let loaded = load_config(&path).expect("valid file-based split credentials must pass");
+        assert_eq!(loaded.server.mode, ServerMode::Cluster);
+        assert_eq!(
+            loaded
+                .server
+                .diagnostic_read_token
+                .as_ref()
+                .unwrap()
+                .expose(),
+            diagnostic.expose()
+        );
+    }
+
+    #[test]
     fn test_console_token_redacted_in_debug() {
         let toml = r#"
 [server]
@@ -1927,6 +2410,7 @@ console_token = "supersecret-token"
     fn test_console_auth_defaults_to_none() {
         let config = ServerSection::default();
         assert!(config.console_token.is_none());
+        assert!(config.diagnostic_read_token.is_none());
         assert!(config.console_cors_allowed_origins.is_none());
     }
 
@@ -1951,7 +2435,6 @@ alice = "wonderland-key"
     fn test_default_values_applied() {
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],
@@ -1967,49 +2450,121 @@ alice = "wonderland-key"
 
         assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert!(matches!(config.state, StateBackendConfig::InProcess));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
         assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
     }
 
     #[test]
-    fn key_groups_are_mode_scoped_and_typed() {
-        let single: ServerConfig = toml::from_str("[server]\n").unwrap();
-        assert_eq!(single.server.resolved_key_groups(), LOCAL_KEY_GROUP_COUNT);
+    fn event_time_durations_use_engine_millisecond_bounds() {
+        let parsed: ServerConfig = toml::from_str(
+            "[server]\ntemporal_join_idle_history_retention = \"24h\"\nsource_idle_timeout = \"5s\"\nevent_time_max_future_skew = \"30s\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.server.temporal_join_idle_history_retention,
+            Some(Duration::from_secs(24 * 60 * 60))
+        );
+        assert_eq!(
+            parsed.server.source_idle_timeout,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parsed.server.event_time_max_future_skew,
+            Duration::from_secs(30)
+        );
+        validate_config(&parsed).unwrap();
 
-        for explicit in [1, 256] {
-            let input = format!("[server]\nmode = \"single\"\nkey_groups = {explicit}\n");
-            let config: ServerConfig = toml::from_str(&input).unwrap();
-            let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err()
-            else {
-                panic!("expected a cluster-only key_groups validation error");
-            };
-            assert!(errors.iter().any(|error| error.contains("cluster-only")));
+        let default: ServerConfig = toml::from_str("").unwrap();
+        assert_eq!(default.server.temporal_join_idle_history_retention, None);
+        assert_eq!(default.server.source_idle_timeout, None);
+        assert_eq!(
+            default.server.event_time_max_future_skew,
+            Duration::from_millis(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs())
+        );
+
+        for (retention, expected) in [
+            (
+                Duration::ZERO,
+                "temporal_join_idle_history_retention must be at least 1ms",
+            ),
+            (
+                Duration::from_nanos(999_999),
+                "temporal_join_idle_history_retention must be at least 1ms",
+            ),
+            (
+                Duration::from_millis((i64::MAX as u64) + 1),
+                "temporal_join_idle_history_retention exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.temporal_join_idle_history_retention = Some(retention);
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
         }
+
+        for (timeout, expected) in [
+            (Duration::ZERO, "source_idle_timeout must be at least 1ms"),
+            (
+                Duration::from_nanos(999_999),
+                "source_idle_timeout must be at least 1ms",
+            ),
+            (
+                Duration::MAX,
+                "source_idle_timeout exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.source_idle_timeout = Some(timeout);
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (skew, expected) in [
+            (
+                Duration::from_nanos(1),
+                "event_time_max_future_skew must be zero or at least 1ms",
+            ),
+            (
+                Duration::MAX,
+                "event_time_max_future_skew exceeds the supported millisecond range",
+            ),
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.event_time_max_future_skew = skew;
+            let error = validate_config(&config).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let mut disabled: ServerConfig = toml::from_str("").unwrap();
+        disabled.server.event_time_max_future_skew = Duration::ZERO;
+        validate_config(&disabled).unwrap();
+    }
+
+    #[test]
+    fn key_groups_are_mode_neutral_and_typed() {
+        let single: ServerConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(single.server.resolved_key_groups(), DEFAULT_KEY_GROUP_COUNT);
+
+        let configured_single: ServerConfig =
+            toml::from_str("[server]\nmode = \"single\"\nkey_groups = 64\n").unwrap();
+        assert_eq!(configured_single.server.resolved_key_groups().get(), 64);
+        validate_config(&configured_single).unwrap();
 
         let cluster: ServerConfig = toml::from_str("[server]\nmode = \"cluster\"\n").unwrap();
         assert_eq!(
             cluster.server.resolved_key_groups(),
-            DEFAULT_CLUSTER_KEY_GROUP_COUNT
+            DEFAULT_KEY_GROUP_COUNT
         );
 
         let configured: ServerConfig =
             toml::from_str("[server]\nmode = \"cluster\"\nkey_groups = 1024\n").unwrap();
         assert_eq!(configured.server.resolved_key_groups().get(), 1024);
 
-        for invalid in [0_u32, u32::from(u16::MAX) + 1] {
-            let input = format!("[server]\nmode = \"cluster\"\nkey_groups = {invalid}\n");
-            assert!(toml::from_str::<ServerConfig>(&input).is_err());
+        for mode in ["single", "cluster"] {
+            for invalid in [0_u32, u32::from(u16::MAX) + 1] {
+                let input = format!("[server]\nmode = \"{mode}\"\nkey_groups = {invalid}\n");
+                assert!(toml::from_str::<ServerConfig>(&input).is_err());
+            }
         }
-    }
-
-    #[test]
-    fn state_rejects_retired_vnode_capacity() {
-        let error = toml::from_str::<ServerConfig>(
-            "[state]\nbackend = \"in_process\"\nvnode_capacity = 256\n",
-        )
-        .expect_err("key-group topology must not be configured per state backend");
-        assert!(error.to_string().contains("vnode_capacity"), "{error}");
     }
 
     #[test]
@@ -2049,24 +2604,6 @@ incremental_emit = false
         .unwrap();
 
         assert!(!config.server.incremental_emit);
-    }
-
-    #[test]
-    fn checkpoint_rejects_removed_mechanism_knobs() {
-        for option in [
-            r#"snapshot_strategy = "incremental""#,
-            "delta_chain_max = 2",
-        ] {
-            let input = format!(
-                r#"
-[checkpoint]
-{option}
-"#,
-            );
-            let error = toml::from_str::<ServerConfig>(&input)
-                .expect_err("removed checkpoint knobs must not be silently ignored");
-            assert!(error.to_string().contains("unknown field"), "{error}");
-        }
     }
 
     #[test]
@@ -2133,6 +2670,7 @@ interval = "10s"
 [[source]]
 name = "test"
 connector = "kafka"
+primary_key = ["id"]
 [[source.schema]]
 name = "id"
 type = "BIGINT"
@@ -2147,6 +2685,7 @@ type = "VARCHAR"
         assert!(!config.sources[0].schema[0].nullable);
         assert_eq!(config.sources[0].schema[1].data_type, "VARCHAR");
         assert!(config.sources[0].schema[1].nullable); // default
+        assert_eq!(config.sources[0].primary_key, ["id"]);
     }
 
     #[test]

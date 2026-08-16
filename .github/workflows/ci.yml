@@ -350,11 +350,57 @@ jobs:
         continue-on-error: true
 
   # ============================================
+  # Independent Evidence Contract Scaffolds
+  # ============================================
+  soak-contract-scaffold:
+    name: Ineligible contract/model scaffolds (NOT evidence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          components: clippy, rustfmt
+      - name: Format standalone contract tool
+        run: cargo fmt --manifest-path tools/independent-soak-contract/Cargo.toml -- --check
+      - name: Lint standalone contract tool
+        run: cargo clippy --locked --manifest-path tools/independent-soak-contract/Cargo.toml --all-targets -- -D warnings
+      - name: Test standalone contract tool
+        run: cargo test --locked --manifest-path tools/independent-soak-contract/Cargo.toml
+      - name: Reject Laminar, path, and workspace dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=tools/independent-soak-contract/Cargo.toml
+          if grep -Eq '(path|workspace)[[:space:]]*=' "$manifest"; then
+            echo "standalone soak contract unexpectedly uses a path or workspace dependency"
+            exit 1
+          fi
+          dependency_tree="$(cargo tree --locked --manifest-path tools/independent-soak-contract/Cargo.toml --prefix none)"
+          if grep -Eq '^laminar[-_]' <<< "$dependency_tree"; then
+            echo "standalone soak contract unexpectedly depends on a Laminar package"
+            exit 1
+          fi
+      - name: Validate ineligible draft and golden oracle fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- validate-contract tools/independent-soak-contract/contracts/draft-v1alpha1.json 2>&1)"
+          echo "$draft_output"
+          grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$draft_output"
+          grep -Fq 'VALID_INELIGIBLE_DRAFT' <<< "$draft_output"
+
+          fixture_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- verify-oracle-fixture tools/independent-soak-contract/fixtures/grouped-count-sum-alo-v2.json 2>&1)"
+          echo "$fixture_output"
+          grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
+          grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"
+
+  # ============================================
   # CI Success Gate
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -366,7 +412,8 @@ jobs:
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
-             [[ "${{ needs.docs.result }}" != "success" ]]; then
+             [[ "${{ needs.docs.result }}" != "success" ]] || \
+             [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi

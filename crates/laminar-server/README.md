@@ -9,7 +9,6 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 - **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload**: edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
-- **Checkpoint validation**: `--validate-checkpoints` flag validates all stored checkpoints and exits
 - **Platform allocators**: jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
 - **Docker and Helm** deployment with multi-arch images
 
@@ -22,7 +21,6 @@ Options:
   --config <FILE>         Configuration file [default: laminardb.toml]
   --log-level <LEVEL>     Logging level: trace, debug, info, warn, error [default: info]
   --admin-bind <ADDR>     Override HTTP bind address from config
-  --validate-checkpoints  Validate stored checkpoints and exit
   -h, --help              Print help
   -V, --version           Print version
 ```
@@ -54,11 +52,10 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "single"             # "single" (standalone) or "cluster" (multi-node at-least-once)
+mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
-delivery = "at_least_once"  # pipeline-wide; exactly_once is single-node only
+delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
-log_level = "info"
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.
@@ -67,24 +64,12 @@ log_level = "info"
 # bob   = "${BOB_PASSWORD}"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
 
-[state]
-backend = "local"           # "in_process", "local", or "object_store"
-path = "./data/state"       # required when backend = "local"
-# When backend = "object_store": url = "s3://bucket/state" (same schemes as
-# [checkpoint]); credentials from provider env vars or [state.storage].
-# Local state paths are node-durable and valid for embedded/single-node
-# exactly-once. A file:// checkpoint URL selects the built-in local directory
-# protected by its exclusive OS lock. Shared object-store URLs and
-# library-injected object or decision stores fail with LDB-0014 because their
-# writer-fencing provenance cannot be proved. Cluster mode requires cloud
-# object storage shared by every node.
-# Cluster exactly-once currently fails closed with LDB-0013 because supported
-# connectors lack certified term-fenced source handoff and external sink cursors.
-
 [checkpoint]
-# Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the
-# AWS/GCS/Azure backends are in the default build). Credentials come from the
-# standard provider env vars, or set them under [checkpoint.storage].
+# Provider-neutral object_store URL: file://, s3://, gs://, az://, or abfs(s)://.
+# R2 and MinIO use s3:// with their endpoint option. Credentials come from the
+# standard provider environment or [checkpoint.storage]. Cluster URLs must be
+# visible to every node. Replay-capable single-node delivery currently requires
+# file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
 timeout = "120s" # one deadline across fence, capture, durable decision, and completion
@@ -94,9 +79,9 @@ name = "trades"
 connector = "kafka"
 format = "json"
 [source.properties]
-bootstrap.servers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
 topic = "market-trades"
-group.id = "laminar"
+"group.id" = "laminar"
 [[source.schema]]
 name = "symbol"
 type = "VARCHAR"
@@ -124,10 +109,10 @@ EMIT ON WINDOW CLOSE
 name = "output"
 pipeline = "avg_price"
 connector = "kafka"
-[sink.properties]
-bootstrap.servers = "localhost:9092"
-topic = "avg-prices"
 format = "json"
+[sink.properties]
+"bootstrap.servers" = "localhost:9092"
+topic = "avg-prices"
 ```
 
 ## AI Functions
@@ -293,7 +278,7 @@ Edit the TOML file while the server is running. The file watcher detects changes
 1. Removes sinks, pipelines, lookups, sources that were deleted or changed
 2. Recreates sources, lookups, pipelines, sinks that were added or changed
 
-Changes to `[server]`, `[state]`, and `[checkpoint]` sections require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
+Changes to `[server]` and `[checkpoint]` require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 

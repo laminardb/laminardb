@@ -42,8 +42,8 @@ pub fn decode_arrow_schema_ipc(hex: &str) -> Option<Schema> {
 
 /// Configuration for a connector instance.
 ///
-/// Connectors receive their configuration as a string key-value map,
-/// typically parsed from SQL `WITH (...)` clauses or programmatic config.
+/// Connectors receive their configuration as a string key-value map assembled
+/// from SQL connector and format clauses or supplied programmatically.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectorConfig {
     /// The connector type identifier (e.g., "kafka", "postgres-cdc").

@@ -4,18 +4,41 @@
 
 ### Changed
 
-- Key-group topology is mode-scoped: embedded and single-node use one group, while cluster uses
-  optional `server.key_groups` (default 256). Checkpoints and assignment certificates now bind the
-  partitioning ABI so incompatible recovery or shuffle peers fail closed.
+- Stateful joins and non-windowed keyed aggregates now use one managed vnode ownership,
+  checkpoint, restore, and rebalance lifecycle in single-node and cluster execution.
+- The bounded append-only event-time join supports `INNER`, left/right/full outer, left/right semi,
+  and left/right anti joins with ordered `BIGINT`/`VARCHAR` composite keys. A named join stream may
+  feed a separate non-`DISTINCT` `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregate stage. Fused
+  `JOIN ... GROUP BY`, cluster event-time window aggregates, and unsupported join shapes fail
+  admission.
+- Join output is capped at 262,144 rows and 64 MiB per cycle. Exceeding either cap is a terminal
+  controlled failure; the operator does not spill or continue a partial fanout.
+- Cluster exactly-once admission is connector-gated. The admitted composition is exact-certified
+  Kafka input with coordinated append-mode Delta Lake on direct S3/S3A. Azure and GCS Delta targets
+  remain cluster at-least-once pending provider-native EO soaks; Kafka and Iceberg sinks remain
+  at-least-once.
+- Checkpoint and recovery records now bind the exact deployment, pipeline, assignment, process
+  roster, vnode inventory, source cut, state seal, and external publication cursor. Production
+  certification remains pending the four-mode real-connector fault, validity, and latency soak
+  matrix.
+- The public `[state]` backend selector is removed; `[checkpoint]` is the sole durability
+  configuration. Aggregate and window hot maps now use `FxHashMap`. The final one-node-object
+  checkpoint cutover and production soak certification remain pending.
+- Embedded, standalone, and cluster runtimes now share one configurable key-group topology with a
+  default of 256. Local keyed aggregates and interval joins route across all locally owned vnodes;
+  the unified v7 checkpoint image and remaining stateful operators are still pending.
+- The v0.28 checkpoint and state format is intentionally incompatible with older persisted formats,
+  which are rejected and require a fresh deployment namespace.
 
 ### Removed
 
-- Removed the experimental tiered-state feature and configuration. Its demotion path could clear
-  vnode dirtiness before a checkpoint was durable, then replace newer live groups with bytes from
-  the prior durable checkpoint after an attempt failed. It is not a safe keyed-state foundation.
-- Removed WebSocket source-server, replay, connector-owned checkpoint, and connector-owned
-  event-time options. WebSocket sources are client-only and best-effort; event time is declared
-  with SQL `WATERMARK FOR` and decoded against an explicit timestamp schema.
+- Removed the experimental tiered-state feature and configuration.
+- Removed the public `VnodeRehydrator`, `VnodeRehydration`, and `RehydratedVnode` APIs and
+  `LaminarDB::rehydrated_vnode_state()`. Restore is now an internal authority-pinned lifecycle.
+- Removed obsolete WebSocket source-server, replay, connector-owned checkpoint, and connector-owned
+  event-time options. WebSocket sources are client-only and best-effort; event time is declared by
+  SQL watermarks.
+- Removed superseded distributed-state and recovery plans from the active documentation set.
 
 ## [0.22.0]
 

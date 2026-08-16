@@ -15,7 +15,8 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourcePosition, SourceStart, SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
@@ -27,6 +28,31 @@ use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
 
 const DISCOVERY_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FILE_CHECKPOINT_CONNECTOR: &str = "files";
+const CHECKPOINT_VERSION_METADATA: &str = "checkpoint.version";
+const FILE_CHECKPOINT_VERSION: &str = "1";
+
+fn validate_file_checkpoint(checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
+    match checkpoint.get_metadata("connector") {
+        Some(FILE_CHECKPOINT_CONNECTOR) => {}
+        Some(connector) => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "file checkpoint belongs to connector '{connector}'"
+            )));
+        }
+        None => {
+            return Err(ConnectorError::ConfigurationError(
+                "file checkpoint is missing connector identity".into(),
+            ));
+        }
+    }
+    if checkpoint.get_metadata(CHECKPOINT_VERSION_METADATA) != Some(FILE_CHECKPOINT_VERSION) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "file checkpoint requires {CHECKPOINT_VERSION_METADATA}={FILE_CHECKPOINT_VERSION}"
+        )));
+    }
+    Ok(())
+}
 
 #[async_trait]
 trait FileReader: Send + Sync {
@@ -51,6 +77,7 @@ impl FileReader for LocalFileReader {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileProgress {
     path: String,
     size: u64,
@@ -193,6 +220,7 @@ impl SourceConnector for FileSource {
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
             SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
         ))
     }
 
@@ -220,6 +248,7 @@ impl SourceConnector for FileSource {
                 attempt,
                 checkpoint,
             } => {
+                validate_file_checkpoint(&checkpoint)?;
                 if checkpoint.get_offset("manifest").is_none() {
                     return Err(ConnectorError::ConfigurationError(format!(
                         "file checkpoint {attempt:?} is missing required manifest state"
@@ -519,6 +548,8 @@ impl SourceConnector for FileSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new();
+        cp.set_metadata("connector", FILE_CHECKPOINT_CONNECTOR);
+        cp.set_metadata(CHECKPOINT_VERSION_METADATA, FILE_CHECKPOINT_VERSION);
         self.manifest.to_checkpoint(&mut cp);
         if let Some(file) = &self.current_file {
             let progress = FileProgress {
@@ -709,7 +740,7 @@ fn append_metadata_column(
 mod tests {
     use super::*;
     use crate::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
-    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::checkpoint::CheckpointAttempt;
     use std::collections::BTreeMap;
     use tokio::sync::Notify;
 
@@ -1023,6 +1054,14 @@ mod tests {
         source.manifest.insert("test.csv".into());
         let cp = source.checkpoint();
         assert!(cp.get_offset("manifest").is_some());
+        assert_eq!(
+            cp.get_metadata("connector"),
+            Some(FILE_CHECKPOINT_CONNECTOR)
+        );
+        assert_eq!(
+            cp.get_metadata(CHECKPOINT_VERSION_METADATA),
+            Some(FILE_CHECKPOINT_VERSION)
+        );
     }
 
     #[tokio::test]
@@ -1031,7 +1070,7 @@ mod tests {
         let mut source = FileSource::new();
 
         // Build a checkpoint with manifest data.
-        let mut cp = SourceCheckpoint::new();
+        let mut cp = FileSource::new().checkpoint();
         cp.set_offset("manifest", r#"["a.csv"]"#);
 
         let mut config = ConnectorConfig::new("files");
@@ -1054,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_resume_manifest_fails_before_discovery_starts() {
-        let mut cp = SourceCheckpoint::new();
+        let mut cp = FileSource::new().checkpoint();
         cp.set_offset("manifest", "{not-json");
         let mut config = ConnectorConfig::new("files");
         config.set("path", "/tmp");
@@ -1071,6 +1110,67 @@ mod tests {
             .await
             .expect_err("corrupt durable manifest must fail closed");
         assert!(error.to_string().contains("invalid file manifest"));
+        assert!(source.discovery.is_none());
+        assert!(!source.is_open);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_wrong_checkpoint_identity_or_version() {
+        let directory = tempfile::tempdir().unwrap();
+        for (connector, version, expected) in [
+            (
+                "generator",
+                FILE_CHECKPOINT_VERSION,
+                "belongs to connector 'generator'",
+            ),
+            (
+                FILE_CHECKPOINT_CONNECTOR,
+                "0",
+                "requires checkpoint.version=1",
+            ),
+        ] {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("manifest", "[]");
+            checkpoint.set_metadata("connector", connector);
+            checkpoint.set_metadata(CHECKPOINT_VERSION_METADATA, version);
+
+            let mut source = FileSource::new();
+            let error = source
+                .start(start_request(
+                    text_source_config(directory.path()),
+                    SourcePosition::Resume {
+                        attempt: CheckpointAttempt::canonical(7),
+                        checkpoint,
+                    },
+                ))
+                .await
+                .expect_err("non-current file checkpoint must be rejected");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(source.discovery.is_none());
+            assert!(!source.is_open);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_unknown_file_progress_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = FileSource::new().checkpoint();
+        checkpoint.set_offset(
+            "file_progress",
+            r#"{"path":"a.txt","size":1,"modified_ms":1,"content_sha256":"00","next_row":1,"legacy_cursor":true}"#,
+        );
+        let mut source = FileSource::new();
+        let error = source
+            .start(start_request(
+                text_source_config(directory.path()),
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::canonical(8),
+                    checkpoint,
+                },
+            ))
+            .await
+            .expect_err("same-version unknown progress fields must fail closed");
+        assert!(error.to_string().contains("unknown field"), "{error}");
         assert!(source.discovery.is_none());
         assert!(!source.is_open);
     }

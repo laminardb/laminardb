@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::physical_plan::ExecutionPlan;
+use laminar_connectors::connector::{SourceContract, SourceInputMode};
 use laminar_core::catalog::CatalogObjectKind;
 use laminar_sql::parser::StreamingStatement;
 use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
@@ -131,6 +132,19 @@ enum IncEmit {
     None,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct IntervalTopologyCandidate {
+    mutable_join: bool,
+    candidate_carries_changelog: bool,
+    changelog_input: Option<ChangelogInputKind>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ChangelogInputKind {
+    Forwarded,
+    StaticEnrich,
+}
+
 struct StreamCreateGuard<'a> {
     db: &'a LaminarDB,
     name: String,
@@ -240,18 +254,6 @@ pub(crate) fn logical_aggregate_stage_count(plan: &datafusion_expr::LogicalPlan)
             .sum::<usize>()
 }
 
-fn distinct_streaming_aggregate(sql: &str) -> Option<String> {
-    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.first()? else {
-        return None;
-    };
-    laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref())
-        .aggregates
-        .into_iter()
-        .find(|aggregate| aggregate.distinct)
-        .map(|aggregate| format!("{:?}", aggregate.aggregate_type).to_ascii_lowercase())
-}
-
 pub(crate) struct PlannedStreamingQuery {
     pub(crate) emit_clause: Option<laminar_sql::parser::EmitClause>,
     pub(crate) window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
@@ -259,6 +261,51 @@ pub(crate) struct PlannedStreamingQuery {
     pub(crate) join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     pub(crate) has_analytic: bool,
     pub(crate) has_frame: bool,
+}
+
+pub(crate) async fn validate_managed_aggregate_admission(
+    ctx: &datafusion::prelude::SessionContext,
+    query_sql: &str,
+    window_config: Option<&laminar_sql::translator::WindowOperatorConfig>,
+    emit_clause: Option<&laminar_sql::parser::EmitClause>,
+    key_group_count: laminar_core::state::KeyGroupCount,
+) -> Result<bool, DbError> {
+    if let Some(window) = window_config {
+        let state = crate::core_window_state::CoreWindowState::try_from_sql(
+            ctx,
+            query_sql,
+            window,
+            emit_clause,
+            key_group_count,
+        )
+        .await?;
+        if state.is_none() {
+            return Err(DbError::InvalidOperation(
+                "window aggregate cannot be constructed on the managed execution path".into(),
+            ));
+        }
+        return Ok(true);
+    }
+
+    let emit_changelog =
+        emit_clause.is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
+    crate::aggregate_state::IncrementalAggState::try_from_sql(
+        ctx,
+        query_sql,
+        emit_changelog,
+        key_group_count,
+    )
+    .await
+    .map(|state| state.is_some())
+}
+
+fn query_inputs_registered(ctx: &datafusion::prelude::SessionContext, query_sql: &str) -> bool {
+    crate::sql_analysis::extract_table_references(query_sql)
+        .iter()
+        .all(|name| {
+            ctx.table_exist(exact_table_reference(name))
+                .unwrap_or(false)
+        })
 }
 
 /// Terminality guard error: `consumer` tried to read incremental MV `mv`'s changelog.
@@ -1057,10 +1104,32 @@ impl LaminarDB {
                 "[LDB-6044] catalog cleanup failed and the instance is permanently fenced".into()
             })
         };
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            self.latch_local_terminal_pipeline_halt();
+            if let Some(controller) = self.cluster_controller.lock().clone() {
+                controller.set_recovering(true);
+                if let Err(publication_error) = crate::coordinated_recovery::queue_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ) {
+                    tracing::error!(
+                        %publication_error,
+                        "could not retain terminal catalog-cleanup fault request"
+                    );
+                }
+            }
+        } else {
+            self.terminal_pipeline_halt
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        #[cfg(not(feature = "cluster"))]
+        self.terminal_pipeline_halt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         DbState::Faulted.store(&self.state);
         self.shutdown_signal.notify_one();
         tracing::error!(reason = %recorded, "catalog cleanup terminally fenced the database");
-        DbError::Pipeline(recorded)
+        DbError::PipelineTerminal(recorded)
     }
 
     pub(crate) fn rollback_catalog_create(
@@ -1095,14 +1164,15 @@ impl LaminarDB {
             "[LDB-6044] catalog cleanup is incomplete and this LaminarDB instance is permanently fenced"
                 .into()
         });
-        Err(DbError::Pipeline(format!(
+        Err(DbError::PipelineTerminal(format!(
             "{operation} rejected by terminal catalog cleanup fence: {reason}"
         )))
     }
 
     /// Streams and materialized views have a synchronous coordinator control path.
     /// Lifecycle transitions never do; a running local, uncheckpointed pipeline is
-    /// the only live topology that can admit them safely.
+    /// the only live topology that can admit them safely. Shape-specific handlers may
+    /// still require offline initialization.
     pub(crate) fn ensure_topology_ddl_allowed(&self, operation: &str) -> Result<(), DbError> {
         self.ensure_catalog_cleanup_unfenced(operation)?;
         if crate::db::catalog_manifest_replay_active() {
@@ -1121,9 +1191,25 @@ impl LaminarDB {
             ))),
             DbState::Running if self.config.checkpoint.is_some() => {
                 Err(DbError::Pipeline(format!(
-                "[LDB-6043] {operation} cannot change a running checkpointed topology; stop the \
+                    "[LDB-6043] {operation} cannot change a running checkpointed topology; stop the \
                  pipeline and reset/migrate its checkpoint state first"
-            )))
+                )))
+            }
+            DbState::Running
+                if self.connector_manager.lock().streams().values().any(|stream| {
+                    stream.join_config.as_ref().is_some_and(|joins| {
+                        joins.iter().any(|join| {
+                            matches!(
+                                join,
+                                laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                            )
+                        })
+                    })
+                }) =>
+            {
+                Err(DbError::Pipeline(format!(
+                    "[LDB-6043] {operation} cannot change a live topology containing managed temporal state; stop the pipeline before changing the topology"
+                )))
             }
             DbState::Running if self.control_tx.lock().is_none() => {
                 Err(DbError::Pipeline(format!(
@@ -1185,14 +1271,38 @@ impl LaminarDB {
         connector_type: Option<&String>,
         connector_options: &HashMap<String, String>,
         format: Option<&laminar_sql::parser::FormatSpec>,
-        with_options: &HashMap<String, String>,
         kind: ConnectorKind,
     ) -> Result<Option<ResolvedConnector>, DbError> {
-        if connector_type.is_none() && !has_connector_key(with_options) {
+        let Some(connector_type) = connector_type else {
+            if format.is_some() {
+                let clause = match kind {
+                    ConnectorKind::Source => "FROM",
+                    ConnectorKind::Sink => "INTO",
+                };
+                return Err(DbError::InvalidOperation(format!(
+                    "FORMAT requires an explicit {clause} connector"
+                )));
+            }
             return Ok(None);
-        }
-        let mut resolved =
-            resolve_connector_info(connector_type, connector_options, format, with_options);
+        };
+        let mut resolved = ResolvedConnector {
+            connector_type: Some(connector_type.clone()),
+            connector_options: connector_options.clone(),
+            format: format.map(|format| format.format_type.clone()),
+            format_options: format
+                .map(|format| format.options.clone())
+                .unwrap_or_default(),
+        };
+        let kind_name = match kind {
+            ConnectorKind::Source => "Source",
+            ConnectorKind::Sink => "Sink",
+        };
+        crate::connector_manager::validate_connector_format_options(
+            kind_name,
+            &resolved.connector_options,
+            resolved.format.as_deref(),
+            &resolved.format_options,
+        )?;
         let lookup = |name: &str| {
             self.config_vars
                 .get(name)
@@ -1237,8 +1347,7 @@ impl LaminarDB {
                     .to_string(),
             ));
         }
-        let has_connector =
-            create.connector_type.is_some() || has_connector_key(&create.with_options);
+        let has_connector = create.connector_type.is_some();
 
         let source_name = canonical_object_name(&create.name)?;
         reject_reserved_namespace(&source_name)?;
@@ -1260,7 +1369,6 @@ impl LaminarDB {
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
-            &create.with_options,
             ConnectorKind::Source,
         )?;
 
@@ -1268,6 +1376,16 @@ impl LaminarDB {
             .build_source_definition(create, resolved.as_ref(), has_connector, &source_name)
             .await?;
         source_def.name.clone_from(&source_name);
+        let source_contract = self.validate_source_input_schema_contract(
+            &source_name,
+            resolved.as_ref(),
+            &source_def,
+        )?;
+        if source_contract
+            .is_some_and(|contract| contract.input_mode != SourceInputMode::AppendOnly)
+        {
+            self.validate_new_mutation_source_consumers(&source_name)?;
+        }
 
         {
             let mut planner = self.planner.lock();
@@ -1395,6 +1513,138 @@ impl LaminarDB {
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))
     }
 
+    fn validate_source_input_schema_contract(
+        &self,
+        source_name: &str,
+        resolved: Option<&ResolvedConnector>,
+        source_def: &streaming_ddl::SourceDefinition,
+    ) -> Result<Option<SourceContract>, DbError> {
+        let weight = laminar_core::changelog::WEIGHT_COLUMN;
+        let fields = source_def.schema.fields();
+        if let Some(field) = fields.iter().find(|field| {
+            ["_op", "__op"]
+                .iter()
+                .any(|name| field.name().eq_ignore_ascii_case(name))
+        }) {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE SOURCE column '{}' is reserved engine mutation metadata",
+                field.name()
+            )));
+        }
+        let weight_fields = fields
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name().eq_ignore_ascii_case(weight))
+            .collect::<Vec<_>>();
+        let canonical_weight = matches!(weight_fields.as_slice(), [(index, field)]
+            if *index + 1 == fields.len()
+                && field.name() == weight
+                && field.data_type() == &DataType::Int64
+                && !field.is_nullable());
+
+        let contract = if let Some(resolved) = resolved {
+            let registration = crate::connector_manager::SourceRegistration {
+                name: source_name.to_string(),
+                connector_type: resolved.connector_type.clone(),
+                connector_options: resolved.connector_options.clone(),
+                format: resolved.format.clone(),
+                format_options: resolved.format_options.clone(),
+            };
+            let mut config = crate::connector_manager::build_source_config(&registration)?;
+            config.set(
+                "_arrow_schema".to_string(),
+                crate::pipeline_callback::encode_arrow_schema(&source_def.schema),
+            );
+            let connector = self
+                .connector_registry
+                .create_source(&config, None)
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "cannot construct source '{source_name}' for input-mode validation: {error}"
+                    ))
+                })?;
+            Some(connector.contract(&config).map_err(|error| {
+                DbError::Config(format!(
+                    "source '{source_name}' has an invalid connector contract: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+
+        match contract.map(|contract| contract.input_mode) {
+            Some(SourceInputMode::FullChangelog) if canonical_weight => Ok(()),
+            Some(SourceInputMode::FullChangelog) => Err(DbError::InvalidOperation(format!(
+                "full-changelog source '{source_name}' requires exact trailing non-null BIGINT '{weight}'"
+            ))),
+            Some(SourceInputMode::AppendOnly | SourceInputMode::KeyedUpsert) | None
+                if weight_fields.is_empty() =>
+            {
+                Ok(())
+            }
+            Some(mode) => Err(DbError::InvalidOperation(format!(
+                "source '{source_name}' declares '{weight}', but connector input mode is {mode:?}"
+            ))),
+            None => Err(DbError::InvalidOperation(format!(
+                "source '{source_name}' cannot declare engine changelog column '{weight}' without a FullChangelog connector contract"
+            ))),
+        }?;
+        Ok(contract)
+    }
+
+    /// A mutation connector may be declared before its stateful consumer, but it cannot be
+    /// retrofitted underneath an already-persisted ordinary stream or sink. Full contract
+    /// certification is repeated after the stateful route exists and again before startup.
+    fn validate_new_mutation_source_consumers(&self, source_name: &str) -> Result<(), DbError> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let manager = self.connector_manager.lock();
+        if manager.sinks().values().any(|sink| {
+            sink.input == source_name || sink.query_inputs.iter().any(|input| input == source_name)
+        }) {
+            return Err(DbError::Config(format!(
+                "mutation source '{source_name}' cannot be created beneath an existing direct sink; mutable sources are exclusive to admitted stateful routes"
+            )));
+        }
+        for stream in manager.streams().values() {
+            if !crate::sql_analysis::extract_table_references(&stream.query_sql)
+                .contains(source_name)
+            {
+                continue;
+            }
+            let potential_stateful_route = match stream.join_config.as_deref() {
+                Some([JoinOperatorConfig::Temporal(config)]) => {
+                    config.right_table == source_name && config.left_table != source_name
+                }
+                Some([JoinOperatorConfig::StreamStream(config)]) => {
+                    crate::sql_analysis::detect_stream_join_query(&stream.query_sql).is_some_and(
+                        |detected| {
+                            (config.left_table == source_name || config.right_table == source_name)
+                                && detected.left_pre_filter.is_none()
+                                && detected.right_pre_filter.is_none()
+                                && detected.config.left_table == config.left_table
+                                && detected.config.right_table == config.right_table
+                                && detected.config.join_type == config.join_type
+                                && detected.config.left_keys == config.left_keys
+                                && detected.config.right_keys == config.right_keys
+                                && detected.config.left_time_column == config.left_time_column
+                                && detected.config.right_time_column == config.right_time_column
+                                && detected.config.time_bound == config.time_bound
+                        },
+                    )
+                }
+                _ => false,
+            };
+            if !potential_stateful_route {
+                return Err(DbError::Config(format!(
+                    "mutation source '{source_name}' cannot be created beneath ordinary stream '{}'; mutable sources are exclusive to admitted stateful routes",
+                    stream.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `None` when an existing source was kept (`IF NOT EXISTS`).
     fn register_source_entry(
         &self,
@@ -1403,6 +1653,7 @@ impl LaminarDB {
     ) -> Result<Option<Arc<crate::catalog::SourceEntry>>, DbError> {
         let name = &source_def.name;
         let schema = source_def.schema.clone();
+        let primary_key = source_def.primary_key.clone();
         let watermark_col = source_def.watermark.as_ref().map(|w| w.column.clone());
         let max_ooo = source_def
             .watermark
@@ -1420,6 +1671,7 @@ impl LaminarDB {
                 Some(self.catalog.register_source(
                     name,
                     schema,
+                    primary_key,
                     watermark_col,
                     max_ooo,
                     buffer_size,
@@ -1432,6 +1684,7 @@ impl LaminarDB {
             Some(self.catalog.register_source(
                 name,
                 schema,
+                primary_key,
                 watermark_col,
                 max_ooo,
                 buffer_size,
@@ -1475,9 +1728,16 @@ impl LaminarDB {
                 applied: false,
             }));
         };
-        let input = match &create.from {
-            laminar_sql::parser::SinkFrom::Table(t) => canonical_object_name(t)?,
-            laminar_sql::parser::SinkFrom::Query(_) => "query".to_string(),
+        let (input, query_inputs) = match &create.from {
+            laminar_sql::parser::SinkFrom::Table(table) => {
+                (canonical_object_name(table)?, Vec::new())
+            }
+            laminar_sql::parser::SinkFrom::Query(_) => {
+                return Err(DbError::Unsupported(
+                    "sink queries require a named internal stream; CREATE STREAM for the query and sink FROM that stream"
+                        .into(),
+                ));
+            }
         };
 
         // A sink CAN consume an incremental MV's changelog when its connector is upsert- or
@@ -1491,7 +1751,6 @@ impl LaminarDB {
             create.connector_type.as_ref(),
             &create.connector_options,
             create.format.as_ref(),
-            &create.with_options,
             ConnectorKind::Sink,
         )?;
 
@@ -1501,22 +1760,66 @@ impl LaminarDB {
             planner.plan(&stmt).map_err(laminar_sql::Error::from)?;
         }
 
-        self.catalog.register_sink(&name, &input)?;
-
-        if let Some(resolved) = resolved {
-            if let Some(ct) = resolved.connector_type {
-                let mut mgr = self.connector_manager.lock();
-                mgr.register_sink(crate::connector_manager::SinkRegistration {
-                    name: name.clone(),
-                    input: input.clone(),
-                    connector_type: Some(ct),
-                    connector_options: resolved.connector_options,
-                    format: resolved.format,
-                    format_options: resolved.format_options,
-                    filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
-                });
+        let candidate = if let Some(resolved) = resolved {
+            crate::connector_manager::SinkRegistration {
+                name: name.clone(),
+                input: input.clone(),
+                query_inputs: query_inputs.clone(),
+                connector_type: resolved.connector_type,
+                connector_options: resolved.connector_options,
+                format: resolved.format,
+                format_options: resolved.format_options,
+                filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
+            }
+        } else {
+            crate::connector_manager::SinkRegistration {
+                name: name.clone(),
+                input: input.clone(),
+                query_inputs,
+                connector_type: None,
+                connector_options: HashMap::new(),
+                format: None,
+                format_options: HashMap::new(),
+                filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
+            }
+        };
+        let (source_regs, mut sink_regs, stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        for input in std::iter::once(candidate.input.as_str()).chain(
+            candidate
+                .query_inputs
+                .iter()
+                .map(std::string::String::as_str),
+        ) {
+            if self.catalog.get_source(input).is_none() {
+                continue;
+            }
+            if self
+                .resolve_registered_source_contract(input, &source_regs)?
+                .is_some_and(|(contract, _)| contract.input_mode != SourceInputMode::AppendOnly)
+            {
+                return Err(DbError::Config(format!(
+                    "sink '{name}' cannot directly consume mutation source '{input}'; mutable sources are exclusive to admitted stateful routes"
+                )));
             }
         }
+        sink_regs.insert(name.clone(), candidate.clone());
+        self.validate_persisted_temporal_source_contracts(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
+
+        self.catalog.register_sink(&name, &input)?;
+
+        self.connector_manager.lock().register_sink(candidate);
 
         reservation.commit();
 
@@ -1559,6 +1862,12 @@ impl LaminarDB {
         }
         let (fields, primary_key) = build_table_fields_and_primary_key(create)?;
         let schema = Arc::new(Schema::new(fields));
+        if crate::catalog::schema_has_reserved_mutation_columns(schema.as_ref()) {
+            return Err(DbError::InvalidOperation(
+                "CREATE TABLE columns _op, __op, and __weight are reserved engine mutation metadata"
+                    .into(),
+            ));
+        }
 
         let Some(reservation) =
             self.reserve_catalog_name(&name, CatalogObjectKind::Table, create.if_not_exists)?
@@ -1693,6 +2002,10 @@ impl LaminarDB {
         self.ensure_topology_ddl_allowed("CREATE STREAM")?;
         let name_str = canonical_object_name(name)?;
         reject_reserved_namespace(&name_str)?;
+        if crate::sql_analysis::has_temporal_query(query_sql) {
+            self.ensure_temporal_stream_offline(&name_str)?;
+        }
+        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(mut reservation) =
             self.reserve_catalog_name(&name_str, CatalogObjectKind::Stream, if_not_exists)?
         else {
@@ -1703,9 +2016,31 @@ impl LaminarDB {
             }));
         };
 
-        self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
-        let planned =
-            self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
+        self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql)?;
+        let planned = self
+            .plan_streaming_query(name, query, emit_clause.cloned(), query_sql)
+            .await?;
+        if !self.is_cluster_runtime()
+            && (planned.window_config.is_some() || planned.join_config.is_none())
+            && query_inputs_registered(&self.ctx, query_sql)
+        {
+            let _ = validate_managed_aggregate_admission(
+                &self.ctx,
+                query_sql,
+                planned.window_config.as_ref(),
+                planned.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await?;
+        }
+        let temporal_output_schema = self
+            .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
+            .await?;
+        self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
+        let _ = self
+            .validate_interval_topology_candidate("stream", &name_str, query_sql, &planned)
+            .await?;
         self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
             .await?;
         let PlannedStreamingQuery {
@@ -1717,10 +2052,14 @@ impl LaminarDB {
             has_frame: plan_has_frame,
         } = planned;
 
-        // A stream over an incremental MV must net the changelog — an aggregate or a simple
-        // projection/filter; a complex shape (e.g. a join) is rejected.
-        self.reject_unsupported_reading_incremental_mv(query_sql, "a stream")
-            .await?;
+        // A stream over an incremental MV must net the changelog — a non-windowed aggregate or a
+        // simple projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(
+            query_sql,
+            "a stream",
+            plan_window.is_some(),
+        )
+        .await?;
         let query_sql = query_sql.to_string();
 
         // The typed namespace reservation prevents rollback from erasing another object.
@@ -1741,8 +2080,10 @@ impl LaminarDB {
             release.notified().await;
         }
 
-        let placeholder_schema =
-            crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await;
+        let placeholder_schema = match temporal_output_schema {
+            Some(schema) => Some(schema),
+            None => crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await,
+        };
 
         if let Some(bytes) = retention_bytes {
             let cap = usize::try_from(bytes).unwrap_or(usize::MAX);
@@ -1844,6 +2185,8 @@ impl LaminarDB {
             }));
         }
         let targets = self.build_drop_plan(&name_str, CatalogObjectKind::Stream, cascade)?;
+        self.ensure_mutable_interval_drop_offline("DROP STREAM", &targets)
+            .await?;
         let graph_names: Vec<String> = targets
             .iter()
             .filter(|target| {
@@ -2100,40 +2443,45 @@ impl LaminarDB {
         }))
     }
 
-    fn plan_streaming_query(
+    async fn plan_streaming_query(
         &self,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
         query_sql: &str,
-        certify_state_backed_join: bool,
     ) -> Result<PlannedStreamingQuery, DbError> {
-        let admission = if certify_state_backed_join {
-            let incremental_mvs = self.incremental_mv_names();
-            if let Some(join) =
-                crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
-            {
-                Some(
-                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
-                        join.left_table,
-                        join.right_table,
-                        join.left_keys,
-                        join.right_keys,
-                        join.left_outer,
-                    )
-                    .map_err(|error| {
-                        DbError::InvalidOperation(format!(
-                            "invalid incremental-join admission certificate: {error}"
-                        ))
-                    })?,
+        let admission = if crate::sql_analysis::has_join_clause(query_sql) {
+            let (source_regs, sink_regs, stream_regs) = {
+                let manager = self.connector_manager.lock();
+                (
+                    manager.sources().clone(),
+                    manager.sinks().clone(),
+                    manager.streams().clone(),
                 )
-            } else if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
+            };
+            let ordered = self
+                .validate_persisted_interval_source_contracts(
+                    &source_regs,
+                    &sink_regs,
+                    &stream_regs,
+                    self.runtime_mode(),
+                )
+                .await?;
+            let static_tables = self.static_table_names();
+            let current = crate::pipeline_lifecycle::resolve_stream_output_schemas(
+                &self.ctx,
+                &stream_regs,
+                &static_tables,
+                &ordered.joins,
+            )
+            .await?;
+            if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
-                &incremental_mvs,
-                &self.static_table_names(),
+                &current.changelog_carrying,
+                &static_tables,
             ) {
                 Some(
-                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
+                    laminar_sql::planner::ChangelogEnrichAdmission::try_new(
                         join.changelog_table,
                         join.static_table,
                         join.left_keys,
@@ -2163,7 +2511,7 @@ impl LaminarDB {
             retention_bytes: None,
         };
         let plan_result = if let Some(admission) = admission.as_ref() {
-            planner.plan_state_backed_join(&statement, admission)
+            planner.plan_changelog_enrich(&statement, admission)
         } else {
             planner.plan(&statement)
         };
@@ -2184,6 +2532,450 @@ impl LaminarDB {
         })
     }
 
+    async fn validate_temporal_topology_candidate(
+        &self,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<Option<arrow_schema::SchemaRef>, DbError> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let joins = plan.join_config.as_deref().unwrap_or_default();
+        let contains_temporal = joins
+            .iter()
+            .any(|join| matches!(join, JoinOperatorConfig::Temporal(_)));
+        if !contains_temporal && crate::sql_analysis::has_temporal_query(query_sql) {
+            return Err(DbError::Unsupported(
+                "the planner did not bind the managed temporal-join contract".into(),
+            ));
+        }
+        let (source_regs, sink_regs, mut stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        stream_regs.insert(
+            name.to_string(),
+            crate::connector_manager::StreamRegistration {
+                name: name.to_string(),
+                query_sql: query_sql.to_string(),
+                emit_clause: plan.emit_clause.clone(),
+                window_config: plan.window_config.clone(),
+                order_config: plan.order_config.clone(),
+                join_config: plan.join_config.clone(),
+                has_analytic: plan.has_analytic,
+                has_frame: plan.has_frame,
+                incremental: false,
+            },
+        );
+        self.validate_persisted_temporal_source_contracts(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
+        if !contains_temporal {
+            return Ok(None);
+        }
+        let [JoinOperatorConfig::Temporal(config)] = joins else {
+            return Err(DbError::Unsupported(
+                "managed temporal streams require exactly one two-input temporal join".into(),
+            ));
+        };
+        self.ensure_temporal_stream_offline(name)?;
+        let (left, right) = self.validate_temporal_source_metadata(name, config, &source_regs)?;
+        crate::pipeline_lifecycle::plan_temporal_output_schema(
+            &self.ctx,
+            name,
+            query_sql,
+            config,
+            &left.schema,
+            &right.schema,
+        )
+        .await
+        .map(Some)
+    }
+
+    fn ensure_temporal_stream_offline(&self, name: &str) -> Result<(), DbError> {
+        if crate::db::catalog_manifest_replay_active()
+            || DbState::load(&self.state) == DbState::Created
+        {
+            return Ok(());
+        }
+        Err(DbError::Pipeline(format!(
+            "[LDB-6043] CREATE STREAM '{name}' contains a temporal join and must be created \
+             while the pipeline is stopped so its managed projection and vnode state are \
+             initialized before source intake"
+        )))
+    }
+
+    fn reject_interval_output_subquery(name: &str, query_sql: &str) -> Result<(), DbError> {
+        if crate::sql_analysis::detect_stream_join_query(query_sql).is_some()
+            && crate::sql_analysis::interval_output_has_nested_query(query_sql)
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "interval join '{name}' cannot contain a projection or filter subquery"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reject_temporal_materialized_view(
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        let planned_temporal = plan.join_config.as_ref().is_some_and(|joins| {
+            joins.iter().any(|join| {
+                matches!(
+                    join,
+                    laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                )
+            })
+        });
+        if planned_temporal || crate::sql_analysis::has_temporal_query(query_sql) {
+            return Err(DbError::Unsupported(
+                "materialized views cannot directly own managed temporal-join state; create a temporal stream while the pipeline is stopped"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_interval_topology_candidate(
+        &self,
+        object_kind: &str,
+        name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<IntervalTopologyCandidate, DbError> {
+        let (source_regs, sink_regs, mut stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        stream_regs.insert(
+            name.to_string(),
+            crate::connector_manager::StreamRegistration {
+                name: name.to_string(),
+                query_sql: query_sql.to_string(),
+                emit_clause: plan.emit_clause.clone(),
+                window_config: plan.window_config.clone(),
+                order_config: plan.order_config.clone(),
+                join_config: plan.join_config.clone(),
+                has_analytic: plan.has_analytic,
+                has_frame: plan.has_frame,
+                incremental: false,
+            },
+        );
+        let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            self.runtime_mode(),
+        )?;
+        let admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        let query_references = crate::sql_analysis::extract_table_references(query_sql);
+        for input in &query_references {
+            self.validate_registered_mutation_source_admission(
+                input,
+                &source_regs,
+                &temporal_source_roles,
+                &admissions,
+            )?;
+        }
+        let mutable_interval = admissions.joins.contains_key(name);
+        if crate::sql_analysis::query_references_weight(query_sql) {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE {object_kind} '{name}' is not a certified changelog producer and cannot explicitly reference or alias the reserved engine-owned '{}' column",
+                crate::aggregate_state::WEIGHT_COLUMN
+            )));
+        }
+        let has_existing_changelog_root = !admissions.joins.is_empty()
+            || stream_regs.values().any(|registration| {
+                registration.incremental
+                    || registration.emit_clause.as_ref().is_some_and(|emit| {
+                        matches!(emit, laminar_sql::parser::EmitClause::Changes)
+                    })
+            });
+        if !has_existing_changelog_root {
+            return Ok(IntervalTopologyCandidate {
+                mutable_join: mutable_interval,
+                ..IntervalTopologyCandidate::default()
+            });
+        }
+        let reference_tables = self.static_table_names();
+        let resolved = crate::pipeline_lifecycle::resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &reference_tables,
+            &admissions.joins,
+        )
+        .await?;
+        let consumes_ordered_changelog = query_references
+            .iter()
+            .any(|input| resolved.changelog_carrying.contains(input));
+        if consumes_ordered_changelog
+            && (plan.order_config.is_some()
+                || crate::sql_analysis::query_has_order_or_row_limit(query_sql))
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "CREATE {object_kind} '{name}' cannot apply ordering or row limits to a changelog"
+            )));
+        }
+        let candidate_carries_changelog = resolved.changelog_carrying.contains(name);
+        let fixed_ordered_topology = mutable_interval || consumes_ordered_changelog;
+        if fixed_ordered_topology
+            && !crate::db::catalog_manifest_replay_active()
+            && DbState::load(&self.state) != DbState::Created
+        {
+            return Err(DbError::Pipeline(format!(
+                "[LDB-6043] CREATE {object_kind} '{name}' creates or consumes a mutable bounded interval changelog and must be created while the pipeline is stopped so its ordered routing and retained state are initialized before source intake"
+            )));
+        }
+        let changelog_enrich = consumes_ordered_changelog
+            && crate::sql_analysis::detect_changelog_enrich_query(
+                query_sql,
+                &resolved.changelog_carrying,
+                &reference_tables,
+            )
+            .is_some();
+        Ok(IntervalTopologyCandidate {
+            mutable_join: mutable_interval,
+            candidate_carries_changelog,
+            changelog_input: consumes_ordered_changelog.then_some(if changelog_enrich {
+                ChangelogInputKind::StaticEnrich
+            } else {
+                ChangelogInputKind::Forwarded
+            }),
+        })
+    }
+
+    async fn ensure_mutable_interval_drop_offline(
+        &self,
+        operation: &str,
+        targets: &[CatalogDropTarget],
+    ) -> Result<(), DbError> {
+        if crate::db::catalog_manifest_replay_active()
+            || DbState::load(&self.state) != DbState::Running
+        {
+            return Ok(());
+        }
+        let (source_regs, sink_regs, stream_regs) = {
+            let manager = self.connector_manager.lock();
+            (
+                manager.sources().clone(),
+                manager.sinks().clone(),
+                manager.streams().clone(),
+            )
+        };
+        let admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                self.runtime_mode(),
+            )
+            .await?;
+        if let Some(target) = targets
+            .iter()
+            .find(|target| admissions.joins.contains_key(&target.name))
+        {
+            return Err(DbError::Pipeline(format!(
+                "[LDB-6043] {operation} would remove mutable bounded interval join '{}' from a running fixed startup topology; stop the pipeline first",
+                target.name
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn validate_interval_join_schema(
+        &self,
+        object_name: &str,
+        query_sql: &str,
+        plan: &PlannedStreamingQuery,
+    ) -> Result<(), DbError> {
+        let Some(joins) = &plan.join_config else {
+            return Ok(());
+        };
+
+        let mut has_interval_join = false;
+        for join in joins {
+            let laminar_sql::translator::JoinOperatorConfig::StreamStream(config) = join else {
+                continue;
+            };
+            has_interval_join = true;
+            let left_schema = self
+                .ctx
+                .table_provider(exact_table_reference(&config.left_table))
+                .await
+                .map_err(|error| {
+                    DbError::InvalidOperation(format!(
+                        "cannot validate interval join '{object_name}' input '{}': {error}",
+                        config.left_table
+                    ))
+                })?
+                .schema();
+            let right_schema = self
+                .ctx
+                .table_provider(exact_table_reference(&config.right_table))
+                .await
+                .map_err(|error| {
+                    DbError::InvalidOperation(format!(
+                        "cannot validate interval join '{object_name}' input '{}': {error}",
+                        config.right_table
+                    ))
+                })?
+                .schema();
+
+            let field = |schema: &Schema, table: &str, column: &str| {
+                schema
+                    .field_with_name(column)
+                    .map(|field| (field.data_type().clone(), field.is_nullable()))
+                    .map_err(|_| {
+                        DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' column '{table}.{column}' does not exist"
+                        ))
+                    })
+            };
+            if config.left_keys.is_empty() || config.left_keys.len() != config.right_keys.len() {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires non-empty equality-key vectors with matching arity"
+                )));
+            }
+            for (left_column, right_column) in config.left_keys.iter().zip(config.right_keys.iter())
+            {
+                let (left_key, _) = field(&left_schema, &config.left_table, left_column)?;
+                let (right_key, _) = field(&right_schema, &config.right_table, right_column)?;
+                if !matches!(&left_key, DataType::Utf8 | DataType::Int64)
+                    || !matches!(&right_key, DataType::Utf8 | DataType::Int64)
+                    || left_key != right_key
+                {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' key pairs must have the same Utf8 or Int64 type; '{}.{}' is {} and '{}.{}' is {}",
+                        config.left_table,
+                        left_column,
+                        left_key,
+                        config.right_table,
+                        right_column,
+                        right_key
+                    )));
+                }
+            }
+
+            if matches!(
+                config.join_type,
+                laminar_sql::parser::join_parser::JoinType::Inner
+                    | laminar_sql::parser::join_parser::JoinType::Left
+                    | laminar_sql::parser::join_parser::JoinType::Right
+                    | laminar_sql::parser::join_parser::JoinType::Full
+            ) {
+                let mut output_names = std::collections::HashSet::new();
+                for field in left_schema.fields() {
+                    if !output_names.insert(field.name().clone()) {
+                        return Err(DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' input schema repeats column '{}'",
+                            field.name()
+                        )));
+                    }
+                }
+                for field in right_schema.fields() {
+                    let name = format!("{}_{}", field.name(), config.right_table);
+                    if !output_names.insert(name.clone()) {
+                        return Err(DbError::InvalidOperation(format!(
+                            "interval join '{object_name}' internal output column '{name}' collides; rename the input column or relation"
+                        )));
+                    }
+                }
+            }
+
+            for (schema, table, column) in [
+                (&left_schema, &config.left_table, &config.left_time_column),
+                (
+                    &right_schema,
+                    &config.right_table,
+                    &config.right_time_column,
+                ),
+            ] {
+                let (time, nullable) = field(schema, table, column)?;
+                if !matches!(&time, DataType::Timestamp(_, _)) {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' event-time column '{table}.{column}' must be Timestamp(_), found {time}"
+                    )));
+                }
+                if nullable {
+                    return Err(DbError::InvalidOperation(format!(
+                        "interval join '{object_name}' event-time column '{table}.{column}' must be declared NOT NULL"
+                    )));
+                }
+            }
+
+            for (side, source_name, time_column) in [
+                (
+                    "left",
+                    config.left_table.as_str(),
+                    config.left_time_column.as_str(),
+                ),
+                (
+                    "right",
+                    config.right_table.as_str(),
+                    config.right_time_column.as_str(),
+                ),
+            ] {
+                let Some(source) = self.catalog.get_source(source_name) else {
+                    return Err(DbError::InvalidOperation(format!(
+                        "{side} interval join input '{source_name}' must be a directly watermarked source"
+                    )));
+                };
+                if source.watermark_column.as_deref() != Some(time_column)
+                    || source
+                        .is_processing_time
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(DbError::InvalidOperation(format!(
+                        "{side} interval join input '{source_name}' must define an event-time watermark on '{time_column}'"
+                    )));
+                }
+            }
+        }
+
+        if has_interval_join {
+            if crate::sql_analysis::has_unaliased_projection(query_sql) {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires every projected expression to have an explicit alias"
+                )));
+            }
+            if crate::sql_analysis::has_unqualified_interval_output_column(query_sql) {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' requires every projected or filtered column to use its left or right input qualifier"
+                )));
+            }
+            let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
+                DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' could not be validated: {error}"
+                ))
+            })?;
+            if logical_aggregate_stage_count(dataframe.logical_plan()) != 0 {
+                return Err(DbError::InvalidOperation(format!(
+                    "interval join '{object_name}' cannot contain an aggregate stage"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn cluster_state_lifecycle_error(object_kind: &str, name: &str, reason: &str) -> DbError {
         DbError::InvalidOperation(format!(
             "[{}] {object_kind} '{name}' is not supported in cluster mode: {reason}",
@@ -2196,10 +2988,7 @@ impl LaminarDB {
         object_kind: &str,
         name: &str,
         query_sql: &str,
-        emit_clause: Option<&laminar_sql::parser::EmitClause>,
     ) -> Result<(), DbError> {
-        use laminar_sql::parser::EmitClause;
-
         if !self.is_cluster_runtime() {
             return Ok(());
         }
@@ -2211,67 +3000,33 @@ impl LaminarDB {
             ))
         };
 
-        if let Some(aggregate) = distinct_streaming_aggregate(query_sql) {
-            return reject(&format!(
-                "DISTINCT aggregate '{aggregate}' has unbounded per-key state and no spillable vnode lifecycle"
-            ));
-        }
-
-        if emit_clause
-            .is_some_and(|emit| matches!(emit, EmitClause::OnWindowClose | EmitClause::Final))
-        {
-            return reject(
-                "window-close/final emission has whole-operator window state without a vnode lifecycle",
-            );
-        }
         if crate::sql_analysis::plan_frame_query(query_sql).is_some() {
             return reject(
                 "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
-        if !crate::sql_analysis::detect_ai_functions(query_sql).is_empty() {
+        let hazards = crate::sql_analysis::cluster_query_hazards(query_sql).ok_or_else(|| {
+            Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                "query SQL could not be certified by the cluster admission parser",
+            )
+        })?;
+        if hazards.runtime_function {
+            return reject(
+                "runtime clock/watermark functions require a cluster-wide evaluation frontier",
+            );
+        }
+        if hazards.ai_function {
             return reject(
                 "AI inference has checkpointed in-flight rows but no vnode-keyed rebalance lifecycle",
             );
         }
-        if !matches!(
-            crate::sql_analysis::analyze_temporal_filter(query_sql),
-            crate::sql_analysis::TemporalFilterAnalysis::NotPresent
-        ) {
-            return reject(
-                "retracting temporal-filter state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
-        }
-
-        let incremental_mvs = self.incremental_mv_names();
-        if crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
-            .is_some()
-            || crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_mvs)
+        if crate::sql_analysis::has_join_clause(query_sql)
+            && self.first_incremental_ref(query_sql).is_some()
         {
             return reject(
                 "incremental changelog join state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
-        }
-        if crate::sql_analysis::detect_temporal_probe_query(query_sql)
-            .0
-            .is_some()
-        {
-            return reject(
-                "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
-        }
-        if crate::sql_analysis::detect_asof_query(query_sql)
-            .0
-            .is_some()
-        {
-            return reject("ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle");
-        }
-        if crate::sql_analysis::detect_temporal_query(query_sql)
-            .0
-            .is_some()
-        {
-            return reject(
-                "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
         Ok(())
@@ -2279,7 +3034,7 @@ impl LaminarDB {
 
     /// Cluster admission is based on configured runtime mode, never the current owner count.
     /// Every stateful route admitted here must implement key shuffle plus vnode capture, restore,
-    /// and revoke. Joins fail closed until their operator and output state have that lifecycle.
+    /// and revoke. Bounded interval joins and managed temporal joins satisfy that contract.
     pub(crate) async fn validate_cluster_query_shape(
         &self,
         object_kind: &str,
@@ -2292,12 +3047,7 @@ impl LaminarDB {
         if !self.is_cluster_runtime() {
             return Ok(false);
         }
-        self.validate_cluster_query_shape_before_plan(
-            object_kind,
-            name,
-            query_sql,
-            plan.emit_clause.as_ref(),
-        )?;
+        self.validate_cluster_query_shape_before_plan(object_kind, name, query_sql)?;
         let reject = |reason: &str| {
             Err(Self::cluster_state_lifecycle_error(
                 object_kind,
@@ -2311,6 +3061,98 @@ impl LaminarDB {
                 "analytic/window-frame state has no vnode-keyed checkpoint and rebalance lifecycle",
             );
         }
+        let managed_window_emit = plan.emit_clause.as_ref().is_some_and(|emit| {
+            matches!(
+                emit,
+                laminar_sql::parser::EmitClause::OnWindowClose
+                    | laminar_sql::parser::EmitClause::Final
+            )
+        });
+        if let Some(window) = plan.window_config.as_ref() {
+            if !managed_window_emit {
+                return reject(
+                    "cluster windows require EMIT ON WINDOW CLOSE or EMIT FINAL on the managed CoreWindow path",
+                );
+            }
+            if plan.join_config.is_some() || crate::sql_analysis::has_join_clause(query_sql) {
+                return reject(
+                    "a windowed join requires a planner-certified combined join/window vnode lifecycle",
+                );
+            }
+            let source_name = crate::sql_analysis::managed_core_window_source(
+                query_sql,
+                window,
+            )
+            .ok_or_else(|| {
+                    Self::cluster_state_lifecycle_error(
+                        object_kind,
+                        name,
+                        "managed CoreWindow execution requires one direct source, an unqualified event-time column, and no nested or row-expanding query shape",
+                    )
+                })?;
+            let source = self.catalog.get_source(&source_name).ok_or_else(|| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    "managed CoreWindow execution requires exactly one direct source",
+                )
+            })?;
+            if source
+                .is_processing_time
+                .load(std::sync::atomic::Ordering::Acquire)
+                || source.watermark_column.as_deref() != Some(window.time_column.as_str())
+                || source.max_out_of_orderness.is_none()
+            {
+                return reject(
+                    "managed CoreWindow execution requires an event-time watermark on its window time column",
+                );
+            }
+            let managed = crate::core_window_state::CoreWindowState::try_from_sql(
+                &self.ctx,
+                query_sql,
+                window,
+                plan.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await
+            .map_err(|error| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    &format!("managed CoreWindow validation failed: {error}"),
+                )
+            })?
+            .ok_or_else(|| {
+                Self::cluster_state_lifecycle_error(
+                    object_kind,
+                    name,
+                    "window aggregate cannot be constructed on the managed CoreWindow path",
+                )
+            })?;
+            if !managed.planned_functions_are_immutable() {
+                return reject(
+                    "managed CoreWindow execution requires replay-immutable planned functions",
+                );
+            }
+            if managed.compiled_projection().is_none() {
+                return reject(
+                    "managed CoreWindow execution requires compiled pre-aggregation over its direct source",
+                );
+            }
+            #[cfg(feature = "cluster")]
+            if self.shuffle_sender.lock().is_none()
+                || self.shuffle_receiver.lock().is_none()
+                || self.vnode_registry.lock().is_none()
+            {
+                return reject("CoreWindow has no complete shuffle and vnode ownership scope");
+            }
+            return Ok(true);
+        }
+        if managed_window_emit {
+            return reject(
+                "window-close/final emission requires a managed TUMBLE, HOP, or SESSION aggregate",
+            );
+        }
         if plan
             .order_config
             .as_ref()
@@ -2321,28 +3163,70 @@ impl LaminarDB {
             );
         }
         if let Some(joins) = &plan.join_config {
-            let reason = match joins.first() {
-                Some(JoinOperatorConfig::StreamStream(_)) => {
-                    "stream join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Asof(_)) => {
-                    "ASOF join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Temporal(_)) => {
-                    "temporal join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::TemporalProbe(_)) => {
-                    "temporal-probe join state has no vnode-keyed checkpoint and rebalance lifecycle"
-                }
-                Some(JoinOperatorConfig::Lookup(_)) | None => {
-                    "lookup join operator and output state have no vnode lifecycle"
-                }
+            let [join] = joins.as_slice() else {
+                return reject("cluster streaming joins require exactly one two-input stage");
             };
-            return reject(reason);
+            if let JoinOperatorConfig::Temporal(config) = join {
+                crate::sql_analysis::temporal_projection_sql(query_sql, config).map_err(
+                    |error| {
+                        Self::cluster_state_lifecycle_error(
+                            object_kind,
+                            name,
+                            &format!("managed temporal join validation failed: {error}"),
+                        )
+                    },
+                )?;
+                #[cfg(feature = "cluster")]
+                if self.shuffle_sender.lock().is_none()
+                    || self.shuffle_receiver.lock().is_none()
+                    || self.vnode_registry.lock().is_none()
+                {
+                    return reject(
+                        "temporal join has no complete shuffle and vnode ownership scope",
+                    );
+                }
+                return Ok(true);
+            }
+            let JoinOperatorConfig::StreamStream(config) = join else {
+                return reject("lookup join operator and output state have no vnode lifecycle");
+            };
+            if config.time_bound.is_zero() || i64::try_from(config.time_bound.as_millis()).is_err()
+            {
+                return reject(
+                    "the distributed join supports only certified direct-source bounded equality joins with a positive finite event-time bound",
+                );
+            }
+            let detected =
+                crate::sql_analysis::detect_stream_join_query(query_sql).ok_or_else(|| {
+                    Self::cluster_state_lifecycle_error(
+                        object_kind,
+                        name,
+                        "the planner join does not map to the bounded interval-join execution path",
+                    )
+                })?;
+            if detected.config.left_table != config.left_table
+                || detected.config.right_table != config.right_table
+                || detected.config.join_type != config.join_type
+                || detected.config.left_keys != config.left_keys
+                || detected.config.right_keys != config.right_keys
+                || detected.config.left_time_column != config.left_time_column
+                || detected.config.right_time_column != config.right_time_column
+                || detected.config.time_bound != config.time_bound
+            {
+                return reject("planner and interval-join execution metadata disagree");
+            }
+            #[cfg(feature = "cluster")]
+            if self.shuffle_sender.lock().is_none()
+                || self.shuffle_receiver.lock().is_none()
+                || self.vnode_registry.lock().is_none()
+            {
+                return reject("interval join has no complete shuffle and vnode ownership scope");
+            }
+            return Ok(true);
+        } else if crate::sql_analysis::has_temporal_query(query_sql) {
+            return reject("the planner did not bind the managed temporal-join contract");
         } else if crate::sql_analysis::detect_stream_join_query(query_sql).is_some() {
-            return reject(
-                "stream join state has no vnode-keyed checkpoint and rebalance lifecycle",
-            );
+            return reject("the planner did not bind the bounded interval-join contract");
         }
 
         let dataframe = self.ctx.sql(query_sql).await.map_err(|error| {
@@ -2393,17 +3277,18 @@ impl LaminarDB {
                 .emit_clause
                 .as_ref()
                 .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
-            let aggregate = match crate::aggregate_state::IncrementalAggState::try_from_sql(
+            match crate::aggregate_state::IncrementalAggState::try_from_sql(
                 &self.ctx,
                 query_sql,
                 emit_changelog,
+                self.checkpoint_key_groups(),
             )
             .await
             {
-                Ok(Some(aggregate)) => aggregate,
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     return reject(
-                        "aggregate cannot be constructed on the exact incremental execution path; node-local DataFusion fallback would produce partial cluster results",
+                        "aggregate cannot be constructed on the exact incremental execution path",
                     );
                 }
                 Err(error) => {
@@ -2411,13 +3296,6 @@ impl LaminarDB {
                         "aggregate incremental execution path could not be constructed: {error}"
                     ));
                 }
-            };
-            let incremental_mvs = self.incremental_mv_names();
-            let reads_changelog = crate::sql_analysis::extract_table_references(query_sql)
-                .iter()
-                .any(|table| incremental_mvs.contains(table));
-            if let Some(reason) = aggregate.cluster_state_rejection(reads_changelog) {
-                return reject(&reason);
             }
         }
         Ok(has_aggregate)
@@ -2451,6 +3329,7 @@ impl LaminarDB {
                 "materialized state has no planner-certified distribution and assignment-fenced checkpoint/read lifecycle",
             ));
         }
+        Self::reject_interval_output_subquery(&name_str, query_sql)?;
         let Some(mut reservation) = self.reserve_catalog_name(
             &name_str,
             CatalogObjectKind::MaterializedView,
@@ -2464,14 +3343,36 @@ impl LaminarDB {
             }));
         };
 
-        let incremental_names = self.incremental_mv_names();
-        if crate::sql_analysis::is_multiway_incremental_join(query_sql, &incremental_names) {
-            return Err(DbError::MaterializedView(format!(
-                "multi-way incremental join '{name_str}' is disabled until the runtime supports \
-                 atomic batch topology admission"
-            )));
+        let planned = self
+            .plan_streaming_query(name, query, emit_clause, query_sql)
+            .await?;
+        if !self.is_cluster_runtime()
+            && (planned.window_config.is_some() || planned.join_config.is_none())
+            && query_inputs_registered(&self.ctx, query_sql)
+        {
+            let _ = validate_managed_aggregate_admission(
+                &self.ctx,
+                query_sql,
+                planned.window_config.as_ref(),
+                planned.emit_clause.as_ref(),
+                self.checkpoint_key_groups(),
+            )
+            .await?;
         }
-        let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
+        Self::reject_temporal_materialized_view(query_sql, &planned)?;
+        let _ = self
+            .validate_temporal_topology_candidate(&name_str, query_sql, &planned)
+            .await?;
+        self.validate_interval_join_schema(&name_str, query_sql, &planned)
+            .await?;
+        let interval_topology = self
+            .validate_interval_topology_candidate(
+                "materialized view",
+                &name_str,
+                query_sql,
+                &planned,
+            )
+            .await?;
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
             window_config: plan_window,
@@ -2482,10 +3383,14 @@ impl LaminarDB {
         } = planned;
 
         let query_sql = query_sql.to_string();
-        // A chained MV over an incremental MV must net the changelog — an aggregate or a simple
-        // projection/filter; a complex shape (e.g. a join) is rejected.
-        self.reject_unsupported_reading_incremental_mv(&query_sql, "a materialized view")
-            .await?;
+        // A chained MV over an incremental MV must net the changelog — a non-windowed aggregate or
+        // a simple projection/filter; a complex shape (e.g. a join) is rejected.
+        self.reject_unsupported_reading_incremental_mv(
+            &query_sql,
+            "a materialized view",
+            plan_window.is_some(),
+        )
+        .await?;
         let schema = self.resolve_mv_schema(&query_sql).await?;
         let sources = self.collect_mv_sources(&query_sql, &name_str);
 
@@ -2509,9 +3414,12 @@ impl LaminarDB {
 
         // An incremental MV emits a dirty-only changelog into a snapshot store; decide the store once
         // so the operator and MV store agree (keyed upsert for aggregates, Z-set for proj/filter).
-        let (inc, has_aggregate) = self
-            .incremental_emit_mode(&query_sql, plan_window.is_some())
-            .await;
+        let (inc, has_aggregate) = if interval_topology.mutable_join {
+            (IncEmit::Multiset, false)
+        } else {
+            self.incremental_emit_mode(&query_sql, plan_window.is_some(), &interval_topology)
+                .await
+        };
         let incremental = !matches!(inc, IncEmit::None);
 
         {
@@ -2588,7 +3496,7 @@ impl LaminarDB {
         }))
     }
 
-    /// Falls back to executing the query for shapes `DataFusion` can't plan (e.g. ASOF).
+    /// Falls back to executing the query when static schema planning is unavailable.
     async fn resolve_mv_schema(&self, query_sql: &str) -> Result<Arc<Schema>, DbError> {
         if let Some(s) = crate::pipeline_lifecycle::plan_output_schema(&self.ctx, query_sql).await {
             return Ok(s);
@@ -2642,30 +3550,50 @@ impl LaminarDB {
 
     /// Static (reference/dimension) table names — valid right sides for a changelog enrich join.
     fn static_table_names(&self) -> rustc_hash::FxHashSet<String> {
-        self.table_store.read().table_names().into_iter().collect()
+        let on_demand: rustc_hash::FxHashSet<String> = self
+            .connector_manager
+            .lock()
+            .tables()
+            .values()
+            .filter(|registration| registration.on_demand)
+            .map(|registration| registration.name.clone())
+            .collect();
+        self.table_store
+            .read()
+            .table_names()
+            .into_iter()
+            .filter(|name| !on_demand.contains(name))
+            .collect()
     }
 
-    /// A query reading an incremental MV must net the retraction changelog — an aggregate or a
-    /// simple projection/filter; complex shapes (e.g. joins) mishandle retractions and are rejected.
+    /// A query reading an incremental MV must net the retraction changelog — a non-windowed
+    /// aggregate or a simple projection/filter; other stateful shapes are rejected.
     async fn reject_unsupported_reading_incremental_mv(
         &self,
         query_sql: &str,
         consumer: &str,
+        has_window: bool,
     ) -> Result<(), DbError> {
         let Some(mv) = self.first_incremental_ref(query_sql) else {
             return Ok(());
         };
-        // Allowed: aggregate, simple projection/filter, `changelog ⋈ static dim` enrich, or
-        // `changelog ⋈ changelog` INNER or LEFT-outer IVM join. RIGHT/FULL, non-equi ON residuals,
-        // and other complex shapes are rejected.
+        if has_window {
+            return Err(incremental_mv_consumer_error(&mv, consumer));
+        }
+        // A changelog may enrich against a static table. Every other join shape is rejected;
+        // non-windowed aggregates and simple projection/filter consumers continue to net
+        // retractions.
         let inc = self.incremental_mv_names();
-        let supported = crate::sql_analysis::detect_changelog_enrich_query(
+        let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
             query_sql,
             &inc,
             &self.static_table_names(),
         )
-        .is_some()
-            || crate::sql_analysis::detect_changelog_incremental_join(query_sql, &inc).is_some()
+        .is_some();
+        if crate::sql_analysis::has_join_clause(query_sql) && !changelog_enrich {
+            return Err(incremental_mv_consumer_error(&mv, consumer));
+        }
+        let supported = changelog_enrich
             || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
                 let plan = df.logical_plan();
                 crate::aggregate_state::find_aggregate(plan).is_some()
@@ -2682,12 +3610,18 @@ impl LaminarDB {
     /// projection/filter over a changelog, `None` (full-emit) otherwise (incl. global aggregates).
     /// Returns the store mode and whether the query is an aggregate (threaded to
     /// `register_mv_provider` so it needn't re-plan to pick `Aggregate` vs append storage).
-    async fn incremental_emit_mode(&self, query_sql: &str, has_window: bool) -> (IncEmit, bool) {
+    async fn incremental_emit_mode(
+        &self,
+        query_sql: &str,
+        has_window: bool,
+        topology: &IntervalTopologyCandidate,
+    ) -> (IncEmit, bool) {
         if has_window {
             return (IncEmit::None, false);
         }
         let flag = self.config.incremental_emit;
-        let reads_incremental = self.first_incremental_ref(query_sql).is_some();
+        let reads_incremental =
+            topology.changelog_input.is_some() || self.first_incremental_ref(query_sql).is_some();
         let Some(df) = self.ctx.sql(query_sql).await.ok() else {
             return (IncEmit::None, false);
         };
@@ -2704,27 +3638,22 @@ impl LaminarDB {
             return (inc, true);
         }
         // Projection/filter over an incremental MV's changelog → Z-set multiset snapshot.
-        if reads_incremental && crate::sql_analysis::extract_projection_filter(plan).is_some() {
+        if topology.candidate_carries_changelog
+            && crate::sql_analysis::extract_projection_filter(plan).is_some()
+        {
             return (IncEmit::Multiset, false);
         }
         // `changelog ⋈ static dim` enrich join → Z-set multiset snapshot.
-        if reads_incremental
-            && crate::sql_analysis::detect_changelog_enrich_query(
+        if topology.candidate_carries_changelog
+            && (matches!(
+                topology.changelog_input,
+                Some(ChangelogInputKind::StaticEnrich)
+            ) || crate::sql_analysis::detect_changelog_enrich_query(
                 query_sql,
                 &self.incremental_mv_names(),
                 &self.static_table_names(),
             )
-            .is_some()
-        {
-            return (IncEmit::Multiset, false);
-        }
-        // `changelog ⋈ changelog` inner IVM join → Z-set multiset snapshot.
-        if reads_incremental
-            && crate::sql_analysis::detect_changelog_incremental_join(
-                query_sql,
-                &self.incremental_mv_names(),
-            )
-            .is_some()
+            .is_some())
         {
             return (IncEmit::Multiset, false);
         }
@@ -2799,6 +3728,8 @@ impl LaminarDB {
         }
         let targets =
             self.build_drop_plan(&name_str, CatalogObjectKind::MaterializedView, cascade)?;
+        self.ensure_mutable_interval_drop_offline("DROP MATERIALIZED VIEW", &targets)
+            .await?;
         let graph_names: Vec<String> = targets
             .iter()
             .filter(|target| {
@@ -2906,70 +3837,12 @@ impl LaminarDB {
     }
 }
 
-const STREAMING_OPTION_KEYS: &[&str] = &[
-    "connector",
-    "format",
-    "buffer_size",
-    "buffersize",
-    "backpressure",
-    "wait_strategy",
-    "waitstrategy",
-    "track_stats",
-    "trackstats",
-    "stats",
-    "event_time",
-    "watermark_delay",
-];
-
-/// Normalised connector info after merging the two CREATE SOURCE/SINK syntax forms.
+/// Normalized connector info from an explicit source `FROM` or sink `INTO` clause.
 pub(crate) struct ResolvedConnector {
     pub connector_type: Option<String>,
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
-}
-
-/// Whether a `WITH (...)` clause names a connector, matched case-insensitively
-/// to stay consistent with `resolve_connector_info`.
-fn has_connector_key(with_options: &HashMap<String, String>) -> bool {
-    with_options
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("connector"))
-}
-
-pub(crate) fn resolve_connector_info(
-    connector_type: Option<&String>,
-    connector_options: &HashMap<String, String>,
-    format: Option<&laminar_sql::parser::FormatSpec>,
-    with_options: &HashMap<String, String>,
-) -> ResolvedConnector {
-    if connector_type.is_some() {
-        ResolvedConnector {
-            connector_type: connector_type.cloned(),
-            connector_options: connector_options.clone(),
-            format: format.map(|f| f.format_type.clone()),
-            format_options: format.map(|f| f.options.clone()).unwrap_or_default(),
-        }
-    } else if let Some(ct) = with_options
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("connector"))
-        .map(|(_, v)| v)
-    {
-        let (conn_opts, fmt, fmt_opts) = extract_connector_from_with_options(with_options);
-        ResolvedConnector {
-            connector_type: Some(ct.to_uppercase()),
-            connector_options: conn_opts,
-            format: fmt,
-            format_options: fmt_opts,
-        }
-    } else {
-        ResolvedConnector {
-            connector_type: None,
-            connector_options: HashMap::new(),
-            format: None,
-            format_options: HashMap::new(),
-        }
-    }
 }
 
 /// Validate that a resolved format string is known.
@@ -2979,40 +3852,6 @@ pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
             .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
     }
     Ok(())
-}
-
-/// Extract `(connector_options, format, format_options)` from a `WITH (...)` clause.
-pub(crate) fn extract_connector_from_with_options(
-    with_options: &HashMap<String, String>,
-) -> (
-    HashMap<String, String>,
-    Option<String>,
-    HashMap<String, String>,
-) {
-    let mut connector_options = HashMap::with_capacity(with_options.len());
-    let mut format: Option<String> = None;
-    let mut format_options = HashMap::with_capacity(4);
-
-    for (key, value) in with_options {
-        let lower = key.to_lowercase();
-        if lower == "connector" {
-            continue;
-        }
-        if lower == "format" {
-            format = Some(value.clone());
-            continue;
-        }
-        if let Some(suffix) = lower.strip_prefix("format.") {
-            format_options.insert(suffix.to_string(), value.clone());
-            continue;
-        }
-        if STREAMING_OPTION_KEYS.contains(&lower.as_str()) {
-            continue;
-        }
-        connector_options.insert(key.clone(), value.clone());
-    }
-
-    (connector_options, format, format_options)
 }
 
 #[cfg(test)]

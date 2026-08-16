@@ -219,6 +219,51 @@ fn test_with_schema() {
     assert_eq!(sink.schema(), schema);
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn open_rejects_injected_weight_schema_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("weighted");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let legacy_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            true,
+        ),
+    ]));
+    super::super::delta_io::open_or_create_table(
+        &path,
+        std::collections::HashMap::new(),
+        Some(&legacy_schema),
+    )
+    .await
+    .unwrap();
+
+    let pipeline_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            laminar_core::changelog::WEIGHT_COLUMN,
+            DataType::Int64,
+            false,
+        ),
+    ]);
+    let mut connector_config = ConnectorConfig::new("delta-lake");
+    connector_config.set("table.path", &path);
+    connector_config.set(
+        "_arrow_schema",
+        crate::config::encode_arrow_schema_ipc(&pipeline_schema),
+    );
+
+    let mut sink = DeltaLakeSink::new(DeltaLakeSinkConfig::new(&path), None);
+    let error = sink.open(&connector_config).await.unwrap_err();
+    assert!(matches!(&error, ConnectorError::SchemaMismatch(_)));
+    assert!(error.to_string().contains("non-null Int64"));
+}
+
 #[test]
 fn test_schema_empty_when_none() {
     let sink = DeltaLakeSink::new(test_config(), None);
@@ -556,14 +601,37 @@ async fn test_close() {
 // ── Contract tests ──
 
 #[test]
-fn test_contract_append_exactly_once() {
-    let mut config = test_config();
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let sink = DeltaLakeSink::new(config, None);
-    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
-    assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
-    assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
-    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+fn test_contract_append_exactly_once_certifies_only_direct_s3() {
+    for (path, topology, cluster_exact) in [
+        ("s3://bucket/table", SinkTopology::MultiWriter, true),
+        ("s3a://bucket/table", SinkTopology::MultiWriter, true),
+        ("gs://bucket/table", SinkTopology::MultiWriter, false),
+        ("az://container/table", SinkTopology::MultiWriter, false),
+        ("abfs://container/table", SinkTopology::MultiWriter, false),
+        ("abfss://container/table", SinkTopology::MultiWriter, false),
+        ("wasb://container/table", SinkTopology::MultiWriter, false),
+        ("wasbs://container/table", SinkTopology::MultiWriter, false),
+        (
+            "uc://catalog/schema/table",
+            SinkTopology::MultiWriter,
+            false,
+        ),
+        ("C:/delta/table", SinkTopology::Singleton, false),
+    ] {
+        let mut config = DeltaLakeSinkConfig::new(path);
+        config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+        let sink = DeltaLakeSink::new(config, None);
+        let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+        assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
+        assert_eq!(contract.topology, topology, "path={path}");
+        assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+        assert_eq!(
+            contract.is_cluster_exact_delivery_certified(),
+            cluster_exact,
+            "path={path}"
+        );
+        assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+    }
 }
 
 #[cfg(feature = "delta-lake")]
@@ -582,6 +650,7 @@ fn test_contract_upsert() {
     let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
     assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert!(!contract.is_cluster_exact_delivery_certified());
 }
 
 #[test]
@@ -591,6 +660,8 @@ fn test_contract_at_least_once() {
     let sink = DeltaLakeSink::new(config, None);
     let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+    assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
+    assert!(!contract.is_cluster_exact_delivery_certified());
 }
 
 // ── Changelog splitting tests ──
@@ -963,8 +1034,8 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_large_epoch");
@@ -1035,7 +1106,7 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
             target: attempt,
             entries: vec![CoordinatedCommitPayload {
                 attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: Some(descriptor),
             }],
         },
@@ -1064,8 +1135,8 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_recover");
@@ -1108,7 +1179,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
                     target: attempt,
                     entries: vec![CoordinatedCommitPayload {
                         attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(descriptor),
                     }],
                 },
@@ -1147,8 +1218,8 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_failover_overlap");
@@ -1188,7 +1259,7 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
                 target: first_attempt,
                 entries: vec![CoordinatedCommitPayload {
                     attempt: first_attempt,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: Some(first_descriptor.clone()),
                 }],
             },
@@ -1228,12 +1299,12 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
                 entries: vec![
                     CoordinatedCommitPayload {
                         attempt: first_attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(first_descriptor),
                     },
                     CoordinatedCommitPayload {
                         attempt: second_attempt,
-                        participant_id: 0,
+                        participant_id: 1,
                         payload: Some(second_descriptor),
                     },
                 ],
@@ -1302,8 +1373,8 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_reconcile");
@@ -1335,7 +1406,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
             target: attempt,
             entries: vec![CoordinatedCommitPayload {
                 attempt,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         },
@@ -1353,7 +1424,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         target: second,
         entries: vec![CoordinatedCommitPayload {
             attempt: second,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };
@@ -1381,12 +1452,12 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         entries: vec![
             CoordinatedCommitPayload {
                 attempt: second,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             },
             CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             },
         ],
@@ -1418,7 +1489,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
             target: third,
             entries: vec![CoordinatedCommitPayload {
                 attempt: third,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         },
@@ -1444,8 +1515,8 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
         CoordinatedCommitPayload, CoordinatedCommitter,
     };
-    use laminar_core::state::CheckpointAttempt;
-    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_commit_timeout");
@@ -1472,7 +1543,7 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         target: attempt,
         entries: vec![CoordinatedCommitPayload {
             attempt,
-            participant_id: 0,
+            participant_id: 1,
             payload: None,
         }],
     };

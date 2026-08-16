@@ -28,7 +28,7 @@ Cluster mode is still pre-production while the open security and operability wor
 
 1. **Set `laminardb.mode` to `"cluster"`**
 2. **Increase `replicaCount` to `3` (or more)**
-3. **Configure durable state and checkpoints**
+3. **Configure a cluster-shared checkpoint URL**
 
 Here is an example cluster values file (`cluster-values.yaml`):
 
@@ -37,13 +37,10 @@ replicaCount: 3
 
 laminardb:
   mode: cluster
+  delivery: at_least_once
   logLevel: info
-  workers: 4
+  keyGroups: 256
   
-  state:
-    backend: object_store
-    url: "az://laminardb-checkpoints/cluster-state"
-    
   checkpoint:
     interval: "30s"
     timeout: "120s"
@@ -51,7 +48,6 @@ laminardb:
     url: "az://laminardb-checkpoints/cluster"
     
   cluster:
-    keyGroups: 256
     discovery:
       strategy: gossip
       gossipPort: 7946
@@ -59,11 +55,7 @@ laminardb:
       # set `seeds` explicitly only for non-standard topologies
 
 persistence:
-  state:
-    enabled: true
-    storageClass: "managed-csi" # Azure Disk CSI / local SSD on-prem
-    size: 50Gi
-  # Checkpoints use the object store above — one (state) PVC per pod, not two.
+  # The cluster uses the object store above, so it needs no checkpoint PVC.
   checkpoints:
     enabled: false
 
@@ -160,21 +152,18 @@ prometheusRule:
 | `laminardb.mode` | Server mode: `single` or `cluster` | `single` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
-| `laminardb.workers` | Number of worker threads (0 = auto) | `0` |
+| `laminardb.keyGroups` | Stable hash partitions; one node owns all in single mode and clusters distribute them | `256` |
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
-| `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
-| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or single-node `exactly_once` (cluster currently requires `at_least_once`) | `at_least_once` |
-| `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
-| `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
+| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or capability-gated `exactly_once` | `best_effort` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
-| `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
+| `laminardb.checkpoint.url` | Provider-neutral checkpoint URL: `s3://` (including R2/MinIO), `gs://`, `az://`, `abfs(s)://`, or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
-| `laminardb.cluster.keyGroups` | Stable hash partitions used for cluster placement and rescaling | `256` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
-| `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
-| `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |
 | `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |
 | `guaranteedQoS` | Pin requests == limits for guaranteed CPU/Mem | `false` |
 | `extraEnvFrom` | Inject variables from ConfigMaps / Secrets | `[]` |
 | `extraVolumes` | Additional volumes to mount into pods | `[]` |
+
+For `at_least_once` or `exactly_once`, a local `file://` checkpoint URL requires
+`persistence.checkpoints.enabled=true`; the chart rejects an ephemeral combination at render time.

@@ -49,6 +49,7 @@ fn batch_admission_releases_after_last_retaining_consumer() {
     let peer = Arc::new(Semaphore::new(1));
     let received = ReceivedBatch {
         batch: RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty())),
+        routed_vnodes: Arc::from([11]),
         reservation: Some(Arc::new(InboundReservation {
             node: Arc::clone(&node).try_acquire_owned().unwrap(),
             peer: Arc::clone(&peer).try_acquire_owned().unwrap(),
@@ -62,6 +63,8 @@ fn batch_admission_releases_after_last_retaining_consumer() {
         recovery_gen: 5,
         checkpoint_sequence: 0,
     };
+
+    assert_eq!(received.routed_vnodes(), &[11]);
 
     let (batch, admission) = received.into_parts();
     let second_consumer = admission.clone();

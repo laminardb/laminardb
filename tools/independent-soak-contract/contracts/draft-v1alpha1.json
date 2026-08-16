@@ -1,0 +1,70 @@
+{
+  "schema_version": "distributed-state-soak/v1alpha1",
+  "notice": "NOT CERTIFICATION EVIDENCE",
+  "status": "draft_ineligible",
+  "certification_eligible": false,
+  "scenario": {
+    "id": "grouped-count-sum-alo",
+    "admission": "blocked_ldb_4007",
+    "delivery_guarantee": "at_least_once",
+    "source": "replayable_splittable_kafka",
+    "source_group_ordering": "one_topic_partition_per_logical_group",
+    "operator": "grouped_count_star_sum_exact_integer_decimal",
+    "output": "append_result_snapshots",
+    "sink": {
+      "required_capability": "durable_multiwriter_append",
+      "implementation": "kafka_envelope_append_candidate",
+      "eligibility": "candidate_ineligible"
+    }
+  },
+  "oracle": {
+    "status": "fixture_only",
+    "public_surfaces_only": true,
+    "laminar_library_dependencies": false,
+    "numeric_coverage": "integer_fixture_only_decimal_required",
+    "stable_operation_identity": "required_not_implemented",
+    "assignment_generation": "required_not_implemented"
+  },
+  "gates": {
+    "owners_and_independent_review": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "immutable_artifact_identities": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "production_environment": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "numerical_contract": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "fault_controller": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "evidence_store": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "cluster_admission": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "operation_identity": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "assignment_provenance_and_fencing": {
+      "state": "unresolved",
+      "approved_values": null
+    },
+    "independent_dry_run": {
+      "state": "unresolved",
+      "approved_values": null
+    }
+  }
+}

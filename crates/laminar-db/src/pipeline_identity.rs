@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use arrow_schema::{Field, Schema};
 use laminar_connectors::config::ConnectorConfig;
+use laminar_connectors::connector::{SourceInputMode, SourceRowPositionCapability};
 use laminar_connectors::registry::ConnectorRegistry;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
@@ -17,11 +18,13 @@ use crate::connector_manager::{
     SourceRegistration, StreamRegistration, TableRegistration,
 };
 use crate::error::DbError;
-use laminar_core::storage::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDENTITY_VERSION};
+use laminar_core::checkpoint::checkpoint_manifest::{PipelineIdentity, PIPELINE_IDENTITY_VERSION};
 
 /// Recovery-state serialization contract. Bump when persisted operator/vnode bytes become
 /// incompatible even if the logical pipeline is unchanged.
-const STATE_ABI_VERSION: u32 = crate::operator_graph::GRAPH_CHECKPOINT_VERSION;
+const STATE_ABI_VERSION: u32 = crate::operator_graph::STATE_FRAME_ABI_VERSION;
+const STATE_LAYOUT: &str = "vnode";
+
 #[derive(Serialize)]
 struct CanonicalPipeline {
     canonical_version: u16,
@@ -30,6 +33,8 @@ struct CanonicalPipeline {
     state_layout: &'static str,
     vnode_count: u16,
     delivery_guarantee: String,
+    source_idle_timeout_ms: Option<u64>,
+    event_time_max_future_skew_ms: i64,
     sources: Vec<CanonicalSource>,
     streams: Vec<CanonicalStream>,
     tables: Vec<CanonicalTable>,
@@ -41,7 +46,10 @@ struct CanonicalSource {
     name: String,
     connector_type: String,
     options: BTreeMap<String, String>,
+    input_mode: &'static str,
+    row_positions: &'static str,
     schema: Option<CanonicalSchema>,
+    primary_key: Vec<String>,
     watermark_column: Option<String>,
     max_out_of_orderness_ms: Option<u64>,
     processing_time: bool,
@@ -55,6 +63,8 @@ struct CanonicalStream {
     window_config: String,
     order_config: String,
     join_config: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_join_idle_history_retention_ms: Option<i64>,
     incremental: bool,
 }
 
@@ -129,7 +139,6 @@ pub(crate) struct PipelineIdentityContext<'a> {
     connector_registry: &'a ConnectorRegistry,
     registrations: PipelineRegistrations<'a>,
     vnode_count: u16,
-    clustered: bool,
 }
 
 impl<'a> PipelineIdentityContext<'a> {
@@ -140,7 +149,6 @@ impl<'a> PipelineIdentityContext<'a> {
         connector_registry: &'a ConnectorRegistry,
         registrations: PipelineRegistrations<'a>,
         vnode_count: u16,
-        clustered: bool,
     ) -> Self {
         Self {
             config,
@@ -148,26 +156,33 @@ impl<'a> PipelineIdentityContext<'a> {
             connector_registry,
             registrations,
             vnode_count,
-            clustered,
         }
     }
 }
 
-/// Compute the checkpoint compatibility identity before recovery starts.
+/// Compute the exact checkpoint recovery identity.
 pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineIdentity, DbError> {
     let payload = CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
         partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-        state_layout: state_layout(context.clustered),
+        state_layout: STATE_LAYOUT,
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
+        source_idle_timeout_ms: crate::config::source_idle_timeout_ms(
+            context.config.source_idle_timeout,
+        )
+        .map_err(|reason| DbError::Config(reason.to_string()))?,
+        event_time_max_future_skew_ms: crate::config::event_time_max_future_skew_ms(
+            context.config.event_time_max_future_skew,
+        )
+        .map_err(|reason| DbError::Config(reason.to_string()))?,
         sources: canonical_sources(
             context.catalog,
             context.connector_registry,
             &context.registrations,
         )?,
-        streams: canonical_streams(&context.registrations),
+        streams: canonical_streams(context.config, &context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
     };
@@ -180,14 +195,6 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
     })
 }
 
-const fn state_layout(clustered: bool) -> &'static str {
-    if clustered {
-        "partitioned-vnode"
-    } else {
-        "local"
-    }
-}
-
 fn canonical_sources(
     catalog: &SourceCatalog,
     connector_registry: &ConnectorRegistry,
@@ -195,16 +202,23 @@ fn canonical_sources(
 ) -> Result<Vec<CanonicalSource>, DbError> {
     let mut sources = Vec::with_capacity(registrations.sources.len());
     for reg in registrations.sources.values() {
-        let (connector_type, options) = if reg.connector_type.is_some() {
+        let (connector_type, options, input_mode, row_positions) = if reg.connector_type.is_some() {
             canonical_source_connector(&build_source_config(reg)?, connector_registry)?
         } else {
-            ("catalog-bridge".into(), BTreeMap::new())
+            (
+                "catalog-bridge".into(),
+                BTreeMap::new(),
+                SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::Unavailable,
+            )
         };
         let entry = catalog.get_source(&reg.name);
         sources.push(canonical_source(
             reg.name.clone(),
             connector_type,
             options,
+            input_mode,
+            row_positions,
             entry.as_deref(),
         ));
     }
@@ -220,6 +234,8 @@ fn canonical_sources(
             name,
             "catalog-bridge".into(),
             BTreeMap::new(),
+            SourceInputMode::AppendOnly,
+            SourceRowPositionCapability::Unavailable,
             entry.as_deref(),
         ));
     }
@@ -231,13 +247,18 @@ fn canonical_source(
     name: String,
     connector_type: String,
     options: BTreeMap<String, String>,
+    input_mode: SourceInputMode,
+    row_positions: SourceRowPositionCapability,
     entry: Option<&SourceEntry>,
 ) -> CanonicalSource {
     CanonicalSource {
         name,
         connector_type,
         options,
+        input_mode: canonical_source_input_mode(input_mode),
+        row_positions: canonical_source_row_positions(row_positions),
         schema: entry.map(|entry| canonical_schema(&entry.schema)),
+        primary_key: entry.map_or_else(Vec::new, |entry| entry.primary_key.clone()),
         watermark_column: entry.and_then(|entry| entry.watermark_column.clone()),
         max_out_of_orderness_ms: entry
             .and_then(|entry| entry.max_out_of_orderness)
@@ -247,22 +268,46 @@ fn canonical_source(
     }
 }
 
-fn canonical_streams(registrations: &PipelineRegistrations<'_>) -> Vec<CanonicalStream> {
+fn canonical_streams(
+    config: &LaminarConfig,
+    registrations: &PipelineRegistrations<'_>,
+) -> Result<Vec<CanonicalStream>, DbError> {
     let mut streams: Vec<_> = registrations
         .streams
         .values()
-        .map(|reg| CanonicalStream {
-            name: reg.name.clone(),
-            query_sql: canonical_sql(&reg.query_sql),
-            emit_clause: format!("{:?}", reg.emit_clause),
-            window_config: format!("{:?}", reg.window_config),
-            order_config: format!("{:?}", reg.order_config),
-            join_config: format!("{:?}", reg.join_config),
-            incremental: reg.incremental,
+        .map(|reg| {
+            let is_temporal = reg.join_config.as_ref().is_some_and(|joins| {
+                joins.iter().any(|join| {
+                    matches!(
+                        join,
+                        laminar_sql::translator::JoinOperatorConfig::Temporal(_)
+                    )
+                })
+            });
+            let temporal_join_idle_history_retention_ms = is_temporal
+                .then(|| {
+                    crate::config::temporal_join_idle_history_retention_ms(
+                        config.temporal_join_idle_history_retention,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!("temporal stream '{}': {reason}", reg.name))
+                    })
+                })
+                .transpose()?;
+            Ok(CanonicalStream {
+                name: reg.name.clone(),
+                query_sql: canonical_sql(&reg.query_sql),
+                emit_clause: format!("{:?}", reg.emit_clause),
+                window_config: format!("{:?}", reg.window_config),
+                order_config: format!("{:?}", reg.order_config),
+                join_config: format!("{:?}", reg.join_config),
+                temporal_join_idle_history_retention_ms,
+                incremental: reg.incremental,
+            })
         })
-        .collect();
+        .collect::<Result<_, DbError>>()?;
     streams.sort_by(|left, right| left.name.cmp(&right.name));
-    streams
+    Ok(streams)
 }
 
 fn canonical_tables(
@@ -333,14 +378,49 @@ fn canonical_connector(config: &ConnectorConfig) -> (String, BTreeMap<String, St
 fn canonical_source_connector(
     config: &ConnectorConfig,
     connector_registry: &ConnectorRegistry,
-) -> Result<(String, BTreeMap<String, String>), DbError> {
-    let options = connector_registry
-        .source_recovery_identity_options(config)
+) -> Result<
+    (
+        String,
+        BTreeMap<String, String>,
+        SourceInputMode,
+        SourceRowPositionCapability,
+    ),
+    DbError,
+> {
+    let source = connector_registry
+        .create_source(config, None)
         .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
-    Ok(options.map_or_else(
+    let contract = source
+        .contract(config)
+        .map_err(|error| DbError::Checkpoint(format!("source contract identity: {error}")))?;
+    let options = source
+        .recovery_identity_options(config)
+        .map_err(|error| DbError::Checkpoint(format!("source recovery identity: {error}")))?;
+    let (connector_type, options) = options.map_or_else(
         || canonical_connector(config),
         |options| (config.connector_type().to_string(), options),
+    );
+    Ok((
+        connector_type,
+        options,
+        contract.input_mode,
+        contract.row_positions,
     ))
+}
+
+const fn canonical_source_input_mode(input_mode: SourceInputMode) -> &'static str {
+    match input_mode {
+        SourceInputMode::AppendOnly => "append_only",
+        SourceInputMode::KeyedUpsert => "keyed_upsert",
+        SourceInputMode::FullChangelog => "full_changelog",
+    }
+}
+
+const fn canonical_source_row_positions(capability: SourceRowPositionCapability) -> &'static str {
+    match capability {
+        SourceRowPositionCapability::Unavailable => "unavailable",
+        SourceRowPositionCapability::OrderedDeterministic => "ordered_deterministic",
+    }
 }
 
 fn canonical_schema(schema: &Schema) -> CanonicalSchema {
@@ -387,15 +467,52 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn canonical_identity_digest_changes_with_the_partitioning_abi() {
-        let payload = |partitioning_abi_version| CanonicalPipeline {
+    fn canonical_source_digest(
+        input_mode: SourceInputMode,
+        row_positions: SourceRowPositionCapability,
+    ) -> [u8; 32] {
+        let payload = CanonicalPipeline {
             canonical_version: PIPELINE_IDENTITY_VERSION,
             state_abi_version: STATE_ABI_VERSION,
+            partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+            state_layout: STATE_LAYOUT,
+            vnode_count: 1,
+            delivery_guarantee: "at-least-once".into(),
+            source_idle_timeout_ms: None,
+            event_time_max_future_skew_ms: laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            sources: vec![CanonicalSource {
+                name: "events".into(),
+                connector_type: "test".into(),
+                options: BTreeMap::new(),
+                input_mode: canonical_source_input_mode(input_mode),
+                row_positions: canonical_source_row_positions(row_positions),
+                schema: None,
+                primary_key: Vec::new(),
+                watermark_column: None,
+                max_out_of_orderness_ms: None,
+                processing_time: false,
+            }],
+            streams: Vec::new(),
+            tables: Vec::new(),
+            sinks: Vec::new(),
+        };
+        Sha256::digest(serde_json::to_vec(&payload).unwrap()).into()
+    }
+
+    #[test]
+    fn canonical_identity_digest_changes_with_root_execution_config() {
+        let payload = |state_abi_version,
+                       partitioning_abi_version,
+                       source_idle_timeout_ms,
+                       event_time_max_future_skew_ms| CanonicalPipeline {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            state_abi_version,
             partitioning_abi_version,
-            state_layout: "local",
+            state_layout: STATE_LAYOUT,
             vnode_count: 1,
             delivery_guarantee: "best_effort".into(),
+            source_idle_timeout_ms,
+            event_time_max_future_skew_ms,
             sources: Vec::new(),
             streams: Vec::new(),
             tables: Vec::new(),
@@ -403,13 +520,145 @@ mod tests {
         };
 
         let current = Sha256::digest(
-            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION)).unwrap(),
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
         );
+        assert_eq!(STATE_ABI_VERSION, 5);
+        let prior_state_abi = Sha256::digest(
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION - 1,
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, prior_state_abi);
         let changed = Sha256::digest(
-            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION + 1))
-                .unwrap(),
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
+                laminar_core::state::PARTITIONING_ABI_VERSION + 1,
+                None,
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
         );
         assert_ne!(current, changed);
+        let idle_timeout = Sha256::digest(
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                Some(5_000),
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, idle_timeout);
+        let future_skew = Sha256::digest(
+            serde_json::to_vec(&payload(
+                STATE_ABI_VERSION,
+                laminar_core::state::PARTITIONING_ABI_VERSION,
+                None,
+                30_000,
+            ))
+            .unwrap(),
+        );
+        assert_ne!(current, future_skew);
+    }
+
+    #[test]
+    fn source_input_mode_changes_canonical_identity() {
+        let digest = |input_mode| {
+            canonical_source_digest(input_mode, SourceRowPositionCapability::Unavailable)
+        };
+        let append = digest(SourceInputMode::AppendOnly);
+        let upsert = digest(SourceInputMode::KeyedUpsert);
+        let changelog = digest(SourceInputMode::FullChangelog);
+        assert_ne!(append, upsert);
+        assert_ne!(append, changelog);
+        assert_ne!(upsert, changelog);
+    }
+
+    #[test]
+    fn source_row_position_capability_changes_canonical_identity() {
+        assert_ne!(
+            canonical_source_digest(
+                SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::Unavailable,
+            ),
+            canonical_source_digest(
+                SourceInputMode::AppendOnly,
+                SourceRowPositionCapability::OrderedDeterministic,
+            )
+        );
+    }
+
+    #[test]
+    fn temporal_retention_changes_only_temporal_stream_identity() {
+        let stream = |join_config| StreamRegistration {
+            name: "joined".into(),
+            query_sql: "SELECT * FROM trades".into(),
+            emit_clause: None,
+            window_config: None,
+            order_config: None,
+            join_config,
+            has_analytic: false,
+            has_frame: false,
+            incremental: false,
+        };
+        let temporal = stream(Some(vec![
+            laminar_sql::translator::JoinOperatorConfig::Temporal(
+                laminar_sql::translator::TemporalJoinTranslatorConfig {
+                    left_table: "trades".into(),
+                    right_table: "quotes".into(),
+                    left_key_columns: vec!["symbol".into()],
+                    right_key_columns: vec!["symbol".into()],
+                    left_time_column: "trade_time".into(),
+                    right_time_column: "quote_time".into(),
+                    join_kind: laminar_sql::temporal::TemporalJoinKind::Left,
+                    probe_schedule: laminar_sql::temporal::TemporalProbeSchedule::as_of(),
+                    probe_alias: None,
+                },
+            ),
+        ]));
+        let ordinary = stream(None);
+        let identity_for = |registration: &StreamRegistration, retention: std::time::Duration| {
+            let config = LaminarConfig {
+                temporal_join_idle_history_retention: Some(retention),
+                ..LaminarConfig::default()
+            };
+            let catalog =
+                SourceCatalog::new(8, laminar_core::streaming::BackpressureStrategy::Block);
+            let connector_registry = ConnectorRegistry::new();
+            let registrations = PipelineRegistrations::new(
+                std::iter::empty::<&SourceRegistration>(),
+                std::iter::empty::<&SinkRegistration>(),
+                std::iter::once(registration),
+                std::iter::empty::<&TableRegistration>(),
+            );
+            compute(&PipelineIdentityContext::new(
+                &config,
+                &catalog,
+                &connector_registry,
+                registrations,
+                1,
+            ))
+            .unwrap()
+        };
+
+        assert_ne!(
+            identity_for(&temporal, std::time::Duration::from_secs(60)),
+            identity_for(&temporal, std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            identity_for(&ordinary, std::time::Duration::from_secs(60)),
+            identity_for(&ordinary, std::time::Duration::from_secs(120))
+        );
     }
 
     #[test]
@@ -466,6 +715,50 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&canonical_schema(&left)).unwrap(),
             serde_json::to_vec(&canonical_schema(&right)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_primary_key_order_changes_pipeline_identity() {
+        let identity_for = |primary_key: &[&str]| {
+            let catalog =
+                SourceCatalog::new(8, laminar_core::streaming::BackpressureStrategy::Block);
+            catalog
+                .register_source(
+                    "events",
+                    std::sync::Arc::new(Schema::new(vec![
+                        Field::new("tenant", arrow_schema::DataType::Utf8, false),
+                        Field::new("event_id", arrow_schema::DataType::Int64, false),
+                    ])),
+                    primary_key.iter().map(|column| (*column).into()).collect(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+
+            let config = LaminarConfig::default();
+            let connector_registry = ConnectorRegistry::new();
+            let registrations = PipelineRegistrations::new(
+                std::iter::empty::<&SourceRegistration>(),
+                std::iter::empty::<&SinkRegistration>(),
+                std::iter::empty::<&StreamRegistration>(),
+                std::iter::empty::<&TableRegistration>(),
+            );
+            compute(&PipelineIdentityContext::new(
+                &config,
+                &catalog,
+                &connector_registry,
+                registrations,
+                1,
+            ))
+            .unwrap()
+        };
+
+        assert_ne!(
+            identity_for(&["tenant", "event_id"]),
+            identity_for(&["event_id", "tenant"])
         );
     }
 }

@@ -16,15 +16,17 @@ pub use crate::checkpoint::{
     LeaderProofOwner,
 };
 pub use barrier::{
-    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, InMemoryKv, Phase,
-    QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
+    BarrierAck, BarrierAckDisposition, BarrierAnnouncement, BarrierCoordinator, ClusterKv,
+    InMemoryKv, Phase, QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 #[cfg(feature = "cluster")]
 pub use controller::CheckpointPrepareObservation;
 pub use controller::{
-    ClusterController, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,
-    RecoveryControlError, RecoveryFault, RecoveryFaultReportOutcome, RecoveryFaultRequest,
-    RecoveryRound, RecoveryRoundId, RecoveryStoppedReport, ReleaseCommitStatus,
+    ClusterController, LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError,
+    LocalProcessAuthorityIdentity, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,
+    RecoveryControlError, RecoveryFault, RecoveryFaultDisposition, RecoveryFaultReportOutcome,
+    RecoveryFaultRequest, RecoveryRound, RecoveryRoundId, RecoveryStoppedReport,
+    ReleaseCommitStatus,
 };
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
@@ -38,10 +40,11 @@ pub use catalog_manifest::{
 pub use leader::leader_of;
 pub use leader_lease::{
     lease_grants_leadership, lease_grants_proof, AssignmentDrainDecision, AssignmentDrainVerdict,
-    AssignmentRecoveryDecision, ClusterCheckpointAuthorityError, ClusterOutcomeInventory,
-    ClusterOutcomeRetentionBoundary, LeaderCandidacy, LeaderLease, LeaderLeaseConfig,
-    LeaderLeaseManager, LeaderLeaseObservation, LeaderLeaseOwner, LeaderLeaseStore, LeaseError,
-    LeaseOutcome, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
+    AssignmentRecoveryDecision, ClusterArtifactCleanupCursor, ClusterArtifactCleanupPhase,
+    ClusterCheckpointAuthorityError, ClusterOutcomeInventory, ClusterOutcomeRetentionBoundary,
+    LeaderCandidacy, LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation,
+    LeaderLeaseOwner, LeaderLeaseStore, LeaseError, LeaseOutcome,
+    RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
 };
 pub use lease_deadline::LeaseDeadline;
 pub use namespace_proof::{

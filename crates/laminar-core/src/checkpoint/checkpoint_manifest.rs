@@ -1,27 +1,31 @@
-//! Checkpoint manifest types.
-//!
-//! Manifests are JSON for debuggability. Large operator state goes into a
-//! separate `state.bin` sidecar referenced by offset/length in the manifest.
+//! Versioned checkpoint manifest.
 
 #![allow(clippy::disallowed_types)] // cold path: manifest serialization
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::num::{NonZeroU32, NonZeroU64};
 
-use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
+use sha2::{Digest, Sha256};
 
-/// Current checkpoint manifest format. Older manifests are rejected rather
-/// than guessed at recovery time.
-/// Version 6 binds recovery to the durable key-partitioning ABI.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 6;
+use crate::checkpoint::assignment::CheckpointAssignmentFence;
+use crate::state::{
+    KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID, PARTITIONING_ABI_VERSION,
+};
+
+/// Current checkpoint manifest format. Every other version is rejected.
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 9;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 3;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 6;
+
+/// Runtime envelope used for prepared sink descriptors.
+pub const PREPARED_SINK_DESCRIPTOR_VERSION: u16 = 1;
+
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// SHA-256 identity of the logical pipeline and recovery-state ABI.
-///
-/// The canonical version is part of the persisted contract: changing canonicalization or state
-/// compatibility requires a new version rather than silently comparing unlike digests.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineIdentity {
     /// Version of the canonical payload format.
     pub canonical_version: u16,
@@ -30,16 +34,15 @@ pub struct PipelineIdentity {
 }
 
 impl PipelineIdentity {
-    /// Identity of an empty canonical payload, used by manifest-only tests and empty runtimes.
+    /// Identity of an empty canonical payload.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             canonical_version: PIPELINE_IDENTITY_VERSION,
-            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            sha256: EMPTY_SHA256.into(),
         }
     }
 
-    /// Validate the persisted identity format.
     pub(crate) fn validation_error(&self) -> Option<String> {
         if self.canonical_version != PIPELINE_IDENTITY_VERSION {
             return Some(format!(
@@ -47,15 +50,8 @@ impl PipelineIdentity {
                 self.canonical_version
             ));
         }
-        if self.sha256.len() != 64
-            || !self
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Some("pipeline identity must be 64 lowercase hexadecimal characters".into());
-        }
-        None
+        (!is_sha256(&self.sha256))
+            .then(|| "pipeline identity must be 64 lowercase hexadecimal characters".into())
     }
 
     /// Whether this identity uses the current canonical version and digest encoding.
@@ -65,96 +61,179 @@ impl PipelineIdentity {
     }
 }
 
-/// Durable publication state of a checkpoint manifest.
-///
-/// `Prepared` records are inventory, not an independent commit signal. Recovery may promote one
-/// only when the exact durable checkpoint decision exists. `Finalized` records are published
-/// recovery candidates, still subject to that decision whenever a decision store is configured.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DurableCheckpointPhase {
-    /// State has been captured but the checkpoint has not completed.
-    Prepared,
-    /// The checkpoint completed and is eligible for recovery.
-    Finalized,
+/// Stable identity of one immutable node data object.
+#[derive(
+    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(deny_unknown_fields)]
+pub struct StateChunkId {
+    /// Node that wrote the object.
+    pub participant_id: u64,
+    /// Checkpoint that created the object.
+    pub checkpoint_id: u64,
 }
 
-/// A point-in-time snapshot of all pipeline state.
+/// A byte range within an immutable node data object.
+#[derive(
+    Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ByteRange {
+    /// First byte in the range.
+    pub offset: u64,
+    /// Number of bytes in the range.
+    pub length: u64,
+}
+
+impl ByteRange {
+    /// Return the exclusive range end, or `None` on overflow.
+    #[must_use]
+    pub fn end(self) -> Option<u64> {
+        self.offset.checked_add(self.length)
+    }
+}
+
+/// The one data object written by this participant for this checkpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDataObject {
+    /// Identity used to derive the provider-neutral object path.
+    pub chunk: StateChunkId,
+    /// Exact object length.
+    pub object_length: u64,
+    /// SHA-256 of the complete object.
+    pub sha256: String,
+}
+
+/// State-frame identity. Whole-operator metadata and vnode-keyed state are distinct.
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateFrameKey {
+    /// Non-vnode state such as graph progress, channel watermarks, idleness, and timers.
+    OperatorWhole {
+        /// Stable operator identifier.
+        operator_id: String,
+    },
+    /// State owned by one vnode of an operator.
+    Vnode {
+        /// Stable operator identifier.
+        operator_id: String,
+        /// Vnode within the manifest's partition domain.
+        vnode: u16,
+    },
+}
+
+/// A checksummed state payload in the current or a prior node data object.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StateFrame {
+    /// Logical state slot restored from this payload.
+    pub key: StateFrameKey,
+    /// Object containing the payload.
+    pub chunk: StateChunkId,
+    /// Exact payload range.
+    pub range: ByteRange,
+    /// SHA-256 of only this frame.
+    pub sha256: String,
+}
+
+/// Opaque phase-one sink descriptor stored in the current node data object.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedSinkDescriptor {
+    /// Stable registered sink name.
+    pub sink_name: String,
+    /// Runtime descriptor-envelope version.
+    pub format_version: u16,
+    /// `None` and an explicit empty range have different connector semantics.
+    pub payload: Option<ByteRange>,
+    /// Presence-domain-separated SHA-256 of the optional payload.
+    pub sha256: String,
+}
+
+/// Watermark and idleness state for one stable input channel.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelProgress {
+    /// Participant owning this channel state.
+    pub participant_id: u64,
+    /// Stable registered source name.
+    pub source_name: String,
+    /// Reserved logical singleton or opaque physical input-channel identity.
+    pub input_channel: Vec<u8>,
+    /// Watermark when initialized; `None` before the channel emits one.
+    pub watermark: Option<i64>,
+    /// Whether the channel is excluded from the active watermark minimum.
+    pub idle: bool,
+}
+
+/// Metadata and exact logical reference count for an older immutable object.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReferencedStateChunk {
+    /// Prior object identity. The object path is derived without listing.
+    pub chunk: StateChunkId,
+    /// Exact immutable object length.
+    pub object_length: u64,
+    /// SHA-256 of the complete object.
+    pub sha256: String,
+    /// Number of state frames in this manifest that reference the object. GC aggregates this
+    /// over the bounded committed manifest/index inventory; it never discovers references by
+    /// listing objects.
+    pub ref_count: NonZeroU32,
+}
+
+/// A point-in-time snapshot of one participant's pipeline state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointManifest {
-    /// Manifest format version (for future evolution).
+    /// Exact manifest format version.
     pub version: u32,
     /// Unique, monotonically increasing checkpoint ID; must equal `epoch`.
     pub checkpoint_id: u64,
-    /// The same checkpoint ID retained in the persisted field named `epoch`.
+    /// Persisted protocol epoch; must equal `checkpoint_id`.
     pub epoch: u64,
-    /// Timestamp when checkpoint was created (millis since Unix epoch).
+    /// Creation time in milliseconds since the Unix epoch.
     pub timestamp_ms: u64,
-    /// Durable publication state. This field is intentionally required.
-    pub durable_phase: DurableCheckpointPhase,
-    /// Writer identity (`0` outside cluster mode).
+    /// Node owning this manifest and its current data object.
     pub participant_id: u64,
-
-    // ── Connector State ──
-    /// Per-source connector offsets (key: source name).
-    #[serde(default)]
+    /// Per-source connector offsets.
     pub source_offsets: HashMap<String, ConnectorCheckpoint>,
-    /// Per-table source offsets for reference tables (key: table name).
-    #[serde(default)]
-    pub table_offsets: HashMap<String, ConnectorCheckpoint>,
-
-    // ── Operator State ──
-    /// Per-operator checkpoint data (key: operator/node name).
-    ///
-    /// Small state is inlined as base64. Large state is stored in a separate
-    /// `state.bin` file and this map holds only a reference marker.
-    #[serde(default)]
-    pub operator_states: HashMap<String, OperatorCheckpoint>,
-
-    // ── Storage State ──
-    /// Path to the table store checkpoint, if any.
-    #[serde(default)]
-    pub table_store_checkpoint_path: Option<String>,
-    // ── Time State ──
-    /// Global watermark at checkpoint time.
-    #[serde(default)]
-    pub watermark: Option<i64>,
-    /// Per-source watermarks (key: source name).
-    #[serde(default)]
-    pub source_watermarks: HashMap<String, i64>,
-
-    // ── Topology ──
-    /// Sorted names of all registered sources at checkpoint time.
-    ///
-    /// Used during recovery to detect topology changes (added/removed sources)
-    /// and warn the operator.
-    #[serde(default)]
+    /// Canonically sorted registered source names.
     pub source_names: Vec<String>,
-    /// Sorted names of all registered sinks at checkpoint time.
-    #[serde(default)]
+    /// Canonically sorted registered sink names.
     pub sink_names: Vec<String>,
-
-    // ── Pipeline Identity ──
-    /// Required, deterministic identity of the logical topology and state ABI.
+    /// Deterministic logical topology and state ABI identity.
     pub pipeline_identity: PipelineIdentity,
-    /// Create-once checkpoint/decision-store incarnation. A storage reset rotates this value so
-    /// surviving external sink cursors cannot be reused by a fresh checkpoint-id sequence.
+    /// Create-once checkpoint namespace incarnation.
     pub deployment_id: String,
-
-    // ── Metadata ──
     /// Durable key encoding, hashing, and key-group mapping contract.
     pub partitioning_abi_version: u16,
-    /// Virtual partition count for state key distribution.
-    #[serde(default)]
+    /// Virtual partition count.
     pub vnode_count: u16,
-
-    // ── Integrity ──
-    /// SHA-256 hex digest of the sidecar `state.bin` file (if any).
+    /// Exact cluster assignment generation and participant fence; local manifests use `None`.
+    pub assignment_fence: Option<CheckpointAssignmentFence>,
+    /// Whether this cut can be restored under a different cluster vnode assignment.
     ///
-    /// Written during checkpoint commit so that recovery can verify the
-    /// sidecar hasn't been corrupted or truncated on disk/S3.
-    #[serde(default)]
-    pub state_checksum: Option<String>,
+    /// Cluster manifests must carry an affirmative, capture-time proof. Local manifests cannot
+    /// claim reassignment portability because they have no assignment-fenced recovery domain.
+    pub reassignment_portable: bool,
+    /// Canonically sorted vnodes whose state inventory this participant supplies.
+    pub owned_vnodes: Vec<u16>,
+    /// Derived checkpoint watermark retained with the exact cut.
+    pub checkpoint_watermark: Option<i64>,
+    /// Canonically ordered per-channel watermarks and idle/uninitialized states.
+    pub channel_progress: Vec<ChannelProgress>,
+    /// The only data object written by this node for this checkpoint.
+    pub node_data: NodeDataObject,
+    /// Canonically ordered complete logical state inventory.
+    pub state_frames: Vec<StateFrame>,
+    /// Canonically ordered phase-one sink descriptor inventory.
+    pub prepared_sinks: Vec<PreparedSinkDescriptor>,
+    /// Canonically ordered older objects retained by `state_frames`.
+    pub referenced_chunks: Vec<ReferencedStateChunk>,
 }
 
 /// Errors found during manifest validation.
@@ -166,120 +245,25 @@ pub struct ManifestValidationError {
 
 impl std::fmt::Display for ManifestValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        f.write_str(&self.message)
     }
 }
 
 impl CheckpointManifest {
-    /// Validates manifest consistency before recovery.
-    ///
-    /// `expected_key_group_count` is the runtime's configured key-group count;
-    /// a manifest written with a different count can't be safely restored
-    /// because state keys won't map to the same shards.
-    ///
-    /// Returns a list of issues found. An empty list means the manifest is valid.
-    /// Every returned issue makes the manifest ineligible for recovery.
-    #[must_use]
-    pub fn validate(
-        &self,
-        expected_key_group_count: KeyGroupCount,
-    ) -> Vec<ManifestValidationError> {
-        let mut errors = Vec::new();
-
-        if self.version != CHECKPOINT_MANIFEST_VERSION {
-            errors.push(ManifestValidationError {
-                message: format!(
-                    "unsupported manifest version {}; expected {CHECKPOINT_MANIFEST_VERSION}",
-                    self.version
-                ),
-            });
-        }
-
-        if self.partitioning_abi_version != PARTITIONING_ABI_VERSION {
-            errors.push(ManifestValidationError {
-                message: format!(
-                    "partitioning ABI mismatch: checkpoint has {}, runtime expects {PARTITIONING_ABI_VERSION}",
-                    self.partitioning_abi_version
-                ),
-            });
-        }
-
-        if self.checkpoint_id == 0 || self.epoch != self.checkpoint_id {
-            errors.push(ManifestValidationError {
-                message: "checkpoint attempt must use one nonzero canonical checkpoint ID".into(),
-            });
-        }
-
-        if self.timestamp_ms == 0 {
-            errors.push(ManifestValidationError {
-                message: "timestamp_ms is 0 (missing creation time)".into(),
-            });
-        }
-
-        if let Some(message) = self.pipeline_identity.validation_error() {
-            errors.push(ManifestValidationError { message });
-        }
-        if !self.deployment_id.is_empty() {
-            let valid = uuid::Uuid::parse_str(&self.deployment_id)
-                .is_ok_and(|id| !id.is_nil() && id.to_string() == self.deployment_id);
-            if !valid {
-                errors.push(ManifestValidationError {
-                    message: "deployment_id must be a canonical non-nil UUID".into(),
-                });
-            }
-        }
-
-        // Source offsets should reference known sources (if topology is recorded)
-        if !self.source_names.is_empty() {
-            for name in self.source_offsets.keys() {
-                if !self.source_names.contains(name) {
-                    errors.push(ManifestValidationError {
-                        message: format!("source_offsets contains '{name}' not in source_names"),
-                    });
-                }
-            }
-        }
-
-        if self.vnode_count == 0 {
-            errors.push(ManifestValidationError {
-                message: "vnode_count is 0 (missing or legacy checkpoint)".into(),
-            });
-        } else if self.vnode_count != expected_key_group_count.get() {
-            errors.push(ManifestValidationError {
-                message: format!(
-                    "vnode_count mismatch: checkpoint has {}, runtime expects {expected_key_group_count}",
-                    self.vnode_count,
-                ),
-            });
-        }
-
-        if !self.operator_states.is_empty() && self.state_checksum.is_none() {
-            errors.push(ManifestValidationError {
-                message: "operator state is missing its integrity checksum".into(),
-            });
-        }
-
-        errors
-    }
-
-    /// Creates a new manifest for an embedded or single-node runtime.
-    ///
-    /// Validation rejects values where `checkpoint_id` and `epoch` differ.
+    /// Create a prepared manifest with the common vnode topology.
     #[must_use]
     pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
-        Self::new_with_key_group_count(checkpoint_id, epoch, LOCAL_KEY_GROUP_COUNT)
+        Self::new_with_key_group_count(checkpoint_id, epoch, DEFAULT_KEY_GROUP_COUNT)
     }
 
-    /// Creates a new manifest with an explicit stable key-group count.
-    ///
-    /// Validation rejects values where `checkpoint_id` and `epoch` differ.
+    /// Create a prepared manifest with an explicit vnode topology.
     #[must_use]
     pub fn new_with_key_group_count(
         checkpoint_id: u64,
         epoch: u64,
         key_group_count: KeyGroupCount,
     ) -> Self {
-        #[allow(clippy::cast_possible_truncation)] // u64 millis won't overflow until year 584M
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -290,488 +274,793 @@ impl CheckpointManifest {
             checkpoint_id,
             epoch,
             timestamp_ms,
-            durable_phase: DurableCheckpointPhase::Prepared,
-            participant_id: 0,
+            participant_id: LOCAL_NODE_ID.0,
             source_offsets: HashMap::new(),
-            table_offsets: HashMap::new(),
-            operator_states: HashMap::new(),
-            table_store_checkpoint_path: None,
-            watermark: None,
-            source_watermarks: HashMap::new(),
             source_names: Vec::new(),
             sink_names: Vec::new(),
             pipeline_identity: PipelineIdentity::empty(),
             deployment_id: String::new(),
             partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnode_count: key_group_count.get(),
-            state_checksum: None,
+            assignment_fence: None,
+            reassignment_portable: false,
+            owned_vnodes: (0..key_group_count.get()).collect(),
+            checkpoint_watermark: None,
+            channel_progress: Vec::new(),
+            node_data: NodeDataObject {
+                chunk: StateChunkId {
+                    participant_id: LOCAL_NODE_ID.0,
+                    checkpoint_id,
+                },
+                object_length: 0,
+                sha256: EMPTY_SHA256.into(),
+            },
+            state_frames: Vec::new(),
+            prepared_sinks: Vec::new(),
+            referenced_chunks: Vec::new(),
         }
+    }
+
+    /// Bind the manifest and current data-object identity to one participant.
+    pub fn bind_participant(&mut self, participant_id: u64) {
+        self.participant_id = participant_id;
+        self.node_data.chunk.participant_id = participant_id;
+    }
+
+    /// Validate the exact v9 recovery contract.
+    #[must_use]
+    pub fn validate(
+        &self,
+        expected_key_group_count: KeyGroupCount,
+    ) -> Vec<ManifestValidationError> {
+        let mut errors = Vec::new();
+        let mut error = |message| errors.push(ManifestValidationError { message });
+
+        if self.version != CHECKPOINT_MANIFEST_VERSION {
+            error(format!(
+                "unsupported manifest version {}; expected {CHECKPOINT_MANIFEST_VERSION}",
+                self.version
+            ));
+        }
+        if self.partitioning_abi_version != PARTITIONING_ABI_VERSION {
+            error(format!(
+                "partitioning ABI mismatch: checkpoint has {}, runtime expects {PARTITIONING_ABI_VERSION}",
+                self.partitioning_abi_version
+            ));
+        }
+        if self.checkpoint_id == 0 || self.epoch != self.checkpoint_id {
+            error("checkpoint attempt must use one nonzero canonical checkpoint ID".into());
+        }
+        if self.timestamp_ms == 0 {
+            error("timestamp_ms must be nonzero".into());
+        }
+        if let Some(message) = self.pipeline_identity.validation_error() {
+            error(message);
+        }
+        let valid_deployment = uuid::Uuid::parse_str(&self.deployment_id)
+            .is_ok_and(|id| !id.is_nil() && id.to_string() == self.deployment_id);
+        if !valid_deployment {
+            error("deployment_id must be a canonical non-nil UUID".into());
+        }
+        if self.vnode_count != expected_key_group_count.get() {
+            error(format!(
+                "vnode_count mismatch: checkpoint has {}, runtime expects {expected_key_group_count}",
+                self.vnode_count
+            ));
+        }
+        if self.participant_id == 0 {
+            error("participant_id must be nonzero".into());
+        }
+        if self.owned_vnodes.is_empty() {
+            error("owned_vnodes must not be empty".into());
+        } else if !self.owned_vnodes.windows(2).all(|pair| pair[0] < pair[1]) {
+            error("owned_vnodes must be strictly ordered and unique".into());
+        }
+        if self
+            .owned_vnodes
+            .iter()
+            .any(|vnode| *vnode >= self.vnode_count)
+        {
+            error("owned_vnodes contains a vnode outside the manifest domain".into());
+        }
+        if let Some(fence) = &self.assignment_fence {
+            if fence.vnode_count != u32::from(self.vnode_count)
+                || fence.partitioning_abi_version != self.partitioning_abi_version
+                || !fence.contains(self.participant_id)
+            {
+                error(
+                    "assignment_fence does not cover this manifest topology and participant".into(),
+                );
+            }
+            if !self.reassignment_portable {
+                error(
+                    "a cluster manifest must be proven portable across vnode reassignment".into(),
+                );
+            }
+        } else {
+            let owns_complete_domain = self.owned_vnodes.len() == usize::from(self.vnode_count)
+                && self.owned_vnodes.iter().copied().eq(0..self.vnode_count);
+            if self.participant_id != LOCAL_NODE_ID.0 || !owns_complete_domain {
+                error("a local manifest must use LOCAL_NODE_ID and own every vnode".into());
+            }
+            if self.reassignment_portable {
+                error("a local manifest cannot claim vnode reassignment portability".into());
+            }
+        }
+        validate_sorted_unique("source_names", &self.source_names, &mut error);
+        validate_sorted_unique("sink_names", &self.sink_names, &mut error);
+        if !self.channel_progress.windows(2).all(|pair| {
+            (
+                &pair[0].participant_id,
+                &pair[0].source_name,
+                &pair[0].input_channel,
+            ) < (
+                &pair[1].participant_id,
+                &pair[1].source_name,
+                &pair[1].input_channel,
+            )
+        }) {
+            error(
+                "channel_progress must be strictly ordered by participant, source, and input channel"
+                    .into(),
+            );
+        }
+        let mut channel_modes = BTreeMap::new();
+        for channel in &self.channel_progress {
+            if channel.participant_id != self.participant_id {
+                error("channel_progress participant_id must match the manifest participant".into());
+            }
+            if channel.source_name.is_empty() {
+                error("channel_progress source_name must not be empty".into());
+            } else if self
+                .source_names
+                .binary_search(&channel.source_name)
+                .is_err()
+            {
+                error(format!(
+                    "channel_progress source '{}' not in source_names",
+                    channel.source_name
+                ));
+            }
+            if channel.input_channel.is_empty() {
+                error("channel_progress input_channel must not be empty".into());
+            }
+            let modes = channel_modes
+                .entry(channel.source_name.as_str())
+                .or_insert((false, false));
+            if channel.input_channel == super::SINGLETON_WATERMARK_CHANNEL {
+                modes.0 = true;
+            } else {
+                modes.1 = true;
+            }
+        }
+        for (source, (logical, physical)) in channel_modes {
+            if logical && physical {
+                error(format!(
+                    "channel_progress source '{source}' mixes logical and physical input channels"
+                ));
+            }
+        }
+        match super::classify_channel_progress(&self.channel_progress) {
+            Ok(classification) if self.checkpoint_watermark != classification.active_value() => {
+                error("checkpoint_watermark does not match channel progress".into());
+            }
+            Err(message) => error(message),
+            Ok(_) => {}
+        }
+        for name in self.source_offsets.keys() {
+            if self.source_names.binary_search(name).is_err() {
+                error(format!(
+                    "source_offsets contains '{name}' not in source_names"
+                ));
+            }
+        }
+        for (name, checkpoint) in &self.source_offsets {
+            if let Some(channels) = &checkpoint.input_channels {
+                if channels.iter().any(Vec::is_empty)
+                    || !channels.windows(2).all(|pair| pair[0] < pair[1])
+                {
+                    error(format!(
+                        "source '{name}' input_channels must contain non-empty, strictly ordered unique identities"
+                    ));
+                }
+                if channels
+                    .iter()
+                    .any(|channel| channel == super::SINGLETON_WATERMARK_CHANNEL)
+                {
+                    error(format!(
+                        "source '{name}' input_channels contains the reserved logical watermark channel"
+                    ));
+                }
+                let mut progress = self
+                    .channel_progress
+                    .iter()
+                    .filter(|channel| channel.source_name == *name)
+                    .map(|channel| channel.input_channel.as_slice())
+                    .collect::<Vec<_>>();
+                if !progress.is_empty()
+                    && !progress
+                        .iter()
+                        .all(|channel| *channel == super::SINGLETON_WATERMARK_CHANNEL)
+                {
+                    progress.sort_unstable();
+                    if !progress.into_iter().eq(channels.iter().map(Vec::as_slice)) {
+                        error(format!(
+                            "source '{name}' input_channels do not match its channel_progress roster"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let current = self.node_data.chunk;
+        if current.participant_id != self.participant_id
+            || current.checkpoint_id != self.checkpoint_id
+        {
+            error("node_data chunk must match the manifest participant and checkpoint".into());
+        }
+        if !is_sha256(&self.node_data.sha256) {
+            error("node_data digest must be lowercase SHA-256".into());
+        }
+
+        let referenced_by_id = self
+            .referenced_chunks
+            .iter()
+            .map(|reference| (reference.chunk, reference))
+            .collect::<HashMap<_, _>>();
+        if referenced_by_id.len() != self.referenced_chunks.len()
+            || !self
+                .referenced_chunks
+                .windows(2)
+                .all(|pair| pair[0].chunk < pair[1].chunk)
+        {
+            error("referenced_chunks must be strictly ordered and unique".into());
+        }
+        for reference in &self.referenced_chunks {
+            if reference.chunk == current
+                || reference.chunk.checkpoint_id >= self.checkpoint_id
+                || reference.chunk.checkpoint_id == 0
+            {
+                error(format!(
+                    "referenced chunk {:?} is not an older immutable object",
+                    reference.chunk
+                ));
+            }
+            if !is_sha256(&reference.sha256) {
+                error(format!(
+                    "referenced chunk {:?} digest must be lowercase SHA-256",
+                    reference.chunk
+                ));
+            }
+        }
+
+        let mut prior_counts = HashMap::<StateChunkId, u32>::new();
+        let mut current_ranges = Vec::new();
+        if !self
+            .state_frames
+            .windows(2)
+            .all(|pair| pair[0].key < pair[1].key)
+        {
+            error("state_frames must be strictly ordered by logical key".into());
+        }
+        for frame in &self.state_frames {
+            if let StateFrameKey::Vnode { vnode, .. } = &frame.key {
+                if *vnode >= self.vnode_count {
+                    error(format!(
+                        "state frame vnode {vnode} is outside the vnode domain"
+                    ));
+                }
+                if self.owned_vnodes.binary_search(vnode).is_err() {
+                    error(format!(
+                        "state frame vnode {vnode} is not owned by participant {}",
+                        self.participant_id
+                    ));
+                }
+            }
+            if frame.range.length == 0 {
+                error(format!("state frame {:?} has an empty payload", frame.key));
+            }
+            if !is_sha256(&frame.sha256) {
+                error(format!(
+                    "state frame {:?} digest must be lowercase SHA-256",
+                    frame.key
+                ));
+            }
+            let object_length = if frame.chunk == current {
+                current_ranges.push((frame.range, format!("state frame {:?}", frame.key)));
+                Some(self.node_data.object_length)
+            } else {
+                let reference = referenced_by_id.get(&frame.chunk).copied();
+                if let Some(reference) = reference {
+                    let count = prior_counts.entry(frame.chunk).or_default();
+                    *count = count.saturating_add(1);
+                    Some(reference.object_length)
+                } else {
+                    error(format!(
+                        "state frame {:?} references an untracked chunk {:?}",
+                        frame.key, frame.chunk
+                    ));
+                    None
+                }
+            };
+            validate_range(frame.range, object_length, "state frame", &mut error);
+        }
+        for reference in &self.referenced_chunks {
+            let actual = prior_counts.get(&reference.chunk).copied().unwrap_or(0);
+            if actual != reference.ref_count.get() {
+                error(format!(
+                    "referenced chunk {:?} declares ref_count {}, but {actual} state frames reference it",
+                    reference.chunk,
+                    reference.ref_count
+                ));
+            }
+        }
+
+        if !self
+            .prepared_sinks
+            .windows(2)
+            .all(|pair| pair[0].sink_name < pair[1].sink_name)
+        {
+            error("prepared_sinks must be strictly ordered by sink_name".into());
+        }
+        for sink in &self.prepared_sinks {
+            if sink.sink_name.is_empty() {
+                error("prepared sink name must not be empty".into());
+            }
+            if self.sink_names.binary_search(&sink.sink_name).is_err() {
+                error(format!(
+                    "prepared sink '{}' is not in sink_names",
+                    sink.sink_name
+                ));
+            }
+            if sink.format_version != PREPARED_SINK_DESCRIPTOR_VERSION {
+                error(format!(
+                    "prepared sink '{}' format_version must be {PREPARED_SINK_DESCRIPTOR_VERSION}",
+                    sink.sink_name,
+                ));
+            }
+            if !is_sha256(&sink.sha256) {
+                error(format!(
+                    "prepared sink '{}' digest must be lowercase SHA-256",
+                    sink.sink_name
+                ));
+            }
+            match sink.payload {
+                Some(range) => {
+                    validate_range(
+                        range,
+                        Some(self.node_data.object_length),
+                        "prepared sink payload",
+                        &mut error,
+                    );
+                    current_ranges.push((range, format!("prepared sink '{}'", sink.sink_name)));
+                }
+                None if sink.sha256 != checkpoint_descriptor_sha256(None) => error(format!(
+                    "prepared sink '{}' without a payload has the wrong domain-separated digest",
+                    sink.sink_name
+                )),
+                None => {}
+            }
+        }
+
+        let mut expected_offset = 0_u64;
+        for (range, owner) in current_ranges {
+            if range.offset != expected_offset {
+                error(format!(
+                    "{owner} starts at {}, expected {expected_offset} in the canonical node object",
+                    range.offset
+                ));
+            }
+            if let Some(end) = range.end() {
+                expected_offset = end;
+            }
+        }
+        if expected_offset != self.node_data.object_length {
+            error(format!(
+                "current frame and sink ranges cover {expected_offset} bytes, but node_data declares {}",
+                self.node_data.object_length
+            ));
+        }
+
+        errors
     }
 }
 
-/// Connector-agnostic offset container.
-///
-/// Uses string key-value pairs to support all connector types:
-/// - **Kafka**: `{"events:0": "1234", "events:1": "5678"}`
-/// - **`PostgreSQL` CDC**: `{"lsn": "0/1234ABCD"}`
-/// - **Delta Lake**: `{"version": "42"}`
-///
-/// The containing [`CheckpointManifest`] supplies the exact attempt identity;
-/// duplicating its epoch in each connector payload would create conflicting
-/// authorities during recovery.
+/// Connector-owned offset map stored at the exact checkpoint cut.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectorCheckpoint {
-    /// Connector-specific offset data.
+    /// Connector-specific offsets.
     pub offsets: HashMap<String, String>,
-    /// Optional metadata (connector type, topic name, etc.).
+    /// Connector metadata required to interpret the offsets.
     pub metadata: HashMap<String, String>,
-    /// Provider-neutral source-assignment version that owns this offset cut.
-    ///
-    /// `None` is valid for sources that do not participate in partition assignment. Cluster
-    /// recovery validates populated versions against the checkpoint assignment fence.
-    pub source_assignment_version: Option<std::num::NonZeroU64>,
+    /// Canonically ordered opaque identities of the input channels owned by this cut.
+    pub input_channels: Option<Vec<Vec<u8>>>,
+    /// Source-assignment version owning this cut, when applicable.
+    pub source_assignment_version: Option<NonZeroU64>,
 }
 
 impl ConnectorCheckpoint {
-    /// Creates an empty connector checkpoint.
+    /// Create an empty connector checkpoint.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Creates a connector checkpoint with pre-populated offsets.
+    /// Create a checkpoint from an offset map.
     #[must_use]
     pub fn with_offsets(offsets: HashMap<String, String>) -> Self {
         Self {
             offsets,
-            metadata: HashMap::new(),
-            source_assignment_version: None,
+            ..Self::default()
         }
     }
 }
 
-/// Serialized operator state stored in the manifest.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct OperatorCheckpoint {
-    /// Base64-encoded binary state (for small payloads inlined in JSON).
-    #[serde(default)]
-    pub state_b64: Option<String>,
-    /// If true, state is stored externally in the state.bin sidecar file.
-    #[serde(default)]
-    pub external: bool,
-    /// Byte offset into the state.bin file (if external).
-    #[serde(default)]
-    pub external_offset: u64,
-    /// Byte length of the state in the state.bin file (if external).
-    #[serde(default)]
-    pub external_length: u64,
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-impl OperatorCheckpoint {
-    /// Creates an inline operator checkpoint from raw bytes.
-    ///
-    /// The bytes are base64-encoded for JSON storage.
-    #[must_use]
-    pub fn inline(data: &[u8]) -> Self {
-        use base64::Engine;
-        Self {
-            state_b64: Some(base64::engine::general_purpose::STANDARD.encode(data)),
-            external: false,
-            external_offset: 0,
-            external_length: 0,
+fn validate_sorted_unique(field: &str, values: &[String], error: &mut impl FnMut(String)) {
+    if !values.windows(2).all(|pair| pair[0] < pair[1]) {
+        error(format!("{field} must be strictly ordered and unique"));
+    }
+}
+
+fn validate_range(
+    range: ByteRange,
+    object_length: Option<u64>,
+    owner: &str,
+    error: &mut impl FnMut(String),
+) {
+    let Some(end) = range.end() else {
+        error(format!("{owner} byte range overflows"));
+        return;
+    };
+    if object_length.is_some_and(|length| end > length) {
+        error(format!("{owner} byte range ends beyond its object"));
+    }
+}
+
+/// SHA-256 helper used by capture and focused format tests.
+#[must_use]
+pub fn checkpoint_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Domain-separated digest for an optional prepared sink descriptor.
+#[must_use]
+pub fn checkpoint_descriptor_sha256(payload: Option<&[u8]>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"laminardb-prepared-sink-descriptor-v1\0");
+    match payload {
+        None => hasher.update([0]),
+        Some(bytes) => {
+            hasher.update([1]);
+            hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(bytes);
         }
     }
-
-    /// Creates an external reference to state in the sidecar file.
-    #[must_use]
-    pub fn external(offset: u64, length: u64) -> Self {
-        Self {
-            state_b64: None,
-            external: true,
-            external_offset: offset,
-            external_length: length,
-        }
-    }
-
-    /// Decodes the inline state, returning the raw bytes.
-    ///
-    /// Returns `None` if the state is external, no inline data is present,
-    /// or if the base64 data is corrupted (logs a warning in that case).
-    #[must_use]
-    pub fn decode_inline(&self) -> Option<Vec<u8>> {
-        use base64::Engine;
-        self.state_b64.as_ref().and_then(|b64| {
-            match base64::engine::general_purpose::STANDARD.decode(b64) {
-                Ok(data) => Some(data),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        b64_len = b64.len(),
-                        "[LDB-4004] Failed to decode inline operator state from base64 — \
-                         operator will start from scratch"
-                    );
-                    None
-                }
-            }
-        })
-    }
-
-    /// Decodes the inline state, returning a `Result` for callers that need
-    /// to distinguish between "no inline state" and "corrupted state".
-    ///
-    /// Returns `Ok(None)` if no inline data is present (external or absent).
-    /// Returns `Ok(Some(bytes))` on successful decode.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if base64 data is present but corrupted.
-    pub fn try_decode_inline(&self) -> Result<Option<Vec<u8>>, String> {
-        use base64::Engine;
-        match &self.state_b64 {
-            None => Ok(None),
-            Some(b64) => base64::engine::general_purpose::STANDARD
-                .decode(b64)
-                .map(Some)
-                .map_err(|e| format!("[LDB-4004] base64 decode failed: {e}")),
-        }
-    }
-
-    /// Creates an `OperatorCheckpoint` from raw bytes using a size threshold.
-    ///
-    /// If `data.len() <= threshold`, the state is inlined as base64.
-    /// If `data.len() > threshold`, the state is marked as external with the
-    /// given offset and length, and the raw data is returned for sidecar storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `data` — Raw operator state bytes
-    /// * `threshold` — Maximum size in bytes for inline storage
-    /// * `current_offset` — Byte offset into the sidecar file for this blob
-    ///
-    /// # Returns
-    ///
-    /// A tuple of the checkpoint entry and optional raw data for the sidecar.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn from_bytes(
-        data: &[u8],
-        threshold: usize,
-        current_offset: u64,
-    ) -> (Self, Option<Vec<u8>>) {
-        if data.len() <= threshold {
-            (Self::inline(data), None)
-        } else {
-            let length = data.len() as u64;
-            (Self::external(current_offset, length), Some(data.to_vec()))
-        }
-    }
-
-    /// Shared-buffer variant of [`Self::from_bytes`].
-    ///
-    /// Takes an owned [`bytes::Bytes`] and returns the same type on the
-    /// external path, avoiding the `data.to_vec()` copy the `&[u8]`
-    /// version has to make. The checkpoint pipeline passes rkyv output
-    /// through as `Bytes`, so per-operator state no longer doubles in
-    /// memory when crossing this boundary.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn from_bytes_shared(
-        data: bytes::Bytes,
-        threshold: usize,
-        current_offset: u64,
-    ) -> (Self, Option<bytes::Bytes>) {
-        if data.len() <= threshold {
-            (Self::inline(&data), None)
-        } else {
-            let length = data.len() as u64;
-            (Self::external(current_offset, length), Some(data))
-        }
-    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_manifest_new() {
-        let m = CheckpointManifest::new(5, 5);
-        assert_eq!(m.version, CHECKPOINT_MANIFEST_VERSION);
-        assert_eq!(m.partitioning_abi_version, PARTITIONING_ABI_VERSION);
-        assert_eq!(m.durable_phase, DurableCheckpointPhase::Prepared);
-        assert_eq!(m.checkpoint_id, 5);
-        assert_eq!(m.epoch, 5);
-        assert_eq!(m.vnode_count, LOCAL_KEY_GROUP_COUNT.get());
-        assert!(m.timestamp_ms > 0);
-        assert!(m.source_offsets.is_empty());
-        assert!(m.operator_states.is_empty());
-    }
-
-    #[test]
-    fn test_manifest_new_with_explicit_key_group_count() {
-        let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
-        let manifest = CheckpointManifest::new_with_key_group_count(5, 5, key_group_count);
-
-        assert_eq!(manifest.vnode_count, key_group_count.get());
-        assert!(manifest.validate(key_group_count).is_empty());
-        assert!(!manifest.validate(LOCAL_KEY_GROUP_COUNT).is_empty());
-    }
-
-    #[test]
-    fn test_manifest_json_round_trip() {
-        let mut m = CheckpointManifest::new(42, 42);
-        let mut source_checkpoint = ConnectorCheckpoint::with_offsets(HashMap::from([
-            ("events:0".into(), "1234".into()),
-            ("events:1".into(), "5678".into()),
-        ]));
-        source_checkpoint.source_assignment_version = std::num::NonZeroU64::new(12);
-        m.source_offsets
-            .insert("kafka-src".into(), source_checkpoint);
-        m.watermark = Some(999_000);
-        m.operator_states
-            .insert("window-agg".into(), OperatorCheckpoint::inline(b"hello"));
-
-        let json = serde_json::to_string_pretty(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.checkpoint_id, 42);
-        assert_eq!(restored.epoch, 42);
-        assert_eq!(restored.watermark, Some(999_000));
-        let src = restored.source_offsets.get("kafka-src").unwrap();
-        assert_eq!(src.offsets.get("events:0"), Some(&"1234".into()));
-        assert_eq!(src.source_assignment_version, std::num::NonZeroU64::new(12));
-
-        let op = restored.operator_states.get("window-agg").unwrap();
-        assert_eq!(op.decode_inline().unwrap(), b"hello");
-    }
-
-    #[test]
-    fn test_manifest_rejects_previous_version() {
-        let mut manifest = CheckpointManifest::new(1, 1);
-        manifest.version = CHECKPOINT_MANIFEST_VERSION - 1;
-        let restored: CheckpointManifest =
-            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
-        let errors = restored.validate(LOCAL_KEY_GROUP_COUNT);
-        let previous = CHECKPOINT_MANIFEST_VERSION - 1;
-        assert!(
-            errors.iter().any(|error| error
-                .message
-                .contains(&format!("unsupported manifest version {previous}"))),
-            "{errors:?}"
+    fn valid_manifest(id: u64) -> CheckpointManifest {
+        let mut manifest = CheckpointManifest::new_with_key_group_count(
+            id,
+            id,
+            KeyGroupCount::try_from(1_u16).unwrap(),
         );
+        manifest.deployment_id = uuid::Uuid::from_u128(1).to_string();
+        manifest.source_names = vec!["source".into()];
+        manifest.sink_names = vec!["sink".into()];
+        manifest.node_data.sha256 = checkpoint_sha256(b"");
+        manifest
     }
 
-    #[test]
-    fn test_manifest_rejects_noncanonical_attempt_identity() {
-        for (checkpoint_id, epoch) in [(0, 0), (5, 0), (0, 5), (5, 6)] {
-            let manifest = CheckpointManifest::new(checkpoint_id, epoch);
-            let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
-            assert!(
-                errors.iter().any(|error| error
-                    .message
-                    .contains("one nonzero canonical checkpoint ID")),
-                "{checkpoint_id}/{epoch}: {errors:?}"
-            );
+    fn channel(id: &str, watermark: Option<i64>, idle: bool) -> ChannelProgress {
+        ChannelProgress {
+            participant_id: LOCAL_NODE_ID.0,
+            source_name: "source".into(),
+            input_channel: id.as_bytes().to_vec(),
+            watermark,
+            idle,
         }
     }
 
     #[test]
-    fn test_connector_checkpoint_new() {
-        let cp = ConnectorCheckpoint::new();
-        assert!(cp.offsets.is_empty());
-        assert!(cp.metadata.is_empty());
-        assert_eq!(cp.source_assignment_version, None);
-    }
-
-    #[test]
-    fn test_connector_checkpoint_with_offsets() {
-        let offsets = HashMap::from([("lsn".into(), "0/ABCD".into())]);
-        let cp = ConnectorCheckpoint::with_offsets(offsets);
-        assert_eq!(cp.offsets.get("lsn"), Some(&"0/ABCD".into()));
-        assert_eq!(cp.source_assignment_version, None);
-    }
-
-    #[test]
-    fn test_operator_checkpoint_inline() {
-        let op = OperatorCheckpoint::inline(b"state-data");
-        assert!(!op.external);
-        assert!(op.state_b64.is_some());
-        assert_eq!(op.decode_inline().unwrap(), b"state-data");
-    }
-
-    #[test]
-    fn test_operator_checkpoint_external() {
-        let op = OperatorCheckpoint::external(1024, 256);
-        assert!(op.external);
-        assert_eq!(op.external_offset, 1024);
-        assert_eq!(op.external_length, 256);
-        assert!(op.decode_inline().is_none());
-    }
-
-    #[test]
-    fn test_operator_checkpoint_empty_inline() {
-        let op = OperatorCheckpoint::inline(b"");
-        assert_eq!(op.decode_inline().unwrap(), b"");
-    }
-
-    #[test]
-    fn test_manifest_table_offsets() {
-        let mut m = CheckpointManifest::new(1, 1);
-        m.table_offsets.insert(
-            "instruments".into(),
-            ConnectorCheckpoint::with_offsets(HashMap::from([("lsn".into(), "0/ABCD".into())])),
-        );
-        m.table_store_checkpoint_path = Some("/tmp/table_store_cp".into());
-
-        let json = serde_json::to_string(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.table_offsets.len(), 1);
+    fn active_uninitialized_channel_withholds_the_watermark() {
+        let channels = vec![channel("a", Some(20), false), channel("b", None, false)];
         assert_eq!(
-            restored.table_store_checkpoint_path.as_deref(),
-            Some("/tmp/table_store_cp")
+            crate::checkpoint::classify_channel_progress(&channels),
+            Ok(crate::checkpoint::CheckpointWatermark::Uninitialized)
         );
+
+        let mut manifest = valid_manifest(1);
+        manifest.channel_progress = channels;
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .is_empty());
+        manifest.checkpoint_watermark = Some(20);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("does not match channel progress")));
     }
 
     #[test]
-    fn test_manifest_topology_fields_round_trip() {
-        let mut m = CheckpointManifest::new(1, 1);
-        m.source_names = vec!["kafka-clicks".into(), "ws-prices".into()];
-        m.sink_names = vec!["pg-sink".into()];
-
-        let json = serde_json::to_string(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.source_names, vec!["kafka-clicks", "ws-prices"]);
-        assert_eq!(restored.sink_names, vec!["pg-sink"]);
-    }
-
-    #[test]
-    fn test_manifest_requires_durable_phase() {
-        let json = r#"{
-            "version": 1,
-            "checkpoint_id": 5,
-            "epoch": 3,
-            "timestamp_ms": 1000
-        }"#;
-        assert!(serde_json::from_str::<CheckpointManifest>(json).is_err());
-    }
-
-    #[test]
-    fn test_manifest_requires_pipeline_identity() {
-        let manifest = CheckpointManifest::new(5, 5);
-        let mut value = serde_json::to_value(manifest).unwrap();
-        value.as_object_mut().unwrap().remove("pipeline_identity");
-        assert!(serde_json::from_value::<CheckpointManifest>(value).is_err());
-    }
-
-    #[test]
-    fn test_manifest_requires_partitioning_abi() {
-        let manifest = CheckpointManifest::new(5, 5);
-        let mut value = serde_json::to_value(manifest).unwrap();
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("partitioning_abi_version");
-        assert!(serde_json::from_value::<CheckpointManifest>(value).is_err());
-    }
-
-    #[test]
-    fn test_manifest_rejects_wrong_partitioning_abi() {
-        let mut manifest = CheckpointManifest::new(5, 5);
-        manifest.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
-
-        let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.message.contains("partitioning ABI mismatch")),
-            "{errors:?}"
+    fn idle_uninitialized_channel_is_excluded() {
+        let channels = vec![channel("a", Some(20), false), channel("b", None, true)];
+        assert_eq!(
+            crate::checkpoint::classify_channel_progress(&channels),
+            Ok(crate::checkpoint::CheckpointWatermark::Active(20))
         );
+
+        let mut manifest = valid_manifest(1);
+        manifest.channel_progress = channels;
+        manifest.checkpoint_watermark = Some(20);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .is_empty());
     }
 
     #[test]
-    fn test_validate_orphaned_source_offset() {
-        let mut m = CheckpointManifest::new(1, 1);
-        m.source_names = vec!["a".into(), "b".into()];
-        m.source_offsets
-            .insert("c".into(), ConnectorCheckpoint::new());
-
-        let errors = m.validate(LOCAL_KEY_GROUP_COUNT);
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("'c' not in source_names")),
-            "expected orphaned source offset error: {errors:?}"
+    fn all_idle_channels_have_no_watermark() {
+        let channels = vec![channel("a", None, true), channel("b", None, true)];
+        assert_eq!(
+            crate::checkpoint::classify_channel_progress(&[]),
+            Ok(crate::checkpoint::CheckpointWatermark::Idle)
         );
+        assert_eq!(
+            crate::checkpoint::classify_channel_progress(&channels),
+            Ok(crate::checkpoint::CheckpointWatermark::Idle)
+        );
+        let retained = vec![channel("a", Some(10), true), channel("b", Some(20), true)];
+        assert_eq!(
+            crate::checkpoint::channel_progress_frontier(&retained),
+            Ok(Some(20))
+        );
+
+        let mut manifest = valid_manifest(1);
+        manifest.channel_progress = channels;
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .is_empty());
+        manifest.checkpoint_watermark = Some(20);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("does not match channel progress")));
+
+        let invalid = vec![channel("idle", Some(i64::MIN), true)];
+        assert!(crate::checkpoint::classify_channel_progress(&invalid).is_err());
     }
 
     #[test]
-    fn test_manifest_pipeline_identity_round_trip() {
-        let mut m = CheckpointManifest::new(1, 1);
-        m.pipeline_identity = PipelineIdentity {
-            canonical_version: PIPELINE_IDENTITY_VERSION,
-            sha256: "ab".repeat(32),
+    fn v9_round_trip_carries_portability_channels_ranges_sinks_and_prior_chunk_refs() {
+        let mut manifest = valid_manifest(9);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        let prior = StateChunkId {
+            participant_id: 2,
+            checkpoint_id: 8,
         };
+        let current_data = b"ew";
+        manifest.node_data.object_length = current_data.len() as u64;
+        manifest.node_data.sha256 = checkpoint_sha256(current_data);
+        manifest.state_frames = vec![
+            StateFrame {
+                key: StateFrameKey::OperatorWhole {
+                    operator_id: "graph".into(),
+                },
+                chunk: prior,
+                range: ByteRange {
+                    offset: 0,
+                    length: 3,
+                },
+                sha256: checkpoint_sha256(b"old"),
+            },
+            StateFrame {
+                key: StateFrameKey::Vnode {
+                    operator_id: "join".into(),
+                    vnode: 0,
+                },
+                chunk: manifest.node_data.chunk,
+                range: ByteRange {
+                    offset: 0,
+                    length: 2,
+                },
+                sha256: checkpoint_sha256(b"ew"),
+            },
+        ];
+        manifest.referenced_chunks.push(ReferencedStateChunk {
+            chunk: prior,
+            object_length: 3,
+            sha256: checkpoint_sha256(b"old"),
+            ref_count: NonZeroU32::new(1).unwrap(),
+        });
+        manifest.prepared_sinks.push(PreparedSinkDescriptor {
+            sink_name: "sink".into(),
+            format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+            payload: Some(ByteRange {
+                offset: 2,
+                length: 0,
+            }),
+            sha256: checkpoint_descriptor_sha256(Some(b"")),
+        });
 
-        let json = serde_json::to_string(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.pipeline_identity, m.pipeline_identity);
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        assert!(manifest.validate(one).is_empty());
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let restored: CheckpointManifest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, manifest);
+        assert!(!restored.reassignment_portable);
     }
 
     #[test]
-    fn test_from_bytes_inline() {
-        let data = b"small-state";
-        let (op, sidecar) = OperatorCheckpoint::from_bytes(data, 1024, 0);
-        assert!(!op.external);
-        assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), data);
+    fn previous_manifest_versions_are_not_accepted() {
+        let mut manifest = valid_manifest(1);
+        manifest.version = 8;
+        let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("unsupported manifest version 8")));
+
+        let mut json = serde_json::to_value(valid_manifest(1)).unwrap();
+        json.as_object_mut().unwrap().remove("node_data");
+        assert!(serde_json::from_value::<CheckpointManifest>(json).is_err());
+
+        let mut v8_shape = serde_json::to_value(valid_manifest(1)).unwrap();
+        let object = v8_shape.as_object_mut().unwrap();
+        object.insert("version".into(), serde_json::Value::from(8));
+        object.remove("reassignment_portable");
+        assert!(serde_json::from_value::<CheckpointManifest>(v8_shape).is_err());
     }
 
     #[test]
-    fn test_from_bytes_external() {
-        let data = vec![0xAB; 2048];
-        let (op, sidecar) = OperatorCheckpoint::from_bytes(&data, 1024, 512);
-        assert!(op.external);
-        assert_eq!(op.external_offset, 512);
-        assert_eq!(op.external_length, 2048);
-        assert!(op.decode_inline().is_none());
-        assert_eq!(sidecar.unwrap(), data);
+    fn local_manifest_cannot_claim_reassignment_portability() {
+        let mut manifest = valid_manifest(1);
+        manifest.reassignment_portable = true;
+
+        let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
+        assert!(errors.iter().any(|error| {
+            error
+                .message
+                .contains("local manifest cannot claim vnode reassignment portability")
+        }));
     }
 
     #[test]
-    fn test_from_bytes_at_threshold_boundary() {
-        // Exactly at threshold → inline
-        let data = vec![0xFF; 100];
-        let (op, sidecar) = OperatorCheckpoint::from_bytes(&data, 100, 0);
-        assert!(!op.external);
-        assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), data);
+    fn validation_rejects_noncanonical_or_mismatched_input_channels() {
+        let mut manifest = valid_manifest(1);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-1".to_vec(), b"partition-0".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
 
-        // One byte over threshold → external
-        let data_over = vec![0xFF; 101];
-        let (op2, sidecar2) = OperatorCheckpoint::from_bytes(&data_over, 100, 0);
-        assert!(op2.external);
-        assert!(sidecar2.is_some());
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("input_channels")));
+
+        manifest
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![crate::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec()]);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("reserved logical watermark channel")));
+
+        manifest
+            .source_offsets
+            .get_mut("source")
+            .unwrap()
+            .input_channels = Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]);
+        manifest.channel_progress = vec![channel("partition-0", Some(1), false)];
+        manifest.checkpoint_watermark = Some(1);
+        assert!(manifest
+            .validate(KeyGroupCount::try_from(1_u16).unwrap())
+            .iter()
+            .any(|error| error.message.contains("channel_progress roster")));
     }
 
     #[test]
-    fn test_from_bytes_empty_data() {
-        let (op, sidecar) = OperatorCheckpoint::from_bytes(b"", 1024, 0);
-        assert!(!op.external);
-        assert!(sidecar.is_none());
-        assert_eq!(op.decode_inline().unwrap(), b"");
+    fn logical_singleton_is_independent_of_the_connector_roster() {
+        let mut manifest = valid_manifest(1);
+        manifest.source_offsets.insert(
+            "source".into(),
+            ConnectorCheckpoint {
+                input_channels: Some(vec![b"partition-0".to_vec(), b"partition-1".to_vec()]),
+                ..ConnectorCheckpoint::default()
+            },
+        );
+        manifest.channel_progress = vec![ChannelProgress {
+            participant_id: LOCAL_NODE_ID.0,
+            source_name: "source".into(),
+            input_channel: crate::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec(),
+            watermark: Some(1),
+            idle: false,
+        }];
+        manifest.checkpoint_watermark = Some(1);
+
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        assert!(manifest.validate(one).is_empty());
+
+        manifest.channel_progress[0].source_name = "missing".into();
+        assert!(manifest
+            .validate(one)
+            .iter()
+            .any(|error| error.message.contains("not in source_names")));
     }
 
     #[test]
-    fn test_manifest_rejects_missing_v2_fields() {
-        let json = r#"{
-            "version": 1,
-            "checkpoint_id": 1,
-            "epoch": 1,
-            "timestamp_ms": 1000
-        }"#;
-        assert!(serde_json::from_str::<CheckpointManifest>(json).is_err());
+    fn validation_rejects_gaps_bad_refcounts_and_out_of_bounds_vnodes() {
+        let mut manifest = valid_manifest(3);
+        let current_data = b"xta";
+        manifest.node_data.object_length = current_data.len() as u64;
+        manifest.node_data.sha256 = checkpoint_sha256(current_data);
+        manifest.state_frames.push(StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "join".into(),
+                vnode: manifest.vnode_count,
+            },
+            chunk: manifest.node_data.chunk,
+            range: ByteRange {
+                offset: 1,
+                length: 2,
+            },
+            sha256: checkpoint_sha256(b"ta"),
+        });
+
+        let errors = manifest.validate(KeyGroupCount::try_from(1_u16).unwrap());
+        assert!(errors.iter().any(|error| error.message.contains("outside")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("starts at 1, expected 0")));
+    }
+
+    #[test]
+    fn absent_and_empty_sink_descriptors_remain_distinct() {
+        let mut absent = valid_manifest(2);
+        absent.prepared_sinks.push(PreparedSinkDescriptor {
+            sink_name: "sink".into(),
+            format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+            payload: None,
+            sha256: checkpoint_descriptor_sha256(None),
+        });
+        let mut empty = absent.clone();
+        empty.prepared_sinks[0].payload = Some(ByteRange {
+            offset: 0,
+            length: 0,
+        });
+        empty.prepared_sinks[0].sha256 = checkpoint_descriptor_sha256(Some(b""));
+
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        assert!(absent.validate(one).is_empty());
+        assert!(empty.validate(one).is_empty());
+        assert_ne!(
+            absent.prepared_sinks[0].sha256,
+            empty.prepared_sinks[0].sha256
+        );
+        assert_ne!(
+            serde_json::to_vec(&absent).unwrap(),
+            serde_json::to_vec(&empty).unwrap()
+        );
     }
 }

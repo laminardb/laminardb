@@ -58,9 +58,5 @@ delivery     = "at_least_once"
 # Kafka can replay from committed offsets and Iceberg durably acknowledges each
 # append, but Iceberg publication is not checkpoint-committable. A failure may
 # therefore replay an already-published append; this demo is at-least-once.
-[state]
-backend      = "local"
-path         = "./.laminardb/state"
-
 [checkpoint]
 interval = "10s"

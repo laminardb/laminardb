@@ -4,14 +4,18 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{future::Future as _, future::IntoFuture as _, task::Poll};
 
 use prometheus::Registry;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+#[cfg(feature = "cluster")]
+use axum::extract::{Extension, RawQuery};
+use axum::extract::{MatchedPath, Path, Query, State};
+#[cfg(feature = "cluster")]
+use axum::http::Method;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -21,7 +25,7 @@ use tracing::{info, warn};
 
 use laminar_db::{ConnectorInfo, LaminarDB, PipelineNodeType};
 
-use crate::config::{ServerConfig, ServerMode};
+use crate::config::{Secret, ServerConfig, ServerMode, ServerSection};
 use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
@@ -47,12 +51,136 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
+    pub(crate) auth_policy: HttpAuthPolicy,
+    #[cfg(feature = "cluster")]
+    pub(crate) diagnostic_reads: DiagnosticReadGate,
     pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) serving_gate: Arc<ServingGate>,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
+}
+
+#[derive(Clone)]
+pub(crate) struct HttpAuthPolicy {
+    console_token: Option<Secret>,
+    #[cfg(feature = "cluster")]
+    diagnostic_read_token: Option<Secret>,
+    #[cfg(feature = "cluster")]
+    cluster_mode: bool,
+}
+
+impl HttpAuthPolicy {
+    pub(crate) fn from_server(server: &ServerSection) -> Self {
+        Self {
+            console_token: server.console_token.clone(),
+            #[cfg(feature = "cluster")]
+            diagnostic_read_token: server.diagnostic_read_token.clone(),
+            #[cfg(feature = "cluster")]
+            cluster_mode: server.mode == ServerMode::Cluster,
+        }
+    }
+
+    fn console_token(&self) -> Option<&Secret> {
+        self.console_token.as_ref()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn diagnostic_principal(&self, headers: &HeaderMap) -> DiagnosticAuth {
+        let Some(token) = single_bearer_token(headers) else {
+            return if self.console_token.is_none() && self.diagnostic_read_token.is_none() {
+                DiagnosticAuth::Unconfigured
+            } else {
+                DiagnosticAuth::Unauthorized
+            };
+        };
+        if self
+            .console_token
+            .as_ref()
+            .is_some_and(|expected| secret_matches(token, expected))
+        {
+            return DiagnosticAuth::Authorized(DiagnosticPrincipal::Console);
+        }
+        if self
+            .diagnostic_read_token
+            .as_ref()
+            .is_some_and(|expected| secret_matches(token, expected))
+        {
+            return DiagnosticAuth::Authorized(DiagnosticPrincipal::DiagnosticRead);
+        }
+        DiagnosticAuth::Unauthorized
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "cluster")]
+enum DiagnosticPrincipal {
+    Console,
+    DiagnosticRead,
+}
+
+#[cfg(feature = "cluster")]
+enum DiagnosticAuth {
+    Unconfigured,
+    Unauthorized,
+    Authorized(DiagnosticPrincipal),
+}
+
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW: usize = 8;
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(feature = "cluster")]
+const DIAGNOSTIC_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(feature = "cluster")]
+struct DiagnosticRateWindow {
+    starts: [Option<Instant>; DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW],
+}
+
+#[cfg(feature = "cluster")]
+impl Default for DiagnosticRateWindow {
+    fn default() -> Self {
+        Self {
+            starts: [None; DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW],
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl DiagnosticRateWindow {
+    fn try_start(&mut self, now: Instant) -> bool {
+        for start in &mut self.starts {
+            if start.is_some_and(|started| {
+                now.checked_duration_since(started)
+                    .is_some_and(|elapsed| elapsed >= DIAGNOSTIC_READ_RATE_WINDOW)
+            }) {
+                *start = None;
+            }
+        }
+        let Some(slot) = self.starts.iter_mut().find(|start| start.is_none()) else {
+            return false;
+        };
+        *slot = Some(now);
+        true
+    }
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) struct DiagnosticReadGate {
+    permit: Arc<tokio::sync::Semaphore>,
+    rate: parking_lot::Mutex<DiagnosticRateWindow>,
+}
+
+#[cfg(feature = "cluster")]
+impl DiagnosticReadGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            permit: Arc::new(tokio::sync::Semaphore::new(1)),
+            rate: parking_lot::Mutex::new(DiagnosticRateWindow::default()),
+        }
+    }
 }
 
 const SERVING_STARTING: u8 = 0;
@@ -215,7 +343,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Control-plane (`/api/v1/*`) and realtime (`/ws/{name}`) routes, gated by
     // the console bearer token when one is configured.
-    let protected = Router::new()
+    let console = Router::new()
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
@@ -240,13 +368,41 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    public
-        .merge(protected)
+    // The local evidence routes accept the console administrator or the strictly narrower
+    // diagnostic-read bearer. They intentionally sit outside console CORS and override Axum's
+    // implicit GET-to-HEAD behavior.
+    let diagnostics = Router::new()
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get(cluster_local_evidence).head(diagnostic_method_not_allowed),
+        )
+        .route(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+            get(cluster_local_checkpoint_barrier_timings).head(diagnostic_method_not_allowed),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            diagnostic_bounds_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            diagnostic_auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            startup_gate_middleware,
+        ));
+
+    let public_console = public
+        .merge(console)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             startup_gate_middleware,
         ))
         .layer(cors)
+        .merge(diagnostics);
+
+    public_console
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
@@ -301,19 +457,16 @@ async fn auth_middleware(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Clone the token out and drop the guard before any `.await`; the
-    // parking_lot guard is `!Send` and must not cross `next.run`.
-    let expected = state.current_config.read().server.console_token.clone();
-
-    if let Some(expected) = expected {
-        let expected = expected.expose();
+    if let Some(expected) = state.auth_policy.console_token() {
         // The `?token=` query parameter exists for browser WebSocket clients,
         // which can't set the `Authorization` header on the upgrade request.
         // Restrict it to WS routes (`/ws/…`) so it can't leak into access
         // logs, referrers, or proxy caches on regular control-plane requests.
         let is_ws = req.uri().path().starts_with("/ws/");
-        let authorized = bearer_token(req.headers()).is_some_and(|t| ct_eq(t, expected))
-            || (is_ws && query_token(req.uri()).is_some_and(|t| ct_eq(&t, expected)));
+        let authorized = single_bearer_token(req.headers())
+            .is_some_and(|token| secret_matches(token, expected))
+            || (is_ws
+                && query_token(req.uri()).is_some_and(|token| secret_matches(&token, expected)));
         if !authorized {
             return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
@@ -322,13 +475,113 @@ async fn auth_middleware(
     next.run(req).await
 }
 
-/// Extract the bearer token from an `Authorization: Bearer <token>` header.
-fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+#[cfg(feature = "cluster")]
+async fn diagnostic_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !state.auth_policy.cluster_mode {
+        return next.run(req).await;
+    }
+    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid diagnostic request target")
+            .into_response();
+    }
+    match state.auth_policy.diagnostic_principal(req.headers()) {
+        DiagnosticAuth::Unconfigured => next.run(req).await,
+        DiagnosticAuth::Unauthorized => {
+            error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+        }
+        DiagnosticAuth::Authorized(principal) => {
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn diagnostic_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let _ = state;
+    next.run(req).await
+}
+
+#[cfg(feature = "cluster")]
+async fn diagnostic_bounds_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let bounded_get = req.method() == Method::GET
+        && matches!(
+            req.uri().path(),
+            "/api/v1/cluster/local-evidence" | "/api/v1/cluster/local-checkpoint-barrier-timings"
+        )
+        && req.extensions().get::<DiagnosticPrincipal>().is_some();
+    if !bounded_get {
+        return next.run(req).await;
+    }
+
+    let Ok(_permit) = Arc::clone(&state.diagnostic_reads.permit).try_acquire_owned() else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "local diagnostic request already in progress",
+        )
+        .into_response();
+    };
+    if !state.diagnostic_reads.rate.lock().try_start(Instant::now()) {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "local diagnostic request rate exceeded",
+        )
+        .into_response();
+    }
+
+    match tokio::time::timeout(DIAGNOSTIC_READ_DEADLINE, next.run(req)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "local diagnostic request timed out",
+        )
+        .into_response(),
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn diagnostic_bounds_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let _ = state;
+    next.run(req).await
+}
+
+async fn diagnostic_method_not_allowed() -> impl IntoResponse {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "diagnostic route requires GET",
+    )
+}
+
+/// Extract exactly one bearer value. Duplicate fields and comma-joined values fail closed.
+fn single_bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let token = value.to_str().ok()?.strip_prefix("Bearer ")?;
+    (!token.contains(',')).then_some(token)
+}
+
+fn secret_matches(presented: &str, expected: &Secret) -> bool {
+    let expected = expected.expose();
+    presented.len() == expected.len() && ct_eq(presented, expected)
 }
 
 /// Extract and percent-decode the `token` query parameter, if present. Browser
@@ -486,9 +739,14 @@ async fn request_logging(
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let method = req.method().clone();
-    // Log only the path — the query string can carry the `?token=` secret used
-    // by browser WebSocket clients, which must not land in access logs.
-    let path = req.uri().path().to_owned();
+    // Log only the matched route template. Raw targets can carry a WebSocket query token or an
+    // attacker-controlled credential-shaped path segment and must not land in access logs.
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str)
+        .unwrap_or("<unmatched>")
+        .to_owned();
     let start = Instant::now();
 
     let response = next.run(req).await;
@@ -646,8 +904,33 @@ async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(ConnectorsResponse { sources, sinks })
 }
 
-async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    match state.db.checkpoint().await {
+async fn trigger_checkpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let forwarded_budget = match headers.get("x-laminar-checkpoint-budget-nanos") {
+        None => None,
+        Some(value) => {
+            let parsed = value
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|budget| *budget != 0);
+            let Some(budget) = parsed else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid forwarded checkpoint budget",
+                )
+                .into_response();
+            };
+            Some(Duration::from_nanos(budget))
+        }
+    };
+    let result = match forwarded_budget {
+        Some(timeout) => state.db.checkpoint_forwarded_with_timeout(timeout).await,
+        None => state.db.checkpoint().await,
+    };
+    match result {
         Ok(result) => {
             let status = if result.success {
                 StatusCode::OK
@@ -814,7 +1097,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     // Update current config on success
     if result.success {
         let mut current = state.current_config.write();
-        *current = new_config;
+        reload::commit_reloadable_config(&mut current, new_config);
         info!(
             "Configuration reloaded successfully ({} ops)",
             result.applied.len()
@@ -892,7 +1175,7 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
             .filter(|m| self_id != m.id)
             .map(|m| m.rpc_address.clone())
             .collect();
-        let token = state.current_config.read().server.console_token.clone();
+        let token = state.auth_policy.console_token.clone();
         let client = reqwest::Client::new();
         // Fan out concurrently with `join_all`; these are I/O-bound futures with
         // no CPU work, so there's nothing to gain from spawning a task each.
@@ -1027,6 +1310,148 @@ const CLUSTER_DISABLED_MSG: &str = "cluster endpoints are only available in clus
 #[cfg(not(feature = "cluster"))]
 const CLUSTER_DISABLED_MSG: &str = "cluster endpoints require the `cluster` feature";
 
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_SCHEMA_VERSION: &str = "laminardb-local-authority-evidence/v1";
+#[cfg(feature = "cluster")]
+const MAX_LOCAL_EVIDENCE_RESPONSE_BYTES: usize = 4_096;
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG: &str =
+    "local process authority evidence requires configured HTTP authentication";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_QUERY_MSG: &str = "local process authority evidence does not accept a query";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_UNAVAILABLE_MSG: &str = "local process authority evidence is unavailable";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_INVALID_MSG: &str = "local process authority evidence is invalid";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION: &str =
+    "laminardb-local-checkpoint-barrier-timings/v1";
+#[cfg(feature = "cluster")]
+const MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES: usize = 64 * 1_024;
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG: &str =
+    "local checkpoint barrier timings require configured HTTP authentication";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_UNAVAILABLE_MSG: &str =
+    "local checkpoint barrier timings are unavailable";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG: &str =
+    "local checkpoint barrier timings are invalid";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG: &str =
+    "invalid local checkpoint barrier timing query";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_CONFLICT_MSG: &str =
+    "local checkpoint barrier timing cursor conflicts with this process";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_OVERWRITTEN_MSG: &str =
+    "local checkpoint barrier timing cursor has been overwritten";
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalEvidenceResponse {
+    schema_version: &'static str,
+    evidence: laminar_core::cluster::control::LocalProcessAuthorityEvidence,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCheckpointBarrierTimingsQuery {
+    after_sequence: u64,
+    expected_node_id: Option<u64>,
+    expected_boot_incarnation: Option<String>,
+    expected_process_term: Option<u64>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalCheckpointBarrierTimingsResponse<'a> {
+    schema_version: &'static str,
+    process_identity: laminar_core::cluster::control::LocalProcessAuthorityIdentity,
+    after_sequence: u64,
+    page: LocalCheckpointBarrierTimingsPage<'a>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalCheckpointBarrierTimingsPage<'a> {
+    capacity: usize,
+    oldest_retained_sequence: Option<u64>,
+    next_sequence: u64,
+    overwritten_record_count: u64,
+    recording_loss_count: u64,
+    metadata_exhausted: bool,
+    has_more: bool,
+    records: &'a [laminar_db::checkpoint_timing::CheckpointBarrierTimingRecord],
+}
+
+#[cfg(feature = "cluster")]
+impl<'a> LocalCheckpointBarrierTimingsResponse<'a> {
+    fn new(
+        after_sequence: u64,
+        timing_page: &'a laminar_db::checkpoint_timing::CheckpointBarrierTimingPage,
+    ) -> Self {
+        let snapshot = &timing_page.snapshot;
+        Self {
+            schema_version: LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION,
+            process_identity: timing_page.process,
+            after_sequence,
+            page: LocalCheckpointBarrierTimingsPage {
+                capacity: snapshot.capacity,
+                oldest_retained_sequence: snapshot.oldest_retained_sequence,
+                next_sequence: snapshot.next_sequence,
+                overwritten_record_count: snapshot.overwritten_record_count,
+                recording_loss_count: snapshot.recording_loss_count,
+                metadata_exhausted: snapshot.metadata_exhausted,
+                has_more: snapshot.has_more,
+                records: &snapshot.records,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn local_checkpoint_barrier_timing_error_response(
+    error: &laminar_db::checkpoint_timing::CheckpointBarrierTimingReadError,
+) -> (StatusCode, &'static str) {
+    use laminar_db::checkpoint_timing::{
+        CheckpointBarrierTimingReadError, CheckpointBarrierTimingSnapshotError,
+    };
+
+    match error {
+        CheckpointBarrierTimingReadError::ProcessIdentityMismatch { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::CursorAhead { .. },
+        ) => (
+            StatusCode::CONFLICT,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_CONFLICT_MSG,
+        ),
+        CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::CursorOverwritten { .. },
+        ) => (
+            StatusCode::GONE,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_OVERWRITTEN_MSG,
+        ),
+        CheckpointBarrierTimingReadError::ProcessIdentityUnavailable
+        | CheckpointBarrierTimingReadError::ProcessIdentityChanged { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(CheckpointBarrierTimingSnapshotError::Busy) => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_UNAVAILABLE_MSG,
+            )
+        }
+        CheckpointBarrierTimingReadError::ProcessIdentityRequired
+        | CheckpointBarrierTimingReadError::LedgerProcessMismatch { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::InvalidLimit { .. },
+        ) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+        ),
+    }
+}
+
 /// `GET /api/v1/cluster/nodes` — current cluster membership.
 async fn cluster_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
@@ -1078,6 +1503,284 @@ async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse
         let _ = state;
         error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
     }
+}
+
+/// `GET /api/v1/cluster/local-evidence` — bounded evidence retained by this exact process.
+///
+/// This route intentionally remains behind the normal startup/recovery serving gate. It never
+/// rereads the durable assignment snapshot or treats shared publication as local convergence.
+#[cfg(feature = "cluster")]
+async fn cluster_local_evidence(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<DiagnosticPrincipal>>,
+    RawQuery(raw_query): RawQuery,
+) -> impl IntoResponse {
+    let Some(cluster) = state.cluster.as_ref() else {
+        return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+    };
+    let Some(Extension(_principal)) = principal else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
+        )
+        .into_response();
+    };
+    if raw_query.is_some() {
+        return error_response(StatusCode::BAD_REQUEST, LOCAL_EVIDENCE_QUERY_MSG).into_response();
+    }
+
+    let evidence = match cluster
+        .controller
+        .read_local_process_authority_evidence()
+        .await
+    {
+        Ok(evidence) => evidence,
+        Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Unavailable(
+            error,
+        )) => {
+            warn!(%error, "local process authority evidence is unavailable");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_EVIDENCE_UNAVAILABLE_MSG,
+            )
+            .into_response();
+        }
+        Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Invalid(error)) => {
+            warn!(%error, "local process authority evidence is invalid");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_EVIDENCE_INVALID_MSG,
+            )
+            .into_response();
+        }
+    };
+
+    let adoption = &evidence.adopted_assignment;
+    if evidence.participant.node_id == 0
+        || evidence.participant.boot_incarnation.is_nil()
+        || evidence.process_term == 0
+        || !adoption.is_canonical()
+        || adoption.participant != evidence.participant
+    {
+        warn!("local process authority evidence violated its canonical response contract");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_EVIDENCE_INVALID_MSG,
+        )
+        .into_response();
+    }
+
+    let envelope = LocalEvidenceResponse {
+        schema_version: LOCAL_EVIDENCE_SCHEMA_VERSION,
+        evidence,
+    };
+    let encoded = match serde_json::to_vec(&envelope) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            warn!(%error, "failed to serialize local process authority evidence");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_EVIDENCE_INVALID_MSG,
+            )
+            .into_response();
+        }
+    };
+    if encoded.len() > MAX_LOCAL_EVIDENCE_RESPONSE_BYTES {
+        warn!(
+            encoded_bytes = encoded.len(),
+            maximum_bytes = MAX_LOCAL_EVIDENCE_RESPONSE_BYTES,
+            "local process authority evidence exceeded its response bound"
+        );
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_EVIDENCE_INVALID_MSG,
+        )
+        .into_response();
+    }
+
+    // Close a capture/response race with terminal fencing or a newly started recovery.
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
+
+    let mut response = (StatusCode::OK, encoded).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn cluster_local_evidence(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let _ = state;
+    error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+}
+
+/// `GET /api/v1/cluster/local-checkpoint-barrier-timings` — bounded local pause evidence.
+///
+/// This route reads only the process-local fixed-capacity ledger. Sequence zero bootstraps the
+/// current identity; every continuation cursor is inseparable from that returned identity,
+/// preventing an old process's cursor from skipping records after a restart. It does not read
+/// checkpoint authority or imply durable settlement.
+#[cfg(feature = "cluster")]
+async fn cluster_local_checkpoint_barrier_timings(
+    State(state): State<Arc<AppState>>,
+    principal: Option<Extension<DiagnosticPrincipal>>,
+    query: Result<
+        Query<LocalCheckpointBarrierTimingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        use laminar_db::checkpoint_timing::MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS;
+
+        let Some(_cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+        let Some(Extension(_principal)) = principal else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG,
+            )
+            .into_response();
+        };
+
+        let Query(query) = match query {
+            Ok(query) => query,
+            Err(_) => {
+                // Query rejections can echo attacker-controlled field names. Keep access logs
+                // limited to the fixed route/method/status/latency contract.
+                warn!("rejected malformed local checkpoint barrier timing query");
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                )
+                .into_response();
+            }
+        };
+        let expected_process = match (
+            query.expected_node_id,
+            query.expected_boot_incarnation.as_deref(),
+            query.expected_process_term,
+        ) {
+            (None, None, None) if query.after_sequence == 0 => None,
+            (Some(node_id), Some(boot_incarnation), Some(process_term)) => {
+                let Ok(boot_incarnation) = uuid::Uuid::parse_str(boot_incarnation) else {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                    )
+                    .into_response();
+                };
+                let process = laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+                    participant: laminar_core::checkpoint::CheckpointParticipant {
+                        node_id,
+                        boot_incarnation,
+                    },
+                    process_term,
+                };
+                if !process.is_canonical() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                    )
+                    .into_response();
+                }
+                Some(process)
+            }
+            _ => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                )
+                .into_response();
+            }
+        };
+
+        let timing_page = match state.db.checkpoint_barrier_timing_snapshot(
+            expected_process,
+            query.after_sequence,
+            MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                let (status, message) = local_checkpoint_barrier_timing_error_response(&error);
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    warn!(%error, "local checkpoint barrier timing page violated its contract");
+                }
+                return error_response(status, message).into_response();
+            }
+        };
+
+        if expected_process.is_some_and(|expected| timing_page.process != expected)
+            || timing_page
+                .snapshot
+                .records
+                .iter()
+                .any(|record| record.process != timing_page.process)
+        {
+            warn!("local checkpoint barrier timing response mixed process identities");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+            )
+            .into_response();
+        }
+        let envelope =
+            LocalCheckpointBarrierTimingsResponse::new(query.after_sequence, &timing_page);
+        let encoded = match serde_json::to_vec(&envelope) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                warn!(%error, "failed to serialize local checkpoint barrier timings");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+                )
+                .into_response();
+            }
+        };
+        if encoded.len() > MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES {
+            warn!(
+                encoded_bytes = encoded.len(),
+                maximum_bytes = MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES,
+                "local checkpoint barrier timing response exceeded its bound"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+            )
+            .into_response();
+        }
+
+        if let Some(reason) = state.serving_rejection() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+        }
+
+        let mut response = (StatusCode::OK, encoded).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn cluster_local_checkpoint_barrier_timings(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let _ = state;
+    error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
 }
 
 /// `GET /api/v1/cluster/leader` — the current leader's `NodeInfo` (if known)

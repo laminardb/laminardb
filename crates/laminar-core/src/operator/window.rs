@@ -142,6 +142,25 @@ impl WindowId {
 /// Window assignment results. Inline storage for up to 4 windows (avoids heap).
 pub type WindowIdVec = SmallVec<[WindowId; 4]>;
 
+/// A window boundary cannot be represented by the timestamp type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("window boundaries [{start}, {end}) for timestamp {timestamp} do not fit in i64")]
+pub struct WindowAssignmentError {
+    timestamp: i64,
+    start: i128,
+    end: i128,
+}
+
+impl WindowAssignmentError {
+    pub(crate) const fn new(timestamp: i64, start: i128, end: i128) -> Self {
+        Self {
+            timestamp,
+            start,
+            end,
+        }
+    }
+}
+
 /// CDC operation type with Z-set weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CdcOperation {
@@ -343,17 +362,53 @@ impl TumblingWindowAssigner {
     }
 
     /// O(1) window assignment. Floor-divides timestamp into window boundaries.
+    ///
+    /// # Panics
+    /// Panics if either boundary falls outside the `i64` timestamp range.
     #[inline]
     #[must_use]
     pub fn assign(&self, timestamp: i64) -> WindowId {
-        let adjusted = timestamp - self.offset_ms;
-        let window_start = if adjusted >= 0 {
-            (adjusted / self.size_ms) * self.size_ms
-        } else {
-            ((adjusted - self.size_ms + 1) / self.size_ms) * self.size_ms
-        };
-        let window_start = window_start + self.offset_ms;
-        WindowId::new(window_start, window_start + self.size_ms)
+        self.try_assign(timestamp)
+            .expect("tumbling window boundaries must fit in i64")
+    }
+
+    /// Assigns a timestamp, rejecting boundaries outside the `i64` timestamp range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either window boundary cannot be represented as `i64`.
+    #[inline]
+    pub fn try_assign(&self, timestamp: i64) -> Result<WindowId, WindowAssignmentError> {
+        if let Some(adjusted) = timestamp.checked_sub(self.offset_ms) {
+            let quotient = adjusted.div_euclid(self.size_ms);
+            if let Some((start, end)) = quotient
+                .checked_mul(self.size_ms)
+                .and_then(|start| start.checked_add(self.offset_ms))
+                .and_then(|start| start.checked_add(self.size_ms).map(|end| (start, end)))
+            {
+                return Ok(WindowId::new(start, end));
+            }
+        }
+
+        self.assign_wide(timestamp)
+    }
+
+    #[cold]
+    fn assign_wide(&self, timestamp: i64) -> Result<WindowId, WindowAssignmentError> {
+        let size_ms = i128::from(self.size_ms);
+        let offset_ms = i128::from(self.offset_ms);
+        let adjusted = i128::from(timestamp) - offset_ms;
+        let window_start = adjusted.div_euclid(size_ms) * size_ms + offset_ms;
+        let window_end = window_start + size_ms;
+
+        match (i64::try_from(window_start), i64::try_from(window_end)) {
+            (Ok(start), Ok(end)) => Ok(WindowId::new(start, end)),
+            _ => Err(WindowAssignmentError::new(
+                timestamp,
+                window_start,
+                window_end,
+            )),
+        }
     }
 }
 

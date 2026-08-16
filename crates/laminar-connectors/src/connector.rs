@@ -4,13 +4,15 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{
+    Array, ArrayRef, BinaryArray, RecordBatch, RecordBatchOptions, UInt32Array, UInt8Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
-use crate::checkpoint::SourceCheckpoint;
+use crate::checkpoint::{SourceCheckpoint, SourceCheckpointDelta};
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
@@ -103,6 +105,31 @@ pub enum SourceTopology {
     NodeLocalIngress,
 }
 
+/// Update model emitted by a configured source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceInputMode {
+    /// Every row is an insertion.
+    #[default]
+    AppendOnly,
+    /// Current row images and deletes are reconciled by the declared primary key.
+    KeyedUpsert,
+    /// Decoded rows carry a non-null, non-zero `Int64` `__weight` column.
+    FullChangelog,
+}
+
+/// Whether a source emits an ordered deterministic position for every decoded row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SourceRowPositionCapability {
+    /// The source does not provide row positions.
+    #[default]
+    Unavailable,
+    /// Every emitted row carries a replay position. Within one source run, `(order_key,
+    /// sub_offset)` is nondecreasing per partition across batches; recovery may restart from an
+    /// earlier position. Replaying an equal position must produce the same logical row and
+    /// mutation.
+    OrderedDeterministic,
+}
+
 /// Complete source admission contract for a concrete connector configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SourceContract {
@@ -110,19 +137,36 @@ pub struct SourceContract {
     pub consistency: SourceConsistency,
     /// Valid runtime placement model.
     pub topology: SourceTopology,
+    /// Update model produced after connector decoding.
+    pub input_mode: SourceInputMode,
+    /// Deterministic per-row position support.
+    pub row_positions: SourceRowPositionCapability,
     exact_delivery_certified: bool,
 }
 
 impl SourceContract {
-    /// Construct a source contract from its recovery and placement dimensions.
+    /// Construct a source contract from its recovery, placement, and update dimensions.
     /// Exactly-once certification defaults to fail-closed.
     #[must_use]
-    pub const fn new(consistency: SourceConsistency, topology: SourceTopology) -> Self {
+    pub const fn new(
+        consistency: SourceConsistency,
+        topology: SourceTopology,
+        input_mode: SourceInputMode,
+    ) -> Self {
         Self {
             consistency,
             topology,
+            input_mode,
+            row_positions: SourceRowPositionCapability::Unavailable,
             exact_delivery_certified: false,
         }
+    }
+
+    /// Declare the source's per-row position contract.
+    #[must_use]
+    pub const fn with_row_positions(mut self, capability: SourceRowPositionCapability) -> Self {
+        self.row_positions = capability;
+        self
     }
 
     /// Mark a built-in connector whose exact-delivery suite is an engine release gate.
@@ -213,6 +257,9 @@ pub struct SinkContract {
     pub topology: SinkTopology,
     /// Strongest supported input update model.
     pub input_mode: SinkInputMode,
+    /// True only for a built-in sink whose immutable phase-one and fenced
+    /// external cursor protocol is certified for multi-node exact delivery.
+    cluster_exact_delivery_certified: bool,
 }
 
 impl SinkContract {
@@ -227,7 +274,22 @@ impl SinkContract {
             consistency,
             topology,
             input_mode,
+            cluster_exact_delivery_certified: false,
         }
+    }
+
+    /// Mark a built-in sink whose cluster exact-delivery protocol is a release gate.
+    #[must_use]
+    pub(crate) const fn with_cluster_exact_delivery_certification(mut self) -> Self {
+        self.cluster_exact_delivery_certified = true;
+        self
+    }
+
+    /// Whether this sink's complete multi-node exact-delivery protocol is certified.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn is_cluster_exact_delivery_certified(self) -> bool {
+        self.cluster_exact_delivery_certified
     }
 
     /// Whether this contract participates in checkpoint-owned external commit.
@@ -243,18 +305,740 @@ impl SinkContract {
     }
 }
 
+/// Reserved column carrying the source partition bytes.
+pub const SOURCE_PARTITION_COLUMN: &str = "__source_partition";
+/// Reserved column carrying an order-preserving source cursor.
+pub const SOURCE_ORDER_KEY_COLUMN: &str = "__source_order_key";
+/// Reserved column carrying a row ordinal within one source cursor.
+pub const SOURCE_SUB_OFFSET_COLUMN: &str = "__source_sub_offset";
+/// Reserved column carrying row-level source mutations for stateful operators.
+#[doc(hidden)]
+pub const SOURCE_MUTATION_COLUMN: &str = "__source_mutation";
+
+const SOURCE_POSITION_COLUMNS: [&str; 3] = [
+    SOURCE_PARTITION_COLUMN,
+    SOURCE_ORDER_KEY_COLUMN,
+    SOURCE_SUB_OFFSET_COLUMN,
+];
+const SOURCE_METADATA_COLUMNS: [&str; 4] = [
+    SOURCE_MUTATION_COLUMN,
+    SOURCE_PARTITION_COLUMN,
+    SOURCE_ORDER_KEY_COLUMN,
+    SOURCE_SUB_OFFSET_COLUMN,
+];
+
+/// Append the reserved row-position fields to a connector's declared schema.
+///
+/// # Errors
+/// Returns an error when the declared schema already uses a reserved field name.
+pub fn schema_with_source_row_positions(schema: &SchemaRef) -> Result<SchemaRef, ConnectorError> {
+    schema_with_source_metadata(schema, false)
+}
+
+/// Append the mixed-mutation field and trailing row-position fields to a declared schema.
+///
+/// # Errors
+/// Returns an error when the declared schema already uses a reserved field name.
+pub fn schema_with_source_mutations_and_row_positions(
+    schema: &SchemaRef,
+) -> Result<SchemaRef, ConnectorError> {
+    schema_with_source_metadata(schema, true)
+}
+
+fn schema_with_source_metadata(
+    schema: &SchemaRef,
+    include_mutations: bool,
+) -> Result<SchemaRef, ConnectorError> {
+    if let Some(field) = schema.fields().iter().find(|field| {
+        SOURCE_METADATA_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "source schema contains reserved metadata column '{}'",
+            field.name()
+        )));
+    }
+
+    let mut fields = schema.fields().to_vec();
+    if include_mutations {
+        fields.push(Arc::new(Field::new(
+            SOURCE_MUTATION_COLUMN,
+            DataType::UInt8,
+            false,
+        )));
+    }
+    fields.extend([
+        Arc::new(Field::new(SOURCE_PARTITION_COLUMN, DataType::Binary, false)),
+        Arc::new(Field::new(SOURCE_ORDER_KEY_COLUMN, DataType::Binary, false)),
+        Arc::new(Field::new(
+            SOURCE_SUB_OFFSET_COLUMN,
+            DataType::UInt32,
+            false,
+        )),
+    ]);
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+#[derive(Clone, Copy)]
+struct SourceMetadataLayout {
+    visible_columns: usize,
+    has_mutations: bool,
+}
+
+fn source_metadata_layout(schema: &Schema) -> Result<Option<SourceMetadataLayout>, ConnectorError> {
+    let fields = schema.fields();
+    if !fields.iter().any(|field| {
+        SOURCE_METADATA_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Ok(None);
+    }
+
+    let position_start = fields
+        .len()
+        .checked_sub(SOURCE_POSITION_COLUMNS.len())
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch(
+                "source metadata must end with the exact three row-position fields".into(),
+            )
+        })?;
+    let expected_positions = [
+        (SOURCE_PARTITION_COLUMN, DataType::Binary),
+        (SOURCE_ORDER_KEY_COLUMN, DataType::Binary),
+        (SOURCE_SUB_OFFSET_COLUMN, DataType::UInt32),
+    ];
+    for (field, (name, data_type)) in fields[position_start..].iter().zip(expected_positions) {
+        if field.name() != name || field.data_type() != &data_type || field.is_nullable() {
+            return Err(ConnectorError::SchemaMismatch(
+                "source metadata must end with the exact three typed row-position fields".into(),
+            ));
+        }
+    }
+
+    let has_mutations = position_start != 0
+        && fields[position_start - 1]
+            .name()
+            .eq_ignore_ascii_case(SOURCE_MUTATION_COLUMN);
+    let visible_columns = position_start - usize::from(has_mutations);
+    if has_mutations {
+        let field = &fields[visible_columns];
+        if field.name() != SOURCE_MUTATION_COLUMN
+            || field.data_type() != &DataType::UInt8
+            || field.is_nullable()
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "source mutation metadata must be the exact non-null UInt8 field immediately before row positions"
+                    .into(),
+            ));
+        }
+    }
+    if fields[..visible_columns].iter().any(|field| {
+        SOURCE_METADATA_COLUMNS
+            .iter()
+            .any(|reserved| field.name().eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(ConnectorError::SchemaMismatch(
+            "source metadata fields are reserved and must use their exact trailing positions"
+                .into(),
+        ));
+    }
+
+    Ok(Some(SourceMetadataLayout {
+        visible_columns,
+        has_mutations,
+    }))
+}
+
+fn validate_source_position_arrays(
+    records: &RecordBatch,
+    layout: SourceMetadataLayout,
+) -> Result<(), ConnectorError> {
+    let position_start = layout.visible_columns + usize::from(layout.has_mutations);
+    let partition = records.columns()[position_start]
+        .as_any()
+        .downcast_ref::<BinaryArray>();
+    let order = records.columns()[position_start + 1]
+        .as_any()
+        .downcast_ref::<BinaryArray>();
+    let sub_offset = records.columns()[position_start + 2]
+        .as_any()
+        .downcast_ref::<UInt32Array>();
+    let (Some(partition), Some(order), Some(sub_offset)) = (partition, order, sub_offset) else {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata arrays have invalid types".into(),
+        ));
+    };
+    if partition.len() != records.num_rows()
+        || order.len() != records.num_rows()
+        || sub_offset.len() != records.num_rows()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata is not row-aligned".into(),
+        ));
+    }
+    if partition.null_count() != 0 || order.null_count() != 0 || sub_offset.null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata must not contain nulls".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// One borrowed deterministic source coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRowPositionRef<'a> {
+    /// Connector-defined partition identity.
+    pub partition: &'a [u8],
+    /// Connector-defined order-preserving cursor.
+    pub order_key: &'a [u8],
+    /// Row ordinal within one source cursor.
+    pub sub_offset: u32,
+}
+
+/// Validated borrowed access to row-aligned deterministic source coordinates.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceRowPositionView<'a> {
+    partition: &'a BinaryArray,
+    order_key: &'a BinaryArray,
+    sub_offset: &'a UInt32Array,
+}
+
+impl<'a> SourceRowPositionView<'a> {
+    /// Number of row positions.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.partition.len()
+    }
+
+    /// Whether the batch has no row positions.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.partition.is_empty()
+    }
+
+    /// Position for `row`, if it is in bounds.
+    #[must_use]
+    pub fn get(self, row: usize) -> Option<SourceRowPositionRef<'a>> {
+        (row < self.len()).then(|| SourceRowPositionRef {
+            partition: self.partition.value(row),
+            order_key: self.order_key.value(row),
+            sub_offset: self.sub_offset.value(row),
+        })
+    }
+}
+
+/// Borrow optional row-aligned source positions after validating their canonical layout.
+///
+/// # Errors
+/// Returns an error for partial, misplaced, nullable, incorrectly typed, or misaligned metadata.
+pub fn source_row_positions(
+    records: &RecordBatch,
+) -> Result<Option<SourceRowPositionView<'_>>, ConnectorError> {
+    let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
+        return Ok(None);
+    };
+    validate_source_position_arrays(records, layout)?;
+    let position_start = layout.visible_columns + usize::from(layout.has_mutations);
+    let (Some(partition), Some(order_key), Some(sub_offset)) = (
+        records.columns()[position_start]
+            .as_any()
+            .downcast_ref::<BinaryArray>(),
+        records.columns()[position_start + 1]
+            .as_any()
+            .downcast_ref::<BinaryArray>(),
+        records.columns()[position_start + 2]
+            .as_any()
+            .downcast_ref::<UInt32Array>(),
+    ) else {
+        return Err(ConnectorError::SchemaMismatch(
+            "source row-position metadata arrays have invalid types".into(),
+        ));
+    };
+    Ok(Some(SourceRowPositionView {
+        partition,
+        order_key,
+        sub_offset,
+    }))
+}
+
+fn validate_encoded_source_schema(
+    visible: &Schema,
+    encoded: &Schema,
+    expect_mutations: bool,
+) -> Result<(), ConnectorError> {
+    let layout = source_metadata_layout(encoded)?.ok_or_else(|| {
+        ConnectorError::SchemaMismatch("encoded source schema is missing row positions".into())
+    })?;
+    if layout.has_mutations != expect_mutations
+        || encoded.fields()[..layout.visible_columns] != visible.fields()[..]
+        || encoded.metadata() != visible.metadata()
+    {
+        return Err(ConnectorError::SchemaMismatch(
+            "encoded source schema does not match its visible schema and metadata contract".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validated borrowed access to row-aligned source mutations.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceMutationView<'a> {
+    values: &'a UInt8Array,
+}
+
+impl SourceMutationView<'_> {
+    /// Number of row mutations.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether the batch has no row mutations.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Mutation for `row`, if it is in bounds.
+    #[must_use]
+    pub fn get(self, row: usize) -> Option<SourceMutation> {
+        self.values.values().get(row).map(|value| match *value {
+            0 => SourceMutation::Put,
+            1 => SourceMutation::Tombstone,
+            _ => unreachable!("SourceMutationView is validated when constructed"),
+        })
+    }
+}
+
+/// Borrow the optional row-aligned mutation metadata after validating it.
+///
+/// # Errors
+/// Returns an error for malformed metadata, nulls, unknown values, or a noncanonical all-put
+/// mutation column.
+pub fn source_mutations(
+    records: &RecordBatch,
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
+    source_mutations_validated(records, false)
+}
+
+/// Borrow mutations from a slice derived from a strictly validated routed batch.
+///
+/// Unlike ingress validation, this permits a retained mutation column whose slice contains only
+/// puts. Layout, alignment, types, nulls, and values remain validated.
+///
+/// # Errors
+/// Returns an error for malformed mutation or row-position metadata.
+pub fn source_mutations_routed(
+    records: &RecordBatch,
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
+    source_mutations_validated(records, true)
+}
+
+fn source_mutations_validated(
+    records: &RecordBatch,
+    allow_all_put: bool,
+) -> Result<Option<SourceMutationView<'_>>, ConnectorError> {
+    let Some(layout) = source_metadata_layout(records.schema().as_ref())? else {
+        return Ok(None);
+    };
+    validate_source_position_arrays(records, layout)?;
+    if !layout.has_mutations {
+        return Ok(None);
+    }
+    let mutations = records
+        .column(layout.visible_columns)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| {
+            ConnectorError::SchemaMismatch("source mutation metadata array is not UInt8".into())
+        })?;
+    if mutations.len() != records.num_rows() {
+        return Err(ConnectorError::SchemaMismatch(format!(
+            "source mutation count {} does not match decoded row count {}",
+            mutations.len(),
+            records.num_rows()
+        )));
+    }
+    if mutations.null_count() != 0 {
+        return Err(ConnectorError::SchemaMismatch(
+            "source mutation metadata must not contain nulls".into(),
+        ));
+    }
+    let mut has_tombstone = false;
+    for &value in mutations.values() {
+        match value {
+            0 => {}
+            1 => has_tombstone = true,
+            value => {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "source mutation metadata contains unknown value {value}"
+                )));
+            }
+        }
+    }
+    if !has_tombstone && !allow_all_put {
+        return Err(ConnectorError::SchemaMismatch(
+            "all-put source mutations must omit the mutation metadata field".into(),
+        ));
+    }
+    Ok(Some(SourceMutationView { values: mutations }))
+}
+
+/// Remove only mutation metadata while retaining the exact trailing row positions.
+///
+/// # Errors
+/// Returns an error when any source metadata field is malformed.
+pub fn strip_source_mutations(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    strip_source_mutations_validated(records, false)
+}
+
+/// Remove mutation metadata from a slice derived from a strictly validated routed batch.
+///
+/// # Errors
+/// Returns an error when any source metadata field is malformed.
+pub fn strip_source_mutations_routed(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    strip_source_mutations_validated(records, true)
+}
+
+fn strip_source_mutations_validated(
+    records: &RecordBatch,
+    allow_all_put: bool,
+) -> Result<RecordBatch, ConnectorError> {
+    let schema = records.schema();
+    let Some(layout) = source_metadata_layout(schema.as_ref())? else {
+        return Ok(records.clone());
+    };
+    source_mutations_validated(records, allow_all_put)?;
+    if !layout.has_mutations {
+        return Ok(records.clone());
+    }
+    let mut fields = schema.fields()[..layout.visible_columns].to_vec();
+    fields.extend(
+        schema.fields()[layout.visible_columns + 1..]
+            .iter()
+            .cloned(),
+    );
+    let mut columns = records.columns()[..layout.visible_columns].to_vec();
+    columns.extend(
+        records.columns()[layout.visible_columns + 1..]
+            .iter()
+            .cloned(),
+    );
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("failed to strip source mutation metadata: {error}"))
+    })
+}
+
+/// Remove all connector metadata without copying visible Arrow buffers.
+///
+/// Batches without reserved fields are returned unchanged. Mutation metadata, when present, must
+/// be immediately before the exact trailing row-position fields.
+///
+/// # Errors
+/// Returns an error for partial, misplaced, nullable, incorrectly typed, or invalid metadata.
+pub fn strip_source_row_positions(records: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let schema = records.schema();
+    let Some(layout) = source_metadata_layout(schema.as_ref())? else {
+        return Ok(records.clone());
+    };
+    source_mutations(records)?;
+    let visible_schema = Arc::new(Schema::new_with_metadata(
+        schema.fields()[..layout.visible_columns].to_vec(),
+        schema.metadata().clone(),
+    ));
+    let options = RecordBatchOptions::new().with_row_count(Some(records.num_rows()));
+    RecordBatch::try_new_with_options(
+        visible_schema,
+        records.columns()[..layout.visible_columns].to_vec(),
+        &options,
+    )
+    .map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("failed to strip source metadata: {error}"))
+    })
+}
+
+/// Deterministic source coordinates aligned one-for-one with decoded rows.
+#[derive(Debug, Clone)]
+pub struct SourceRowPositions {
+    partition: BinaryArray,
+    order_key: BinaryArray,
+    sub_offset: UInt32Array,
+}
+
+impl SourceRowPositions {
+    /// Construct a validated row-position sidecar.
+    ///
+    /// # Errors
+    /// Returns an error when arrays differ in length or contain nulls.
+    pub fn try_new(
+        partition: BinaryArray,
+        order_key: BinaryArray,
+        sub_offset: UInt32Array,
+    ) -> Result<Self, ConnectorError> {
+        let len = partition.len();
+        if order_key.len() != len || sub_offset.len() != len {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "source row-position arrays have different lengths: partition={len}, order={}, sub_offset={}",
+                order_key.len(),
+                sub_offset.len()
+            )));
+        }
+        if partition.null_count() != 0
+            || order_key.null_count() != 0
+            || sub_offset.null_count() != 0
+        {
+            return Err(ConnectorError::SchemaMismatch(
+                "source row-position arrays must not contain nulls".into(),
+            ));
+        }
+        Ok(Self {
+            partition,
+            order_key,
+            sub_offset,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.partition.len()
+    }
+
+    /// Partition coordinate for each row.
+    #[must_use]
+    pub const fn partition(&self) -> &BinaryArray {
+        &self.partition
+    }
+
+    /// Order-preserving cursor for each row.
+    #[must_use]
+    pub const fn order_key(&self) -> &BinaryArray {
+        &self.order_key
+    }
+
+    /// Row ordinal within one source cursor.
+    #[must_use]
+    pub const fn sub_offset(&self) -> &UInt32Array {
+        &self.sub_offset
+    }
+
+    fn validate_row_count(&self, rows: usize) -> Result<(), ConnectorError> {
+        if self.len() == rows {
+            Ok(())
+        } else {
+            Err(ConnectorError::SchemaMismatch(format!(
+                "source row-position count {} does not match decoded row count {rows}",
+                self.len()
+            )))
+        }
+    }
+
+    fn append_metadata(
+        self,
+        records: &RecordBatch,
+        encoded_schema: &SchemaRef,
+        mutations: Option<&[SourceMutation]>,
+    ) -> Result<RecordBatch, ConnectorError> {
+        self.validate_row_count(records.num_rows())?;
+        validate_encoded_source_schema(
+            records.schema().as_ref(),
+            encoded_schema.as_ref(),
+            mutations.is_some(),
+        )?;
+        if let Some(mutations) = mutations {
+            if mutations.len() != records.num_rows() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "source mutation count {} does not match decoded row count {}",
+                    mutations.len(),
+                    records.num_rows()
+                )));
+            }
+            if !mutations.contains(&SourceMutation::Tombstone) {
+                return Err(ConnectorError::SchemaMismatch(
+                    "all-put source mutations must omit the mutation metadata field".into(),
+                ));
+            }
+        }
+        let mut columns = records.columns().to_vec();
+        if let Some(mutations) = mutations {
+            columns.push(Arc::new(UInt8Array::from_iter_values(
+                mutations.iter().map(|mutation| match mutation {
+                    SourceMutation::Put => 0,
+                    SourceMutation::Tombstone => 1,
+                }),
+            )));
+        }
+        columns.extend([
+            Arc::new(self.partition) as ArrayRef,
+            Arc::new(self.order_key) as ArrayRef,
+            Arc::new(self.sub_offset) as ArrayRef,
+        ]);
+        RecordBatch::try_new(Arc::clone(encoded_schema), columns).map_err(|error| {
+            ConnectorError::SchemaMismatch(format!("failed to append source metadata: {error}"))
+        })
+    }
+}
+
+/// Canonical mutation applied by a stateful operator for one source row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMutation {
+    /// Insert or replace the keyed value.
+    Put,
+    /// Remove the keyed value.
+    Tombstone,
+}
+
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {
     /// Arrow batch carrying the records.
     pub records: RecordBatch,
+    row_positions: Option<SourceRowPositions>,
+    mutations: Option<Box<[SourceMutation]>>,
+    cursor: Option<SourceBatchCursor>,
+}
+
+/// Source progress captured with one emitted batch.
+#[derive(Debug, Clone)]
+pub enum SourceBatchCursor {
+    /// Complete recovery cursor captured with the batch.
+    Complete(SourceCheckpoint),
+    /// Changed offsets extending a complete cursor emitted earlier.
+    Incremental(SourceCheckpointDelta),
 }
 
 impl SourceBatch {
     /// Construct a source batch.
     #[must_use]
     pub fn new(records: RecordBatch) -> Self {
-        Self { records }
+        Self {
+            records,
+            row_positions: None,
+            mutations: None,
+            cursor: None,
+        }
+    }
+
+    /// Construct a batch with deterministic positions for every decoded row.
+    ///
+    /// # Errors
+    /// Returns an error when the sidecar is not row-aligned with `records`.
+    pub fn positioned(
+        records: RecordBatch,
+        row_positions: SourceRowPositions,
+    ) -> Result<Self, ConnectorError> {
+        row_positions.validate_row_count(records.num_rows())?;
+        Ok(Self {
+            records,
+            row_positions: Some(row_positions),
+            mutations: None,
+            cursor: None,
+        })
+    }
+
+    /// Attach row-aligned mutations to a batch.
+    ///
+    /// All-`Put` input is canonicalized to the default. Connectors should call this only for
+    /// batches that may contain tombstones.
+    ///
+    /// # Errors
+    /// Returns an error when the mutation count differs from the decoded row count.
+    pub fn with_mutations(
+        mut self,
+        mutations: impl Into<Box<[SourceMutation]>>,
+    ) -> Result<Self, ConnectorError> {
+        let mutations = mutations.into();
+        if mutations.len() != self.records.num_rows() {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "source mutation count {} does not match decoded row count {}",
+                mutations.len(),
+                self.records.num_rows()
+            )));
+        }
+        self.mutations = mutations
+            .contains(&SourceMutation::Tombstone)
+            .then_some(mutations);
+        Ok(self)
+    }
+
+    /// Bind the exact source cursor captured with this batch.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: SourceCheckpoint) -> Self {
+        self.cursor = Some(SourceBatchCursor::Complete(checkpoint));
+        self
+    }
+
+    /// Bind changed offsets from the assignment checkpoint already published by an earlier batch.
+    #[must_use]
+    pub fn with_checkpoint_delta(mut self, delta: SourceCheckpointDelta) -> Self {
+        self.cursor = Some(SourceBatchCursor::Incremental(delta));
+        self
+    }
+
+    /// Remove the source cursor bound to this batch, when present.
+    pub fn take_cursor(&mut self) -> Option<SourceBatchCursor> {
+        self.cursor.take()
+    }
+
+    /// Deterministic row positions, when supplied by the connector.
+    #[must_use]
+    pub const fn row_positions(&self) -> Option<&SourceRowPositions> {
+        self.row_positions.as_ref()
+    }
+
+    /// Mixed row mutations, or `None` when every row is a [`SourceMutation::Put`].
+    #[must_use]
+    pub fn mutations(&self) -> Option<&[SourceMutation]> {
+        self.mutations.as_deref()
+    }
+
+    /// Validate and append optional mixed mutations plus deterministic row positions.
+    ///
+    /// The mutation field is omitted for the canonical all-`Put` case.
+    ///
+    /// # Errors
+    /// Returns an error when capability, schema, or row-aligned metadata is malformed.
+    pub fn into_records_with_metadata(
+        self,
+        capability: SourceRowPositionCapability,
+        positioned_schema: &SchemaRef,
+        mutation_schema: &SchemaRef,
+    ) -> Result<RecordBatch, ConnectorError> {
+        let Self {
+            records,
+            row_positions,
+            mutations,
+            cursor: _,
+        } = self;
+        match (capability, row_positions) {
+            (SourceRowPositionCapability::Unavailable, None) if mutations.is_none() => Ok(records),
+            (SourceRowPositionCapability::Unavailable, _) => Err(ConnectorError::SchemaMismatch(
+                "source emitted state metadata without declaring deterministic row positions"
+                    .into(),
+            )),
+            (SourceRowPositionCapability::OrderedDeterministic, None) => {
+                Err(ConnectorError::SchemaMismatch(
+                    "source declared deterministic row positions but omitted the sidecar".into(),
+                ))
+            }
+            (SourceRowPositionCapability::OrderedDeterministic, Some(positions)) => {
+                let schema = if mutations.is_some() {
+                    mutation_schema
+                } else {
+                    positioned_schema
+                };
+                positions.append_metadata(&records, schema, mutations.as_deref())
+            }
+        }
     }
 
     /// Record count in the batch.
@@ -469,7 +1253,7 @@ pub enum SourcePosition {
     /// Resume from an exact durable engine checkpoint.
     Resume {
         /// Checkpoint attempt that owns the connector state.
-        attempt: laminar_core::state::CheckpointAttempt,
+        attempt: laminar_core::checkpoint::CheckpointAttempt,
         /// Connector cursor captured by `attempt`.
         checkpoint: SourceCheckpoint,
     },
@@ -617,7 +1401,7 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
-    /// Resolve the source schema from the `WITH (...)` properties before
+    /// Resolve the source schema from the connector and format properties before
     /// DDL reaches the planner. Implementations that perform network I/O must
     /// bound it with a timeout. Return `Err(ConnectorError::…)` on failure so
     /// the runtime can surface the cause to DDL — do not log and swallow.
@@ -756,16 +1540,11 @@ pub trait SourceConnector: Send {
 
     /// Declare recovery and placement semantics for this exact configuration.
     ///
-    /// The fail-closed default is an ephemeral singleton. Durable or
-    /// distributed semantics must be opted into by the connector explicitly.
-    ///
     /// # Errors
     ///
     /// Returns an error when the concrete configuration cannot provide a valid
-    /// recovery or placement contract. The default implementation never fails.
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        Ok(SourceContract::default())
-    }
+    /// recovery, placement, or input contract.
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError>;
 
     /// Return connector-owned semantic options for durable recovery identity.
     ///
@@ -889,7 +1668,7 @@ pub trait SinkConnector: Send {
     ///
     /// # Errors
     /// Returns `ConfigurationError` if the sink exposes a coordinated committer
-    /// yet relies on this default — it would seal epochs with no external commit.
+    /// yet relies on this default — it would finalize epochs with no external commit.
     async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
         if self.as_coordinated_committer().is_some() {
             return Err(ConnectorError::ConfigurationError(
@@ -1038,8 +1817,8 @@ pub struct CoordinatedCommitCursor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedCommitPayload {
     /// Exact checkpoint attempt that admitted this marker.
-    pub attempt: laminar_core::state::CheckpointAttempt,
-    /// Stable runtime participant id (`0` in local modes).
+    pub attempt: laminar_core::checkpoint::CheckpointAttempt,
+    /// Stable nonzero runtime participant ID.
     pub participant_id: u64,
     /// Connector-specific committable, or `None` for an explicitly empty cut.
     pub payload: Option<Vec<u8>>,
@@ -1057,8 +1836,8 @@ pub struct CoordinatedCommitBatch {
     /// Non-zero authority token that the external commit must persist atomically.
     pub fencing_token: u64,
     /// Highest exact attempt atomically covered by this commit.
-    pub target: laminar_core::state::CheckpointAttempt,
-    /// Every sealed participant marker through `target`, including empty ones.
+    pub target: laminar_core::checkpoint::CheckpointAttempt,
+    /// Every prepared participant marker through `target`, including empty ones.
     pub entries: Vec<CoordinatedCommitPayload>,
 }
 
@@ -1142,7 +1921,7 @@ impl CoordinatedCommitBatch {
     /// # Errors
     /// Returns a diagnostic when the batch is malformed or exceeds a fixed bound.
     pub fn validate_shape(&self) -> Result<(), String> {
-        use laminar_core::state::CheckpointAttemptRelation;
+        use laminar_core::checkpoint::CheckpointAttemptRelation;
 
         if !self.target.is_canonical() {
             return Err(
@@ -1152,10 +1931,10 @@ impl CoordinatedCommitBatch {
         if let Some(entry) = self
             .entries
             .iter()
-            .find(|entry| !entry.attempt.is_canonical())
+            .find(|entry| entry.participant_id == 0 || !entry.attempt.is_canonical())
         {
             return Err(format!(
-                "coordinated batch entry for participant {} must use one nonzero canonical checkpoint ID",
+                "coordinated batch entry must use a nonzero participant and canonical checkpoint ID; got participant {}",
                 entry.participant_id
             ));
         }
@@ -1437,6 +2216,201 @@ mod tests {
     fn test_source_batch() {
         let batch = SourceBatch::new(test_batch(10));
         assert_eq!(batch.num_rows(), 10);
+        assert!(batch.row_positions().is_none());
+        assert!(batch.mutations().is_none());
+    }
+
+    #[test]
+    fn source_row_positions_reject_nulls_and_misalignment() {
+        let null_partition = BinaryArray::from(vec![Some(&b"p0"[..]), None]);
+        let order = BinaryArray::from(vec![&b"0"[..], &b"1"[..]]);
+        let sub_offset = UInt32Array::from(vec![0, 0]);
+        assert!(
+            SourceRowPositions::try_new(null_partition, order.clone(), sub_offset.clone()).is_err()
+        );
+
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            order,
+            sub_offset,
+        )
+        .unwrap();
+        assert!(SourceBatch::positioned(test_batch(1), positions).is_err());
+    }
+
+    #[test]
+    fn source_batch_validates_and_canonicalizes_mutations() {
+        let mixed = SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap();
+        assert_eq!(
+            mixed.mutations(),
+            Some(&[SourceMutation::Put, SourceMutation::Tombstone][..])
+        );
+
+        let puts = SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Put; 2])
+            .unwrap();
+        assert!(puts.mutations().is_none());
+        assert!(SourceBatch::new(test_batch(2))
+            .with_mutations(vec![SourceMutation::Tombstone])
+            .is_err());
+    }
+
+    #[test]
+    fn source_metadata_round_trip_is_sparse_and_zero_copy() {
+        let records = test_batch(2);
+        assert!(source_row_positions(&records).unwrap().is_none());
+        let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
+        let mutation_schema =
+            schema_with_source_mutations_and_row_positions(&records.schema()).unwrap();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            BinaryArray::from(vec![&b"0"[..], &b"1"[..]]),
+            UInt32Array::from(vec![0, 0]),
+        )
+        .unwrap();
+        let encoded = SourceBatch::positioned(records.clone(), positions.clone())
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::OrderedDeterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        let mutations = source_mutations(&encoded).unwrap().unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert!(!mutations.is_empty());
+        assert_eq!(mutations.get(0), Some(SourceMutation::Put));
+        assert_eq!(mutations.get(1), Some(SourceMutation::Tombstone));
+        let row_positions = source_row_positions(&encoded).unwrap().unwrap();
+        assert_eq!(row_positions.len(), 2);
+        assert!(!row_positions.is_empty());
+        assert_eq!(
+            row_positions.get(1),
+            Some(SourceRowPositionRef {
+                partition: b"p0",
+                order_key: b"1",
+                sub_offset: 0,
+            })
+        );
+        assert_eq!(row_positions.get(2), None);
+        assert_eq!(
+            encoded.schema().field(records.num_columns()).name(),
+            SOURCE_MUTATION_COLUMN
+        );
+
+        let positioned = strip_source_mutations(&encoded).unwrap();
+        assert_eq!(positioned.schema(), positioned_schema);
+        assert!(Arc::ptr_eq(positioned.column(0), records.column(0)));
+
+        let routed_put = encoded.slice(0, 1);
+        assert!(source_mutations(&routed_put).is_err());
+        assert_eq!(
+            source_mutations_routed(&routed_put)
+                .unwrap()
+                .unwrap()
+                .get(0),
+            Some(SourceMutation::Put)
+        );
+        let routed_visible = Arc::clone(routed_put.column(0));
+        let routed_positioned = strip_source_mutations_routed(&routed_put).unwrap();
+        assert!(Arc::ptr_eq(&routed_visible, routed_positioned.column(0)));
+
+        let stripped = strip_source_row_positions(&encoded).unwrap();
+        assert_eq!(stripped.schema(), records.schema());
+        assert_eq!(stripped.num_rows(), records.num_rows());
+        assert!(Arc::ptr_eq(stripped.column(0), records.column(0)));
+
+        let puts = SourceBatch::positioned(records.clone(), positions)
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put; 2])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::OrderedDeterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&puts.schema(), &positioned_schema));
+        assert!(puts.column_by_name(SOURCE_MUTATION_COLUMN).is_none());
+        assert!(source_mutations(&puts).unwrap().is_none());
+    }
+
+    #[test]
+    fn source_metadata_rejects_collisions_and_malformed_batches() {
+        let collision = Arc::new(Schema::new(vec![Field::new(
+            "__SOURCE_MUTATION",
+            DataType::UInt8,
+            false,
+        )]));
+        assert!(schema_with_source_row_positions(&collision).is_err());
+        assert!(schema_with_source_mutations_and_row_positions(&collision).is_err());
+
+        let records = test_batch(2);
+        let positioned_schema = schema_with_source_row_positions(&records.schema()).unwrap();
+        let mutation_schema =
+            schema_with_source_mutations_and_row_positions(&records.schema()).unwrap();
+        let positions = SourceRowPositions::try_new(
+            BinaryArray::from(vec![&b"p0"[..], &b"p0"[..]]),
+            BinaryArray::from(vec![&b"0"[..], &b"1"[..]]),
+            UInt32Array::from(vec![0, 0]),
+        )
+        .unwrap();
+        let encoded = SourceBatch::positioned(records.clone(), positions)
+            .unwrap()
+            .with_mutations(vec![SourceMutation::Put, SourceMutation::Tombstone])
+            .unwrap()
+            .into_records_with_metadata(
+                SourceRowPositionCapability::OrderedDeterministic,
+                &positioned_schema,
+                &mutation_schema,
+            )
+            .unwrap();
+        let mutation_index = records.num_columns();
+
+        let malformed = |field: Field, array: ArrayRef| {
+            let mut fields = encoded.schema().fields().to_vec();
+            fields[mutation_index] = Arc::new(field);
+            let mut columns = encoded.columns().to_vec();
+            columns[mutation_index] = array;
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let wrong_type = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::Int64, false),
+            Arc::new(Int64Array::from(vec![0, 1])),
+        );
+        assert!(source_mutations(&wrong_type).is_err());
+
+        let null = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, true),
+            Arc::new(UInt8Array::from(vec![Some(0), None])),
+        );
+        assert!(strip_source_mutations(&null).is_err());
+
+        let unknown = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, false),
+            Arc::new(UInt8Array::from(vec![0, 2])),
+        );
+        assert!(source_mutations(&unknown).is_err());
+        assert!(strip_source_mutations(&unknown).is_err());
+
+        let all_put = malformed(
+            Field::new(SOURCE_MUTATION_COLUMN, DataType::UInt8, false),
+            Arc::new(UInt8Array::from(vec![0, 0])),
+        );
+        assert!(strip_source_mutations(&all_put).is_err());
+
+        let mut fields = encoded.schema().fields().to_vec();
+        let mutation_field = fields.remove(mutation_index);
+        fields.push(mutation_field);
+        let mut columns = encoded.columns().to_vec();
+        let mutation_column = columns.remove(mutation_index);
+        columns.push(mutation_column);
+        let misplaced = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        assert!(source_mutations(&misplaced).is_err());
     }
 
     #[test]
@@ -1469,6 +2443,11 @@ mod tests {
         let contract = SourceContract::default();
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert_eq!(contract.input_mode, SourceInputMode::AppendOnly);
+        assert_eq!(
+            contract.row_positions,
+            SourceRowPositionCapability::Unavailable
+        );
         assert!(!contract.supports_replay());
         assert!(!contract.requires_checkpointing());
         assert!(!contract.is_exact_delivery_certified());
@@ -1479,14 +2458,16 @@ mod tests {
         let contract = SourceContract::new(
             SourceConsistency::CommitCoupled,
             SourceTopology::NodeLocalIngress,
+            SourceInputMode::FullChangelog,
         );
         assert!(contract.supports_replay());
         assert!(contract.requires_checkpointing());
+        assert_eq!(contract.input_mode, SourceInputMode::FullChangelog);
     }
 
     #[test]
     fn source_start_rejects_split_and_zero_resume_before_connector_start() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for attempt in [CheckpointAttempt::new(7, 8), CheckpointAttempt::new(0, 0)] {
             let error = SourceStart::new(
@@ -1534,7 +2515,7 @@ mod tests {
 
     #[test]
     fn coordinated_namespace_is_bounded_stable_and_sink_scoped() {
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
         const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
 
         let first =
@@ -1567,7 +2548,7 @@ mod tests {
     fn coordinated_namespace_rejects_ambiguous_identity() {
         const DEPLOYMENT: &str = "018f0000-0000-7000-8000-000000000001";
 
-        use laminar_core::storage::checkpoint_manifest::{
+        use laminar_core::checkpoint::checkpoint_manifest::{
             PipelineIdentity, PIPELINE_IDENTITY_VERSION,
         };
         let malformed = PipelineIdentity {
@@ -1588,8 +2569,8 @@ mod tests {
 
     #[test]
     fn coordinated_batch_fingerprint_covers_the_exact_ordered_cut() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1649,8 +2630,8 @@ mod tests {
     }
 
     fn valid_coordinated_batch() -> CoordinatedCommitBatch {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let target = CheckpointAttempt::canonical(102);
         CoordinatedCommitBatch {
@@ -1668,7 +2649,7 @@ mod tests {
             target,
             entries: vec![CoordinatedCommitPayload {
                 attempt: target,
-                participant_id: 0,
+                participant_id: 1,
                 payload: None,
             }],
         }
@@ -1676,7 +2657,7 @@ mod tests {
 
     #[test]
     fn coordinated_batch_rejects_noncanonical_target_before_other_shape_checks() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for target in [
             CheckpointAttempt::new(102, 103),
@@ -1694,7 +2675,7 @@ mod tests {
 
     #[test]
     fn coordinated_batch_rejects_noncanonical_entry_before_other_shape_checks() {
-        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         for attempt in [
             CheckpointAttempt::new(101, 102),
@@ -1704,18 +2685,22 @@ mod tests {
             batch.entries[0].attempt = attempt;
             let error = batch.validate_shape().unwrap_err();
             assert!(
-                error.contains(
-                    "entry for participant 0 must use one nonzero canonical checkpoint ID"
-                ),
+                error.contains("canonical checkpoint ID"),
                 "unexpected validation error: {error}"
             );
         }
+        let mut batch = valid_coordinated_batch();
+        batch.entries[0].participant_id = 0;
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("nonzero participant"));
     }
 
     #[test]
     fn coordinated_batch_rejects_cursor_rollback_and_unproven_overlap() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let first = CheckpointAttempt::canonical(108);
         let target = CheckpointAttempt::canonical(110);
@@ -1735,12 +2720,12 @@ mod tests {
             entries: vec![
                 CoordinatedCommitPayload {
                     attempt: first,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: None,
                 },
                 CoordinatedCommitPayload {
                     attempt: target,
-                    participant_id: 0,
+                    participant_id: 1,
                     payload: None,
                 },
             ],
@@ -1764,8 +2749,8 @@ mod tests {
 
     #[test]
     fn coordinated_batch_requires_unique_canonical_attempt_participants() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1790,32 +2775,32 @@ mod tests {
             payload: None,
         };
 
-        let duplicate = batch(vec![payload(target, 0), payload(target, 0)]);
+        let duplicate = batch(vec![payload(target, 1), payload(target, 1)]);
         assert!(duplicate
             .validate_shape()
             .unwrap_err()
             .contains("duplicate"));
 
-        let out_of_order = batch(vec![payload(target, 1), payload(target, 0)]);
+        let out_of_order = batch(vec![payload(target, 2), payload(target, 1)]);
         assert!(out_of_order
             .validate_shape()
             .unwrap_err()
             .contains("out-of-order"));
 
         let noncanonical = batch(vec![
-            payload(CheckpointAttempt::new(3, 101), 0),
-            payload(target, 0),
+            payload(CheckpointAttempt::new(3, 101), 1),
+            payload(target, 2),
         ]);
         assert!(noncanonical
             .validate_shape()
             .unwrap_err()
-            .contains("one nonzero canonical checkpoint ID"));
+            .contains("canonical checkpoint ID"));
     }
 
     #[test]
     fn coordinated_batch_entry_limit_accepts_max_and_rejects_max_plus_one() {
-        use laminar_core::state::CheckpointAttempt;
-        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+        use laminar_core::checkpoint::CheckpointAttempt;
 
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
@@ -1832,7 +2817,7 @@ mod tests {
             },
             fencing_token: 1,
             target,
-            entries: (0..count)
+            entries: (1..=count)
                 .map(|participant_id| CoordinatedCommitPayload {
                     attempt: target,
                     participant_id: participant_id as u64,

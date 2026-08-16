@@ -35,10 +35,22 @@ fn config_for(dir: &std::path::Path) -> LaminarConfig {
 /// millisecond values and this helper scales to µs.
 fn make_batch(symbols: &[&str], prices: &[f64], timestamps_ms: &[i64]) -> RecordBatch {
     let us: Vec<i64> = timestamps_ms.iter().map(|ms| ms * 1000).collect();
-    RecordBatch::try_from_iter(vec![
-        ("symbol", Arc::new(StringArray::from(symbols.to_vec())) as _),
-        ("price", Arc::new(Float64Array::from(prices.to_vec())) as _),
-        ("ts", Arc::new(TimestampMicrosecondArray::from(us)) as _),
+    RecordBatch::try_from_iter_with_nullable(vec![
+        (
+            "symbol",
+            Arc::new(StringArray::from(symbols.to_vec())) as _,
+            true,
+        ),
+        (
+            "price",
+            Arc::new(Float64Array::from(prices.to_vec())) as _,
+            true,
+        ),
+        (
+            "ts",
+            Arc::new(TimestampMicrosecondArray::from(us)) as _,
+            true,
+        ),
     ])
     .unwrap()
 }

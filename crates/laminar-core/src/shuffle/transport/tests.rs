@@ -5,9 +5,9 @@ use arrow_array::Int64Array;
 use arrow_schema::{DataType, Field, Schema};
 
 use super::*;
+use crate::checkpoint::CheckpointAttempt;
 use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant};
 use crate::cluster::control::LeaseDeadline;
-use crate::state::CheckpointAttempt;
 use uuid::Uuid;
 
 fn assignment_owners(nodes: &[ShufflePeerId]) -> Vec<ShufflePeerId> {
@@ -148,6 +148,43 @@ async fn sender_natural_process_lease_expiry_cancels_blocked_admission() {
     assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     assert_eq!(sender.assignment_version(), 1);
     drop(held_budget);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_marks_post_enqueue_process_lease_loss_as_admitted() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+    let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+    sender
+        .install_process_lease_deadline(Arc::clone(&deadline))
+        .unwrap();
+    let fence = assignment_fence(1, &[1, 2]);
+    sender
+        .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+        .unwrap();
+    sender.register_peer(2, receiver.local_addr());
+
+    let (enqueued, release) = sender.pause_next_send_after_enqueue_for_test();
+    let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+    let send = sender.send_to_for_assignment(2, 1, &message);
+    tokio::pin!(send);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            () = enqueued.notified() => {}
+            result = &mut send => panic!("send completed before the post-enqueue pause: {result:?}"),
+        }
+    })
+    .await
+    .expect("shuffle frame did not enter the outbound queue");
+    deadline.fence();
+    release.notify_one();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(1), send)
+        .await
+        .expect("post-enqueue lease loss did not finish the send")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(shuffle_send_may_have_been_admitted(&error));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -365,6 +402,62 @@ async fn wait_until(mut ready: impl FnMut() -> bool) {
     })
     .await
     .expect("shuffle state did not settle");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_wakes_for_admitted_data_frontier_and_barrier() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1);
+    sender.register_peer(2, receiver.local_addr());
+    let wake = receiver.work_ready_notify();
+
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage".into(), 0, one_row(1)),
+        )
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+    assert!(receiver.queued_work_ready());
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("an enqueue before the waiter did not retain a wake permit");
+    assert_eq!(receiver.drain_available().len(), 1);
+    assert!(!receiver.queued_work_ready());
+
+    for watermark in [1, 2] {
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::Frontier {
+                    stage: "stage".into(),
+                    watermark: Some(watermark),
+                    idle: false,
+                },
+            )
+            .await
+            .unwrap();
+    }
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(3)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("frontier enqueue did not retain a wake permit");
+    assert!(receiver.queued_work_ready());
+    let _ = receiver.drain_checkpointed_staged();
+    assert_eq!(receiver.drain_staged_frontiers().len(), 1);
+    assert!(receiver.queued_work_ready());
+    let _ = receiver.drain_checkpointed_staged();
+    assert_eq!(receiver.drain_staged_frontiers().len(), 1);
+    assert!(!receiver.queued_work_ready());
+
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("barrier enqueue did not retain a wake permit");
+    assert!(receiver.queued_work_ready());
 }
 
 #[test]
@@ -769,6 +862,161 @@ async fn sender_to_receiver_delivers_with_peer_attribution() {
         received.message(),
         &ShuffleMessage::Barrier(CheckpointBarrier::new(1234, 1234))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frontier_shares_data_sequence_and_barrier_high_water() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1);
+    sender.register_peer(2, receiver.local_addr());
+
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("join/right".into(), 0, one_row(1)),
+        )
+        .await
+        .unwrap();
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::Frontier {
+                stage: "join/right".into(),
+                watermark: Some(1_000),
+                idle: false,
+            },
+        )
+        .await
+        .unwrap();
+    send_barrier(&sender, &[2], CheckpointBarrier::new(1, 1))
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(2)).await;
+
+    let data = receiver.drain_checkpointed_data_for("join/right");
+    assert!(data.is_empty());
+
+    let frontiers = receiver.drain_staged_frontiers();
+    assert_eq!(frontiers.len(), 1);
+    assert_eq!(frontiers[0].preceding().len(), 1);
+    assert_eq!(frontiers[0].preceding()[0].checkpoint_sequence(), 0);
+    let frontier = frontiers[0].frontier();
+    assert_eq!(
+        frontier.message(),
+        &ShuffleMessage::Frontier {
+            stage: "join/right".into(),
+            watermark: Some(1_000),
+            idle: false,
+        }
+    );
+    assert_eq!(frontier.checkpoint_sequence(), 1);
+
+    wait_until(|| receiver.stage_checkpointed_inbound()).await;
+    let barriers = receiver.drain_staged_barriers();
+    assert_eq!(barriers.len(), 1);
+    let barrier = &barriers[0];
+    assert!(matches!(barrier.message(), ShuffleMessage::Barrier(_)));
+    assert_eq!(barrier.checkpoint_sequence(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_stage_drain_preserves_pre_frontier_data_as_one_cut() {
+    let receiver = bind_on_loopback(2).await;
+    let sender = sender(1);
+    sender.register_peer(2, receiver.local_addr());
+
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage-b".into(), 0, one_row(10)),
+        )
+        .await
+        .unwrap();
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::Frontier {
+                stage: "stage-b".into(),
+                watermark: Some(100),
+                idle: false,
+            },
+        )
+        .await
+        .unwrap();
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage-b".into(), 0, one_row(20)),
+        )
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(3)).await;
+
+    assert!(receiver.drain_checkpointed_data_for("stage-a").is_empty());
+    let cuts = receiver.drain_staged_frontiers();
+    assert_eq!(cuts.len(), 1);
+    assert_eq!(cuts[0].preceding().len(), 1);
+    assert_eq!(cuts[0].preceding()[0].checkpoint_sequence(), 0);
+    let before = cuts[0].preceding()[0]
+        .batch()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(before.value(0), 10);
+    assert_eq!(cuts[0].frontier().checkpoint_sequence(), 1);
+
+    let after = receiver.drain_checkpointed_data_for("stage-b");
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].checkpoint_sequence(), 2);
+    let value = after[0]
+        .batch()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(value.value(0), 20);
+}
+
+#[test]
+fn frontier_prefix_does_not_cross_a_reconnected_stream() {
+    let sender_incarnation = Uuid::from_u128(1);
+    let receiver_incarnation = Uuid::from_u128(2);
+    let mut staged = rustc_hash::FxHashMap::default();
+    staged.insert(
+        "stage".to_owned(),
+        vec![ReceivedBatch {
+            batch: one_row(10),
+            routed_vnodes: Arc::from([0_u32]),
+            reservation: None,
+            peer: 1,
+            sender_incarnation,
+            receiver_incarnation,
+            stream_id: Uuid::from_u128(10),
+            assignment_version: 1,
+            recovery_gen: 0,
+            checkpoint_sequence: 0,
+        }],
+    );
+    let frontier = ReceivedShuffle {
+        peer: 1,
+        message: ShuffleMessage::Frontier {
+            stage: "stage".into(),
+            watermark: Some(100),
+            idle: false,
+        },
+        reservation: None,
+        sender_incarnation,
+        receiver_incarnation,
+        stream_id: Uuid::from_u128(11),
+        assignment_version: 1,
+        assignment_digest: None,
+        recovery_gen: 0,
+        checkpoint_sequence: 1,
+    };
+
+    assert!(take_frontier_prefix(&mut staged, "stage", &frontier).is_empty());
+    assert_eq!(staged["stage"].len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1262,6 +1510,7 @@ async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover()
 
     let after = receiver.drain_checkpointed_data_for("after");
     assert_eq!(after.len(), 1);
+    assert_eq!(after[0].routed_vnodes(), &[0]);
     assert_eq!(
         after[0]
             .batch()
@@ -1275,6 +1524,7 @@ async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover()
 
     let held = receiver.drain_checkpointed_data_for("held");
     assert_eq!(held.len(), 1);
+    assert_eq!(held[0].routed_vnodes(), &[0]);
     assert_eq!(
         held[0]
             .batch()
@@ -1549,12 +1799,45 @@ async fn staged_old_generation_is_discarded_without_refaulting_recovery() {
         )
         .await
         .unwrap();
-    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::Frontier {
+                stage: "stage".into(),
+                watermark: Some(10),
+                idle: false,
+            },
+        )
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(2)).await;
     assert!(receiver.drain_checkpointed_data_for("other").is_empty());
 
     receiver.set_recovery_gen(1);
+    sender.set_recovery_gen(1);
+    assert!(receiver.drain_staged_frontiers().is_empty());
 
-    assert!(receiver.drain_checkpointed_data_for("stage").is_empty());
+    sender
+        .send_to(
+            2,
+            &ShuffleMessage::checkpointed("stage".into(), 0, one_row(2)),
+        )
+        .await
+        .unwrap();
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+
+    let current = receiver.drain_checkpointed_data_for("stage");
+    assert_eq!(current.len(), 1);
+    assert_eq!(
+        current[0]
+            .batch()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
     assert_eq!(receiver.delivery_loss_incidents().load(O::Acquire), 0);
 }
 

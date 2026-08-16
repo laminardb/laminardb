@@ -28,10 +28,16 @@ fn config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
     }
 }
 
+fn non_recoverable_config(dir: &std::path::Path, incremental: bool) -> LaminarConfig {
+    let mut config = config(dir, incremental);
+    config.checkpoint = None;
+    config
+}
+
 fn batch(ks: &[i64], vs: &[i64]) -> RecordBatch {
-    RecordBatch::try_from_iter(vec![
-        ("k", Arc::new(Int64Array::from(ks.to_vec())) as _),
-        ("v", Arc::new(Int64Array::from(vs.to_vec())) as _),
+    RecordBatch::try_from_iter_with_nullable(vec![
+        ("k", Arc::new(Int64Array::from(ks.to_vec())) as _, true),
+        ("v", Arc::new(Int64Array::from(vs.to_vec())) as _, true),
     ])
     .unwrap()
 }
@@ -258,7 +264,7 @@ async fn counted_multiset_survives_coordinator_checkpoint_restart_and_retraction
 #[tokio::test]
 async fn chained_dim_enrich_join_is_correct_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     // Static dimension table (keyed reference table).
@@ -291,12 +297,12 @@ async fn chained_dim_enrich_join_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
-/// A certified state-backed LEFT enrich join preserves unmatched changelog rows and retracts their
+/// A certified changelog-to-static LEFT join preserves unmatched rows and retracts their
 /// previous values when the upstream aggregate changes.
 #[tokio::test]
 async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
     let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    let db = LaminarDB::open_with_config(non_recoverable_config(dir.path(), true)).unwrap();
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute("CREATE TABLE dim (k BIGINT PRIMARY KEY, label BIGINT)")
@@ -308,7 +314,7 @@ async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
          SELECT agg.k, agg.total, dim.label FROM agg LEFT JOIN dim ON agg.k = dim.k",
     )
     .await
-    .expect("the exact state-backed LEFT dimension join must be admitted");
+    .expect("the exact changelog-to-static LEFT join must be admitted");
     db.start().await.unwrap();
 
     let source = db.source_untyped("events").unwrap();
@@ -424,7 +430,7 @@ async fn terminality_guard_allows_agg_and_projection_rejects_join() {
         .await
         .expect("chained projection stream is allowed (Phase 2)");
 
-    // A join over the changelog (complex shape) is rejected — not yet supported.
+    // Stateful joins over a changelog are outside the supported enrichment contract.
     let join = db
         .execute(
             "CREATE MATERIALIZED VIEW j AS SELECT agg.k FROM agg JOIN events ON agg.k = events.k",
@@ -455,7 +461,7 @@ async fn sink_from_incremental_mv_rejects_noncapable_sink_at_start() {
     db.execute(MV).await.unwrap();
     // Guard relaxed: the sink DDL itself now succeeds over an incremental MV.
     db.execute(&format!(
-        "CREATE SINK f FROM agg INTO FILES (path = '{}', format = 'json')",
+        "CREATE SINK f FROM agg INTO FILES (path = '{}') FORMAT JSON",
         out.display().to_string().replace('\\', "/")
     ))
     .await
@@ -482,7 +488,7 @@ async fn sink_from_nonincremental_mv_allows_noncapable_sink() {
     db.execute(SRC).await.unwrap();
     db.execute(MV).await.unwrap();
     db.execute(&format!(
-        "CREATE SINK f FROM agg INTO FILES (path = '{}', format = 'json')",
+        "CREATE SINK f FROM agg INTO FILES (path = '{}') FORMAT JSON",
         out.display().to_string().replace('\\', "/")
     ))
     .await
@@ -508,7 +514,7 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
         .await
         .expect("stream over incremental MV");
     db.execute(&format!(
-        "CREATE SINK f FROM s INTO FILES (path = '{}', format = 'json')",
+        "CREATE SINK f FROM s INTO FILES (path = '{}') FORMAT JSON",
         out.display().to_string().replace('\\', "/")
     ))
     .await
@@ -522,10 +528,10 @@ async fn sink_over_changelog_stream_rejects_noncapable_sink_at_start() {
     db.shutdown().await.ok();
 }
 
-/// An inner `changelog ⋈ changelog` IVM join over TWO incremental MVs maintains a correct snapshot
-/// under UPDATES on BOTH sides — the δA⋈B + A⋈δB netting drops stale joined rows.
+/// Stateful joins over changelog-producing materialized views are not part of the single bounded
+/// interval-join contract and must fail before catalog registration.
 #[tokio::test]
-async fn incremental_join_over_two_changelogs_nets_both_sides() {
+async fn changelog_joins_are_rejected_at_ddl() {
     let dir = tempfile::tempdir().unwrap();
     let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
     db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
@@ -537,358 +543,21 @@ async fn incremental_join_over_two_changelogs_nets_both_sides() {
     db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS total FROM ev_a GROUP BY k")
         .await
         .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS wtotal FROM ev_b GROUP BY k")
+    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS total FROM ev_b GROUP BY k")
         .await
         .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW joined AS \
-         SELECT a.k, a.total, b.wtotal FROM agg_a a JOIN agg_b b ON a.k = b.k",
-    )
-    .await
-    .expect("inner changelog ⋈ changelog join is allowed (Stage 3b)");
-    db.start().await.unwrap();
 
-    let sa = db.source_untyped("ev_a").unwrap();
-    let sb = db.source_untyped("ev_b").unwrap();
-    // Seed both sides for k=1,2.
-    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    // Update LEFT k=1 (total 10->15) and RIGHT k=2 (wtotal 200->250).
-    sa.push_arrow(batch(&[1], &[5])).unwrap();
-    sb.push_arrow(batch(&[2], &[50])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-
-    // No stale (1,10,100) or (2,20,200); both updates tracked.
-    assert_eq!(
-        read_query(&db, "SELECT k, total, wtotal FROM joined", 3).await,
-        vec![vec![1, 15, 100], vec![2, 20, 250]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// An incremental join survives checkpoint → restart: the post-restart UPDATE only nets correctly
-/// if the operator's per-side Z-set state was restored (else the stale joined row persists).
-#[tokio::test]
-async fn incremental_join_survives_checkpoint_restart() {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = dir.path().to_path_buf();
-
-    const DDL: [&str; 5] = [
-        "CREATE SOURCE ev_a (k BIGINT, v BIGINT)",
-        "CREATE SOURCE ev_b (k BIGINT, v BIGINT)",
-        "CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS total FROM ev_a GROUP BY k",
-        "CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS wtotal FROM ev_b GROUP BY k",
-        "CREATE MATERIALIZED VIEW joined AS \
-         SELECT a.k, a.total, b.wtotal FROM agg_a a JOIN agg_b b ON a.k = b.k",
-    ];
-
-    {
-        let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
-        for stmt in DDL {
-            db.execute(stmt).await.unwrap();
-        }
-        db.start().await.unwrap();
-        let sa = db.source_untyped("ev_a").unwrap();
-        let sb = db.source_untyped("ev_b").unwrap();
-        sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-        sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            read_query(&db, "SELECT k, total, wtotal FROM joined", 3).await,
-            vec![vec![1, 10, 100], vec![2, 20, 200]]
+    for (name, join) in [("joined_inner", "JOIN"), ("joined_left", "LEFT JOIN")] {
+        let ddl = format!(
+            "CREATE MATERIALIZED VIEW {name} AS \\
+             SELECT a.k FROM agg_a a {join} agg_b b ON a.k = b.k"
         );
-        let cp = db.checkpoint().await.unwrap();
-        assert!(cp.success, "checkpoint must succeed");
-        db.shutdown().await.unwrap();
-    }
-
-    {
-        let db = LaminarDB::open_with_config(config(&storage, true)).unwrap();
-        for stmt in DDL {
-            db.execute(stmt).await.unwrap();
-        }
-        db.start().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        // Snapshot restored.
-        assert_eq!(
-            read_query(&db, "SELECT k, total, wtotal FROM joined", 3).await,
-            vec![vec![1, 10, 100], vec![2, 20, 200]],
-            "join MV snapshot must survive restart"
+        assert!(
+            db.execute(&ddl).await.is_err(),
+            "{join} changelog join was admitted"
         );
-        // UPDATE left k=1 (total 10->15). Netting the retraction of the stale (1,10,100) requires
-        // the restored right-side state (k=1: wtotal=100) to still match.
-        let sa = db.source_untyped("ev_a").unwrap();
-        sa.push_arrow(batch(&[1], &[5])).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert_eq!(
-            read_query(&db, "SELECT k, total, wtotal FROM joined", 3).await,
-            vec![vec![1, 15, 100], vec![2, 20, 200]],
-            "post-restart update must net (no stale (1,10,100)) — proves side-state was restored"
-        );
-        db.shutdown().await.unwrap();
+        assert!(db.execute(&format!("SELECT * FROM {name}")).await.is_err());
     }
-}
-
-/// A LEFT outer `changelog ⋈ changelog` join NULL-pads unmatched left rows and tracks the
-/// pad↔inner transition as right matches come and go.
-#[tokio::test]
-async fn left_outer_incremental_join_nullpads_unmatched_left() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS total FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS wtotal FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW joined AS \
-         SELECT a.k, a.total, b.wtotal FROM agg_a a LEFT JOIN agg_b b ON a.k = b.k",
-    )
-    .await
-    .expect("inner+LEFT changelog join allowed (Stage 3b Slice 2)");
-    db.start().await.unwrap();
-
-    let sa = db.source_untyped("ev_a").unwrap();
-    let sb = db.source_untyped("ev_b").unwrap();
-    // Left has k=1,2; right matches only k=1. k=2 must show NULL wtotal.
-    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    sb.push_arrow(batch(&[1], &[100])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // wtotal is nullable; COALESCE the NULL to -1 to read it as an i64 column.
-    assert_eq!(
-        read_query(&db, "SELECT k, total, COALESCE(wtotal, -1) FROM joined", 3).await,
-        vec![vec![1, 10, 100], vec![2, 20, -1]]
-    );
-
-    // Right k=2 arrives → its NULL-pad retracts, the inner row appears.
-    sb.push_arrow(batch(&[2], &[200])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    assert_eq!(
-        read_query(&db, "SELECT k, total, COALESCE(wtotal, -1) FROM joined", 3).await,
-        vec![vec![1, 10, 100], vec![2, 20, 200]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// Guard: inner and LEFT `changelog ⋈ changelog` joins are allowed; a RIGHT/outer join and a
-/// `changelog ⋈ source` join stay rejected.
-#[tokio::test]
-async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS total FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS wtotal FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-
-    db.execute(
-        "CREATE MATERIALIZED VIEW j AS \
-         SELECT a.k, a.total, b.wtotal FROM agg_a a JOIN agg_b b ON a.k = b.k",
-    )
-    .await
-    .expect("inner changelog join allowed");
-    db.execute(
-        "CREATE MATERIALIZED VIEW jl AS \
-         SELECT a.k, a.total, b.wtotal FROM agg_a a LEFT JOIN agg_b b ON a.k = b.k",
-    )
-    .await
-    .expect("LEFT changelog join allowed (Slice 2)");
-
-    let right = db
-        .execute(
-            "CREATE MATERIALIZED VIEW jr AS \
-             SELECT a.k FROM agg_a a RIGHT JOIN agg_b b ON a.k = b.k",
-        )
-        .await;
-    assert!(
-        right.is_err(),
-        "RIGHT join over changelogs is a later slice"
-    );
-
-    let src = db
-        .execute(
-            "CREATE MATERIALIZED VIEW js AS \
-             SELECT agg_a.k FROM agg_a JOIN ev_a ON agg_a.k = ev_a.k",
-        )
-        .await;
-    assert!(src.is_err(), "changelog ⋈ source join is rejected");
-
-    let raw = db
-        .execute(
-            "CREATE MATERIALIZED VIEW raw_join AS \
-             SELECT ev_a.k FROM ev_a JOIN ev_b ON ev_a.k = ev_b.k",
-        )
-        .await;
-    assert!(raw.is_err(), "raw source ⋈ source join is rejected");
-}
-
-/// Multi-way A⋈B⋈C as chained pairwise IVM joins: an intermediate join MV is itself a
-/// changelog that feeds the next join. Updates on ALL THREE sides must net through the chain.
-#[tokio::test]
-async fn multiway_incremental_join_chained_pairwise() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
-        .await
-        .unwrap();
-    // Intermediate ab = agg_a ⋈ agg_b, then abc = ab ⋈ agg_c — the join MV `ab` feeds the next join.
-    db.execute(
-        "CREATE MATERIALIZED VIEW ab AS \
-         SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW abc AS \
-         SELECT ab.k, ab.ta, ab.tb, c.tc FROM ab JOIN agg_c c ON ab.k = c.k",
-    )
-    .await
-    .expect("chained pairwise multi-way join allowed");
-    db.start().await.unwrap();
-
-    let (sa, sb, sc) = (
-        db.source_untyped("ev_a").unwrap(),
-        db.source_untyped("ev_b").unwrap(),
-        db.source_untyped("ev_c").unwrap(),
-    );
-    sa.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
-    sb.push_arrow(batch(&[1, 2], &[100, 200])).unwrap();
-    sc.push_arrow(batch(&[1, 2], &[1000, 2000])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    // Update one column on each side: ta[k1] 10->15, tb[k2] 200->250, tc[k1] 1000->1500.
-    sa.push_arrow(batch(&[1], &[5])).unwrap();
-    sb.push_arrow(batch(&[2], &[50])).unwrap();
-    sc.push_arrow(batch(&[1], &[500])).unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-
-    // Every update nets through the two-level chain; no stale rows.
-    assert_eq!(
-        read_query(&db, "SELECT k, ta, tb, tc FROM abc", 4).await,
-        vec![vec![1, 15, 100, 1500], vec![2, 20, 250, 2000]]
-    );
-    db.shutdown().await.unwrap();
-}
-
-/// A join projection with a duplicate OUTPUT column name (same-named column from both sides) must be
-/// rejected — otherwise the operator binds the join key and the projected column to different physical
-/// columns, and it compounds when the MV feeds a downstream join.
-#[tokio::test]
-async fn incremental_join_rejects_duplicate_output_column() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    db.execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS t FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS t FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    // Both sides project `t` → duplicate output name → rejected.
-    let bad = db
-        .execute(
-            "CREATE MATERIALIZED VIEW dup AS \
-             SELECT a.t, b.t FROM agg_a a JOIN agg_b b ON a.k = b.k",
-        )
-        .await;
-    assert!(
-        bad.is_err(),
-        "duplicate output column name must be rejected"
-    );
-}
-
-/// Multi-way incremental joins require atomic batch topology admission; until that exists they
-/// fail before registering the requested MV.
-#[tokio::test]
-async fn single_statement_multiway_join_fails_without_partial_registration() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k")
-        .await
-        .unwrap();
-    let error = db
-        .execute(
-            "CREATE MATERIALIZED VIEW abc AS \
-         SELECT a.k, a.ta, b.tb, c.tc \
-         FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
-        )
-        .await
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("atomic batch topology admission"));
-    assert!(db.execute("SELECT * FROM abc").await.is_err());
-}
-
-/// A multi-way join whose participant is a non-incremental source is rejected (not decomposed).
-#[tokio::test]
-async fn single_statement_multiway_rejects_non_incremental_participant() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
-    for s in ["ev_a", "ev_b", "ev_c"] {
-        db.execute(&format!("CREATE SOURCE {s} (k BIGINT, v BIGINT)"))
-            .await
-            .unwrap();
-    }
-    db.execute("CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k")
-        .await
-        .unwrap();
-    db.execute("CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k")
-        .await
-        .unwrap();
-    // ev_c is a raw source (not incremental) -> the whole 3-way is rejected.
-    let bad = db
-        .execute(
-            "CREATE MATERIALIZED VIEW abc AS \
-             SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k JOIN ev_c c ON b.k = c.k",
-        )
-        .await;
-    assert!(
-        bad.is_err(),
-        "a source participant in a multi-way join is rejected"
-    );
 }
 
 /// SUBSCRIBE to an incremental MV delivers plain consolidated snapshots for updates emitted after

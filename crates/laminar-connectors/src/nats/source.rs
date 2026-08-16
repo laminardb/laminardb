@@ -27,7 +27,8 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
     ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
-    SourceConsistency, SourceContract, SourcePosition, SourceStart, SourceTopology,
+    SourceConsistency, SourceContract, SourceInputMode, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
@@ -340,13 +341,28 @@ impl SourceConnector for NatsSource {
         Some(self.task_tracker.clone())
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let format = match config.get("format") {
+            Some(value) => serde::Format::parse(value)
+                .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?,
+            None => self
+                .config
+                .as_ref()
+                .map_or(serde::Format::Json, |config| config.format),
+        };
+        let input_mode = if format == serde::Format::Debezium {
+            SourceInputMode::KeyedUpsert
+        } else {
+            SourceInputMode::AppendOnly
+        };
+
         // Neither Core NATS nor the current JetStream implementation can
         // rewind an abandoned checkpoint attempt deterministically. Durable
         // consumers alone are insufficient for LaminarDB replay semantics.
         Ok(SourceContract::new(
             SourceConsistency::Ephemeral,
             SourceTopology::Singleton,
+            input_mode,
         ))
     }
 
@@ -938,6 +954,12 @@ mod tests {
         let contract = source.contract(&config).expect("static NATS contract");
         assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+
+        config.set("format", "debezium");
+        assert_eq!(
+            source.contract(&config).unwrap().input_mode,
+            SourceInputMode::KeyedUpsert
+        );
     }
 
     #[test]

@@ -7,15 +7,9 @@
 mode = "single"
 bind = "127.0.0.1:8080"
 delivery = "at_least_once"
-metrics_bind = "127.0.0.1:9090"
-workers = 0           # auto-detect CPU count
-log_level = "info"
-
-[state]
-backend = "in_process"
 
 [checkpoint]
-# Local path, or an object store: s3://, gs://, az:// (in the default build).
+# Provider-neutral object_store URL: file://, s3:// (including R2/MinIO), gs://, or az://.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "10s"
 

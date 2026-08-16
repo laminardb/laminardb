@@ -11,13 +11,9 @@ pub struct StreamCheckpointConfig {
     /// Directory for persisting checkpoints. `None` uses the database storage directory, then
     /// falls back to `./data`; it never silently selects volatile checkpoint storage.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Number of predecessor checkpoints retained alongside the current recovery cut.
-    /// `None` = default (3); predecessors keep reference/delta chains resolvable.
-    pub max_retained: Option<usize>,
-    /// Maximum bytes admitted for one checkpoint across in-flight capture and
-    /// persisted/restored external state. `None` uses
-    /// `DEFAULT_MAX_CHECKPOINT_STATE_BYTES`.
-    pub max_staged_bytes: Option<u64>,
+    /// Maximum bytes admitted for one participant's checkpoint node-data object.
+    /// `None` uses `DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES`.
+    pub max_node_data_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -30,7 +26,6 @@ mod tests {
         assert!(config.interval_ms.is_none());
         assert!(config.timeout_ms.is_none());
         assert!(config.data_dir.is_none());
-        assert!(config.max_retained.is_none());
-        assert!(config.max_staged_bytes.is_none());
+        assert!(config.max_node_data_bytes.is_none());
     }
 }

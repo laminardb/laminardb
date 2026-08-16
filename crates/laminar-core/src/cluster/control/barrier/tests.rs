@@ -134,16 +134,18 @@ fn prepare_retry_classification_keeps_fence_failures_semantic() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn eager_prepare_retry_budget_tracks_the_configured_quorum_window() {
-    let default = prepare_fanout_budget(Duration::from_secs(3)).unwrap();
+fn eager_prepare_retry_budget_keeps_exact_attempt_deadline_and_short_rpc_cadence() {
+    let attempt_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let default = prepare_fanout_budget(attempt_deadline, Duration::from_secs(3)).unwrap();
     assert_eq!(default.per_attempt, Duration::from_millis(1_500));
-    assert_eq!(default.total, PREPARE_RPC_TIMEOUT);
+    assert_eq!(default.deadline, attempt_deadline);
 
-    let extended = prepare_fanout_budget(Duration::from_secs(40)).unwrap();
+    let extended = prepare_fanout_budget(attempt_deadline, Duration::from_secs(40)).unwrap();
     assert_eq!(extended.per_attempt, Duration::from_secs(20));
-    assert_eq!(extended.total, Duration::from_secs(40));
-    assert!(prepare_fanout_budget(Duration::ZERO).is_err());
-    assert!(prepare_fanout_budget(Duration::from_nanos(1)).is_err());
+    assert_eq!(extended.deadline, attempt_deadline);
+    assert!(prepare_fanout_budget(attempt_deadline, Duration::ZERO).is_err());
+    assert!(prepare_fanout_budget(attempt_deadline, Duration::from_nanos(1)).is_err());
+    assert!(prepare_fanout_budget(tokio::time::Instant::now(), Duration::from_secs(3)).is_err());
 }
 
 #[cfg(feature = "cluster")]
@@ -460,20 +462,142 @@ fn phase_ack_rejects_same_map_from_a_restarted_process() {
     };
     let ack = barrier_v1::Ack {
         epoch: announcement.epoch,
-        ok: true,
+        disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
         error: None,
         local_watermark_ms: None,
         checkpoint_id: announcement.checkpoint_id,
         assignment_digest: restarted.digest().to_vec(),
         watermark_status: 0,
+        flags: announcement.flags,
     };
 
     assert!(validate_phase_ack(&ack, &announcement).is_err());
 }
 
+#[cfg(feature = "cluster")]
+#[test]
+fn phase_ack_and_capture_cache_bind_flags_and_failure_precedence() {
+    assert!(ack_disposition_from_wire(0).is_err());
+
+    let announcement = BarrierAnnouncement {
+        epoch: 21,
+        checkpoint_id: 21,
+        assignment_fence: None,
+        leader_proof: None,
+        phase: Phase::Commit,
+        flags: crate::checkpoint::flags::HANDOFF,
+    };
+    let ack = barrier_v1::Ack {
+        epoch: announcement.epoch,
+        disposition: ack_disposition_to_wire(BarrierAckDisposition::Prepared),
+        error: None,
+        local_watermark_ms: None,
+        checkpoint_id: announcement.checkpoint_id,
+        assignment_digest: Vec::new(),
+        watermark_status: 0,
+        flags: 0,
+    };
+    assert!(validate_phase_ack(&ack, &announcement).is_err());
+
+    let regular = BarrierIdentity::from_announcement(&BarrierAnnouncement {
+        flags: 0,
+        ..announcement.clone()
+    });
+    let handoff = BarrierIdentity::from_announcement(&announcement);
+    assert_ne!(regular, handoff);
+
+    let captured = BarrierAck {
+        epoch: announcement.epoch,
+        checkpoint_id: announcement.checkpoint_id,
+        assignment_digest: None,
+        flags: announcement.flags,
+        disposition: BarrierAckDisposition::Captured,
+        error: None,
+        watermark: CheckpointWatermark::Uninitialized,
+    };
+    let replay = BarrierAck {
+        disposition: BarrierAckDisposition::CapturedWithReplay,
+        ..captured.clone()
+    };
+    let failed = BarrierAck {
+        disposition: BarrierAckDisposition::Failed,
+        error: Some("durable prepare failed".into()),
+        ..captured.clone()
+    };
+    let legacy_prepared_with_replay = BarrierAck {
+        disposition: BarrierAckDisposition::PreparedWithReplay,
+        ..captured.clone()
+    };
+    let mut cache = PrepareAckState::default();
+    assert_eq!(cache.record_ack(handoff, &captured), captured);
+    assert_eq!(
+        cache.record_ack(handoff, &legacy_prepared_with_replay),
+        captured
+    );
+    assert_eq!(cache.record_ack(handoff, &replay), replay);
+    assert_eq!(cache.record_ack(handoff, &captured), replay);
+    assert_eq!(cache.record_ack(handoff, &failed), failed);
+    assert_eq!(cache.record_ack(handoff, &replay), failed);
+
+    let regular_ack = BarrierAck {
+        flags: 0,
+        ..captured
+    };
+    assert_eq!(cache.record_ack(regular, &regular_ack), regular_ack);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn prepare_quorum_requires_an_explicit_captured_ack() {
+    use barrier_v1::CheckpointWatermarkStatus as WireStatus;
+
+    let fence = test_fence(17, &[1, 2], &[(1, 11), (2, 22)]);
+    let mut prepare = BarrierAnnouncement {
+        epoch: 22,
+        checkpoint_id: 22,
+        assignment_fence: Some(fence.clone()),
+        leader_proof: None,
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    let mut ack = barrier_v1::Ack {
+        epoch: prepare.epoch,
+        disposition: ack_disposition_to_wire(BarrierAckDisposition::Captured),
+        error: None,
+        local_watermark_ms: Some(91),
+        checkpoint_id: prepare.checkpoint_id,
+        assignment_digest: fence.digest().to_vec(),
+        watermark_status: WireStatus::CheckpointWatermarkActive as i32,
+        flags: prepare.flags,
+    };
+
+    assert_eq!(
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap(),
+        (NodeId(2), CheckpointWatermark::Active(91), false)
+    );
+
+    ack.disposition = ack_disposition_to_wire(BarrierAckDisposition::Prepared);
+    let (_, failure) =
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap_err();
+    assert!(matches!(failure, PeerFailure::Nack(message) if message.contains("explicit Captured")));
+
+    ack.disposition = ack_disposition_to_wire(BarrierAckDisposition::CapturedWithReplay);
+    let (_, failure) =
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap_err();
+    assert!(matches!(failure, PeerFailure::Nack(message) if message.contains("HANDOFF")));
+
+    prepare.flags = crate::checkpoint::flags::HANDOFF;
+    ack.flags = prepare.flags;
+    assert_eq!(
+        validate_capture_ack(NodeId(2), &prepare, Some(&fence.digest()), &ack).unwrap(),
+        (NodeId(2), CheckpointWatermark::Active(91), true)
+    );
+}
+
 #[cfg(all(test, feature = "cluster"))]
 mod grpc_tests {
     use super::*;
+    use crate::cluster::discovery::NodeState;
     use object_store::memory::InMemory;
     use std::net::SocketAddr;
 
@@ -970,12 +1094,14 @@ mod grpc_tests {
         let identity = BarrierIdentity {
             attempt: CheckpointAttempt::new(epoch, checkpoint_id),
             assignment_digest,
+            flags: 0,
         };
         let cached_ack = BarrierAck {
             epoch,
             checkpoint_id,
             assignment_digest,
-            ok: true,
+            flags: 0,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Active(17),
         };
@@ -1448,7 +1574,8 @@ mod grpc_tests {
                     .assignment_fence
                     .as_ref()
                     .map(crate::checkpoint::CheckpointAssignmentFence::digest),
-                ok: true,
+                flags: prepare.flags,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -1734,7 +1861,7 @@ mod grpc_tests {
 
         let error = leader.announce(&aligned).await.unwrap_err();
 
-        assert!(error.contains("successful exact Prepare quorum"), "{error}");
+        assert!(error.contains("successful exact capture quorum"), "{error}");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), leader_watch.changed())
                 .await
@@ -2416,7 +2543,8 @@ mod grpc_tests {
                 epoch: prepare.epoch,
                 checkpoint_id: prepare.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
-                ok: true,
+                flags: prepare.flags,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark: CheckpointWatermark::Active(91),
             })
@@ -2427,12 +2555,13 @@ mod grpc_tests {
             QuorumOutcome::Reached {
                 acks,
                 follower_watermark: CheckpointWatermark::Active(91),
+                handoff_replay_pending: false,
             } if acks == vec![NodeId(2)]
         ));
     }
 
     #[tokio::test]
-    async fn eager_prepare_ack_before_quorum_wait_is_retained() {
+    async fn captured_ack_reaches_quorum_while_durable_tail_is_blocked() {
         let (leader, follower, proof) = started_barrier_pair().await;
         let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
         let prepare = BarrierAnnouncement {
@@ -2449,17 +2578,23 @@ mod grpc_tests {
             .await
             .unwrap();
         wait_for_direct_prepare(&follower, &prepare).await;
+        let (durable_release_tx, durable_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let durable_tail = tokio::spawn(async move {
+            let _ = durable_release_rx.await;
+        });
         follower
             .ack(&BarrierAck {
                 epoch: prepare.epoch,
                 checkpoint_id: prepare.checkpoint_id,
                 assignment_digest: Some(fence.digest()),
-                ok: true,
+                flags: prepare.flags,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark: CheckpointWatermark::Active(92),
             })
             .await
             .unwrap();
+        assert!(!durable_tail.is_finished());
 
         let outcome = leader
             .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(1))
@@ -2469,8 +2604,12 @@ mod grpc_tests {
             QuorumOutcome::Reached {
                 acks,
                 follower_watermark: CheckpointWatermark::Active(92),
+                handoff_replay_pending: false,
             } if acks == vec![NodeId(2)]
         ));
+        assert!(!durable_tail.is_finished());
+        durable_release_tx.send(()).unwrap();
+        durable_tail.await.unwrap();
     }
 
     #[tokio::test]
@@ -2514,6 +2653,77 @@ mod grpc_tests {
         })
         .await
         .expect("caller timeout did not cancel the follower Prepare waiter");
+    }
+
+    #[tokio::test]
+    async fn fatal_prepare_ack_does_not_wait_for_a_silent_peer() {
+        let leader_kv = kv(NodeId(1));
+        let (store, proof) = lease_authority().await;
+        let leader = coordinator(leader_kv.clone(), Arc::clone(&store));
+        let follower_two = coordinator(kv(NodeId(2)), Arc::clone(&store));
+        let follower_three = coordinator(kv(NodeId(3)), store);
+        bind_process(&leader, 1, 1, 1);
+        bind_process(&follower_two, 2, 22, 1);
+        bind_process(&follower_three, 3, 33, 1);
+        install_local_proof(&leader, &proof);
+        leader
+            .start_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let follower_two_addr = follower_two
+            .start_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let follower_three_addr = follower_three
+            .start_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        leader_kv.seed(
+            NodeId(2),
+            BARRIER_ADDR_KEY,
+            endpoint_advertisement(follower_two_addr, 2, 22, 1),
+        );
+        leader_kv.seed(
+            NodeId(3),
+            BARRIER_ADDR_KEY,
+            endpoint_advertisement(follower_three_addr, 3, 33, 1),
+        );
+
+        let fence = test_fence(11, &[1, 2, 3], &[(1, 1), (2, 22), (3, 33)]);
+        let prepare = BarrierAnnouncement {
+            epoch: 3,
+            checkpoint_id: 3,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(proof),
+            phase: Phase::Prepare,
+            flags: 0,
+        };
+        leader
+            .announce_prepare(&prepare, Duration::from_secs(2))
+            .await
+            .unwrap();
+        wait_for_direct_prepare(&follower_two, &prepare).await;
+        wait_for_direct_prepare(&follower_three, &prepare).await;
+        follower_two
+            .ack(&BarrierAck {
+                epoch: prepare.epoch,
+                checkpoint_id: prepare.checkpoint_id,
+                assignment_digest: Some(fence.digest()),
+                flags: prepare.flags,
+                disposition: BarrierAckDisposition::Failed,
+                error: Some("injected prepare failure".into()),
+                watermark: CheckpointWatermark::Uninitialized,
+            })
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = leader
+            .wait_for_quorum(&prepare, &[NodeId(2), NodeId(3)], Duration::from_secs(2))
+            .await;
+        assert!(matches!(outcome, QuorumOutcome::Failed { failures }
+                if failures == vec![(NodeId(2), "injected prepare failure".into())]));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -2748,7 +2958,8 @@ mod grpc_tests {
                     epoch: 1,
                     checkpoint_id: 1,
                     assignment_digest: Some(follower_fence.digest()),
-                    ok: true,
+                    flags: 0,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Active(100),
                 })
@@ -2784,6 +2995,7 @@ mod grpc_tests {
             QuorumOutcome::Reached {
                 acks,
                 follower_watermark,
+                handoff_replay_pending: false,
             } => {
                 assert_eq!(acks, vec![NodeId(2)]);
                 assert_eq!(follower_watermark, CheckpointWatermark::Active(100));
@@ -2839,7 +3051,6 @@ mod grpc_tests {
             id: NodeId(node_id),
             name: format!("node-{node_id}"),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state,
             metadata: crate::cluster::discovery::NodeMetadata::default(),
             last_heartbeat_ms: 0,
@@ -2983,7 +3194,8 @@ mod grpc_tests {
                     epoch: announcement.epoch,
                     checkpoint_id: announcement.checkpoint_id,
                     assignment_digest: Some(follower_fence.digest()),
-                    ok: true,
+                    flags: announcement.flags,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Active(101),
                 })
@@ -2999,167 +3211,10 @@ mod grpc_tests {
                 QuorumOutcome::Reached {
                     acks,
                     follower_watermark: CheckpointWatermark::Active(101),
+                    handoff_replay_pending: false,
                 } if acks.as_slice() == [NodeId(2)]
             ),
             "the stale transport client must be evicted and re-resolved: {outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn terminal_hint_does_not_authorize_or_close_a_prepare_attempt() {
-        let leader_kv = kv(NodeId(1));
-        let follower_kv = kv(NodeId(2));
-        let (store, proof) = lease_authority().await;
-        let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
-        let follower_coord = coordinator(follower_kv.clone(), store);
-        let leader_addr = leader_coord
-            .start_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        let follower_addr = follower_coord
-            .start_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-        follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
-
-        let prepare = BarrierAnnouncement {
-            epoch: 11,
-            checkpoint_id: 11,
-            assignment_fence: None,
-            leader_proof: Some(proof),
-            phase: Phase::Prepare,
-            flags: 0,
-        };
-        leader_coord.announce(&prepare).await.unwrap();
-
-        let first = leader_coord.wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(2));
-        let duplicate =
-            leader_coord.wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(2));
-        let follower = async {
-            let _ = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
-            // Give both identical RPCs time to register before completing
-            // the local checkpoint once.
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            follower_coord
-                .ack(&BarrierAck {
-                    epoch: prepare.epoch,
-                    checkpoint_id: prepare.checkpoint_id,
-                    assignment_digest: None,
-                    ok: true,
-                    error: None,
-                    watermark: CheckpointWatermark::Active(77),
-                })
-                .await
-                .unwrap();
-        };
-        let (first, duplicate, ()) = tokio::join!(first, duplicate, follower);
-        assert!(matches!(first, QuorumOutcome::Reached { .. }), "{first:?}");
-        assert!(
-            matches!(duplicate, QuorumOutcome::Reached { .. }),
-            "{duplicate:?}"
-        );
-
-        // More retries before the decision reuse the immutable cached ACK;
-        // no second local checkpoint execution is required.
-        for _ in 0..2 {
-            let retry = leader_coord
-                .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(500))
-                .await;
-            assert!(matches!(retry, QuorumOutcome::Reached { .. }), "{retry:?}");
-        }
-
-        let commit = BarrierAnnouncement {
-            phase: Phase::Commit,
-            ..prepare.clone()
-        };
-        leader_coord.announce(&commit).await.unwrap();
-        let retry_after_hint = leader_coord
-            .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(500))
-            .await;
-        assert!(
-            matches!(retry_after_hint, QuorumOutcome::Reached { .. }),
-            "a terminal hint must not close an attempt without its immutable outcome: {retry_after_hint:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_nack_replaces_an_earlier_capture_ack() {
-        let leader_kv = kv(NodeId(1));
-        let follower_kv = kv(NodeId(2));
-        let (store, proof) = lease_authority().await;
-        let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
-        let follower_coord = coordinator(follower_kv.clone(), store);
-        let leader_addr = leader_coord
-            .start_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        let follower_addr = follower_coord
-            .start_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-        follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
-
-        let prepare = BarrierAnnouncement {
-            epoch: 12,
-            checkpoint_id: 12,
-            assignment_fence: None,
-            leader_proof: Some(proof),
-            phase: Phase::Prepare,
-            flags: 0,
-        };
-        leader_coord.announce(&prepare).await.unwrap();
-        let capture_wait =
-            leader_coord.wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(2));
-        let capture = async {
-            let _ = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
-            let received_at = follower_coord
-                .prepare_received_at(&prepare)
-                .expect("direct Prepare receipt must be retained");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(
-                received_at.elapsed() >= Duration::from_millis(50),
-                "delayed follower admission must not receive a fresh attempt budget"
-            );
-            follower_coord
-                .ack(&BarrierAck {
-                    epoch: prepare.epoch,
-                    checkpoint_id: prepare.checkpoint_id,
-                    assignment_digest: None,
-                    ok: true,
-                    error: None,
-                    watermark: CheckpointWatermark::Active(77),
-                })
-                .await
-                .unwrap();
-        };
-        let (capture_outcome, ()) = tokio::join!(capture_wait, capture);
-        assert!(
-            matches!(capture_outcome, QuorumOutcome::Reached { .. }),
-            "{capture_outcome:?}"
-        );
-
-        follower_coord
-            .ack(&BarrierAck {
-                epoch: prepare.epoch,
-                checkpoint_id: prepare.checkpoint_id,
-                assignment_digest: None,
-                ok: false,
-                error: Some("durable prepare failed".into()),
-                watermark: CheckpointWatermark::Active(77),
-            })
-            .await
-            .unwrap();
-
-        let retry = leader_coord
-            .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(2))
-            .await;
-        assert_eq!(
-            retry,
-            QuorumOutcome::Failed {
-                failures: vec![(NodeId(2), "durable prepare failed".into())],
-            }
         );
     }
 
@@ -3223,7 +3278,8 @@ mod grpc_tests {
                     epoch: accepted.epoch,
                     checkpoint_id: accepted.checkpoint_id,
                     assignment_digest: Some(accepted_fence.digest()),
-                    ok: true,
+                    flags: accepted.flags,
+                    disposition: BarrierAckDisposition::Captured,
                     error: None,
                     watermark: CheckpointWatermark::Uninitialized,
                 })
@@ -3674,89 +3730,6 @@ fn durable_terminal_is_authoritative_during_channel_merge() {
     .is_err());
 }
 
-/// The gRPC-vs-gossip merge in `observe`: a manually seeded gossip-only `Prepare` for a newer
-/// attempt supersedes an older gRPC value, while lagging gossip for the same exact attempt
-/// never masks terminal progress.
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn observe_merges_grpc_and_gossip_by_epoch() {
-    let leader_kv = kv(NodeId(1));
-    let follower_kv = kv(NodeId(2));
-    let leader_coord = BarrierCoordinator::new(leader_kv.clone());
-    let follower_coord = BarrierCoordinator::new(follower_kv.clone());
-
-    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let leader_addr = leader_coord.start_server(addr, None).await.unwrap();
-    let bound_addr = follower_coord.start_server(addr, None).await.unwrap();
-    leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
-    follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
-
-    // Epoch 5 aborts — delivered over gRPC, lands in the
-    // follower's latest-wins watch.
-    leader_coord
-        .announce(&BarrierAnnouncement {
-            epoch: 5,
-            checkpoint_id: 5,
-            assignment_fence: None,
-            leader_proof: None,
-            phase: Phase::Abort,
-            flags: 0,
-        })
-        .await
-        .unwrap();
-    for _ in 0..100 {
-        if let Some(ann) = follower_coord.observe_hint(NodeId(1)).await.unwrap() {
-            if ann.phase == Phase::Abort {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    // This uncertified local-mode Prepare is seeded in gossip KV only and must win the merge
-    // over the stale watch value.
-    let next = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 6,
-        checkpoint_id: 6,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
-    })
-    .unwrap();
-    follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, next);
-    let got = follower_coord
-        .observe_hint(NodeId(1))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(got.epoch, 6);
-    assert_eq!(got.phase, Phase::Prepare);
-
-    // Same-epoch lagging gossip must not mask the fresher gRPC
-    // value (RPC arrival order is authoritative within an epoch).
-    let stale = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 5,
-        checkpoint_id: 5,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
-    })
-    .unwrap();
-    follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, stale);
-    let got = follower_coord
-        .observe_hint(NodeId(1))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        got.phase,
-        Phase::Abort,
-        "lagging gossip must not mask the fresher gRPC announcement",
-    );
-}
-
 #[tokio::test]
 async fn leader_announces_follower_observes() {
     for terminal_phase in [Phase::Commit, Phase::Abort] {
@@ -3820,7 +3793,8 @@ async fn coordinator_rejects_noncanonical_attempts_before_publication() {
             epoch,
             checkpoint_id,
             assignment_digest: None,
-            ok: true,
+            flags: 0,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         };
@@ -4170,14 +4144,49 @@ async fn scan_latest_propagates_scan_failure() {
     assert_eq!(error, "injected scan failure");
 }
 
+fn certified_kv_prepare(attempt: u64, followers: &[NodeId], flags: u64) -> BarrierAnnouncement {
+    let mut owners = vec![1];
+    owners.extend(followers.iter().map(|node| node.0));
+    let participants = owners
+        .iter()
+        .map(|node| (*node, u128::from(*node) * 11))
+        .collect::<Vec<_>>();
+    BarrierAnnouncement {
+        epoch: attempt,
+        checkpoint_id: attempt,
+        assignment_fence: Some(test_fence(attempt, &owners, &participants)),
+        leader_proof: None,
+        phase: Phase::Prepare,
+        flags,
+    }
+}
+
+#[tokio::test]
+async fn remote_quorum_requires_an_assignment_certificate() {
+    let outcome = BarrierCoordinator::new(kv(NodeId(1)))
+        .wait_for_quorum(
+            &plain_announcement(7, 7),
+            &[NodeId(2)],
+            Duration::from_secs(1),
+        )
+        .await;
+    assert!(matches!(outcome, QuorumOutcome::Failed { .. }));
+}
+
 #[tokio::test]
 async fn quorum_reached_when_all_ack_success() {
     let k = kv(NodeId(1));
+    let prepare = certified_kv_prepare(7, &[NodeId(2), NodeId(3)], 0);
+    let assignment_digest = prepare
+        .assignment_fence
+        .as_ref()
+        .map(crate::checkpoint::CheckpointAssignmentFence::digest);
     let ack_json = serde_json::to_string(&BarrierAck {
         epoch: 7,
         checkpoint_id: 7,
-        assignment_digest: None,
-        ok: true,
+        assignment_digest,
+        flags: 0,
+        disposition: BarrierAckDisposition::Captured,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4186,14 +4195,6 @@ async fn quorum_reached_when_all_ack_success() {
     k.seed(NodeId(3), ACK_KEY, ack_json);
 
     let coord = BarrierCoordinator::new(k);
-    let prepare = BarrierAnnouncement {
-        epoch: 7,
-        checkpoint_id: 7,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
-    };
     let outcome = coord
         .wait_for_quorum(
             &prepare,
@@ -4205,6 +4206,7 @@ async fn quorum_reached_when_all_ack_success() {
         QuorumOutcome::Reached {
             mut acks,
             follower_watermark,
+            handoff_replay_pending: false,
         } => {
             acks.sort_by_key(|n| n.0);
             assert_eq!(acks, vec![NodeId(2), NodeId(3)]);
@@ -4217,6 +4219,11 @@ async fn quorum_reached_when_all_ack_success() {
 #[tokio::test]
 async fn uninitialized_participant_blocks_cluster_watermark_advancement() {
     let k = kv(NodeId(1));
+    let prepare = certified_kv_prepare(7, &[NodeId(2), NodeId(3)], 0);
+    let assignment_digest = prepare
+        .assignment_fence
+        .as_ref()
+        .map(crate::checkpoint::CheckpointAssignmentFence::digest);
     for (node, watermark) in [
         (NodeId(2), CheckpointWatermark::Active(100)),
         (NodeId(3), CheckpointWatermark::Uninitialized),
@@ -4227,8 +4234,9 @@ async fn uninitialized_participant_blocks_cluster_watermark_advancement() {
             serde_json::to_string(&BarrierAck {
                 epoch: 7,
                 checkpoint_id: 7,
-                assignment_digest: None,
-                ok: true,
+                assignment_digest,
+                flags: 0,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -4238,14 +4246,7 @@ async fn uninitialized_participant_blocks_cluster_watermark_advancement() {
 
     let outcome = BarrierCoordinator::new(k)
         .wait_for_quorum(
-            &BarrierAnnouncement {
-                epoch: 7,
-                checkpoint_id: 7,
-                assignment_fence: None,
-                leader_proof: None,
-                phase: Phase::Prepare,
-                flags: 0,
-            },
+            &prepare,
             &[NodeId(2), NodeId(3)],
             Duration::from_millis(200),
         )
@@ -4263,6 +4264,11 @@ async fn uninitialized_participant_blocks_cluster_watermark_advancement() {
 #[tokio::test]
 async fn idle_participant_is_excluded_from_cluster_watermark_minimum() {
     let k = kv(NodeId(1));
+    let prepare = certified_kv_prepare(7, &[NodeId(2), NodeId(3)], 0);
+    let assignment_digest = prepare
+        .assignment_fence
+        .as_ref()
+        .map(crate::checkpoint::CheckpointAssignmentFence::digest);
     for (node, watermark) in [
         (NodeId(2), CheckpointWatermark::Active(100)),
         (NodeId(3), CheckpointWatermark::Idle),
@@ -4273,8 +4279,9 @@ async fn idle_participant_is_excluded_from_cluster_watermark_minimum() {
             serde_json::to_string(&BarrierAck {
                 epoch: 7,
                 checkpoint_id: 7,
-                assignment_digest: None,
-                ok: true,
+                assignment_digest,
+                flags: 0,
+                disposition: BarrierAckDisposition::Captured,
                 error: None,
                 watermark,
             })
@@ -4284,14 +4291,7 @@ async fn idle_participant_is_excluded_from_cluster_watermark_minimum() {
 
     let outcome = BarrierCoordinator::new(k)
         .wait_for_quorum(
-            &BarrierAnnouncement {
-                epoch: 7,
-                checkpoint_id: 7,
-                assignment_fence: None,
-                leader_proof: None,
-                phase: Phase::Prepare,
-                flags: 0,
-            },
+            &prepare,
             &[NodeId(2), NodeId(3)],
             Duration::from_millis(200),
         )
@@ -4307,13 +4307,22 @@ async fn idle_participant_is_excluded_from_cluster_watermark_minimum() {
 }
 
 #[tokio::test]
-async fn quorum_timeout_when_follower_silent() {
+async fn quorum_timeout_dominates_prepared_with_replay_when_follower_silent() {
     let k = kv(NodeId(1));
+    let prepare = certified_kv_prepare(
+        8,
+        &[NodeId(2), NodeId(3)],
+        crate::checkpoint::flags::HANDOFF,
+    );
     let ack_json = serde_json::to_string(&BarrierAck {
         epoch: 8,
         checkpoint_id: 8,
-        assignment_digest: None,
-        ok: true,
+        assignment_digest: prepare
+            .assignment_fence
+            .as_ref()
+            .map(crate::checkpoint::CheckpointAssignmentFence::digest),
+        flags: crate::checkpoint::flags::HANDOFF,
+        disposition: BarrierAckDisposition::CapturedWithReplay,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4321,14 +4330,6 @@ async fn quorum_timeout_when_follower_silent() {
     k.seed(NodeId(2), ACK_KEY, ack_json);
 
     let coord = BarrierCoordinator::new(k);
-    let prepare = BarrierAnnouncement {
-        epoch: 8,
-        checkpoint_id: 8,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
-    };
     let outcome = coord
         .wait_for_quorum(
             &prepare,
@@ -4346,38 +4347,36 @@ async fn quorum_timeout_when_follower_silent() {
 }
 
 #[tokio::test]
-async fn quorum_fails_fast_on_reported_error() {
+async fn fatal_prepare_ack_dominates_prepared_with_replay() {
     let k = kv(NodeId(1));
-    let good = serde_json::to_string(&BarrierAck {
+    let flags = crate::checkpoint::flags::HANDOFF;
+    let prepare = certified_kv_prepare(9, &[NodeId(2), NodeId(3)], flags);
+    let assignment_digest = prepare
+        .assignment_fence
+        .as_ref()
+        .map(crate::checkpoint::CheckpointAssignmentFence::digest);
+    let replay = BarrierAck {
         epoch: 9,
         checkpoint_id: 9,
-        assignment_digest: None,
-        ok: true,
+        assignment_digest,
+        flags,
+        disposition: BarrierAckDisposition::CapturedWithReplay,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
-    })
-    .unwrap();
-    let bad = serde_json::to_string(&BarrierAck {
+    };
+    let failed = BarrierAck {
         epoch: 9,
         checkpoint_id: 9,
-        assignment_digest: None,
-        ok: false,
+        assignment_digest,
+        flags,
+        disposition: BarrierAckDisposition::Failed,
         error: Some("state snapshot failed: disk full".into()),
         watermark: CheckpointWatermark::Uninitialized,
-    })
-    .unwrap();
-    k.seed(NodeId(2), ACK_KEY, good);
-    k.seed(NodeId(3), ACK_KEY, bad);
-
-    let coord = BarrierCoordinator::new(k);
-    let prepare = BarrierAnnouncement {
-        epoch: 9,
-        checkpoint_id: 9,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
     };
+    k.seed(NodeId(2), ACK_KEY, serde_json::to_string(&replay).unwrap());
+    k.seed(NodeId(3), ACK_KEY, serde_json::to_string(&failed).unwrap());
+
+    let coord = BarrierCoordinator::new(k.clone());
     let outcome = coord
         .wait_for_quorum(&prepare, &[NodeId(2), NodeId(3)], Duration::from_secs(2))
         .await;
@@ -4389,16 +4388,41 @@ async fn quorum_fails_fast_on_reported_error() {
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+
+    k.seed(
+        NodeId(3),
+        ACK_KEY,
+        serde_json::to_string(&BarrierAck {
+            disposition: BarrierAckDisposition::Captured,
+            ..replay
+        })
+        .unwrap(),
+    );
+    assert_eq!(
+        coord
+            .wait_for_quorum(&prepare, &[NodeId(2), NodeId(3)], Duration::from_secs(2))
+            .await,
+        QuorumOutcome::Reached {
+            acks: vec![NodeId(2), NodeId(3)],
+            follower_watermark: CheckpointWatermark::Uninitialized,
+            handoff_replay_pending: true,
+        }
+    );
 }
 
 #[tokio::test]
 async fn wrong_epoch_ack_is_ignored() {
     let k = kv(NodeId(1));
+    let prepare = certified_kv_prepare(10, &[NodeId(2)], 0);
     let stale = serde_json::to_string(&BarrierAck {
         epoch: 9,
         checkpoint_id: 9,
-        assignment_digest: None,
-        ok: true,
+        assignment_digest: prepare
+            .assignment_fence
+            .as_ref()
+            .map(crate::checkpoint::CheckpointAssignmentFence::digest),
+        flags: 0,
+        disposition: BarrierAckDisposition::Captured,
         error: None,
         watermark: CheckpointWatermark::Uninitialized,
     })
@@ -4406,14 +4430,6 @@ async fn wrong_epoch_ack_is_ignored() {
     k.seed(NodeId(2), ACK_KEY, stale);
 
     let coord = BarrierCoordinator::new(k);
-    let prepare = BarrierAnnouncement {
-        epoch: 10,
-        checkpoint_id: 10,
-        assignment_fence: None,
-        leader_proof: None,
-        phase: Phase::Prepare,
-        flags: 0,
-    };
     let outcome = coord
         .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(100))
         .await;
@@ -4441,7 +4457,8 @@ async fn wrong_attempt_or_assignment_ack_is_ignored() {
             epoch: 9,
             checkpoint_id: 9,
             assignment_digest: Some(expected_fence.digest()),
-            ok: true,
+            flags: 0,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         },
@@ -4449,7 +4466,8 @@ async fn wrong_attempt_or_assignment_ack_is_ignored() {
             epoch: 10,
             checkpoint_id: 10,
             assignment_digest: Some(wrong_fence.digest()),
-            ok: true,
+            flags: 0,
+            disposition: BarrierAckDisposition::Captured,
             error: None,
             watermark: CheckpointWatermark::Uninitialized,
         },

@@ -6,9 +6,6 @@ mode = "single"
 bind = "127.0.0.1:8080"
 delivery = "best_effort"
 
-[state]
-backend = "in_process"
-
 [checkpoint]
 interval = "5s"
 

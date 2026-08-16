@@ -386,7 +386,6 @@ fn current_info(node: &NodeHandle) -> NodeInfo {
         id: node.instance_id,
         name: format!("minicluster-n{}", node.instance_id.0),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: minicluster_metadata(node.instance_id, node.process_generation),
         last_heartbeat_ms: 0,
@@ -398,6 +397,7 @@ fn minicluster_metadata(instance_id: NodeId, process_generation: u64) -> NodeMet
         uuid::Uuid::from_u128((u128::from(process_generation) << 64) | u128::from(instance_id.0));
     let mut metadata = NodeMetadata {
         cores: 1,
+        version: env!("CARGO_PKG_VERSION").into(),
         ..NodeMetadata::default()
     };
     metadata.tags.insert(
@@ -478,7 +478,6 @@ impl MiniCluster {
             id: instance_id,
             name: format!("minicluster-rejoin-{}", instance_id.0),
             rpc_address: String::new(),
-            raft_address: String::new(),
             state: NodeState::Active,
             metadata: minicluster_metadata(instance_id, process_generation),
             last_heartbeat_ms: 0,
@@ -552,7 +551,6 @@ impl MiniCluster {
                 id: instance_id,
                 name: format!("minicluster-n{idx}"),
                 rpc_address: String::new(),
-                raft_address: String::new(),
                 state: NodeState::Active,
                 metadata: minicluster_metadata(instance_id, process_generation),
                 last_heartbeat_ms: 0,

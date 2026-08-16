@@ -98,6 +98,13 @@ impl Default for DebeziumDeserializer {
     }
 }
 
+fn output_schema(schema: &SchemaRef) -> SchemaRef {
+    let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new("__op", DataType::Utf8, false)));
+    fields.push(Arc::new(Field::new("__ts_ms", DataType::Int64, false)));
+    Arc::new(Schema::new(fields))
+}
+
 impl RecordDeserializer for DebeziumDeserializer {
     fn deserialize(&self, data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, SerdeError> {
         let envelope: Value = serde_json::from_slice(data)?;
@@ -145,14 +152,25 @@ impl RecordDeserializer for DebeziumDeserializer {
         ts_builder.append_value(ts_ms);
         columns.push(Arc::new(ts_builder.finish()));
 
-        // Build extended schema with metadata columns
-        let mut fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
-        fields.push(Arc::new(Field::new("__op", DataType::Utf8, false)));
-        fields.push(Arc::new(Field::new("__ts_ms", DataType::Int64, false)));
-        let extended_schema = Arc::new(Schema::new(fields));
-
-        RecordBatch::try_new(extended_schema, columns)
+        RecordBatch::try_new(output_schema(schema), columns)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
+    }
+
+    fn deserialize_batch(
+        &self,
+        records: &[&[u8]],
+        schema: &SchemaRef,
+    ) -> Result<RecordBatch, SerdeError> {
+        if records.is_empty() {
+            return Ok(RecordBatch::new_empty(output_schema(schema)));
+        }
+        let batches = records
+            .iter()
+            .map(|record| self.deserialize(record, schema))
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = batches[0].schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|error| SerdeError::MalformedInput(format!("failed to concat batch: {error}")))
     }
 
     fn format(&self) -> Format {

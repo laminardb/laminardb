@@ -1,19 +1,27 @@
 //! Arrow IPC round-trip for `Vec<ScalarValue>`.
 //!
 //! Each tuple is a one-row `RecordBatch` encoded via the IPC stream format.
-//! Old `serde_json` checkpoints are incompatible; no migration.
 
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
+use arrow_ipc::reader::StreamDecoder;
 use datafusion_common::ScalarValue;
 
 use crate::error::DbError;
 
 /// Encode a scalar tuple as a one-row Arrow IPC stream; empty input → empty `Vec`.
+#[cfg(test)]
 pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError> {
+    scalars_to_ipc_bounded(scalars, usize::MAX)
+}
+
+pub(crate) fn scalars_to_ipc_bounded(
+    scalars: &[ScalarValue],
+    max_bytes: usize,
+) -> Result<Vec<u8>, DbError> {
     if scalars.is_empty() {
         return Ok(Vec::new());
     }
@@ -32,8 +40,12 @@ pub(crate) fn scalars_to_ipc(scalars: &[ScalarValue]) -> Result<Vec<u8>, DbError
         .collect::<Result<Vec<_>, _>>()?;
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|e| DbError::Pipeline(format!("scalar batch build: {e}")))?;
-    laminar_core::serialization::serialize_batch_stream(&batch)
-        .map_err(|e| DbError::Pipeline(format!("scalar IPC encode: {e}")))
+    laminar_core::serialization::serialize_batches_stream_bounded(
+        batch.schema().as_ref(),
+        std::iter::once(&batch),
+        max_bytes,
+    )
+    .map_err(|e| DbError::Pipeline(format!("scalar IPC encode: {e}")))
 }
 
 /// Decode bytes previously produced by [`scalars_to_ipc`]; empty input → empty `Vec`.
@@ -41,8 +53,38 @@ pub(crate) fn ipc_to_scalars(bytes: &[u8]) -> Result<Vec<ScalarValue>, DbError> 
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
-    let batch = laminar_core::serialization::deserialize_batch_stream(bytes)
-        .map_err(|e| DbError::Pipeline(format!("scalar IPC decode: {e}")))?;
+    let mut decoder = StreamDecoder::new();
+    let mut buffer = arrow::buffer::Buffer::from(bytes);
+    let mut batch = None;
+    while !buffer.is_empty() {
+        let next_batch = decoder.decode(&mut buffer).map_err(|error| {
+            if batch.is_some() {
+                DbError::Pipeline(format!(
+                    "scalar IPC contains trailing bytes after its record batch: {error}"
+                ))
+            } else {
+                DbError::Pipeline(format!("scalar IPC decode: {error}"))
+            }
+        })?;
+        if let Some(next_batch) = next_batch {
+            if batch.replace(next_batch).is_some() {
+                return Err(DbError::Pipeline(
+                    "scalar IPC contains more than one record batch".into(),
+                ));
+            }
+        }
+    }
+    decoder
+        .finish()
+        .map_err(|error| DbError::Pipeline(format!("scalar IPC decode: {error}")))?;
+    let batch =
+        batch.ok_or_else(|| DbError::Pipeline("scalar IPC contains no record batch".into()))?;
+    if batch.num_rows() != 1 {
+        return Err(DbError::Pipeline(format!(
+            "scalar IPC contains {} rows; expected 1",
+            batch.num_rows()
+        )));
+    }
     (0..batch.num_columns())
         .map(|i| {
             ScalarValue::try_from_array(batch.column(i), 0)
@@ -109,5 +151,44 @@ mod tests {
             }
             other => panic!("unexpected decoded scalar: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_noncanonical_stream_shape() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::DataType;
+        use arrow_ipc::writer::StreamWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef],
+        )
+        .unwrap();
+        let mut multiple = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut multiple, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(ipc_to_scalars(&multiple)
+            .unwrap_err()
+            .to_string()
+            .contains("more than one record batch"));
+
+        let mut trailing = scalars_to_ipc(&[ScalarValue::Int64(Some(1))]).unwrap();
+        trailing.push(0);
+        assert!(ipc_to_scalars(&trailing)
+            .unwrap_err()
+            .to_string()
+            .contains("trailing bytes"));
+
+        let oversized_header = [0xff; 8];
+        assert!(ipc_to_scalars(&oversized_header).is_err());
     }
 }

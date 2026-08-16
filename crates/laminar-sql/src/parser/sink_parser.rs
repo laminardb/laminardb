@@ -4,7 +4,7 @@
 //! ```sql
 //! CREATE [OR REPLACE] SINK [IF NOT EXISTS] name
 //! FROM table_name | (SELECT ...)
-//! [WITH ('key' = 'value', ...)];
+//! [INTO connector (...)] [FORMAT format [WITH (...)]];
 //! ```
 
 #[allow(clippy::disallowed_types)] // cold path: SQL parsing
@@ -82,27 +82,45 @@ pub fn parse_create_sink(parser: &mut Parser) -> Result<CreateSinkStatement, Par
     let (connector_type, connector_options) = parse_into_connector(parser)?;
 
     // Optional FORMAT <type> [WITH (key = 'value', ...)]
-    let (format, output_options) = parse_sink_format(parser)?;
+    let format = parse_sink_format(parser)?;
+    if format.is_some() && connector_type.is_none() {
+        return Err(ParseError::StreamingError(
+            "CREATE SINK FORMAT requires an explicit INTO connector".into(),
+        ));
+    }
+    if connector_options
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("format"))
+        || format.as_ref().is_some_and(|format| {
+            format
+                .options
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("format"))
+        })
+    {
+        return Err(ParseError::StreamingError(
+            "CREATE SINK option 'format' is unsupported; declare the format with the FORMAT clause"
+                .into(),
+        ));
+    }
 
-    // WITH options (optional) — only if we haven't consumed format WITH already
-    let with_options = if format.is_none() {
-        parse_with_options(parser)?
-    } else {
-        HashMap::new()
-    };
+    if try_parse_custom_keyword(parser, "WITH") {
+        return Err(ParseError::StreamingError(
+            "CREATE SINK trailing WITH is unsupported; put connector options in INTO (...) and format options in FORMAT ... WITH (...)"
+                .into(),
+        ));
+    }
     expect_statement_end(parser)?;
 
     Ok(CreateSinkStatement {
         name,
         from,
-        with_options,
         or_replace,
         if_not_exists,
         filter,
         connector_type,
         connector_options,
         format,
-        output_options,
     })
 }
 
@@ -154,13 +172,9 @@ fn parse_into_connector(
 }
 
 /// Parse optional `FORMAT <type> WITH (key = 'value', ...)` clause for sinks.
-///
-/// Returns `(format_spec, output_options)`.
-fn parse_sink_format(
-    parser: &mut Parser,
-) -> Result<(Option<FormatSpec>, HashMap<String, String>), ParseError> {
+fn parse_sink_format(parser: &mut Parser) -> Result<Option<FormatSpec>, ParseError> {
     if !try_parse_custom_keyword(parser, "FORMAT") {
-        return Ok((None, HashMap::new()));
+        return Ok(None);
     }
 
     // Format type name
@@ -174,16 +188,12 @@ fn parse_sink_format(
         }
     };
 
-    // WITH (key = 'value', ...) — output options like key specification
-    let output_options = parse_with_options(parser)?;
+    let options = parse_with_options(parser)?;
 
-    Ok((
-        Some(FormatSpec {
-            format_type,
-            options: HashMap::new(),
-        }),
-        output_options,
-    ))
+    Ok(Some(FormatSpec {
+        format_type,
+        options,
+    }))
 }
 
 /// Parse a single option key or value string.
@@ -227,27 +237,6 @@ mod tests {
         let sink = parse("CREATE SINK alerts FROM (SELECT * FROM events WHERE severity > 5)");
         assert_eq!(sink.name.to_string(), "alerts");
         assert!(matches!(sink.from, SinkFrom::Query(_)));
-    }
-
-    #[test]
-    fn test_create_sink_with_options() {
-        let sink = parse(
-            "CREATE SINK kafka_sink FROM orders WITH (
-                'connector' = 'kafka',
-                'topic' = 'processed_orders',
-                'format' = 'avro'
-            )",
-        );
-        assert_eq!(sink.name.to_string(), "kafka_sink");
-        assert_eq!(sink.with_options.len(), 3);
-        assert_eq!(
-            sink.with_options.get("connector"),
-            Some(&"kafka".to_string())
-        );
-        assert_eq!(
-            sink.with_options.get("topic"),
-            Some(&"processed_orders".to_string())
-        );
     }
 
     #[test]
@@ -307,30 +296,44 @@ mod tests {
         assert_eq!(sink.name.to_string(), "fraud_alerts");
         assert!(sink.filter.is_some());
         assert_eq!(sink.connector_type, Some("KAFKA".to_string()));
-        assert!(sink.format.is_some());
-        assert_eq!(sink.format.as_ref().unwrap().format_type, "JSON");
-        assert_eq!(sink.output_options.len(), 1);
-        assert_eq!(
-            sink.output_options.get("key"),
-            Some(&"session_id".to_string())
+        let format = sink.format.as_ref().unwrap();
+        assert_eq!(format.format_type, "JSON");
+        assert_eq!(format.options.len(), 1);
+        assert_eq!(format.options.get("key"), Some(&"session_id".to_string()));
+    }
+
+    #[test]
+    fn format_requires_connector() {
+        let dialect = LaminarDialect::default();
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("CREATE SINK output FROM events FORMAT JSON")
+            .unwrap();
+        let error = parse_create_sink(&mut parser).unwrap_err().to_string();
+        assert!(
+            error.contains("requires an explicit INTO connector"),
+            "{error}"
         );
     }
 
     #[test]
-    fn test_sink_format_json_no_connector() {
-        let sink = parse("CREATE SINK output FROM events FORMAT JSON WITH (key = 'id')");
-        assert!(sink.connector_type.is_none());
-        assert!(sink.format.is_some());
-        assert_eq!(sink.format.as_ref().unwrap().format_type, "JSON");
+    fn connector_local_format_is_rejected() {
+        let dialect = LaminarDialect::default();
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql("CREATE SINK output FROM events INTO KAFKA (format = 'json')")
+            .unwrap();
+        let error = parse_create_sink(&mut parser).unwrap_err().to_string();
+        assert!(
+            error.contains("declare the format with the FORMAT clause"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn test_sink_backward_compat() {
+    fn test_sink_without_connector() {
         let sink = parse("CREATE SINK output FROM events");
         assert!(sink.filter.is_none());
         assert!(sink.connector_type.is_none());
         assert!(sink.format.is_none());
-        assert!(sink.output_options.is_empty());
     }
 
     #[test]
@@ -343,5 +346,16 @@ mod tests {
         );
         assert_eq!(sink.connector_type, Some("KAFKA".to_string()));
         assert_eq!(sink.format.as_ref().unwrap().format_type, "AVRO");
+    }
+
+    #[test]
+    fn trailing_with_is_rejected() {
+        for option in ["'connector' = 'kafka'", "'buffer_size' = '4096'"] {
+            let sql = format!("CREATE SINK output FROM events WITH ({option})");
+            let dialect = LaminarDialect::default();
+            let mut parser = Parser::new(&dialect).try_with_sql(&sql).unwrap();
+            let error = parse_create_sink(&mut parser).unwrap_err().to_string();
+            assert!(error.contains("trailing WITH is unsupported"), "{error}");
+        }
     }
 }

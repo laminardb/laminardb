@@ -23,6 +23,30 @@ impl ClusterKv for FailedWriteKv {
     }
 }
 
+#[cfg(feature = "cluster")]
+struct PendingAnnouncementReadKv;
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl ClusterKv for PendingAnnouncementReadKv {
+    async fn write(&self, _key: &str, _value: String) {}
+
+    async fn read_from(&self, _who: NodeId, _key: &str) -> Option<String> {
+        None
+    }
+
+    async fn read_from_checked(&self, _who: NodeId, key: &str) -> Result<Option<String>, String> {
+        if key == ANNOUNCEMENT_KEY {
+            return std::future::pending::<Result<Option<String>, String>>().await;
+        }
+        Ok(None)
+    }
+
+    async fn scan(&self, _key: &str) -> Vec<(NodeId, String)> {
+        Vec::new()
+    }
+}
+
 struct DelayedRecoveryKv {
     inner: InMemoryKv,
     block_next_recovery_write: std::sync::atomic::AtomicBool,
@@ -204,6 +228,63 @@ impl FaultyReadyReadKv {
     }
 }
 
+struct EvidenceReadGateKv {
+    inner: InMemoryKv,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl EvidenceReadGateKv {
+    fn new(local_id: NodeId) -> Self {
+        Self {
+            inner: InMemoryKv::new(local_id),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        assert!(!self.armed.swap(true, Ordering::AcqRel));
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+
+    fn release_blocked_read(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl ClusterKv for EvidenceReadGateKv {
+    async fn write(&self, key: &str, value: String) {
+        self.inner.write(key, value).await;
+    }
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        self.inner.read_from(who, key).await
+    }
+
+    async fn read_from_checked(&self, who: NodeId, key: &str) -> Result<Option<String>, String> {
+        if key == ADOPTED_ASSIGNMENT_KEY && self.armed.swap(false, Ordering::AcqRel) {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?
+                .forget();
+        }
+        Ok(self.inner.read_from(who, key).await)
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        self.inner.scan(key).await
+    }
+}
+
 impl DelayedRecoveryKv {
     fn new(local_id: NodeId) -> Self {
         Self {
@@ -285,7 +366,6 @@ fn info(id: u64) -> NodeInfo {
         id: NodeId(id),
         name: format!("n{id}"),
         rpc_address: String::new(),
-        raft_address: String::new(),
         state: NodeState::Active,
         metadata: NodeMetadata::default(),
         last_heartbeat_ms: 0,
@@ -296,6 +376,36 @@ fn ctl(self_id: u64, peers: Vec<NodeInfo>) -> ClusterController {
     let (_tx, rx) = watch::channel(peers);
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(self_id)));
     ClusterController::new(NodeId(self_id), kv, None, rx)
+}
+
+fn assignment_adoption(
+    controller: &ClusterController,
+    assignment_version: u64,
+) -> CheckpointAssignmentAdoption {
+    let owners = [controller.instance_id().0; 3];
+    CheckpointAssignmentAdoption {
+        participant: CheckpointParticipant {
+            node_id: controller.instance_id().0,
+            boot_incarnation: controller.recovery_incarnation(),
+        },
+        assignment_version,
+        partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
+        vnode_count: u32::try_from(owners.len()).unwrap(),
+        assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+        vnode_state_ready: true,
+    }
+}
+
+fn assignment_fence_for_adoption(
+    adoption: &CheckpointAssignmentAdoption,
+) -> CheckpointAssignmentFence {
+    let owners = vec![adoption.participant.node_id; usize::try_from(adoption.vnode_count).unwrap()];
+    CheckpointAssignmentFence::from_owner_map(
+        adoption.assignment_version,
+        &owners,
+        vec![adoption.participant],
+    )
+    .unwrap()
 }
 
 fn checkpoint_fence_and_drain(
@@ -417,6 +527,12 @@ async fn recovery_authority_rejects_a_structural_but_undurable_process_fence() {
             encoded_len: 1,
         },
         vec![forged],
+        crate::checkpoint::CommittedCheckpointRef {
+            epoch: 1,
+            checkpoint_id: 1,
+            sha256: "0".repeat(64),
+            len: 1,
+        },
         lease.proof(),
     )
     .unwrap();
@@ -974,6 +1090,51 @@ fn leader_proof_rejects_restarted_owner_and_stale_token() {
         "a new boot on the same stable node is a different owner"
     );
     assert!(!c.proof_is_live(&stale));
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn leader_gate_tracks_deadline_generations_without_reviving_a_stale_proof() {
+    use crate::cluster::control::{LeaderLease, LeaderLeaseOwner, LeaseDeadline};
+
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: Uuid::from_u128(1),
+        process_term: 7,
+    };
+    let lease = |token| LeaderLease {
+        seq: token,
+        renewal_sequence: token,
+        token,
+        owner: owner.clone(),
+        expires_at_ms: i64::MIN,
+        catalog_manifest: None,
+    };
+    let c = ctl(1, vec![info(5)]);
+    c.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))))
+        .unwrap();
+    let old_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
+    let (lease_tx, lease_rx) = watch::channel(Some(lease(1)));
+    let (deadline_tx, deadline_rx) = watch::channel(Arc::clone(&old_deadline));
+    c.set_leader_lease_runtime_watches(lease_rx, owner.clone(), deadline_rx)
+        .unwrap();
+
+    let stale = c.capture_leader_proof().expect("initial live proof");
+    old_deadline.fence();
+    lease_tx.send_replace(None);
+    let next_deadline = Arc::new(LeaseDeadline::uninitialized());
+    deadline_tx.send_replace(Arc::clone(&next_deadline));
+    assert!(!c.is_leader());
+    assert!(!c.proof_is_live(&stale));
+
+    next_deadline.extend(Duration::from_secs(10));
+    lease_tx.send_replace(Some(lease(2)));
+    let current = c.capture_leader_proof().expect("rotated live proof");
+    assert_eq!(current.fencing_token, 2);
+    assert!(c.proof_is_live(&current));
+    assert!(!c.proof_is_live(&stale));
+    assert!(!old_deadline.is_live());
+    assert!(next_deadline.is_live());
 }
 
 #[test]
@@ -1751,6 +1912,49 @@ fn quorum_miss_quarantine_requires_an_ack_or_a_different_boot() {
 }
 
 #[test]
+fn recovery_ack_clears_only_the_exact_quarantined_boot() {
+    let c = ctl(1, vec![info(2)]);
+    let failed = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: Uuid::from_u128(22),
+    };
+    let successor = CheckpointParticipant {
+        node_id: 2,
+        boot_incarnation: Uuid::from_u128(23),
+    };
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: c.recovery_incarnation(),
+            },
+            failed,
+        ],
+    )
+    .unwrap();
+    c.publish_checkpoint_assignment_fence(Some(fence));
+    c.note_unresponsive(&[NodeId(2)]);
+
+    c.note_recovery_responsive(&[successor]);
+    assert!(
+        c.is_unresponsive(NodeId(2)),
+        "an acknowledgement from another boot must not clear the failed boot"
+    );
+    c.note_recovery_responsive(&[failed]);
+    assert!(!c.is_unresponsive(NodeId(2)));
+
+    c.publish_checkpoint_assignment_fence(None);
+    c.note_unresponsive(&[NodeId(2)]);
+    c.note_recovery_responsive(&[failed]);
+    assert!(
+        c.is_unresponsive(NodeId(2)),
+        "an unbound quarantine requires an ordinary checkpoint acknowledgement"
+    );
+}
+
+#[test]
 fn assignable_with_locality_attaches_self_and_peer_domains() {
     let mut peer = info(3);
     peer.metadata.failure_domain = Some("region=r;zone=z2".to_string());
@@ -1812,6 +2016,24 @@ async fn wait_for_barrier_propagates_observation_failure_immediately() {
         error.contains("malformed durable barrier announcement"),
         "{error}"
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn wait_for_barrier_bounds_a_pending_initial_observation() {
+    let kv: Arc<dyn ClusterKv> = Arc::new(PendingAnnouncementReadKv);
+    let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+    let follower = ClusterController::new(NodeId(2), kv, None, members_rx);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(100);
+
+    let observed = follower
+        .wait_for_barrier(|_| true, Duration::from_millis(100))
+        .await
+        .expect("a pending observation must become an ordinary bounded miss");
+
+    assert!(observed.is_none());
+    assert_eq!(tokio::time::Instant::now(), deadline);
 }
 
 #[cfg(feature = "cluster")]
@@ -1908,6 +2130,210 @@ async fn checkpoint_prepare_without_assignment_still_requires_durable_authority(
         .await
         .expect_err("a malformed Prepare must not bypass durable leader validation");
     assert!(error.contains("no durable leader lease exists"), "{error}");
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn checkpoint_prepare_hint_observation_stops_at_caller_timeout() {
+    let kv: Arc<dyn ClusterKv> = Arc::new(PendingAnnouncementReadKv);
+    let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+    let follower = ClusterController::new(NodeId(2), kv, None, members_rx);
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(100);
+
+    let error = follower
+        .observe_checkpoint_prepare_until(Duration::from_millis(100))
+        .await
+        .expect_err("a stalled Prepare hint read must respect the caller timeout");
+
+    assert!(error.contains("hint observation timed out"), "{error}");
+    assert_eq!(tokio::time::Instant::now(), deadline);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn stale_direct_prepare_does_not_shorten_newer_gossip_observation() {
+    use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
+
+    let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+    let control_kv: Arc<dyn ClusterKv> = follower_kv.clone();
+    let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+    let follower = ClusterController::new(NodeId(2), control_kv, None, members_rx);
+
+    let authority = Arc::new(super::super::LeaderLeaseStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        1_000,
+    ));
+    let leader_boot = Uuid::from_u128(11);
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: leader_boot,
+        process_term: 3,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("empty leader authority must be acquired");
+    };
+    follower.set_leader_lease_store(authority);
+
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: leader_boot,
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: follower.recovery_incarnation(),
+            },
+        ],
+    )
+    .unwrap();
+    follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    follower
+        .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+        .await
+        .unwrap();
+
+    let old_prepare = BarrierAnnouncement {
+        epoch: 9,
+        checkpoint_id: 9,
+        assignment_fence: Some(fence.clone()),
+        leader_proof: Some(lease.proof()),
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    let old_received_at = tokio::time::Instant::now();
+    follower
+        .barrier
+        .inject_direct_prepare_observation_for_test(old_prepare.clone(), old_received_at.into_std())
+        .await
+        .unwrap();
+    assert_eq!(
+        follower.checkpoint_prepare_received_at(&old_prepare),
+        Some(old_received_at.into_std())
+    );
+
+    let checkpoint_timeout = Duration::from_millis(100);
+    tokio::time::advance(checkpoint_timeout + Duration::from_millis(1)).await;
+    let newer_prepare = BarrierAnnouncement {
+        epoch: 10,
+        checkpoint_id: 10,
+        ..old_prepare
+    };
+    follower_kv.seed(
+        NodeId(1),
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&newer_prepare).unwrap(),
+    );
+
+    let observed_at = tokio::time::Instant::now();
+    let observed = follower
+        .observe_checkpoint_prepare_until(checkpoint_timeout)
+        .await
+        .expect("an unrelated expired direct Prepare must not block newer gossip")
+        .expect("the newer gossip Prepare must be observed");
+    let CheckpointPrepareObservation::AssignmentReady(observed) = observed else {
+        panic!("the newer gossip Prepare must match the installed assignment");
+    };
+    assert_eq!(observed, newer_prepare);
+    assert_eq!(
+        follower.checkpoint_prepare_received_at(&observed),
+        Some(observed_at.into_std()),
+        "the newer identity must receive its own non-refreshed observation clock"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn checkpoint_prepare_authority_timeout_does_not_refresh_gossip_identity_clock() {
+    use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
+
+    let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+    let control_kv: Arc<dyn ClusterKv> = follower_kv.clone();
+    let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+    let follower = ClusterController::new(NodeId(2), control_kv, None, members_rx);
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let gate = Arc::new(AuthorityIoGateStore::new(
+        backing,
+        AuthorityIoGateOperation::Get,
+    ));
+    let gated_backing: Arc<dyn object_store::ObjectStore> = gate.clone();
+    let authority = Arc::new(super::super::LeaderLeaseStore::new(gated_backing, 1_000));
+    let leader_boot = Uuid::from_u128(11);
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: leader_boot,
+        process_term: 3,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("empty leader authority must be acquired");
+    };
+    follower.set_leader_lease_store(authority);
+
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: leader_boot,
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: follower.recovery_incarnation(),
+            },
+        ],
+    )
+    .unwrap();
+    follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    let announcement = BarrierAnnouncement {
+        epoch: 9,
+        checkpoint_id: 9,
+        assignment_fence: Some(fence),
+        leader_proof: Some(lease.proof()),
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    follower_kv.seed(
+        NodeId(1),
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&announcement).unwrap(),
+    );
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(100);
+    gate.arm();
+    let observed = follower.observe_checkpoint_prepare_until(Duration::from_millis(100));
+    tokio::pin!(observed);
+    tokio::select! {
+        () = gate.wait_until_blocked() => {}
+        result = &mut observed => panic!("authority validation returned before its gate: {result:?}"),
+    }
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let error = observed
+        .await
+        .expect_err("a stalled authority read must respect the exact Prepare deadline");
+    assert!(error.contains("authority validation timed out"), "{error}");
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(
+        follower.checkpoint_prepare_received_at(&announcement),
+        Some(started.into_std())
+    );
+
+    let retry_started = tokio::time::Instant::now();
+    let retry_error = follower
+        .observe_checkpoint_prepare_until(Duration::from_millis(100))
+        .await
+        .expect_err("re-observation must not refresh the exact identity deadline");
+    assert!(
+        retry_error.contains("deadline elapsed before authority validation"),
+        "{retry_error}"
+    );
+    assert_eq!(tokio::time::Instant::now(), retry_started);
 }
 
 #[cfg(feature = "cluster")]
@@ -2019,6 +2445,7 @@ async fn adopted_assignment_report_binds_the_current_process_and_exact_map() {
         partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
         vnode_count: u32::try_from(owners.len()).unwrap(),
         assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+        vnode_state_ready: true,
     };
     c.announce_adopted_assignment(&report).await.unwrap();
     assert_eq!(
@@ -2026,9 +2453,306 @@ async fn adopted_assignment_report_binds_the_current_process_and_exact_map() {
         vec![(NodeId(1), report.clone())]
     );
 
-    let mut restarted = report;
+    let mut withdrawn = report;
+    withdrawn.vnode_state_ready = false;
+    c.announce_adopted_assignment(&withdrawn).await.unwrap();
+    assert_eq!(
+        c.read_adopted_assignments().await.unwrap(),
+        vec![(NodeId(1), withdrawn.clone())]
+    );
+
+    let mut restarted = withdrawn;
     restarted.participant.boot_incarnation = Uuid::new_v4();
     assert!(c.announce_adopted_assignment(&restarted).await.is_err());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_is_exact_compact_and_round_trips() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(101);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    let (_authority, proof) = install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+
+    let evidence = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap();
+    assert_eq!(evidence.participant, adoption.participant);
+    assert_eq!(evidence.process_term, proof.owner.process_term);
+    assert_eq!(evidence.adopted_assignment, adoption);
+
+    let identity = controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
+    assert!(identity.is_canonical());
+    assert_eq!(identity.participant, evidence.participant);
+    assert_eq!(identity.process_term, evidence.process_term);
+
+    let transition = controller.process_authority_transition.lock();
+    let error = controller
+        .try_live_local_process_authority_identity()
+        .expect_err("the nonblocking sampler must not wait behind an authority transition");
+    assert!(error.contains("transition is in progress"), "{error}");
+    drop(transition);
+
+    let encoded = serde_json::to_vec(&evidence).unwrap();
+    assert!(encoded.len() <= 4 * 1_024, "{} bytes", encoded.len());
+    assert_eq!(
+        serde_json::from_slice::<LocalProcessAuthorityEvidence>(&encoded).unwrap(),
+        evidence
+    );
+
+    controller.fence_process_lease();
+    let error = controller
+        .try_live_local_process_authority_identity()
+        .expect_err("a terminally fenced process must not expose live identity");
+    assert!(error.contains("not live"), "{error}");
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_requires_the_live_exact_assignment_fence() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(151);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("no durable assignment adoption")
+        ),
+        "{error}"
+    );
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+    assert_eq!(
+        controller
+            .read_local_process_authority_evidence()
+            .await
+            .unwrap()
+            .adopted_assignment,
+        adoption.clone()
+    );
+
+    controller.publish_checkpoint_assignment_fence(None);
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("audited assignment fence is unavailable")
+        ),
+        "durable publication alone must not survive local watcher suspension: {error}"
+    );
+
+    let mismatched_fence = CheckpointAssignmentFence::from_owner_map(
+        adoption.assignment_version,
+        &[node.0, node.0],
+        vec![adoption.participant],
+    )
+    .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(mismatched_fence));
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("contradicts the same-version")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_ignores_canonical_prior_boot_adoption() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(201);
+    let prior_boot = Uuid::from_u128(200);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+
+    let current_adoption = assignment_adoption(&controller, 6);
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(
+        &current_adoption,
+    )));
+    let mut stale_adoption = current_adoption;
+    stale_adoption.participant.boot_incarnation = prior_boot;
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        serde_json::to_string(&stale_adoption).unwrap(),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("prior local boot")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_rejects_noncanonical_or_oversized_adoption() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(301);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    let mut adoption_with_unknown_field = serde_json::to_value(&adoption).unwrap();
+    adoption_with_unknown_field
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        serde_json::to_string(&adoption_with_unknown_field).unwrap(),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("unknown field")
+        ),
+        "{error}"
+    );
+
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        "x".repeat(MAX_ADOPTED_ASSIGNMENT_BYTES + 1),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("expected 1..=")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_revalidates_lease_after_point_reads() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(401);
+    let recovery = Arc::new(EvidenceReadGateKv::new(node));
+    let control: Arc<dyn ClusterKv> = recovery.clone();
+    let recovery_kv: Arc<dyn ClusterKv> = recovery.clone();
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery_kv,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    ));
+    install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+
+    recovery.arm();
+    let reading = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move { controller.read_local_process_authority_evidence().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), recovery.wait_until_blocked())
+        .await
+        .expect("local evidence read did not reach the injected point-read gate");
+    controller.fence_process_lease();
+    recovery.release_blocked_read();
+
+    let error = reading.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("lease authority")
+        ),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -2041,9 +2765,17 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
     let kv = Arc::new(InMemoryKv::new(self_id));
     let control: Arc<dyn ClusterKv> = kv.clone();
     let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
     let (_members_tx, members_rx) = watch::channel(vec![info(peer_id.0)]);
     let controller = ClusterController::new_with_recovery_incarnation(
-        self_id, control, recovery, None, members_rx, self_boot,
+        self_id,
+        control,
+        recovery,
+        Some(Arc::clone(&assignment_store)),
+        members_rx,
+        self_boot,
     );
     controller.publish_recovery_incarnation().await.unwrap();
     kv.seed(peer_id, RECOVERY_INCARNATION_KEY, peer_boot.to_string());
@@ -2057,12 +2789,26 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
             boot_incarnation: peer_boot,
         },
     ];
-    let predecessor =
-        CheckpointAssignmentFence::from_owner_map(7, &[self_id.0, peer_id.0], participants.clone())
-            .unwrap();
-    let target =
-        CheckpointAssignmentFence::from_owner_map(8, &[peer_id.0, self_id.0], participants.clone())
-            .unwrap();
+    let first = super::super::AssignmentSnapshot::empty()
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, self_id), (1, peer_id)]),
+            participants.clone(),
+        )
+        .unwrap();
+    assignment_store.save_if_absent(&first).await.unwrap();
+    let predecessor_snapshot = first
+        .next_for_participants(
+            std::collections::BTreeMap::from([(0, self_id), (1, peer_id)]),
+            participants.clone(),
+        )
+        .unwrap();
+    assert!(matches!(
+        assignment_store
+            .save_if_version(&predecessor_snapshot, first.version)
+            .await
+            .unwrap(),
+        super::super::RotateOutcome::Rotated
+    ));
     let authority = Arc::new(super::super::LeaderLeaseStore::new(
         Arc::new(object_store::memory::InMemory::new()),
         1_000,
@@ -2078,7 +2824,21 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
         panic!("empty authority must be acquired");
     };
     controller.set_leader_lease_store(authority);
-    let transition = AssignmentDrainTransition::new(predecessor, target, lease.proof()).unwrap();
+    let draining = predecessor_snapshot
+        .next_draining(
+            std::collections::BTreeMap::from([(0, peer_id), (1, self_id)]),
+            participants.clone(),
+            lease.proof(),
+        )
+        .unwrap();
+    assert!(matches!(
+        assignment_store
+            .save_if_version(&draining, predecessor_snapshot.version)
+            .await
+            .unwrap(),
+        super::super::RotateOutcome::Rotated
+    ));
+    let transition = draining.drain_transition.clone().unwrap();
     controller.publish_checkpoint_drain_transition(Some(transition.clone()));
     controller.announce_drain_ack(&transition).await.unwrap();
     assert!(
@@ -2103,9 +2863,7 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
         .await
         .unwrap());
 
-    let stale_predecessor =
-        CheckpointAssignmentFence::from_owner_map(6, &[self_id.0, peer_id.0], participants.clone())
-            .unwrap();
+    let stale_predecessor = first.assignment_fence().unwrap();
     let stale_transition = AssignmentDrainTransition::new(
         stale_predecessor,
         transition.predecessor.clone(),
@@ -2118,9 +2876,12 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
         .await
         .unwrap());
 
-    let future_target =
-        CheckpointAssignmentFence::from_owner_map(9, &[self_id.0, peer_id.0], participants.clone())
-            .unwrap();
+    let future_target = CheckpointAssignmentFence::from_owner_map(
+        transition.target.assignment_version + 1,
+        &[self_id.0, peer_id.0],
+        participants.clone(),
+    )
+    .unwrap();
     let future_transition = AssignmentDrainTransition::new(
         transition.target.clone(),
         future_target,
@@ -2179,6 +2940,27 @@ async fn drain_quorum_requires_the_exact_current_boot_roster_and_certificate() {
             .await
             .unwrap(),
         "a restart invalidates an acknowledgement from the previous boot"
+    );
+    kv.seed(peer_id, RECOVERY_INCARNATION_KEY, peer_boot.to_string());
+    assert!(controller
+        .drain_ack_quorum_reached(&transition)
+        .await
+        .unwrap());
+
+    let committed = draining.committed_target().unwrap();
+    assert!(matches!(
+        assignment_store
+            .finalize_drain(&draining, &committed)
+            .await
+            .unwrap(),
+        super::super::RotateOutcome::Rotated
+    ));
+    assert!(
+        !controller
+            .drain_ack_quorum_reached(&transition)
+            .await
+            .unwrap(),
+        "immutable receipts cannot authorize HANDOFF after terminal materialization"
     );
 }
 
@@ -2246,6 +3028,127 @@ fn publish_cluster_min_watermark_is_monotonic() {
     // Equal value is a no-op; still Some(250).
     c.publish_cluster_min_watermark(250);
     assert_eq!(c.cluster_min_watermark(), Some(250));
+}
+
+#[test]
+fn committed_channel_progress_publishes_source_specific_frontiers() {
+    use crate::checkpoint::ChannelProgress;
+
+    let channel = |source_name: &str, input_channel: u8, watermark: Option<i64>, idle: bool| {
+        ChannelProgress {
+            participant_id: 1,
+            source_name: source_name.into(),
+            input_channel: vec![input_channel],
+            watermark,
+            idle,
+        }
+    };
+    let c = ctl(1, vec![]);
+    c.publish_committed_channel_progress(&[
+        channel("fast", 0, Some(1_000), false),
+        channel("fast", 1, Some(900), false),
+        channel("slow", 0, Some(100), false),
+        channel("all_idle", 0, Some(300), true),
+        channel("all_idle", 1, Some(400), true),
+        channel("mixed", 0, Some(250), false),
+        channel("mixed", 1, Some(900), true),
+    ])
+    .unwrap();
+
+    assert_eq!(c.cluster_min_watermark(), Some(100));
+    let first = c.committed_source_watermarks_snapshot();
+    assert_eq!(first.get("fast"), Some(&900));
+    assert_eq!(first.get("slow"), Some(&100));
+    assert_eq!(first.get("all_idle"), Some(&400));
+    assert_eq!(first.get("mixed"), Some(&250));
+    assert_eq!(first.get("absent"), None);
+
+    // A later publication cannot regress an already installed source frontier.
+    c.publish_committed_channel_progress(&[
+        channel("fast", 0, Some(800), false),
+        channel("slow", 0, Some(200), false),
+    ])
+    .unwrap();
+    assert_eq!(c.cluster_min_watermark(), Some(200));
+    let second = c.committed_source_watermarks_snapshot();
+    assert_eq!(second.get("fast"), Some(&900));
+    assert_eq!(second.get("slow"), Some(&200));
+    assert_eq!(first.get("slow"), Some(&100));
+
+    let withheld = ctl(1, vec![]);
+    withheld
+        .publish_committed_channel_progress(&[
+            channel("withheld", 0, None, false),
+            channel("withheld", 1, Some(700), true),
+        ])
+        .unwrap();
+    assert_eq!(withheld.cluster_min_watermark(), None);
+    assert!(
+        !withheld
+            .committed_source_watermarks_snapshot()
+            .contains_key("withheld"),
+        "an idle initialized channel must not override an active uninitialized sibling"
+    );
+}
+
+#[test]
+fn committed_checkpoint_progress_restores_an_empty_sources_retained_frontier() {
+    let controller = ctl(1, vec![]);
+    let retained = std::collections::BTreeMap::from([("orders".to_owned(), 900)]);
+
+    controller
+        .publish_committed_checkpoint_progress(&[], &retained)
+        .unwrap();
+
+    assert_eq!(controller.cluster_min_watermark(), None);
+    assert_eq!(
+        controller
+            .committed_source_watermarks_snapshot()
+            .get("orders"),
+        Some(&900)
+    );
+}
+
+#[test]
+fn recovered_checkpoint_progress_exactly_replaces_a_newer_live_cut_and_genesis_clears_it() {
+    use crate::checkpoint::ChannelProgress;
+
+    let channel = |watermark| ChannelProgress {
+        participant_id: 1,
+        source_name: "orders".into(),
+        input_channel: vec![0],
+        watermark: Some(watermark),
+        idle: false,
+    };
+    let controller = ctl(1, vec![]);
+    controller
+        .publish_committed_checkpoint_progress(
+            &[channel(900)],
+            &std::collections::BTreeMap::from([("orders".to_owned(), 900)]),
+        )
+        .unwrap();
+    let newer_snapshot = controller.committed_source_watermarks_snapshot();
+
+    controller
+        .replace_recovered_checkpoint_progress(
+            &[channel(100)],
+            &std::collections::BTreeMap::from([("orders".to_owned(), 100)]),
+        )
+        .unwrap();
+    assert_eq!(controller.cluster_min_watermark(), Some(100));
+    assert_eq!(
+        controller
+            .committed_source_watermarks_snapshot()
+            .get("orders"),
+        Some(&100)
+    );
+    assert_eq!(newer_snapshot.get("orders"), Some(&900));
+
+    controller
+        .replace_recovered_checkpoint_progress(&[], &std::collections::BTreeMap::new())
+        .unwrap();
+    assert_eq!(controller.cluster_min_watermark(), None);
+    assert!(controller.committed_source_watermarks_snapshot().is_empty());
 }
 
 async fn install_recovery_authority(
@@ -2341,6 +3244,7 @@ fn recovery_round_with_evidence(
     let mut faults = vec![RecoveryFault {
         reporter: NodeId(leader_proof.owner.node_id),
         sequence: generation,
+        disposition: RecoveryFaultDisposition::Recoverable,
     }];
     faults.extend(
         evidence_participants
@@ -2348,6 +3252,7 @@ fn recovery_round_with_evidence(
             .map(|participant| RecoveryFault {
                 reporter: NodeId(participant.node_id),
                 sequence: generation,
+                disposition: RecoveryFaultDisposition::Recoverable,
             }),
     );
     faults.sort_unstable_by_key(|fault| fault.reporter);
@@ -2441,6 +3346,37 @@ async fn report_new_local_fault(controller: &ClusterController) {
     controller.report_fault(request).await.unwrap();
 }
 
+#[tokio::test]
+async fn terminal_fault_arriving_after_prepare_blocks_start_and_preserves_prepare() {
+    let controller = ctl(1, vec![]);
+    let (_authority, proof) = install_recovery_authority(&controller, 10_000).await;
+    let request = controller.next_recovery_fault_request().unwrap();
+    assert_eq!(
+        controller.report_fault(request).await.unwrap(),
+        RecoveryFaultReportOutcome::Active
+    );
+    let round = recovery_round_from_current_faults(&controller, 47, &proof, &[1]).await;
+    controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+    controller.announce_recover_prepare(&round).await.unwrap();
+
+    assert_eq!(
+        controller.report_terminal_fault(request).await.unwrap(),
+        RecoveryFaultReportOutcome::Active
+    );
+    let error = controller
+        .announce_recover_start(&round, 9)
+        .await
+        .unwrap_err();
+    assert!(error.contains("fault set changed"), "{error}");
+    assert_eq!(
+        controller.observe_recover().await.unwrap(),
+        Some(RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Prepare,
+        })
+    );
+}
+
 async fn supersede_test_process_lease(
     controller: &ClusterController,
 ) -> super::super::ProcessLease {
@@ -2471,28 +3407,13 @@ async fn supersede_test_process_lease(
     successor
 }
 
-fn prepared_witness(checkpoint_id: u64, participant_id: u64) -> PreparedCheckpointWitness {
-    PreparedCheckpointWitness::new(
-        CheckpointAttempt::canonical(checkpoint_id),
-        participant_id,
-        Uuid::from_u128(500).to_string(),
-        crate::checkpoint::PipelineIdentity::empty(),
-    )
-    .unwrap()
-}
-
-fn stopped_report(
-    controller: &ClusterController,
-    round: &RecoveryRound,
-    prepared_witnesses: Vec<PreparedCheckpointWitness>,
-) -> RecoveryStoppedReport {
+fn stopped_report(controller: &ClusterController, round: &RecoveryRound) -> RecoveryStoppedReport {
     RecoveryStoppedReport::new(
         round,
         CheckpointParticipant {
             node_id: controller.instance_id().0,
             boot_incarnation: controller.recovery_incarnation(),
         },
-        prepared_witnesses,
     )
     .unwrap()
 }
@@ -2854,8 +3775,9 @@ async fn recovery_start_and_clear_require_the_identical_prepared_round() {
     let c = ctl(1, vec![]);
     c.publish_recovery_incarnation().await.unwrap();
     let (_authority, proof) = install_recovery_authority(&c, 1_000).await;
-    let round = recovery_round(&c, 11, &proof, &[1]);
-    let other = recovery_round(&c, 12, &proof, &[1]);
+    report_new_local_fault(&c).await;
+    let round = recovery_round_from_current_faults(&c, 11, &proof, &[1]).await;
+    let other = recovery_round_from_current_faults(&c, 12, &proof, &[1]).await;
     c.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
 
     c.announce_recover_prepare(&round).await.unwrap();
@@ -3208,7 +4130,8 @@ async fn durable_recovery_state_survives_fast_kv_reconstruction() {
     );
     controller.publish_recovery_incarnation().await.unwrap();
     let (authority, proof) = install_recovery_authority(&controller, 1_000).await;
-    let round = recovery_round(&controller, 51, &proof, &[1]);
+    report_new_local_fault(&controller).await;
+    let round = recovery_round_from_current_faults(&controller, 51, &proof, &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
     controller.adopt_recovery_generation(51).await.unwrap();
     controller.announce_recover_prepare(&round).await.unwrap();
@@ -3275,8 +4198,25 @@ async fn delayed_old_phase_cannot_clobber_same_process_new_leader_term() {
         .unwrap();
     controller.set_leader_lease_store(Arc::clone(&authority));
 
+    assert_eq!(
+        authority
+            .record_recovery_fault(
+                RecoveryFaultPublisher {
+                    participant: CheckpointParticipant {
+                        node_id: node.0,
+                        boot_incarnation: controller.recovery_incarnation(),
+                    },
+                    process_term: owner.process_term,
+                },
+                1,
+            )
+            .await
+            .unwrap(),
+        super::super::leader_lease::RecordRecoveryFaultResult::Active
+    );
+
     let old_proof = old_lease.proof();
-    let old_round = recovery_round(&controller, 61, &old_proof, &[1]);
+    let old_round = recovery_round_from_current_faults(&controller, 61, &old_proof, &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(old_round.assignment_fence.clone()));
     controller
         .announce_recover_prepare(&old_round)
@@ -3318,7 +4258,8 @@ async fn delayed_old_phase_cannot_clobber_same_process_new_leader_term() {
     assert!(current_lease.token > old_lease.token);
     lease_tx.send_replace(Some(current_lease.clone()));
 
-    let current_round = recovery_round(&controller, 62, &current_lease.proof(), &[1]);
+    let current_round =
+        recovery_round_from_current_faults(&controller, 62, &current_lease.proof(), &[1]).await;
     controller.publish_checkpoint_assignment_fence(Some(current_round.assignment_fence.clone()));
     let current_prepare = {
         let controller = Arc::clone(&controller);
@@ -3507,6 +4448,7 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
         vec![RecoveryFault {
             reporter: NodeId(1),
             sequence: 42,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }],
     )
     .unwrap_err();
@@ -3524,6 +4466,7 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
         vec![RecoveryFault {
             reporter: NodeId(1),
             sequence: 43,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }],
     )
     .unwrap_err();
@@ -3541,6 +4484,7 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
         vec![RecoveryFault {
             reporter: NodeId(1),
             sequence: 44,
+            disposition: RecoveryFaultDisposition::Recoverable,
         }],
     )
     .unwrap_err();
@@ -3565,14 +4509,17 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
             RecoveryFault {
                 reporter: NodeId(1),
                 sequence: 43,
+                disposition: RecoveryFaultDisposition::Recoverable,
             },
             RecoveryFault {
                 reporter: NodeId(2),
                 sequence: 43,
+                disposition: RecoveryFaultDisposition::Recoverable,
             },
             RecoveryFault {
                 reporter: NodeId(3),
                 sequence: 43,
+                disposition: RecoveryFaultDisposition::Recoverable,
             },
         ],
     )
@@ -3603,10 +4550,12 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
             RecoveryFault {
                 reporter: NodeId(1),
                 sequence: 44,
+                disposition: RecoveryFaultDisposition::Recoverable,
             },
             RecoveryFault {
                 reporter: NodeId(outsider.node_id),
                 sequence: 44,
+                disposition: RecoveryFaultDisposition::Recoverable,
             },
         ],
     )
@@ -3618,6 +4567,7 @@ fn recovery_round_separates_owners_from_bounded_evidence_participants() {
         .map(|node_id| RecoveryFault {
             reporter: NodeId(node_id),
             sequence: 44,
+            disposition: RecoveryFaultDisposition::Recoverable,
         })
         .collect();
     let oversized_fault_set = RecoveryRound::new(
@@ -3660,6 +4610,41 @@ fn recovery_announcement_wire_is_bounded_strict_and_canonical() {
     let oversized = " ".repeat(MAX_RECOVERY_ANNOUNCEMENT_BYTES + 1);
     let error = parse_recovery_announcement(&oversized).unwrap_err();
     assert!(error.contains("maximum"), "{error}");
+}
+
+#[test]
+fn recoverable_fault_wire_remains_legacy_byte_identical() {
+    let legacy = r#"{"reporter":1,"sequence":7}"#;
+    let fault: RecoveryFault = serde_json::from_str(legacy).unwrap();
+
+    assert_eq!(fault.disposition, RecoveryFaultDisposition::Recoverable);
+    assert_eq!(serde_json::to_string(&fault).unwrap(), legacy);
+}
+
+#[test]
+fn terminal_prepare_wire_is_explicit_and_cannot_advance() {
+    let controller = ctl(1, Vec::new());
+    let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+    let mut round = recovery_round(&controller, 46, &proof, &[1]);
+    round.faults[0].disposition = RecoveryFaultDisposition::Terminal;
+    let prepare = RecoveryAnnouncement {
+        round: round.clone(),
+        phase: RecoverPhase::Prepare,
+    };
+
+    let encoded = encode_recovery_announcement(&prepare).unwrap();
+    assert!(encoded.contains(r#""disposition":"terminal""#));
+    assert_eq!(
+        parse_recovery_announcement(&encoded).unwrap(),
+        Some(prepare)
+    );
+
+    let start = RecoveryAnnouncement {
+        round,
+        phase: RecoverPhase::Start { epoch: 1 },
+    };
+    let error = encode_recovery_announcement(&start).unwrap_err();
+    assert!(error.contains("may only be retained in Prepare"), "{error}");
 }
 
 #[tokio::test]
@@ -3717,10 +4702,7 @@ async fn stopped_report_point_reads_ignore_outsiders_and_admit_evidence_publishe
         boot_incarnation: controller.recovery_incarnation(),
     };
     let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
-    controller
-        .announce_stopped(&round, vec![prepared_witness(42, evidence_node.0)])
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     kv.seed(
         NodeId(99),
         RECOVERY_STOPPED_REPORT_KEY,
@@ -3754,7 +4736,7 @@ async fn stopped_report_point_reads_ignore_outsiders_and_admit_evidence_publishe
 }
 
 #[tokio::test]
-async fn stopped_report_announcement_reads_back_exact_publisher_and_inventory() {
+async fn stopped_report_announcement_reads_back_exact_publisher() {
     let node = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(node));
     let (_members_tx, members_rx) = watch::channel(Vec::new());
@@ -3762,18 +4744,13 @@ async fn stopped_report_announcement_reads_back_exact_publisher_and_inventory() 
     controller.publish_recovery_incarnation().await.unwrap();
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let witnesses = vec![prepared_witness(42, 1)];
-
-    controller
-        .announce_stopped(&round, witnesses.clone())
-        .await
-        .unwrap();
+    controller.announce_stopped(&round).await.unwrap();
     assert_eq!(
         controller
             .read_stopped(&round, &round.stopped_participants())
             .await
             .unwrap(),
-        vec![stopped_report(&controller, &round, witnesses)]
+        vec![stopped_report(&controller, &round)]
     );
 }
 
@@ -3788,7 +4765,7 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
     let current_round = recovery_round(&controller, 41, &proof, &[1]);
     let newer_round = recovery_round(&controller, 42, &proof, &[1]);
 
-    let old = stopped_report(&controller, &old_round, Vec::new());
+    let old = stopped_report(&controller, &old_round);
     kv.seed(
         node,
         RECOVERY_STOPPED_REPORT_KEY,
@@ -3800,7 +4777,7 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
         .unwrap()
         .is_empty());
 
-    let newer = stopped_report(&controller, &newer_round, Vec::new());
+    let newer = stopped_report(&controller, &newer_round);
     kv.seed(
         node,
         RECOVERY_STOPPED_REPORT_KEY,
@@ -3826,21 +4803,21 @@ async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
 }
 
 #[test]
-fn stopped_report_wire_round_trips_empty_and_bounded_inventory() {
+fn stopped_report_wire_round_trips_compact_round_identity() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
 
-    let empty = stopped_report(&controller, &round, Vec::new());
-    let raw = encode_recovery_stopped_report(&empty, &round).unwrap();
+    let report = stopped_report(&controller, &round);
+    let raw = encode_recovery_stopped_report(&report, &round).unwrap();
     assert!(
         raw.len() < 512,
-        "compact empty stopped report was {} bytes",
+        "compact stopped report was {} bytes",
         raw.len()
     );
     assert_eq!(
         parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
-        empty
+        report
     );
     let mut divergent_round = round.clone();
     divergent_round.faults[0].sequence += 1;
@@ -3848,19 +4825,10 @@ fn stopped_report_wire_round_trips_empty_and_bounded_inventory() {
     let error = parse_recovery_stopped_report(&raw, NodeId(1), &divergent_round).unwrap_err();
     assert!(error.contains("exact frozen round"), "{error}");
 
-    let witnesses = (1..=MAX_PREPARED_CHECKPOINT_WITNESSES as u64)
-        .map(|attempt| prepared_witness(attempt, 1))
-        .collect();
-    let full = stopped_report(&controller, &round, witnesses);
-    let raw = encode_recovery_stopped_report(&full, &round).unwrap();
     assert!(raw.len() <= MAX_RECOVERY_STOPPED_REPORT_BYTES);
     assert!(!raw.contains("assignment_fence"));
     assert!(!raw.contains("evidence_participants"));
     assert!(!raw.contains("faults"));
-    assert_eq!(
-        parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
-        full
-    );
 }
 
 #[test]
@@ -3868,7 +4836,7 @@ fn stopped_report_rejects_stale_boot_and_wrong_slot_publisher() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let report = stopped_report(&controller, &round, Vec::new());
+    let report = stopped_report(&controller, &round);
 
     let raw = encode_recovery_stopped_report(&report, &round).unwrap();
     let error = parse_recovery_stopped_report(&raw, NodeId(2), &round).unwrap_err();
@@ -3882,66 +4850,11 @@ fn stopped_report_rejects_stale_boot_and_wrong_slot_publisher() {
 }
 
 #[test]
-fn stopped_report_rejects_unsorted_duplicate_and_excess_inventory() {
-    let controller = ctl(1, Vec::new());
-    let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
-    let round = recovery_round(&controller, 41, &proof, &[1]);
-
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![prepared_witness(1, 2)],
-    )
-    .unwrap_err();
-    assert!(error.contains("does not match report publisher"), "{error}");
-
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![prepared_witness(2, 1), prepared_witness(1, 1)],
-    )
-    .unwrap_err();
-    assert!(error.contains("uniquely sorted"), "{error}");
-
-    let duplicate = prepared_witness(1, 1);
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        vec![duplicate.clone(), duplicate],
-    )
-    .unwrap_err();
-    assert!(error.contains("uniquely sorted"), "{error}");
-
-    let witnesses = (1..=(MAX_PREPARED_CHECKPOINT_WITNESSES + 1) as u64)
-        .map(|attempt| prepared_witness(attempt, 1))
-        .collect();
-    let error = RecoveryStoppedReport::new(
-        &round,
-        CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: controller.recovery_incarnation(),
-        },
-        witnesses,
-    )
-    .unwrap_err();
-    assert!(error.contains("prepared witnesses; maximum"), "{error}");
-}
-
-#[test]
 fn stopped_report_wire_rejects_oversize_and_unknown_fields() {
     let controller = ctl(1, Vec::new());
     let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
     let round = recovery_round(&controller, 41, &proof, &[1]);
-    let report = stopped_report(&controller, &round, Vec::new());
+    let report = stopped_report(&controller, &round);
     let raw = encode_recovery_stopped_report(&report, &round).unwrap();
 
     let oversize = format!(
@@ -3958,7 +4871,7 @@ fn stopped_report_wire_rejects_oversize_and_unknown_fields() {
     assert!(error.contains("unknown field"), "{error}");
 
     let unsupported_round = recovery_round(&controller, 42, &proof, &[1]);
-    let mut unsupported = stopped_report(&controller, &unsupported_round, Vec::new());
+    let mut unsupported = stopped_report(&controller, &unsupported_round);
     unsupported.protocol_version = RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION + 1;
     let raw = serde_json::to_string(&unsupported).unwrap();
     let error = parse_recovery_stopped_report(&raw, NodeId(1), &unsupported_round).unwrap_err();
@@ -3982,9 +4895,6 @@ async fn superseded_same_id_process_cannot_ack_an_old_round() {
     let replacement = ClusterController::new(node, kv, None, new_rx);
     replacement.publish_recovery_incarnation().await.unwrap();
 
-    let error = old
-        .announce_stopped(&old_round, Vec::new())
-        .await
-        .unwrap_err();
+    let error = old.announce_stopped(&old_round).await.unwrap_err();
     assert!(error.contains("superseded local process"), "{error}");
 }

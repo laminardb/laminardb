@@ -5,7 +5,7 @@
 //! for consumption by `object_store` / `deltalake`.
 //!
 //! Resolution priority chain:
-//! 1. Explicit options from SQL `WITH` clause (`storage.*` keys)
+//! 1. Explicit connector options (`storage.*` keys)
 //! 2. Environment variables (`AWS_ACCESS_KEY_ID`, etc.)
 //! 3. Instance metadata / default credential providers (handled by `object_store`)
 #![allow(clippy::disallowed_types)] // cold path: storage configuration
@@ -84,7 +84,7 @@ impl ResolvedStorageOptions {
 /// Storage credential resolver.
 ///
 /// Resolves credentials by priority chain:
-/// 1. Explicit `storage.*` keys from SQL WITH clause
+/// 1. Explicit `storage.*` connector options
 /// 2. Environment variables
 /// 3. Instance metadata / default credential provider (handled downstream by `object_store`)
 pub struct StorageCredentialResolver;
@@ -98,7 +98,7 @@ impl StorageCredentialResolver {
     /// # Arguments
     ///
     /// * `table_path` - URI of the table (`s3://`, `az://`, `gs://`, or local path)
-    /// * `explicit_options` - Options from SQL WITH clause (`storage.` prefix already stripped)
+    /// * `explicit_options` - Connector options (`storage.` prefix already stripped)
     ///
     /// # Returns
     ///

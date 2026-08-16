@@ -1,0 +1,30 @@
+# Disposable broker topology for the validation-only matched EndTxn fault probe.
+#
+# The broker listens on container port 19192 and advertises the host proxy at
+# 127.0.0.1:19192. Docker exposes the broker itself only as the loopback origin
+# 127.0.0.1:19194, so metadata and coordinator reconnects cannot bypass the proxy.
+#
+# Bring up:  docker compose -f tests/docker/kafka-transaction-ambiguity-compose.yml up -d --wait
+# Tear down: docker compose -f tests/docker/kafka-transaction-ambiguity-compose.yml down
+
+services:
+  redpanda-ambiguity:
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
+    container_name: laminardb-redpanda-ambiguity
+    ports:
+      - "127.0.0.1:19194:19192"
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:19192
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:19192
+      - --node-id=0
+      - --check=false
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9644/v1/status/ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

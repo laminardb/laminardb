@@ -140,7 +140,6 @@ mod tests {
     fn base_config() -> ServerConfig {
         ServerConfig {
             server: ServerSection::default(),
-            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             supervision: Default::default(),
             sources: vec![],

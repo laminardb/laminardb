@@ -114,43 +114,6 @@
       ],
       connections: [[0, 2], [1, 2], [2, 3], [3, 4]],
       sources: [0, 1]
-    },
-
-    asof: {
-      operators: [
-        {
-          id: 'source1', label: 'Trades', sublabel: 'Kafka', icon: 'kafka',
-          description: 'Main driving stream of trade events. Each trade is enriched with the most recent quote.',
-          enabled: true, behavior: 'spawn',
-          pos: [0.0, 0.5]
-        },
-        {
-          id: 'source2', label: 'Quotes', sublabel: 'Kafka', icon: 'kafka',
-          description: 'Reference stream of quote updates. Provides bid/ask used for ASOF lookup against trades.',
-          enabled: true, behavior: 'spawn',
-          pos: [0.35, 0.15]
-        },
-        {
-          id: 'asof_join', label: 'ASOF JOIN', sublabel: 't.ts >= q.ts', icon: 'asof',
-          description: 'Temporal join: each trade is matched with the most recent preceding quote. The driving stream passes through enriched.',
-          enabled: true, behavior: 'asof_join',
-          pos: [0.4, 0.5]
-        },
-        {
-          id: 'window', label: 'Window', sublabel: 'SLIDING 10s', icon: 'window',
-          description: 'Sliding window that keeps multiple events in flight, releasing them one at a time after a delay.',
-          enabled: true, behavior: 'sliding_window',
-          pos: [0.7, 0.5]
-        },
-        {
-          id: 'sink', label: 'Sink', sublabel: 'Delta Lake', icon: 'sink',
-          description: 'Writes enriched trade data with quote spreads to Delta Lake.',
-          enabled: true, behavior: 'sink',
-          pos: [1.0, 0.5]
-        }
-      ],
-      connections: [[0, 2], [1, 2], [2, 3], [3, 4]],
-      sources: [0, 1]
     }
   };
 
@@ -206,10 +169,6 @@
   // Join buffers (dual-input)
   var joinBufferA = []; // from first input
   var joinBufferB = []; // from second input
-
-  // ASOF Join state
-  var asofMainBuffer = [];
-  var asofLookupLatest = null; // most recent lookup particle color
 
   // Sink storage visual
   var sinkStack = [];
@@ -543,27 +502,6 @@
         ctx.fill();
         break;
 
-      case 'asof':
-        // Clock with arrow
-        ctx.beginPath();
-        ctx.arc(cx, cy, s * 0.7, 0, Math.PI * 2);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(cx, cy - s * 0.35);
-        ctx.lineTo(cx, cy);
-        ctx.lineTo(cx + s * 0.3, cy + s * 0.1);
-        ctx.stroke();
-        // Small lookup arrow from side
-        ctx.beginPath();
-        ctx.moveTo(cx - s * 0.9, cy - s * 0.4);
-        ctx.lineTo(cx - s * 0.5, cy - s * 0.1);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(cx - s * 0.65, cy - s * 0.5);
-        ctx.lineTo(cx - s * 0.9, cy - s * 0.4);
-        ctx.lineTo(cx - s * 0.65, cy - s * 0.2);
-        ctx.stroke();
-        break;
     }
     ctx.restore();
   }
@@ -1095,32 +1033,6 @@
         }
         break;
 
-      case 'asof_join':
-        // ASOF join: main stream passes through, lookup stream updates reference
-        var asofInputs = getInputConnections(p.targetNode);
-        var isMainStream = false;
-        if (asofInputs.length >= 2) {
-          isMainStream = (p.sourceIndex === asofInputs[0].fromIdx) ||
-            isSourceDescendant(p.sourceIndex, asofInputs[0].fromIdx);
-        } else {
-          isMainStream = true;
-        }
-
-        if (!isMainStream) {
-          // Lookup stream: update the latest reference color, consume particle
-          asofLookupLatest = { r: p.color.r, g: p.color.g, b: p.color.b };
-          p.state = 'dying';
-        } else {
-          // Main stream: pass through, enriched if lookup available
-          if (asofLookupLatest) {
-            p.color = blendColors(p.color, asofLookupLatest);
-            p.flashTimer = 180;
-          }
-          p.state = 'moving';
-          advanceParticle(p);
-        }
-        break;
-
       case 'sink':
         sinkStack.push({ color: { r: p.color.r, g: p.color.g, b: p.color.b }, alpha: 1 });
         if (sinkStack.length > SINK_MAX) sinkStack.shift();
@@ -1465,8 +1377,6 @@
     aggregateBuffer = [];
     joinBufferA = [];
     joinBufferB = [];
-    asofMainBuffer = [];
-    asofLookupLatest = null;
     sinkStack = [];
     spawnTimers = {};
     eventCount = 0;

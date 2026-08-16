@@ -1,10 +1,8 @@
-//! Delta Lake source config. Parsed from SQL `WITH (...)` via
+//! Delta Lake source config. Parsed from the resolved connector config via
 //! [`DeltaSourceConfig::from_config`].
 #![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
-use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::ConnectorConfig;
@@ -16,104 +14,25 @@ use crate::storage::{
 
 use super::delta_config::DeltaCatalogType;
 
-/// Read mode for the Delta Lake source.
-///
-/// Controls whether the source reads full snapshots or incremental changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DeltaReadMode {
-    /// Read full table snapshot at each new version.
-    ///
-    /// Every version change triggers a complete table scan. Useful for
-    /// batch-style materialization or tables small enough to re-read.
-    Snapshot,
-    /// Read data version-by-version for incremental processing.
-    ///
-    /// Walks versions one-by-one from `current_version + 1` to latest.
-    /// Each version's data is emitted exactly once.
-    #[default]
-    Incremental,
-}
-
-impl FromStr for DeltaReadMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "snapshot" | "batch" => Ok(Self::Snapshot),
-            "incremental" | "streaming" | "stream" => Ok(Self::Incremental),
-            other => Err(format!("unknown read mode: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for DeltaReadMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Snapshot => write!(f, "snapshot"),
-            Self::Incremental => write!(f, "incremental"),
-        }
-    }
-}
-
-/// Action to take when schema evolution is detected across versions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SchemaEvolutionAction {
-    /// Log a warning and continue with the new schema.
-    #[default]
-    Warn,
-    /// Return an error and stop the source.
-    Error,
-}
-
-impl FromStr for SchemaEvolutionAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "warn" | "warning" => Ok(Self::Warn),
-            "error" | "fail" => Ok(Self::Error),
-            other => Err(format!("unknown schema evolution action: '{other}'")),
-        }
-    }
-}
-
-impl fmt::Display for SchemaEvolutionAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Warn => write!(f, "warn"),
-            Self::Error => write!(f, "error"),
-        }
-    }
-}
-
 /// Configuration for the Delta Lake source connector.
 ///
-/// Parsed from SQL `WITH (...)` clause options or constructed programmatically.
+/// Parsed from resolved source connector options or constructed programmatically.
 #[derive(Debug, Clone)]
 pub struct DeltaSourceConfig {
     /// Path to the Delta Lake table (local, `s3://`, `az://`, `gs://`).
     pub table_path: String,
 
-    /// Starting version to read from. `None` means start from the latest version.
+    /// First table version to read. `None` reads only versions committed after startup.
     pub starting_version: Option<i64>,
 
     /// How often to poll for new versions (default: 1 second).
     pub poll_interval: Duration,
 
-    /// Read mode: snapshot (full re-read) or incremental (changes only).
-    pub read_mode: DeltaReadMode,
-
-    /// Optional partition filter predicate (SQL expression, e.g. `"date = '2024-01-01'"`).
-    pub partition_filter: Option<String>,
-
-    /// Action to take on schema evolution between versions.
-    pub schema_evolution_action: SchemaEvolutionAction,
-
-    /// Use Change Data Feed for incremental reads (requires CDF on table).
-    pub cdf_enabled: bool,
-
     /// Storage options (S3 credentials, Azure keys, etc.).
     pub storage_options: HashMap<String, String>,
+
+    /// Option keys populated from the environment during parsing.
+    env_resolved_storage_keys: Vec<String>,
 
     /// Catalog type for table discovery.
     pub catalog_type: DeltaCatalogType,
@@ -134,11 +53,8 @@ impl Default for DeltaSourceConfig {
             table_path: String::new(),
             starting_version: None,
             poll_interval: Duration::from_secs(1),
-            read_mode: DeltaReadMode::default(),
-            partition_filter: None,
-            schema_evolution_action: SchemaEvolutionAction::default(),
-            cdf_enabled: false,
             storage_options: HashMap::new(),
+            env_resolved_storage_keys: Vec::new(),
             catalog_type: DeltaCatalogType::None,
             catalog_database: None,
             catalog_name: None,
@@ -157,7 +73,7 @@ impl DeltaSourceConfig {
         }
     }
 
-    /// Parses a source config from a [`ConnectorConfig`] (SQL WITH clause).
+    /// Parses a source config from a resolved [`ConnectorConfig`].
     ///
     /// # Required keys
     ///
@@ -184,28 +100,26 @@ impl DeltaSourceConfig {
             })?;
             cfg.poll_interval = Duration::from_millis(ms);
         }
-        if let Some(v) = config.get("read.mode") {
-            cfg.read_mode = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid read.mode: '{v}' (expected 'snapshot' or 'incremental')"
-                ))
-            })?;
+        if config.get("read.mode").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta source does not support read.mode".into(),
+            ));
         }
-        if let Some(v) = config.get("partition.filter") {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                cfg.partition_filter = Some(trimmed.to_string());
-            }
+        if config.get("cdf.enabled").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta source does not support cdf.enabled".into(),
+            ));
         }
-        if let Some(v) = config.get("cdf.enabled") {
-            cfg.cdf_enabled = v.eq_ignore_ascii_case("true");
+        if config.get("partition.filter").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta source does not support partition.filter".into(),
+            ));
         }
-        if let Some(v) = config.get("schema.evolution.action") {
-            cfg.schema_evolution_action = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid schema.evolution.action: '{v}' (expected 'warn' or 'error')"
-                ))
-            })?;
+        if config.get("schema.evolution.action").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta CDF source always fails on schema evolution; schema.evolution.action is unsupported"
+                    .into(),
+            ));
         }
 
         // ── Catalog configuration ──
@@ -240,6 +154,7 @@ impl DeltaSourceConfig {
         // Resolve storage credentials.
         let explicit_storage = config.properties_with_prefix("storage.");
         let resolved = StorageCredentialResolver::resolve(&cfg.table_path, &explicit_storage);
+        cfg.env_resolved_storage_keys = resolved.env_resolved_keys;
         cfg.storage_options = resolved.options;
 
         // Map LogStore configuration keys to delta-rs storage options.
@@ -256,6 +171,16 @@ impl DeltaSourceConfig {
         Ok(cfg)
     }
 
+    /// Returns configured options without values copied from the environment.
+    #[cfg(feature = "delta-lake")]
+    pub(crate) fn stable_storage_options(&self) -> HashMap<String, String> {
+        let mut options = self.storage_options.clone();
+        for key in &self.env_resolved_storage_keys {
+            options.remove(key);
+        }
+        options
+    }
+
     /// Formats the storage options for safe logging with secrets redacted.
     #[must_use]
     pub fn display_storage_options(&self) -> String {
@@ -270,6 +195,11 @@ impl DeltaSourceConfig {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.table_path.is_empty() {
             return Err(ConnectorError::missing_config("table.path"));
+        }
+        if self.starting_version.is_some_and(|version| version < 0) {
+            return Err(ConnectorError::ConfigurationError(
+                "starting.version must be non-negative".into(),
+            ));
         }
 
         // Validate catalog-specific requirements.
@@ -380,8 +310,10 @@ mod tests {
 
     #[test]
     fn test_invalid_starting_version() {
-        let config = make_config(&[("table.path", "/data/test"), ("starting.version", "abc")]);
-        assert!(DeltaSourceConfig::from_config(&config).is_err());
+        for value in ["abc", "-1"] {
+            let config = make_config(&[("table.path", "/data/test"), ("starting.version", value)]);
+            assert!(DeltaSourceConfig::from_config(&config).is_err());
+        }
     }
 
     #[test]
@@ -391,105 +323,49 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
-    // ── New config fields tests ──
-
     #[test]
-    fn test_read_mode_defaults_to_incremental() {
-        let cfg = DeltaSourceConfig::default();
-        assert_eq!(cfg.read_mode, DeltaReadMode::Incremental);
-    }
-
-    #[test]
-    fn test_read_mode_parse() {
-        assert_eq!(
-            "snapshot".parse::<DeltaReadMode>().unwrap(),
-            DeltaReadMode::Snapshot
-        );
-        assert_eq!(
-            "batch".parse::<DeltaReadMode>().unwrap(),
-            DeltaReadMode::Snapshot
-        );
-        assert_eq!(
-            "incremental".parse::<DeltaReadMode>().unwrap(),
-            DeltaReadMode::Incremental
-        );
-        assert_eq!(
-            "streaming".parse::<DeltaReadMode>().unwrap(),
-            DeltaReadMode::Incremental
-        );
-        assert_eq!(
-            "stream".parse::<DeltaReadMode>().unwrap(),
-            DeltaReadMode::Incremental
-        );
-        assert!("unknown".parse::<DeltaReadMode>().is_err());
-    }
-
-    #[test]
-    fn test_read_mode_display() {
-        assert_eq!(DeltaReadMode::Snapshot.to_string(), "snapshot");
-        assert_eq!(DeltaReadMode::Incremental.to_string(), "incremental");
-    }
-
-    #[test]
-    fn test_read_mode_from_config() {
-        let config = make_config(&[("table.path", "/data/test"), ("read.mode", "snapshot")]);
-        let cfg = DeltaSourceConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.read_mode, DeltaReadMode::Snapshot);
-    }
-
-    #[test]
-    fn test_read_mode_invalid() {
-        let config = make_config(&[("table.path", "/data/test"), ("read.mode", "invalid")]);
-        assert!(DeltaSourceConfig::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_partition_filter_from_config() {
-        let config = make_config(&[
-            ("table.path", "/data/test"),
+    fn removed_options_fail_closed() {
+        for (key, value) in [
+            ("read.mode", "incremental"),
+            ("cdf.enabled", "true"),
+            ("partition.filter", ""),
             ("partition.filter", "date = '2024-01-01'"),
-        ]);
-        let cfg = DeltaSourceConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.partition_filter.as_deref(), Some("date = '2024-01-01'"));
+            ("schema.evolution.action", "warn"),
+        ] {
+            assert!(DeltaSourceConfig::from_config(&make_config(&[
+                ("table.path", "/data/test"),
+                (key, value),
+            ]))
+            .is_err());
+        }
     }
 
+    #[cfg(feature = "delta-lake")]
     #[test]
-    fn test_partition_filter_empty_is_none() {
-        let config = make_config(&[("table.path", "/data/test"), ("partition.filter", "")]);
-        let cfg = DeltaSourceConfig::from_config(&config).unwrap();
-        assert!(cfg.partition_filter.is_none());
-    }
+    fn stable_storage_options_exclude_environment_fallbacks() {
+        let mut explicit = HashMap::new();
+        explicit.insert("aws_region".into(), "eu-west-2".into());
+        let resolved =
+            StorageCredentialResolver::resolve_with_env("s3://bucket/table", &explicit, |key| {
+                match key {
+                    "AWS_ACCESS_KEY_ID" => Some("rotating-key".into()),
+                    "AWS_SECRET_ACCESS_KEY" => Some("rotating-secret".into()),
+                    _ => None,
+                }
+            });
+        let config = DeltaSourceConfig {
+            table_path: "s3://bucket/table".into(),
+            storage_options: resolved.options,
+            env_resolved_storage_keys: resolved.env_resolved_keys,
+            ..DeltaSourceConfig::default()
+        };
 
-    #[test]
-    fn test_schema_evolution_action_parse() {
+        let stable = config.stable_storage_options();
         assert_eq!(
-            "warn".parse::<SchemaEvolutionAction>().unwrap(),
-            SchemaEvolutionAction::Warn
+            stable.get("aws_region").map(String::as_str),
+            Some("eu-west-2")
         );
-        assert_eq!(
-            "error".parse::<SchemaEvolutionAction>().unwrap(),
-            SchemaEvolutionAction::Error
-        );
-        assert_eq!(
-            "fail".parse::<SchemaEvolutionAction>().unwrap(),
-            SchemaEvolutionAction::Error
-        );
-        assert!("unknown".parse::<SchemaEvolutionAction>().is_err());
-    }
-
-    #[test]
-    fn test_schema_evolution_action_from_config() {
-        let config = make_config(&[
-            ("table.path", "/data/test"),
-            ("schema.evolution.action", "error"),
-        ]);
-        let cfg = DeltaSourceConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.schema_evolution_action, SchemaEvolutionAction::Error);
-    }
-
-    #[test]
-    fn test_schema_evolution_action_default() {
-        let cfg = DeltaSourceConfig::default();
-        assert_eq!(cfg.schema_evolution_action, SchemaEvolutionAction::Warn);
+        assert!(!stable.contains_key("aws_access_key_id"));
+        assert!(!stable.contains_key("aws_secret_access_key"));
     }
 }

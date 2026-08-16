@@ -120,7 +120,7 @@ impl Profile {
             Self::BareMetal => Ok(()),
             Self::Embedded => {
                 if let Some(url) = object_store_url.filter(|url| url.starts_with("file://")) {
-                    laminar_core::storage::object_store_builder::file_url_path(url)
+                    laminar_core::checkpoint::object_store_builder::file_url_path(url)
                         .map_err(|error| ProfileError::RequirementNotMet(error.to_string()))?;
                     return Ok(());
                 }

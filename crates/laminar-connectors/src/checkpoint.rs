@@ -7,6 +7,8 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
+use crate::error::ConnectorError;
+
 enum OffsetTree {
     Leaf(Arc<str>),
     Branch { older: Arc<Self>, newer: Arc<Self> },
@@ -147,7 +149,7 @@ impl fmt::Debug for PersistentOffset {
 /// This payload deliberately has no checkpoint epoch or attempt identifier.
 /// The barrier protocol and top-level manifest bind it to an exact attempt.
 /// Ordinary offsets remain eager; connectors with large append-only positions
-/// can opt into [`PersistentOffset`] without changing the compatibility API.
+/// can opt into [`PersistentOffset`] while retaining the same accessors.
 pub struct SourceCheckpoint {
     /// Small connector-specific offset data.
     offsets: HashMap<String, String>,
@@ -155,14 +157,134 @@ pub struct SourceCheckpoint {
     /// Large values represented as immutable serialized fragment logs.
     persistent_offsets: HashMap<String, PersistentOffset>,
 
-    /// Compatibility view for callers that explicitly request all offsets.
+    /// Materialized view for callers that explicitly request all offsets.
     materialized_offsets: Arc<OnceLock<HashMap<String, String>>>,
 
     /// Optional metadata for the checkpoint.
     metadata: HashMap<String, String>,
 
+    /// Canonically ordered opaque identities of the input channels owned by this cut.
+    input_channels: Option<Arc<[Vec<u8>]>>,
+
     /// Provider-neutral assignment version that owns this source cut.
     assignment_version: Option<NonZeroU64>,
+}
+
+/// Offset changes for one assignment-scoped source batch.
+///
+/// The input-channel allocation is shared with the complete checkpoint published for the
+/// assignment. A runtime must merge this delta into that exact checkpoint before durability.
+/// `Some(value)` upserts an offset; `None` removes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceCheckpointDelta {
+    assignment_version: NonZeroU64,
+    input_channels: Arc<[Vec<u8>]>,
+    offset_changes: HashMap<String, Option<String>>,
+}
+
+impl SourceCheckpointDelta {
+    /// Creates an incremental cursor for an already-published assignment.
+    ///
+    /// # Errors
+    /// Returns an error when the delta has no changed offsets.
+    pub fn new(
+        assignment_version: NonZeroU64,
+        input_channels: Arc<[Vec<u8>]>,
+        offset_changes: HashMap<String, Option<String>>,
+    ) -> Result<Self, ConnectorError> {
+        if offset_changes.is_empty() {
+            return Err(ConnectorError::InvalidState {
+                expected: "at least one changed source offset".into(),
+                actual: "an empty incremental source cursor".into(),
+            });
+        }
+        Ok(Self {
+            assignment_version,
+            input_channels,
+            offset_changes,
+        })
+    }
+
+    /// Assignment publication owning this delta.
+    #[must_use]
+    pub const fn assignment_version(&self) -> NonZeroU64 {
+        self.assignment_version
+    }
+
+    /// Shared input-channel inventory for the owning assignment.
+    #[must_use]
+    pub const fn input_channels_arc(&self) -> &Arc<[Vec<u8>]> {
+        &self.input_channels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn changes(&self) -> &HashMap<String, Option<String>> {
+        &self.offset_changes
+    }
+
+    /// Validates that this delta extends the supplied complete cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the base cursor is unbound or belongs to a different assignment or
+    /// input-channel roster.
+    pub fn validate_base(&self, base: &SourceCheckpoint) -> Result<(), ConnectorError> {
+        let Some(base_version) = base.assignment_version else {
+            return Err(ConnectorError::InvalidState {
+                expected: format!(
+                    "complete source checkpoint for assignment {}",
+                    self.assignment_version
+                ),
+                actual: "an unbound source checkpoint".into(),
+            });
+        };
+        if base_version != self.assignment_version {
+            return Err(ConnectorError::InvalidState {
+                expected: format!("source assignment {}", self.assignment_version),
+                actual: format!("source assignment {base_version}"),
+            });
+        }
+        let Some(base_channels) = base.input_channels.as_ref() else {
+            return Err(ConnectorError::InvalidState {
+                expected: "a complete source checkpoint with input channels".into(),
+                actual: "a source checkpoint without input channels".into(),
+            });
+        };
+        if !Arc::ptr_eq(base_channels, &self.input_channels)
+            && base_channels.as_ref() != self.input_channels.as_ref()
+        {
+            return Err(ConnectorError::InvalidState {
+                expected: "the input-channel roster of the complete source checkpoint".into(),
+                actual: "a different incremental source roster".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Coalesces a later batch delta from the same assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `newer` belongs to a different assignment or input-channel roster.
+    pub fn merge(&mut self, newer: Self) -> Result<(), ConnectorError> {
+        if self.assignment_version != newer.assignment_version
+            || (!Arc::ptr_eq(&self.input_channels, &newer.input_channels)
+                && self.input_channels.as_ref() != newer.input_channels.as_ref())
+        {
+            return Err(ConnectorError::InvalidState {
+                expected: format!(
+                    "source assignment {} and its input channels",
+                    self.assignment_version
+                ),
+                actual: format!(
+                    "source assignment {} or a different input-channel roster",
+                    newer.assignment_version
+                ),
+            });
+        }
+        self.offset_changes.extend(newer.offset_changes);
+        Ok(())
+    }
 }
 
 impl Clone for SourceCheckpoint {
@@ -172,6 +294,7 @@ impl Clone for SourceCheckpoint {
             persistent_offsets: self.persistent_offsets.clone(),
             materialized_offsets: Arc::clone(&self.materialized_offsets),
             metadata: self.metadata.clone(),
+            input_channels: self.input_channels.clone(),
             assignment_version: self.assignment_version,
         }
     }
@@ -184,6 +307,7 @@ impl Default for SourceCheckpoint {
             persistent_offsets: HashMap::new(),
             materialized_offsets: Arc::new(OnceLock::new()),
             metadata: HashMap::new(),
+            input_channels: None,
             assignment_version: None,
         }
     }
@@ -191,6 +315,7 @@ impl Default for SourceCheckpoint {
 
 impl fmt::Debug for SourceCheckpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let input_channel_count = self.input_channels.as_ref().map(|channels| channels.len());
         f.debug_struct("SourceCheckpoint")
             .field("offsets", &self.offsets)
             .field(
@@ -198,6 +323,7 @@ impl fmt::Debug for SourceCheckpoint {
                 &self.persistent_offsets.keys().collect::<Vec<_>>(),
             )
             .field("metadata", &self.metadata)
+            .field("input_channel_count", &input_channel_count)
             .field("assignment_version", &self.assignment_version)
             .finish_non_exhaustive()
     }
@@ -207,6 +333,7 @@ impl PartialEq for SourceCheckpoint {
     fn eq(&self, other: &Self) -> bool {
         self.offsets() == other.offsets()
             && self.metadata == other.metadata
+            && self.input_channels == other.input_channels
             && self.assignment_version == other.assignment_version
     }
 }
@@ -228,6 +355,7 @@ impl SourceCheckpoint {
             persistent_offsets: HashMap::new(),
             materialized_offsets: Arc::new(OnceLock::new()),
             metadata: HashMap::new(),
+            input_channels: None,
             assignment_version: None,
         }
     }
@@ -284,7 +412,7 @@ impl SourceCheckpoint {
     /// Materializes all offsets into an owned map for durable checkpoint
     /// conversion.
     ///
-    /// If the compatibility view has not been requested, persistent values are
+    /// If the materialized view has not been requested, persistent values are
     /// written directly into the returned map and are not retained as a second
     /// full copy inside this checkpoint.
     #[must_use]
@@ -318,6 +446,53 @@ impl SourceCheckpoint {
         &self.metadata
     }
 
+    /// Replaces the complete input-channel inventory for this source cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a channel is empty, reserved, duplicated, or out of canonical order.
+    pub fn set_input_channels(
+        &mut self,
+        channels: impl Into<Arc<[Vec<u8>]>>,
+    ) -> Result<(), ConnectorError> {
+        let channels = channels.into();
+        if channels.iter().any(Vec::is_empty) {
+            return Err(ConnectorError::InvalidState {
+                expected: "non-empty opaque input-channel identities".into(),
+                actual: "an empty input-channel identity".into(),
+            });
+        }
+        if channels
+            .iter()
+            .any(|channel| channel == laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL)
+        {
+            return Err(ConnectorError::InvalidState {
+                expected: "physical input-channel identities".into(),
+                actual: "the reserved logical watermark channel".into(),
+            });
+        }
+        if !channels.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(ConnectorError::InvalidState {
+                expected: "strictly ordered unique input-channel identities".into(),
+                actual: "noncanonical input-channel inventory".into(),
+            });
+        }
+        self.input_channels = Some(channels);
+        Ok(())
+    }
+
+    /// Returns the canonical opaque input-channel inventory, when the connector declares one.
+    #[must_use]
+    pub fn input_channels(&self) -> Option<&[Vec<u8>]> {
+        self.input_channels.as_deref()
+    }
+
+    /// Returns the shared input-channel inventory for lock-free runtime installation.
+    #[must_use]
+    pub const fn input_channels_arc(&self) -> Option<&Arc<[Vec<u8>]>> {
+        self.input_channels.as_ref()
+    }
+
     /// Binds this source cut to the exact partition-assignment publication that owns it.
     pub fn bind_assignment_version(&mut self, assignment_version: NonZeroU64) {
         self.assignment_version = Some(assignment_version);
@@ -327,6 +502,26 @@ impl SourceCheckpoint {
     #[must_use]
     pub const fn assignment_version(&self) -> Option<NonZeroU64> {
         self.assignment_version
+    }
+
+    /// Applies changed offsets from the same assignment without cloning the complete cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delta does not extend this checkpoint's assignment and channel
+    /// roster.
+    pub fn apply_delta(&mut self, delta: SourceCheckpointDelta) -> Result<(), ConnectorError> {
+        delta.validate_base(self)?;
+        for (key, value) in delta.offset_changes {
+            self.persistent_offsets.remove(&key);
+            if let Some(value) = value {
+                self.offsets.insert(key, value);
+            } else {
+                self.offsets.remove(&key);
+            }
+        }
+        self.invalidate_materialized_offsets();
+        Ok(())
     }
 
     /// Returns `true` if the checkpoint has no offsets.
@@ -378,6 +573,43 @@ mod tests {
 
         assert_eq!(cp.get_metadata("connector"), Some("kafka"));
         assert_eq!(cp.get_metadata("topic"), Some("events"));
+    }
+
+    #[test]
+    fn input_channels_are_canonical_and_part_of_checkpoint_identity() {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint
+            .set_input_channels(vec![b"partition-1".to_vec(), b"partition-2".to_vec()])
+            .unwrap();
+
+        assert_eq!(
+            checkpoint.input_channels(),
+            Some([b"partition-1".to_vec(), b"partition-2".to_vec()].as_slice())
+        );
+        assert_ne!(checkpoint, SourceCheckpoint::new());
+        let cloned = checkpoint.clone();
+        assert_eq!(cloned, checkpoint);
+        assert!(Arc::ptr_eq(
+            cloned.input_channels.as_ref().unwrap(),
+            checkpoint.input_channels.as_ref().unwrap()
+        ));
+
+        assert!(SourceCheckpoint::new()
+            .set_input_channels(vec![b"partition-2".to_vec(), b"partition-1".to_vec()])
+            .is_err());
+        assert!(SourceCheckpoint::new()
+            .set_input_channels(vec![Vec::new()])
+            .is_err());
+        assert!(SourceCheckpoint::new()
+            .set_input_channels(vec![
+                laminar_core::checkpoint::SINGLETON_WATERMARK_CHANNEL.to_vec(),
+            ])
+            .is_err());
+
+        let mut owned_empty = SourceCheckpoint::new();
+        owned_empty.set_input_channels(Vec::new()).unwrap();
+        assert_eq!(owned_empty.input_channels(), Some([].as_slice()));
+        assert_ne!(owned_empty, SourceCheckpoint::new());
     }
 
     #[test]
@@ -455,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn eager_offsets_do_not_allocate_a_compatibility_copy() {
+    fn eager_offsets_do_not_allocate_a_materialized_copy() {
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset("partition", "42");
         assert_eq!(

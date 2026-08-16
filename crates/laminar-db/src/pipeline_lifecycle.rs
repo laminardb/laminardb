@@ -4,50 +4,85 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
 use futures::FutureExt;
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract,
-    SinkTopology, SourceConsistency, SourceContract, SourceTopology,
+    SinkTopology, SourceConsistency, SourceContract, SourceInputMode, SourceRowPositionCapability,
+    SourceTopology,
 };
-use laminar_core::state::StateBackendDurability;
+use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
+use laminar_core::checkpoint::{channel_progress_frontier, SINGLETON_WATERMARK_CHANNEL};
 use rustc_hash::FxHashMap;
 
+use crate::catalog::schema_has_reserved_mutation_columns;
 use crate::connector_task_fence::ConnectorTaskFenceRegistration;
+use crate::db::{
+    exact_table_reference, DbState, LaminarDB, RecoveredInputChannelProgress, RuntimeMode,
+    SourceWatermarkState,
+};
 #[cfg(feature = "cluster")]
-use crate::db::ClusterStartupDisposition;
-use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWatermarkState};
+use crate::db::{ClusterStartupDisposition, StartupCheckpointArtifactAudit};
 use crate::error::DbError;
-use crate::pipeline::streaming_coordinator::TrackedSourceRegistration;
+use crate::pipeline::streaming_coordinator::{admit_append_only_source, TrackedSourceRegistration};
 
-/// Bound recovery amplification while keeping every delta parent strictly inside the retained
-/// predecessor window. A single retained predecessor cannot support a delta chain, so it stays on
-/// full per-vnode snapshots.
-#[cfg(feature = "cluster")]
-const fn cluster_delta_chain_bound(max_retained: usize) -> Option<u32> {
-    match max_retained {
-        0 | 1 => None,
-        2 => Some(1),
-        3 => Some(2),
-        4 => Some(3),
-        _ => Some(4),
-    }
-}
-
-const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability {
+const fn required_recovery_scope(runtime: RuntimeMode) -> CheckpointStorageScope {
     match runtime {
-        RuntimeMode::Local => StateBackendDurability::NodeDurable,
-        RuntimeMode::Cluster => StateBackendDurability::ClusterShared,
+        RuntimeMode::Local => CheckpointStorageScope::NodeDurable,
+        RuntimeMode::Cluster => CheckpointStorageScope::ClusterShared,
     }
 }
 
 const EXACT_SINK_PROTOCOL: &str =
     "exactly-once external sinks require checkpoint-committable consistency, coordinated phase \
-     1, participant-complete sealed markers, and a namespaced exact external cursor";
+     1, an immutable committed checkpoint index, and a namespaced exact external cursor";
 const CLUSTER_BEST_EFFORT: &str =
     "cluster mode requires at_least_once delivery; best_effort has no defined \
      rebalance/state-loss contract";
+const KEYED_SOURCE_PRIMARY_KEY: &str =
+    "[LDB-5038] keyed-upsert sources require an explicit CREATE SOURCE PRIMARY KEY";
+#[cfg(feature = "cluster")]
+const CLUSTER_COMPUTE_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
+const PUBLIC_PIPELINE_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "cluster")]
+const COORDINATED_RECOVERY_STOP_FINALIZATION_MARGIN: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+fn checked_pipeline_deadline(
+    timeout: std::time::Duration,
+    context: &str,
+) -> Result<tokio::time::Instant, DbError> {
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            DbError::InvalidOperation(format!(
+                "{context} timeout {timeout:?} exceeds the platform clock range"
+            ))
+        })
+}
+
+#[cfg(feature = "cluster")]
+fn configured_checkpoint_timeout(config: &crate::config::LaminarConfig) -> std::time::Duration {
+    config
+        .checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.timeout_ms)
+        .map_or(
+            crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+            std::time::Duration::from_millis,
+        )
+}
+
+#[cfg(feature = "cluster")]
+fn coordinated_recovery_stop_ceiling(
+    checkpoint_timeout: std::time::Duration,
+    cleanup_timeout: std::time::Duration,
+) -> std::time::Duration {
+    checkpoint_timeout
+        .saturating_add(cleanup_timeout)
+        .saturating_add(cleanup_timeout)
+        .saturating_add(COORDINATED_RECOVERY_STOP_FINALIZATION_MARGIN)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PipelineLifecycleAuthority {
@@ -64,6 +99,13 @@ enum StartupFailureKind {
     InvalidOperation,
     Shutdown,
     Pipeline,
+    PipelineTerminal,
+    BackpressureFail,
+    ShuffleTerminal,
+    ManagedStateBudgetExceeded {
+        accounted_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -83,6 +125,20 @@ impl StartupFailure {
             DbError::InvalidOperation(message) => (StartupFailureKind::InvalidOperation, message),
             DbError::Shutdown => (StartupFailureKind::Shutdown, String::new()),
             DbError::Pipeline(message) => (StartupFailureKind::Pipeline, message),
+            DbError::PipelineTerminal(message) => (StartupFailureKind::PipelineTerminal, message),
+            DbError::BackpressureFail(message) => (StartupFailureKind::BackpressureFail, message),
+            DbError::ShuffleTerminal(message) => (StartupFailureKind::ShuffleTerminal, message),
+            DbError::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes,
+                limit_bytes,
+            } => (
+                StartupFailureKind::ManagedStateBudgetExceeded {
+                    accounted_bytes,
+                    limit_bytes,
+                },
+                context,
+            ),
             error => (StartupFailureKind::Pipeline, error.to_string()),
         };
         Self {
@@ -100,6 +156,17 @@ impl StartupFailure {
             StartupFailureKind::InvalidOperation => DbError::InvalidOperation(message),
             StartupFailureKind::Shutdown => DbError::Shutdown,
             StartupFailureKind::Pipeline => DbError::Pipeline(message),
+            StartupFailureKind::PipelineTerminal => DbError::PipelineTerminal(message),
+            StartupFailureKind::BackpressureFail => DbError::BackpressureFail(message),
+            StartupFailureKind::ShuffleTerminal => DbError::ShuffleTerminal(message),
+            StartupFailureKind::ManagedStateBudgetExceeded {
+                accounted_bytes,
+                limit_bytes,
+            } => DbError::ManagedStateBudgetExceeded {
+                context: message,
+                accounted_bytes,
+                limit_bytes,
+            },
         }
     }
 }
@@ -137,8 +204,15 @@ impl StartupAttempt {
         self.notify.notify_waiters();
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.outcome.lock().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_success_for_test() -> Arc<Self> {
+        let attempt = Arc::new(Self::new());
+        attempt.complete(Ok(()));
+        attempt
     }
 
     async fn wait(&self) -> Result<(), DbError> {
@@ -178,6 +252,65 @@ async fn report_cluster_compute_fault(
     }
 }
 
+/// Persist the non-recoverable disposition before allowing a halted generation to disappear.
+#[cfg(feature = "cluster")]
+pub(crate) async fn report_cluster_terminal_halt(
+    controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    pending: Arc<std::sync::atomic::AtomicU64>,
+) {
+    let Some(controller) = controller else {
+        tracing::error!(
+            "cluster terminal pipeline halt has no recovery controller; durable publication remains pending"
+        );
+        return std::future::pending::<()>().await;
+    };
+    let mut backoff = std::time::Duration::from_millis(25);
+    let mut authority_lost = false;
+    loop {
+        if !authority_lost && controller.process_lease_is_live() {
+            match crate::coordinated_recovery::request_local_terminal_fault(&controller, &pending)
+                .await
+            {
+                Ok((
+                    _,
+                    laminar_core::cluster::control::RecoveryFaultReportOutcome::Active
+                    | laminar_core::cluster::control::RecoveryFaultReportOutcome::TerminalFenceActive,
+                )) => return,
+                Ok((_, outcome)) => {
+                    tracing::warn!(
+                        ?outcome,
+                        "terminal pipeline fault request was not yet admitted"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(%error, "durable terminal pipeline halt publication failed; retrying while shutdown remains fenced");
+                }
+            }
+        }
+
+        if authority_lost || !controller.process_lease_is_live() {
+            authority_lost = true;
+            let durable = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                controller.read_recovery_fault_inventory(),
+            )
+            .await;
+            if matches!(durable, Ok(Ok(inventory)) if inventory.has_terminal_fault()) {
+                return;
+            }
+            tracing::error!(
+                "terminal pipeline fault lost process authority before durable confirmation; \
+                 waiting for a namespace-wide terminal marker while shutdown remains fenced"
+            );
+        }
+
+        tokio::time::sleep(backoff).await;
+        backoff = backoff
+            .saturating_mul(2)
+            .min(std::time::Duration::from_secs(1));
+    }
+}
+
 /// Queue only a fault that won lifecycle ownership before this runtime generation was cancelled.
 #[cfg(feature = "cluster")]
 fn queue_owned_cluster_compute_fault(
@@ -196,6 +329,8 @@ fn queue_owned_cluster_compute_fault(
 /// Validate source durability and placement before the connector performs I/O.
 fn admit_source_contract(
     contract: SourceContract,
+    has_primary_key: bool,
+    has_reserved_mutation_columns: bool,
     delivery: DeliveryGuarantee,
     checkpointing_enabled: bool,
     runtime: RuntimeMode,
@@ -203,12 +338,19 @@ fn admit_source_contract(
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
         return Err(CLUSTER_BEST_EFFORT);
     }
-    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
-        return Err(
-            "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
-             certified term-fenced source handoff and external sink cursor commits",
-        );
+    if contract.input_mode == SourceInputMode::KeyedUpsert && !has_primary_key {
+        return Err(KEYED_SOURCE_PRIMARY_KEY);
     }
+    admit_append_only_source(contract, has_reserved_mutation_columns)?;
+    admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+}
+
+fn admit_source_recovery_contract(
+    contract: SourceContract,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
     if delivery == DeliveryGuarantee::ExactlyOnce && !contract.is_exact_delivery_certified() {
         return Err(
             "[LDB-5037] exactly-once source delivery is not production-certified for this \
@@ -257,10 +399,142 @@ fn admit_source_contract(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TemporalSourceRole {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OrderedIntervalAdmissions {
+    pub(crate) joins:
+        FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
+    /// Only non-append sources are present. Absence means the ordinary append-only route.
+    pub(crate) source_modes: FxHashMap<String, SourceInputMode>,
+}
+
+impl TemporalSourceRole {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+fn admit_temporal_source_contract(
+    contract: SourceContract,
+    role: TemporalSourceRole,
+    has_primary_key: bool,
+    has_reserved_mutation_columns: bool,
+    delivery: DeliveryGuarantee,
+    checkpointing_enabled: bool,
+    runtime: RuntimeMode,
+) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
+        return Err(CLUSTER_BEST_EFFORT);
+    }
+    if delivery != DeliveryGuarantee::BestEffort && !checkpointing_enabled {
+        return Err(
+            "at-least-once and exactly-once temporal joins require checkpointing for state and source-offset recovery",
+        );
+    }
+    if contract.row_positions != SourceRowPositionCapability::OrderedDeterministic {
+        return Err("temporal joins require ordered deterministic row positions");
+    }
+    if has_reserved_mutation_columns {
+        return Err("temporal source schemas cannot declare engine-owned mutation columns");
+    }
+    match (role, contract.input_mode) {
+        (TemporalSourceRole::Left, SourceInputMode::AppendOnly)
+        | (TemporalSourceRole::Right, SourceInputMode::AppendOnly | SourceInputMode::KeyedUpsert) =>
+            {}
+        (TemporalSourceRole::Left, _) => {
+            return Err("temporal left inputs must be append-only");
+        }
+        (TemporalSourceRole::Right, SourceInputMode::FullChangelog) => {
+            return Err(
+                "temporal right inputs support append-only or keyed-upsert mutations, not full changelogs",
+            );
+        }
+    }
+    if contract.input_mode == SourceInputMode::KeyedUpsert && !has_primary_key {
+        return Err(KEYED_SOURCE_PRIMARY_KEY);
+    }
+    admit_source_recovery_contract(contract, delivery, checkpointing_enabled, runtime)
+}
+
+fn has_only_temporal_right_consumers(
+    source: &str,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+) -> bool {
+    if sink_regs
+        .values()
+        .any(|sink| sink.input == source || sink.query_inputs.iter().any(|input| input == source))
+    {
+        return false;
+    }
+    let mut consumed = false;
+    for stream in stream_regs.values() {
+        if let Some([laminar_sql::translator::JoinOperatorConfig::Temporal(config)]) =
+            stream.join_config.as_deref()
+        {
+            if config.right_table == source && config.left_table != source {
+                consumed = true;
+                continue;
+            }
+            if config.left_table == source || config.right_table == source {
+                return false;
+            }
+        }
+        if crate::sql_analysis::extract_table_references(&stream.query_sql).contains(source) {
+            return false;
+        }
+    }
+    consumed
+}
+
+fn has_only_ordered_interval_consumers(
+    source: &str,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+    admitted_joins: &FxHashMap<
+        String,
+        [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+    >,
+) -> bool {
+    if sink_regs
+        .values()
+        .any(|sink| sink.input == source || sink.query_inputs.iter().any(|input| input == source))
+    {
+        return false;
+    }
+    let mut consumed = false;
+    for stream in stream_regs.values() {
+        let references = crate::sql_analysis::extract_table_references(&stream.query_sql);
+        let configured_input = stream.join_config.as_deref().is_some_and(|joins| {
+            matches!(
+                joins,
+                [laminar_sql::translator::JoinOperatorConfig::StreamStream(config)]
+                    if config.left_table == source || config.right_table == source
+            )
+        });
+        if !configured_input && !references.contains(source) {
+            continue;
+        }
+        consumed = true;
+        if !admitted_joins.contains_key(&stream.name) || !configured_input {
+            return false;
+        }
+    }
+    consumed
+}
+
 fn validate_source_recovery_assignment(
     source: &str,
     assignment_scoped: bool,
-    checkpoint: Option<&laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint>,
+    checkpoint: Option<&laminar_core::checkpoint::ConnectorCheckpoint>,
     expected_assignment: Option<std::num::NonZeroU64>,
 ) -> Result<(), DbError> {
     let captured = checkpoint.and_then(|checkpoint| checkpoint.source_assignment_version);
@@ -293,12 +567,6 @@ fn admit_sink_contract(
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
         return Err(CLUSTER_BEST_EFFORT);
     }
-    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
-        return Err(
-            "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
-             certified term-fenced source handoff and external sink cursor commits",
-        );
-    }
     match (delivery, contract.consistency) {
         (DeliveryGuarantee::ExactlyOnce, SinkConsistency::CheckpointCommittable) => {}
         (DeliveryGuarantee::ExactlyOnce, _) => return Err(EXACT_SINK_PROTOCOL),
@@ -309,6 +577,15 @@ fn admit_sink_contract(
             );
         }
         _ => {}
+    }
+    if runtime == RuntimeMode::Cluster
+        && delivery == DeliveryGuarantee::ExactlyOnce
+        && !contract.is_cluster_exact_delivery_certified()
+    {
+        return Err(
+            "cluster exactly-once requires a certified immutable phase-one sink with an atomic, \
+             namespaced external checkpoint cursor",
+        );
     }
 
     if delivery == DeliveryGuarantee::AtLeastOnce
@@ -353,7 +630,7 @@ struct SinkAdmissionContext<'a> {
     runtime: RuntimeMode,
     carries_changelog: bool,
     checkpointing_enabled: bool,
-    state_backend_scope: StateBackendDurability,
+    checkpoint_storage_scope: CheckpointStorageScope,
 }
 
 struct PreparedSink {
@@ -363,6 +640,7 @@ struct PreparedSink {
     filter_expr: Option<String>,
     input: String,
     contract: SinkContract,
+    expects_changelog: bool,
     write_timeout: std::time::Duration,
     flush_interval: std::time::Duration,
     requires_recovery_on_error: bool,
@@ -375,14 +653,12 @@ type PipelineSink = (
     Option<String>,
     String,
     SinkContract,
+    bool,
 );
 
 struct PipelineSinkSetup {
     sinks: Vec<PipelineSink>,
     sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
-    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-    committer_poll: std::time::Duration,
-    committer_notify: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     callback_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
 }
@@ -390,12 +666,16 @@ struct PipelineSinkSetup {
 struct PipelineRecoveryState {
     graph: crate::operator_graph::OperatorGraph,
     recovered_mv_store: crate::mv_store::MvStore,
-    recovered_source_wms: rustc_hash::FxHashMap<String, i64>,
+    recovered_channel_progress:
+        FxHashMap<String, FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+    recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>>,
+    /// Exact source-keyed cuts owned by the committed checkpoint decision. Unlike physical
+    /// channel progress, this map retains a source's cut across an empty current inventory.
+    recovered_source_watermarks: FxHashMap<String, i64>,
+    /// `None` denotes a fresh start. The version distinguishes cumulative v4 source cuts from
+    /// legacy v3 indices whose empty current inventory cannot reconstruct an erased prior cut.
+    recovered_checkpoint_index_version: Option<u32>,
     recovered_watermark_frontier: Option<i64>,
-    recovered_all_sources_idle: bool,
-    source_watermark_recovery_selected: bool,
-    #[cfg(feature = "cluster")]
-    reconciled_source_handoff_version: Option<u64>,
     restored_reference_tables: bool,
 }
 
@@ -404,7 +684,281 @@ struct PipelineWatermarks {
     watermark_states: FxHashMap<String, SourceWatermarkState>,
     source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     source_ids: FxHashMap<String, usize>,
+    source_names: Vec<String>,
     tracker: Option<laminar_core::time::WatermarkTracker>,
+}
+
+fn recovered_source_watermark(
+    progress: Option<&FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+    owns_empty_inventory: bool,
+    committed_source_watermark: Option<i64>,
+) -> (Option<i64>, bool) {
+    let Some(progress) = progress.filter(|progress| !progress.is_empty()) else {
+        return if owns_empty_inventory {
+            (committed_source_watermark, true)
+        } else {
+            (None, false)
+        };
+    };
+    let mut active = false;
+    let mut active_min = i64::MAX;
+    let mut idle_max = None;
+    for channel in progress.values() {
+        if let Some(watermark) = channel.watermark {
+            idle_max = Some(idle_max.map_or(watermark, |current: i64| current.max(watermark)));
+        }
+        if !channel.idle {
+            active = true;
+            let Some(watermark) = channel.watermark else {
+                return (None, false);
+            };
+            active_min = active_min.min(watermark);
+        }
+    }
+    if active {
+        (Some(active_min), false)
+    } else {
+        (committed_source_watermark.or(idle_max), true)
+    }
+}
+
+fn physical_recovered_input_channel_progress(
+    progress: Option<&FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>>,
+) -> FxHashMap<Box<[u8]>, RecoveredInputChannelProgress> {
+    let mut physical = progress.cloned().unwrap_or_default();
+    physical.remove(SINGLETON_WATERMARK_CHANNEL);
+    physical
+}
+
+fn restore_source_watermark_state(
+    state: &mut SourceWatermarkState,
+    recovered: Option<i64>,
+    idle: bool,
+    committed_source_watermark: Option<i64>,
+) {
+    let Some(watermark) = recovered else {
+        return;
+    };
+    if idle && committed_source_watermark == Some(watermark) {
+        // A committed source decision is trusted recovery evidence. Installing it as the
+        // partitioned external floor ensures a subsequently installed all-idle inventory writes
+        // the same exact per-channel cut rather than regressing to its older physical values.
+        let _ = state.install_committed_watermark_floor(watermark);
+    } else {
+        state.generator.restore_watermark_for_recovery(watermark);
+    }
+}
+
+fn validate_recovered_source_watermark(
+    source_name: &str,
+    recovered: Option<i64>,
+    idle: bool,
+    committed_source_watermark: Option<i64>,
+    recovered_checkpoint_index_version: Option<u32>,
+) -> Result<(), DbError> {
+    if let Some(version) = recovered_checkpoint_index_version {
+        if version < laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION
+            && idle
+            && recovered.is_none()
+            && committed_source_watermark.is_none()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "legacy committed checkpoint index version {version} cannot reconstruct the \
+                 retained watermark for idle source '{source_name}' from empty or uninitialized \
+                 channel progress"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod recovered_source_watermark_tests {
+    use super::*;
+    use laminar_core::time::{BoundedOutOfOrdernessGenerator, EventTimeExtractor, ExtractionMode};
+
+    fn channel_progress(
+        entries: &[(&[u8], Option<i64>, bool)],
+    ) -> FxHashMap<Box<[u8]>, RecoveredInputChannelProgress> {
+        entries
+            .iter()
+            .map(|(channel, watermark, idle)| {
+                (
+                    Box::<[u8]>::from(*channel),
+                    RecoveredInputChannelProgress {
+                        watermark: *watermark,
+                        idle: *idle,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_owned_inventory_restores_its_exact_committed_source_cut() {
+        let progress = FxHashMap::default();
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), true, Some(900)),
+            (Some(900), true)
+        );
+    }
+
+    #[test]
+    fn all_idle_inventory_prefers_the_exact_committed_source_cut() {
+        let progress = channel_progress(&[(b"left", Some(700), true), (b"right", Some(800), true)]);
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), false, Some(900)),
+            (Some(900), true)
+        );
+    }
+
+    #[test]
+    fn logical_empty_inventory_marker_is_not_restored_as_a_physical_channel() {
+        let progress = channel_progress(&[(SINGLETON_WATERMARK_CHANNEL, Some(900), true)]);
+        let physical = physical_recovered_input_channel_progress(Some(&progress));
+        let inventory: Arc<[Vec<u8>]> = Arc::from(Vec::<Vec<u8>>::new());
+
+        assert!(physical.is_empty());
+        validate_recovered_input_channels("orders", &physical, Some(&inventory)).unwrap();
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), true, Some(900)),
+            (Some(900), true),
+            "the unstripped logical marker must still recover the source decision"
+        );
+    }
+
+    #[test]
+    fn active_uninitialized_inventory_ignores_a_retained_committed_cut() {
+        let progress = channel_progress(&[
+            (b"initialized", Some(700), false),
+            (b"uninitialized", None, false),
+        ]);
+        assert_eq!(
+            recovered_source_watermark(Some(&progress), false, Some(900)),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn legacy_idle_inventory_without_a_reconstructable_cut_fails_closed() {
+        let legacy_version =
+            laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION.saturating_sub(1);
+        let error =
+            validate_recovered_source_watermark("orders", None, true, None, Some(legacy_version))
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::Checkpoint(message)
+                if message.contains("legacy committed checkpoint index")
+                    && message.contains("orders")
+        ));
+    }
+
+    #[test]
+    fn current_index_and_active_uninitialized_legacy_source_remain_uninitialized() {
+        assert!(validate_recovered_source_watermark(
+            "orders",
+            None,
+            true,
+            None,
+            Some(laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION),
+        )
+        .is_ok());
+        assert!(validate_recovered_source_watermark(
+            "orders",
+            None,
+            false,
+            None,
+            Some(laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION - 1),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn committed_idle_cut_becomes_the_recovered_partition_floor() {
+        let inventory: Arc<[Vec<u8>]> = Arc::from([b"partition".to_vec()]);
+        let progress = channel_progress(&[(b"partition", Some(700), true)]);
+        let mut state = SourceWatermarkState::new(
+            EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+            Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+            "ts".into(),
+        )
+        .with_input_channels(
+            std::time::Duration::ZERO,
+            0,
+            None,
+            progress.clone(),
+            Some(Arc::clone(&inventory)),
+        );
+        let (recovered, idle) = recovered_source_watermark(Some(&progress), false, Some(900));
+        restore_source_watermark_state(&mut state, recovered, idle, Some(900));
+        state
+            .install_input_channels(Some(inventory), i64::MIN)
+            .unwrap();
+
+        assert_eq!(state.generator.current_watermark(), 900);
+        let restored = state.input_channel_progress().unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].watermark, Some(900));
+        assert!(restored[0].idle);
+    }
+
+    #[test]
+    fn committed_empty_inventory_cut_floors_its_first_recovered_channel() {
+        let empty_inventory: Arc<[Vec<u8>]> = Arc::from(Vec::<Vec<u8>>::new());
+        let progress = FxHashMap::default();
+        let mut state = SourceWatermarkState::new(
+            EventTimeExtractor::from_column("ts").with_mode(ExtractionMode::Max),
+            Box::new(BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0)),
+            "ts".into(),
+        )
+        .with_input_channels(
+            std::time::Duration::ZERO,
+            0,
+            None,
+            progress.clone(),
+            Some(Arc::clone(&empty_inventory)),
+        );
+        let (recovered, idle) = recovered_source_watermark(Some(&progress), true, Some(900));
+        restore_source_watermark_state(&mut state, recovered, idle, Some(900));
+        state
+            .install_input_channels(Some(empty_inventory), i64::MIN)
+            .unwrap();
+
+        assert_eq!(state.generator.current_watermark(), 900);
+        assert_eq!(state.input_channels_all_idle(), Some(true));
+        assert!(state.input_channel_progress().unwrap().unwrap().is_empty());
+
+        state
+            .install_input_channels(Some(Arc::from([b"new-partition".to_vec()])), i64::MIN)
+            .unwrap();
+        let restored = state.input_channel_progress().unwrap().unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].watermark, Some(900));
+        assert!(!restored[0].idle);
+    }
+}
+
+fn validate_recovered_input_channels(
+    source_name: &str,
+    progress: &FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+    inventory: Option<&Arc<[Vec<u8>]>>,
+) -> Result<(), DbError> {
+    let inventory = inventory.ok_or_else(|| {
+        DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' has no input-channel inventory"
+        ))
+    })?;
+    if inventory.len() != progress.len()
+        || inventory
+            .iter()
+            .any(|channel| !progress.contains_key(channel.as_slice()))
+    {
+        return Err(DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' input-channel inventory does not match its watermark progress"
+        )));
+    }
+    Ok(())
 }
 
 struct PipelineRuntimeSetup {
@@ -415,7 +969,6 @@ struct PipelineRuntimeSetup {
     checkpoint_complete_rx:
         crossfire::AsyncRx<crossfire::mpsc::Array<crate::pipeline::CheckpointCompletion>>,
     checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
     #[cfg(feature = "cluster")]
     source_process_authority: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     runtime_mode: RuntimeMode,
@@ -423,9 +976,6 @@ struct PipelineRuntimeSetup {
 
 struct PreparedPipelineRuntime {
     runtime: PipelineRuntimeSetup,
-    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-    committer_poll: std::time::Duration,
-    committer_notify: Arc<tokio::sync::Notify>,
 }
 
 type ReferenceTableRuntimeSource = (
@@ -563,7 +1113,7 @@ fn admit_sink(
         runtime,
         carries_changelog,
         checkpointing_enabled,
-        state_backend_scope,
+        checkpoint_storage_scope,
     } = context;
     let contract = sink.contract(config).map_err(|e| {
         DbError::Config(format!(
@@ -594,11 +1144,11 @@ fn admit_sink(
             )));
         }
         let required_scope = required_recovery_scope(runtime);
-        if !state_backend_scope.satisfies(required_scope) {
+        if !checkpoint_storage_scope.satisfies(required_scope) {
             return Err(DbError::Config(format!(
-                "[LDB-5035] sink '{name}' cannot run exactly-once: prepared participant markers \
-                 require {required_scope:?} state, but the configured backend is \
-                 {state_backend_scope:?}"
+                "[LDB-5035] sink '{name}' cannot run exactly-once: committed checkpoints require \
+                 {required_scope:?} storage, but the configured checkpoint store is \
+                 {checkpoint_storage_scope:?}"
             )));
         }
         if sink.as_coordinated_committer().is_none() {
@@ -889,19 +1439,13 @@ async fn open_prepared_sinks(
     Ok(())
 }
 
-/// Resolve a query's output schema by planning it. On `ASOF JOIN` failure,
-/// retries with the schema-equivalent rewrite. Returns `None` if the query
-/// still can't be planned (e.g. a dependency isn't registered yet).
+/// Resolve a query's output schema by planning it. Returns `None` when a
+/// dependency is not registered yet or the query is invalid.
 pub(crate) async fn plan_output_schema(
     ctx: &datafusion::prelude::SessionContext,
     sql: &str,
 ) -> Option<arrow_schema::SchemaRef> {
-    let plan = if let Ok(plan) = ctx.state().create_logical_plan(sql).await {
-        plan
-    } else {
-        let rewritten = crate::sql_analysis::rewrite_asof_joins_for_planning(sql)?;
-        ctx.state().create_logical_plan(&rewritten).await.ok()?
-    };
+    let plan = ctx.state().create_logical_plan(sql).await.ok()?;
     let fields: Vec<_> = plan
         .schema()
         .fields()
@@ -911,27 +1455,129 @@ pub(crate) async fn plan_output_schema(
     Some(Arc::new(arrow_schema::Schema::new(fields)))
 }
 
-async fn resolve_stream_output_schemas(
+pub(crate) async fn plan_temporal_output_schema(
+    ctx: &datafusion::prelude::SessionContext,
+    stream: &str,
+    sql: &str,
+    config: &laminar_sql::translator::TemporalJoinTranslatorConfig,
+    left_schema: &arrow_schema::SchemaRef,
+    right_schema: &arrow_schema::SchemaRef,
+) -> Result<arrow_schema::SchemaRef, DbError> {
+    let left = laminar_connectors::connector::schema_with_source_row_positions(left_schema)
+        .map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' left source-position schema: {error}"
+            ))
+        })?;
+    let right = laminar_connectors::connector::schema_with_source_row_positions(right_schema)
+        .map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' right source-position schema: {error}"
+            ))
+        })?;
+    let joined = crate::temporal_join_state::temporal_join_output_schema(
+        left.as_ref(),
+        right.as_ref(),
+        &config.right_table,
+        config.join_kind,
+        config.probe_alias.is_some(),
+    )?;
+    let input_table = format!("__temporal_schema_{}", uuid::Uuid::new_v4().simple());
+    let projection =
+        crate::sql_analysis::temporal_projection_sql_for_input(sql, config, &input_table)?;
+    let what = format!("temporal stream '{stream}' projection");
+    crate::operator::prepare_post_projection(ctx, &projection, &input_table, &joined, &what)
+        .await
+        .map(|(_, schema)| schema)
+}
+
+pub(crate) async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-) -> Result<HashMap<String, arrow_schema::SchemaRef>, DbError> {
+    reference_tables: &rustc_hash::FxHashSet<String>,
+    ordered_interval_joins: &FxHashMap<
+        String,
+        [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+    >,
+) -> Result<ResolvedStreamOutputs, DbError> {
     use datafusion::datasource::empty::EmptyTable;
 
-    let mut out: HashMap<String, arrow_schema::SchemaRef> =
+    let mut schemas: HashMap<String, arrow_schema::SchemaRef> =
         HashMap::with_capacity(stream_regs.len());
+    let mut shapes: HashMap<String, StreamOutputShape> = HashMap::with_capacity(stream_regs.len());
     let mut pending: Vec<&crate::connector_manager::StreamRegistration> =
         stream_regs.values().collect();
     let mut placeholders: Vec<String> = Vec::new();
 
-    let result: Result<(), DbError> = async {
+    let result: Result<ResolvedStreamOutputs, DbError> = async {
         while !pending.is_empty() {
             let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
             let mut progressed = false;
             for reg in pending {
-                let Some(schema) = plan_output_schema(ctx, &reg.query_sql).await else {
-                    next.push(reg);
-                    continue;
+                let temporal = reg.join_config.as_deref().and_then(|joins| match joins {
+                    [laminar_sql::translator::JoinOperatorConfig::Temporal(config)] => Some(config),
+                    _ => None,
+                });
+                let (schema, shape) = if let Some(config) = temporal {
+                    let left = ctx
+                        .table_provider(exact_table_reference(&config.left_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "temporal stream '{}' cannot resolve left source '{}': {error}",
+                                reg.name, config.left_table
+                            ))
+                        })?;
+                    let right = ctx
+                        .table_provider(exact_table_reference(&config.right_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "temporal stream '{}' cannot resolve right source '{}': {error}",
+                                reg.name, config.right_table
+                            ))
+                        })?;
+                    (
+                        plan_temporal_output_schema(
+                            ctx,
+                            &reg.name,
+                            &reg.query_sql,
+                            config,
+                            &left.schema(),
+                            &right.schema(),
+                        )
+                        .await?,
+                        StreamOutputShape {
+                            aggregate: false,
+                            projection_filter: false,
+                            planned_functions_immutable: true,
+                        },
+                    )
+                } else {
+                    let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
+                        next.push(reg);
+                        continue;
+                    };
+                    let fields = plan
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| (**field).clone())
+                        .collect::<Vec<_>>();
+                    (
+                        Arc::new(arrow_schema::Schema::new(fields)),
+                        StreamOutputShape {
+                            aggregate: crate::aggregate_state::find_aggregate(&plan).is_some(),
+                            projection_filter: crate::sql_analysis::extract_projection_filter(
+                                &plan,
+                            )
+                            .is_some(),
+                            planned_functions_immutable:
+                                crate::sql_analysis::planned_functions_are_immutable(&plan),
+                        },
+                    )
                 };
+                shapes.insert(reg.name.clone(), shape);
 
                 if !ctx
                     .table_exist(exact_table_reference(&reg.name))
@@ -949,21 +1595,20 @@ async fn resolve_stream_output_schemas(
                     })?;
                     placeholders.push(reg.name.clone());
                 }
-                out.insert(reg.name.clone(), schema);
+                schemas.insert(reg.name.clone(), schema);
                 progressed = true;
             }
 
             if !progressed {
                 let mut unresolved: Vec<&str> = next.iter().map(|r| r.name.as_str()).collect();
                 unresolved.sort_unstable();
-                // For ASOF joins, report the rewritten-plan error (the raw planner
-                // just says "AsOf unsupported", which masks the real blocker).
                 let sql = &next[0].query_sql;
-                let err = match crate::sql_analysis::rewrite_asof_joins_for_planning(sql) {
-                    Some(rewritten) => ctx.state().create_logical_plan(&rewritten).await.err(),
-                    None => ctx.state().create_logical_plan(sql).await.err(),
-                }
-                .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+                let err = ctx
+                    .state()
+                    .create_logical_plan(sql)
+                    .await
+                    .err()
+                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
                 return Err(DbError::Pipeline(format!(
                     "unresolvable stream dependency among [{}]: {err}",
                     unresolved.join(", ")
@@ -971,7 +1616,222 @@ async fn resolve_stream_output_schemas(
             }
             pending = next;
         }
-        Ok(())
+
+        for reg in stream_regs.values() {
+            let shape = shapes.get(&reg.name).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "stream '{}' has no resolved output shape",
+                    reg.name
+                ))
+            })?;
+            if !shape.aggregate && reg.window_config.is_none() {
+                continue;
+            }
+            let certified = crate::ddl::validate_managed_aggregate_admission(
+                ctx,
+                &reg.query_sql,
+                reg.window_config.as_ref(),
+                reg.emit_clause.as_ref(),
+                laminar_core::state::DEFAULT_KEY_GROUP_COUNT,
+            )
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "stream '{}' aggregate could not be certified: {error}",
+                    reg.name
+                ))
+            })?;
+            if !certified {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{}' aggregate has no managed execution path",
+                    reg.name
+                )));
+            }
+        }
+
+        let mut changelog_carrying: rustc_hash::FxHashSet<String> =
+            ordered_interval_joins.keys().cloned().collect();
+
+        for reg in stream_regs.values() {
+            let shape = shapes.get(&reg.name).ok_or_else(|| {
+                DbError::Pipeline(format!(
+                    "stream '{}' has no resolved output shape",
+                    reg.name
+                ))
+            })?;
+            let emit_changelog = reg.incremental
+                || reg
+                    .emit_clause
+                    .as_ref()
+                    .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
+            if shape.aggregate && emit_changelog {
+                changelog_carrying.insert(reg.name.clone());
+            }
+
+            if reg.window_config.is_none()
+                && !crate::sql_analysis::has_join_clause(&reg.query_sql)
+                && reg
+                    .emit_clause
+                    .as_ref()
+                    .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes))
+            {
+                use crate::sql_analysis::TemporalFilterAnalysis;
+                match crate::sql_analysis::analyze_temporal_filter(&reg.query_sql) {
+                    TemporalFilterAnalysis::Recognized(_) => {
+                        changelog_carrying.insert(reg.name.clone());
+                    }
+                    TemporalFilterAnalysis::PresentUnrecognized => {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' has an unrecognized retracting temporal-filter shape",
+                            reg.name
+                        )));
+                    }
+                    TemporalFilterAnalysis::NotPresent => {}
+                }
+            }
+        }
+
+        loop {
+            let mut added = false;
+            for reg in stream_regs.values() {
+                let references = crate::sql_analysis::extract_table_references(&reg.query_sql);
+                if !references
+                    .iter()
+                    .any(|name| changelog_carrying.contains(name))
+                {
+                    continue;
+                }
+                if reg.order_config.is_some()
+                    || crate::sql_analysis::query_has_order_or_row_limit(&reg.query_sql)
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot apply ordering or row limits to a changelog",
+                        reg.name
+                    )));
+                }
+                if reg.window_config.is_some() {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot safely consume a changelog with window state; window aggregates do not apply input retractions",
+                        reg.name
+                    )));
+                }
+                let shape = shapes.get(&reg.name).expect("resolved above");
+                if crate::sql_analysis::query_references_weight(&reg.query_sql) {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' consumes a changelog by explicitly referencing the engine-owned '{}' column",
+                        reg.name,
+                        crate::aggregate_state::WEIGHT_COLUMN
+                    )));
+                }
+                if !shape.planned_functions_immutable {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' consumes a changelog through a planned function that is not replay-immutable",
+                        reg.name
+                    )));
+                }
+                let temporal_filter = !matches!(
+                    crate::sql_analysis::analyze_temporal_filter(&reg.query_sql),
+                    crate::sql_analysis::TemporalFilterAnalysis::NotPresent
+                );
+                let changelog_enrich = crate::sql_analysis::detect_changelog_enrich_query(
+                    &reg.query_sql,
+                    &changelog_carrying,
+                    reference_tables,
+                );
+                if changelog_enrich.is_some() && shape.aggregate {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot combine aggregate state with changelog enrichment",
+                        reg.name
+                    )));
+                }
+                if let Some(enrich) = &changelog_enrich {
+                    let provider = ctx
+                        .table_provider(exact_table_reference(&enrich.static_table))
+                        .await
+                        .map_err(|error| {
+                            DbError::Pipeline(format!(
+                                "stream '{}' cannot resolve static enrich table '{}': {error}",
+                                reg.name, enrich.static_table
+                            ))
+                        })?;
+                    if schema_has_reserved_mutation_columns(provider.schema().as_ref()) {
+                        return Err(DbError::Pipeline(format!(
+                            "stream '{}' static enrich table '{}' declares reserved engine mutation metadata (_op, __op, or __weight)",
+                            reg.name, enrich.static_table
+                        )));
+                    }
+                }
+                let changelog_enrich = changelog_enrich.is_some();
+                if shape.projection_filter
+                    && !shape.aggregate
+                    && !changelog_enrich
+                    && crate::sql_analysis::projection_sql_preserving_weight(&reg.query_sql)
+                        .is_none()
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' changelog projection cannot preserve the engine-owned weight through its exact SQL shape",
+                        reg.name
+                    )));
+                }
+
+                if temporal_filter
+                    || (!shape.projection_filter && !shape.aggregate && !changelog_enrich)
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "stream '{}' cannot safely consume a changelog; supported consumers are \
+                         a projection/filter, an aggregate, or a certified static-table enrich",
+                        reg.name
+                    )));
+                }
+
+                let emit_changelog = reg.incremental
+                    || reg.emit_clause.as_ref().is_some_and(|emit| {
+                        matches!(emit, laminar_sql::parser::EmitClause::Changes)
+                    });
+                let forwards_changelog = shape.projection_filter || changelog_enrich;
+                if (forwards_changelog || (shape.aggregate && emit_changelog))
+                    && changelog_carrying.insert(reg.name.clone())
+                {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        for reg in stream_regs.values().filter(|reg| reg.incremental) {
+            if !changelog_carrying.contains(&reg.name) {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{}' is registered as incremental but has no certified changelog \
+                     output path",
+                    reg.name
+                )));
+            }
+        }
+        for (name, schema) in &schemas {
+            if !changelog_carrying.contains(name)
+                && schema.fields().iter().any(|field| {
+                    field
+                        .name()
+                        .eq_ignore_ascii_case(crate::aggregate_state::WEIGHT_COLUMN)
+                })
+            {
+                return Err(DbError::Pipeline(format!(
+                    "stream '{name}' is not a certified changelog producer but declares the reserved engine-owned '{}' column",
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+        }
+        for name in &changelog_carrying {
+            let schema = schemas.get_mut(name).expect("resolved above");
+            *schema = advertise_changelog_schema(name, schema)?;
+        }
+
+        Ok(ResolvedStreamOutputs {
+            schemas,
+            changelog_carrying,
+        })
     }
     .await;
 
@@ -979,7 +1839,62 @@ async fn resolve_stream_output_schemas(
         let _ = ctx.deregister_table(exact_table_reference(name));
     }
 
-    result.map(|()| out)
+    result
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedStreamOutputs {
+    pub(crate) schemas: HashMap<String, arrow_schema::SchemaRef>,
+    pub(crate) changelog_carrying: rustc_hash::FxHashSet<String>,
+}
+
+struct StreamOutputShape {
+    aggregate: bool,
+    projection_filter: bool,
+    planned_functions_immutable: bool,
+}
+
+fn advertise_changelog_schema(
+    stream: &str,
+    schema: &arrow_schema::SchemaRef,
+) -> Result<arrow_schema::SchemaRef, DbError> {
+    use arrow_schema::{DataType, Field, Schema};
+
+    let weight = crate::aggregate_state::WEIGHT_COLUMN;
+    let matching = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name().eq_ignore_ascii_case(weight))
+        .collect::<Vec<_>>();
+    if let [(index, field)] = matching.as_slice() {
+        if *index + 1 == schema.fields().len()
+            && field.name() == weight
+            && field.data_type() == &DataType::Int64
+            && !field.is_nullable()
+        {
+            return Ok(Arc::clone(schema));
+        }
+        return Err(DbError::Pipeline(format!(
+            "stream '{stream}' exposes reserved changelog column '{}' with type {:?} and \
+             nullable={}; expected sole exact trailing non-null Int64 '{weight}'",
+            field.name(),
+            field.data_type(),
+            field.is_nullable()
+        )));
+    }
+    if !matching.is_empty() {
+        return Err(DbError::Pipeline(format!(
+            "stream '{stream}' exposes duplicate reserved changelog column '{weight}'"
+        )));
+    }
+
+    let mut fields = schema.fields().to_vec();
+    fields.push(Arc::new(Field::new(weight, DataType::Int64, false)));
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
 }
 
 /// Prune timestamps outside `window`; if under `max_restarts`, record `now` and return
@@ -1121,6 +2036,47 @@ impl Drop for StartupDriverGuard {
     }
 }
 
+/// Retire only the transition handed to a graph generation that never launches. A later
+/// generation must reload the durable cut before source intake can open.
+#[cfg(feature = "cluster")]
+struct PendingVnodeTransitionLaunchGuard {
+    handle: crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    expected: Option<Arc<crate::vnode_transition_staging::PendingVnodeTransition>>,
+    armed: bool,
+}
+
+#[cfg(feature = "cluster")]
+impl PendingVnodeTransitionLaunchGuard {
+    fn capture(db: &LaminarDB) -> Self {
+        Self {
+            handle: Arc::clone(&db.pending_vnode_transition),
+            expected: db.pending_vnode_transition.lock().clone(),
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.expected.take();
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for PendingVnodeTransitionLaunchGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(expected) = self.expected.as_ref() else {
+            return;
+        };
+        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(
+            &self.handle,
+            expected,
+        );
+    }
+}
+
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<String>()
@@ -1145,82 +2101,270 @@ fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
     }
 }
 
+fn runtime_exit_is_covered_by_terminal_stop(
+    owns_fault_state: bool,
+    state: &std::sync::atomic::AtomicU8,
+    runtime_shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    !owns_fault_state
+        && runtime_shutdown.is_cancelled()
+        && DbState::load(state) == DbState::ShuttingDown
+}
+
+/// Retire every vnode-state claim owned by a terminal cluster compute generation before making
+/// its fault observable. The compute future and its private runtime must already be dropped, so
+/// taking the write side proves no callback from that generation can still publish the staged
+/// transition. Assignment adoption takes the same fence and therefore cannot split retirement
+/// from the `Faulted` publication.
+#[cfg(feature = "cluster")]
+fn retire_cluster_compute_generation(
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) {
+    pending_vnode_transition.lock().take();
+    installed_vnode_state.lock().take();
+}
+
+/// Serialize retirement of the two vnode-state claims against every graph callback and
+/// assignment adoption. The returned guard lets lifecycle callers retain the serialization
+/// through their terminal state publication.
+#[cfg(feature = "cluster")]
+async fn retire_cluster_compute_generation_until(
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, tokio::time::error::Elapsed> {
+    let generation =
+        tokio::time::timeout_at(deadline, Arc::clone(rotation_execution_fence).write_owned())
+            .await?;
+    retire_cluster_compute_generation(pending_vnode_transition, installed_vnode_state);
+    Ok(generation)
+}
+
+#[cfg(feature = "cluster")]
+fn publish_cluster_compute_fault_state(
+    state: &std::sync::atomic::AtomicU8,
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) -> bool {
+    let _generation = rotation_execution_fence.blocking_write();
+    retire_cluster_compute_generation(pending_vnode_transition, installed_vnode_state);
+    publish_runtime_fault_state(state)
+}
+
+#[cfg(feature = "cluster")]
+fn publish_cluster_terminal_compute_halt_state(
+    state: &std::sync::atomic::AtomicU8,
+    authority_transition: &parking_lot::Mutex<()>,
+    terminal_pipeline_halt: &std::sync::atomic::AtomicBool,
+    source_gate: &std::sync::atomic::AtomicBool,
+    recovery_fence: &std::sync::atomic::AtomicBool,
+    rotation_execution_fence: &Arc<tokio::sync::RwLock<()>>,
+    pending_vnode_transition: &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
+    installed_vnode_state: &crate::vnode_transition_staging::InstalledVnodeStateHandle,
+) -> bool {
+    latch_cluster_terminal_data_plane(
+        authority_transition,
+        terminal_pipeline_halt,
+        source_gate,
+        recovery_fence,
+    );
+    publish_cluster_compute_fault_state(
+        state,
+        rotation_execution_fence,
+        pending_vnode_transition,
+        installed_vnode_state,
+    )
+}
+
+/// Linearize a terminal latch and its data-plane close against every source/shuffle authority
+/// grant. Vnode-generation retirement deliberately happens after this guard is released: the
+/// assignment activation path takes the rotation fence before this transition lock.
+#[cfg(feature = "cluster")]
+fn latch_cluster_terminal_data_plane(
+    authority_transition: &parking_lot::Mutex<()>,
+    terminal_latch: &std::sync::atomic::AtomicBool,
+    source_gate: &std::sync::atomic::AtomicBool,
+    recovery_fence: &std::sync::atomic::AtomicBool,
+) {
+    let _transition = authority_transition.lock();
+    terminal_latch.store(true, std::sync::atomic::Ordering::SeqCst);
+    recovery_fence.store(true, std::sync::atomic::Ordering::Release);
+    source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 impl LaminarDB {
-    /// Fence new work and wake the running pipeline without waiting for teardown.
-    pub fn close(&self) {
-        let runtime_shutdown = self.runtime_shutdown.write();
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        runtime_shutdown.cancel();
-        self.shutdown_signal.notify_one();
+    /// Permanently fence this process after a deterministic pipeline halt. This is process-local;
+    /// remote durable terminal evidence uses [`Self::latch_durable_terminal_recovery_fence`].
+    #[cfg(feature = "cluster")]
+    pub(crate) fn latch_local_terminal_pipeline_halt(&self) {
+        latch_cluster_terminal_data_plane(
+            &self.cluster_authority_transition,
+            &self.terminal_pipeline_halt,
+            &self.source_gate,
+            &self.coordinated_recovery_fenced,
+        );
     }
 
-    /// Stage each boot-owned vnode's chain at the exact recovered attempt the source offsets
-    /// resume from. A missing backend is fatal (offsets staged, state absent).
+    /// Permanently fence this DB instance after terminal evidence is durable anywhere in the
+    /// cluster authority namespace. Healthy peers retain a distinct local-halt latch so they can
+    /// still quiesce and acknowledge the terminal Prepare.
     #[cfg(feature = "cluster")]
-    async fn stage_owned_vnodes_from_chains(
-        &self,
-        attempt: laminar_core::state::CheckpointAttempt,
-    ) -> Result<(), DbError> {
-        let Some(self_id) = self
-            .cluster_controller
-            .lock()
-            .as_ref()
-            .map(|c| c.instance_id())
-        else {
-            return Err(DbError::Checkpoint(
-                "[LDB-6031] cluster recovery has no live cluster controller".into(),
-            ));
-        };
-        let owned = match self.vnode_registry.lock().as_ref() {
-            Some(registry) => laminar_core::state::owned_vnodes(registry, self_id),
-            None => {
-                return Err(DbError::Checkpoint(
-                    "[LDB-6031] cluster recovery has no vnode registry".into(),
-                ));
-            }
-        };
-        tracing::info!(
-            owned = owned.len(),
-            epoch = attempt.epoch,
-            checkpoint_id = attempt.checkpoint_id,
-            "cluster recovery: rehydrating boot-owned vnodes from chains"
+    pub(crate) fn latch_durable_terminal_recovery_fence(&self) {
+        latch_cluster_terminal_data_plane(
+            &self.cluster_authority_transition,
+            &self.durable_terminal_recovery_fence,
+            &self.source_gate,
+            &self.coordinated_recovery_fenced,
         );
-        if owned.is_empty() {
-            return Ok(());
-        }
-        let Some(backend) = self.state_backend.lock().clone() else {
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_fresh_cluster_vnode_start(&self) -> Result<(), DbError> {
+        if self.has_unapplied_vnode_transition() {
             return Err(DbError::Checkpoint(
-                "[LDB-6031] cluster recovery requires a durable state backend but none is \
-                 wired — refusing to start with staged source offsets and empty aggregate state"
-                    .to_string(),
+                "[LDB-6031] cluster startup found staged vnode state but no exact recovered \
+                 checkpoint; refusing a fresh graph"
+                    .into(),
             ));
-        };
-        let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
-            .rehydrate_at(&owned, attempt)
-            .await?;
-        let mut staged = self.rehydrated_vnode_state.lock();
-        for (vnode, chain) in report.restored {
-            staged.insert(
-                vnode,
-                crate::db::RehydratedVnode {
-                    epoch: attempt.epoch,
-                    chain,
-                },
-            );
         }
-        tracing::info!(
-            staged = staged.len(),
-            epoch = attempt.epoch,
-            checkpoint_id = attempt.checkpoint_id,
-            "cluster recovery: staged boot-owned vnodes for aggregate recovery"
-        );
         Ok(())
+    }
+
+    /// Prepare the success marker for a graph generation with no vnode transition callbacks.
+    /// Startup holds `assignment_adoption_lock`, so the registry cannot be overtaken while durable
+    /// history is revalidated. The marker is installed at the compute-generation ready boundary.
+    #[cfg(feature = "cluster")]
+    async fn prepare_graph_ready_vnode_state_binding(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<crate::vnode_transition_staging::InstalledVnodeStateBinding>, DbError> {
+        let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "cluster graph readiness has no vnode registry for installed-state binding".into(),
+            )
+        })?;
+        let assignment = registry.versioned_snapshot();
+        if assignment.version() == 0 || self.has_unapplied_vnode_transition() {
+            return Ok(None);
+        }
+
+        let pipeline_identity = self
+            .coordinator
+            .lock()
+            .await
+            .as_ref()
+            .map(crate::checkpoint_coordinator::CheckpointCoordinator::bound_pipeline_identity)
+            .transpose()?;
+        let Some(pipeline_identity) = pipeline_identity else {
+            return Ok(None);
+        };
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "cluster graph readiness has no controller for assignment validation".into(),
+            )
+        })?;
+        let store = self
+            .assignment_snapshot_store
+            .lock()
+            .clone()
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "cluster graph readiness has no durable assignment history".into(),
+                )
+            })?;
+        let durable = tokio::time::timeout_at(deadline, store.load_version(assignment.version()))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "assignment {} history read timed out at graph readiness",
+                    assignment.version()
+                ))
+            })?
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "assignment {} is absent from durable history at graph readiness",
+                    assignment.version()
+                ))
+            })?;
+        tokio::time::timeout_at(
+            deadline,
+            crate::rebalance::audit_assignment_snapshot_authority(
+                &store,
+                Some(controller.as_ref()),
+                &durable,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "assignment {} authority audit timed out at graph readiness",
+                assignment.version()
+            ))
+        })?
+        .map_err(DbError::Checkpoint)?;
+        let durable_owners = durable
+            .to_vnode_vec(registry.vnode_count())
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        if durable.draining
+            || durable.version != assignment.version()
+            || durable_owners.as_slice() != assignment.owners()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} durable history does not match the graph-ready registry",
+                assignment.version()
+            )));
+        }
+        let fence = durable
+            .assignment_fence()
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        match fence.participant_incarnation(controller.instance_id().0) {
+            Some(boot_incarnation) if boot_incarnation == controller.recovery_incarnation() => {}
+            Some(_) => {
+                return Err(DbError::Checkpoint(format!(
+                    "assignment {} names a different local process incarnation at graph readiness",
+                    assignment.version()
+                )));
+            }
+            None => return Ok(None),
+        }
+
+        // Revalidate after external I/O even though startup still owns assignment adoption.
+        let current = registry.versioned_snapshot();
+        if current.version() != assignment.version()
+            || current.owners() != assignment.owners()
+            || self.has_unapplied_vnode_transition()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "assignment {} changed or gained vnode work before graph-ready publication",
+                assignment.version()
+            )));
+        }
+        Ok(Some(
+            crate::vnode_transition_staging::InstalledVnodeStateBinding::new(
+                fence,
+                pipeline_identity,
+            )?,
+        ))
     }
 
     /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Fence new work and wake the runtime so it can shut down.
+    pub fn close(&self) {
+        let runtime_shutdown = self.runtime_shutdown.write();
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(feature = "cluster")]
+        self.assignment_restore_shutdown.cancel();
+        runtime_shutdown.cancel();
+        self.shutdown_signal.notify_one();
     }
 
     /// Enable auto-restart from the last checkpoint on a fault. Without it, a fault parks
@@ -1229,11 +2373,11 @@ impl LaminarDB {
         *self.supervisor_self.lock() = Arc::downgrade(self);
     }
 
-    /// Make the next [`Self::start`] restore to `epoch` (the cluster-agreed cut) instead
-    /// of the local latest. Cleared on start.
+    /// Select the next coordinated start's recovery cut. `None` selects the latest durable head.
+    /// The value is taken by startup when a checkpoint coordinator is present.
     #[cfg(feature = "cluster")]
-    pub fn set_recover_target_epoch(&self, epoch: u64) {
-        *self.recover_target_epoch.lock() = Some(epoch);
+    pub(crate) fn set_recover_target_epoch(&self, epoch: Option<u64>) {
+        *self.recover_target_epoch.lock() = epoch;
     }
 
     /// Open or close the source-intake gate. Closed (`true`) during a coordinated round until
@@ -1247,9 +2391,15 @@ impl LaminarDB {
         }
         let _transition = self.cluster_authority_transition.lock();
         if self
-            .pending_recovery_fault
+            .terminal_pipeline_halt
             .load(std::sync::atomic::Ordering::Acquire)
-            != 0
+            || self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
         {
             self.source_gate
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1280,6 +2430,9 @@ impl LaminarDB {
     /// opens the gate.
     #[cfg(feature = "cluster")]
     pub fn fence_cluster_startup(&self) {
+        // Every startup boundary invalidates prior same-process evidence. A later graph attempt
+        // must either publish a fresh pre-start audit or use finish's fail-closed durable fallback.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         self.set_source_gate(true);
         if let Some(controller) = self.cluster_controller.lock().as_ref() {
             controller.set_recovering(true);
@@ -1300,15 +2453,20 @@ impl LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) fn release_coordinated_recovery_lifecycle(&self) {
         let _lifecycle_claim = self.startup_attempt.lock();
-        self.coordinated_recovery_fenced
-            .store(false, std::sync::atomic::Ordering::Release);
-        if self
-            .pending_recovery_fault
+        let keep_fenced = self
+            .terminal_pipeline_halt
             .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
-            self.coordinated_recovery_fenced
-                .store(true, std::sync::atomic::Ordering::Release);
+            || self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0;
+        self.coordinated_recovery_fenced
+            .store(keep_fenced, std::sync::atomic::Ordering::Release);
+        if keep_fenced {
+            self.set_source_gate(true);
         }
     }
 
@@ -1325,6 +2483,31 @@ impl LaminarDB {
         {
             return Err(DbError::InvalidOperation(format!(
                 "pipeline {operation} is fenced by coordinated recovery"
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_terminal_halt_allows_start(
+        &self,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<(), DbError> {
+        let _ = authority;
+        let local_halt = self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(feature = "cluster")]
+        let durable_halt = self.is_cluster_runtime()
+            && self
+                .durable_terminal_recovery_fence
+                .load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(feature = "cluster"))]
+        let durable_halt = false;
+        if local_halt || durable_halt {
+            return Err(DbError::PipelineTerminal(format!(
+                "cannot restart a permanently halted pipeline in this process: {}",
+                self.last_fault()
+                    .unwrap_or_else(|| "terminal halt reason was not recorded".into())
             )));
         }
         Ok(())
@@ -1446,6 +2629,11 @@ impl LaminarDB {
             None => true,
         };
         if idle {
+            // This process is absent from the exact owner-complete checkpoint roster. A global
+            // artifact inventory can therefore belong only to the active owners; treating it as
+            // local crash residue would let an idle join interrupt their live checkpoint. Install
+            // topology metadata while retaining the local data-plane fence, without publishing a
+            // recovery fault or attempting to settle another process's artifacts.
             controller.set_recovering(false);
             let drain_transition = controller
                 .checkpoint_drain_transition()
@@ -1464,8 +2652,66 @@ impl LaminarDB {
             }
             return Ok(ClusterStartupDisposition::Idle);
         }
-        let pending_fault =
-            match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
+        // A clean pre-start audit linearizes before this process can publish graph readiness. Once
+        // the owner-complete assignment fence exists, every participant has crossed that same
+        // boundary, so a later inventory belongs to live checkpoint work and is not crash residue.
+        // Evidence from any other process generation is unusable and falls back to the durable
+        // read below.
+        let audited_artifacts = self
+            .startup_checkpoint_artifact_audit
+            .lock()
+            .as_ref()
+            .copied()
+            .filter(|audit| {
+                controller
+                    .try_live_local_process_authority_identity()
+                    .is_ok_and(|process| process == audit.process())
+            });
+        let unresolved_artifacts = match audited_artifacts {
+            Some(StartupCheckpointArtifactAudit::Clean(_)) => false,
+            Some(StartupCheckpointArtifactAudit::Artifacts(_)) => true,
+            None => {
+                let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "cluster startup checkpoint authority is unavailable: {error}"
+                    ))
+                })?;
+                tokio::time::timeout_at(
+                    deadline,
+                    checkpoint_authority.cluster_checkpoint_artifacts(),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "cluster startup artifact inventory read failed: {error}"
+                    ))
+                })?
+                .is_some()
+            }
+        };
+        if unresolved_artifacts {
+            controller.set_recovering(true);
+            tokio::time::timeout_at(
+                deadline,
+                crate::coordinated_recovery::request_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("startup artifact recovery fault publication timed out".into())
+            })?
+            .map_err(DbError::Checkpoint)?;
+            return Ok(ClusterStartupDisposition::RecoveryFenced);
+        }
+        let fault_inventory =
+            match tokio::time::timeout_at(deadline, controller.read_recovery_fault_inventory())
+                .await
+            {
                 Err(_) => {
                     controller.set_recovering(true);
                     return Err(DbError::Checkpoint(
@@ -1478,8 +2724,16 @@ impl LaminarDB {
                         "cluster startup recovery fault audit failed: {error}"
                     )));
                 }
-                Ok(Ok(reports)) => reports.iter().any(|(_, sequence)| *sequence != 0),
+                Ok(Ok(inventory)) => inventory,
             };
+        if fault_inventory.has_terminal_fault() {
+            self.latch_durable_terminal_recovery_fence();
+            controller.set_recovering(true);
+            let reason = "cluster startup is fenced by a durable terminal pipeline fault";
+            self.last_fault.lock().get_or_insert(reason.into());
+            return Err(DbError::PipelineTerminal(reason.into()));
+        }
+        let pending_fault = !fault_inventory.faults().is_empty();
         let Ok(active) = tokio::time::timeout_at(deadline, controller.observe_recover()).await
         else {
             return Err(DbError::Checkpoint(
@@ -1602,6 +2856,9 @@ impl LaminarDB {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        // Never reuse evidence from an earlier or failed bootstrap attempt. Only the complete
+        // authority-checked read below publishes a replacement latch.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("cluster recovery generation bootstrap has no controller".into())
         })?;
@@ -1610,6 +2867,13 @@ impl LaminarDB {
                 "cluster recovery generation bootstrap lost its process lease".into(),
             ));
         }
+        let audit_process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "cluster startup artifact audit has no live process authority: {error}"
+                ))
+            })?;
         let terminal =
             tokio::time::timeout_at(deadline, controller.latest_committed_recover_release())
                 .await
@@ -1626,11 +2890,42 @@ impl LaminarDB {
         let committed = terminal
             .as_ref()
             .map_or(0, |release| release.round.id.generation);
-        if !controller.process_lease_is_live() {
+        let checkpoint_authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup checkpoint authority is unavailable: {error}"
+            ))
+        })?;
+        let unresolved_artifacts = tokio::time::timeout_at(
+            deadline,
+            checkpoint_authority.cluster_checkpoint_artifacts(),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("cluster startup artifact inventory read timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster startup artifact inventory read failed: {error}"
+            ))
+        })?
+        .is_some();
+        let final_process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "cluster startup artifact audit lost process authority: {error}"
+                ))
+            })?;
+        if final_process != audit_process {
             return Err(DbError::Checkpoint(
-                "cluster recovery generation bootstrap lost its process lease".into(),
+                "cluster startup artifact audit changed process authority during its read".into(),
             ));
         }
+        *self.startup_checkpoint_artifact_audit.lock() = Some(if unresolved_artifacts {
+            StartupCheckpointArtifactAudit::Artifacts(audit_process)
+        } else {
+            StartupCheckpointArtifactAudit::Clean(audit_process)
+        });
         let current = self.shuffle_recovery_generation()?.unwrap_or(0);
         if current == committed {
             return Ok(());
@@ -1760,7 +3055,6 @@ impl LaminarDB {
     async fn cleanup_failed_start(&self) -> Result<(), DbError> {
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
-        self.quiesce_committer_until(deadline).await?;
         self.quiesce_checkpoint_decision_until(deadline).await?;
         {
             let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
@@ -1772,11 +3066,7 @@ impl LaminarDB {
                     )
             })?;
             if let Some(coordinator) = coordinator.as_mut() {
-                let expected_sinks = coordinator.committable_sink_names()?;
-                coordinator
-                    .audit_sink_open_witness_topology(expected_sinks)
-                    .await?;
-                tokio::time::timeout_at(deadline, coordinator.reconcile_prepared_on_init())
+                tokio::time::timeout_at(deadline, coordinator.reconcile_sink_open_witness())
                     .await
                     .map_err(|_| {
                         DbError::Checkpoint(format!(
@@ -1811,31 +3101,6 @@ impl LaminarDB {
             Err(_) => Err(DbError::Pipeline(format!(
                 "{operation} could not observe terminal startup before its deadline; startup remains fenced"
             ))),
-        }
-    }
-
-    async fn quiesce_committer_until(&self, deadline: tokio::time::Instant) -> Result<(), DbError> {
-        let mut owned = tokio::time::timeout_at(deadline, self.committer_handle.lock())
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(
-                    "teardown could not acquire coordinated-committer ownership; deployment fences remain held"
-                        .into(),
-                )
-            })?;
-        let Some(handle) = owned.as_mut() else {
-            return Ok(());
-        };
-        handle.abort();
-        match tokio::time::timeout_at(deadline, handle).await {
-            Ok(_) => {
-                owned.take();
-                Ok(())
-            }
-            Err(_) => Err(DbError::Checkpoint(
-                "coordinated committer did not terminate before the teardown deadline; deployment fences remain held"
-                    .into(),
-            )),
         }
     }
 
@@ -2080,7 +3345,7 @@ impl LaminarDB {
         if self.is_closed() {
             return Err(DbError::Shutdown);
         }
-        self.ensure_catalog_cleanup_unfenced("pipeline start")?;
+        self.ensure_terminal_halt_allows_start(authority)?;
         #[cfg(feature = "cluster")]
         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
         #[cfg(not(feature = "cluster"))]
@@ -2089,6 +3354,7 @@ impl LaminarDB {
         let runtime = self.control_runtime.handle()?;
         let attempt = {
             let mut owned = self.startup_attempt.lock();
+            self.ensure_terminal_halt_allows_start(authority)?;
             #[cfg(feature = "cluster")]
             self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
             #[cfg(not(feature = "cluster"))]
@@ -2125,6 +3391,7 @@ impl LaminarDB {
                         // A compute fault publishes the cluster recovery fence before Faulted.
                         // Re-read that fence after observing the state so a public restart cannot
                         // slip through the fence-before-state publication window.
+                        self.ensure_terminal_halt_allows_start(authority)?;
                         #[cfg(feature = "cluster")]
                         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
                         #[cfg(not(feature = "cluster"))]
@@ -2149,6 +3416,7 @@ impl LaminarDB {
                                         driver_runtime.block_on(db.clone().drive_start_attempt(
                                             driver_attempt,
                                             claimed == DbState::Faulted,
+                                            authority,
                                         ));
                                     }));
                                 if result.is_err() && !emergency_attempt.is_complete() {
@@ -2195,6 +3463,7 @@ impl LaminarDB {
         self: Arc<Self>,
         attempt: Arc<StartupAttempt>,
         starting_from_fault: bool,
+        authority: PipelineLifecycleAuthority,
     ) {
         let terminal = StartupDriverGuard::new(&self, Arc::clone(&attempt));
         let result =
@@ -2212,6 +3481,14 @@ impl LaminarDB {
                 DbState::Faulted.store(&self.state);
                 match cleanup {
                     Ok(Ok(())) => Err(DbError::Pipeline(reason)),
+                    Ok(Err(error)) if error.requires_pipeline_halt() => {
+                        tracing::error!(
+                            panic = %reason,
+                            cleanup_error = %error,
+                            "terminal cleanup error superseded a generic startup panic"
+                        );
+                        Err(error)
+                    }
                     Ok(Err(error)) => Err(DbError::Pipeline(format!(
                         "{reason}; failed-start cleanup remains fenced: {error}"
                     ))),
@@ -2222,7 +3499,99 @@ impl LaminarDB {
                 }
             }
         };
+        let result = self.normalize_start_result_for_terminal_latch(result);
+        self.terminalize_start_attempt_if_needed(authority, &result)
+            .await;
         terminal.finish(result);
+    }
+
+    fn normalize_start_result_for_terminal_latch(
+        &self,
+        result: Result<(), DbError>,
+    ) -> Result<(), DbError> {
+        if !self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return result;
+        }
+        match result {
+            Err(error) if error.requires_pipeline_halt() => Err(error),
+            Ok(()) | Err(_) => Err(DbError::PipelineTerminal(
+                self.last_fault()
+                    .unwrap_or_else(|| "terminal startup failure".into()),
+            )),
+        }
+    }
+
+    /// A startup owner outlives callers that time out while awaiting it. Terminalization therefore
+    /// belongs here, before the sticky attempt result is published, rather than in a recovery
+    /// monitor that may already have dropped its receiver.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async))]
+    async fn terminalize_start_attempt_if_needed(
+        &self,
+        authority: PipelineLifecycleAuthority,
+        result: &Result<(), DbError>,
+    ) {
+        let Err(error) = result else {
+            return;
+        };
+        if !error.requires_pipeline_halt() {
+            return;
+        }
+        let _ = authority;
+        let reason = if self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.last_fault().unwrap_or_else(|| error.to_string())
+        } else {
+            error.to_string()
+        };
+        *self.last_fault.lock() = Some(reason.clone());
+
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            self.latch_local_terminal_pipeline_halt();
+            let controller = self.cluster_controller.lock().clone();
+            if let Some(controller) = controller.as_deref() {
+                controller.set_recovering(true);
+                if let Err(publication_error) = crate::coordinated_recovery::queue_local_fault(
+                    controller,
+                    &self.pending_recovery_fault,
+                ) {
+                    tracing::error!(
+                        %publication_error,
+                        "could not retain terminal startup fault request"
+                    );
+                }
+            }
+            let generation = Arc::clone(&self.rotation_execution_fence)
+                .write_owned()
+                .await;
+            retire_cluster_compute_generation(
+                &self.pending_vnode_transition,
+                &self.installed_vnode_state,
+            );
+            publish_runtime_fault_state(&self.state);
+            drop(generation);
+            tracing::error!(
+                %reason,
+                "pipeline startup hit a permanent error; awaiting durable terminal fencing"
+            );
+            report_cluster_terminal_halt(controller, Arc::clone(&self.pending_recovery_fault))
+                .await;
+            self.latch_durable_terminal_recovery_fence();
+            return;
+        }
+
+        self.terminal_pipeline_halt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        publish_runtime_fault_state(&self.state);
+        tracing::error!(
+            %reason,
+            "pipeline startup hit a permanent error; automatic restart is disabled"
+        );
     }
 
     async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
@@ -2240,21 +3609,10 @@ impl LaminarDB {
         let generation_quiesce_deadline =
             tokio::time::Instant::now() + FAULT_RESTART_QUIESCE_TIMEOUT;
         if let Err(error) = self
-            .quiesce_committer_until(generation_quiesce_deadline)
-            .await
-        {
-            if starting_from_fault {
-                DbState::Faulted.store(&self.state);
-            } else {
-                DbState::Created.store(&self.state);
-            }
-            return Err(error);
-        }
-        if let Err(error) = self
             .quiesce_connector_generation_until(generation_quiesce_deadline)
             .await
         {
-            if starting_from_fault {
+            if starting_from_fault || error.requires_pipeline_halt() {
                 DbState::Faulted.store(&self.state);
             } else {
                 DbState::Created.store(&self.state);
@@ -2293,6 +3651,18 @@ impl LaminarDB {
                 // An incomplete rollback is a terminal per-instance fence: never turn it into a
                 // retryable startup failure by publishing `Created` over the guard's `Faulted`.
                 DbState::Faulted.store(&self.state);
+                if error.requires_pipeline_halt() {
+                    tracing::error!(
+                        %cleanup_error,
+                        "catalog rollback also failed after a permanent startup error"
+                    );
+                    return Err(error);
+                }
+                if cleanup_error.requires_pipeline_halt() {
+                    return Err(DbError::PipelineTerminal(format!(
+                        "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
+                    )));
+                }
                 return Err(DbError::Pipeline(format!(
                     "{error}; catalog bootstrap rollback remains terminally fenced: {cleanup_error}"
                 )));
@@ -2300,6 +3670,10 @@ impl LaminarDB {
 
             // No runtime resources have been constructed and catalog rollback completed. Publish
             // a retryable state only if no concurrent fault superseded this startup generation.
+            if error.requires_pipeline_halt() {
+                DbState::Faulted.store(&self.state);
+                return Err(error);
+            }
             return match DbState::compare_exchange(DbState::Starting, DbState::Created, &self.state)
             {
                 Ok(_) => Err(error),
@@ -2327,12 +3701,32 @@ impl LaminarDB {
                 match self.finish_start_transition() {
                     Ok(()) => Ok(()),
                     Err(error) => match self.cleanup_failed_start().await {
-                        Ok(()) => Err(error),
+                        Ok(()) => {
+                            if error.requires_pipeline_halt() {
+                                DbState::Faulted.store(&self.state);
+                            }
+                            Err(error)
+                        }
                         Err(cleanup_error) => {
                             DbState::Faulted.store(&self.state);
-                            Err(DbError::Pipeline(format!(
-                                "{error}; failed-start cleanup remains fenced: {cleanup_error}"
-                            )))
+                            if error.requires_pipeline_halt() {
+                                tracing::error!(
+                                    %cleanup_error,
+                                    "failed-start cleanup also failed after a permanent startup error"
+                                );
+                                Err(error)
+                            } else if cleanup_error.requires_pipeline_halt() {
+                                tracing::error!(
+                                    startup_error = %error,
+                                    %cleanup_error,
+                                    "terminal cleanup error superseded a generic startup failure"
+                                );
+                                Err(cleanup_error)
+                            } else {
+                                Err(DbError::Pipeline(format!(
+                                    "{error}; failed-start cleanup remains fenced: {cleanup_error}"
+                                )))
+                            }
                         }
                     },
                 }
@@ -2340,15 +3734,34 @@ impl LaminarDB {
             Err(e) => {
                 match self.cleanup_failed_start().await {
                     Ok(()) => {
-                        // Reset so a retry re-runs startup rather than silently returning Ok.
-                        DbState::Created.store(&self.state);
+                        if e.requires_pipeline_halt() {
+                            DbState::Faulted.store(&self.state);
+                        } else {
+                            // Reset so a retry re-runs startup rather than silently returning Ok.
+                            DbState::Created.store(&self.state);
+                        }
                         Err(e)
                     }
                     Err(cleanup_error) => {
                         DbState::Faulted.store(&self.state);
-                        Err(DbError::Pipeline(format!(
-                            "{e}; failed-start cleanup remains fenced: {cleanup_error}"
-                        )))
+                        if e.requires_pipeline_halt() {
+                            tracing::error!(
+                                %cleanup_error,
+                                "failed-start cleanup also failed after a permanent startup error"
+                            );
+                            Err(e)
+                        } else if cleanup_error.requires_pipeline_halt() {
+                            tracing::error!(
+                                startup_error = %e,
+                                %cleanup_error,
+                                "terminal cleanup error superseded a generic startup failure"
+                            );
+                            Err(cleanup_error)
+                        } else {
+                            Err(DbError::Pipeline(format!(
+                                "{e}; failed-start cleanup remains fenced: {cleanup_error}"
+                            )))
+                        }
                     }
                 }
             }
@@ -2358,13 +3771,7 @@ impl LaminarDB {
     fn validate_startup_durability(
         &self,
         startup_runtime: RuntimeMode,
-    ) -> Result<
-        (
-            Option<Arc<dyn object_store::ObjectStore>>,
-            StateBackendDurability,
-        ),
-        DbError,
-    > {
+    ) -> Result<Option<Arc<dyn object_store::ObjectStore>>, DbError> {
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster
             && (!self.mv_registry.lock().is_empty() || !self.mv_store.read().is_empty())
@@ -2375,23 +3782,6 @@ impl LaminarDB {
             )));
         }
 
-        // A renewable lease can identify the current leader, but the object-store
-        // decision CAS and external sink transaction do not atomically consume its
-        // term/token. Until those writes are term-fenced end to end, admitting
-        // cluster EO would allow an expired leader to finalize a checkpoint.
-        // Keep this duplicate of the builder admission because tests and embedders
-        // can construct a database through lower-level paths.
-        if startup_runtime == RuntimeMode::Cluster
-            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-        {
-            return Err(DbError::Config(
-                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
-                 term-fenced, but supported connectors do not yet provide a certified \
-                 term-fenced source handoff and external sink cursor commit. Use cluster \
-                 at_least_once, or exactly_once in embedded/single-node mode"
-                    .into(),
-            ));
-        }
         #[cfg(feature = "cluster")]
         let has_injected_decision_store = self.decision_store.lock().is_some();
         #[cfg(not(feature = "cluster"))]
@@ -2426,12 +3816,11 @@ impl LaminarDB {
             // survives a same-node process restart. Explicit URLs are classified fail-closed;
             // notably memory:// cannot own source acknowledgements under a replay guarantee.
             let checkpoint_scope = if injected_cluster_checkpoint_store.is_some() {
-                StateBackendDurability::ClusterShared
+                CheckpointStorageScope::ClusterShared
             } else {
                 match self.config.object_store_url.as_deref() {
-                    Some(url) if url.starts_with("file://") => StateBackendDurability::NodeDurable,
-                    Some(url) => StateBackendDurability::for_storage_url(url),
-                    None => StateBackendDurability::NodeDurable,
+                    Some(url) => CheckpointStorageScope::for_url(url),
+                    None => CheckpointStorageScope::NodeDurable,
                 }
             };
             let required = required_recovery_scope(startup_runtime);
@@ -2446,40 +3835,7 @@ impl LaminarDB {
             }
         }
 
-        let state_backend_scope = self
-            .state_backend
-            .lock()
-            .as_ref()
-            .map_or(StateBackendDurability::Volatile, |backend| {
-                backend.durability_scope()
-            });
-        match startup_runtime {
-            // A cluster peer must be able to recover a failed node's vnodes.
-            RuntimeMode::Cluster
-                if !state_backend_scope.satisfies(StateBackendDurability::ClusterShared) =>
-            {
-                return Err(DbError::Config(format!(
-                    "[LDB-0011] cluster mode requires ClusterShared state so a peer can \
-                         recover a failed node's vnodes; the configured backend is \
-                         {state_backend_scope:?}. Use shared cloud storage (s3://, gs://, or \
-                         az://); in-process, local paths, and file:// storage are not \
-                         cluster-shared."
-                )));
-            }
-            // Local exact recovery may use the same node's durable filesystem.
-            RuntimeMode::Local
-                if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-                    && !state_backend_scope.satisfies(StateBackendDurability::NodeDurable) =>
-            {
-                return Err(DbError::Config(format!(
-                    "[LDB-5035] local exactly-once delivery requires NodeDurable state, but the \
-                     configured backend is {state_backend_scope:?}; configure a local path, \
-                     file:// URL, or shared cloud object store"
-                )));
-            }
-            _ => {}
-        }
-        Ok((injected_cluster_checkpoint_store, state_backend_scope))
+        Ok(injected_cluster_checkpoint_store)
     }
 
     async fn initialize_checkpointing(
@@ -2490,25 +3846,35 @@ impl LaminarDB {
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
         startup_runtime: RuntimeMode,
         injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
-        state_backend_scope: StateBackendDurability,
-    ) -> Result<(), DbError> {
-        #[cfg(not(feature = "cluster"))]
-        let _ = state_backend_scope;
-
+    ) -> Result<Option<laminar_core::checkpoint::PipelineIdentity>, DbError> {
+        let participant = self.checkpoint_participant();
+        let bound_pipeline_identity =
+            if self.config.checkpoint.is_some() || startup_runtime == RuntimeMode::Cluster {
+                let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
+                    source_regs.values(),
+                    sink_regs.values(),
+                    stream_regs.values(),
+                    table_regs.values(),
+                );
+                let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
+                    &self.config,
+                    &self.catalog,
+                    &self.connector_registry,
+                    identity_registrations,
+                    self.checkpoint_key_groups().get(),
+                );
+                Some(crate::pipeline_identity::compute(&identity_context)?)
+            } else {
+                None
+            };
         if let Some(ref cp_config) = self.config.checkpoint {
             use crate::checkpoint_coordinator::{
                 CheckpointConfig as CkpConfig, CheckpointCoordinator,
             };
 
-            let max_retained = cp_config.max_retained.unwrap_or(3);
-            if max_retained == 0 {
-                return Err(DbError::Config(
-                    "checkpoint.max_retained must be greater than zero".into(),
-                ));
-            }
-            let max_staged_bytes = cp_config.max_staged_bytes.ok_or_else(|| {
+            let max_node_data_bytes = cp_config.max_node_data_bytes.ok_or_else(|| {
                 DbError::Config(
-                    "checkpoint.max_staged_bytes was not resolved at construction".into(),
+                    "checkpoint.max_node_data_bytes was not resolved at construction".into(),
                 )
             })?;
             if cp_config.interval_ms == Some(0) {
@@ -2535,7 +3901,7 @@ impl LaminarDB {
                 .as_deref()
                 .filter(|url| url.starts_with("file://"))
                 .map(|url| {
-                    laminar_core::storage::object_store_builder::file_url_path(url)
+                    laminar_core::checkpoint::object_store_builder::file_url_path(url)
                         .map_err(|error| DbError::Config(format!("object store: {error}")))
                 })
                 .transpose()?;
@@ -2577,101 +3943,58 @@ impl LaminarDB {
                 })?;
                 *self.checkpoint_namespace_lock.lock() = Some(lock);
             }
-            let participant = self.checkpoint_participant();
-            let participant_id = participant.unwrap_or(0);
-            let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
-                source_regs.values(),
-                sink_regs.values(),
-                stream_regs.values(),
-                table_regs.values(),
-            );
-            let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
-                &self.config,
-                &self.catalog,
-                &self.connector_registry,
-                identity_registrations,
-                key_group_count.get(),
-                participant.is_some(),
-            );
-            let pipeline_identity = crate::pipeline_identity::compute(&identity_context)?;
+            let participant_id = participant.unwrap_or(laminar_core::state::LOCAL_NODE_ID.0);
+            let pipeline_identity = bound_pipeline_identity.clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "checkpoint startup did not derive the pipeline identity".into(),
+                )
+            })?;
 
-            let (store, decision_backing): (
-                Box<dyn laminar_core::storage::CheckpointStore>,
-                Option<Arc<dyn object_store::ObjectStore>>,
-            ) = if let Some(obj) = injected_cluster_checkpoint_store.as_ref() {
-                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    Arc::clone(obj),
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
+            let checkpoint_backing = self
+                .checkpoint_object_store()?
+                .ok_or_else(|| DbError::Checkpoint("checkpoint object store is disabled".into()))?;
+            let probe_timeout = std::time::Duration::from_secs(10);
+            let probe = if uses_local_checkpoint_store {
+                laminar_core::checkpoint::probe_object_store_conditional_create(
+                    checkpoint_backing.as_ref(),
+                    "",
+                    probe_timeout,
                 )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), Some(Arc::clone(obj)))
-            } else if let Some(file_root) = explicit_file_checkpoint_root.as_ref() {
-                laminar_core::durable_fs::ensure_durable_directory(file_root).map_err(|error| {
-                    DbError::Config(format!(
-                        "create file checkpoint directory {}: {error}",
-                        file_root.display()
-                    ))
-                })?;
-                let checkpoint_dir = participant.map_or(file_root.clone(), |id| {
-                    file_root.join("nodes").join(id.to_string())
-                });
-                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
-                )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), None)
-            } else if let Some(ref url) = self.config.object_store_url {
-                let obj = laminar_core::storage::object_store_builder::build_object_store(
-                    url,
-                    &self.config.object_store_options,
-                )
-                .map_err(|e| DbError::Config(format!("object store: {e}")))?;
-                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                    Arc::clone(&obj),
-                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
-                )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), Some(obj))
+                .await
             } else {
-                laminar_core::durable_fs::ensure_durable_directory(&data_dir).map_err(|e| {
-                    DbError::Config(format!("data dir {}: {e}", data_dir.display()))
-                })?;
-                let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
-                    data_dir.join("nodes").join(id.to_string())
-                });
-                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                    checkpoint_dir,
+                laminar_core::checkpoint::probe_object_store_conditional_update(
+                    checkpoint_backing.as_ref(),
+                    "",
+                    probe_timeout,
                 )
-                .with_max_state_data_bytes(max_staged_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id);
-                (Box::new(cs), None)
+                .await
             };
+            probe.map_err(|error| {
+                DbError::Config(format!(
+                    "checkpoint object store does not provide required conditional writes: {error}"
+                ))
+            })?;
+            let store: Box<dyn laminar_core::checkpoint::CheckpointStore> = Box::new(
+                laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
+                    Arc::clone(&checkpoint_backing),
+                    "",
+                )
+                .with_max_node_data_bytes(max_node_data_bytes)?
+                .with_key_group_count(key_group_count)
+                .with_participant_id(participant_id),
+            );
+            let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();
             let config = CkpConfig {
-                max_retained,
                 checkpoint_timeout: cp_config.timeout_ms.map_or(
                     defaults.checkpoint_timeout,
                     std::time::Duration::from_millis,
                 ),
-                max_staged_bytes,
+                max_node_data_bytes,
                 ..defaults
             };
-            let mut coord = CheckpointCoordinator::new(config, store).await?;
-            #[cfg(feature = "cluster")]
-            if startup_runtime == RuntimeMode::Cluster
-                && state_backend_scope.satisfies(StateBackendDurability::ClusterShared)
-            {
-                let delta_chain_bound = cluster_delta_chain_bound(max_retained);
-                coord.configure_state_ancestry(delta_chain_bound);
-            }
+            let mut coord = CheckpointCoordinator::new(config, store)?;
             coord.bind_pipeline_identity(pipeline_identity.clone())?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
                 coord.set_metrics(Arc::clone(prom));
@@ -2744,44 +4067,822 @@ impl LaminarDB {
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 
-            let state_backend = self.state_backend.lock().clone();
             let vnode_registry = self.vnode_registry.lock().clone();
-            if let (Some(backend), Some(registry)) = (state_backend, vnode_registry) {
-                backend
-                    .bind_state_namespace(&deployment_id, &pipeline_identity)
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "bind state backend namespace before recovery: {error}"
-                        ))
-                    })?;
+            if let Some(registry) = vnode_registry {
                 let owner = {
                     #[cfg(feature = "cluster")]
                     {
                         self.cluster_controller
                             .lock()
                             .as_ref()
-                            .map_or(laminar_core::state::NodeId(0), |c| {
+                            .map_or(laminar_core::state::LOCAL_NODE_ID, |c| {
                                 laminar_core::state::NodeId(c.instance_id().0)
                             })
                     }
                     #[cfg(not(feature = "cluster"))]
                     {
-                        laminar_core::state::NodeId(0)
+                        laminar_core::state::LOCAL_NODE_ID
                     }
                 };
                 let version = registry.assignment_version();
-                backend.set_authoritative_version(version);
-                coord.set_state_backend(backend)?;
                 coord.set_assignment_version(version);
-                coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
-                coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
+                if startup_runtime == RuntimeMode::Cluster {
+                    coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
+                }
             }
 
             *self.coordinator.lock().await = Some(coord);
         }
-        Ok(())
+        Ok(bound_pipeline_identity)
     }
+
+    pub(crate) fn validate_temporal_source_metadata(
+        &self,
+        stream: &str,
+        config: &laminar_sql::translator::TemporalJoinTranslatorConfig,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<
+        (
+            Arc<crate::catalog::SourceEntry>,
+            Arc<crate::catalog::SourceEntry>,
+        ),
+        DbError,
+    > {
+        use arrow_schema::DataType;
+
+        if config.left_key_columns.is_empty()
+            || config.left_key_columns.len() != config.right_key_columns.len()
+        {
+            return Err(DbError::Config(format!(
+                "temporal stream '{stream}' requires paired equality keys"
+            )));
+        }
+        let left = self.catalog.get_source(&config.left_table).ok_or_else(|| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' left source '{}' is absent from the source catalog",
+                config.left_table
+            ))
+        })?;
+        let right = self
+            .catalog
+            .get_source(&config.right_table)
+            .ok_or_else(|| {
+                DbError::Config(format!(
+                "temporal stream '{stream}' right source '{}' is absent from the source catalog",
+                config.right_table
+                ))
+            })?;
+
+        for (role, source_name, time_column, entry) in [
+            (
+                TemporalSourceRole::Left,
+                config.left_table.as_str(),
+                config.left_time_column.as_str(),
+                &left,
+            ),
+            (
+                TemporalSourceRole::Right,
+                config.right_table.as_str(),
+                config.right_time_column.as_str(),
+                &right,
+            ),
+        ] {
+            let source_reg = source_regs.get(source_name).ok_or_else(|| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' {} input '{source_name}' must be a direct configured source; catalog bridges and intermediate streams are unsupported",
+                    role.name()
+                ))
+            })?;
+            if source_reg.connector_type.is_none() || source_reg.name != source_name {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} input '{source_name}' must be a direct configured source; catalog bridges and intermediate streams are unsupported",
+                    role.name()
+                )));
+            }
+            laminar_connectors::connector::schema_with_source_row_positions(&entry.schema)
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "temporal stream '{stream}' {} source-position schema: {error}",
+                        role.name()
+                    ))
+                })?;
+            if entry
+                .is_processing_time
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} source '{source_name}' must use event time, not processing time",
+                    role.name()
+                )));
+            }
+            if entry.watermark_column.as_deref() != Some(time_column)
+                || entry.max_out_of_orderness.is_none()
+            {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} source '{source_name}' must declare WATERMARK FOR {time_column} with a bounded out-of-orderness policy",
+                    role.name()
+                )));
+            }
+            let field = entry.schema.field_with_name(time_column).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' {} time column '{time_column}' is absent",
+                    role.name()
+                ))
+            })?;
+            if field.is_nullable() || !matches!(field.data_type(), DataType::Timestamp(_, _)) {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' {} time column '{time_column}' must be a non-null timestamp",
+                    role.name()
+                )));
+            }
+        }
+
+        let mut key_types = Vec::with_capacity(config.left_key_columns.len());
+        for (left_key, right_key) in config
+            .left_key_columns
+            .iter()
+            .zip(&config.right_key_columns)
+        {
+            let left_field = left.schema.field_with_name(left_key).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' left key column '{left_key}' is absent"
+                ))
+            })?;
+            let right_field = right.schema.field_with_name(right_key).map_err(|_| {
+                DbError::Config(format!(
+                    "temporal stream '{stream}' right key column '{right_key}' is absent"
+                ))
+            })?;
+            if left_field.data_type() != right_field.data_type() {
+                return Err(DbError::Config(format!(
+                    "temporal stream '{stream}' key types must match exactly"
+                )));
+            }
+            key_types.push(left_field.data_type().clone());
+        }
+        laminar_core::state::PartitionKeyCodecV1::try_new(key_types).map_err(|error| {
+            DbError::Config(format!(
+                "temporal stream '{stream}' key is not partitionable: {error}"
+            ))
+        })?;
+
+        Ok((left, right))
+    }
+
+    pub(crate) fn validate_persisted_temporal_source_contracts(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        runtime: RuntimeMode,
+    ) -> Result<FxHashMap<String, TemporalSourceRole>, DbError> {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let mut streams: Vec<_> = stream_regs.values().collect();
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut contracts = HashMap::new();
+        let mut temporal_source_roles = FxHashMap::default();
+        let mut retention_validated = false;
+        for stream in streams {
+            let Some(joins) = stream.join_config.as_deref() else {
+                continue;
+            };
+            for join in joins {
+                let JoinOperatorConfig::Temporal(config) = join else {
+                    continue;
+                };
+                if !retention_validated {
+                    crate::config::temporal_join_idle_history_retention_ms(
+                        self.config.temporal_join_idle_history_retention,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!("temporal stream '{}': {reason}", stream.name))
+                    })?;
+                    retention_validated = true;
+                }
+                let (left_entry, right_entry) =
+                    self.validate_temporal_source_metadata(&stream.name, config, source_regs)?;
+                for (role, source_name, entry) in [
+                    (
+                        TemporalSourceRole::Left,
+                        config.left_table.as_str(),
+                        left_entry.as_ref(),
+                    ),
+                    (
+                        TemporalSourceRole::Right,
+                        config.right_table.as_str(),
+                        right_entry.as_ref(),
+                    ),
+                ] {
+                    let source_reg = &source_regs[source_name];
+                    let contract = if let Some(contract) = contracts.get(source_name).copied() {
+                        contract
+                    } else {
+                        let connector_config = self
+                            .build_registered_source_config(source_name, source_reg)
+                            .map_err(|error| {
+                                DbError::Config(format!(
+                                    "temporal source '{source_name}' has invalid connector configuration: {error}"
+                                ))
+                            })?;
+                        let connector = self
+                            .connector_registry
+                            .create_source(&connector_config, None)
+                            .map_err(|error| {
+                                DbError::Config(format!(
+                                    "cannot construct temporal source '{source_name}' for contract validation: {error}"
+                                ))
+                            })?;
+                        let connector_schema = connector.schema();
+                        if !connector_schema.fields().is_empty()
+                            && connector_schema.as_ref() != entry.schema.as_ref()
+                        {
+                            return Err(DbError::Config(format!(
+                                "temporal source '{source_name}' connector schema does not match its catalog schema"
+                            )));
+                        }
+                        let contract = connector.contract(&connector_config).map_err(|error| {
+                            DbError::Config(format!(
+                                "temporal source '{source_name}' has an invalid connector contract: {error}"
+                            ))
+                        })?;
+                        contracts.insert(source_name.to_string(), contract);
+                        contract
+                    };
+                    if matches!(role, TemporalSourceRole::Right)
+                        && contract.input_mode == SourceInputMode::KeyedUpsert
+                        && !has_only_temporal_right_consumers(source_name, stream_regs, sink_regs)
+                    {
+                        return Err(DbError::Config(format!(
+                            "temporal right mutation source '{source_name}' has a non-temporal-right consumer"
+                        )));
+                    }
+                    admit_temporal_source_contract(
+                        contract,
+                        role,
+                        !entry.primary_key.is_empty(),
+                        schema_has_reserved_mutation_columns(entry.schema.as_ref()),
+                        self.config.delivery_guarantee,
+                        self.config.checkpoint.is_some(),
+                        runtime,
+                    )
+                    .map_err(|reason| {
+                        DbError::Config(format!(
+                            "temporal stream '{}' {} source '{}' is not admissible in {runtime:?} mode with {} delivery: {reason} (contract: {contract:?})",
+                            stream.name,
+                            role.name(),
+                            source_name,
+                            self.config.delivery_guarantee
+                        ))
+                    })?;
+                    temporal_source_roles
+                        .entry(source_name.to_string())
+                        .or_insert(role);
+                }
+            }
+        }
+        Ok(temporal_source_roles)
+    }
+
+    pub(crate) fn resolve_registered_source_contract(
+        &self,
+        source_name: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<Option<(SourceContract, arrow_schema::SchemaRef)>, DbError> {
+        let Some(source_reg) = source_regs
+            .get(source_name)
+            .filter(|registration| registration.connector_type.is_some())
+        else {
+            return Ok(None);
+        };
+        let connector_config = self
+            .build_registered_source_config(source_name, source_reg)
+            .map_err(|error| {
+                DbError::Config(format!(
+                    "source '{source_name}' has invalid connector configuration: {error}"
+                ))
+            })?;
+        let connector = self
+            .connector_registry
+            .create_source(&connector_config, None)
+            .map_err(|error| {
+                DbError::Config(format!(
+                    "cannot construct interval source '{source_name}' for contract validation: {error}"
+                ))
+            })?;
+        let connector_schema = connector.schema();
+        let contract = connector.contract(&connector_config).map_err(|error| {
+            DbError::Config(format!(
+                "source '{source_name}' has an invalid connector contract: {error}"
+            ))
+        })?;
+        Ok(Some((contract, connector_schema)))
+    }
+
+    /// Require every configured mutation source to be owned by exactly one certified stateful
+    /// route. The role-specific validators also prove consumer exclusivity; this closes sources
+    /// that are otherwise absent from both role maps (for example a direct copy or sink).
+    pub(crate) fn validate_registered_mutation_source_admission(
+        &self,
+        source_name: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_admissions: &OrderedIntervalAdmissions,
+    ) -> Result<(), DbError> {
+        let Some((contract, _)) =
+            self.resolve_registered_source_contract(source_name, source_regs)?
+        else {
+            return Ok(());
+        };
+        if contract.input_mode == SourceInputMode::AppendOnly {
+            return Ok(());
+        }
+        let temporal_right = temporal_source_roles.get(source_name)
+            == Some(&TemporalSourceRole::Right)
+            && contract.input_mode == SourceInputMode::KeyedUpsert;
+        let ordered_interval =
+            ordered_interval_admissions.source_modes.get(source_name) == Some(&contract.input_mode);
+        if temporal_right ^ ordered_interval {
+            return Ok(());
+        }
+        Err(DbError::Config(format!(
+            "mutation source '{source_name}' is not exclusive to exactly one admitted temporal-right or bounded interval route"
+        )))
+    }
+
+    fn validate_interval_source_metadata(
+        &self,
+        stream: &str,
+        source_name: &str,
+        time_column: &str,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+    ) -> Result<Arc<crate::catalog::SourceEntry>, DbError> {
+        let entry = self.catalog.get_source(source_name).ok_or_else(|| {
+            DbError::Config(format!(
+                "interval stream '{stream}' input '{source_name}' is absent from the source catalog"
+            ))
+        })?;
+        let direct = source_regs.get(source_name).is_some_and(|registration| {
+            registration.connector_type.is_some() && registration.name == source_name
+        });
+        if !direct {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' input '{source_name}' must be a direct configured source when either input is mutable"
+            )));
+        }
+        if entry
+            .is_processing_time
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' must use event time, not processing time"
+            )));
+        }
+        if entry.watermark_column.as_deref() != Some(time_column)
+            || entry.max_out_of_orderness.is_none()
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' must declare WATERMARK FOR {time_column} with a bounded out-of-orderness policy"
+            )));
+        }
+        let field = entry.schema.field_with_name(time_column).map_err(|_| {
+            DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' time column '{time_column}' is absent"
+            ))
+        })?;
+        if field.is_nullable()
+            || !matches!(field.data_type(), arrow_schema::DataType::Timestamp(_, _))
+        {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' time column '{time_column}' must be a non-null timestamp"
+            )));
+        }
+        Ok(entry)
+    }
+
+    fn bounded_interval_input_mode(
+        stream: &str,
+        source_name: &str,
+        entry: &crate::catalog::SourceEntry,
+        contract: SourceContract,
+        join_keys: &[String],
+        time_column: &str,
+    ) -> Result<crate::operator::interval_join_input::BoundedJoinInputMode, DbError> {
+        use crate::operator::interval_join_input::BoundedJoinInputMode;
+        use arrow_schema::DataType;
+
+        if contract.row_positions != SourceRowPositionCapability::OrderedDeterministic {
+            return Err(DbError::Config(format!(
+                "interval stream '{stream}' source '{source_name}' requires ordered deterministic row positions"
+            )));
+        }
+        laminar_connectors::connector::schema_with_source_row_positions(&entry.schema).map_err(
+            |error| {
+                DbError::Config(format!(
+                    "interval stream '{stream}' source '{source_name}' has an invalid source-position schema: {error}"
+                ))
+            },
+        )?;
+
+        let fields = entry.schema.fields();
+        let reserved = |name: &str| {
+            ["_op", "__op", crate::aggregate_state::WEIGHT_COLUMN]
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        };
+        match contract.input_mode {
+            SourceInputMode::AppendOnly => {
+                if fields.iter().any(|field| reserved(field.name())) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' append-only source '{source_name}' cannot declare mutation metadata"
+                    )));
+                }
+                Ok(BoundedJoinInputMode::AppendOnly)
+            }
+            SourceInputMode::KeyedUpsert => {
+                if fields.iter().any(|field| reserved(field.name())) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' cannot declare engine-owned mutation columns"
+                    )));
+                }
+                laminar_connectors::connector::schema_with_source_mutations_and_row_positions(
+                    &entry.schema,
+                )
+                .map_err(|error| {
+                    DbError::Config(format!(
+                        "interval stream '{stream}' source '{source_name}' has an invalid mutation schema: {error}"
+                    ))
+                })?;
+                if entry.primary_key.is_empty() {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' requires an explicit PRIMARY KEY"
+                    )));
+                }
+                for required in join_keys {
+                    if !entry.primary_key.iter().any(|column| column == required) {
+                        return Err(DbError::Config(format!(
+                            "interval stream '{stream}' keyed-upsert source '{source_name}' PRIMARY KEY must include join/event-time column '{required}'"
+                        )));
+                    }
+                }
+                if !entry.primary_key.iter().any(|column| column == time_column) {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' keyed-upsert source '{source_name}' PRIMARY KEY must include join/event-time column '{time_column}'"
+                    )));
+                }
+                let primary_key_indices = entry
+                    .primary_key
+                    .iter()
+                    .map(|column| {
+                        entry.schema.index_of(column).map_err(|_| {
+                            DbError::Config(format!(
+                                "interval stream '{stream}' source '{source_name}' PRIMARY KEY column '{column}' is absent"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(BoundedJoinInputMode::KeyedUpsert {
+                    primary_key_indices,
+                })
+            }
+            SourceInputMode::FullChangelog => {
+                let weight = crate::aggregate_state::WEIGHT_COLUMN;
+                let Some((last_index, last)) = fields
+                    .len()
+                    .checked_sub(1)
+                    .map(|index| (index, &fields[index]))
+                else {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' full-changelog source '{source_name}' requires a trailing '{weight}' column"
+                    )));
+                };
+                let reserved_indices = fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, field)| reserved(field.name()))
+                    .map(|(index, _)| index)
+                    .collect::<Vec<_>>();
+                if reserved_indices != [last_index]
+                    || last.name() != weight
+                    || last.data_type() != &DataType::Int64
+                    || last.is_nullable()
+                {
+                    return Err(DbError::Config(format!(
+                        "interval stream '{stream}' full-changelog source '{source_name}' requires the sole reserved column to be exact trailing non-null Int64 '{weight}'"
+                    )));
+                }
+                Ok(BoundedJoinInputMode::FullChangelog)
+            }
+        }
+    }
+
+    pub(crate) async fn validate_persisted_interval_source_contracts(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        runtime: RuntimeMode,
+    ) -> Result<OrderedIntervalAdmissions, DbError> {
+        use crate::operator::interval_join_input::BoundedJoinInputMode;
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        let mut streams = stream_regs.values().collect::<Vec<_>>();
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut contracts = FxHashMap::<String, Option<SourceContract>>::default();
+        let mut connector_schemas = FxHashMap::<String, arrow_schema::SchemaRef>::default();
+        let mut admission = OrderedIntervalAdmissions::default();
+
+        for stream in streams {
+            let Some([JoinOperatorConfig::StreamStream(config)]) = stream.join_config.as_deref()
+            else {
+                continue;
+            };
+            let direct_entry = |source_name: &str| {
+                if source_regs
+                    .get(source_name)
+                    .is_none_or(|registration| registration.connector_type.is_none())
+                {
+                    return Ok(None);
+                }
+                self.catalog.get_source(source_name).map(Some).ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval stream '{}' configured source '{source_name}' is absent from the source catalog",
+                        stream.name
+                    ))
+                })
+            };
+            let left_entry = direct_entry(&config.left_table)?;
+            let right_entry = direct_entry(&config.right_table)?;
+            let mut resolve = |source_name: &str| {
+                if let Some(contract) = contracts.get(source_name) {
+                    return Ok(*contract);
+                }
+                let contract = self
+                    .resolve_registered_source_contract(source_name, source_regs)?
+                    .map(|(contract, schema)| {
+                        connector_schemas.insert(source_name.to_string(), schema);
+                        contract
+                    });
+                contracts.insert(source_name.to_string(), contract);
+                Ok::<_, DbError>(contract)
+            };
+            let left_contract = left_entry
+                .as_deref()
+                .map(|_| resolve(&config.left_table))
+                .transpose()?
+                .flatten();
+            let right_contract = right_entry
+                .as_deref()
+                .map(|_| resolve(&config.right_table))
+                .transpose()?
+                .flatten();
+            let mutable = [left_contract, right_contract]
+                .into_iter()
+                .flatten()
+                .any(|contract| contract.input_mode != SourceInputMode::AppendOnly);
+            if !mutable {
+                continue;
+            }
+            // Preserve the legacy append-only path. Once either port is mutable, both direct
+            // connector schemas become part of the ordered normalizer ABI and must match the
+            // catalog exactly.
+            for (source_name, entry) in [
+                (config.left_table.as_str(), left_entry.as_deref()),
+                (config.right_table.as_str(), right_entry.as_deref()),
+            ] {
+                let Some(entry) = entry else {
+                    continue;
+                };
+                let connector_schema = connector_schemas.get(source_name).ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval source '{source_name}' connector contract disappeared during validation"
+                    ))
+                })?;
+                if !connector_schema.fields().is_empty()
+                    && connector_schema.as_ref() != entry.schema.as_ref()
+                {
+                    return Err(DbError::Config(format!(
+                        "interval source '{source_name}' connector schema does not match its catalog schema"
+                    )));
+                }
+            }
+
+            if runtime == RuntimeMode::Cluster
+                && self.config.delivery_guarantee == DeliveryGuarantee::BestEffort
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}': {CLUSTER_BEST_EFFORT}",
+                    stream.name
+                )));
+            }
+            if self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+                && self.config.checkpoint.is_none()
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' requires checkpointing for at-least-once/exactly-once state and source-offset recovery",
+                    stream.name
+                )));
+            }
+            let detected = crate::sql_analysis::detect_stream_join_query(&stream.query_sql)
+                .ok_or_else(|| {
+                    DbError::Config(format!(
+                        "interval stream '{}' does not map exactly to the bounded interval-join execution path",
+                        stream.name
+                    ))
+                })?;
+            if detected.config.left_table != config.left_table
+                || detected.config.right_table != config.right_table
+                || detected.config.join_type != config.join_type
+                || detected.config.left_keys != config.left_keys
+                || detected.config.right_keys != config.right_keys
+                || detected.config.left_time_column != config.left_time_column
+                || detected.config.right_time_column != config.right_time_column
+                || detected.config.time_bound != config.time_bound
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' planner and bounded execution metadata disagree",
+                    stream.name
+                )));
+            }
+            if detected.left_pre_filter.is_some() || detected.right_pre_filter.is_some() {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable inputs do not support source prefilters",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::has_unaliased_projection(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output requires every projected expression to have an explicit alias",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::has_unqualified_interval_output_column(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output requires every projected and filtered column to use its left/right source qualifier",
+                    stream.name
+                )));
+            }
+            if stream.order_config.is_some()
+                || stream.has_analytic
+                || stream.has_frame
+                || crate::sql_analysis::mutable_changelog_has_unsafe_modifiers(&stream.query_sql)
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output does not support DISTINCT, ordering/row limits, analytic frames, grouping, or other row-set modifiers",
+                    stream.name
+                )));
+            }
+            if crate::sql_analysis::query_references_weight(&stream.query_sql) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable query cannot reference the engine-owned '{}' input column",
+                    stream.name,
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+            let dataframe = self.ctx.sql(&stream.query_sql).await.map_err(|error| {
+                DbError::Config(format!(
+                    "interval stream '{}' could not plan its replay contract: {error}",
+                    stream.name
+                ))
+            })?;
+            if crate::ddl::logical_aggregate_stage_count(dataframe.logical_plan()) != 0 {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable output cannot contain an aggregate stage",
+                    stream.name
+                )));
+            }
+            if !crate::sql_analysis::planned_functions_are_immutable(dataframe.logical_plan()) {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable route contains a planned function that is not replay-immutable",
+                    stream.name
+                )));
+            }
+            if dataframe
+                .logical_plan()
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| {
+                    field
+                        .name()
+                        .eq_ignore_ascii_case(crate::aggregate_state::WEIGHT_COLUMN)
+                })
+            {
+                return Err(DbError::Config(format!(
+                    "interval stream '{}' mutable projection cannot declare or alias the engine-owned '{}' output column",
+                    stream.name,
+                    crate::aggregate_state::WEIGHT_COLUMN
+                )));
+            }
+
+            let left_entry = self.validate_interval_source_metadata(
+                &stream.name,
+                &config.left_table,
+                &config.left_time_column,
+                source_regs,
+            )?;
+            let right_entry = self.validate_interval_source_metadata(
+                &stream.name,
+                &config.right_table,
+                &config.right_time_column,
+                source_regs,
+            )?;
+            let left_contract = left_contract.ok_or_else(|| {
+                DbError::Config(format!(
+                    "interval stream '{}' left input '{}' must be a direct configured source when either input is mutable",
+                    stream.name, config.left_table
+                ))
+            })?;
+            let right_contract = right_contract.ok_or_else(|| {
+                DbError::Config(format!(
+                    "interval stream '{}' right input '{}' must be a direct configured source when either input is mutable",
+                    stream.name, config.right_table
+                ))
+            })?;
+            let modes = [
+                Self::bounded_interval_input_mode(
+                    &stream.name,
+                    &config.left_table,
+                    left_entry.as_ref(),
+                    left_contract,
+                    &config.left_keys,
+                    &config.left_time_column,
+                )?,
+                Self::bounded_interval_input_mode(
+                    &stream.name,
+                    &config.right_table,
+                    right_entry.as_ref(),
+                    right_contract,
+                    &config.right_keys,
+                    &config.right_time_column,
+                )?,
+            ];
+            for (source_name, contract) in [
+                (config.left_table.as_str(), left_contract),
+                (config.right_table.as_str(), right_contract),
+            ] {
+                admit_source_recovery_contract(
+                    contract,
+                    self.config.delivery_guarantee,
+                    self.config.checkpoint.is_some(),
+                    runtime,
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "interval stream '{}' source '{source_name}' is not recoverable with {} delivery: {reason} (contract: {contract:?})",
+                        stream.name, self.config.delivery_guarantee
+                    ))
+                })?;
+                if contract.input_mode != SourceInputMode::AppendOnly {
+                    match admission
+                        .source_modes
+                        .insert(source_name.to_string(), contract.input_mode)
+                    {
+                        Some(previous) if previous != contract.input_mode => {
+                            return Err(DbError::Config(format!(
+                                "interval mutation source '{source_name}' resolved conflicting input modes"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            debug_assert!(modes
+                .iter()
+                .any(|mode| !matches!(mode, BoundedJoinInputMode::AppendOnly)));
+            admission.joins.insert(stream.name.clone(), modes);
+        }
+
+        for source in admission.source_modes.keys() {
+            if !has_only_ordered_interval_consumers(
+                source,
+                stream_regs,
+                sink_regs,
+                &admission.joins,
+            ) {
+                return Err(DbError::Config(format!(
+                    "interval mutation source '{source}' has a consumer outside its admitted bounded interval joins"
+                )));
+            }
+        }
+        Ok(admission)
+    }
+
+    fn build_registered_source_config(
+        &self,
+        source_name: &str,
+        registration: &crate::connector_manager::SourceRegistration,
+    ) -> Result<laminar_connectors::config::ConnectorConfig, DbError> {
+        let mut config = crate::connector_manager::build_source_config(registration)?;
+        if let Some(entry) = self.catalog.get_source(source_name) {
+            config.set(
+                "_arrow_schema".to_string(),
+                crate::pipeline_callback::encode_arrow_schema(&entry.schema),
+            );
+        }
+        Ok(config)
+    }
+
     async fn start_inner(&self) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
@@ -2810,54 +4911,55 @@ impl LaminarDB {
 
         let startup_runtime = self.runtime_mode();
 
-        let (injected_cluster_checkpoint_store, state_backend_scope) =
-            self.validate_startup_durability(startup_runtime)?;
-
-        self.initialize_checkpointing(
+        let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
             &source_regs,
             &sink_regs,
             &stream_regs,
-            &table_regs,
             startup_runtime,
-            injected_cluster_checkpoint_store,
-            state_backend_scope,
-        )
-        .await?;
-
-        #[cfg(feature = "cluster")]
-        if startup_runtime == RuntimeMode::Cluster {
-            let prepared_witnesses = {
-                let coordinator = self.coordinator.lock().await;
-                match coordinator.as_ref() {
-                    Some(coordinator) => coordinator.prepared_checkpoint_witnesses().await?,
-                    None => Vec::new(),
-                }
-            };
-            if !prepared_witnesses.is_empty() {
-                let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "cluster Prepared recovery requires an installed controller".into(),
-                    )
-                })?;
-                self.fence_coordinated_recovery_lifecycle();
-                controller.set_recovering(true);
-                crate::coordinated_recovery::request_local_fault(
-                    &controller,
-                    &self.pending_recovery_fault,
-                )
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "could not request coordinated recovery for Prepared checkpoint inventory: {error}"
-                        ))
-                    })?;
-                tracing::warn!(
-                    prepared_attempts = prepared_witnesses.len(),
-                    "connector startup deferred until coordinated recovery settles Prepared checkpoints"
-                );
-                return Ok(());
-            }
+        )?;
+        let ordered_interval_admissions = self
+            .validate_persisted_interval_source_contracts(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                startup_runtime,
+            )
+            .await?;
+        let mut registered_source_names = source_regs.keys().collect::<Vec<_>>();
+        registered_source_names.sort_unstable();
+        for source_name in registered_source_names {
+            self.validate_registered_mutation_source_admission(
+                source_name,
+                &source_regs,
+                &temporal_source_roles,
+                &ordered_interval_admissions,
+            )?;
         }
+
+        let injected_cluster_checkpoint_store =
+            self.validate_startup_durability(startup_runtime)?;
+
+        // Freeze assignment publication before checkpoint initialization snapshots the registry.
+        // The previous, narrower guard in `start_connector_pipeline` left a window where a watcher
+        // could advance the registry after the coordinator captured its version but before runtime
+        // launch, binding the new graph to the stale assignment.
+        #[cfg(feature = "cluster")]
+        let startup_assignment_guard = if startup_runtime == RuntimeMode::Cluster {
+            Some(self.assignment_adoption_lock.lock().await)
+        } else {
+            None
+        };
+
+        let pipeline_identity = self
+            .initialize_checkpointing(
+                &source_regs,
+                &sink_regs,
+                &stream_regs,
+                &table_regs,
+                startup_runtime,
+                injected_cluster_checkpoint_store,
+            )
+            .await?;
 
         if has_external || !stream_regs.is_empty() {
             tracing::info!(
@@ -2874,6 +4976,9 @@ impl LaminarDB {
                 stream_regs,
                 table_regs,
                 has_external,
+                pipeline_identity,
+                temporal_source_roles,
+                ordered_interval_admissions,
                 runtime_shutdown,
             )
             .await?;
@@ -2884,6 +4989,9 @@ impl LaminarDB {
                 "Starting in embedded (in-memory) mode — no streams"
             );
         }
+
+        #[cfg(feature = "cluster")]
+        drop(startup_assignment_guard);
 
         Ok(())
     }
@@ -2904,6 +5012,8 @@ impl LaminarDB {
                 has_analytic: stream.has_analytic,
                 has_frame: stream.has_frame,
             };
+            self.validate_interval_join_schema(&stream.name, &stream.query_sql, &plan)
+                .await?;
             has_ownership_partitioned_state |= self
                 .validate_cluster_query_shape(
                     "persisted stream",
@@ -2918,11 +5028,19 @@ impl LaminarDB {
 
     fn build_connector_operator_graph(
         &self,
-        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
+        ordered_interval_joins: &FxHashMap<
+            String,
+            [crate::operator::interval_join_input::BoundedJoinInputMode; 2],
+        >,
+        pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
     ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
         use crate::operator_graph::OperatorGraph;
+
+        #[cfg(not(feature = "cluster"))]
+        let _ = pipeline_identity;
         let ctx = {
             use datafusion::execution::SessionStateBuilder;
             let mut session_config = laminar_sql::datafusion::base_session_config();
@@ -2945,6 +5063,7 @@ impl LaminarDB {
             context
         };
         laminar_sql::register_streaming_functions(&ctx);
+        self.register_custom_functions_into(&ctx);
 
         let lookup_tables: Vec<(String, arrow::datatypes::SchemaRef)> = {
             let ts = self.table_store.read();
@@ -2972,12 +5091,20 @@ impl LaminarDB {
                     error = %e,
                     "failed to register lookup table in operator graph context"
                 );
-            } else {
+            } else if !table_regs
+                .get(&name)
+                .is_some_and(|registration| registration.on_demand)
+            {
                 reference_table_names.insert(name);
             }
         }
 
         let mut graph = OperatorGraph::new(ctx);
+        graph.set_ordered_interval_joins(ordered_interval_joins.clone());
+        graph.set_key_group_count(self.checkpoint_key_groups());
+        graph.set_temporal_join_idle_history_retention(
+            self.config.temporal_join_idle_history_retention,
+        );
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
         graph.set_reference_tables(reference_table_names);
         if let Some(ref prom) = *self.engine_metrics.lock() {
@@ -3003,40 +5130,26 @@ impl LaminarDB {
                     receiver,
                     self_id,
                 });
-                graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
-                graph.set_revoke_handle(Arc::clone(&self.pending_revoke_vnodes));
+                let pipeline_identity = pipeline_identity.cloned().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "[LDB-6051] cluster graph has no bound pipeline identity".into(),
+                    )
+                })?;
+                graph.set_pipeline_identity(pipeline_identity);
+                graph.set_pending_vnode_transition_handle(Arc::clone(
+                    &self.pending_vnode_transition,
+                ));
+                graph.set_installed_vnode_state_handle(Arc::clone(&self.installed_vnode_state));
                 graph.set_rotation_execution_fence(Arc::clone(&self.rotation_execution_fence));
-                // With a durable backend, per-vnode partials are the authoritative agg checkpoint;
-                // the whole-node manifest copy is one node's slices and traps boot recovery.
-                let has_shared_state = self.state_backend.lock().as_ref().is_some_and(|backend| {
-                    backend
-                        .durability_scope()
-                        .satisfies(StateBackendDurability::ClusterShared)
-                });
-                if has_shared_state {
-                    graph.set_vnode_partials_authoritative();
-                    tracing::info!(
-                        "cluster agg: per-vnode partials authoritative (no manifest copy)"
-                    );
-                    if let Some(chain_bound) = self
-                        .config
-                        .checkpoint
-                        .as_ref()
-                        .and_then(|cp| cluster_delta_chain_bound(cp.max_retained.unwrap_or(3)))
-                    {
-                        graph.set_delta_chain_bound(chain_bound);
-                        tracing::info!(
-                            delta_chain_bound = chain_bound,
-                            "bounded incremental vnode checkpoints enabled"
-                        );
-                    }
-                }
             }
         }
 
-        for name in source_regs.keys() {
-            if let Some(entry) = self.catalog.get_source(name) {
-                graph.register_source_schema(name.clone(), entry.schema.clone());
+        // The connector manager contains only externally configured sources. Plain SQL-created
+        // sources are bridged directly from the catalog, but managed operators must still plan
+        // against their schemas before source connectors and checkpoint recovery are built.
+        for name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&name) {
+                graph.register_source_schema(name, entry.schema.clone());
             }
         }
 
@@ -3056,15 +5169,8 @@ impl LaminarDB {
                 .unwrap_or_else(tokio::runtime::Handle::current),
         );
 
-        // Seed incremental MVs up front so a `changelog ⋈ static dim` consumer detects its source
-        // regardless of the (HashMap-ordered) build loop below.
-        graph.set_incremental_tables(
-            stream_regs
-                .values()
-                .filter(|r| r.incremental)
-                .map(|r| r.name.clone())
-                .collect(),
-        );
+        // Seed changelog producers up front so consumer admission is independent of build order.
+        graph.set_changelog_tables(changelog_carrying.clone());
 
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();
         ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
@@ -3081,108 +5187,18 @@ impl LaminarDB {
         }
         graph.take_build_errors()?;
 
-        for tcfg in graph.temporal_join_configs() {
-            if self.lookup_registry.get_entry(&tcfg.table_name).is_none() {
-                let initial_batch = self
-                    .table_store
-                    .read()
-                    .to_record_batch(&tcfg.table_name)?
-                    .or_else(|| {
-                        self.catalog
-                            .get_source(&tcfg.table_name)
-                            .map(|e| RecordBatch::new_empty(e.schema.clone()))
-                    })
-                    .unwrap_or_else(|| {
-                        RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()))
-                    });
-                let key_columns = vec![tcfg.table_key_column.clone()];
-                let key_indices: Vec<usize> = key_columns
-                    .iter()
-                    .filter_map(|k| initial_batch.schema().index_of(k).ok())
-                    .collect();
-
-                // If the AS OF clause didn't resolve a version column, pick the first
-                // timestamp/int column that isn't the join key.
-                let resolved_version_col = if tcfg.table_version_column.is_empty() {
-                    let schema = initial_batch.schema();
-                    schema
-                        .fields()
-                        .iter()
-                        .find(|f| {
-                            f.name() != &tcfg.table_key_column
-                                && matches!(
-                                    f.data_type(),
-                                    arrow::datatypes::DataType::Int64
-                                        | arrow::datatypes::DataType::Timestamp(_, _)
-                                )
-                        })
-                        .map(|f| f.name().clone())
-                        .unwrap_or_default()
-                } else {
-                    tcfg.table_version_column.clone()
-                };
-
-                let Ok(version_col_idx) = initial_batch.schema().index_of(&resolved_version_col)
-                else {
-                    if !initial_batch.schema().fields().is_empty() {
-                        tracing::warn!(
-                            table=%tcfg.table_name,
-                            version_col=%resolved_version_col,
-                            "Version column not found in temporal table schema; \
-                             will resolve on first CDC batch"
-                        );
-                    }
-                    // Index built on first CDC update.
-                    self.lookup_registry.register_versioned(
-                        &tcfg.table_name,
-                        laminar_sql::datafusion::VersionedLookupState {
-                            batch: initial_batch,
-                            index: Arc::new(
-                                laminar_sql::datafusion::lookup_join_exec::VersionedIndex::default(
-                                ),
-                            ),
-                            key_columns,
-                            version_column: resolved_version_col,
-                            stream_time_column: tcfg.stream_time_column.clone(),
-                            max_versions_per_key: usize::MAX,
-                        },
-                    );
-                    continue;
-                };
-                let index = Arc::new(
-                    laminar_sql::datafusion::lookup_join_exec::VersionedIndex::build(
-                        &initial_batch,
-                        &key_indices,
-                        version_col_idx,
-                        usize::MAX,
-                    )
-                    .unwrap_or_default(),
-                );
-                self.lookup_registry.register_versioned(
-                    &tcfg.table_name,
-                    laminar_sql::datafusion::VersionedLookupState {
-                        batch: initial_batch,
-                        index,
-                        key_columns,
-                        version_column: resolved_version_col,
-                        stream_time_column: tcfg.stream_time_column.clone(),
-                        max_versions_per_key: usize::MAX,
-                    },
-                );
-            }
-        }
         Ok(graph)
     }
 
     fn build_pipeline_sources(
         &self,
-        graph: &mut crate::operator_graph::OperatorGraph,
         source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        temporal_source_roles: &FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_source_modes: &FxHashMap<String, SourceInputMode>,
         checkpointing_enabled: bool,
         runtime_mode: RuntimeMode,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
-        use crate::connector_manager::build_source_config;
         use crate::pipeline::SourceRegistration;
         use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
@@ -3190,12 +5206,8 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let mut config = build_source_config(reg)?;
-
-            if let Some(entry) = self.catalog.get_source(name) {
-                let schema_str = crate::pipeline_callback::encode_arrow_schema(&entry.schema);
-                config.set("_arrow_schema".to_string(), schema_str);
-            }
+            let source_entry = self.catalog.get_source(name);
+            let config = self.build_registered_source_config(name, reg)?;
 
             let source = self
                 .connector_registry
@@ -3207,35 +5219,84 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
-            #[cfg(feature = "cluster")]
-            let mut source = source;
             let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                 Arc::<str>::from(format!("source:{name}")),
                 source.terminal_task_tracker(),
                 &self.owned_connector_task_fences,
             );
-            let contract = source.contract(&config).map_err(|e| {
-                DbError::Config(format!(
-                    "source '{name}' (type '{}') has an invalid contract: {e}",
-                    config.connector_type()
-                ))
-            })?;
-            admit_source_contract(
-                contract,
-                self.config.delivery_guarantee,
-                checkpointing_enabled,
-                runtime_mode,
-            )
-            .map_err(|reason| {
+            let mut source = TrackedSourceRegistration::from_captured(
+                SourceRegistration {
+                    name: name.clone(),
+                    connector: source,
+                    config,
+                    assignment_scoped: false,
+                    position: laminar_connectors::connector::SourcePosition::Initial,
+                },
+                task_fence,
+            )?;
+            if let Some(entry) = source_entry.as_ref() {
+                source =
+                    source.with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+            }
+            let contract = source.contract();
+            let has_primary_key = source_entry
+                .as_ref()
+                .is_some_and(|entry| !entry.primary_key.is_empty());
+            let has_reserved_mutation_columns = source_entry
+                .as_ref()
+                .is_some_and(|entry| schema_has_reserved_mutation_columns(entry.schema.as_ref()));
+            let temporal_role = temporal_source_roles.get(name).copied();
+            let ordered_interval_mode = ordered_interval_source_modes.get(name).copied();
+            let admission = if let Some(mode) = ordered_interval_mode {
+                if mode == contract.input_mode {
+                    admit_source_recovery_contract(
+                        contract,
+                        self.config.delivery_guarantee,
+                        checkpointing_enabled,
+                        runtime_mode,
+                    )
+                } else {
+                    Err("bounded interval source contract changed after startup admission")
+                }
+            } else if let Some(role) = temporal_role {
+                admit_temporal_source_contract(
+                    contract,
+                    role,
+                    has_primary_key,
+                    has_reserved_mutation_columns,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+            } else {
+                admit_source_contract(
+                    contract,
+                    has_primary_key,
+                    has_reserved_mutation_columns,
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+            };
+            admission.map_err(|reason| {
                 DbError::Config(format!(
                     "source '{name}' is not admissible in {runtime_mode:?} mode with {} delivery: \
                      {reason} (contract: {contract:?})",
                     self.config.delivery_guarantee
                 ))
             })?;
+            if matches!(temporal_role, Some(TemporalSourceRole::Right))
+                && contract.input_mode == SourceInputMode::KeyedUpsert
+            {
+                source = source.with_temporal_right_mutations();
+            }
+            if let Some(mode) = ordered_interval_mode {
+                source = source.with_ordered_interval_input_mode(mode)?;
+            }
             let assignment_scoped = cfg!(feature = "cluster")
                 && runtime_mode == RuntimeMode::Cluster
                 && contract.topology == SourceTopology::Splittable;
+            source.assignment_scoped = assignment_scoped;
             #[cfg(feature = "cluster")]
             if assignment_scoped {
                 let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
@@ -3252,6 +5313,7 @@ impl LaminarDB {
                         ))
                     })?;
                 source
+                    .connector
                     .set_vnode_assignment(name, registry, self_id)
                     .map_err(|error| {
                         DbError::Config(format!(
@@ -3259,17 +5321,7 @@ impl LaminarDB {
                         ))
                     })?;
             }
-            sources.push(TrackedSourceRegistration::from_captured(
-                SourceRegistration {
-                    name: name.clone(),
-                    connector: source,
-                    config,
-                    contract,
-                    assignment_scoped,
-                    position: laminar_connectors::connector::SourcePosition::Initial,
-                },
-                task_fence,
-            ));
+            sources.push(source);
         }
 
         let bridged_names: rustc_hash::FxHashSet<String> =
@@ -3291,11 +5343,22 @@ impl LaminarDB {
                     &self.owned_connector_task_fences,
                 );
                 let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
-                let contract = connector.contract(&config).map_err(|e| {
-                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
-                })?;
+                let source = TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                )?
+                .with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+                let contract = source.contract();
                 admit_source_contract(
                     contract,
+                    !entry.primary_key.is_empty(),
+                    schema_has_reserved_mutation_columns(entry.schema.as_ref()),
                     self.config.delivery_guarantee,
                     checkpointing_enabled,
                     runtime_mode,
@@ -3307,17 +5370,7 @@ impl LaminarDB {
                         self.config.delivery_guarantee
                     ))
                 })?;
-                sources.push(TrackedSourceRegistration::from_captured(
-                    SourceRegistration {
-                        name: name.clone(),
-                        connector: Box::new(connector),
-                        config,
-                        contract,
-                        assignment_scoped: false,
-                        position: laminar_connectors::connector::SourcePosition::Initial,
-                    },
-                    task_fence,
-                ));
+                sources.push(source);
             }
         }
         for name in self.catalog.list_sources() {
@@ -3325,7 +5378,6 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
-                graph.register_source_schema(name.clone(), entry.schema.clone());
                 let subscription = entry.sink.subscribe();
                 let connector = crate::catalog_connector::CatalogSourceConnector::new(
                     subscription,
@@ -3338,11 +5390,22 @@ impl LaminarDB {
                     &self.owned_connector_task_fences,
                 );
                 let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
-                let contract = connector.contract(&config).map_err(|e| {
-                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
-                })?;
+                let source = TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                )?
+                .with_admitted_schema(entry.schema.clone(), entry.primary_key.clone())?;
+                let contract = source.contract();
                 admit_source_contract(
                     contract,
+                    !entry.primary_key.is_empty(),
+                    schema_has_reserved_mutation_columns(entry.schema.as_ref()),
                     self.config.delivery_guarantee,
                     checkpointing_enabled,
                     runtime_mode,
@@ -3354,17 +5417,7 @@ impl LaminarDB {
                         self.config.delivery_guarantee
                     ))
                 })?;
-                sources.push(TrackedSourceRegistration::from_captured(
-                    SourceRegistration {
-                        name: name.clone(),
-                        connector: Box::new(connector),
-                        config,
-                        contract,
-                        assignment_scoped: false,
-                        position: laminar_connectors::connector::SourcePosition::Initial,
-                    },
-                    task_fence,
-                ));
+                sources.push(source);
             }
         }
         Ok(sources)
@@ -3373,55 +5426,18 @@ impl LaminarDB {
         &self,
         sources: &[TrackedSourceRegistration],
         sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        stream_output_schemas: &HashMap<String, arrow_schema::SchemaRef>,
+        changelog_carrying: &rustc_hash::FxHashSet<String>,
         runtime_mode: RuntimeMode,
         checkpointing_enabled: bool,
         pipeline_checkpoint_timeout: std::time::Duration,
         prom_registry: Option<&Arc<prometheus::Registry>>,
     ) -> Result<PipelineSinkSetup, DbError> {
         use crate::connector_manager::build_sink_config;
-        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, stream_regs).await?;
-        {
-            let mut schemas = self.stream_schemas.write();
-            schemas.clear();
-            schemas.extend(
-                stream_output_schemas
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Arc::clone(v))),
-            );
-        }
-
         let (sink_event_tx, sink_event_rx) =
             laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
                 crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
             );
-        // Names whose output carries a Z-set changelog: incremental MVs, plus any stream/view whose
-        // query reads a changelog-carrying name (a projection/filter forwards the changelog). A
-        // non-capable sink over one of these silently drops retractions, so it's rejected below.
-        let changelog_carrying: rustc_hash::FxHashSet<String> = {
-            let mut set: rustc_hash::FxHashSet<String> = stream_regs
-                .iter()
-                .filter(|(_, r)| r.incremental)
-                .map(|(n, _)| n.clone())
-                .collect();
-            loop {
-                let mut added = false;
-                for (name, reg) in stream_regs {
-                    if !set.contains(name)
-                        && crate::sql_analysis::extract_table_references(&reg.query_sql)
-                            .iter()
-                            .any(|t| set.contains(t.as_str()))
-                    {
-                        set.insert(name.clone());
-                        added = true;
-                    }
-                }
-                if !added {
-                    break;
-                }
-            }
-            set
-        };
 
         let mut prepared_sinks = Vec::new();
         for (name, reg) in sink_regs {
@@ -3455,13 +5471,20 @@ impl LaminarDB {
             );
 
             let carries_changelog = changelog_carrying.contains(&reg.input);
-            let state_backend_scope = self
-                .state_backend
-                .lock()
-                .as_ref()
-                .map_or(StateBackendDurability::Volatile, |backend| {
-                    backend.durability_scope()
-                });
+            #[cfg(feature = "cluster")]
+            let injected_shared_store = self.cluster_checkpoint_object_store().is_some();
+            #[cfg(not(feature = "cluster"))]
+            let injected_shared_store = false;
+            let checkpoint_storage_scope = if self.config.checkpoint.is_none() {
+                CheckpointStorageScope::Volatile
+            } else if injected_shared_store {
+                CheckpointStorageScope::ClusterShared
+            } else {
+                self.config.object_store_url.as_deref().map_or(
+                    CheckpointStorageScope::NodeDurable,
+                    CheckpointStorageScope::for_url,
+                )
+            };
             let (contract, configured_timeout) = admit_sink(
                 sink.as_ref(),
                 SinkAdmissionContext {
@@ -3472,7 +5495,7 @@ impl LaminarDB {
                     runtime: runtime_mode,
                     carries_changelog,
                     checkpointing_enabled,
-                    state_backend_scope,
+                    checkpoint_storage_scope,
                 },
             )?;
             let write_timeout = configured_timeout.map_or(
@@ -3499,6 +5522,7 @@ impl LaminarDB {
                 filter_expr: reg.filter_expr.clone(),
                 input: reg.input.clone(),
                 contract,
+                expects_changelog: carries_changelog,
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error: contract.is_checkpoint_committable()
@@ -3529,20 +5553,6 @@ impl LaminarDB {
             None
         };
 
-        let expected_committable_sinks = prepared_sinks
-            .iter()
-            .filter(|sink| sink.contract.is_checkpoint_committable())
-            .map(|sink| sink.name.clone())
-            .collect();
-        {
-            let coordinator = self.coordinator.lock().await;
-            if let Some(coordinator) = coordinator.as_ref() {
-                coordinator
-                    .audit_sink_open_witness_topology(expected_committable_sinks)
-                    .await?;
-            }
-        }
-
         // Opening is one atomic startup stage: a slow connector consumes the remaining shared
         // checkpoint-derived budget rather than receiving a fresh timeout of its own. Cluster
         // opens use the exact authority later installed in the actor and callback.
@@ -3560,6 +5570,7 @@ impl LaminarDB {
             Option<String>,
             String, // input stream name (FROM clause target)
             SinkContract,
+            bool, // admitted input is a changelog and must carry canonical weight
         )> = Vec::with_capacity(prepared_sinks.len());
         for prepared in prepared_sinks {
             let PreparedSink {
@@ -3568,6 +5579,7 @@ impl LaminarDB {
                 filter_expr,
                 input,
                 contract,
+                expects_changelog,
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error,
@@ -3596,12 +5608,19 @@ impl LaminarDB {
                 debug_assert!(!owned.iter().any(|known| known.same_actor(&handle)));
                 owned.push(handle.clone());
             }
-            sinks.push((name, handle, filter_expr, input, contract));
+            sinks.push((
+                name,
+                handle,
+                filter_expr,
+                input,
+                contract,
+                expects_changelog,
+            ));
             task_fence.handoff();
         }
         drop(sink_event_tx);
 
-        let (coordinated_committer, committer_poll, committer_notify) = {
+        {
             let mut guard = self.coordinator.lock().await;
             if let Some(coord) = guard.as_mut() {
                 coord.set_assignment_scoped_sources(
@@ -3610,31 +5629,19 @@ impl LaminarDB {
                         .filter(|source| source.assignment_scoped)
                         .map(|source| source.name.clone()),
                 );
-                for (name, handle, _, _, _) in &sinks {
+                for (name, handle, _, _, _, _) in &sinks {
                     coord.register_sink(name.clone(), handle.clone());
                 }
-                (
-                    coord.coordinated_committer()?,
-                    crate::checkpoint_coordinator::CheckpointCoordinator::committer_poll_interval(),
-                    coord.committer_notify(),
-                )
-            } else {
-                (
-                    None,
-                    std::time::Duration::from_secs(1),
-                    Arc::new(tokio::sync::Notify::new()),
-                )
             }
-        };
+        }
 
         #[cfg(feature = "cluster")]
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                // Stopped-quorum recovery records Abort before recovery-owned Start. Reconcile
-                // that terminal decision before selecting the coordinated cut.
+                // Resolve any interrupted sink epoch before coordinated recovery opens connectors.
                 if runtime_mode == RuntimeMode::Cluster {
-                    coord.reconcile_prepared_on_init().await?;
+                    coord.reconcile_sink_open_witness().await?;
                 }
             }
         }
@@ -3642,31 +5649,20 @@ impl LaminarDB {
         Ok(PipelineSinkSetup {
             sinks,
             sink_event_rx,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
             #[cfg(feature = "cluster")]
             callback_controller,
         })
     }
     fn restore_reference_table_checkpoint(
         &self,
-        recovered: &crate::recovery_manager::RecoveredState,
+        checkpoint_id: u64,
+        checkpoint: Option<&bytes::Bytes>,
     ) -> Result<bool, DbError> {
-        let checkpoint = recovered
-            .manifest
-            .operator_states
-            .get(crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY);
         let has_reference_tables = !self.table_store.read().table_names().is_empty();
 
         match (has_reference_tables, checkpoint) {
             (true, Some(state)) => {
-                let bytes = state.decode_inline().ok_or_else(|| {
-                    DbError::Checkpoint(
-                        "reference-table checkpoint is not inline after sidecar resolution".into(),
-                    )
-                })?;
-                let restored = self.table_store.write().restore_checkpoint(&bytes)?;
+                let restored = self.table_store.write().restore_checkpoint(state)?;
                 if !restored {
                     return Err(DbError::Checkpoint(
                         "reference-table checkpoint did not cover the complete catalog".into(),
@@ -3675,8 +5671,7 @@ impl LaminarDB {
                 Ok(true)
             }
             (true, None) => Err(DbError::Checkpoint(format!(
-                "recovered checkpoint {} has no atomic reference-table state",
-                recovered.manifest.checkpoint_id
+                "recovered checkpoint {checkpoint_id} has no atomic reference-table state"
             ))),
             (false, Some(_)) => Err(DbError::Checkpoint(
                 "recovered checkpoint contains reference-table state but the catalog has no tables"
@@ -3686,32 +5681,260 @@ impl LaminarDB {
         }
     }
 
+    fn restore_recovered_state_frames(
+        &self,
+        graph: crate::operator_graph::OperatorGraph,
+        recovered: &crate::recovery_manager::RecoveredState,
+        participant_id: u64,
+    ) -> Result<
+        (
+            crate::operator_graph::OperatorGraph,
+            crate::mv_store::MvStore,
+            bool,
+        ),
+        DbError,
+    > {
+        use laminar_core::checkpoint::StateFrameKey;
+
+        let mut graph_whole = Vec::new();
+        let mut graph_vnodes = Vec::new();
+        #[cfg(feature = "cluster")]
+        let mut reassigned_graph = Vec::new();
+        let mut mv_states = HashMap::new();
+        let mut reference_tables = None;
+
+        for frame in &recovered.state_frames {
+            match &frame.key {
+                StateFrameKey::OperatorWhole { operator_id } => {
+                    if let Some(name) = operator_id.strip_prefix("graph:") {
+                        #[cfg(feature = "cluster")]
+                        if recovered.reassigned {
+                            reassigned_graph.push(frame.clone());
+                            continue;
+                        }
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected remote graph state without reassignment"
+                                    .into(),
+                            ));
+                        }
+                        graph_whole.push((name.to_owned(), frame.payload.clone()));
+                    } else if operator_id == crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY {
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected a remote reference-table image".into(),
+                            ));
+                        }
+                        if reference_tables.replace(frame.payload.clone()).is_some() {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint repeats reference-table state".into(),
+                            ));
+                        }
+                    } else if let Some(name) =
+                        operator_id.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
+                    {
+                        if frame.participant_id != participant_id {
+                            return Err(DbError::Checkpoint(
+                                "checkpoint selected a remote materialized-view image".into(),
+                            ));
+                        }
+                        if mv_states
+                            .insert(name.to_owned(), frame.payload.to_vec())
+                            .is_some()
+                        {
+                            return Err(DbError::Checkpoint(format!(
+                                "checkpoint repeats materialized-view state '{name}'"
+                            )));
+                        }
+                    } else {
+                        return Err(DbError::Checkpoint(format!(
+                            "checkpoint contains unknown state frame '{operator_id}'"
+                        )));
+                    }
+                }
+                StateFrameKey::Vnode { operator_id, vnode } => {
+                    let name = operator_id.strip_prefix("graph:").ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "checkpoint contains unknown vnode state frame '{operator_id}'"
+                        ))
+                    })?;
+                    #[cfg(feature = "cluster")]
+                    if recovered.reassigned {
+                        reassigned_graph.push(frame.clone());
+                        continue;
+                    }
+                    if frame.participant_id != participant_id {
+                        return Err(DbError::Checkpoint(
+                            "checkpoint selected remote vnode state without reassignment".into(),
+                        ));
+                    }
+                    graph_vnodes.push((name.to_owned(), u32::from(*vnode), frame.payload.clone()));
+                }
+            }
+        }
+
+        graph_whole.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        graph_vnodes.sort_unstable_by(|left, right| {
+            left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+        });
+        #[cfg(feature = "cluster")]
+        if recovered.reassigned
+            && recovered.target_vnodes.is_empty()
+            && !reassigned_graph.is_empty()
+        {
+            return Err(DbError::Checkpoint(
+                "zero-owner recovery selected graph state".into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        let (graph, restored_graph_frames) = if recovered.reassigned
+            && !recovered.target_vnodes.is_empty()
+        {
+            let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "reassigned checkpoint restore has no active vnode registry".into(),
+                )
+            })?;
+            let assignment = registry.versioned_snapshot();
+            let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "reassigned checkpoint restore has no cluster controller".into(),
+                )
+            })?;
+            let target = controller
+                .checkpoint_assignment_fence(assignment.version())
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "reassigned checkpoint restore has no certified assignment {}",
+                        assignment.version()
+                    ))
+                })?;
+            let current_owned = assignment
+                .owners()
+                .iter()
+                .enumerate()
+                .filter_map(|(vnode, owner)| {
+                    (*owner == laminar_core::state::NodeId(participant_id))
+                        .then_some(u32::try_from(vnode).expect("vnode count fits u32"))
+                })
+                .collect::<Vec<_>>();
+            if current_owned != recovered.target_vnodes {
+                return Err(DbError::Checkpoint(
+                    "reassigned checkpoint target vnode roster changed before graph restore".into(),
+                ));
+            }
+            let predecessor = recovered
+                .committed
+                .assignment_fence
+                .as_ref()
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "reassigned checkpoint restore has no predecessor assignment".into(),
+                    )
+                })?;
+            graph.restore_reassigned_vnode_state(
+                predecessor,
+                &recovered.predecessor_owners,
+                &target,
+                &reassigned_graph,
+            )?
+        } else {
+            graph.restore_state_frames(
+                &graph_whole,
+                &graph_vnodes,
+                u32::from(recovered.committed.vnode_count),
+            )?
+        };
+        #[cfg(not(feature = "cluster"))]
+        let (graph, restored_graph_frames) = graph.restore_state_frames(
+            &graph_whole,
+            &graph_vnodes,
+            u32::from(recovered.committed.vnode_count),
+        )?;
+        let recovered_mv_store = self.mv_store.read().recovery_image(&mv_states)?;
+        let restored_reference_tables =
+            self.restore_reference_table_checkpoint(recovered.epoch(), reference_tables.as_ref())?;
+        tracing::info!(
+            checkpoint_id = recovered.committed.checkpoint_id,
+            graph_frames = restored_graph_frames,
+            materialized_views = mv_states.len(),
+            "restored checkpoint state frames"
+        );
+        Ok((graph, recovered_mv_store, restored_reference_tables))
+    }
+
     async fn recover_pipeline_state(
         &self,
         mut graph: crate::operator_graph::OperatorGraph,
         sources: &mut [TrackedSourceRegistration],
         runtime_mode: RuntimeMode,
+        vnode_state_report_timeout: std::time::Duration,
     ) -> Result<PipelineRecoveryState, DbError> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = vnode_state_report_timeout;
+        #[cfg(feature = "cluster")]
+        if runtime_mode == RuntimeMode::Cluster {
+            // A new graph generation has no installed vnode state until fresh initialization or
+            // exact-cut callbacks complete. A stopped/faulted graph must never lend its marker to
+            // the replacement generation. Startup holds assignment_adoption_lock, so publish the
+            // durable withdrawal before clearing the marker; otherwise a remote rotation could
+            // consume a stale true report during recovery preparation.
+            let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "cluster pipeline recovery has no vnode registry for readiness withdrawal"
+                        .into(),
+                )
+            })?;
+            let assignment = registry.versioned_snapshot();
+            if assignment.version() != 0 {
+                let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "cluster pipeline recovery has no controller for readiness withdrawal"
+                            .into(),
+                    )
+                })?;
+                let deadline = tokio::time::Instant::now() + vnode_state_report_timeout;
+                tokio::time::timeout_at(
+                    deadline,
+                    self.publish_local_vnode_state_report(&controller, &assignment, false),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "assignment {} vnode-state readiness withdrawal timed out before pipeline recovery",
+                        assignment.version()
+                    ))
+                })??;
+            }
+            self.installed_vnode_state.lock().take();
+        }
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
         // Hoist watermarks now so generators are seeded before watermark-state construction;
         // without this, generators restart at i64::MIN while offsets resume mid-stream.
         let mut recovered_mv_store = self.mv_store.read().fresh_image()?;
-        let mut recovered_source_wms: rustc_hash::FxHashMap<String, i64> =
-            rustc_hash::FxHashMap::default();
+        let mut recovered_channel_progress: FxHashMap<
+            String,
+            FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+        > = FxHashMap::default();
+        let mut recovered_input_channels: FxHashMap<String, Arc<[Vec<u8>]>> = FxHashMap::default();
+        let mut recovered_source_watermarks: FxHashMap<String, i64> = FxHashMap::default();
+        let mut recovered_checkpoint_index_version = None;
         let mut recovered_watermark_frontier = None;
-        #[cfg(feature = "cluster")]
-        let mut recovered_all_sources_idle = false;
-        #[cfg(not(feature = "cluster"))]
-        let recovered_all_sources_idle = false;
-        // A generation with no coordinator is also a fresh recovery image; reset any watermark
-        // retained by the previous in-process generation before accepting new rows.
-        let mut source_watermark_recovery_selected = true;
-        #[cfg(feature = "cluster")]
-        let mut startup_reconciled_source_handoff_version = None;
         let mut restored_reference_tables = false;
         {
             let mut guard = self.coordinator.lock().await;
+            #[cfg(feature = "cluster")]
+            if runtime_mode == RuntimeMode::Cluster && guard.is_none() {
+                // A checkpoint-free cluster start cannot acquire state owned by another node.
+                self.validate_fresh_cluster_vnode_start()?;
+            }
             if let Some(ref mut coord) = *guard {
+                #[cfg(feature = "cluster")]
+                coord.set_recovery_graph_payload_limit(
+                    self.config
+                        .pipeline_max_managed_state_bytes
+                        .expect("managed-state budget is resolved at database construction"),
+                );
                 // Restore to the cluster-agreed epoch if one was armed, else the local
                 // latest. Take it owned first so the guard isn't held across the await.
                 #[cfg(feature = "cluster")]
@@ -3723,11 +5946,9 @@ impl LaminarDB {
                 };
                 #[cfg(not(feature = "cluster"))]
                 let recovery = coord.recover().await;
-                // Local RecoveryManager first closes every valid, outcome-less Prepared witness
-                // with a create-once Abort. Reconciliation can then safely finalize or roll back
-                // the exact terminal winner without maintaining a second settlement protocol.
+                // Resolve any interrupted sink epoch before opening its successor.
                 if runtime_mode == RuntimeMode::Local && recovery.is_ok() {
-                    coord.reconcile_prepared_on_init().await?;
+                    coord.reconcile_sink_open_witness().await?;
                 }
                 #[cfg(feature = "cluster")]
                 {
@@ -3747,22 +5968,31 @@ impl LaminarDB {
                 }
                 match recovery {
                     Ok(Some(recovered)) => {
+                        recovered_checkpoint_index_version = Some(recovered.committed.version);
+                        recovered_source_watermarks = recovered
+                            .committed
+                            .effective_source_watermarks()
+                            .map_err(DbError::Checkpoint)?
+                            .into_iter()
+                            .collect();
                         #[cfg(feature = "cluster")]
                         let recovered_assignment = if runtime_mode == RuntimeMode::Cluster {
-                            let capsule = recovered.cluster_capsule().ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "[LDB-6041] cluster recovery selected checkpoint {} without its recovery capsule",
-                                    recovered.manifest.checkpoint_id
-                                ))
-                            })?;
                             Some(
                                 std::num::NonZeroU64::new(
-                                    capsule.assignment_fence.assignment_version,
+                                    recovered
+                                        .committed
+                                        .assignment_fence
+                                        .as_ref()
+                                        .ok_or_else(|| {
+                                            DbError::Checkpoint(
+                                                "cluster checkpoint has no assignment fence".into(),
+                                            )
+                                        })?
+                                        .assignment_version,
                                 )
                                 .ok_or_else(|| {
                                     DbError::Checkpoint(
-                                        "[LDB-6055] recovered cluster assignment fence is zero"
-                                            .into(),
+                                        "recovered cluster assignment fence is zero".into(),
                                     )
                                 })?,
                             )
@@ -3771,198 +6001,107 @@ impl LaminarDB {
                         };
                         #[cfg(not(feature = "cluster"))]
                         let recovered_assignment = None;
+
                         for source in sources.iter() {
                             validate_source_recovery_assignment(
                                 &source.name,
                                 source.assignment_scoped,
-                                recovered.manifest.source_offsets.get(&source.name),
+                                recovered.source_offsets().get(&source.name),
                                 recovered_assignment,
                             )?;
                         }
 
-                        source_watermark_recovery_selected = true;
-                        recovered_watermark_frontier = recovered.manifest.watermark;
-                        #[cfg(feature = "cluster")]
-                        {
-                            recovered_all_sources_idle =
-                                recovered.cluster_capsule().is_some_and(|capsule| {
-                                    capsule.cluster_watermark
-                                        == laminar_core::checkpoint::CheckpointWatermark::Idle
-                                });
-                        }
-                        recovered_source_wms = recovered
-                            .manifest
-                            .source_watermarks
-                            .iter()
-                            .filter(|(_, &wm)| wm != i64::MIN)
-                            .map(|(name, &wm)| (name.clone(), wm))
-                            .collect();
-                        let recovered_attempt = laminar_core::state::CheckpointAttempt::new(
-                            recovered.manifest.epoch,
-                            recovered.manifest.checkpoint_id,
-                        );
-                        for src in sources.iter_mut() {
-                            if !src.contract.supports_replay() {
+                        recovered_watermark_frontier =
+                            channel_progress_frontier(recovered.channel_progress())
+                                .map_err(DbError::Checkpoint)?;
+                        let participant_id = coord.store().participant_id();
+                        for channel in recovered.channel_progress() {
+                            // Physical channels may move on rescale; logical singleton state does not.
+                            if channel.input_channel == SINGLETON_WATERMARK_CHANNEL
+                                && channel.participant_id != participant_id
+                            {
                                 continue;
                             }
-                            let manifest_cp = recovered.manifest.source_offsets.get(&src.name);
-                            let restored = manifest_cp
-                                .map(crate::checkpoint_coordinator::connector_to_source_checkpoint);
-                            if let Some(restored) = restored {
-                                tracing::info!(
-                                    source = %src.name,
-                                    "attaching checkpoint offsets for source recovery"
+                            recovered_channel_progress
+                                .entry(channel.source_name.clone())
+                                .or_default()
+                                .insert(
+                                    channel.input_channel.clone().into_boxed_slice(),
+                                    RecoveredInputChannelProgress {
+                                        watermark: channel.watermark,
+                                        idle: channel.idle,
+                                    },
                                 );
-                                src.position =
-                                    laminar_connectors::connector::SourcePosition::Resume {
-                                        attempt: recovered_attempt,
-                                        checkpoint: restored,
-                                    };
-                            } else {
-                                return Err(DbError::Checkpoint(format!(
-                                    "[LDB-6042] recovered checkpoint {} has no restorable \
-                                     offset for replayable source '{}'",
-                                    recovered.manifest.checkpoint_id, src.name
-                                )));
-                            }
                         }
-                        let op_keys: Vec<&String> =
-                            recovered.manifest.operator_states.keys().collect();
-                        let instance_hint = {
-                            #[cfg(feature = "cluster")]
-                            {
-                                self.cluster_controller
-                                    .lock()
-                                    .as_ref()
-                                    .map_or(0, |c| c.instance_id().0)
+                        for (source_name, checkpoint) in recovered.source_offsets() {
+                            if let Some(input_channels) = checkpoint.input_channels.as_ref() {
+                                recovered_input_channels
+                                    .insert(source_name.clone(), Arc::from(input_channels.clone()));
                             }
-                            #[cfg(not(feature = "cluster"))]
-                            {
-                                0u64
-                            }
-                        };
-                        tracing::info!(
-                            instance = instance_hint,
-                            count = op_keys.len(),
-                            keys = ?op_keys,
-                            "manifest operator_states summary"
-                        );
-                        restored_reference_tables =
-                            self.restore_reference_table_checkpoint(&recovered)?;
-                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
-                            if let Some(bytes) = op.decode_inline() {
-                                match graph.restore_from_bytes(&bytes) {
-                                    Ok((restored_graph, n)) => {
-                                        graph = restored_graph;
-                                        tracing::info!(
-                                            queries = n,
-                                            "Restored operator graph state from checkpoint"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // Source offsets are already staged; resuming with
-                                        // empty operator state would silently lose in-flight
-                                        // windows. Fail loud so the intent to start fresh
-                                        // must be explicit.
-                                        return Err(DbError::Checkpoint(format!(
-                                            "[LDB-6029] operator graph restore failed: \
-                                             {e} — refusing to start with checkpointed \
-                                             source offsets and empty operator state"
-                                        )));
-                                    }
-                                }
-                            } else {
-                                return Err(DbError::Checkpoint(
-                                    "[LDB-6029] operator graph checkpoint is not inline after \
-                                     sidecar resolution"
-                                        .to_string(),
-                                ));
-                            }
-                        } else if recovered
-                            .manifest
-                            .operator_states
-                            .contains_key("stream_executor")
-                        {
-                            return Err(DbError::Checkpoint(
-                                "[LDB-6029] legacy stream_executor checkpoint is unsupported; \
-                                 explicit checkpoint reset is required"
-                                    .to_string(),
-                            ));
                         }
 
-                        let mut mv_states = HashMap::new();
-                        for (key, state) in &recovered.manifest.operator_states {
-                            let Some(name) =
-                                key.strip_prefix(crate::mv_store::CHECKPOINT_KEY_PREFIX)
-                            else {
-                                continue;
-                            };
-                            let bytes = state.try_decode_inline().map_err(|error| {
-                                DbError::Checkpoint(format!(
-                                    "MV checkpoint '{name}' is corrupt: {error}"
-                                ))
-                            })?;
-                            let bytes = bytes.ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "MV checkpoint '{name}' is not inline after sidecar resolution"
-                                ))
-                            })?;
-                            mv_states.insert(name.to_string(), bytes);
-                        }
-                        recovered_mv_store = {
-                            let live = self.mv_store.read();
-                            live.recovery_image(&mv_states)
-                        }?;
-
-                        // Rebuild aggregates from each boot-owned vnode's chain at the recovered
-                        // cut — the same epoch the source offsets resume from.
-                        #[cfg(feature = "cluster")]
-                        if runtime_mode == RuntimeMode::Cluster {
-                            self.stage_owned_vnodes_from_chains(recovered_attempt)
-                                .await?;
-                        }
-
-                        if !mv_states.is_empty() {
-                            tracing::info!(
-                                mvs = mv_states.len(),
-                                "Restored MV state from checkpoint"
+                        let recovered_attempt =
+                            laminar_core::checkpoint::CheckpointAttempt::canonical(
+                                recovered.epoch(),
                             );
+                        for src in sources.iter_mut() {
+                            if !src.contract().supports_replay() {
+                                continue;
+                            }
+                            let checkpoint = recovered.source_offsets().get(&src.name).ok_or_else(|| {
+                                DbError::Checkpoint(format!(
+                                    "recovered checkpoint {} has no offset for replayable source '{}'",
+                                    recovered.epoch(), src.name
+                                ))
+                            })?;
+                            src.position = laminar_connectors::connector::SourcePosition::Resume {
+                                attempt: recovered_attempt,
+                                checkpoint:
+                                    crate::checkpoint_coordinator::connector_to_source_checkpoint(
+                                        checkpoint,
+                                    ),
+                            };
                         }
+
+                        let (restored_graph, restored_mvs, restored_tables) =
+                            self.restore_recovered_state_frames(graph, &recovered, participant_id)?;
+                        graph = restored_graph;
+                        recovered_mv_store = restored_mvs;
+                        restored_reference_tables = restored_tables;
+
                         tracing::info!(
-                            checkpoint_id = recovered.manifest.checkpoint_id,
+                            checkpoint_id = recovered.committed.checkpoint_id,
                             epoch = recovered.epoch(),
-                            "Recovered from unified checkpoint"
+                            "recovered committed checkpoint"
                         );
                     }
                     Ok(None) => {
-                        source_watermark_recovery_selected = true;
+                        #[cfg(feature = "cluster")]
+                        if runtime_mode == RuntimeMode::Cluster {
+                            self.validate_fresh_cluster_vnode_start()?;
+                        }
                         tracing::info!("No checkpoint found, starting fresh");
                     }
                     Err(e) => {
                         return Err(e);
                     }
                 }
-                #[cfg(feature = "cluster")]
-                if source_watermark_recovery_selected {
-                    startup_reconciled_source_handoff_version =
-                        self.vnode_registry.lock().as_ref().and_then(|registry| {
-                            registry
-                                .versioned_snapshot()
-                                .source_handoff_installed_version()
-                        });
-                }
             }
+        }
+
+        let graph_metrics = self.engine_metrics.lock().clone();
+        if let Some(prom) = graph_metrics {
+            graph.set_metrics(prom);
         }
 
         Ok(PipelineRecoveryState {
             graph,
             recovered_mv_store,
-            recovered_source_wms,
+            recovered_channel_progress,
+            recovered_input_channels,
+            recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
-            #[cfg(feature = "cluster")]
-            reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
         })
     }
@@ -3999,21 +6138,6 @@ impl LaminarDB {
         tables_to_publish.dedup();
         for name in tables_to_publish {
             self.sync_table_to_datafusion(&name)?;
-            // Setup built the Versioned (temporal-join) state before the
-            // snapshot existed; rebuild it over the snapshot now instead of
-            // downgrading it to a plain Snapshot.
-            let entry = self.lookup_registry.get_entry(&name);
-            if let Some(laminar_sql::datafusion::RegisteredLookup::Versioned(v)) = &entry {
-                if let Some(batch) = self.table_store.read().to_record_batch(&name)? {
-                    if let Some(state) = crate::pipeline_callback::rebuild_versioned_state(v, batch)
-                    {
-                        self.lookup_registry.register_versioned(&name, state);
-                    }
-                }
-            } else if let Some(batch) = self.table_store.read().to_record_batch(&name)? {
-                self.lookup_registry
-                    .register(&name, laminar_sql::datafusion::LookupSnapshot { batch });
-            }
         }
 
         for (name, reg) in table_regs {
@@ -4106,11 +6230,16 @@ impl LaminarDB {
     }
     fn prepare_pipeline_watermarks(
         &self,
+        sources: &[TrackedSourceRegistration],
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
-        recovered_source_wms: &FxHashMap<String, i64>,
+        recovered_channel_progress: &FxHashMap<
+            String,
+            FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+        >,
+        recovered_input_channels: &FxHashMap<String, Arc<[Vec<u8>]>>,
+        recovered_source_watermarks: &FxHashMap<String, i64>,
+        recovered_checkpoint_index_version: Option<u32>,
         recovered_watermark_frontier: Option<i64>,
-        recovered_all_sources_idle: bool,
-        source_watermark_recovery_selected: bool,
     ) -> Result<PipelineWatermarks, DbError> {
         let stream_entries: Vec<_> = self
             .catalog
@@ -4130,122 +6259,115 @@ impl LaminarDB {
             })
             .collect::<Result<_, _>>()?;
 
-        // `LAMINAR_MAX_FUTURE_SKEW_MS=0` disables the future-skew ceiling (legacy unbounded).
-        let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
-            Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    value = %v,
-                    "invalid LAMINAR_MAX_FUTURE_SKEW_MS (expected an integer); \
-                     using the default"
-                );
-                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS
-            }),
-            Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
-        };
-        let source_names = self.catalog.list_sources();
+        let future_skew_ms =
+            crate::config::event_time_max_future_skew_ms(self.config.event_time_max_future_skew)
+                .map_err(|error| DbError::Config(error.to_string()))?;
+        let idle_timeout = self.config.source_idle_timeout;
+        let source_contracts: FxHashMap<&str, SourceContract> = sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.contract()))
+            .collect();
+        let mut checkpoint_source_names = self.catalog.list_sources();
+        checkpoint_source_names.sort_unstable();
         let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
+            FxHashMap::with_capacity_and_hasher(
+                checkpoint_source_names.len(),
+                rustc_hash::FxBuildHasher,
+            );
         let mut source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        let mut source_ids: FxHashMap<String, usize> =
-            FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
-        for name in source_names {
+            FxHashMap::with_capacity_and_hasher(
+                checkpoint_source_names.len(),
+                rustc_hash::FxBuildHasher,
+            );
+        let mut source_ids: FxHashMap<String, usize> = FxHashMap::with_capacity_and_hasher(
+            checkpoint_source_names.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for name in checkpoint_source_names.iter().cloned() {
             if let Some(entry) = self.catalog.get_source(&name) {
-                if let (Some(col), Some(dur)) =
-                    (&entry.watermark_column, entry.max_out_of_orderness)
-                {
-                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col)
+                let watermark = entry
+                    .watermark_column
+                    .clone()
+                    .zip(entry.max_out_of_orderness)
+                    .or_else(|| {
+                        entry.source.event_time_column().map(|column| {
+                            (
+                                column,
+                                entry
+                                    .source
+                                    .max_out_of_orderness()
+                                    .unwrap_or(std::time::Duration::ZERO),
+                            )
+                        })
+                    });
+                if let Some((column, out_of_orderness)) = watermark {
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&column)
                         .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
+                    let processing_time = entry
                         .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur)
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> =
+                        if processing_time {
+                            Box::new(laminar_core::time::ProcessingTimeGenerator::new())
+                        } else {
+                            Box::new(
+                                laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
+                                    out_of_orderness,
+                                )
                                 .with_max_future_skew(future_skew_ms),
-                        )
-                    };
+                            )
+                        };
+                    let contract = source_contracts.get(name.as_str()).ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "watermarked source '{name}' has no runtime source contract"
+                        ))
+                    })?;
+                    let mut state = SourceWatermarkState::new(extractor, generator, column);
+                    if !processing_time
+                        && contract.row_positions
+                            == SourceRowPositionCapability::OrderedDeterministic
+                    {
+                        let recovered = physical_recovered_input_channel_progress(
+                            recovered_channel_progress.get(&name),
+                        );
+                        let recovered_inventory = recovered_input_channels.get(&name).cloned();
+                        if recovered_channel_progress.contains_key(&name)
+                            || recovered_input_channels.contains_key(&name)
+                        {
+                            validate_recovered_input_channels(
+                                &name,
+                                &recovered,
+                                recovered_inventory.as_ref(),
+                            )?;
+                        }
+                        state = state.with_input_channels(
+                            out_of_orderness,
+                            future_skew_ms,
+                            idle_timeout,
+                            recovered,
+                            recovered_inventory,
+                        );
+                    }
                     let id = source_ids.len();
                     source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col.clone(),
-                        },
-                    );
+                    watermark_states.insert(name.clone(), state);
                 }
                 source_entries_for_wm.insert(name, entry);
             }
         }
 
-        // Fallback watermark path for sources configured through the programmatic API.
-        for name in self.catalog.list_sources() {
-            if watermark_states.contains_key(&name) {
-                continue;
-            }
-            if let Some(entry) = self.catalog.get_source(&name) {
-                if let Some(col) = entry.source.event_time_column() {
-                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&col)
-                        .with_mode(laminar_core::time::ExtractionMode::Max);
-                    let ooo_bound = entry
-                        .source
-                        .max_out_of_orderness()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
-                        .is_processing_time
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        Box::new(laminar_core::time::ProcessingTimeGenerator::new())
-                    } else {
-                        Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                ooo_bound,
-                            )
-                            .with_max_future_skew(future_skew_ms),
-                        )
-                    };
-                    let id = source_ids.len();
-                    source_ids.insert(name.clone(), id);
-                    watermark_states.insert(
-                        name.clone(),
-                        SourceWatermarkState {
-                            extractor,
-                            generator,
-                            column: col,
-                        },
-                    );
-                }
-            }
-        }
-
-        // LAMINAR_SOURCE_IDLE_TIMEOUT_MS > 0 enables idle-source detection; unset/0 = disabled.
-        let idle_timeout_ms: Option<u64> = match std::env::var("LAMINAR_SOURCE_IDLE_TIMEOUT_MS") {
-            Ok(v) => match v.parse::<u64>() {
-                Ok(0) => None,
-                Ok(ms) => Some(ms),
-                Err(_) => {
-                    tracing::warn!(
-                        value = %v,
-                        "invalid LAMINAR_SOURCE_IDLE_TIMEOUT_MS (expected a non-negative \
-                         integer); idle-source detection disabled"
-                    );
-                    None
-                }
-            },
-            Err(_) => None,
-        };
         let mut tracker = if source_ids.is_empty() {
             None
         } else {
             let mut t = laminar_core::time::WatermarkTracker::new(source_ids.len());
-            if let Some(ms) = idle_timeout_ms {
-                let d = std::time::Duration::from_millis(ms);
-                for id in 0..source_ids.len() {
-                    t.set_idle_timeout(id, Some(d));
+            if let Some(timeout) = idle_timeout {
+                for (name, id) in &source_ids {
+                    if !watermark_states
+                        .get(name)
+                        .is_some_and(SourceWatermarkState::is_partitioned)
+                    {
+                        t.set_idle_timeout(*id, Some(timeout));
+                    }
                 }
             }
             Some(t)
@@ -4272,50 +6394,68 @@ impl LaminarDB {
             );
         }
 
-        if source_watermark_recovery_selected {
-            let mut tracker_watermarks = vec![None; source_ids.len()];
-            for (name, &source_id) in &source_ids {
-                let recovered = recovered_source_wms
+        let mut tracker_watermarks = vec![None; source_ids.len()];
+        let mut idle_sources = vec![false; source_ids.len()];
+        for (name, &source_id) in &source_ids {
+            let owns_empty_inventory = watermark_states
+                .get(name)
+                .is_some_and(SourceWatermarkState::is_partitioned)
+                && recovered_input_channels
                     .get(name)
-                    .copied()
-                    .or(recovered_watermark_frontier);
-                tracker_watermarks[source_id] = recovered;
-                if let (Some(state), Some(watermark)) = (watermark_states.get_mut(name), recovered)
-                {
-                    state.generator.restore_watermark_for_recovery(watermark);
-                }
-            }
-            if let Some(tracker) = tracker.as_mut() {
-                let idle_sources = vec![recovered_all_sources_idle; source_ids.len()];
-                tracker
-                    .restore_for_recovery(
-                        &tracker_watermarks,
-                        &idle_sources,
-                        recovered_watermark_frontier,
-                    )
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "failed to restore the committed watermark tracker: {error}"
-                        ))
-                    })?;
-            }
-            self.pipeline_watermark.store(
-                recovered_watermark_frontier.unwrap_or(i64::MIN),
-                std::sync::atomic::Ordering::Release,
+                    .is_some_and(|inventory| inventory.is_empty());
+            let (recovered, idle) = recovered_source_watermark(
+                recovered_channel_progress.get(name),
+                owns_empty_inventory,
+                recovered_source_watermarks.get(name).copied(),
             );
-            tracing::info!(
-                sources = tracker_watermarks.len(),
-                pipeline_watermark = ?recovered_watermark_frontier,
-                all_sources_idle = recovered_all_sources_idle,
-                "restored exact watermark frontier from checkpoint"
-            );
+            validate_recovered_source_watermark(
+                name,
+                recovered,
+                idle,
+                recovered_source_watermarks.get(name).copied(),
+                recovered_checkpoint_index_version,
+            )?;
+            tracker_watermarks[source_id] = recovered;
+            idle_sources[source_id] = idle;
+            if let Some(state) = watermark_states.get_mut(name) {
+                restore_source_watermark_state(
+                    state,
+                    recovered,
+                    idle,
+                    recovered_source_watermarks.get(name).copied(),
+                );
+            }
         }
+        if let Some(tracker) = tracker.as_mut() {
+            tracker
+                .restore_for_recovery(
+                    &tracker_watermarks,
+                    &idle_sources,
+                    recovered_watermark_frontier,
+                )
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "failed to restore the committed watermark tracker: {error}"
+                    ))
+                })?;
+        }
+        self.pipeline_watermark.store(
+            recovered_watermark_frontier.unwrap_or(i64::MIN),
+            std::sync::atomic::Ordering::Release,
+        );
+        tracing::info!(
+            sources = tracker_watermarks.len(),
+            pipeline_watermark = ?recovered_watermark_frontier,
+            idle_sources = idle_sources.iter().filter(|idle| **idle).count(),
+            "restored checkpoint watermark state"
+        );
 
         Ok(PipelineWatermarks {
             stream_entries,
             watermark_states,
             source_entries: source_entries_for_wm,
             source_ids,
+            source_names: checkpoint_source_names,
             tracker,
         })
     }
@@ -4328,14 +6468,10 @@ impl LaminarDB {
         watermarks: PipelineWatermarks,
         config: crate::pipeline::PipelineConfig,
         runtime_mode: RuntimeMode,
-        #[cfg(feature = "cluster")] reconciled_source_handoff_version: Option<u64>,
     ) -> Result<PreparedPipelineRuntime, DbError> {
         let PipelineSinkSetup {
             sinks,
             sink_event_rx,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
             #[cfg(feature = "cluster")]
             callback_controller,
         } = sink_setup;
@@ -4344,6 +6480,7 @@ impl LaminarDB {
             watermark_states,
             source_entries,
             source_ids,
+            source_names: checkpoint_source_names,
             tracker,
         } = watermarks;
 
@@ -4358,13 +6495,13 @@ impl LaminarDB {
 
         let pending_sink_filter_compiles = sinks
             .iter()
-            .filter(|(_, _, filter_sql, _, _)| filter_sql.is_some())
+            .filter(|(_, _, filter_sql, _, _, _)| filter_sql.is_some())
             .count();
         let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
             .iter()
             .map(|(name, &source_id)| (source_id, Arc::<str>::from(name.as_str())))
             .collect();
-        let source_wms_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        let source_frontiers_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
             source_name_arcs.len(),
             rustc_hash::FxBuildHasher,
         );
@@ -4375,7 +6512,7 @@ impl LaminarDB {
             .expect("EngineMetrics must be set before start()");
 
         let (force_checkpoint_tx, force_checkpoint_rx) =
-            crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointReply>(
+            crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointRequest>(
                 crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY,
             );
         *self.force_ckpt_tx.lock() = Some(force_checkpoint_tx);
@@ -4384,27 +6521,37 @@ impl LaminarDB {
 
         let checkpoint_committable_sinks = sinks
             .iter()
-            .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
+            .any(|(_, handle, _, _, _, _)| handle.checkpoint_committable());
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (
             epoch_allocator,
             quorum_timeout,
             checkpoint_timeout,
             checkpoint_cleanup_timeout,
-            max_staged_bytes,
-            coordinated_commit_admission,
+            max_node_data_bytes,
+            full_vnode_capture_needed,
         ) = {
             let coordinator = self.coordinator.lock().await;
             match coordinator.as_ref() {
                 Some(coordinator) => {
                     let checkpoint = coordinator.config();
+                    let full_vnode_capture_needed = coordinator
+                        .last_committed_manifest()
+                        .is_some_and(|manifest| {
+                            coordinator.committed_manifest_needs_vnode_rebase(
+                                laminar_core::checkpoint::CheckpointAttempt::new(
+                                    manifest.epoch,
+                                    manifest.checkpoint_id,
+                                ),
+                            )
+                        });
                     (
                         Some(coordinator.epoch_allocator()),
                         checkpoint.quorum_timeout,
                         checkpoint.checkpoint_timeout,
                         checkpoint.cleanup_timeout,
-                        checkpoint.max_staged_bytes,
-                        coordinator.coordinated_commit_admission(),
+                        checkpoint.max_node_data_bytes,
+                        full_vnode_capture_needed,
                     )
                 }
                 None => (
@@ -4413,7 +6560,7 @@ impl LaminarDB {
                     std::time::Duration::from_secs(120),
                     crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
                     u64::MAX,
-                    None,
+                    false,
                 ),
             }
         };
@@ -4451,9 +6598,14 @@ impl LaminarDB {
             source_entries_for_wm: source_entries,
             source_ids,
             source_name_arcs,
-            source_wms_buf,
+            checkpoint_source_names,
+            source_frontiers_buf,
+            #[cfg(feature = "cluster")]
+            committed_source_watermarks_snapshot: Arc::new(rustc_hash::FxHashMap::default()),
             tracker,
             prom,
+            #[cfg(feature = "cluster")]
+            checkpoint_barrier_timings: Arc::clone(&self.checkpoint_barrier_timings),
             pipeline_watermark: Arc::clone(&self.pipeline_watermark),
             coordinator: Arc::clone(&self.coordinator),
             table_store: self.table_store.clone(),
@@ -4464,7 +6616,7 @@ impl LaminarDB {
             pending_sink_filter_compiles,
             delivery_guarantee: config.delivery_guarantee,
             serialization_timeout: checkpoint_timeout,
-            checkpoint_state_cap_bytes: max_staged_bytes,
+            checkpoint_state_cap_bytes: max_node_data_bytes,
             checkpoint_serialization_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             checkpoint_timeout,
             checkpoint_cleanup_timeout,
@@ -4472,15 +6624,16 @@ impl LaminarDB {
             sink_timed_out: false,
             sink_fault: None,
             checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            pipeline_halt: None,
             last_checkpoint_admission_failure: None,
             checkpoint_admission_recovering: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
             vnode_registry,
             #[cfg(feature = "cluster")]
-            reconciled_source_handoff_version,
-            #[cfg(feature = "cluster")]
             cluster_controller: callback_controller,
+            #[cfg(feature = "cluster")]
+            assignment_adoption_lock: Arc::clone(&self.assignment_adoption_lock),
             #[cfg(feature = "cluster")]
             follower_tail: Arc::default(),
             #[cfg(feature = "cluster")]
@@ -4498,12 +6651,12 @@ impl LaminarDB {
             subscription_registry: Arc::clone(&self.subscription_registry),
             named_stream_names,
             checkpoint_complete_tx,
+            checkpoint_tail_runtime: self.control_runtime.handle()?,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            #[cfg(feature = "cluster")]
-            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(feature = "cluster")]
-            last_vnode_capture_epoch: None,
+            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(
+                full_vnode_capture_needed,
+            )),
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout,
@@ -4522,14 +6675,10 @@ impl LaminarDB {
                 force_checkpoint_rx,
                 checkpoint_complete_rx,
                 checkpoint_in_flight,
-                coordinated_commit_admission,
                 #[cfg(feature = "cluster")]
                 source_process_authority,
                 runtime_mode,
             },
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
         })
     }
 
@@ -4538,7 +6687,7 @@ impl LaminarDB {
         setup: PipelineRuntimeSetup,
         shutdown: Arc<tokio::sync::Notify>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "cluster")] startup_generation_fence: Option<
+        #[cfg(feature = "cluster")] mut startup_generation_fence: Option<
             tokio::sync::OwnedRwLockWriteGuard<()>,
         >,
     ) -> Result<(), DbError> {
@@ -4549,7 +6698,6 @@ impl LaminarDB {
             force_checkpoint_rx: force_ckpt_rx,
             checkpoint_complete_rx,
             checkpoint_in_flight,
-            coordinated_commit_admission,
             #[cfg(feature = "cluster")]
             source_process_authority,
             runtime_mode,
@@ -4577,8 +6725,7 @@ impl LaminarDB {
         .with_terminal_shutdown(runtime_shutdown.clone())
         .with_force_checkpoint_rx(force_ckpt_rx)
         .with_checkpoint_complete_rx(checkpoint_complete_rx)
-        .with_checkpoint_admission(checkpoint_in_flight)
-        .with_coordinated_commit_admission(coordinated_commit_admission);
+        .with_checkpoint_admission(checkpoint_in_flight);
 
         let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
         let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -4592,15 +6739,31 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         let compute_fault_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
         #[cfg(feature = "cluster")]
+        let compute_fault_authority_transition = Arc::clone(&self.cluster_authority_transition);
+        let compute_terminal_pipeline_halt = Arc::clone(&self.terminal_pipeline_halt);
+        #[cfg(feature = "cluster")]
         let compute_fault_is_cluster = runtime_mode == RuntimeMode::Cluster;
+        #[cfg(feature = "cluster")]
+        let compute_fault_installed_vnode_state = Arc::clone(&self.installed_vnode_state);
+        #[cfg(feature = "cluster")]
+        let compute_fault_pending_vnode_transition = Arc::clone(&self.pending_vnode_transition);
+        #[cfg(feature = "cluster")]
+        let compute_fault_rotation_execution_fence = Arc::clone(&self.rotation_execution_fence);
         #[cfg(feature = "cluster")]
         let compute_fault_controller = self.cluster_controller.lock().clone();
         #[cfg(feature = "cluster")]
         let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
-        #[cfg(feature = "cluster")]
         let compute_fault_runtime_shutdown = runtime_shutdown.clone();
-        match std::thread::Builder::new()
-            .name("laminar-compute".into())
+        #[cfg(all(test, feature = "cluster"))]
+        let compute_before_ready_panic = Arc::clone(&self.compute_before_ready_panic);
+        let compute_thread = std::thread::Builder::new().name("laminar-compute".into());
+        #[cfg(feature = "cluster")]
+        // The local and clustered runtimes share the cluster-enabled coordinator state machine.
+        // Windows' default thread stack is too small for that debug/test layout even when the
+        // binary is running a local pipeline. Keep the allocation explicit and bounded: there is
+        // one compute thread per running pipeline, and cluster I/O workers use the same 4 MiB.
+        let compute_thread = compute_thread.stack_size(CLUSTER_COMPUTE_THREAD_STACK_BYTES);
+        match compute_thread
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -4613,6 +6776,12 @@ impl LaminarDB {
                     }
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(all(test, feature = "cluster"))]
+                    assert!(
+                        !compute_before_ready_panic
+                            .swap(false, std::sync::atomic::Ordering::SeqCst),
+                        "injected cluster compute panic before readiness"
+                    );
                     rt.block_on(async move {
                         Box::pin(coordinator.run_with_ready(callback, startup_tx)).await
                     })
@@ -4638,6 +6807,66 @@ impl LaminarDB {
                     crate::pipeline::ExitReason::Shutdown => {
                         crate::pipeline::ExitReason::Shutdown
                     }
+                    crate::pipeline::ExitReason::Halt(reason) => {
+                        #[cfg(feature = "cluster")]
+                        if !compute_fault_is_cluster {
+                            compute_terminal_pipeline_halt
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        #[cfg(not(feature = "cluster"))]
+                        compute_terminal_pipeline_halt
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        #[cfg(feature = "cluster")]
+                        if compute_fault_is_cluster {
+                            // The local disposition must precede request allocation so a monitor
+                            // that observes the retained ordinal can only publish it as Terminal.
+                            // The state helper idempotently repeats this fence before retirement.
+                            latch_cluster_terminal_data_plane(
+                                &compute_fault_authority_transition,
+                                &compute_terminal_pipeline_halt,
+                                &compute_fault_source_gate,
+                                &compute_fault_recovery_fence,
+                            );
+                            if let Some(controller) = compute_fault_controller.as_deref() {
+                                if let Err(error) = crate::coordinated_recovery::queue_local_fault(
+                                    controller,
+                                    &compute_fault_pending,
+                                ) {
+                                    tracing::error!(
+                                        %error,
+                                        "could not allocate terminal pipeline fault request"
+                                    );
+                                }
+                            }
+                        }
+                        #[cfg(feature = "cluster")]
+                        let owns_fault_state = if compute_fault_is_cluster {
+                            publish_cluster_terminal_compute_halt_state(
+                                &fault_state,
+                                &compute_fault_authority_transition,
+                                &compute_terminal_pipeline_halt,
+                                &compute_fault_source_gate,
+                                &compute_fault_recovery_fence,
+                                &compute_fault_rotation_execution_fence,
+                                &compute_fault_pending_vnode_transition,
+                                &compute_fault_installed_vnode_state,
+                            )
+                        } else {
+                            publish_runtime_fault_state(&fault_state)
+                        };
+                        #[cfg(not(feature = "cluster"))]
+                        let owns_fault_state = publish_runtime_fault_state(&fault_state);
+                        let _ = owns_fault_state;
+                        tracing::error!(
+                            reason = %reason,
+                            "pipeline halted after a permanent error; automatic recovery is disabled"
+                        );
+                        *fault_slot.lock() = Some(reason.clone());
+                        if let Some(ref metrics) = fault_metrics {
+                            metrics.pipeline_faults_total.inc();
+                        }
+                        crate::pipeline::ExitReason::Halt(reason)
+                    }
                     crate::pipeline::ExitReason::Fault(reason) => {
                         #[cfg(feature = "cluster")]
                         if compute_fault_is_cluster {
@@ -4649,20 +6878,28 @@ impl LaminarDB {
                                 .store(true, std::sync::atomic::Ordering::Release);
                         }
 
-                        // Publish before notifying the watcher. This closes the ready-send ->
-                        // watcher-scheduled window in which start() could otherwise report
-                        // Running after the compute loop had already exited.
+                        // Publish before notifying the watcher. The cluster path first retires all
+                        // authority owned by this now-dropped graph generation under the rotation
+                        // fence; a full checkpoint restore can then publish the current assignment
+                        // without replaying a stale predecessor transition.
                         #[cfg(feature = "cluster")]
+                        let owns_fault_state = if compute_fault_is_cluster {
+                            publish_cluster_compute_fault_state(
+                                &fault_state,
+                                &compute_fault_rotation_execution_fence,
+                                &compute_fault_pending_vnode_transition,
+                                &compute_fault_installed_vnode_state,
+                            )
+                        } else {
+                            publish_runtime_fault_state(&fault_state)
+                        };
+                        #[cfg(not(feature = "cluster"))]
                         let owns_fault_state = publish_runtime_fault_state(&fault_state);
-                        #[cfg(not(feature = "cluster"))]
-                        publish_runtime_fault_state(&fault_state);
-                        #[cfg(feature = "cluster")]
-                        let covered_by_terminal_stop = compute_fault_is_cluster
-                            && !owns_fault_state
-                            && compute_fault_runtime_shutdown.is_cancelled()
-                            && DbState::load(&fault_state) == DbState::ShuttingDown;
-                        #[cfg(not(feature = "cluster"))]
-                        let covered_by_terminal_stop = false;
+                        let covered_by_terminal_stop = runtime_exit_is_covered_by_terminal_stop(
+                            owns_fault_state,
+                            &fault_state,
+                            &compute_fault_runtime_shutdown,
+                        );
 
                         if covered_by_terminal_stop {
                             crate::pipeline::ExitReason::Shutdown
@@ -4701,7 +6938,8 @@ impl LaminarDB {
                     }
                 };
                 done_tx.send(exit);
-            }) {
+            })
+        {
             Ok(_) => {}
             Err(e) => {
                 return Err(DbError::Config(format!(
@@ -4713,14 +6951,20 @@ impl LaminarDB {
         match startup_rx.await {
             Ok(Ok(())) => {}
             Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Shutdown);
             }
             Ok(Err(e)) => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Config(e));
             }
             Err(_) => {
+                #[cfg(feature = "cluster")]
+                drop(startup_generation_fence.take());
                 let _ = done_rx.await;
                 return Err(DbError::Config(
                     "compute thread exited before entering the runtime control loop".into(),
@@ -4728,9 +6972,9 @@ impl LaminarDB {
             }
         }
 
-        // Readiness transfers the recovered MV image and fully wired graph to the live loop.
-        // Release only now: a subsequent assignment may safely stage into the graph's shared
-        // handles, and a first cycle already waiting on the read fence can then proceed.
+        // Readiness transfers the recovered MV image and fully wired graph to the live loop. The
+        // caller installed any pre-audited no-work success marker before launch, so an immediate
+        // runtime fault can only clear it, never race a post-ready write that resurrects it.
         #[cfg(feature = "cluster")]
         drop(startup_generation_fence);
 
@@ -4747,7 +6991,16 @@ impl LaminarDB {
         #[cfg(feature = "cluster")]
         let watcher_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
         #[cfg(feature = "cluster")]
+        let watcher_authority_transition = Arc::clone(&self.cluster_authority_transition);
+        let watcher_terminal_pipeline_halt = Arc::clone(&self.terminal_pipeline_halt);
+        #[cfg(feature = "cluster")]
         let watcher_is_cluster = runtime_mode == RuntimeMode::Cluster;
+        #[cfg(feature = "cluster")]
+        let watcher_installed_vnode_state = Arc::clone(&self.installed_vnode_state);
+        #[cfg(feature = "cluster")]
+        let watcher_pending_vnode_transition = Arc::clone(&self.pending_vnode_transition);
+        #[cfg(feature = "cluster")]
+        let watcher_rotation_execution_fence = Arc::clone(&self.rotation_execution_fence);
         #[cfg(feature = "cluster")]
         let watcher_pending_compute_fault = Arc::clone(&self.pending_recovery_fault);
         #[cfg(feature = "cluster")]
@@ -4764,6 +7017,57 @@ impl LaminarDB {
                     // writer has settled. The watcher cannot prove that merely because the
                     // compute thread exited, so a timed-out stop remains ShuttingDown until retry.
                 }
+                crate::pipeline::ExitReason::Halt(reason) => {
+                    tracing::error!(
+                        %reason,
+                        "laminar-compute thread exited after a permanent error"
+                    );
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        latch_cluster_terminal_data_plane(
+                            &watcher_authority_transition,
+                            &watcher_terminal_pipeline_halt,
+                            &watcher_source_gate,
+                            &watcher_recovery_fence,
+                        );
+                    } else {
+                        watcher_terminal_pipeline_halt
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    watcher_terminal_pipeline_halt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    watcher_fault.lock().get_or_insert(reason);
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        // Repeat the fail-closed publication in case the compute thread lost its
+                        // terminal channel after returning the disposition.
+                        let generation = Arc::clone(&watcher_rotation_execution_fence)
+                            .write_owned()
+                            .await;
+                        retire_cluster_compute_generation(
+                            &watcher_pending_vnode_transition,
+                            &watcher_installed_vnode_state,
+                        );
+                        publish_runtime_fault_state(&watcher_state);
+                        drop(generation);
+                    }
+                    #[cfg(feature = "cluster")]
+                    if !watcher_is_cluster {
+                        publish_runtime_fault_state(&watcher_state);
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    publish_runtime_fault_state(&watcher_state);
+                    watcher_shutdown.notify_one();
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        report_cluster_terminal_halt(
+                            watcher_controller,
+                            watcher_pending_compute_fault,
+                        )
+                        .await;
+                    }
+                    // A permanent halt is operator-owned. Do not invoke the local supervisor.
+                }
                 crate::pipeline::ExitReason::Fault(reason) => {
                     tracing::error!(%reason, "laminar-compute thread exited with a recoverable fault");
                     watcher_fault.lock().get_or_insert(reason);
@@ -4773,7 +7077,21 @@ impl LaminarDB {
                         // its normal fault publication reached this watcher.
                         watcher_source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
                         watcher_recovery_fence.store(true, std::sync::atomic::Ordering::Release);
+                        let generation = Arc::clone(&watcher_rotation_execution_fence)
+                            .write_owned()
+                            .await;
+                        retire_cluster_compute_generation(
+                            &watcher_pending_vnode_transition,
+                            &watcher_installed_vnode_state,
+                        );
+                        publish_runtime_fault_state(&watcher_state);
+                        drop(generation);
                     }
+                    #[cfg(feature = "cluster")]
+                    if !watcher_is_cluster {
+                        publish_runtime_fault_state(&watcher_state);
+                    }
+                    #[cfg(not(feature = "cluster"))]
                     publish_runtime_fault_state(&watcher_state);
                     watcher_shutdown.notify_one();
                     // Cluster mode: report the fault and let the leader drive a global
@@ -4805,55 +7123,6 @@ impl LaminarDB {
         Ok(())
     }
 
-    async fn start_coordinated_committer(
-        &self,
-        committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
-        poll_interval: std::time::Duration,
-        notify: Arc<tokio::sync::Notify>,
-    ) -> Result<(), DbError> {
-        let Some(mut committer) = committer else {
-            return Ok(());
-        };
-
-        let state = Arc::clone(&self.state);
-        let handle = tokio::spawn(async move {
-            let mut tick = tokio::time::interval(poll_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            tick.tick().await;
-
-            if let Err(error) = committer.commit_ready().await {
-                tracing::warn!(%error, "initial coordinated committer pass failed; will retry");
-            }
-            loop {
-                tokio::select! {
-                    () = notify.notified() => {}
-                    _ = tick.tick() => {}
-                }
-                if matches!(
-                    DbState::load(&state),
-                    DbState::Stopped | DbState::Faulted | DbState::Created
-                ) {
-                    break;
-                }
-                if let Err(error) = committer.commit_ready().await {
-                    tracing::warn!(%error, "coordinated committer pass failed; will retry");
-                }
-            }
-        });
-
-        let mut owned_handle = self.committer_handle.lock().await;
-        if owned_handle.is_some() {
-            handle.abort();
-            let _ = handle.await;
-            return Err(DbError::Checkpoint(
-                "cannot start a coordinated committer while a prior generation is still owned"
-                    .into(),
-            ));
-        }
-        *owned_handle = Some(handle);
-        Ok(())
-    }
-
     async fn start_connector_pipeline(
         &self,
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -4861,6 +7130,9 @@ impl LaminarDB {
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
         has_external: bool,
+        pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
+        temporal_source_roles: FxHashMap<String, TemporalSourceRole>,
+        ordered_interval_admissions: OrderedIntervalAdmissions,
         runtime_shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), DbError> {
         use crate::pipeline::{CheckpointSchedule, PipelineConfig};
@@ -4872,8 +7144,6 @@ impl LaminarDB {
             let generation_fence = Arc::clone(&self.rotation_execution_fence)
                 .write_owned()
                 .await;
-            self.rehydrated_vnode_state.lock().clear();
-            self.pending_revoke_vnodes.lock().clear();
             Some(generation_fence)
         } else {
             None
@@ -4906,13 +7176,57 @@ impl LaminarDB {
                 std::time::Duration::from_millis,
             );
 
-        let mut graph =
-            self.build_connector_operator_graph(&source_regs, &stream_regs, &table_regs)?;
+        let reference_tables: rustc_hash::FxHashSet<String> = self
+            .table_store
+            .read()
+            .table_names()
+            .into_iter()
+            .filter(|name| {
+                !table_regs
+                    .get(name)
+                    .is_some_and(|registration| registration.on_demand)
+            })
+            .collect();
+        let resolved_stream_outputs = resolve_stream_output_schemas(
+            &self.ctx,
+            &stream_regs,
+            &reference_tables,
+            &ordered_interval_admissions.joins,
+        )
+        .await?;
+        let stream_output_schemas = &resolved_stream_outputs.schemas;
+        {
+            let mut schemas = self.stream_schemas.write();
+            schemas.clear();
+            schemas.extend(
+                stream_output_schemas
+                    .iter()
+                    .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
+            );
+        }
+
+        let mut graph = self.build_connector_operator_graph(
+            &stream_regs,
+            &table_regs,
+            &resolved_stream_outputs.changelog_carrying,
+            &ordered_interval_admissions.joins,
+            pipeline_identity.as_ref(),
+        )?;
+        for (name, schema) in stream_output_schemas {
+            graph.register_intermediate_schema(name, schema);
+        }
+        graph.set_max_managed_state_bytes(
+            self.config
+                .pipeline_max_managed_state_bytes
+                .expect("managed-state budget must be resolved at database construction"),
+        );
+        let graph = graph.initialize_managed_state().await?;
 
         let prom_registry = self.prometheus_registry.lock().clone();
         let mut sources = self.build_pipeline_sources(
-            &mut graph,
             &source_regs,
+            &temporal_source_roles,
+            &ordered_interval_admissions.source_modes,
             checkpointing_enabled,
             runtime_mode,
             prom_registry.as_ref(),
@@ -4922,54 +7236,66 @@ impl LaminarDB {
             .prepare_pipeline_sinks(
                 &sources,
                 &sink_regs,
-                &stream_regs,
+                stream_output_schemas,
+                &resolved_stream_outputs.changelog_carrying,
                 runtime_mode,
                 checkpointing_enabled,
                 pipeline_checkpoint_timeout,
                 prom_registry.as_ref(),
             )
             .await?;
+        let recovery = self
+            .recover_pipeline_state(
+                graph,
+                &mut sources,
+                runtime_mode,
+                pipeline_checkpoint_timeout,
+            )
+            .await?;
+        #[cfg(feature = "cluster")]
+        let mut vnode_transition_launch = (runtime_mode == RuntimeMode::Cluster)
+            .then(|| PendingVnodeTransitionLaunchGuard::capture(self));
         let PipelineRecoveryState {
             graph,
             recovered_mv_store,
-            recovered_source_wms,
+            recovered_channel_progress,
+            recovered_input_channels,
+            recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
-            #[cfg(feature = "cluster")]
-                reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
             restored_reference_tables,
-        } = self
-            .recover_pipeline_state(graph, &mut sources, runtime_mode)
-            .await?;
+        } = recovery;
         let previous_mv_store = {
             let mut live = self.mv_store.write();
             std::mem::replace(&mut *live, recovered_mv_store)
         };
         drop(previous_mv_store);
 
-        if source_watermark_recovery_selected {
-            for source_name in self.catalog.list_sources() {
-                if let Some(entry) = self.catalog.get_source(&source_name) {
-                    entry.source.restore_watermark_for_recovery(
-                        recovered_source_wms
-                            .get(&source_name)
-                            .copied()
-                            .or(recovered_watermark_frontier)
-                            .unwrap_or(i64::MIN),
-                    );
-                }
+        for source_name in self.catalog.list_sources() {
+            if let Some(entry) = self.catalog.get_source(&source_name) {
+                let (watermark, _) = recovered_source_watermark(
+                    recovered_channel_progress.get(&source_name),
+                    recovered_input_channels
+                        .get(&source_name)
+                        .is_some_and(|inventory| inventory.is_empty()),
+                    recovered_source_watermarks.get(&source_name).copied(),
+                );
+                entry
+                    .source
+                    .restore_watermark_for_recovery(watermark.unwrap_or(i64::MIN));
             }
         }
 
         self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
             .await?;
         let watermarks = self.prepare_pipeline_watermarks(
+            &sources,
             &stream_regs,
-            &recovered_source_wms,
+            &recovered_channel_progress,
+            &recovered_input_channels,
+            &recovered_source_watermarks,
+            recovered_checkpoint_index_version,
             recovered_watermark_frontier,
-            recovered_all_sources_idle,
-            source_watermark_recovery_selected,
         )?;
         let max_poll = self.config.default_buffer_size.min(1024);
         tracing::info!(
@@ -5004,7 +7330,6 @@ impl LaminarDB {
             cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
             drain_budget_ns,
             query_budget_ns,
-            background_budget_ns: 5_000_000, // 5ms
             max_input_buf_batches: self.config.pipeline_max_input_buf_batches.unwrap_or(256),
             max_input_buf_bytes: self.config.pipeline_max_input_buf_bytes,
             backpressure_policy: self.config.pipeline_backpressure_policy,
@@ -5012,12 +7337,7 @@ impl LaminarDB {
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         };
 
-        let PreparedPipelineRuntime {
-            runtime,
-            coordinated_committer,
-            committer_poll,
-            committer_notify,
-        } = self
+        let PreparedPipelineRuntime { runtime } = self
             .prepare_pipeline_runtime(
                 sources,
                 graph,
@@ -5025,28 +7345,55 @@ impl LaminarDB {
                 watermarks,
                 pipeline_config,
                 runtime_mode,
-                #[cfg(feature = "cluster")]
-                startup_reconciled_source_handoff_version,
             )
             .await?;
 
-        self.launch_pipeline_runtime(
-            runtime,
-            Arc::clone(&self.shutdown_signal),
-            runtime_shutdown,
-            #[cfg(feature = "cluster")]
-            startup_generation_fence,
-        )
-        .await?;
+        #[cfg(feature = "cluster")]
+        let graph_ready_vnode_state = if runtime_mode == RuntimeMode::Cluster {
+            let graph_ready_deadline = checked_pipeline_deadline(
+                pipeline_checkpoint_timeout,
+                "pipeline graph-ready checkpoint",
+            )?;
+            self.prepare_graph_ready_vnode_state_binding(graph_ready_deadline)
+                .await?
+        } else {
+            None
+        };
+        #[cfg(feature = "cluster")]
+        if let Some(installed) = graph_ready_vnode_state.as_ref() {
+            *self.installed_vnode_state.lock() = Some(installed.clone());
+        }
+        let launch = self
+            .launch_pipeline_runtime(
+                runtime,
+                Arc::clone(&self.shutdown_signal),
+                runtime_shutdown,
+                #[cfg(feature = "cluster")]
+                startup_generation_fence,
+            )
+            .await;
+        #[cfg(feature = "cluster")]
+        let launch = launch.inspect_err(|_| {
+            if let Some(expected) = graph_ready_vnode_state.as_ref() {
+                let mut installed = self.installed_vnode_state.lock();
+                if installed.as_ref() == Some(expected) {
+                    installed.take();
+                }
+            }
+        });
+        launch?;
+        #[cfg(feature = "cluster")]
+        if let Some(guard) = vnode_transition_launch.as_mut() {
+            guard.complete();
+        }
 
-        self.start_coordinated_committer(coordinated_committer, committer_poll, committer_notify)
-            .await
+        Ok(())
     }
     async fn quiesce_checkpoint_decision_until(
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
+        let _coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
             .await
             .map_err(|_| {
                 DbError::Checkpoint(
@@ -5054,11 +7401,6 @@ impl LaminarDB {
                         .into(),
                 )
             })?;
-        if let Some(coordinator) = coordinator.as_mut() {
-            coordinator
-                .quiesce_pending_decision_write_until(deadline)
-                .await?;
-        }
         Ok(())
     }
 
@@ -5093,6 +7435,20 @@ impl LaminarDB {
         // before lifecycle arbitration also prevents a brief stop-created state from admitting
         // a new startup while shutdown is queued behind that stop.
         self.close();
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime()
+            && self
+                .terminal_pipeline_halt
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            // Catalog bootstrap can fail before the recovery monitor exists. Shutdown is then the
+            // last live owner capable of proving the permanent disposition to shared authority;
+            // it must not quiesce that authority or publish Stopped until durable proof exists.
+            let controller = { self.cluster_controller.lock().clone() };
+            report_cluster_terminal_halt(controller, Arc::clone(&self.pending_recovery_fault))
+                .await;
+            self.latch_durable_terminal_recovery_fence();
+        }
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         #[cfg(feature = "cluster")]
         self.quiesce_recovery_monitor_until(deadline).await?;
@@ -5103,7 +7459,10 @@ impl LaminarDB {
                     Arc::clone(in_flight)
                 } else {
                     match DbState::load(&self.state) {
-                        DbState::Stopped => return Ok(()),
+                        DbState::Stopped => {
+                            drop(owned);
+                            return Ok(());
+                        }
                         DbState::Starting => {
                             return Err(DbError::Pipeline(
                                 "shutdown found Starting without an incomplete owned startup attempt"
@@ -5181,6 +7540,32 @@ impl LaminarDB {
             }
         }
         drop(runtime_handle);
+
+        // The runtime can call `complete_pending_vnode_transition` until its join handle has
+        // finished. Retire the staged transition and its predecessor binding only after that
+        // generation is gone, and keep the graph rotation write fence through terminal lifecycle
+        // publication so no callback or assignment adoption can observe a split pair.
+        #[cfg(feature = "cluster")]
+        let _retired_cluster_generation = if self.is_cluster_runtime() {
+            Some(
+                retire_cluster_compute_generation_until(
+                    &self.rotation_execution_fence,
+                    &self.pending_vnode_transition,
+                    &self.installed_vnode_state,
+                    deadline,
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "pipeline shutdown could not retire cluster vnode state before its \
+                         deadline; runtime remains fenced in ShuttingDown"
+                            .into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
         if watcher_error.is_none() {
             if let Some(fault) = self.last_fault.lock().clone() {
                 watcher_error = Some(DbError::Pipeline(format!(
@@ -5194,7 +7579,6 @@ impl LaminarDB {
         // Compute has stopped producing new checkpoint work. Keep every deployment/state fence
         // until an already-issued remote decision create reaches a terminal client-side state.
         self.quiesce_checkpoint_decision_until(deadline).await?;
-        self.quiesce_committer_until(deadline).await?;
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
@@ -5213,6 +7597,20 @@ impl LaminarDB {
             .await
     }
 
+    /// End-to-end deadline owned by the recovery stop itself. This is derived only from the
+    /// immutable database configuration: consulting the live coordinator here can deadlock with
+    /// the coordinator task that stop is joining. Two cleanup windows cover an admitted attempt
+    /// and its retained tail, with a final margin for lifecycle and connector settlement.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn coordinated_recovery_stop_timeout(&self) -> std::time::Duration {
+        let cleanup_timeout =
+            crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout;
+        coordinated_recovery_stop_ceiling(
+            configured_checkpoint_timeout(&self.config),
+            cleanup_timeout,
+        )
+    }
+
     /// Recovery-owned stop after the lifecycle fence is published.
     #[cfg(feature = "cluster")]
     pub(crate) async fn stop_pipeline_for_coordinated_recovery(&self) -> Result<(), DbError> {
@@ -5224,8 +7622,14 @@ impl LaminarDB {
         &self,
         authority: PipelineLifecycleAuthority,
     ) -> Result<(), DbError> {
-        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-        let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+        let stop_timeout = match authority {
+            PipelineLifecycleAuthority::Public => PUBLIC_PIPELINE_STOP_TIMEOUT,
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::CoordinatedRecovery => {
+                self.coordinated_recovery_stop_timeout()
+            }
+        };
+        let deadline = checked_pipeline_deadline(stop_timeout, "pipeline stop")?;
         let first_stop = loop {
             let startup = {
                 let owned = self.startup_attempt.lock();
@@ -5237,7 +7641,10 @@ impl LaminarDB {
                     Arc::clone(in_flight)
                 } else {
                     match DbState::load(&self.state) {
-                        DbState::Created | DbState::Stopped => return Ok(()),
+                        DbState::Created | DbState::Stopped => {
+                            drop(owned);
+                            return Ok(());
+                        }
                         DbState::Starting => {
                             return Err(DbError::InvalidOperation(
                                 "pipeline stop found Starting without an incomplete owned startup attempt"
@@ -5285,19 +7692,17 @@ impl LaminarDB {
         let _topology = tokio::time::timeout_at(deadline, self.topology_ddl_lock.write())
             .await
             .map_err(|_| {
-                DbError::InvalidOperation(
-                    "pipeline stop could not acquire topology ownership within 10s; catalog mutation remains fenced"
-                        .into(),
-                )
+                DbError::InvalidOperation(format!(
+                    "pipeline stop could not acquire topology ownership within {stop_timeout:?}; catalog mutation remains fenced"
+                ))
             })?;
         let _lifecycle = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
             .await
             .map_err(|_| {
-                DbError::InvalidOperation(
-                    "pipeline stop could not acquire lifecycle ownership within 10s; an earlier \
-                     lifecycle operation remains fenced"
-                        .into(),
-                )
+                DbError::InvalidOperation(format!(
+                    "pipeline stop could not acquire lifecycle ownership within {stop_timeout:?}; \
+                     an earlier lifecycle operation remains fenced"
+                ))
             })?;
         let mut runtime_handle = tokio::time::timeout_at(deadline, self.runtime_handle.lock())
             .await
@@ -5319,7 +7724,8 @@ impl LaminarDB {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        "Pipeline stop still draining after 10s; will finalize when the coordinator exits"
+                        timeout = ?stop_timeout,
+                        "Pipeline stop still draining; will finalize when the coordinator exits"
                     );
                     return Err(DbError::InvalidOperation(
                         "pipeline stop is taking longer than expected; coordinator still \
@@ -5331,10 +7737,36 @@ impl LaminarDB {
         }
         drop(runtime_handle);
 
+        // Do not clear the installed predecessor binding while the old compute generation can
+        // still observe its staged transition. The joined runtime cannot hold a graph read fence;
+        // taking the write side now retires both claims atomically with respect to callbacks and
+        // assignment adoption, and retaining it through `Created` publication closes the final
+        // lifecycle race.
+        #[cfg(feature = "cluster")]
+        let _retired_cluster_generation = if self.is_cluster_runtime() {
+            Some(
+                retire_cluster_compute_generation_until(
+                    &self.rotation_execution_fence,
+                    &self.pending_vnode_transition,
+                    &self.installed_vnode_state,
+                    deadline,
+                )
+                .await
+                .map_err(|_| {
+                    DbError::InvalidOperation(
+                        "pipeline stop could not retire cluster vnode state before its deadline; \
+                         runtime remains fenced in ShuttingDown"
+                            .into(),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+
         // Do not announce Created or release the exclusive deployment lock while a timed-out
         // decision create can still mutate the recovery frontier. A later stop retry resumes here.
         self.quiesce_checkpoint_decision_until(deadline).await?;
-        self.quiesce_committer_until(deadline).await?;
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
@@ -5344,12 +7776,120 @@ impl LaminarDB {
             // is intentional if that shutdown was cancelled; a retry must finish its teardown.
             return Ok(());
         }
+        if self
+            .terminal_pipeline_halt
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            match DbState::compare_exchange(DbState::ShuttingDown, DbState::Faulted, &self.state) {
+                Ok(_) | Err(DbState::Faulted) => return Ok(()),
+                Err(observed) => {
+                    return Err(DbError::InvalidOperation(format!(
+                        "terminal pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
+                    )));
+                }
+            }
+        }
         match DbState::compare_exchange(DbState::ShuttingDown, DbState::Created, &self.state) {
             Ok(_) | Err(DbState::Created | DbState::Stopped) => Ok(()),
             Err(observed) => Err(DbError::InvalidOperation(format!(
                 "pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
             ))),
         }
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod recovery_stop_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn coordinated_stop_ceiling_resolves_immutable_checkpoint_config() {
+        let defaults = crate::checkpoint_coordinator::CheckpointConfig::default();
+        assert_eq!(
+            defaults.checkpoint_timeout,
+            std::time::Duration::from_secs(120)
+        );
+        assert_eq!(defaults.cleanup_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            PUBLIC_PIPELINE_STOP_TIMEOUT,
+            std::time::Duration::from_secs(10)
+        );
+
+        let mut config = crate::config::LaminarConfig::default();
+        assert_eq!(
+            configured_checkpoint_timeout(&config),
+            defaults.checkpoint_timeout
+        );
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(
+                configured_checkpoint_timeout(&config),
+                defaults.cleanup_timeout,
+            ),
+            std::time::Duration::from_secs(210)
+        );
+
+        config.checkpoint = Some(laminar_core::streaming::StreamCheckpointConfig {
+            timeout_ms: Some(1_234),
+            ..Default::default()
+        });
+        assert_eq!(
+            configured_checkpoint_timeout(&config),
+            std::time::Duration::from_millis(1_234)
+        );
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(
+                configured_checkpoint_timeout(&config),
+                defaults.cleanup_timeout,
+            ),
+            std::time::Duration::from_millis(91_234)
+        );
+
+        assert_eq!(
+            coordinated_recovery_stop_ceiling(std::time::Duration::MAX, defaults.cleanup_timeout,),
+            std::time::Duration::MAX
+        );
+        assert!(checked_pipeline_deadline(std::time::Duration::ZERO, "test").is_ok());
+        assert!(checked_pipeline_deadline(std::time::Duration::MAX, "test").is_err());
+    }
+}
+
+#[cfg(test)]
+mod startup_failure_tests {
+    use super::*;
+
+    async fn roundtrip(error: DbError) -> DbError {
+        let attempt = StartupAttempt::new();
+        attempt.complete(Err(error));
+        attempt.wait().await.expect_err("startup must fail")
+    }
+
+    #[tokio::test]
+    async fn startup_attempt_preserves_every_terminal_error_variant() {
+        assert!(matches!(
+            roundtrip(DbError::PipelineTerminal("pipeline poison".into())).await,
+            DbError::PipelineTerminal(reason) if reason == "pipeline poison"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::BackpressureFail("bounded queue".into())).await,
+            DbError::BackpressureFail(reason) if reason == "bounded queue"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::ShuffleTerminal("invalid owner".into())).await,
+            DbError::ShuffleTerminal(reason) if reason == "invalid owner"
+        ));
+        assert!(matches!(
+            roundtrip(DbError::ManagedStateBudgetExceeded {
+                context: "restore budget".into(),
+                accounted_bytes: 17,
+                limit_bytes: 16,
+            })
+            .await,
+            DbError::ManagedStateBudgetExceeded {
+                context,
+                accounted_bytes: 17,
+                limit_bytes: 16,
+            } if context == "restore budget"
+        ));
     }
 }
 
