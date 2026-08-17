@@ -1266,7 +1266,6 @@ mod outcome_tests {
 mod sparse_capture_tests;
 
 #[cfg(all(test, feature = "cluster"))]
-#[path = "checkpoint_coordinator_handoff_tests.rs"]
 mod handoff_tests;
 
 async fn run_gc_worker(
