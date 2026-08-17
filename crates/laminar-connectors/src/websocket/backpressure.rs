@@ -27,12 +27,4 @@ pub enum WsBackpressure {
     DropNewest,
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_is_block() {
-        let strategy = WsBackpressure::default();
-        assert!(matches!(strategy, WsBackpressure::Block));
-    }
-}
+mod tests;

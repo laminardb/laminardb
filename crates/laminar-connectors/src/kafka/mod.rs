@@ -417,10 +417,6 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
     ]
 }
 
-/// Round-trip integration tests: serialize → deserialize → verify identity.
-#[cfg(test)]
-mod avro_roundtrip_tests;
-
 #[cfg(test)]
 mod tests {
     use super::*;

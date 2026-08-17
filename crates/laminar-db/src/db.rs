@@ -440,8 +440,7 @@ pub struct LaminarDB {
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
     /// Resolved at `start()`; consulted by SUBSCRIBE WHERE.
-    pub(crate) stream_schemas:
-        parking_lot::RwLock<HashMap<String, arrow_schema::SchemaRef>>,
+    pub(crate) stream_schemas: parking_lot::RwLock<HashMap<String, arrow_schema::SchemaRef>>,
 }
 
 impl Drop for LaminarDB {
@@ -1764,8 +1763,7 @@ impl LaminarDB {
         let future_skew_ms =
             crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
                 .map_err(|error| DbError::Config(error.to_string()))?;
-        config.event_time_max_future_skew =
-            Duration::from_millis(future_skew_ms.unsigned_abs());
+        config.event_time_max_future_skew = Duration::from_millis(future_skew_ms.unsigned_abs());
         let max_managed_state_bytes = config
             .pipeline_max_managed_state_bytes
             .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);

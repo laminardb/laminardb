@@ -1,6 +1,8 @@
 use super::*;
 use arrow_schema::{DataType, Field, Schema};
 
+mod roundtrip;
+
 const TEST_AVRO_SCHEMA: &str = r#"{
         "type": "record",
         "name": "test",

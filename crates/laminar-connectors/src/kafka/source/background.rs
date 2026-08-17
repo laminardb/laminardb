@@ -191,11 +191,6 @@ impl KafkaBlockingTasks {
             }
         }
     }
-
-    #[cfg(test)]
-    pub(super) async fn tracked_count(&self) -> usize {
-        self.handles.lock().await.len()
-    }
 }
 
 pub(super) async fn join_background_task(
@@ -225,6 +220,9 @@ pub(super) async fn join_background_task(
         *handle = None;
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(super) fn ensure_background_task_reaper(
     handle: tokio::task::JoinHandle<()>,

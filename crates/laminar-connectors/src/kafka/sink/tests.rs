@@ -416,7 +416,6 @@ fn test_extract_keys_with_key_column() {
     )
     .unwrap();
     let keys = sink.extract_keys(&batch).unwrap().unwrap();
-    assert_eq!(keys.len(), 2);
     assert_eq!(&keys[0], b"key-a");
     assert_eq!(&keys[1], b"key-b");
 }

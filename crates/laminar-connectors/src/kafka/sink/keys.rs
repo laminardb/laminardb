@@ -30,11 +30,6 @@ impl KeyBuffer {
         let (start, len) = self.offsets[i];
         &self.data[start..start + len]
     }
-
-    #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.offsets.len()
-    }
 }
 
 impl std::ops::Index<usize> for KeyBuffer {
