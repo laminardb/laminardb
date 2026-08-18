@@ -315,6 +315,10 @@ impl DeltaLakeSink {
             )));
         }
 
+        // Comparisons use the Delta storage form: millisecond timestamps are
+        // widened to microseconds at this boundary before identity checks.
+        let pipeline = super::super::delta_io::widen_millisecond_timestamps(pipeline);
+
         if exact_schema_required {
             if pipeline.as_ref() != table.as_ref() {
                 return Err(ConnectorError::SchemaMismatch(

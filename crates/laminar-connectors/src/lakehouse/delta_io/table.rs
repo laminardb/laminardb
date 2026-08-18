@@ -25,7 +25,7 @@ use deltalake::kernel::schema::cast::cast_record_batch;
 /// inside composite types are not rewritten and keep failing conversion,
 /// matching kernel behavior.
 #[cfg(feature = "delta-lake")]
-fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
+pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
     let needs_widening = schema.fields().iter().any(|field| {
         matches!(
             field.data_type(),
