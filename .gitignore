@@ -57,6 +57,7 @@ wal/
 
 # Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md
+AGENTS.md
 .claude/
 docs/architecture/
 docs/adr/
