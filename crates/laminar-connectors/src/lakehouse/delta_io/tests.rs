@@ -464,11 +464,9 @@ async fn test_write_batch_creates_parquet() {
     );
 }
 
-/// Regression: the kernel rejects `Timestamp(Millisecond)` during schema
-/// conversion ("Invalid data type for Delta Lake"), which failed table
-/// creation for pipelines that model time in milliseconds (temporal-probe
-/// `probe_time`). The storage boundary widens such columns to microseconds —
-/// preserving timezone metadata and instants — before creation and writes.
+/// Regression: `Timestamp(Millisecond)` used to fail table creation with
+/// "Invalid data type for Delta Lake"; the boundary must widen it to
+/// microseconds with timezone metadata preserved.
 #[tokio::test]
 async fn test_millisecond_timestamp_columns_widen_to_microseconds() {
     use arrow_array::TimestampMillisecondArray;
@@ -492,8 +490,6 @@ async fn test_millisecond_timestamp_columns_widen_to_microseconds() {
         ),
     ]));
 
-    // Previously failed here with "Invalid data type for Delta Lake:
-    // Timestamp(ms)".
     let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
         .await
         .unwrap();
@@ -521,8 +517,6 @@ async fn test_millisecond_timestamp_columns_widen_to_microseconds() {
     .unwrap();
     assert_eq!(version, 1);
 
-    // The persisted schema round-trips as microsecond timestamps with the
-    // timezone metadata preserved.
     let kernel_schema = table.snapshot().unwrap().schema();
     let stored = arrow_schema::Schema::try_from_kernel(kernel_schema.as_ref()).unwrap();
     assert_eq!(

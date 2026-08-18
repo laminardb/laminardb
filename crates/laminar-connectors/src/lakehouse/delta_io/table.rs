@@ -14,16 +14,9 @@ use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
 #[cfg(feature = "delta-lake")]
 use deltalake::kernel::schema::cast::cast_record_batch;
 
-/// Widens top-level millisecond timestamp columns to microseconds.
-///
-/// Delta Lake physically stores microseconds and its kernel rejects Arrow
-/// `Timestamp(Millisecond, _)` during schema conversion (there is no
-/// schema-level normalizer upstream). Engine outputs that model time in
-/// milliseconds — for example temporal-probe `probe_time` — are widened once
-/// at this storage boundary; values scale by `1_000` and remain
-/// instant-identical. Timezone metadata is preserved. Nested timestamps
-/// inside composite types are not rewritten and keep failing conversion,
-/// matching kernel behavior.
+/// WHY: the kernel accepts only microsecond timestamps; values scale by
+/// `1_000`, timezone metadata is preserved, and nested timestamps stay
+/// rejected (no upstream schema-level normalizer exists).
 #[cfg(feature = "delta-lake")]
 pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
     let needs_widening = schema.fields().iter().any(|field| {
@@ -51,10 +44,8 @@ pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Widens one batch toward its widened schema using the kernel cast kernel
-/// (`cast_record_batch`, the same mechanism delta-rs applies in its own
-/// `DataFusion` sink). Strict and no column addition: schema validation is not
-/// weakened, and a timestamp overflow surfaces as a typed write failure.
+/// Casts via the kernel's own `cast_record_batch` (strict, no column
+/// addition) so schema validation is not weakened.
 #[cfg(feature = "delta-lake")]
 fn widen_batch_millisecond_timestamps(batch: RecordBatch) -> Result<RecordBatch, ConnectorError> {
     let target = widen_millisecond_timestamps(&batch.schema());
@@ -158,8 +149,7 @@ pub async fn open_or_create_table(
 
     info!(table_path, "creating new Delta Lake table");
 
-    // Convert Arrow schema to Delta Lake schema using TryIntoKernel, widening
-    // millisecond timestamps to the microseconds Delta physically stores.
+    // Convert Arrow schema to Delta Lake schema using TryIntoKernel.
     let delta_schema: deltalake::kernel::StructType = widen_millisecond_timestamps(schema)
         .as_ref()
         .try_into_kernel()

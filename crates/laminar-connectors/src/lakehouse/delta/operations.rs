@@ -315,8 +315,7 @@ impl DeltaLakeSink {
             )));
         }
 
-        // Comparisons use the Delta storage form: millisecond timestamps are
-        // widened to microseconds at this boundary before identity checks.
+        // INVARIANT: identity is checked in Delta storage form (ms -> us).
         let pipeline = super::super::delta_io::widen_millisecond_timestamps(pipeline);
 
         if exact_schema_required {
