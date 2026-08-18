@@ -87,6 +87,51 @@ pub(super) fn validate_recovered_source_watermark(
     Ok(())
 }
 
+pub(super) fn validate_recovered_input_channels(
+    source_name: &str,
+    progress: &FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
+    inventory: Option<&Arc<[Vec<u8>]>>,
+) -> Result<(), DbError> {
+    let inventory = inventory.ok_or_else(|| {
+        DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' has no input-channel inventory"
+        ))
+    })?;
+    if inventory.len() != progress.len()
+        || inventory
+            .iter()
+            .any(|channel| !progress.contains_key(channel.as_slice()))
+    {
+        return Err(DbError::Checkpoint(format!(
+            "recovered ordered source '{source_name}' input-channel inventory does not match its watermark progress"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) struct PipelineRuntimeSetup {
+    pub(super) sources: Vec<TrackedSourceRegistration>,
+    pub(super) config: crate::pipeline::PipelineConfig,
+    pub(super) callback: crate::pipeline_callback::ConnectorPipelineCallback,
+    pub(super) force_checkpoint_rx: crate::db::ForceCheckpointRx,
+    pub(super) checkpoint_complete_rx:
+        crossfire::AsyncRx<crossfire::mpsc::Array<crate::pipeline::CheckpointCompletion>>,
+    pub(super) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "cluster")]
+    pub(super) source_process_authority:
+        Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    pub(super) runtime_mode: RuntimeMode,
+}
+
+pub(super) struct PreparedPipelineRuntime {
+    pub(super) runtime: PipelineRuntimeSetup,
+}
+
+pub(super) type ReferenceTableRuntimeSource = (
+    String,
+    Box<dyn laminar_connectors::reference::ReferenceTableSource>,
+);
+
 #[cfg(test)]
 mod recovered_source_watermark_tests {
     use super::*;
@@ -253,48 +298,3 @@ mod recovered_source_watermark_tests {
         assert!(!restored[0].idle);
     }
 }
-
-pub(super) fn validate_recovered_input_channels(
-    source_name: &str,
-    progress: &FxHashMap<Box<[u8]>, RecoveredInputChannelProgress>,
-    inventory: Option<&Arc<[Vec<u8>]>>,
-) -> Result<(), DbError> {
-    let inventory = inventory.ok_or_else(|| {
-        DbError::Checkpoint(format!(
-            "recovered ordered source '{source_name}' has no input-channel inventory"
-        ))
-    })?;
-    if inventory.len() != progress.len()
-        || inventory
-            .iter()
-            .any(|channel| !progress.contains_key(channel.as_slice()))
-    {
-        return Err(DbError::Checkpoint(format!(
-            "recovered ordered source '{source_name}' input-channel inventory does not match its watermark progress"
-        )));
-    }
-    Ok(())
-}
-
-pub(super) struct PipelineRuntimeSetup {
-    pub(super) sources: Vec<TrackedSourceRegistration>,
-    pub(super) config: crate::pipeline::PipelineConfig,
-    pub(super) callback: crate::pipeline_callback::ConnectorPipelineCallback,
-    pub(super) force_checkpoint_rx: crate::db::ForceCheckpointRx,
-    pub(super) checkpoint_complete_rx:
-        crossfire::AsyncRx<crossfire::mpsc::Array<crate::pipeline::CheckpointCompletion>>,
-    pub(super) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    #[cfg(feature = "cluster")]
-    pub(super) source_process_authority:
-        Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    pub(super) runtime_mode: RuntimeMode,
-}
-
-pub(super) struct PreparedPipelineRuntime {
-    pub(super) runtime: PipelineRuntimeSetup,
-}
-
-pub(super) type ReferenceTableRuntimeSource = (
-    String,
-    Box<dyn laminar_connectors::reference::ReferenceTableSource>,
-);
