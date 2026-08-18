@@ -464,6 +464,77 @@ async fn test_write_batch_creates_parquet() {
     );
 }
 
+/// Regression: the kernel rejects `Timestamp(Millisecond)` during schema
+/// conversion ("Invalid data type for Delta Lake"), which failed table
+/// creation for pipelines that model time in milliseconds (temporal-probe
+/// `probe_time`). The storage boundary widens such columns to microseconds —
+/// preserving timezone metadata and instants — before creation and writes.
+#[tokio::test]
+async fn test_millisecond_timestamp_columns_widen_to_microseconds() {
+    use arrow_array::TimestampMillisecondArray;
+    use arrow_schema::TimeUnit;
+    use deltalake::kernel::engine::arrow_conversion::TryFromKernel as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "probe_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            true,
+        ),
+    ]));
+
+    // Previously failed here with "Invalid data type for Delta Lake:
+    // Timestamp(ms)".
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+        .await
+        .unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(1_500)])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(2_500)]).with_timezone("UTC")),
+        ],
+    )
+    .unwrap();
+
+    let (table, version) = write_batches(
+        table,
+        vec![batch],
+        SaveMode::Append,
+        None,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(version, 1);
+
+    // The persisted schema round-trips as microsecond timestamps with the
+    // timezone metadata preserved.
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let stored = arrow_schema::Schema::try_from_kernel(kernel_schema.as_ref()).unwrap();
+    assert_eq!(
+        stored.field_with_name("probe_time").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert_eq!(
+        stored.field_with_name("event_time").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
+    );
+}
+
 #[tokio::test]
 async fn test_multiple_appends_sequential() {
     let temp_dir = TempDir::new().unwrap();

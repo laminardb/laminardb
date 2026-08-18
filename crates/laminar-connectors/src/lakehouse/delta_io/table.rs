@@ -1,11 +1,70 @@
 //! Table opening, direct writes, and durable coordinated cursor reads.
 
+#[cfg(feature = "delta-lake")]
+use std::sync::Arc;
+
 use super::{
     debug, info, CommitProperties, ConnectorError, CoordinatedCommitCursor, DeltaTable,
     DeltaWriteAttemptError, HashMap, RecordBatch, SaveMode, SchemaMode, SchemaRef, StorageProvider,
     Url, SET_TRANSACTION_RETENTION,
 };
+#[cfg(feature = "delta-lake")]
+use arrow_schema::{DataType, Schema, TimeUnit};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
+#[cfg(feature = "delta-lake")]
+use deltalake::kernel::schema::cast::cast_record_batch;
+
+/// Widens top-level millisecond timestamp columns to microseconds.
+///
+/// Delta Lake physically stores microseconds and its kernel rejects Arrow
+/// `Timestamp(Millisecond, _)` during schema conversion (there is no
+/// schema-level normalizer upstream). Engine outputs that model time in
+/// milliseconds — for example temporal-probe `probe_time` — are widened once
+/// at this storage boundary; values scale by `1_000` and remain
+/// instant-identical. Timezone metadata is preserved. Nested timestamps
+/// inside composite types are not rewritten and keep failing conversion,
+/// matching kernel behavior.
+#[cfg(feature = "delta-lake")]
+fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
+    let needs_widening = schema.fields().iter().any(|field| {
+        matches!(
+            field.data_type(),
+            DataType::Timestamp(TimeUnit::Millisecond, _)
+        )
+    });
+    if !needs_widening {
+        return Arc::clone(schema);
+    }
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
+            ),
+            _ => Arc::clone(field),
+        })
+        .collect();
+    Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+}
+
+/// Widens one batch toward its widened schema using the kernel cast kernel
+/// (`cast_record_batch`, the same mechanism delta-rs applies in its own
+/// `DataFusion` sink). Strict and no column addition: schema validation is not
+/// weakened, and a timestamp overflow surfaces as a typed write failure.
+#[cfg(feature = "delta-lake")]
+fn widen_batch_millisecond_timestamps(batch: RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    let target = widen_millisecond_timestamps(&batch.schema());
+    if Arc::ptr_eq(&target, &batch.schema()) {
+        return Ok(batch);
+    }
+    cast_record_batch(&batch, target, false, false).map_err(|error| {
+        ConnectorError::SchemaMismatch(format!("millisecond timestamp widening failed: {error}"))
+    })
+}
 
 /// Converts a path string to a URL.
 #[cfg(feature = "delta-lake")]
@@ -99,8 +158,9 @@ pub async fn open_or_create_table(
 
     info!(table_path, "creating new Delta Lake table");
 
-    // Convert Arrow schema to Delta Lake schema using TryIntoKernel.
-    let delta_schema: deltalake::kernel::StructType = schema
+    // Convert Arrow schema to Delta Lake schema using TryIntoKernel, widening
+    // millisecond timestamps to the microseconds Delta physically stores.
+    let delta_schema: deltalake::kernel::StructType = widen_millisecond_timestamps(schema)
         .as_ref()
         .try_into_kernel()
         .map_err(|e| ConnectorError::SchemaMismatch(format!("schema conversion failed: {e}")))?;
@@ -154,6 +214,12 @@ pub(crate) async fn write_batches(
         let version = table.version().unwrap_or(0);
         return Ok((table, version));
     }
+
+    let batches = batches
+        .into_iter()
+        .map(widen_batch_millisecond_timestamps)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(DeltaWriteAttemptError::Local)?;
 
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
