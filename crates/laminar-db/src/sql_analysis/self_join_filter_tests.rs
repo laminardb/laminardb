@@ -1,3 +1,5 @@
+use laminar_sql::parser::join_parser::JoinType;
+
 use super::*;
 
 #[test]

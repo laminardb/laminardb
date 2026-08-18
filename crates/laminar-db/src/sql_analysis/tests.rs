@@ -1,3 +1,10 @@
+use std::sync::Arc;
+
+use arrow::datatypes::SchemaRef;
+use laminar_sql::translator::TemporalJoinTranslatorConfig;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::table_refs::is_window_tvf;
 use super::*;
 
 #[test]
