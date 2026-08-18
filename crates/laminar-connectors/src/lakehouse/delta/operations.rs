@@ -2,10 +2,12 @@
 
 #[cfg(feature = "delta-lake")]
 use super::{
-    classify_delta_attempt_error, count_collapsed_ops, debug, ensure_uc_table_exists,
-    run_tracked_delta_task, DataType, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
-    WriteResult, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+    classify_delta_attempt_error, count_collapsed_ops, debug, run_tracked_delta_task, DataType,
+    DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode, WriteResult,
+    MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
+#[cfg(all(feature = "delta-lake", feature = "delta-lake-unity"))]
+use super::ensure_uc_table_exists;
 use super::{
     filter_and_project, Arc, Array, ConnectorError, ConnectorState, ConnectorTaskOwner,
     DeliveryGuarantee, DeltaLakeSink, DeltaLakeSinkConfig, DeltaLakeSinkMetrics, DeltaWriteMode,
