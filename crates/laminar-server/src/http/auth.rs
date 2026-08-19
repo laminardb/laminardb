@@ -5,13 +5,18 @@
 //! fail closed; the `?token=` query escape hatch is restricted to `/ws/` upgrade requests.
 
 use std::sync::Arc;
+#[cfg(feature = "cluster")]
 use std::time::Instant;
 
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::StatusCode;
+#[cfg(feature = "cluster")]
+use axum::http::{HeaderMap, Method};
 use axum::response::IntoResponse;
 
-use crate::config::{Secret, ServerMode, ServerSection};
+#[cfg(feature = "cluster")]
+use crate::config::ServerMode;
+use crate::config::{Secret, ServerSection};
 
 use super::error_response;
 use super::state::AppState;

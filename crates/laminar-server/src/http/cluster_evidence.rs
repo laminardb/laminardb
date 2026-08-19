@@ -7,12 +7,19 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Extension, Query, RawQuery, State};
+use axum::extract::State;
+#[cfg(feature = "cluster")]
+use axum::extract::{Extension, Query, RawQuery};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::IntoResponse;
+#[cfg(feature = "cluster")]
+use axum::response::Response;
+#[cfg(feature = "cluster")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cluster")]
 use tracing::warn;
 
+#[cfg(feature = "cluster")]
 use super::auth::DiagnosticPrincipal;
 use super::cluster_admin::CLUSTER_DISABLED_MSG;
 use super::error_response;

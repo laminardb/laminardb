@@ -19,9 +19,13 @@ mod state;
 mod ws;
 
 pub use router::{bind_listener, build_router, serve_listener};
-pub use state::{AppState, ClusterComponents};
+pub use state::AppState;
+#[cfg(feature = "cluster")]
+pub use state::ClusterComponents;
 
-pub(crate) use auth::{DiagnosticReadGate, HttpAuthPolicy};
+#[cfg(feature = "cluster")]
+pub(crate) use auth::DiagnosticReadGate;
+pub(crate) use auth::HttpAuthPolicy;
 pub(crate) use state::ServingGate;
 pub(crate) use ws::ws_connection_slots;
 

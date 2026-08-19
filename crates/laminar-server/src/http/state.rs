@@ -16,7 +16,9 @@ use crate::config::ServerConfig;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 
-use super::auth::{DiagnosticReadGate, HttpAuthPolicy};
+#[cfg(feature = "cluster")]
+use super::auth::DiagnosticReadGate;
+use super::auth::HttpAuthPolicy;
 
 /// Cluster control-plane handles backing the `/api/v1/cluster/*` endpoints.
 /// Absent in single-node mode, where those endpoints return `404`.
