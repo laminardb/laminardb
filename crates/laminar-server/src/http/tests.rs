@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "cluster")]
 use std::time::Instant;
 
+#[cfg(feature = "cluster")]
 use axum::routing::get;
 use axum::Router;
 use laminar_db::LaminarDB;
 
-#[cfg(not(feature = "cluster"))]
-use super::auth::{diagnostic_auth_middleware, diagnostic_bounds_middleware};
 #[cfg(feature = "cluster")]
 use super::auth::{
     diagnostic_auth_middleware, diagnostic_bounds_middleware, DiagnosticRateWindow,
