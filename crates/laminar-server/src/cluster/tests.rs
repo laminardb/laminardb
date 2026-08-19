@@ -1,6 +1,11 @@
 use std::collections::{BinaryHeap, HashMap};
+use std::path::PathBuf;
 
+use laminar_core::cluster::discovery::{
+    NodeId, NodeInfo, NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
+};
 use object_store::ObjectStoreExt as _;
+use tokio::sync::watch;
 
 use super::assignment::{
     assignment_seed_participants, is_same_formation_genesis, resolve_vnode_assignment,
@@ -15,7 +20,10 @@ use super::control_kv::{
     OBJECT_STORE_CONTROL_VERSION, RECOVERY_GENERATION_KEY, RECOVERY_GENERATION_PREFIX,
 };
 use super::leases::spawn_process_lease_terminal_monitor;
+use super::services::start_cluster_http_api_before_activation;
 use super::*;
+use crate::cluster_config::ClusterConfig;
+use crate::config::ServerConfig;
 
 #[tokio::test]
 async fn cluster_entry_rejects_invalid_temporal_retention_before_discovery() {
