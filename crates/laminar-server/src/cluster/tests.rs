@@ -19,8 +19,10 @@ use super::control_kv::{
     OBJECT_STORE_CONTROL_PRUNE_BATCH_RECORDS, OBJECT_STORE_CONTROL_SCAN_CONCURRENCY,
     OBJECT_STORE_CONTROL_VERSION, RECOVERY_GENERATION_KEY, RECOVERY_GENERATION_PREFIX,
 };
+use super::discovery::stop_discovery_with_bound;
 use super::leases::spawn_process_lease_terminal_monitor;
 use super::services::start_cluster_http_api_before_activation;
+use super::shutdown::{wait_for_cluster_shutdown_trigger, ClusterShutdownTrigger};
 use super::*;
 use crate::cluster_config::ClusterConfig;
 use crate::config::ServerConfig;
