@@ -3253,3 +3253,46 @@ async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
         })
     );
 }
+
+#[test]
+fn new_recovery_rounds_wait_for_a_settled_fault_inventory() {
+    let fault = |reporter: u64, sequence: u64| RecoveryFault {
+        reporter: NodeId(reporter),
+        sequence,
+        disposition: RecoveryFaultDisposition::Recoverable,
+    };
+    let mut monitor = RecoveryMonitor::default();
+    let partial = [fault(11, 1)];
+    let cascaded = [fault(11, 1), fault(12, 2), fault(13, 3)];
+
+    // The poll that sees the leader's fault and the poll where cascade faults land must
+    // not freeze a round; one unchanged poll then freezes it over the complete fault set.
+    assert!(!monitor.fault_inventory_settled(1, &partial));
+    assert!(!monitor.fault_inventory_settled(2, &cascaded));
+    assert!(monitor.fault_inventory_settled(2, &cascaded));
+
+    // A settled drive resets the streak; a fresh incident waits one unchanged poll again.
+    let fresh = [fault(11, 4)];
+    assert!(!monitor.fault_inventory_settled(3, &fresh));
+    assert!(monitor.fault_inventory_settled(3, &fresh));
+}
+
+#[test]
+fn continuously_changing_fault_inventory_drives_after_bounded_changes() {
+    let mut monitor = RecoveryMonitor::default();
+    for revision in 1..u64::from(FAULT_INVENTORY_SETTLE_MAX_CHANGES) {
+        let changing = [RecoveryFault {
+            reporter: NodeId(11),
+            sequence: revision,
+            disposition: RecoveryFaultDisposition::Recoverable,
+        }];
+        assert!(!monitor.fault_inventory_settled(revision, &changing));
+    }
+    let bound = u64::from(FAULT_INVENTORY_SETTLE_MAX_CHANGES);
+    let still_changing = [RecoveryFault {
+        reporter: NodeId(11),
+        sequence: bound,
+        disposition: RecoveryFaultDisposition::Recoverable,
+    }];
+    assert!(monitor.fault_inventory_settled(bound, &still_changing));
+}

@@ -44,6 +44,9 @@ const STOP_ROSTER_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
 const ORPHAN_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// How many times the leader retries restoring itself before abandoning the round.
 const SELF_RESTORE_ATTEMPTS: u32 = 3;
+/// Liveness bound: a new round is driven after this many consecutive polls saw the fault
+/// inventory change, so a cascading cluster cannot stall recovery.
+const FAULT_INVENTORY_SETTLE_MAX_CHANGES: u8 = 3;
 
 /// Recovery target meaning "no committed cut exists": start fresh.
 const GENESIS: u64 = 0;
@@ -77,184 +80,12 @@ fn checked_recovery_deadline(timeout: Duration) -> Option<tokio::time::Instant> 
     tokio::time::Instant::now().checked_add(timeout)
 }
 
-fn local_fault_disposition(db: &LaminarDB) -> RecoveryFaultDisposition {
-    if db.terminal_pipeline_halt.load(Ordering::Acquire) {
-        RecoveryFaultDisposition::Terminal
-    } else {
-        RecoveryFaultDisposition::Recoverable
-    }
-}
+mod local_faults;
 
-fn install_new_local_fault_request(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-) -> Result<u64, String> {
-    let request = controller.next_recovery_fault_request()?;
-    pending.fetch_max(request.sequence(), Ordering::AcqRel);
-    Ok(pending.load(Ordering::Acquire))
-}
-
-/// Queue one new local fault event, atomically superseding an older outstanding request. The
-/// request remains latched until an authorized committed Release consumes it.
-pub(crate) fn queue_local_fault(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-) -> Result<(), String> {
-    install_new_local_fault_request(controller, pending).map(|_| ())
-}
-
-fn retain_local_fault_request(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-) -> Result<u64, String> {
-    loop {
-        let observed = pending.load(Ordering::Acquire);
-        if observed != 0 {
-            return Ok(observed);
-        }
-        let request = controller.next_recovery_fault_request()?.sequence();
-        match pending.compare_exchange(0, request, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return Ok(request),
-            Err(concurrent) if concurrent != 0 => return Ok(concurrent),
-            Err(_) => {}
-        }
-    }
-}
-
-async fn persist_local_fault(
-    controller: &ClusterController,
-    raw_request: u64,
-    disposition: RecoveryFaultDisposition,
-) -> Result<RecoveryFaultReportOutcome, String> {
-    let request = controller.recovery_fault_request(raw_request)?;
-    let report = async {
-        match disposition {
-            RecoveryFaultDisposition::Recoverable => controller.report_fault(request).await,
-            RecoveryFaultDisposition::Terminal => controller.report_terminal_fault(request).await,
-        }
-    };
-    match tokio::time::timeout(DECISION_IO_TIMEOUT, report).await {
-        Ok(Ok(outcome)) => {
-            if outcome == RecoveryFaultReportOutcome::Active {
-                tracing::warn!(
-                    request_ordinal = raw_request,
-                    "reported local fault for coordinated cluster recovery"
-                );
-            }
-            Ok(outcome)
-        }
-        Ok(Err(error)) => {
-            tracing::error!(request_ordinal = raw_request, %error, "could not persist local recovery fault");
-            Err(error)
-        }
-        Err(_) => Err("local recovery fault publication timed out".into()),
-    }
-}
-
-/// Publish the exact queued request without clearing its terminal-discovery latch.
-async fn flush_pending_local_fault(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-    disposition: RecoveryFaultDisposition,
-) -> Result<RecoveryFaultReportOutcome, String> {
-    let raw_request = pending.load(Ordering::Acquire);
-    if raw_request == 0 {
-        return Ok(RecoveryFaultReportOutcome::AlreadyCleared);
-    }
-    persist_local_fault(controller, raw_request, disposition).await
-}
-
-/// Coalesce a duplicate notification into the outstanding request and make one bounded durable
-/// publication attempt.
-pub(crate) async fn request_local_fault(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-) -> Result<u64, String> {
-    let raw_request = retain_local_fault_request(controller, pending)?;
-    match persist_local_fault(
-        controller,
-        raw_request,
-        RecoveryFaultDisposition::Recoverable,
-    )
-    .await?
-    {
-        RecoveryFaultReportOutcome::Active => Ok(raw_request),
-        RecoveryFaultReportOutcome::AlreadyCleared
-        | RecoveryFaultReportOutcome::CoveredByNewerRequest => {
-            let concurrent = pending.load(Ordering::Acquire);
-            let fresh_request = if concurrent != 0 && concurrent != raw_request {
-                concurrent
-            } else {
-                install_new_local_fault_request(controller, pending)?
-            };
-            match persist_local_fault(
-                controller,
-                fresh_request,
-                RecoveryFaultDisposition::Recoverable,
-            )
-            .await?
-            {
-                RecoveryFaultReportOutcome::Active => Ok(fresh_request),
-                RecoveryFaultReportOutcome::AlreadyCleared
-                | RecoveryFaultReportOutcome::CoveredByNewerRequest => Err(format!(
-                    "fresh recovery fault request {fresh_request} was settled before it became active"
-                )),
-                RecoveryFaultReportOutcome::TerminalFenceActive => Err(
-                    "durable terminal pipeline fault already fences automatic recovery".into(),
-                ),
-            }
-        }
-        RecoveryFaultReportOutcome::TerminalFenceActive => {
-            Err("durable terminal pipeline fault already fences automatic recovery".into())
-        }
-    }
-}
-
-async fn request_fresh_local_fault(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-    disposition: RecoveryFaultDisposition,
-) -> Result<u64, String> {
-    let raw_request = install_new_local_fault_request(controller, pending)?;
-    match persist_local_fault(controller, raw_request, disposition).await? {
-        RecoveryFaultReportOutcome::Active => Ok(raw_request),
-        RecoveryFaultReportOutcome::AlreadyCleared
-        | RecoveryFaultReportOutcome::CoveredByNewerRequest => Err(format!(
-            "fresh recovery fault request {raw_request} was settled before it became active"
-        )),
-        RecoveryFaultReportOutcome::TerminalFenceActive
-            if disposition == RecoveryFaultDisposition::Terminal =>
-        {
-            Ok(raw_request)
-        }
-        RecoveryFaultReportOutcome::TerminalFenceActive => {
-            Err("durable terminal pipeline fault already fences automatic recovery".into())
-        }
-    }
-}
-
-/// Publish (or confirm) the permanent terminal disposition for this process's retained request.
-pub(crate) async fn request_local_terminal_fault(
-    controller: &ClusterController,
-    pending: &std::sync::atomic::AtomicU64,
-) -> Result<(u64, RecoveryFaultReportOutcome), String> {
-    let raw_request = retain_local_fault_request(controller, pending)?;
-    match persist_local_fault(controller, raw_request, RecoveryFaultDisposition::Terminal).await? {
-        active @ (RecoveryFaultReportOutcome::Active
-        | RecoveryFaultReportOutcome::TerminalFenceActive) => Ok((raw_request, active)),
-        RecoveryFaultReportOutcome::AlreadyCleared
-        | RecoveryFaultReportOutcome::CoveredByNewerRequest => {
-            let fresh_request = install_new_local_fault_request(controller, pending)?;
-            let outcome = persist_local_fault(
-                controller,
-                fresh_request,
-                RecoveryFaultDisposition::Terminal,
-            )
-            .await?;
-            Ok((fresh_request, outcome))
-        }
-    }
-}
+use local_faults::{flush_pending_local_fault, local_fault_disposition, request_fresh_local_fault};
+pub(crate) use local_faults::{
+    queue_local_fault, request_local_fault, request_local_terminal_fault,
+};
 
 /// Spawn the long-lived per-node recovery supervisor. It drives stop/start, so it must outlive
 /// those cycles. An unexpected monitor panic closes intake, publishes a fresh durable fault, and
@@ -326,6 +157,11 @@ struct RecoveryMonitor {
     /// revision recheck. Production has no hook or additional synchronization here.
     #[cfg(test)]
     release_drain_settlement_hook: Option<ReleaseDrainSettlementHook>,
+    /// Unhandled-fault inventory seen on the previous poll, and consecutive polls it changed.
+    /// INVARIANT: a new round freezes the fault set only after it held still for one poll;
+    /// cascade faults reported after the freeze supersede the round before Start.
+    unsettled_fault_inventory: Option<(u64, Vec<RecoveryFault>)>,
+    fault_inventory_change_streak: u8,
 }
 
 #[cfg(test)]
@@ -393,21 +229,8 @@ impl RecoveryMonitor {
                 continue;
             };
 
-            match controller.capture_leader_proof() {
-                None => self.retention_leader = None,
-                Some(proof) if self.retention_leader.as_ref() != Some(&proof) => {
-                    let coordinator = db.coordinator.lock().await;
-                    if let Some(coordinator) = coordinator.as_ref() {
-                        match coordinator.schedule_cluster_retention_resume(proof.clone()) {
-                            Ok(()) => self.retention_leader = Some(proof),
-                            Err(error) => {
-                                tracing::warn!(%error, "could not resume cluster checkpoint retention after leadership acquisition");
-                            }
-                        }
-                    }
-                }
-                Some(_) => {}
-            }
+            self.resume_cluster_retention_for_leader(&db, &controller)
+                .await;
 
             let pending_published = self.publish_pending_local_fault(&db, &controller).await;
             if db.pending_recovery_fault.load(Ordering::Acquire) != 0 && !pending_published {
@@ -579,16 +402,61 @@ impl RecoveryMonitor {
                 },
             }
             if !pending.is_empty() {
-                self.drive_round(
-                    &db,
-                    &controller,
-                    inventory.revision(),
-                    fault_snapshot,
-                    required_prepare_fence.as_ref(),
-                )
-                .await;
+                // A stopped-Prepare handoff re-drives a fenced round now; a new round waits one
+                // poll for the fault set to settle.
+                if required_prepare_fence.is_some()
+                    || self.fault_inventory_settled(inventory.revision(), &fault_snapshot)
+                {
+                    self.drive_round(
+                        &db,
+                        &controller,
+                        inventory.revision(),
+                        fault_snapshot,
+                        required_prepare_fence.as_ref(),
+                    )
+                    .await;
+                }
             }
         }
+    }
+
+    /// Resume cluster checkpoint retention once per acquired leader term.
+    async fn resume_cluster_retention_for_leader(
+        &mut self,
+        db: &LaminarDB,
+        controller: &ClusterController,
+    ) {
+        match controller.capture_leader_proof() {
+            None => self.retention_leader = None,
+            Some(proof) if self.retention_leader.as_ref() != Some(&proof) => {
+                let coordinator = db.coordinator.lock().await;
+                if let Some(coordinator) = coordinator.as_ref() {
+                    match coordinator.schedule_cluster_retention_resume(proof.clone()) {
+                        Ok(()) => self.retention_leader = Some(proof),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not resume cluster checkpoint retention after leadership acquisition");
+                        }
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Whether the inventory held still since the previous poll, or the streak hit its bound.
+    fn fault_inventory_settled(&mut self, revision: u64, faults: &[RecoveryFault]) -> bool {
+        let changed = self
+            .unsettled_fault_inventory
+            .replace((revision, faults.to_vec()))
+            .is_none_or(|(seen_revision, seen_faults)| {
+                seen_revision != revision || seen_faults != faults
+            });
+        self.fault_inventory_change_streak = if changed {
+            self.fault_inventory_change_streak.saturating_add(1)
+        } else {
+            0
+        };
+        !changed || self.fault_inventory_change_streak >= FAULT_INVENTORY_SETTLE_MAX_CHANGES
     }
 
     async fn publish_pending_local_fault(
