@@ -8446,6 +8446,8 @@ fn delta_append_sink_config(
     table_uri: &str,
     storage: &DeltaSoakStorage,
 ) -> String {
+    // Cluster catalog DDL rejects literal secrets; `$${...}` survives server TOML substitution
+    // as a `${...}` env reference the catalog accepts and the connector resolves from the env.
     format!(
         r#"
 [[sink]]
@@ -8457,13 +8459,12 @@ connector = "delta-lake"
 "write.mode" = "append"
 "storage.aws_endpoint" = "{endpoint}"
 "storage.aws_access_key_id" = "{access_key}"
-"storage.aws_secret_access_key" = "{secret_key}"
+"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
 "storage.aws_region" = "{region}"
 "storage.aws_allow_http" = "true"
 "#,
         endpoint = storage.endpoint,
         access_key = storage.access_key,
-        secret_key = storage.secret_key,
         region = storage.region,
     )
 }
@@ -13747,11 +13748,12 @@ fn checkpoint_epoch_progress_requires_strict_advance() {
 
 #[cfg(feature = "kafka")]
 #[test]
-fn explicit_fault_oracle_requires_one_fault_on_only_the_victim() {
+fn explicit_fault_oracle_bounds_cascade_participation_to_one() {
     let baselines = [3.0, 7.0, 2.0];
     assert!(validate_explicit_pipeline_fault_totals(&baselines, &[3.0, 8.0, 2.0], 1).is_ok());
+    assert!(validate_explicit_pipeline_fault_totals(&baselines, &[4.0, 8.0, 2.0], 1).is_ok());
     assert!(
-        validate_explicit_pipeline_fault_totals(&baselines, &[4.0, 8.0, 2.0], 1)
+        validate_explicit_pipeline_fault_totals(&baselines, &[5.0, 8.0, 2.0], 1)
             .unwrap_err()
             .contains("node0")
     );
