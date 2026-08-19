@@ -56,7 +56,19 @@ jobs:
         with:
           key: checkpoint-local-exact-kill9
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
+        # and retry the identical package set.
+        run: |
+          set -euo pipefail
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          for attempt in 1 2 3 4 5; do
+            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+              exit 0
+            fi
+            echo "apt install attempt ${attempt} failed or stalled; retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Kill and restart exact single-node source/state recovery
         # `cluster` compiles the debug-only checkpoint kill gate; runtime mode remains `single`.
@@ -153,7 +165,19 @@ jobs:
         with:
           key: checkpoint-join-${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
+        # and retry the identical package set.
+        run: |
+          set -euo pipefail
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          for attempt in 1 2 3 4 5; do
+            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+              exit 0
+            fi
+            echo "apt install attempt ${attempt} failed or stalled; retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Start cluster-shared dependencies
         run: |
@@ -252,7 +276,19 @@ jobs:
         with:
           key: checkpoint-cluster-recovery-${{ matrix.role }}-${{ matrix.discovery }}
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        # apt mirror fetches have hung for a full job timeout with no output; kill stalls
+        # and retry the identical package set.
+        run: |
+          set -euo pipefail
+          packages="libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler"
+          for attempt in 1 2 3 4 5; do
+            if timeout 300 sudo apt-get update && sudo apt-get install -y $packages; then
+              exit 0
+            fi
+            echo "apt install attempt ${attempt} failed or stalled; retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Start cluster-shared dependencies
         run: |
