@@ -1,6 +1,9 @@
 //! Cluster (multi-node) mode startup orchestrator.
 
-use std::collections::{BinaryHeap, HashMap};
+mod discovery;
+mod leases;
+
+use std::collections::BinaryHeap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,134 +13,21 @@ use tracing::{info, warn};
 
 use laminar_core::checkpoint::object_store_builder::CheckpointStorageScope;
 use laminar_core::cluster::discovery::{
-    Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
-    NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
+    GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo, NodeMetadata, NodeState,
+    StaticDiscovery, StaticDiscoveryConfig,
+};
+
+use discovery::{
+    announce_left_after_fence_with_bound, announce_node_state_with_bound, spawn_membership_watcher,
+    stop_discovery_with_bound, DiscoveryImpl,
+};
+use leases::{
+    acquire_process_lease, revoke_process_authority, LeaderLeaseRuntime, ProcessLeaseRuntime,
+    PROCESS_LEASE_IO_TIMEOUT,
 };
 
 const PROCESS_INCARNATION_TAG: &str = "laminardb.process-incarnation";
-const DISCOVERY_ANNOUNCEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const CLUSTER_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Enum dispatch — `Discovery` trait uses `async fn` (not dyn-compatible).
-enum DiscoveryImpl {
-    Static(StaticDiscovery),
-    Gossip(GossipDiscovery),
-}
-
-impl DiscoveryImpl {
-    async fn start(&mut self) -> Result<(), DiscoveryError> {
-        match self {
-            Self::Static(d) => d.start().await,
-            Self::Gossip(d) => d.start().await,
-        }
-    }
-
-    async fn peers(&self) -> Result<Vec<NodeInfo>, DiscoveryError> {
-        match self {
-            Self::Static(d) => d.peers().await,
-            Self::Gossip(d) => d.peers().await,
-        }
-    }
-
-    async fn announce(&self, info: NodeInfo) -> Result<(), DiscoveryError> {
-        match self {
-            Self::Static(d) => d.announce(info).await,
-            Self::Gossip(d) => d.announce(info).await,
-        }
-    }
-
-    fn membership_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
-        match self {
-            Self::Static(d) => d.membership_watch(),
-            Self::Gossip(d) => d.membership_watch(),
-        }
-    }
-
-    async fn stop(&mut self) -> Result<(), DiscoveryError> {
-        match self {
-            Self::Static(d) => d.stop().await,
-            Self::Gossip(d) => d.stop().await,
-        }
-    }
-}
-
-/// Watches membership changes and logs peer join/leave/crash events.
-fn spawn_membership_watcher(
-    local_node_id: &str,
-    mut rx: watch::Receiver<Vec<NodeInfo>>,
-) -> tokio::task::JoinHandle<()> {
-    let local_name = local_node_id.to_string();
-    tokio::spawn(async move {
-        let mut known: HashMap<u64, (String, NodeState)> = HashMap::new();
-        for node in rx.borrow_and_update().iter() {
-            known.insert(node.id.0, (node.name.clone(), node.state));
-        }
-
-        loop {
-            if rx.changed().await.is_err() {
-                // Sender dropped — discovery shut down
-                info!("[{local_name}] Membership watcher stopping (discovery shut down)");
-                break;
-            }
-
-            let current_peers = rx.borrow_and_update().clone();
-
-            let mut current: HashMap<u64, (String, NodeState)> = HashMap::new();
-            for node in &current_peers {
-                current.insert(node.id.0, (node.name.clone(), node.state));
-            }
-
-            for (id, (name, state)) in &current {
-                if !known.contains_key(id) {
-                    info!(
-                        "[{local_name}] Peer joined: '{}' (id={}, state={})",
-                        name, id, state
-                    );
-                }
-            }
-
-            for (id, (name, old_state)) in &known {
-                if !current.contains_key(id) {
-                    if *old_state == NodeState::Suspected {
-                        warn!(
-                            "[{local_name}] Peer crashed: '{}' (id={}, was suspected)",
-                            name, id
-                        );
-                    } else {
-                        warn!(
-                            "[{local_name}] Peer left: '{}' (id={}, was {})",
-                            name, id, old_state
-                        );
-                    }
-                }
-            }
-
-            for (id, (name, new_state)) in &current {
-                if let Some((_, old_state)) = known.get(id) {
-                    if old_state != new_state {
-                        let level = match new_state {
-                            NodeState::Suspected => "WARN",
-                            NodeState::Left | NodeState::Draining => "WARN",
-                            _ => "INFO",
-                        };
-                        if level == "WARN" {
-                            warn!(
-                                "[{local_name}] Peer state changed: '{}' (id={}) {} -> {}",
-                                name, id, old_state, new_state
-                            );
-                        } else {
-                            info!(
-                                "[{local_name}] Peer state changed: '{}' (id={}) {} -> {}",
-                                name, id, old_state, new_state
-                            );
-                        }
-                    }
-                }
-            }
-
-            known = current;
-        }
-    })
-}
 
 use laminar_db::{ClusterStartupDisposition, LaminarDB, Profile};
 
@@ -159,120 +49,6 @@ pub enum ClusterStartupError {
     EngineShutdown(String),
     #[error("cluster authority lost: {0}")]
     AuthorityLost(String),
-}
-
-struct ProcessLeaseRuntime {
-    acquired: laminar_core::cluster::control::ProcessLease,
-    deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
-    live_rx: watch::Receiver<bool>,
-    shutdown: tokio_util::sync::CancellationToken,
-    terminal: tokio_util::sync::CancellationToken,
-    renewal_task: tokio::task::JoinHandle<()>,
-    terminal_task: tokio::task::JoinHandle<()>,
-    fence_task: Option<tokio::task::JoinHandle<()>>,
-}
-
-fn spawn_process_lease_terminal_monitor(
-    mut live_rx: watch::Receiver<bool>,
-    deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
-    terminal: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::select! {
-            biased;
-            () = deadline.wait_until_expired() => {}
-            () = async {
-                loop {
-                    if !*live_rx.borrow_and_update() {
-                        break;
-                    }
-                    if live_rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            } => {}
-        }
-        terminal.cancel();
-    })
-}
-
-struct LeaderLeaseRuntime {
-    shutdown: tokio_util::sync::CancellationToken,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl LeaderLeaseRuntime {
-    fn new(
-        shutdown: tokio_util::sync::CancellationToken,
-        task: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            shutdown,
-            task: Some(task),
-        }
-    }
-
-    fn cancel(&self) {
-        self.shutdown.cancel();
-    }
-
-    fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
-        self.shutdown.clone()
-    }
-
-    async fn wait_for_exit(&self) {
-        let Some(task) = self.task.as_ref() else {
-            return;
-        };
-        wait_for_cluster_task_exit(task).await;
-    }
-
-    async fn stop(&mut self) {
-        self.cancel();
-        let Some(mut task) = self.task.take() else {
-            return;
-        };
-        match tokio::time::timeout(PROCESS_LEASE_IO_TIMEOUT, &mut task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if error.is_cancelled() => {}
-            Ok(Err(error)) => warn!(%error, "Leader lease task failed during shutdown"),
-            Err(_) => {
-                task.abort();
-                match tokio::time::timeout(PROCESS_LEASE_IO_TIMEOUT, &mut task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) if error.is_cancelled() => {}
-                    Ok(Err(error)) => {
-                        warn!(%error, "Leader lease task failed after shutdown abort")
-                    }
-                    Err(_) => warn!(
-                        timeout = ?PROCESS_LEASE_IO_TIMEOUT,
-                        "Leader lease task did not stop after abort"
-                    ),
-                }
-            }
-        }
-    }
-}
-
-impl Drop for LeaderLeaseRuntime {
-    fn drop(&mut self) {
-        self.shutdown.cancel();
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
-
-fn revoke_process_authority(
-    db: &LaminarDB,
-    serving_gate: &crate::http::ServingGate,
-    leader_lease_shutdown: &tokio_util::sync::CancellationToken,
-    terminal: &tokio_util::sync::CancellationToken,
-) {
-    leader_lease_shutdown.cancel();
-    serving_gate.fence();
-    db.revoke_cluster_authority();
-    terminal.cancel();
 }
 
 fn fence_post_active_startup_failure(
@@ -331,62 +107,6 @@ async fn cleanup_cluster_startup(
     }
 }
 
-impl ProcessLeaseRuntime {
-    fn is_live(&self) -> bool {
-        self.deadline.is_live()
-            && *self.live_rx.borrow()
-            && !self.terminal.is_cancelled()
-            && !self.renewal_task.is_finished()
-    }
-
-    fn terminal_token(&self) -> tokio_util::sync::CancellationToken {
-        self.terminal.clone()
-    }
-
-    fn fence_authority(&self) {
-        self.deadline.fence();
-        self.shutdown.cancel();
-        self.renewal_task.abort();
-        self.terminal.cancel();
-    }
-
-    fn disarm_for_shutdown(&mut self) -> bool {
-        if let Some(task) = self.fence_task.take() {
-            task.abort();
-        }
-        self.terminal_task.abort();
-
-        let was_live = self.deadline.is_live()
-            && *self.live_rx.borrow()
-            && !self.terminal.is_cancelled()
-            && !self.renewal_task.is_finished();
-
-        self.shutdown.cancel();
-        self.renewal_task.abort();
-        self.deadline.fence();
-        self.terminal.cancel();
-        was_live
-    }
-
-    fn install_fence(
-        &mut self,
-        db: Arc<LaminarDB>,
-        controller: Arc<laminar_core::cluster::control::ClusterController>,
-        serving_gate: Arc<crate::http::ServingGate>,
-        leader_lease_shutdown: tokio_util::sync::CancellationToken,
-    ) {
-        let terminal = self.terminal.clone();
-        self.fence_task = Some(tokio::spawn(async move {
-            terminal.cancelled().await;
-            revoke_process_authority(&db, &serving_gate, &leader_lease_shutdown, &terminal);
-            tracing::error!(
-                node = controller.instance_id().0,
-                "stable node identity lease lost; database intake and cluster control fenced"
-            );
-        }));
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CatalogStartupAuthority {
     DurableLease,
@@ -431,19 +151,6 @@ async fn wait_for_catalog_startup_authority(
                 }
             }
         }
-    }
-}
-
-impl Drop for ProcessLeaseRuntime {
-    fn drop(&mut self) {
-        if let Some(task) = self.fence_task.take() {
-            task.abort();
-        }
-        self.terminal_task.abort();
-        self.shutdown.cancel();
-        self.renewal_task.abort();
-        self.deadline.fence();
-        self.terminal.cancel();
     }
 }
 
@@ -531,82 +238,6 @@ async fn abort_and_join_cluster_task(
                 timeout = ?CLUSTER_TASK_SHUTDOWN_TIMEOUT,
                 "Cluster task did not stop within the shutdown bound"
             );
-            false
-        }
-    }
-}
-
-async fn announce_node_state_with_bound(
-    discovery: &DiscoveryImpl,
-    info: NodeInfo,
-    terminal: &tokio_util::sync::CancellationToken,
-    operation: &'static str,
-) -> bool {
-    let announcement = tokio::select! {
-        biased;
-        () = terminal.cancelled() => return true,
-        result = tokio::time::timeout(
-            DISCOVERY_ANNOUNCEMENT_TIMEOUT,
-            discovery.announce(info),
-        ) => result,
-    };
-
-    match announcement {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(%error, operation, "Discovery announcement failed"),
-        Err(_) => warn!(
-            operation,
-            timeout = ?DISCOVERY_ANNOUNCEMENT_TIMEOUT,
-            "Discovery announcement timed out"
-        ),
-    }
-    terminal.is_cancelled()
-}
-
-async fn announce_node_state_after_fence_with_bound(
-    discovery: &DiscoveryImpl,
-    info: NodeInfo,
-    operation: &'static str,
-) -> bool {
-    match tokio::time::timeout(DISCOVERY_ANNOUNCEMENT_TIMEOUT, discovery.announce(info)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            warn!(%error, operation, "Discovery announcement failed after authority fencing");
-            false
-        }
-        Err(_) => {
-            warn!(
-                operation,
-                timeout = ?DISCOVERY_ANNOUNCEMENT_TIMEOUT,
-                "Discovery announcement timed out after authority fencing"
-            );
-            false
-        }
-    }
-}
-
-async fn announce_left_after_fence_with_bound(
-    discovery: &DiscoveryImpl,
-    active: &NodeInfo,
-    operation: &'static str,
-) -> bool {
-    let mut left = active.clone();
-    left.state = NodeState::Left;
-    announce_node_state_after_fence_with_bound(discovery, left, operation).await
-}
-
-async fn stop_discovery_with_bound(discovery: &mut DiscoveryImpl) -> bool {
-    // Discovery owns a five-second graceful join plus a one-second abort settle. The outer bound
-    // is deliberately longer so it cannot cancel that forced cleanup at its own boundary.
-    let timeout = CLUSTER_TASK_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(2);
-    match tokio::time::timeout(timeout, discovery.stop()).await {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            warn!(%error, "Discovery stop error");
-            false
-        }
-        Err(_) => {
-            warn!(?timeout, "Discovery did not stop within the shutdown bound");
             false
         }
     }
@@ -1035,150 +666,6 @@ impl Drop for ClusterHandle {
             watcher.abort();
         }
         self.api_handle.abort();
-    }
-}
-
-const PROCESS_LEASE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const PROCESS_LEASE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn unix_time_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
-}
-
-fn start_process_lease_runtime(
-    store: Arc<laminar_core::cluster::control::ProcessLeaseStore>,
-    owner: uuid::Uuid,
-    config: laminar_core::cluster::control::ProcessLeaseConfig,
-    acquisition_started_at: std::time::Instant,
-    acquired: laminar_core::cluster::control::ProcessLease,
-) -> Result<ProcessLeaseRuntime, ClusterStartupError> {
-    let manager = laminar_core::cluster::control::ProcessLeaseManager::new(
-        store,
-        owner,
-        config,
-        acquisition_started_at,
-        &acquired,
-    )
-    .map_err(|error| {
-        ClusterStartupError::EngineConstruction(format!(
-            "start stable node identity lease renewal: {error}"
-        ))
-    })?;
-    let live_rx = manager.live_watch();
-    let deadline = manager.deadline();
-    let shutdown = tokio_util::sync::CancellationToken::new();
-    let terminal = tokio_util::sync::CancellationToken::new();
-    let renewal_task = manager.spawn(shutdown.clone());
-    let terminal_task = spawn_process_lease_terminal_monitor(
-        live_rx.clone(),
-        Arc::clone(&deadline),
-        terminal.clone(),
-    );
-    Ok(ProcessLeaseRuntime {
-        acquired,
-        deadline,
-        live_rx,
-        shutdown,
-        terminal,
-        renewal_task,
-        terminal_task,
-        fence_task: None,
-    })
-}
-
-async fn acquire_process_lease(
-    store: Arc<laminar_core::cluster::control::ProcessLeaseStore>,
-    owner: uuid::Uuid,
-    config: laminar_core::cluster::control::ProcessLeaseConfig,
-) -> Result<ProcessLeaseRuntime, ClusterStartupError> {
-    use laminar_core::cluster::control::ProcessLeaseOutcome;
-
-    let deadline = std::time::Instant::now() + PROCESS_LEASE_ACQUIRE_TIMEOUT;
-    let mut last_failure = "no acquisition attempt completed".to_string();
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(ClusterStartupError::EngineConstruction(format!(
-                "stable node identity lease was not acquired within {PROCESS_LEASE_ACQUIRE_TIMEOUT:?}: {last_failure}"
-            )));
-        }
-        let attempt_timeout = PROCESS_LEASE_IO_TIMEOUT.min(remaining);
-        let acquisition_started_at = std::time::Instant::now();
-        match tokio::time::timeout(
-            attempt_timeout,
-            store.try_acquire(owner, unix_time_millis()),
-        )
-        .await
-        {
-            Ok(Ok(ProcessLeaseOutcome::Acquired(acquired))) => {
-                return start_process_lease_runtime(
-                    store,
-                    owner,
-                    config,
-                    acquisition_started_at,
-                    acquired,
-                );
-            }
-            Ok(Ok(ProcessLeaseOutcome::Held(incumbent))) => {
-                last_failure = format!(
-                    "live boot {} owns term {} until {}",
-                    incumbent.owner, incumbent.term, incumbent.expires_at_ms
-                );
-                let observation = store.observe_rival(&incumbent).map_err(|error| {
-                    ClusterStartupError::EngineConstruction(format!(
-                        "observe stable node identity lease: {error}"
-                    ))
-                })?;
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                let observation_time = config.ttl.min(remaining);
-                tokio::time::sleep(observation_time).await;
-                if observation_time < config.ttl {
-                    continue;
-                }
-                let takeover_started_at = std::time::Instant::now();
-                match tokio::time::timeout(
-                    PROCESS_LEASE_IO_TIMEOUT
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                    store.try_takeover(owner, &observation, unix_time_millis()),
-                )
-                .await
-                {
-                    Ok(Ok(ProcessLeaseOutcome::Acquired(acquired))) => {
-                        return start_process_lease_runtime(
-                            store,
-                            owner,
-                            config,
-                            takeover_started_at,
-                            acquired,
-                        );
-                    }
-                    Ok(Ok(ProcessLeaseOutcome::Held(current))) => {
-                        last_failure = format!(
-                            "boot {} renewed or won term {} during takeover observation",
-                            current.owner, current.term
-                        );
-                    }
-                    Ok(Err(error)) => last_failure = error.to_string(),
-                    Err(_) => {
-                        last_failure =
-                            "takeover verification exceeded the object-store I/O timeout".into();
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                last_failure = error.to_string();
-                tokio::time::sleep(
-                    std::time::Duration::from_millis(250)
-                        .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                )
-                .await;
-            }
-            Err(_) => {
-                last_failure = format!("object-store operation exceeded {attempt_timeout:?}");
-            }
-        }
     }
 }
 
