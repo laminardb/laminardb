@@ -435,6 +435,57 @@ async fn exited_leader_lease_manager_triggers_cluster_runtime_shutdown() {
 }
 
 #[tokio::test]
+async fn exited_rebalance_task_triggers_cluster_runtime_shutdown() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(std::future::pending::<()>());
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(std::future::pending::<()>());
+    let mut rebalance_tasks = vec![tokio::spawn(async {})];
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+    )
+    .await
+    .expect("an exited rebalance control task must wake cluster shutdown")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::RebalanceTaskExited);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+    for task in &mut rebalance_tasks {
+        let _ = abort_and_join_cluster_task(task, "test rebalance task").await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_trigger_prefers_process_lease_loss_when_every_trigger_is_ready() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    terminal.cancel();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(async {});
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(async {});
+    let mut rebalance_tasks = vec![tokio::spawn(async {})];
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+    )
+    .await
+    .expect("a ready shutdown trigger must be selected promptly")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::ProcessLeaseLost);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+    for task in &mut rebalance_tasks {
+        let _ = abort_and_join_cluster_task(task, "test rebalance task").await;
+    }
+}
+
+#[tokio::test]
 async fn process_lease_terminal_monitor_starts_before_resource_fencing() {
     let (live_tx, live_rx) = watch::channel(true);
     let terminal = tokio_util::sync::CancellationToken::new();
@@ -941,6 +992,92 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     assert!(matches!(error, ClusterStartupError::HttpStartup(_)));
     assert!(!controller.live_instances().contains(&node));
+}
+
+#[tokio::test]
+async fn static_cluster_kv_serves_reads_and_scans_from_membership_metadata() {
+    use laminar_core::cluster::control::ClusterKv as _;
+
+    fn tagged(node: u64, key: &str, value: &str) -> NodeInfo {
+        let mut metadata = NodeMetadata::default();
+        metadata.tags.insert(key.to_string(), value.to_string());
+        NodeInfo {
+            id: NodeId(node),
+            name: format!("node-{node}"),
+            rpc_address: String::new(),
+            state: NodeState::Active,
+            metadata,
+            last_heartbeat_ms: 0,
+        }
+    }
+
+    let (membership_tx, membership_rx) = watch::channel(vec![
+        tagged(7, "shuffle", "127.0.0.1:7007"),
+        tagged(9, "unrelated", "value"),
+    ]);
+    let kv = StaticClusterKv::new(membership_rx);
+
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7007")
+    );
+    assert_eq!(kv.read_from(NodeId(9), "shuffle").await, None);
+    assert_eq!(kv.read_from(NodeId(1234), "shuffle").await, None);
+    assert_eq!(
+        kv.scan("shuffle").await,
+        vec![(NodeId(7), "127.0.0.1:7007".to_string())]
+    );
+
+    kv.write("shuffle", "ignored".to_string()).await;
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7007"),
+        "static discovery KV writes must remain no-ops"
+    );
+
+    membership_tx
+        .send(vec![tagged(7, "shuffle", "127.0.0.1:7008")])
+        .unwrap();
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7008"),
+        "reads must track the current membership snapshot"
+    );
+}
+
+#[tokio::test]
+async fn stopping_discovery_releases_the_static_listener() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let local_node = NodeInfo {
+        id: NodeId(51),
+        name: "stop-test".into(),
+        rpc_address: "127.0.0.1:0".into(),
+        state: NodeState::Joining,
+        metadata: NodeMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ..NodeMetadata::default()
+        },
+        last_heartbeat_ms: 0,
+    };
+    let mut discovery = DiscoveryImpl::Static(StaticDiscovery::new(StaticDiscoveryConfig {
+        local_node,
+        seeds: vec![format!("127.0.0.1:{listen_port}")],
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        suspect_threshold: 3,
+        dead_threshold: 10,
+        listen_address: format!("127.0.0.1:{listen_port}"),
+        process_generation: 1,
+        process_incarnation: uuid::Uuid::new_v4(),
+    }));
+    discovery.start().await.unwrap();
+
+    assert!(stop_discovery_with_bound(&mut discovery).await);
+
+    std::net::TcpListener::bind(format!("127.0.0.1:{listen_port}"))
+        .expect("the static discovery listener must be released after stop");
 }
 
 #[tokio::test]
