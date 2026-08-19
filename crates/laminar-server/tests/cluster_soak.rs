@@ -7618,11 +7618,22 @@ fn validate_explicit_pipeline_fault_totals(
         ));
     }
     for (node_id, (baseline, total)) in baselines.iter().zip(totals).enumerate() {
-        let expected = baseline + if node_id == victim { 1.0 } else { 0.0 };
-        if *total != expected {
-            return Err(format!(
-                "node{node_id} pipeline fault total is {total}, expected {expected} after explicit fault on node{victim}"
-            ));
+        if node_id == victim {
+            if *total != baseline + 1.0 {
+                return Err(format!(
+                    "node{node_id} pipeline fault total is {total}, expected {} after explicit fault on node{victim}",
+                    baseline + 1.0
+                ));
+            }
+        } else {
+            // A non-victim may fault exactly once: its in-flight shuffle send to the faulted
+            // victim may have been partially admitted, so it fail-closed joins the same
+            // recovery round. More than that single cascade participation is amplification.
+            if *total > baseline + 1.0 {
+                return Err(format!(
+                    "node{node_id} pipeline fault total is {total}, amplifying the explicit fault on node{victim}"
+                ));
+            }
         }
     }
     Ok(())
