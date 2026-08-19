@@ -2,6 +2,11 @@ use std::collections::{BinaryHeap, HashMap};
 
 use object_store::ObjectStoreExt as _;
 
+use super::assignment::{
+    assignment_seed_participants, is_same_formation_genesis, resolve_vnode_assignment,
+    startup_leader_authority_timeout, wait_for_startup_assignment_fence,
+    wait_for_startup_leader_authority,
+};
 use super::control_kv::{
     list_control_sequences, object_store_control_key_prefix, object_store_control_record_path,
     recovery_generation_path, retain_oldest_control_record, ObjectStoreClusterKv,
