@@ -98,7 +98,7 @@ jobs:
 
   join-validity:
     name: ${{ matrix.label }}
-    runs-on: warp-ubuntu-latest-x64-8x
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
       CARGO_BUILD_JOBS: 8
