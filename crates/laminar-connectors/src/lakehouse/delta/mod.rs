@@ -59,7 +59,7 @@ use crate::connector::DeliveryGuarantee;
 #[cfg(feature = "delta-lake")]
 use publication::{
     classify_delta_attempt_error, count_collapsed_ops, publish_coordinated_delta_batch,
-    retry_coordinated_metadata_until, run_tracked_delta_task, DeltaWriteTaskSuccess,
+    retry_delta_metadata_until, run_tracked_delta_task, DeltaWriteTaskSuccess,
     UnresolvedDeltaPublication,
 };
 

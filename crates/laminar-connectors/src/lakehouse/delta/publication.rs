@@ -6,7 +6,7 @@ use super::{
 };
 
 #[cfg(feature = "delta-lake")]
-const COORDINATED_TABLE_OPEN_BACKOFF: crate::retry::Backoff =
+const DELTA_METADATA_BACKOFF: crate::retry::Backoff =
     crate::retry::Backoff::new(Duration::from_millis(50), Duration::from_secs(1), 0.25);
 
 #[cfg(feature = "delta-lake")]
@@ -95,7 +95,7 @@ impl UnresolvedDeltaPublication {
 }
 
 #[cfg(feature = "delta-lake")]
-pub(super) async fn retry_coordinated_metadata_until<F, Fut, T>(
+pub(super) async fn retry_delta_metadata_until<F, Fut, T>(
     deadline: tokio::time::Instant,
     operation: &'static str,
     mut open: F,
@@ -112,22 +112,20 @@ where
                 format!(" after transient failure: {error}")
             });
             return Err(ConnectorError::TransactionError(format!(
-                "Delta coordinated {operation} exceeded its deadline{context}"
+                "Delta {operation} exceeded its deadline{context}"
             )));
         }
         let result = tokio::time::timeout_at(deadline, open())
             .await
             .map_err(|_| {
-                ConnectorError::TransactionError(format!(
-                    "Delta coordinated {operation} exceeded its deadline"
-                ))
+                ConnectorError::TransactionError(format!("Delta {operation} exceeded its deadline"))
             })?;
         match result {
             Ok(table) => return Ok(table),
             Err(error) if error.is_transient() && !error.is_outcome_unknown() => {
                 last_transient = Some(error.to_string());
                 let now = tokio::time::Instant::now();
-                let backoff = COORDINATED_TABLE_OPEN_BACKOFF.delay(retry);
+                let backoff = DELTA_METADATA_BACKOFF.delay(retry);
                 retry = retry.saturating_add(1);
                 tokio::time::sleep_until((now + backoff).min(deadline)).await;
             }
@@ -152,7 +150,7 @@ pub(super) async fn publish_coordinated_delta_batch(
     let result = async {
         // RECOVERY: `schema = None` keeps retries metadata-only. The conditional commit below is
         // dispatched exactly once and retains its existing outcome-unknown reconciliation path.
-        let table = retry_coordinated_metadata_until(deadline, "table open", || {
+        let table = retry_delta_metadata_until(deadline, "coordinated table open", || {
             super::super::delta_io::open_or_create_table(&table_path, storage_options.clone(), None)
         })
         .await?;
@@ -193,9 +191,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test(start_paused = true)]
-    async fn coordinated_table_open_retries_only_transient_failures() {
+    async fn delta_metadata_retries_only_transient_failures() {
         let attempts = AtomicUsize::new(0);
-        let opened = retry_coordinated_metadata_until(
+        let opened = retry_delta_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(10),
             "test read",
             || async {
@@ -214,7 +212,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 6);
 
         let attempts = AtomicUsize::new(0);
-        let error = retry_coordinated_metadata_until(
+        let error = retry_delta_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(1),
             "test read",
             || async {
@@ -228,7 +226,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
         let attempts = AtomicUsize::new(0);
-        let error = retry_coordinated_metadata_until(
+        let error = retry_delta_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(1),
             "test read",
             || async {
@@ -245,7 +243,7 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
         let attempts = AtomicUsize::new(0);
-        let error = retry_coordinated_metadata_until(
+        let error = retry_delta_metadata_until(
             tokio::time::Instant::now() + Duration::from_millis(500),
             "test read",
             || async {

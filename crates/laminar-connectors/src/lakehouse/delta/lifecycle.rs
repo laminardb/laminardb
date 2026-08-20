@@ -8,7 +8,7 @@ use super::{
 };
 #[cfg(feature = "delta-lake")]
 use super::{
-    publish_coordinated_delta_batch, retry_coordinated_metadata_until, UnresolvedDeltaPublication,
+    publish_coordinated_delta_batch, retry_delta_metadata_until, UnresolvedDeltaPublication,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 
@@ -603,7 +603,7 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
         // RECOVERY: both operations are metadata reads. Retrying typed transient failures cannot
         // duplicate publication; the sink-task command still clamps this future to its caller's
         // earlier checkpoint deadline.
-        let observed = retry_coordinated_metadata_until(deadline, "cursor read", || async {
+        let observed = retry_delta_metadata_until(deadline, "coordinated cursor read", || async {
             let table = super::super::delta_io::open_or_create_table(
                 &self.resolved_table_path,
                 self.resolved_storage_options.clone(),

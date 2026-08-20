@@ -4,9 +4,9 @@
 use super::ensure_uc_table_exists;
 #[cfg(feature = "delta-lake")]
 use super::{
-    classify_delta_attempt_error, count_collapsed_ops, debug, run_tracked_delta_task, DataType,
-    DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode, WriteResult,
-    MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+    classify_delta_attempt_error, count_collapsed_ops, debug, retry_delta_metadata_until,
+    run_tracked_delta_task, DataType, DeltaTable, DeltaWriteTaskSuccess, Future, Instant, SaveMode,
+    WriteResult, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use super::{
     filter_and_project, Arc, Array, ConnectorError, ConnectorState, ConnectorTaskOwner,
@@ -152,21 +152,29 @@ impl DeltaLakeSink {
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
 
-        let table = tokio::time::timeout_at(
-            deadline,
-            delta_io::open_or_create_table(
-                &resolved_path,
-                merged_options.clone(),
-                self.schema.as_ref(),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "Delta table initialization exceeded the {:?} write deadline",
-                self.config.write_timeout
-            ))
-        })??;
+        // RECOVERY: retry only the read-only open. Table creation is a mutation and remains a
+        // single dispatch so an uncertain create outcome is never duplicated by this layer.
+        let mut table = retry_delta_metadata_until(deadline, "table open", || {
+            delta_io::open_or_create_table(&resolved_path, merged_options.clone(), None)
+        })
+        .await?;
+        if table.version().is_none() && self.schema.is_some() {
+            table = tokio::time::timeout_at(
+                deadline,
+                delta_io::open_or_create_table(
+                    &resolved_path,
+                    merged_options.clone(),
+                    self.schema.as_ref(),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(format!(
+                    "Delta table creation exceeded the {:?} write deadline",
+                    self.config.write_timeout
+                ))
+            })??;
+        }
 
         if table.version().is_some() {
             let table_schema = delta_io::get_table_schema(&table)?;
