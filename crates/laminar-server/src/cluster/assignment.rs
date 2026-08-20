@@ -80,6 +80,9 @@ const STARTUP_LEADER_AUTHORITY_MAX_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(250);
 const STARTUP_LEADER_AUTHORITY_MAX_SLEEP: std::time::Duration =
     std::time::Duration::from_millis(375);
+const STARTUP_PROCESS_LEASE_MIN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(25);
+const STARTUP_PROCESS_LEASE_MAX_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 pub(super) fn exact_startup_assignment_fence(
     controller: &laminar_core::cluster::control::ClusterController,
@@ -329,6 +332,55 @@ pub(super) async fn wait_for_startup_assignment_fence(
         })?
 }
 
+/// Load one durable startup lease, retrying only object-store I/O within the roster deadline.
+async fn load_startup_process_lease_until(
+    store: &Arc<dyn object_store::ObjectStore>,
+    node: NodeId,
+    process_lease_ttl_ms: i64,
+    deadline: tokio::time::Instant,
+) -> Result<Option<laminar_core::cluster::control::ProcessLease>, ClusterStartupError> {
+    use laminar_core::cluster::control::{ProcessLeaseError, ProcessLeaseStore};
+    use rand::RngExt as _;
+
+    let lease_store = ProcessLeaseStore::new(Arc::clone(store), node, process_lease_ttl_ms);
+    let mut backoff = STARTUP_PROCESS_LEASE_MIN_BACKOFF;
+    let mut last_io_error = None;
+    let deadline_error = |last_error: Option<&str>| {
+        let context = last_error
+            .map(|error| format!("; last object-store error: {error}"))
+            .unwrap_or_default();
+        ClusterStartupError::EngineConstruction(format!(
+            "load process lease for node {} exceeded {STARTUP_ASSIGNMENT_TIMEOUT:?}{context}",
+            node.0
+        ))
+    };
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(deadline_error(last_io_error.as_deref()));
+        }
+        let load = tokio::time::timeout_at(deadline, lease_store.load()).await;
+        match load {
+            Ok(Ok(lease)) => return Ok(lease),
+            Ok(Err(ProcessLeaseError::Io(error))) => last_io_error = Some(error),
+            Ok(Err(error)) => {
+                return Err(ClusterStartupError::EngineConstruction(format!(
+                    "load process lease for node {}: {error}",
+                    node.0
+                )));
+            }
+            Err(_) => return Err(deadline_error(last_io_error.as_deref())),
+        }
+        let now = tokio::time::Instant::now();
+        let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(250);
+        let jitter = std::time::Duration::from_millis(rand::rng().random_range(0..=base_ms / 2));
+        tokio::time::sleep_until((now + backoff + jitter).min(deadline)).await;
+        backoff = backoff
+            .checked_mul(2)
+            .unwrap_or(STARTUP_PROCESS_LEASE_MAX_BACKOFF)
+            .min(STARTUP_PROCESS_LEASE_MAX_BACKOFF);
+    }
+}
+
 /// Verify advertised startup process incarnations against their durable stable-node leases.
 pub(super) async fn assignment_seed_participants(
     self_id: laminar_core::state::NodeId,
@@ -337,22 +389,20 @@ pub(super) async fn assignment_seed_participants(
     store: &Arc<dyn object_store::ObjectStore>,
     process_lease_ttl_ms: i64,
 ) -> Result<Vec<laminar_core::checkpoint::CheckpointParticipant>, ClusterStartupError> {
-    use laminar_core::cluster::control::ProcessLeaseStore;
-
     let advertised = advertised_startup_participants(self_id, self_incarnation, peers)?;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(STARTUP_ASSIGNMENT_TIMEOUT)
+        .ok_or_else(|| {
+            ClusterStartupError::EngineConstruction(
+                "startup process-lease audit deadline exceeds the monotonic timer range".into(),
+            )
+        })?;
     let mut participants = Vec::with_capacity(advertised.len());
     for participant in advertised {
         let node = NodeId(participant.node_id);
         let boot_incarnation = participant.boot_incarnation;
-        let lease = ProcessLeaseStore::new(Arc::clone(store), node, process_lease_ttl_ms)
-            .load()
-            .await
-            .map_err(|error| {
-                ClusterStartupError::EngineConstruction(format!(
-                    "load process lease for node {}: {error}",
-                    node.0
-                ))
-            })?
+        let lease = load_startup_process_lease_until(store, node, process_lease_ttl_ms, deadline)
+            .await?
             .ok_or_else(|| {
                 ClusterStartupError::EngineConstruction(format!(
                     "node {} has no durable process lease",

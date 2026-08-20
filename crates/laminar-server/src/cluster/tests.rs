@@ -2165,6 +2165,36 @@ async fn assignment_seed_rejects_peer_tag_that_is_not_durable_lease_owner() {
 }
 
 #[tokio::test]
+async fn assignment_seed_retries_transient_process_lease_reads() {
+    use laminar_core::cluster::testing::{FaultyObjectStore, ObjectStoreFault};
+
+    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let self_id = NodeId(1);
+    let self_boot = uuid::Uuid::from_u128(11);
+    acquire_test_process_lease(Arc::clone(&inner), self_id, self_boot, 1_000).await;
+
+    let faulty = Arc::new(FaultyObjectStore::new(inner));
+    faulty.set_fault(ObjectStoreFault::FailReads);
+    let store: Arc<dyn object_store::ObjectStore> = faulty.clone();
+    let clear_fault = async {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        faulty.set_fault(ObjectStoreFault::None);
+    };
+    let (participants, ()) = tokio::join!(
+        assignment_seed_participants(self_id, self_boot, &[], &store, 1_000),
+        clear_fault,
+    );
+
+    assert_eq!(
+        participants.unwrap(),
+        vec![laminar_core::checkpoint::CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: self_boot,
+        }]
+    );
+}
+
+#[tokio::test]
 async fn initial_assignment_roster_excludes_zero_vnode_workers() {
     use laminar_core::checkpoint::CheckpointParticipant;
 
