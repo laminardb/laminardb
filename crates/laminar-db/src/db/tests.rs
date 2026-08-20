@@ -2584,6 +2584,62 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn stale_assignment_activation_preserves_newer_source_drain() {
+    use laminar_core::checkpoint::{AssignmentDrainTransition, CheckpointAssignmentFence};
+
+    let fixture = fault_audit_activation_fixture().await;
+    let target = CheckpointAssignmentFence::from_owner_map(
+        fixture.fence.assignment_version + 1,
+        &[fixture.controller.instance_id().0],
+        fixture.fence.participants.clone(),
+    )
+    .unwrap();
+    let transition = AssignmentDrainTransition::new(
+        fixture.fence.clone(),
+        target,
+        fixture.controller.capture_leader_proof().unwrap(),
+    )
+    .unwrap();
+    fixture
+        .controller
+        .publish_checkpoint_assignment_fence(Some(fixture.fence.clone()));
+    fixture
+        .controller
+        .publish_checkpoint_drain_transition(Some(transition.clone()));
+    let revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let activation = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            revision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(!activation.installed);
+    assert!(!activation.intake_open);
+    assert_eq!(activation.revision, revision);
+    assert_eq!(
+        fixture.controller.checkpoint_drain_transition(),
+        Some(transition)
+    );
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        Some(fixture.fence)
+    );
+    assert!(!fixture.db.cluster_intake_fenced());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn assignment_activation_installs_transport_before_controller_publication() {
     use laminar_core::checkpoint::{
         AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant,

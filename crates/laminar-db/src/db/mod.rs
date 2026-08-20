@@ -1539,6 +1539,21 @@ pub(crate) struct AssignmentAuthorityActivation {
 }
 
 #[cfg(feature = "cluster")]
+fn assignment_transition_allows_activation(
+    fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    requested: Option<&laminar_core::checkpoint::AssignmentDrainTransition>,
+    installed: Option<&laminar_core::checkpoint::AssignmentDrainTransition>,
+) -> Result<bool, DbError> {
+    if requested.is_some_and(|transition| transition.predecessor != *fence) {
+        return Err(DbError::Checkpoint(
+            "assignment drain transition does not bind the installed predecessor certificate"
+                .into(),
+        ));
+    }
+    Ok(installed.is_none() || installed == requested)
+}
+
+#[cfg(feature = "cluster")]
 fn owned_vnode_indices(
     assignment: &[laminar_core::state::NodeId],
     self_id: laminar_core::state::NodeId,
@@ -2245,20 +2260,30 @@ impl LaminarDB {
         expected_revision: u64,
         deadline: tokio::time::Instant,
     ) -> Result<AssignmentAuthorityActivation, DbError> {
-        if drain_transition
-            .as_ref()
-            .is_some_and(|transition| transition.predecessor != *fence)
-        {
-            return Err(DbError::Checkpoint(
-                "assignment drain transition does not bind the installed predecessor certificate"
-                    .into(),
-            ));
-        }
         let _adoption = tokio::time::timeout_at(deadline, self.assignment_adoption_lock.lock())
             .await
             .map_err(|_| {
                 DbError::Checkpoint("timed out serializing assignment authority activation".into())
             })?;
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("assignment activation has no cluster controller".into())
+        })?;
+        let installed_transition = controller.checkpoint_drain_transition();
+        // INVARIANT: only terminal drain reconciliation may clear a locally active transition.
+        // A watcher whose durable read predates leader publication must retry from the new head.
+        if !assignment_transition_allows_activation(
+            fence,
+            drain_transition.as_ref(),
+            installed_transition.as_ref(),
+        )? {
+            return Ok(AssignmentAuthorityActivation {
+                installed: false,
+                intake_open: false,
+                revision: self
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        }
         let _execution = tokio::time::timeout_at(
             deadline,
             Arc::clone(&self.rotation_execution_fence).write_owned(),
@@ -2285,9 +2310,6 @@ impl LaminarDB {
         // remain closed until the terminal assignment is adopted.
         let intake_was_closed = self.cluster_intake_fenced();
         self.set_source_gate(true);
-        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
-            DbError::Checkpoint("assignment activation has no cluster controller".into())
-        })?;
         if !controller.process_lease_is_live() {
             self.revoke_cluster_authority();
             return Ok(AssignmentAuthorityActivation {
