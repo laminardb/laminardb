@@ -1550,7 +1550,7 @@ fn assignment_transition_allows_activation(
                 .into(),
         ));
     }
-    Ok(installed.is_none() || installed == requested)
+    Ok(requested.is_some() || installed.is_none())
 }
 
 #[cfg(feature = "cluster")]
