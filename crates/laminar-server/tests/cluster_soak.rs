@@ -176,6 +176,11 @@ const CHECKPOINT_CONTINUATION_FAILED_LOG: &str = "checkpoint continuation failed
 const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded";
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
+#[cfg(feature = "kafka")]
+const RECOVERY_SUPERSEDED_LOG: &str = "recovery round was superseded:";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_HANDOFF_LOG: &str =
+    "retrying stopped recovery with a direct Prepare-to-Prepare handoff";
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -7675,6 +7680,54 @@ fn validate_recovery_checkpoint_failure_totals(
 }
 
 #[cfg(feature = "kafka")]
+fn validate_recovery_prepare_sequence(
+    fault_logs: &[String],
+    leader: usize,
+) -> Result<usize, String> {
+    let leader_log = fault_logs
+        .get(leader)
+        .ok_or_else(|| format!("recovery leader node{leader} has no fault log"))?;
+    let leader_lines = leader_log.lines().collect::<Vec<_>>();
+    let prepares = leader_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains(RECOVERY_PREPARE_LOG).then_some(index))
+        .collect::<Vec<_>>();
+    let total_prepares = fault_logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
+        .sum::<usize>();
+    if total_prepares != prepares.len() {
+        return Err("recovery Prepare was emitted by a non-leader process".into());
+    }
+    match prepares.as_slice() {
+        [prepare] => Ok(*prepare),
+        [first, second] => {
+            let between = &leader_lines[first + 1..*second];
+            let superseded = between
+                .iter()
+                .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
+                .ok_or_else(|| {
+                    "two recovery Prepare records have no intervening superseded-round fence"
+                        .to_string()
+                })?;
+            if !between[superseded + 1..]
+                .iter()
+                .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
+            {
+                return Err(
+                    "two recovery Prepare records have no ordered direct handoff fence".into(),
+                );
+            }
+            Ok(*second)
+        }
+        _ => Err(format!(
+            "explicit fault created {total_prepares} recovery Prepare generations; expected one, or one fenced direct replacement"
+        )),
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn validate_recovery_checkpoint_failure_evidence(
     baselines: &[f64],
     totals: &[f64],
@@ -7713,25 +7766,11 @@ fn validate_recovery_checkpoint_failure_evidence(
             leader_failure = failures.first().copied();
         }
     }
+    let prepare = validate_recovery_prepare_sequence(fault_logs, leader)?;
     let Some(failed) = leader_failure else {
         return Ok(None);
     };
-    let prepare_count = fault_logs
-        .iter()
-        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
-        .sum::<usize>();
-    if prepare_count != 1 {
-        return Err(format!(
-            "checkpoint failure metric was recorded with {prepare_count} recovery Prepare records"
-        ));
-    }
     let leader_fault_lines = fault_logs[leader].lines().collect::<Vec<_>>();
-    let prepare = leader_fault_lines
-        .iter()
-        .position(|line| line.contains(RECOVERY_PREPARE_LOG))
-        .ok_or_else(|| {
-            "checkpoint failure was not accompanied by the recovery leader's Prepare".to_string()
-        })?;
     let mut fault_failure = None;
     for (index, line) in leader_fault_lines.iter().enumerate() {
         if checkpoint_failure_metric_from_log_line(line)? == Some(failed) {
@@ -7835,14 +7874,8 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .zip(&evidence.log_offsets)
         .map(|(node, offset)| node.log_since(*offset))
         .collect::<Vec<_>>();
-    let prepare_count: usize = logs
-        .iter()
-        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
-        .sum();
-    assert_eq!(
-        prepare_count, 1,
-        "explicit fault created {prepare_count} recovery Prepare generations instead of exactly one"
-    );
+    validate_recovery_prepare_sequence(&logs, evidence.recovery_leader)
+        .unwrap_or_else(|error| panic!("explicit recovery Prepare sequence invalid: {error}"));
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
         .expect("read recovery leader log for checkpoint failure evidence");
     let interrupted = validate_recovery_checkpoint_failure_evidence(
@@ -13794,6 +13827,41 @@ fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
             .unwrap_err()
             .contains("node1")
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
+    let one = vec![RECOVERY_PREPARE_LOG.to_string(), String::new()];
+    assert_eq!(validate_recovery_prepare_sequence(&one, 0).unwrap(), 0);
+
+    let replacement = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
+        3
+    );
+
+    let unfenced = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_LOG}"),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&unfenced, 0)
+        .unwrap_err()
+        .contains("superseded-round fence"));
+
+    let wrong_process = vec![
+        RECOVERY_PREPARE_LOG.to_string(),
+        RECOVERY_PREPARE_LOG.to_string(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&wrong_process, 0)
+        .unwrap_err()
+        .contains("non-leader"));
 }
 
 #[cfg(feature = "kafka")]
