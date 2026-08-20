@@ -52,15 +52,35 @@ fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreErro
         return false;
     };
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    let mut unknown_http = false;
     while let Some(current) = cause {
         if let Some(http) = current.downcast_ref::<HttpError>() {
-            return matches!(
-                http.kind(),
+            match http.kind() {
                 HttpErrorKind::Connect
-                    | HttpErrorKind::Request
-                    | HttpErrorKind::Timeout
-                    | HttpErrorKind::Interrupted
-            );
+                | HttpErrorKind::Request
+                | HttpErrorKind::Timeout
+                | HttpErrorKind::Interrupted => return true,
+                HttpErrorKind::Unknown => unknown_http = true,
+                _ => return false,
+            }
+        }
+        // COMPAT: object_store can classify newer reqwest/hyper chains as Unknown. Only a
+        // concrete transport I/O cause below that typed HTTP boundary is safe to retry.
+        if unknown_http
+            && current.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+            })
+        {
+            return true;
         }
         cause = current.source();
     }
