@@ -29,6 +29,11 @@ tokio::task_local! {
     pub(in crate::lakehouse) static DELAY_COORDINATED_CATALOG_COMMIT: DelayedCoordinatedCatalogCommit;
 }
 
+#[cfg(all(feature = "delta-lake", test))]
+tokio::task_local! {
+    static FAIL_COORDINATED_CURSOR_REFRESHES: Arc<AtomicUsize>;
+}
+
 #[cfg(feature = "delta-lake")]
 pub(super) fn validate_coordinated_retention(retention: Duration) -> Result<(), ConnectorError> {
     if retention < MIN_COORDINATED_DELETED_FILE_RETENTION {
@@ -73,11 +78,15 @@ async fn validate_coordinated_objects(
                     return Ok::<(), ConnectorError>(());
                 };
                 let context = format!("HEAD Delta coordinated object '{}'", object.path);
-                let metadata = retry_publication_metadata_until(deadline, || async {
-                    store.head(&object.path).await.map_err(|error| {
-                        classify_delta_object_store_metadata_error(&context, &error)
-                    })
-                })
+                let metadata = retry_publication_metadata_until(
+                    deadline,
+                    "object validation metadata read",
+                    || async {
+                        store.head(&object.path).await.map_err(|error| {
+                            classify_delta_object_store_metadata_error(&context, &error)
+                        })
+                    },
+                )
                 .await?;
                 if metadata.size != object.expected_size {
                     return Err(ConnectorError::TransactionError(format!(
@@ -178,16 +187,29 @@ fn coordinated_recovery_horizon(
 async fn refresh_publication_cursor_once(
     table: &DeltaTable,
     external_key: &str,
+    phase: &'static str,
 ) -> Result<(DeltaTable, Option<CoordinatedCommitCursor>), ConnectorError> {
     // Cursor filtering and the commit base share this freshly updated snapshot.
+    #[cfg(test)]
+    if let Ok(remaining) = FAIL_COORDINATED_CURSOR_REFRESHES.try_with(Arc::clone) {
+        let inject_failure = remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_ok();
+        if inject_failure {
+            return Err(ConnectorError::ReadError(
+                "injected transient coordinated cursor refresh failure".into(),
+            ));
+        }
+    }
     let mut current = table.clone();
     validate_coordinated_log_store(&current)?;
-    current.update_state().await.map_err(|error| {
-        classify_delta_metadata_error(
-            "refresh Delta coordinated publication snapshot before commit dispatch",
-            &error,
-        )
-    })?;
+    let context = format!("refresh Delta coordinated publication snapshot {phase}");
+    current
+        .update_state()
+        .await
+        .map_err(|error| classify_delta_metadata_error(&context, &error))?;
     let observed = get_coordinated_cursor(&current, external_key).await?;
     Ok((current, observed))
 }
@@ -195,6 +217,7 @@ async fn refresh_publication_cursor_once(
 #[cfg(feature = "delta-lake")]
 async fn retry_publication_metadata_until<F, Fut, T>(
     deadline: tokio::time::Instant,
+    operation: &'static str,
     mut read: F,
 ) -> Result<T, ConnectorError>
 where
@@ -209,16 +232,15 @@ where
                 format!(" after transient failure: {error}")
             });
             return Err(ConnectorError::WriteError(format!(
-                "Delta coordinated publication metadata read exceeded the publication deadline before catalog commit dispatch{context}"
+                "Delta coordinated publication {operation} exceeded the publication deadline{context}"
             )));
         }
         let result = tokio::time::timeout_at(deadline, read())
             .await
             .map_err(|_| {
-                ConnectorError::WriteError(
-                    "Delta coordinated publication metadata read exceeded the publication deadline before catalog commit dispatch"
-                        .into(),
-                )
+                ConnectorError::WriteError(format!(
+                    "Delta coordinated publication {operation} exceeded the publication deadline"
+                ))
             })?;
         match result {
             Ok(value) => return Ok(value),
@@ -239,9 +261,10 @@ async fn refresh_publication_cursor(
     table: &DeltaTable,
     external_key: &str,
     deadline: tokio::time::Instant,
+    phase: &'static str,
 ) -> Result<(DeltaTable, Option<CoordinatedCommitCursor>), ConnectorError> {
-    retry_publication_metadata_until(deadline, || {
-        refresh_publication_cursor_once(table, external_key)
+    retry_publication_metadata_until(deadline, phase, || {
+        refresh_publication_cursor_once(table, external_key, phase)
     })
     .await
 }
@@ -303,19 +326,19 @@ async fn reconcile_prepared_commit_failure(
     external_key: &str,
     cursor: CoordinatedCommitCursor,
     error: &deltalake::DeltaTableError,
+    deadline: tokio::time::Instant,
 ) -> Result<(), ConnectorError> {
-    let reconciliation = async {
-        let mut reconciled = current.clone();
-        reconciled.update_state().await.map_err(|refresh_error| {
-            format!("refresh after prepared-commit failure: {refresh_error}")
-        })?;
-        get_coordinated_cursor(&reconciled, external_key)
-            .await
-            .map_err(|cursor_error| {
-                format!("read cursor after prepared-commit failure: {cursor_error}")
-            })
-    }
-    .await;
+    // RECOVERY: the catalog write was dispatched exactly once. Only retry the idempotent
+    // snapshot/cursor reads needed to determine its outcome, bounded by the original deadline.
+    let reconciliation = refresh_publication_cursor(
+        current,
+        external_key,
+        deadline,
+        "cursor reconciliation after prepared-commit failure",
+    )
+    .await
+    .map(|(_, observed)| observed)
+    .map_err(|reconciliation_error| reconciliation_error.to_string());
     if reconciliation.as_ref() == Ok(&Some(cursor)) {
         return Ok(());
     }
@@ -357,7 +380,13 @@ where
 
     ensure_publication_deadline(deadline, "admission")?;
     let required_alive_until = coordinated_recovery_horizon(deadline)?;
-    let (current, observed) = refresh_publication_cursor(table, external_key, deadline).await?;
+    let (current, observed) = refresh_publication_cursor(
+        table,
+        external_key,
+        deadline,
+        "snapshot refresh before catalog commit dispatch",
+    )
+    .await?;
     let PreparedCoordinatedPublication::Commit {
         adds,
         binding,
@@ -452,7 +481,8 @@ where
     match prepared_commit.await {
         Ok(_post_commit) => Ok(CoordinatedPublicationOutcome { descriptor_count }),
         Err(error) => {
-            reconcile_prepared_commit_failure(&current, external_key, cursor, &error).await?;
+            reconcile_prepared_commit_failure(&current, external_key, cursor, &error, deadline)
+                .await?;
             Ok(CoordinatedPublicationOutcome { descriptor_count })
         }
     }
@@ -571,13 +601,63 @@ pub(in crate::lakehouse) async fn commit_adds_coordinated(
 #[cfg(all(test, feature = "delta-lake"))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[tokio::test]
+    async fn prepared_commit_reconciliation_retries_transient_cursor_reads() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let table = super::super::open_or_create_table(
+            temp_dir.path().to_str().unwrap(),
+            HashMap::new(),
+            Some(&schema),
+        )
+        .await
+        .unwrap();
+        let cursor = CoordinatedCommitCursor {
+            checkpoint_id: 7,
+            fencing_token: 3,
+        };
+        commit_adds_coordinated(
+            &table,
+            Vec::new(),
+            "reconciliation-retry",
+            cursor,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        let failures = Arc::new(AtomicUsize::new(1));
+        FAIL_COORDINATED_CURSOR_REFRESHES
+            .scope(Arc::clone(&failures), async {
+                reconcile_prepared_commit_failure(
+                    &table,
+                    "reconciliation-retry",
+                    cursor,
+                    &deltalake::DeltaTableError::InvalidData {
+                        message: "injected lost acknowledgement".into(),
+                    },
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        assert_eq!(failures.load(AtomicOrdering::SeqCst), 0);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn publication_metadata_retries_only_safe_transient_reads() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let value = retry_publication_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(10),
+            "test metadata read",
             || {
                 let attempts = Arc::clone(&attempts);
                 async move {
@@ -597,6 +677,7 @@ mod tests {
         let attempts = AtomicUsize::new(0);
         let error = retry_publication_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(1),
+            "test metadata read",
             || async {
                 attempts.fetch_add(1, AtomicOrdering::SeqCst);
                 Err::<(), _>(ConnectorError::outcome_unknown(
@@ -614,11 +695,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn publication_metadata_retry_stops_at_the_shared_deadline() {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-        let error = retry_publication_metadata_until(deadline, || async {
-            Err::<(), _>(ConnectorError::ReadError("temporary cursor GET".into()))
-        })
-        .await
-        .unwrap_err();
+        let error =
+            retry_publication_metadata_until(deadline, "test cursor reconciliation", || async {
+                Err::<(), _>(ConnectorError::ReadError("temporary cursor GET".into()))
+            })
+            .await
+            .unwrap_err();
 
         assert!(matches!(error, ConnectorError::WriteError(_)));
         assert!(
