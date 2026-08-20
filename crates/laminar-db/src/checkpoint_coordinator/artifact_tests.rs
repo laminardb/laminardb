@@ -1141,7 +1141,25 @@ async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
     });
     coordinator.register_sink("probe", sink_handle.clone());
 
-    coordinator.begin_initial_epoch().await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    coordinator
+        .begin_sink_epoch_until(deadline, SinkEpochPublication::DeferredToTail)
+        .await
+        .unwrap();
+    assert!(sink_handle.open_epoch_admission(1).is_err());
+    let admission = sink_handle.current_begun_epoch_admission().unwrap();
+    let publisher = tokio::spawn({
+        let sink_handle = sink_handle.clone();
+        async move {
+            tokio::task::yield_now().await;
+            sink_handle.publish_open_epoch(admission)
+        }
+    });
+    coordinator
+        .ensure_assignment_sink_epoch_until(deadline)
+        .await
+        .unwrap();
+    publisher.await.unwrap().unwrap();
     let (inventory, admitted_proof) = authority
         .cluster_checkpoint_artifact_admission()
         .await
@@ -1195,6 +1213,7 @@ async fn cluster_ownerless_worker_keeps_initial_exact_sink_epoch_closed() {
         .unwrap();
 
     let store = ObjectStoreCheckpointStore::new(objects, "ownerless-initial-sink-epoch")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
         .with_participant_id(2);
     let mut coordinator =
         CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
@@ -1234,10 +1253,12 @@ async fn cluster_ownerless_worker_keeps_initial_exact_sink_epoch_closed() {
         controller.checkpoint_assignment_fence(fence.assignment_version),
         Some(fence)
     );
+    assert!(coordinator.certified_idle_process().unwrap());
     coordinator.begin_initial_epoch().await.unwrap();
     assert!(sink_handle.open_epoch_admission(1).is_err());
 
     coordinator.set_vnode_set(vec![0]);
+    assert!(coordinator.certified_idle_process().is_err());
     let error = coordinator.begin_initial_epoch().await.unwrap_err();
     assert!(
         error.to_string().contains("excludes participant 2"),
@@ -1530,7 +1551,13 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         .unwrap();
 
     assert!(coordinator
-        .follower_finish_deferred(attempt.epoch, attempt.checkpoint_id, true, Instant::now(),)
+        .follower_finish_deferred(
+            attempt.epoch,
+            attempt.checkpoint_id,
+            true,
+            Instant::now(),
+            false,
+        )
         .await
         .unwrap());
     assert_eq!(coordinator.allocator.peek_epoch(), successor.attempt.epoch);

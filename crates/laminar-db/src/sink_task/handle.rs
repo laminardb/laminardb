@@ -196,7 +196,7 @@ impl SinkTaskHandle {
         }
     }
 
-    async fn wait_for_open_epoch_until(
+    pub(crate) async fn wait_for_open_epoch_until(
         &self,
         deadline: Option<Instant>,
     ) -> Result<Option<SinkEpochAdmission>, ConnectorError> {

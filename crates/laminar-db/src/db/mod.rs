@@ -1,6 +1,9 @@
 //! The main `LaminarDB` database facade.
 #![allow(clippy::disallowed_types)] // cold path
 
+#[cfg(feature = "cluster")]
+mod assignment_authority;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2403,7 +2406,7 @@ impl LaminarDB {
                     .load(std::sync::atomic::Ordering::Acquire),
             });
         }
-        let mut intake_open = false;
+        let intake_open = false;
         let preserve_predecessor_execution = source_drain_active && !intake_was_closed;
         if !controller.is_recovering() && (!source_drain_active || preserve_predecessor_execution) {
             // Recovery authority and active faults must come from one durable view. Reading them
@@ -2550,51 +2553,16 @@ impl LaminarDB {
                         .load(std::sync::atomic::Ordering::Acquire),
                 });
             }
-            let authority_unchanged = || {
-                tokio::time::Instant::now() < deadline
-                    && !self
-                        .terminal_pipeline_halt
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    && !self
-                        .durable_terminal_recovery_fence
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    && self
-                        .assignment_authority_revision
-                        .load(std::sync::atomic::Ordering::Acquire)
-                        == expected_revision
-                    && !controller.is_recovering()
-                    && controller.process_lease_is_live()
-                    && controller.current_leader().map(|leader| leader.0)
-                        == Some(audited_leader.owner.node_id)
-                    && controller
-                        .checkpoint_assignment_fence(fence.assignment_version)
-                        .as_ref()
-                        == Some(fence)
-                    && controller.checkpoint_drain_transition() == expected_drain_transition
-            };
-            if !authority_unchanged() {
-                self.withdraw_assignment_authority(&controller);
-                return Ok(AssignmentAuthorityActivation {
-                    installed: false,
-                    intake_open: false,
-                    revision: self
-                        .assignment_authority_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
-            }
-            self.set_source_gate(false);
-            if authority_unchanged() {
-                intake_open = true;
-            } else {
-                self.withdraw_assignment_authority(&controller);
-                return Ok(AssignmentAuthorityActivation {
-                    installed: false,
-                    intake_open: false,
-                    revision: self
-                        .assignment_authority_revision
-                        .load(std::sync::atomic::Ordering::Acquire),
-                });
-            }
+            return self
+                .open_assignment_intake_after_audit(
+                    &controller,
+                    fence,
+                    expected_drain_transition.as_ref(),
+                    audited_leader.owner.node_id,
+                    expected_revision,
+                    deadline,
+                )
+                .await;
         }
 
         Ok(AssignmentAuthorityActivation {

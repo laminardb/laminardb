@@ -1,6 +1,8 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
+mod checkpoint_tail;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -311,7 +313,7 @@ struct LeaderTail {
     mutable_operator_capture_guard: Option<MutableCheckpointCaptureGuard>,
     fan_out: FxHashMap<String, SourceCheckpoint>,
     local_watermark: CheckpointWatermark,
-    handoff_replay_pending: bool,
+    handoff: HandoffCapture,
     attempt: CheckpointAttempt,
     attempt_started: std::time::Instant,
     attempt_deadline: tokio::time::Instant,
@@ -327,6 +329,40 @@ struct LeaderTail {
     #[cfg(feature = "cluster")]
     leader_proof: Option<laminar_core::cluster::control::LeaderProof>,
     full_vnode_capture_needed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HandoffCapture {
+    flags: u64,
+    replay_pending: bool,
+}
+
+impl HandoffCapture {
+    const fn new(flags: u64, replay_pending: bool) -> Self {
+        Self {
+            flags,
+            replay_pending,
+        }
+    }
+
+    fn bind_request(
+        self,
+        request: &mut crate::checkpoint_coordinator::CheckpointRequest,
+        reassignment_portable: bool,
+        assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+    ) {
+        request.flags = self.flags;
+        request.handoff_replay_pending = self.replay_pending;
+        request.reassignment_portable = reassignment_portable;
+        request.assignment_fence = assignment_fence;
+    }
+
+    const fn terminal(self) -> bool {
+        crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+            self.flags,
+            self.replay_pending,
+        )
+    }
 }
 
 fn checkpoint_failure_requires_pipeline_fault(
@@ -1282,8 +1318,10 @@ pub(crate) fn fence_intake_after_terminal_handoff_capture(
     flags: u64,
     handoff_replay_pending: bool,
 ) -> bool {
-    let terminal_handoff =
-        flags & laminar_core::checkpoint::flags::HANDOFF != 0 && !handoff_replay_pending;
+    let terminal_handoff = crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+        flags,
+        handoff_replay_pending,
+    );
     if terminal_handoff {
         intake_gate.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1717,7 +1755,11 @@ impl ConnectorPipelineCallback {
 
         match quorum_result {
             Ok((cluster_watermark, participants, follower_replay_pending)) => {
-                tail.handoff_replay_pending |= follower_replay_pending;
+                tail.handoff.replay_pending |= follower_replay_pending;
+                tail.request.handoff_replay_pending = tail.handoff.replay_pending;
+                if tail.handoff.replay_pending {
+                    tail.request.reassignment_portable = false;
+                }
                 let aligned_result = tokio::time::timeout_at(
                     deadline,
                     controller.announce_barrier(&BarrierAnnouncement {
@@ -1935,72 +1977,6 @@ impl ConnectorPipelineCallback {
                     &tail.complete_tx,
                     attempt,
                     terminal_error,
-                    &tail.checkpoint_fault,
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn complete_successful_leader_tail(
-        tail: &mut LeaderTail,
-        result: crate::checkpoint_coordinator::CheckpointResult,
-    ) {
-        let mut continuation_error = result.continuation_error().map(str::to_owned);
-        match CheckpointCompletion::validated(
-            tail.attempt,
-            result,
-            tail.fan_out.clone(),
-            tail.handoff_replay_pending,
-        ) {
-            Ok(completion) => {
-                if let Some(error) = continuation_error.as_ref() {
-                    tail.in_flight.fail_sink_epoch(error.clone());
-                } else if let Err(error) = tail.in_flight.publish_successor() {
-                    let error = format!(
-                        "checkpoint {} epoch {} committed, but successor sink publication failed: {error}",
-                        tail.attempt.checkpoint_id, tail.attempt.epoch
-                    );
-                    set_checkpoint_fault(&tail.checkpoint_fault, error.clone());
-                    continuation_error = Some(error);
-                }
-                if let Some(guard) = tail.mutable_operator_capture_guard.as_mut() {
-                    guard.disarm();
-                }
-                let report_deadline =
-                    tokio::time::Instant::now() + CHECKPOINT_FAILURE_REPORT_TIMEOUT;
-                if !deliver_checkpoint_completion(&tail.complete_tx, completion, report_deadline)
-                    .await
-                {
-                    set_checkpoint_fault(
-                        &tail.checkpoint_fault,
-                        format!(
-                            "checkpoint {} epoch {} committed but its completion could not be \
-                             reported within {:?}",
-                            tail.attempt.checkpoint_id,
-                            tail.attempt.epoch,
-                            CHECKPOINT_FAILURE_REPORT_TIMEOUT,
-                        ),
-                    );
-                    return;
-                }
-                if let Some(error) = continuation_error {
-                    set_checkpoint_fault(&tail.checkpoint_fault, error);
-                } else {
-                    tail.in_flight.disarm_sink_epoch();
-                }
-            }
-            Err(reason) => {
-                tracing::error!(
-                    error = %reason,
-                    "[LDB-6048] refusing mismatched checkpoint completion"
-                );
-                tail.in_flight.fail_sink_epoch(reason.clone());
-                set_checkpoint_fault(&tail.checkpoint_fault, reason.clone());
-                deliver_checkpoint_failure(
-                    &tail.complete_tx,
-                    tail.attempt,
-                    reason,
                     &tail.checkpoint_fault,
                 )
                 .await;
@@ -2301,6 +2277,11 @@ impl ConnectorPipelineCallback {
         let full_vnode_capture_needed = Arc::clone(&tail.full_vnode_capture_needed);
         let attempt_started = tail.attempt_started;
         let checkpoint_cleanup_timeout = tail.checkpoint_cleanup_timeout;
+        let terminal_handoff =
+            crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+                tail.identity.flags,
+                tail.handoff_replay_pending,
+            );
         if local_prepare == FollowerPrepareOutcome::InDoubt {
             tracing::debug!(
                 checkpoint_id = attempt.checkpoint_id,
@@ -2343,6 +2324,7 @@ impl ConnectorPipelineCallback {
                     attempt.checkpoint_id,
                     committed,
                     attempt_started,
+                    terminal_handoff,
                 )
                 .await?;
             if committed && coordinator.committed_manifest_needs_vnode_rebase(attempt) {
@@ -2398,18 +2380,27 @@ impl ConnectorPipelineCallback {
                 return;
             }
         };
-        let successor_published = if committed {
-            match tail.in_flight.publish_successor() {
-                Ok(()) => true,
-                Err(error) => {
-                    set_checkpoint_fault(
+        let terminal_handoff =
+            crate::checkpoint_coordinator::sink_epoch_admission::is_terminal_handoff(
+                tail.identity.flags,
+                tail.handoff_replay_pending,
+            );
+        let sink_transition_resolved = if committed {
+            if terminal_handoff {
+                true
+            } else {
+                match tail.in_flight.publish_successor() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        set_checkpoint_fault(
                         &tail.checkpoint_fault,
                         format!(
                             "follower checkpoint {} epoch {} committed, but successor sink publication failed: {error}",
                             attempt.checkpoint_id, attempt.epoch
                         ),
                     );
-                    false
+                        false
+                    }
                 }
             }
         } else {
@@ -2448,7 +2439,7 @@ impl ConnectorPipelineCallback {
                 ),
             );
         }
-        if reported && successor_published {
+        if reported && sink_transition_resolved {
             tail.in_flight.disarm_sink_epoch();
         }
         if !committed {
@@ -4010,8 +4001,7 @@ impl ConnectorPipelineCallback {
         }
         let operator_state = self.capture_operator_state_until(deadline)?;
         let mut request = self.build_checkpoint_request()?;
-        request.flags = flags;
-        request.handoff_replay_pending = handoff_replay_pending;
+        (request.flags, request.handoff_replay_pending) = (flags, handoff_replay_pending);
         request.assignment_fence = Some(assignment_fence.clone());
         Ok((request, operator_state))
     }
@@ -6805,12 +6795,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         let reassignment_portable =
             assignment_fence.is_some() && checkpoint_rotation_guard.is_some();
+        #[cfg(not(feature = "cluster"))]
+        let reassignment_portable = false;
 
         #[cfg(feature = "cluster")]
         let handoff_replay_pending = flags & laminar_core::checkpoint::flags::HANDOFF != 0
             && !self.graph.handoff_is_quiescent();
         #[cfg(not(feature = "cluster"))]
         let handoff_replay_pending = false;
+        let handoff = HandoffCapture::new(flags, handoff_replay_pending);
 
         #[cfg(feature = "cluster")]
         if fence_intake_after_terminal_handoff_capture(
@@ -6831,15 +6824,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        request.flags = flags;
-        request.handoff_replay_pending = handoff_replay_pending;
-        #[cfg(feature = "cluster")]
-        {
-            // This bit is capture-time evidence, so only a real clustered capture may assert it.
-            // Reaching this point means the fixed-point shuffle flush and final sink fence both
-            // succeeded and the reacquired assignment guard proved handoff quiescence.
-            request.reassignment_portable = reassignment_portable;
-        }
         let local_watermark = match classify_channel_progress(&request.channel_progress) {
             Ok(watermark) => watermark,
             Err(error) => {
@@ -6902,7 +6886,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         fence.clone(),
                     )
                 });
-        request.assignment_fence = assignment_fence;
+        // Capture-time authority is bound only after the final assignment proof is consumed.
+        handoff.bind_request(&mut request, reassignment_portable, assignment_fence);
         let mut tail = LeaderTail {
             in_flight,
             coordinator: Arc::clone(&self.coordinator),
@@ -6913,7 +6898,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             mutable_operator_capture_guard: None,
             fan_out: source_checkpoints.clone(),
             local_watermark,
-            handoff_replay_pending,
+            handoff,
             attempt,
             attempt_started,
             attempt_deadline,

@@ -1,14 +1,18 @@
 #[cfg(feature = "cluster")]
 use super::{
     checked_successor_epoch, require_canonical_attempt, CheckpointArtifactInventory, Duration,
-    EpochAllocator, LeaderProof, SinkEpochReservation,
+    EpochAllocator, SinkEpochReservation,
 };
-use super::{CheckpointAttempt, CheckpointCoordinator, DbError};
+use super::{CheckpointAttempt, CheckpointCoordinator, DbError, LeaderProof};
 
 #[cfg(feature = "cluster")]
 const CLUSTER_SINK_EPOCH_POLL_INITIAL: Duration = Duration::from_millis(10);
 #[cfg(feature = "cluster")]
 const CLUSTER_SINK_EPOCH_POLL_MAX: Duration = Duration::from_millis(250);
+
+pub(crate) const fn is_terminal_handoff(flags: u64, handoff_replay_pending: bool) -> bool {
+    flags & laminar_core::checkpoint::flags::HANDOFF != 0 && !handoff_replay_pending
+}
 
 #[cfg(feature = "cluster")]
 impl EpochAllocator {
@@ -45,6 +49,38 @@ impl EpochAllocator {
 
 impl CheckpointCoordinator {
     #[cfg(feature = "cluster")]
+    pub(crate) fn certified_idle_process(&self) -> Result<bool, DbError> {
+        let Some(controller) = self.cluster_controller.as_ref() else {
+            return Ok(false);
+        };
+        let Some(fence) = controller.checkpoint_assignment_fence(self.assignment_version) else {
+            return Ok(false);
+        };
+        if !fence.is_canonical()
+            || fence.assignment_version != self.assignment_version
+            || fence.vnode_count != u32::from(self.store.key_group_count().get())
+        {
+            return Err(DbError::Checkpoint(format!(
+                "cluster assignment {} has an invalid checkpoint certificate",
+                self.assignment_version
+            )));
+        }
+        let participant_id = self.store.participant_id();
+        match fence.participant_incarnation(participant_id) {
+            Some(incarnation) if incarnation == controller.recovery_incarnation() => Ok(false),
+            Some(_) => Err(DbError::Checkpoint(format!(
+                "cluster assignment {} certifies another incarnation of participant {participant_id}",
+                self.assignment_version
+            ))),
+            None if self.owned_vnodes.is_empty() => Ok(true),
+            None => Err(DbError::Checkpoint(format!(
+                "cluster assignment {} excludes participant {participant_id} with owned vnodes {:?}",
+                self.assignment_version, self.owned_vnodes
+            ))),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
     pub(super) fn initial_sink_epoch_required(&self) -> Result<bool, DbError> {
         if !self.has_checkpoint_committable_sinks() {
             return Ok(false);
@@ -67,6 +103,80 @@ impl CheckpointCoordinator {
             )));
         }
         Ok(true)
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn ensure_assignment_sink_epoch_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if !self.initial_sink_epoch_required()? {
+            return Ok(());
+        }
+        let reservation = *self.allocator.sink_epoch_reservation.lock();
+        match reservation {
+            None => {
+                self.begin_sink_epoch_until(deadline, super::SinkEpochPublication::Immediate)
+                    .await
+            }
+            Some(SinkEpochReservation::Ready(attempt)) => {
+                for sink in self
+                    .sinks
+                    .iter()
+                    .filter(|sink| sink.handle.checkpoint_committable())
+                {
+                    let admission = sink
+                        .handle
+                        .wait_for_open_epoch_until(Some(deadline))
+                        .await
+                        .map_err(|error| {
+                            DbError::Checkpoint(format!(
+                                "sink '{}' assignment epoch is not writable: {error}",
+                                sink.name
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            DbError::Checkpoint(format!(
+                                "sink '{}' has no checkpoint-committable assignment epoch",
+                                sink.name
+                            ))
+                        })?;
+                    if admission.epoch != attempt.epoch {
+                        return Err(DbError::Checkpoint(format!(
+                            "sink '{}' opened epoch {}, expected assignment epoch {}",
+                            sink.name, admission.epoch, attempt.epoch
+                        )));
+                    }
+                }
+                Ok(())
+            }
+            Some(SinkEpochReservation::Opening(attempt)) => Err(DbError::Checkpoint(format!(
+                "sink epoch {} is still opening during assignment activation",
+                attempt.epoch
+            ))),
+            Some(SinkEpochReservation::InDoubt(attempt)) => Err(DbError::Checkpoint(format!(
+                "sink epoch {} requires recovery during assignment activation",
+                attempt.epoch
+            ))),
+        }
+    }
+
+    pub(super) async fn continue_committed_sink_epoch_until(
+        &mut self,
+        external_commit: Result<(), DbError>,
+        index: &laminar_core::checkpoint::CommittedCheckpointIndex,
+        leader_proof: Option<&LeaderProof>,
+        terminal_handoff: bool,
+        deadline: tokio::time::Instant,
+        publication: super::SinkEpochPublication,
+    ) -> Result<(), DbError> {
+        external_commit?;
+        self.schedule_retention(index.clone(), leader_proof);
+        self.clear_sink_witness_until(deadline).await?;
+        if self.has_checkpoint_committable_sinks() && !terminal_handoff {
+            self.begin_sink_epoch_until(deadline, publication).await?;
+        }
+        Ok(())
     }
 
     pub(super) async fn reserve_sink_epoch_for_runtime_until(

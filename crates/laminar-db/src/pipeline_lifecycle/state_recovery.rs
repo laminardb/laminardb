@@ -215,6 +215,46 @@ impl LaminarDB {
         Ok((graph, recovered_mv_store, restored_reference_tables))
     }
 
+    #[cfg(feature = "cluster")]
+    async fn recover_cluster_checkpoint(
+        coord: &mut crate::checkpoint_coordinator::CheckpointCoordinator,
+        runtime_mode: RuntimeMode,
+        recover_target: Option<u64>,
+    ) -> (
+        Result<Option<crate::recovery_manager::RecoveredState>, DbError>,
+        bool,
+    ) {
+        if runtime_mode == RuntimeMode::Cluster && recover_target.is_none() {
+            match coord.certified_idle_process() {
+                Ok(true) => return (Ok(None), true),
+                Ok(false) => {}
+                Err(error) => return (Err(error), false),
+            }
+        }
+        let recovery = match recover_target {
+            Some(target) => coord.recover_to_epoch(target).await,
+            None => coord.recover().await,
+        };
+        (recovery, false)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn report_empty_cluster_recovery(
+        &self,
+        runtime_mode: RuntimeMode,
+        skipped_idle_recovery: bool,
+    ) -> Result<(), DbError> {
+        if runtime_mode == RuntimeMode::Cluster {
+            self.validate_fresh_cluster_vnode_start()?;
+        }
+        if skipped_idle_recovery {
+            tracing::info!("certified ownerless cluster process skipped checkpoint recovery");
+        } else {
+            tracing::info!("No checkpoint found, starting fresh");
+        }
+        Ok(())
+    }
+
     pub(super) async fn recover_pipeline_state(
         &self,
         mut graph: crate::operator_graph::OperatorGraph,
@@ -292,10 +332,8 @@ impl LaminarDB {
                 #[cfg(feature = "cluster")]
                 let recover_target = self.recover_target_epoch.lock().take();
                 #[cfg(feature = "cluster")]
-                let recovery = match recover_target {
-                    Some(target) => coord.recover_to_epoch(target).await,
-                    None => coord.recover().await,
-                };
+                let (recovery, skipped_idle_recovery) =
+                    Self::recover_cluster_checkpoint(coord, runtime_mode, recover_target).await;
                 #[cfg(not(feature = "cluster"))]
                 let recovery = coord.recover().await;
                 // Resolve any interrupted sink epoch before opening its successor.
@@ -429,9 +467,8 @@ impl LaminarDB {
                     }
                     Ok(None) => {
                         #[cfg(feature = "cluster")]
-                        if runtime_mode == RuntimeMode::Cluster {
-                            self.validate_fresh_cluster_vnode_start()?;
-                        }
+                        self.report_empty_cluster_recovery(runtime_mode, skipped_idle_recovery)?;
+                        #[cfg(not(feature = "cluster"))]
                         tracing::info!("No checkpoint found, starting fresh");
                     }
                     Err(e) => {

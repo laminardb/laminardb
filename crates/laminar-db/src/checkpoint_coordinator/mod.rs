@@ -3,8 +3,10 @@
 #![allow(clippy::disallowed_types)] // checkpoint control path
 
 #[cfg(feature = "cluster")]
+mod follower_completion;
+#[cfg(feature = "cluster")]
 mod follower_prepare;
-mod sink_epoch_admission;
+pub(crate) mod sink_epoch_admission;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -4785,7 +4787,10 @@ impl CheckpointCoordinator {
     ) -> Result<CheckpointResult, DbError> {
         require_canonical_attempt(attempt, "checkpoint admission")?;
         let flags = request.flags;
-        let assignment_fence = request.assignment_fence.clone();
+        let (assignment_fence, terminal_handoff) = (
+            request.assignment_fence.clone(),
+            sink_epoch_admission::is_terminal_handoff(flags, request.handoff_replay_pending),
+        );
         #[cfg(feature = "cluster")]
         let validation_proof = match &quorum {
             QuorumStage::Captured { leader_proof, .. } => Some(leader_proof.clone()),
@@ -5169,20 +5174,16 @@ impl CheckpointCoordinator {
                 continuation_deadline,
             )
             .await;
-        let continuation = match continuation {
-            Ok(()) => {
-                self.schedule_retention(index.clone(), leader_proof.as_ref());
-                if let Err(error) = self.clear_sink_witness_until(continuation_deadline).await {
-                    Err(error)
-                } else if self.has_checkpoint_committable_sinks() {
-                    self.begin_sink_epoch_until(continuation_deadline, sink_epoch_publication)
-                        .await
-                } else {
-                    Ok(())
-                }
-            }
-            Err(error) => Err(error),
-        };
+        let continuation = self
+            .continue_committed_sink_epoch_until(
+                continuation,
+                &index,
+                leader_proof.as_ref(),
+                terminal_handoff,
+                continuation_deadline,
+                sink_epoch_publication,
+            )
+            .await;
 
         let duration = started.elapsed();
         self.phase = CheckpointPhase::Idle;
@@ -5511,6 +5512,8 @@ impl CheckpointCoordinator {
             Self::validate_follower_prepare_context(&controller, &request, &announcement, deadline)
                 .await?;
         let handoff_replay_pending = request.handoff_replay_pending;
+        let terminal_handoff =
+            sink_epoch_admission::is_terminal_handoff(request.flags, handoff_replay_pending);
         let prepare_outcome = self
             .follower_prepare_acked_until(
                 request,
@@ -5591,6 +5594,7 @@ impl CheckpointCoordinator {
                 announcement.checkpoint_id,
                 committed,
                 started,
+                terminal_handoff,
             )
             .await;
         if result.is_err() {
@@ -5710,164 +5714,6 @@ impl CheckpointCoordinator {
             }
             tokio::time::sleep(FOLLOWER_DECISION_POLL.min(remaining)).await;
         }
-    }
-
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn follower_finish(
-        &mut self,
-        epoch: u64,
-        checkpoint_id: u64,
-        committed: bool,
-        started: Instant,
-    ) -> Result<bool, DbError> {
-        self.follower_finish_with_publication(
-            epoch,
-            checkpoint_id,
-            committed,
-            started,
-            SinkEpochPublication::Immediate,
-        )
-        .await
-    }
-
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn follower_finish_deferred(
-        &mut self,
-        epoch: u64,
-        checkpoint_id: u64,
-        committed: bool,
-        started: Instant,
-    ) -> Result<bool, DbError> {
-        self.follower_finish_with_publication(
-            epoch,
-            checkpoint_id,
-            committed,
-            started,
-            SinkEpochPublication::DeferredToTail,
-        )
-        .await
-    }
-
-    #[cfg(feature = "cluster")]
-    async fn follower_finish_with_publication(
-        &mut self,
-        epoch: u64,
-        checkpoint_id: u64,
-        committed: bool,
-        started: Instant,
-        sink_epoch_publication: SinkEpochPublication,
-    ) -> Result<bool, DbError> {
-        let attempt = require_canonical_attempt(
-            CheckpointAttempt::new(epoch, checkpoint_id),
-            "follower completion",
-        )?;
-        let deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
-        if committed {
-            let (manifest, manifest_bytes) =
-                self.prepared.get(&attempt).cloned().ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "follower checkpoint {checkpoint_id} has no prepared manifest"
-                    ))
-                })?;
-            let controller = self.cluster_controller.as_ref().ok_or_else(|| {
-                DbError::Checkpoint("follower completion has no cluster controller".into())
-            })?;
-            let authority = controller.checkpoint_authority().map_err(|error| {
-                DbError::Checkpoint(format!("follower checkpoint authority: {error}"))
-            })?;
-            let (outcome, index) = tokio::time::timeout_at(
-                deadline,
-                authority.cluster_outcome_with_committed_checkpoint(epoch),
-            )
-            .await
-            .map_err(|_| DbError::Checkpoint("follower Commit verification timed out".into()))?
-            .map_err(|error| {
-                DbError::Checkpoint(format!("follower Commit verification failed: {error}"))
-            })?
-            .ok_or_else(|| DbError::Checkpoint("follower Commit disappeared".into()))?;
-            let index = index.ok_or_else(|| {
-                DbError::Checkpoint("follower Commit has no committed checkpoint index".into())
-            })?;
-            let reference = outcome.committed_checkpoint.clone().ok_or_else(|| {
-                DbError::Checkpoint("follower Commit has no committed checkpoint reference".into())
-            })?;
-            let source_watermarks = index
-                .effective_source_watermarks()
-                .map_err(DbError::Checkpoint)?;
-            let participant = index
-                .participants
-                .iter()
-                .find(|participant| participant.participant_id == self.store.participant_id())
-                .ok_or_else(|| {
-                    DbError::Checkpoint("follower is absent from committed participant set".into())
-                })?;
-            participant
-                .verify_manifest(manifest.as_ref(), &manifest_bytes)
-                .map_err(DbError::Checkpoint)?;
-            self.last_committed_ref = Some(reference.clone());
-            self.last_committed_source_watermarks = Some((reference, source_watermarks));
-            self.last_committed_manifest = Some(manifest);
-            self.prepared.remove(&attempt);
-        } else {
-            let controller = self.cluster_controller.as_ref().ok_or_else(|| {
-                DbError::Checkpoint("follower completion has no cluster controller".into())
-            })?;
-            let authority = controller.checkpoint_authority().map_err(|error| {
-                DbError::Checkpoint(format!("follower checkpoint authority: {error}"))
-            })?;
-            let settlement =
-                tokio::time::timeout_at(deadline, authority.cluster_attempt_settlement(attempt))
-                    .await
-                    .map_err(|_| {
-                        DbError::Checkpoint("follower Abort verification timed out".into())
-                    })?
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!("follower Abort verification failed: {error}"))
-                    })?
-                    .ok_or_else(|| DbError::Checkpoint("follower Abort is unresolved".into()))?;
-            let settled = CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
-            match settled.relation_to(attempt) {
-                CheckpointAttemptRelation::Exact
-                    if settlement.verdict
-                        == laminar_core::checkpoint_decision::CheckpointVerdict::Abort => {}
-                CheckpointAttemptRelation::Newer => {}
-                _ => {
-                    return Err(DbError::Checkpoint(
-                        "follower cannot discard a checkpoint without an authoritative Abort or superseding terminal outcome"
-                            .into(),
-                    ));
-                }
-            }
-            let rollback = self.rollback_sinks_until(epoch, deadline).await;
-            rollback?;
-            self.failure_requires_recovery = true;
-        }
-        self.allocator.advance_epoch_to(checked_successor_epoch(
-            epoch,
-            "closing a follower checkpoint",
-        )?);
-        let continuation =
-            if !self.failure_requires_recovery && self.has_checkpoint_committable_sinks() {
-                self.begin_sink_epoch_until(deadline, sink_epoch_publication)
-                    .await
-            } else {
-                Ok(())
-            };
-        let duration = started.elapsed();
-        self.phase = CheckpointPhase::Idle;
-        let checkpoint_bytes = if committed {
-            self.last_committed_manifest
-                .as_ref()
-                .map(|manifest| manifest.node_data.object_length)
-        } else {
-            None
-        };
-        self.record_checkpoint_outcome(committed, attempt, duration, checkpoint_bytes);
-        if continuation.is_err() {
-            self.failure_requires_recovery = true;
-        }
-        continuation?;
-        Ok(committed)
     }
 }
 
