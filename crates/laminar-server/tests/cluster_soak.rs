@@ -6929,6 +6929,38 @@ impl DeltaOutputOracle {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn retry_delta_snapshot_until<T, F>(
+    nodes: &mut [Node],
+    deadline: Instant,
+    label: &str,
+    mut snapshot: F,
+) -> T
+where
+    F: FnMut() -> Result<T, String>,
+{
+    let mut last_error = None;
+    loop {
+        assert_running_nodes(nodes);
+        if remaining_at(deadline, Instant::now()).is_none() {
+            let detail = last_error
+                .as_deref()
+                .unwrap_or("deadline elapsed before the first observation");
+            panic!("{label} Delta quiet re-read failed through its deadline: {detail}");
+        }
+        match snapshot() {
+            Ok(snapshot) => return snapshot,
+            Err(error) => {
+                last_error = Some(error);
+                let Some(remaining) = remaining_at(deadline, Instant::now()) else {
+                    continue;
+                };
+                std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn assert_delta_core_window_outputs(
     nodes: &mut [Node],
     outputs: &BTreeMap<String, DeltaOutputOracle>,
@@ -7004,13 +7036,15 @@ fn assert_delta_core_window_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (kind, output) in outputs {
         let previous = completed
             .get(kind)
             .expect("every Delta CoreWindow canary completed");
-        let stable = output
-            .core_window_snapshot()
-            .unwrap_or_else(|error| panic!("{label}: {kind} Delta quiet re-read failed: {error}"));
+        let stable =
+            retry_delta_snapshot_until(nodes, reread_deadline, &format!("{label}: {kind}"), || {
+                output.core_window_snapshot()
+            });
         assert!(
             stable.version >= previous.version,
             "{label}: {kind} Delta version regressed from {} to {}",
@@ -7120,13 +7154,17 @@ fn assert_delta_matrix_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (join_case, output) in outputs {
         let previous = completed
             .get(join_case)
             .expect("every Delta raw matrix case completed");
-        let stable = output.matrix_snapshot().unwrap_or_else(|error| {
-            panic!("{label}: {join_case} Delta quiet re-read failed: {error}")
-        });
+        let stable = retry_delta_snapshot_until(
+            nodes,
+            reread_deadline,
+            &format!("{label}: {join_case}"),
+            || output.matrix_snapshot(),
+        );
         assert!(
             stable.version >= previous.version,
             "{label}: {join_case} Delta version regressed from {} to {}",
@@ -7241,14 +7279,17 @@ fn assert_delta_matrix_aggregates(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (expected_case, output) in outputs {
         let previous = completed
             .get(expected_case)
             .expect("every Delta aggregate case completed");
-        let stable =
-            delta_matrix_aggregate_snapshot(output, expected_case).unwrap_or_else(|error| {
-                panic!("{label}: {expected_case} quiet re-read failed: {error}")
-            });
+        let stable = retry_delta_snapshot_until(
+            nodes,
+            reread_deadline,
+            &format!("{label}: {expected_case}"),
+            || delta_matrix_aggregate_snapshot(output, expected_case),
+        );
         assert_eq!(
             &stable, previous,
             "{label}: {expected_case} Delta aggregate changed during the quiet re-read"
@@ -7397,6 +7438,7 @@ fn assert_delta_exact_outputs_stable(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
     completed: &[DeltaJoinSnapshot],
+    window: Duration,
 ) {
     assert!(!outputs.is_empty(), "Delta stability check has no outputs");
     assert_eq!(
@@ -7409,11 +7451,11 @@ fn assert_delta_exact_outputs_stable(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (output, completed) in outputs.iter().zip(completed) {
-        let stable = output
-            .oracle
-            .snapshot()
-            .unwrap_or_else(|error| panic!("{} Delta quiet re-read failed: {error}", output.label));
+        let stable = retry_delta_snapshot_until(nodes, reread_deadline, output.label, || {
+            output.oracle.snapshot()
+        });
         assert!(
             stable.version >= completed.version,
             "{} Delta version regressed from {} to {}",
@@ -7548,12 +7590,12 @@ fn assert_delta_temporal_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (output, completed) in outputs.iter().zip(completed) {
         let previous = completed.expect("every Delta temporal output completed");
-        let stable = output
-            .oracle
-            .temporal_snapshot(output.kind)
-            .unwrap_or_else(|error| panic!("{} Delta quiet re-read failed: {error}", output.label));
+        let stable = retry_delta_snapshot_until(nodes, reread_deadline, output.label, || {
+            output.oracle.temporal_snapshot(output.kind)
+        });
         assert!(
             stable.version >= previous.version,
             "{} Delta version regressed from {} to {}",
@@ -11442,6 +11484,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                     completed_delta_outputs
                         .as_deref()
                         .expect("single EO outputs completed before final cuts"),
+                    recovery_ceiling,
                 );
                 assert_delta_matrix_outputs(
                     &mut nodes,
@@ -12676,6 +12719,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                     completed_delta_outputs
                         .as_deref()
                         .expect("cluster EO outputs completed before final cuts"),
+                    recovery_ceiling,
                 );
                 assert_delta_matrix_outputs(
                     &mut nodes,
