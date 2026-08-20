@@ -98,10 +98,10 @@ jobs:
 
   join-validity:
     name: ${{ matrix.label }}
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: 8
+      CARGO_BUILD_JOBS: 16
     strategy:
       fail-fast: false
       matrix:
@@ -252,10 +252,10 @@ jobs:
 
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 60
     env:
-      CARGO_BUILD_JOBS: 8
+      CARGO_BUILD_JOBS: 16
     strategy:
       fail-fast: false
       matrix:
