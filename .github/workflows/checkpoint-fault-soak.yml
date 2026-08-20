@@ -98,8 +98,10 @@ jobs:
 
   join-validity:
     name: ${{ matrix.label }}
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-8x
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 8
     strategy:
       fail-fast: false
       matrix:
