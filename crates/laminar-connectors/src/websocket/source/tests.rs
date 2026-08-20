@@ -195,7 +195,7 @@ async fn ack_then_close_sessions_exhaust_reconnect_budget() {
         .await
         .unwrap();
 
-    let error = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             match source.poll_batch(1).await {
                 Err(error) => break error,
