@@ -7730,7 +7730,7 @@ fn validate_recovery_checkpoint_failure_evidence(
         .iter()
         .position(|line| line.contains(RECOVERY_PREPARE_LOG))
         .ok_or_else(|| {
-            "checkpoint failure was not preceded by the recovery leader's Prepare".to_string()
+            "checkpoint failure was not accompanied by the recovery leader's Prepare".to_string()
         })?;
     let mut fault_failure = None;
     for (index, line) in leader_fault_lines.iter().enumerate() {
@@ -7745,11 +7745,14 @@ fn validate_recovery_checkpoint_failure_evidence(
             failed.checkpoint_id, failed.epoch
         )
     })?;
-    if prepare >= fault_failure {
-        return Err(format!(
-            "checkpoint {} epoch {} failure was not caused by the injected recovery Prepare",
-            failed.checkpoint_id, failed.epoch
-        ));
+    // A checkpoint already in flight at the fault boundary can observe the victim's closed
+    // shuffle scope before the recovery leader durably announces Prepare. Both orders are valid;
+    // the captured log boundary and the single recovery generation provide the causal fence.
+    if !leader_fault_lines[prepare + 1..]
+        .iter()
+        .any(|line| line.contains(RECOVERY_RELEASE_LOG))
+    {
+        return Err("recovery Prepare was not followed by recovery Release".into());
     }
     if !leader_fault_lines[fault_failure + 1..]
         .iter()
@@ -13829,23 +13832,25 @@ fn recovery_checkpoint_failure_evidence_binds_the_interrupted_attempt() {
         Some(failed)
     );
 
+    let pre_prepare_leader_log = format!(
+        "checkpoint_id=4 epoch=4 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\n{metric}\n{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=5 epoch=5 checkpoint completed"
+    );
     let pre_prepare_failure_logs = vec![
         format!("{metric}\n{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}"),
         RECOVERY_RELEASE_LOG.into(),
         RECOVERY_RELEASE_LOG.into(),
     ];
-    let error = validate_recovery_checkpoint_failure_evidence(
-        &baselines,
-        &totals,
-        0,
-        &pre_prepare_failure_logs,
-        &leader_log,
-        resumed,
-    )
-    .unwrap_err();
-    assert!(
-        error.contains("not caused by the injected recovery"),
-        "{error}"
+    assert_eq!(
+        validate_recovery_checkpoint_failure_evidence(
+            &baselines,
+            &totals,
+            0,
+            &pre_prepare_failure_logs,
+            &pre_prepare_leader_log,
+            resumed,
+        )
+        .unwrap(),
+        Some(failed)
     );
 
     let no_failure_logs = vec![

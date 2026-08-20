@@ -252,8 +252,10 @@ jobs:
 
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 8
     strategy:
       fail-fast: false
       matrix:
