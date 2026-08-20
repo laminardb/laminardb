@@ -2893,6 +2893,10 @@ impl CheckpointCoordinator {
     }
 
     pub async fn begin_initial_epoch(&mut self) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if !self.initial_sink_epoch_required()? {
+            return Ok(());
+        }
         let deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
         self.begin_sink_epoch_until(deadline, SinkEpochPublication::Immediate)
             .await

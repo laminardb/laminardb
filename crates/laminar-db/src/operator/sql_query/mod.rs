@@ -1983,10 +1983,10 @@ impl SqlQueryOperator {
             )));
         }
         let mut normalized = input;
-        if self.local_frontier.idle {
+        if (!has_data || self.local_frontier.idle) && input.watermark != Some(i64::MIN) {
             normalized.watermark = Self::max_watermark(
                 normalized.watermark,
-                if normalized.idle {
+                if normalized.idle || !self.local_frontier.idle {
                     self.local_frontier.watermark
                 } else {
                     Self::max_watermark(

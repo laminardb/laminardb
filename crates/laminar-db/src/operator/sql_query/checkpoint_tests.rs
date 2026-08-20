@@ -1055,6 +1055,46 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn rowless_local_observation_preserves_the_last_proven_frontier() {
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    let proven = InputFrontier {
+        watermark: Some(100),
+        idle: false,
+    };
+    operator.local_frontier = proven;
+    operator.effective_frontier = proven;
+    operator.last_broadcast = proven;
+
+    for observed in [
+        InputFrontier::default(),
+        InputFrontier {
+            watermark: Some(90),
+            idle: false,
+        },
+    ] {
+        let normalized = operator.normalized_local_frontier(observed, false).unwrap();
+        assert_eq!(normalized.watermark, proven.watermark);
+        assert_eq!(normalized.idle, observed.idle);
+        assert!(operator.normalized_local_frontier(observed, true).is_err());
+    }
+
+    let invalid = InputFrontier {
+        watermark: Some(i64::MIN),
+        idle: false,
+    };
+    assert!(operator.normalized_local_frontier(invalid, false).is_err());
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn pending_send_drains_remote_sum_before_publishing_local_cut() {
     use std::time::Duration;

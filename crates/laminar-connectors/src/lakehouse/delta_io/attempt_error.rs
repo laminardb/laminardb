@@ -79,6 +79,18 @@ pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableE
 }
 
 #[cfg(feature = "delta-lake")]
+pub(crate) fn classify_delta_metadata_error(
+    context: &str,
+    error: &deltalake::DeltaTableError,
+) -> ConnectorError {
+    if delta_error_has_retryable_transport(error) {
+        ConnectorError::ReadError(format!("{context}: {error}"))
+    } else {
+        ConnectorError::TransactionError(format!("{context}: {error}"))
+    }
+}
+
+#[cfg(feature = "delta-lake")]
 pub(crate) fn is_definite_coordinated_nonpublication(error: &deltalake::DeltaTableError) -> bool {
     use deltalake::kernel::transaction::TransactionError;
 

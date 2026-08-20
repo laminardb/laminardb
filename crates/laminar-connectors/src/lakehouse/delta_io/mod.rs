@@ -38,8 +38,8 @@ pub use table::{get_coordinated_cursor, open_or_create_table};
 
 #[cfg(feature = "delta-lake")]
 pub(crate) use attempt_error::{
-    delta_error_has_retryable_transport, is_definite_coordinated_nonpublication,
-    DeltaWriteAttemptError,
+    classify_delta_metadata_error, delta_error_has_retryable_transport,
+    is_definite_coordinated_nonpublication, DeltaWriteAttemptError,
 };
 #[cfg(feature = "delta-lake")]
 pub(crate) use merge::merge_changelog;

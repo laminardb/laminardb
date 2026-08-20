@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use super::{
-    debug, info, CommitProperties, ConnectorError, CoordinatedCommitCursor, DeltaTable,
-    DeltaWriteAttemptError, HashMap, RecordBatch, SaveMode, SchemaMode, SchemaRef, StorageProvider,
-    Url, SET_TRANSACTION_RETENTION,
+    classify_delta_metadata_error, debug, info, CommitProperties, ConnectorError,
+    CoordinatedCommitCursor, DeltaTable, DeltaWriteAttemptError, HashMap, RecordBatch, SaveMode,
+    SchemaMode, SchemaRef, StorageProvider, Url, SET_TRANSACTION_RETENTION,
 };
 #[cfg(feature = "delta-lake")]
 use arrow_schema::{DataType, Schema, TimeUnit};
@@ -266,9 +266,9 @@ pub(super) fn coordinated_transaction_ids(external_key: &str) -> (String, String
 
 #[cfg(feature = "delta-lake")]
 fn reject_transaction_retention(table: &DeltaTable) -> Result<(), ConnectorError> {
-    let snapshot = table.snapshot().map_err(|error| {
-        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
-    })?;
+    let snapshot = table
+        .snapshot()
+        .map_err(|error| classify_delta_metadata_error("read Delta snapshot", &error))?;
     if let Some(value) = snapshot
         .metadata()
         .configuration()
@@ -298,9 +298,9 @@ pub async fn get_coordinated_cursor(
     external_key: &str,
 ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
     reject_transaction_retention(table)?;
-    let snapshot = table.snapshot().map_err(|error| {
-        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
-    })?;
+    let snapshot = table
+        .snapshot()
+        .map_err(|error| classify_delta_metadata_error("read Delta snapshot", &error))?;
     let log_store = table.log_store();
     let (checkpoint_id, fencing_token) = coordinated_transaction_ids(external_key);
     let (checkpoint, token) = tokio::try_join!(
@@ -309,9 +309,10 @@ pub async fn get_coordinated_cursor(
                 .transaction_version(log_store.as_ref(), &checkpoint_id)
                 .await
                 .map_err(|error| {
-                    ConnectorError::TransactionError(format!(
-                        "read Delta checkpoint cursor '{checkpoint_id}': {error}"
-                    ))
+                    classify_delta_metadata_error(
+                        &format!("read Delta checkpoint cursor '{checkpoint_id}'"),
+                        &error,
+                    )
                 })
         },
         async {
@@ -319,9 +320,10 @@ pub async fn get_coordinated_cursor(
                 .transaction_version(log_store.as_ref(), &fencing_token)
                 .await
                 .map_err(|error| {
-                    ConnectorError::TransactionError(format!(
-                        "read Delta fencing cursor '{fencing_token}': {error}"
-                    ))
+                    classify_delta_metadata_error(
+                        &format!("read Delta fencing cursor '{fencing_token}'"),
+                        &error,
+                    )
                 })
         }
     )?;

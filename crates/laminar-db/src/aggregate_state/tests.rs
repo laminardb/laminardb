@@ -1576,6 +1576,59 @@ async fn test_cascaded_count_star_over_changelog() {
 }
 
 #[tokio::test]
+async fn running_state_emits_nothing_after_all_groups_are_retracted() {
+    let ctx = SessionContext::new();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let seed = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["X"])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![seed]]).unwrap();
+    ctx.register_table("upstream", Arc::new(mem)).unwrap();
+
+    let mut state = try_from_sql_local(
+        &ctx,
+        "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
+        false,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pre_agg_schema = Arc::new(Schema::new(vec![
+        Field::new("region", DataType::Utf8, true),
+        Field::new("__agg_input_1", DataType::Boolean, true),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let batch = |weight| {
+        RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["US"])),
+                Arc::new(arrow::array::BooleanArray::from(vec![true])),
+                Arc::new(arrow::array::Int64Array::from(vec![weight])),
+            ],
+        )
+        .unwrap()
+    };
+
+    state.process_batch(&batch(1), 1000).unwrap();
+    assert_eq!(state.emit().unwrap()[0].num_rows(), 1);
+    state.process_batch(&batch(-1), 2000).unwrap();
+
+    assert!(state.emit().unwrap().is_empty());
+    assert_eq!(state.logical_group_count_for_test(), 0);
+}
+
+#[tokio::test]
 async fn pending_group_deletion_survives_vnode_checkpoint() {
     let ctx = SessionContext::new();
     let schema = Arc::new(Schema::new(vec![

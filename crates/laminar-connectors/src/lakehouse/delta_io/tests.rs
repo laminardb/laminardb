@@ -136,6 +136,56 @@ fn cdf_contract_failures_are_terminal() {
 }
 
 #[test]
+fn delta_metadata_retryability_uses_typed_transport_errors() {
+    use delta_object_store::client::{HttpError, HttpErrorKind};
+
+    let transient = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "test",
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Timeout,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                )),
+            },
+        },
+    );
+    assert!(matches!(transient, ConnectorError::ReadError(_)));
+    assert!(transient.is_transient());
+
+    let permanent = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::PermissionDenied {
+                path: "table".into(),
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Timeout,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                )),
+            },
+        },
+    );
+    assert!(matches!(permanent, ConnectorError::TransactionError(_)));
+    assert!(!permanent.is_transient());
+
+    let untyped = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "untyped timeout",
+                )),
+            },
+        },
+    );
+    assert!(matches!(untyped, ConnectorError::TransactionError(_)));
+    assert!(!untyped.is_transient());
+}
+
+#[test]
 fn only_proven_optimistic_collisions_are_retryable_conflicts() {
     use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
 

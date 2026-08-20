@@ -1155,6 +1155,99 @@ async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_ownerless_worker_keeps_initial_exact_sink_epoch_closed() {
+    use laminar_connectors::connector::{
+        SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    };
+
+    let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let owner_boot = uuid::Uuid::from_u128(1);
+    let worker_boot = uuid::Uuid::from_u128(2);
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[1],
+        vec![CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: owner_boot,
+        }],
+    )
+    .unwrap();
+    let control_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(2)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![NodeInfo {
+        id: NodeId(1),
+        name: "owner".into(),
+        rpc_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    }]);
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        NodeId(2),
+        Arc::clone(&control_kv),
+        control_kv,
+        None,
+        members_rx,
+        worker_boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))))
+        .unwrap();
+
+    let store = ObjectStoreCheckpointStore::new(objects, "ownerless-initial-sink-epoch")
+        .with_participant_id(2);
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator.set_assignment_version(fence.assignment_version);
+    coordinator.set_vnode_set(Vec::new());
+    coordinator.set_cluster_controller(Arc::clone(&controller));
+    let sink = AmbiguousFollowerSink {
+        rollbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        schema: Arc::new(arrow::datatypes::Schema::empty()),
+        expected_admission: None,
+    };
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let sink_handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "probe".into(),
+        sink_id: Arc::from("probe"),
+        connector: Box::new(sink),
+        contract: SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coordinator.register_sink("probe", sink_handle.clone());
+
+    assert!(coordinator.initial_sink_epoch_required().unwrap());
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    assert_eq!(
+        controller.checkpoint_assignment_fence(fence.assignment_version),
+        Some(fence)
+    );
+    coordinator.begin_initial_epoch().await.unwrap();
+    assert!(sink_handle.open_epoch_admission(1).is_err());
+
+    coordinator.set_vnode_set(vec![0]);
+    let error = coordinator.begin_initial_epoch().await.unwrap_err();
+    assert!(
+        error.to_string().contains("excludes participant 2"),
+        "{error}"
+    );
+    assert!(sink_handle.open_epoch_admission(1).is_err());
+    sink_handle.close().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
 #[test]
 fn cluster_recovery_reuses_the_checkpoint_bound_external_fence() {
     use laminar_core::checkpoint::{LeaderProof, LeaderProofOwner};

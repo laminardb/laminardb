@@ -1,16 +1,20 @@
 //! Coordinated object validation and terminal catalog publication.
 
 use super::{
-    coordinated_table_binding, coordinated_transaction_ids, decode_commit_descriptors_until,
-    delta_error_has_retryable_transport, ensure_publication_deadline, get_coordinated_cursor,
-    is_definite_coordinated_nonpublication, validate_coordinated_descriptors,
-    validate_coordinated_log_store, Arc, AtomicUsize, CommitProperties, ConnectorError,
-    CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedObject, DeltaTable,
-    DeltaTableBinding, Ordering, SaveMode, Transaction, COORDINATED_CLOCK_SKEW_MARGIN,
-    COORDINATED_HEAD_CONCURRENCY, COORDINATED_TERMINAL_IO_HORIZON,
+    classify_delta_metadata_error, coordinated_table_binding, coordinated_transaction_ids,
+    decode_commit_descriptors_until, delta_error_has_retryable_transport,
+    ensure_publication_deadline, get_coordinated_cursor, is_definite_coordinated_nonpublication,
+    validate_coordinated_descriptors, validate_coordinated_log_store, Arc, AtomicUsize,
+    CommitProperties, ConnectorError, CoordinatedCommitBatch, CoordinatedCommitCursor,
+    CoordinatedObject, DeltaTable, DeltaTableBinding, Ordering, SaveMode, Transaction,
+    COORDINATED_CLOCK_SKEW_MARGIN, COORDINATED_HEAD_CONCURRENCY, COORDINATED_TERMINAL_IO_HORIZON,
     MIN_COORDINATED_DELETED_FILE_RETENTION,
 };
-use std::time::Duration;
+use std::{future::Future, time::Duration};
+
+#[cfg(feature = "delta-lake")]
+const COORDINATED_METADATA_BACKOFF: crate::retry::Backoff =
+    crate::retry::Backoff::new(Duration::from_millis(50), Duration::from_secs(1), 0.25);
 
 #[cfg(all(feature = "delta-lake", test))]
 #[derive(Clone)]
@@ -177,38 +181,75 @@ fn coordinated_recovery_horizon(
 }
 
 #[cfg(feature = "delta-lake")]
+async fn refresh_publication_cursor_once(
+    table: &DeltaTable,
+    external_key: &str,
+) -> Result<(DeltaTable, Option<CoordinatedCommitCursor>), ConnectorError> {
+    // Cursor filtering and the commit base share this freshly updated snapshot.
+    let mut current = table.clone();
+    validate_coordinated_log_store(&current)?;
+    current.update_state().await.map_err(|error| {
+        classify_delta_metadata_error(
+            "refresh Delta coordinated publication snapshot before commit dispatch",
+            &error,
+        )
+    })?;
+    let observed = get_coordinated_cursor(&current, external_key).await?;
+    Ok((current, observed))
+}
+
+#[cfg(feature = "delta-lake")]
+async fn retry_publication_metadata_until<F, Fut, T>(
+    deadline: tokio::time::Instant,
+    mut read: F,
+) -> Result<T, ConnectorError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ConnectorError>>,
+{
+    let mut retry = 0_u32;
+    let mut last_transient = None;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            let context = last_transient.map_or_else(String::new, |error| {
+                format!(" after transient failure: {error}")
+            });
+            return Err(ConnectorError::WriteError(format!(
+                "Delta coordinated publication metadata read exceeded the publication deadline before catalog commit dispatch{context}"
+            )));
+        }
+        let result = tokio::time::timeout_at(deadline, read())
+            .await
+            .map_err(|_| {
+                ConnectorError::WriteError(
+                    "Delta coordinated publication metadata read exceeded the publication deadline before catalog commit dispatch"
+                        .into(),
+                )
+            })?;
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_transient() && !error.is_outcome_unknown() => {
+                last_transient = Some(error.to_string());
+                let now = tokio::time::Instant::now();
+                let backoff = COORDINATED_METADATA_BACKOFF.delay(retry);
+                retry = retry.saturating_add(1);
+                tokio::time::sleep_until((now + backoff).min(deadline)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "delta-lake")]
 async fn refresh_publication_cursor(
     table: &DeltaTable,
     external_key: &str,
     deadline: tokio::time::Instant,
 ) -> Result<(DeltaTable, Option<CoordinatedCommitCursor>), ConnectorError> {
-    // Cursor filtering and the commit base share this freshly updated snapshot.
-    let mut current = table.clone();
-    validate_coordinated_log_store(&current)?;
-    tokio::time::timeout_at(deadline, current.update_state())
-        .await
-        .map_err(|_| {
-            ConnectorError::WriteError(
-                "Delta coordinated snapshot refresh exceeded the publication deadline without dispatching a commit"
-                    .into(),
-            )
-        })?
-        .map_err(|error| {
-            ConnectorError::WriteError(format!(
-                "refresh Delta coordinated publication snapshot before commit dispatch: {error}"
-            ))
-        })?;
-    ensure_publication_deadline(deadline, "snapshot refresh")?;
-    let observed = tokio::time::timeout_at(deadline, get_coordinated_cursor(&current, external_key))
-        .await
-        .map_err(|_| {
-            ConnectorError::WriteError(
-                "Delta coordinated cursor read exceeded the publication deadline without dispatching a commit"
-                    .into(),
-            )
-        })??;
-    ensure_publication_deadline(deadline, "cursor read")?;
-    Ok((current, observed))
+    retry_publication_metadata_until(deadline, || {
+        refresh_publication_cursor_once(table, external_key)
+    })
+    .await
 }
 
 #[cfg(feature = "delta-lake")]
@@ -531,4 +572,65 @@ pub(in crate::lakehouse) async fn commit_adds_coordinated(
     })
     .await?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "delta-lake"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_metadata_retries_only_safe_transient_reads() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let value = retry_publication_metadata_until(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            || {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    if attempts.fetch_add(1, AtomicOrdering::SeqCst) < 4 {
+                        Err(ConnectorError::ReadError("temporary cursor GET".into()))
+                    } else {
+                        Ok(7_u64)
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 5);
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_publication_metadata_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || async {
+                attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                Err::<(), _>(ConnectorError::outcome_unknown(
+                    "catalog outcome is ambiguous",
+                    true,
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_outcome_unknown());
+        assert_eq!(attempts.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publication_metadata_retry_stops_at_the_shared_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        let error = retry_publication_metadata_until(deadline, || async {
+            Err::<(), _>(ConnectorError::ReadError("temporary cursor GET".into()))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ConnectorError::WriteError(_)));
+        assert!(
+            error.to_string().contains("temporary cursor GET"),
+            "{error}"
+        );
+        assert_eq!(tokio::time::Instant::now(), deadline);
+    }
 }

@@ -2067,11 +2067,10 @@ impl IncrementalAggState {
                 self.commit_deleted_group(vnode, &key);
             }
         }
-        if self.vnode_states.resident_group_count() == 0 {
+        let num_rows = self.vnode_states.resident_group_count();
+        if num_rows == 0 {
             return Ok(Vec::new());
         }
-
-        let num_rows = self.vnode_states.resident_group_count();
 
         let group_arrays = if self.num_group_cols > 0 {
             self.row_converter

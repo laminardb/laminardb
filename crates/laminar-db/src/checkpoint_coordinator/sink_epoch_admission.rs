@@ -44,6 +44,31 @@ impl EpochAllocator {
 }
 
 impl CheckpointCoordinator {
+    #[cfg(feature = "cluster")]
+    pub(super) fn initial_sink_epoch_required(&self) -> Result<bool, DbError> {
+        if !self.has_checkpoint_committable_sinks() {
+            return Ok(false);
+        }
+        if let Some(controller) = self.cluster_controller.as_ref() {
+            let Some(fence) = controller.checkpoint_assignment_fence(self.assignment_version)
+            else {
+                return Ok(true);
+            };
+            if fence.contains(self.store.participant_id()) {
+                return Ok(true);
+            }
+            if self.owned_vnodes.is_empty() {
+                return Ok(false);
+            }
+            return Err(DbError::Checkpoint(format!(
+                "cluster initial sink epoch excludes participant {} with owned vnodes {:?}",
+                self.store.participant_id(),
+                self.owned_vnodes
+            )));
+        }
+        Ok(true)
+    }
+
     pub(super) async fn reserve_sink_epoch_for_runtime_until(
         &mut self,
         deadline: tokio::time::Instant,
