@@ -1,13 +1,14 @@
 //! Coordinated object validation and terminal catalog publication.
 
 use super::{
-    classify_delta_metadata_error, coordinated_table_binding, coordinated_transaction_ids,
-    decode_commit_descriptors_until, delta_error_has_retryable_transport,
-    ensure_publication_deadline, get_coordinated_cursor, is_definite_coordinated_nonpublication,
-    validate_coordinated_descriptors, validate_coordinated_log_store, Arc, AtomicUsize,
-    CommitProperties, ConnectorError, CoordinatedCommitBatch, CoordinatedCommitCursor,
-    CoordinatedObject, DeltaTable, DeltaTableBinding, Ordering, SaveMode, Transaction,
-    COORDINATED_CLOCK_SKEW_MARGIN, COORDINATED_HEAD_CONCURRENCY, COORDINATED_TERMINAL_IO_HORIZON,
+    classify_delta_metadata_error, classify_delta_object_store_metadata_error,
+    coordinated_table_binding, coordinated_transaction_ids, decode_commit_descriptors_until,
+    delta_error_has_retryable_transport, ensure_publication_deadline, get_coordinated_cursor,
+    is_definite_coordinated_nonpublication, validate_coordinated_descriptors,
+    validate_coordinated_log_store, Arc, AtomicUsize, CommitProperties, ConnectorError,
+    CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedObject, DeltaTable,
+    DeltaTableBinding, Ordering, SaveMode, Transaction, COORDINATED_CLOCK_SKEW_MARGIN,
+    COORDINATED_HEAD_CONCURRENCY, COORDINATED_TERMINAL_IO_HORIZON,
     MIN_COORDINATED_DELETED_FILE_RETENTION,
 };
 use std::{future::Future, time::Duration};
@@ -71,20 +72,13 @@ async fn validate_coordinated_objects(
                 let Some(object) = objects.get(index) else {
                     return Ok::<(), ConnectorError>(());
                 };
-                let metadata = tokio::time::timeout_at(deadline, store.head(&object.path))
-                    .await
-                    .map_err(|_| {
-                        ConnectorError::TransactionError(format!(
-                            "Delta coordinated object HEAD exceeded the publication deadline for '{}'",
-                            object.path
-                        ))
-                    })?
-                    .map_err(|error| {
-                        ConnectorError::TransactionError(format!(
-                            "HEAD Delta coordinated object '{}': {error}",
-                            object.path
-                        ))
-                    })?;
+                let context = format!("HEAD Delta coordinated object '{}'", object.path);
+                let metadata = retry_publication_metadata_until(deadline, || async {
+                    store.head(&object.path).await.map_err(|error| {
+                        classify_delta_object_store_metadata_error(&context, &error)
+                    })
+                })
+                .await?;
                 if metadata.size != object.expected_size {
                     return Err(ConnectorError::TransactionError(format!(
                         "Delta coordinated object '{}' size mismatch: descriptor {}, physical {}",

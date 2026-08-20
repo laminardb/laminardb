@@ -169,23 +169,39 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(matches!(kernel_transient, ConnectorError::ReadError(_)));
     assert!(kernel_transient.is_transient());
 
-    let kernel_unknown_transport = classify_delta_metadata_error(
-        "read cursor",
-        &deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(
-            delta_object_store::Error::Generic {
-                store: "test",
-                source: Box::new(HttpError::new(
-                    HttpErrorKind::Unknown,
-                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
-                )),
-            },
-        )),
+    let kernel_unknown_error = deltalake::DeltaTableError::KernelError(
+        delta_kernel::error::Error::ObjectStore(delta_object_store::Error::Generic {
+            store: "test",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::other("opaque request failure"),
+            )),
+        }),
     );
+    let kernel_unknown_transport =
+        classify_delta_metadata_error("read cursor", &kernel_unknown_error);
     assert!(matches!(
         kernel_unknown_transport,
         ConnectorError::ReadError(_)
     ));
     assert!(kernel_unknown_transport.is_transient());
+    assert!(
+        !delta_error_has_retryable_transport(&kernel_unknown_error),
+        "an unknown HTTP write outcome must retain conservative publication semantics"
+    );
+
+    let object_store_unknown = classify_delta_object_store_metadata_error(
+        "HEAD staged object",
+        &deltalake::ObjectStoreError::Generic {
+            store: "test",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::other("opaque request failure"),
+            )),
+        },
+    );
+    assert!(matches!(object_store_unknown, ConnectorError::ReadError(_)));
+    assert!(object_store_unknown.is_transient());
 
     let permanent = classify_delta_metadata_error(
         "read cursor",

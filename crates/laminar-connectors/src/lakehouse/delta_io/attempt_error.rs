@@ -43,11 +43,21 @@ fn is_definite_prewrite_conflict(error: &deltalake::DeltaTableError) -> bool {
 }
 
 #[cfg(feature = "delta-lake")]
-fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreError) -> bool {
+#[derive(Clone, Copy)]
+enum DeltaHttpRetryPolicy {
+    ProvenTransport,
+    IdempotentMetadataRead,
+}
+
+#[cfg(feature = "delta-lake")]
+fn object_store_error_is_retryable(
+    error: &deltalake::ObjectStoreError,
+    policy: DeltaHttpRetryPolicy,
+) -> bool {
     use delta_object_store::client::{HttpError, HttpErrorKind};
 
-    // Typed permanent/conditional variants fail closed. A Generic wrapper is
-    // retryable only when its source chain contains a typed transport failure.
+    // Typed permanent/conditional variants fail closed. Unknown HTTP failures are
+    // retryable only for bounded idempotent reads; writes require a concrete I/O cause.
     let deltalake::ObjectStoreError::Generic { source, .. } = error else {
         return false;
     };
@@ -60,6 +70,11 @@ fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreErro
                 | HttpErrorKind::Request
                 | HttpErrorKind::Timeout
                 | HttpErrorKind::Interrupted => return true,
+                HttpErrorKind::Unknown
+                    if matches!(policy, DeltaHttpRetryPolicy::IdempotentMetadataRead) =>
+                {
+                    return true;
+                }
                 HttpErrorKind::Unknown => unknown_http = true,
                 _ => return false,
             }
@@ -88,33 +103,42 @@ fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreErro
 }
 
 #[cfg(feature = "delta-lake")]
-fn kernel_error_has_retryable_transport(error: &delta_kernel::error::Error) -> bool {
+fn kernel_error_is_retryable(
+    error: &delta_kernel::error::Error,
+    policy: DeltaHttpRetryPolicy,
+) -> bool {
     match error {
         delta_kernel::error::Error::Backtraced { source, .. } => {
-            kernel_error_has_retryable_transport(source)
+            kernel_error_is_retryable(source, policy)
         }
         delta_kernel::error::Error::ObjectStore(error) => {
-            object_store_error_has_retryable_transport(error)
+            object_store_error_is_retryable(error, policy)
         }
         _ => false,
     }
 }
 
 #[cfg(feature = "delta-lake")]
-pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableError) -> bool {
+fn delta_error_is_retryable(
+    error: &deltalake::DeltaTableError,
+    policy: DeltaHttpRetryPolicy,
+) -> bool {
     match error {
-        deltalake::DeltaTableError::KernelError(error) => {
-            kernel_error_has_retryable_transport(error)
-        }
+        deltalake::DeltaTableError::KernelError(error) => kernel_error_is_retryable(error, policy),
         deltalake::DeltaTableError::ObjectStore { source }
         | deltalake::DeltaTableError::Transaction {
             source: deltalake::kernel::transaction::TransactionError::ObjectStore { source },
         }
         | deltalake::DeltaTableError::Kernel {
             source: deltalake::kernel::Error::ObjectStore(source),
-        } => object_store_error_has_retryable_transport(source),
+        } => object_store_error_is_retryable(source, policy),
         _ => false,
     }
+}
+
+#[cfg(feature = "delta-lake")]
+pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableError) -> bool {
+    delta_error_is_retryable(error, DeltaHttpRetryPolicy::ProvenTransport)
 }
 
 #[cfg(feature = "delta-lake")]
@@ -122,7 +146,19 @@ pub(crate) fn classify_delta_metadata_error(
     context: &str,
     error: &deltalake::DeltaTableError,
 ) -> ConnectorError {
-    if delta_error_has_retryable_transport(error) {
+    if delta_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
+        ConnectorError::ReadError(format!("{context}: {error}"))
+    } else {
+        ConnectorError::TransactionError(format!("{context}: {error}"))
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+pub(crate) fn classify_delta_object_store_metadata_error(
+    context: &str,
+    error: &deltalake::ObjectStoreError,
+) -> ConnectorError {
+    if object_store_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
         ConnectorError::ReadError(format!("{context}: {error}"))
     } else {
         ConnectorError::TransactionError(format!("{context}: {error}"))
