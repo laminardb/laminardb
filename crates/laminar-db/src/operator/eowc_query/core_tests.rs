@@ -532,6 +532,53 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn stale_source_observation_preserves_the_installed_frontier_floor() {
+    let mut operator = EowcQueryOperator::new(
+        "managed_window",
+        AGG_SQL,
+        Some(EmitClause::OnWindowClose),
+        Some(test_window_config()),
+        aggregate_context(),
+        key_groups(),
+        None,
+    );
+    let proven = InputFrontier {
+        watermark: Some(100),
+        idle: false,
+    };
+    operator.local_frontier = proven;
+    operator.effective_frontier = proven;
+    operator.last_broadcast = proven;
+
+    for observed in [
+        InputFrontier::default(),
+        InputFrontier {
+            watermark: Some(90),
+            idle: false,
+        },
+    ] {
+        for has_data in [false, true] {
+            let normalized = operator
+                .normalized_local_frontier(observed, has_data)
+                .unwrap();
+            assert_eq!(normalized.watermark, proven.watermark);
+            assert_eq!(normalized.idle, observed.idle);
+        }
+    }
+
+    let invalid = InputFrontier {
+        watermark: Some(i64::MIN),
+        idle: false,
+    };
+    for has_data in [false, true] {
+        assert!(operator
+            .normalized_local_frontier(invalid, has_data)
+            .is_err());
+    }
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn zero_admission_send_restarts_once_without_becoming_runnable() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;

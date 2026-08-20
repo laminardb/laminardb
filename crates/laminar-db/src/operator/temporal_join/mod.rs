@@ -3054,35 +3054,26 @@ impl ManagedTemporalJoinOperator {
             }
             self.local_frontiers
         };
+        let mut local_frontiers = frontiers;
         for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
             let port = side.port();
-            validate_frontier(
-                self.local_frontiers[port],
-                frontiers[port],
-                side.name(),
-                &self.name,
-            )?;
-            if frontiers[port].idle
-                && inputs
-                    .get(port)
-                    .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() != 0))
-            {
+            let has_data = inputs
+                .get(port)
+                .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() != 0));
+            if frontiers[port].idle && has_data {
                 return Err(DbError::InvalidOperation(format!(
                     "temporal join [{}] received {} data from an idle local channel",
                     self.name,
                     side.name()
                 )));
             }
-        }
-        let mut local_frontiers = frontiers;
-        for side in [TemporalInputSide::Left, TemporalInputSide::Right] {
-            let port = side.port();
-            if self.local_frontiers[port].idle && !local_frontiers[port].idle {
-                local_frontiers[port].watermark = max_watermark(
-                    local_frontiers[port].watermark,
-                    self.frontiers[port].watermark,
-                );
-            }
+            let installed = self.local_frontiers[port];
+            local_frontiers[port] = super::frontier::normalize_restored_local_frontier(
+                frontiers[port],
+                installed,
+                self.frontiers[port].watermark,
+            );
+            validate_frontier(installed, local_frontiers[port], side.name(), &self.name)?;
         }
 
         let mut routed: BTreeMap<u32, [Vec<RoutedTemporalBatch>; 2]> = BTreeMap::new();
@@ -6146,7 +6137,9 @@ fn validate_frontier(
     side: &str,
     operator: &str,
 ) -> Result<(), DbError> {
-    if previous.watermark.is_some() && next.watermark.is_none() {
+    if next.watermark == Some(i64::MIN)
+        || (previous.watermark.is_some() && next.watermark.is_none())
+    {
         return Err(DbError::Pipeline(format!(
             "temporal join [{operator}] {side} frontier became uninitialized"
         )));

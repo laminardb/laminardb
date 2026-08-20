@@ -1255,20 +1255,11 @@ impl EowcQueryOperator {
                 self.op_name
             )));
         }
-        let mut normalized = input;
-        if self.local_frontier.idle {
-            normalized.watermark = Self::max_watermark(
-                normalized.watermark,
-                if normalized.idle {
-                    self.local_frontier.watermark
-                } else {
-                    Self::max_watermark(
-                        self.local_frontier.watermark,
-                        self.effective_frontier.watermark,
-                    )
-                },
-            );
-        }
+        let normalized = super::frontier::normalize_restored_local_frontier(
+            input,
+            self.local_frontier,
+            self.effective_frontier.watermark,
+        );
         self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
     }

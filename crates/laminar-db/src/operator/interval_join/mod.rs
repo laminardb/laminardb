@@ -3816,7 +3816,6 @@ impl IntervalJoinOperator {
         let mut local_frontiers = frontiers;
         for side in [JoinInputSide::Left, JoinInputSide::Right] {
             let port = side.port();
-            self.validate_frontier(self.local_frontiers[port], frontiers[port], side)?;
             let has_data = inputs
                 .get(port)
                 .is_some_and(|batches| batches.iter().any(|batch| batch.num_rows() != 0));
@@ -3827,17 +3826,13 @@ impl IntervalJoinOperator {
                     side.name()
                 )));
             }
-            if self.local_frontiers[port].idle && !local_frontiers[port].idle {
-                let floor = if port == 0 {
-                    self.applied_left_watermark
-                } else {
-                    self.applied_right_watermark
-                };
-                local_frontiers[port].watermark = Self::max_watermark(
-                    local_frontiers[port].watermark,
-                    Self::watermark_option(floor),
-                );
-            }
+            let installed = self.local_frontiers[port];
+            local_frontiers[port] = super::frontier::normalize_restored_local_frontier(
+                frontiers[port],
+                installed,
+                self.applied_frontiers()[port].watermark,
+            );
+            self.validate_frontier(installed, local_frontiers[port], side)?;
         }
 
         let mut routed = BTreeMap::new();

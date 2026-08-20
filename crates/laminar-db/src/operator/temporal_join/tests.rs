@@ -1666,6 +1666,24 @@ async fn bootstrap_broadcast_holds_restored_cut_ahead_of_live_replay_frontier() 
     );
 
     operator.last_broadcasts = [cut; 2];
+    for observed in [
+        InputFrontier::default(),
+        InputFrontier {
+            watermark: Some(90),
+            idle: false,
+        },
+    ] {
+        let catch_up = operator
+            .plan_cluster_inputs(
+                &[Vec::new(), Vec::new()],
+                [observed; 2],
+                &scope,
+                &assignment,
+                &[2],
+            )
+            .unwrap();
+        assert_eq!(catch_up.local_frontiers, [cut; 2]);
+    }
     let replay = operator
         .plan_cluster_inputs(
             &[Vec::new(), vec![replay]],

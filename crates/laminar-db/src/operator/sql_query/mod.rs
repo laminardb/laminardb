@@ -1982,23 +1982,11 @@ impl SqlQueryOperator {
                 self.op_name
             )));
         }
-        let mut normalized = input;
-        // RECOVERY: the installed local cut remains authoritative while a restored or reassigned
-        // upstream graph frontier catches up. Clamp canonical observations even when delayed
-        // FULL/ANTI output carries data; a literal `Some(i64::MIN)` remains terminal below.
-        if input.watermark != Some(i64::MIN) {
-            normalized.watermark = Self::max_watermark(
-                normalized.watermark,
-                if normalized.idle || !self.local_frontier.idle {
-                    self.local_frontier.watermark
-                } else {
-                    Self::max_watermark(
-                        self.local_frontier.watermark,
-                        self.effective_frontier.watermark,
-                    )
-                },
-            );
-        }
+        let normalized = super::frontier::normalize_restored_local_frontier(
+            input,
+            self.local_frontier,
+            self.effective_frontier.watermark,
+        );
         self.validate_frontier(self.local_frontier, normalized, "local")?;
         Ok(normalized)
     }
