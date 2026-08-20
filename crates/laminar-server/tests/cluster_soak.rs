@@ -181,6 +181,8 @@ const RECOVERY_SUPERSEDED_LOG: &str = "recovery round was superseded:";
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_HANDOFF_LOG: &str =
     "retrying stopped recovery with a direct Prepare-to-Prepare handoff";
+#[cfg(feature = "kafka")]
+const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -7680,10 +7682,17 @@ fn validate_recovery_checkpoint_failure_totals(
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryPrepareSequence {
+    final_prepare_line: usize,
+    abandoned_rounds: u32,
+}
+
+#[cfg(feature = "kafka")]
 fn validate_recovery_prepare_sequence(
     fault_logs: &[String],
     leader: usize,
-) -> Result<usize, String> {
+) -> Result<RecoveryPrepareSequence, String> {
     let leader_log = fault_logs
         .get(leader)
         .ok_or_else(|| format!("recovery leader node{leader} has no fault log"))?;
@@ -7701,7 +7710,10 @@ fn validate_recovery_prepare_sequence(
         return Err("recovery Prepare was emitted by a non-leader process".into());
     }
     match prepares.as_slice() {
-        [prepare] => Ok(*prepare),
+        [prepare] => Ok(RecoveryPrepareSequence {
+            final_prepare_line: *prepare,
+            abandoned_rounds: 0,
+        }),
         [first, second] => {
             let between = &leader_lines[first + 1..*second];
             let superseded = between
@@ -7719,7 +7731,19 @@ fn validate_recovery_prepare_sequence(
                     "two recovery Prepare records have no ordered direct handoff fence".into(),
                 );
             }
-            Ok(*second)
+            let retry_holds = between
+                .iter()
+                .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
+                .count();
+            if retry_holds != 1 {
+                return Err(format!(
+                    "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
+                ));
+            }
+            Ok(RecoveryPrepareSequence {
+                final_prepare_line: *second,
+                abandoned_rounds: 1,
+            })
         }
         _ => Err(format!(
             "explicit fault created {total_prepares} recovery Prepare generations; expected one, or one fenced direct replacement"
@@ -7766,7 +7790,7 @@ fn validate_recovery_checkpoint_failure_evidence(
             leader_failure = failures.first().copied();
         }
     }
-    let prepare = validate_recovery_prepare_sequence(fault_logs, leader)?;
+    let prepare = validate_recovery_prepare_sequence(fault_logs, leader)?.final_prepare_line;
     let Some(failed) = leader_failure else {
         return Ok(None);
     };
@@ -7874,7 +7898,7 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .zip(&evidence.log_offsets)
         .map(|(node, offset)| node.log_since(*offset))
         .collect::<Vec<_>>();
-    validate_recovery_prepare_sequence(&logs, evidence.recovery_leader)
+    let prepare_sequence = validate_recovery_prepare_sequence(&logs, evidence.recovery_leader)
         .unwrap_or_else(|error| panic!("explicit recovery Prepare sequence invalid: {error}"));
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
         .expect("read recovery leader log for checkpoint failure evidence");
@@ -7920,10 +7944,16 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         let failures = node
             .metric("laminardb_coordinated_recovery_failures_total")
             .expect("node stopped exposing coordinated recovery failure count");
+        let expected_failures = evidence.recovery_failure_baselines[index]
+            + if index == evidence.recovery_leader {
+                f64::from(prepare_sequence.abandoned_rounds)
+            } else {
+                0.0
+            };
         assert_eq!(
-            failures, evidence.recovery_failure_baselines[index],
-            "node{} recorded a coordinated recovery failure",
-            node.id
+            failures, expected_failures,
+            "node{} coordinated recovery failure count did not match the certified Prepare sequence",
+            node.id,
         );
         let checkpoint_failures = node
             .metric("laminardb_checkpoints_failed_total")
@@ -13833,18 +13863,27 @@ fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
 #[test]
 fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
     let one = vec![RECOVERY_PREPARE_LOG.to_string(), String::new()];
-    assert_eq!(validate_recovery_prepare_sequence(&one, 0).unwrap(), 0);
+    assert_eq!(
+        validate_recovery_prepare_sequence(&one, 0).unwrap(),
+        RecoveryPrepareSequence {
+            final_prepare_line: 0,
+            abandoned_rounds: 0,
+        }
+    );
 
     let replacement = vec![
         format!(
             "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
-             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+             {RECOVERY_RETRY_HOLD_LOG}\n{RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
         ),
         String::new(),
     ];
     assert_eq!(
         validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
-        3
+        RecoveryPrepareSequence {
+            final_prepare_line: 4,
+            abandoned_rounds: 1,
+        }
     );
 
     let unfenced = vec![
@@ -13854,6 +13893,17 @@ fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
     assert!(validate_recovery_prepare_sequence(&unfenced, 0)
         .unwrap_err()
         .contains("superseded-round fence"));
+
+    let missing_retry_hold = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&missing_retry_hold, 0)
+        .unwrap_err()
+        .contains("retry holds"));
 
     let wrong_process = vec![
         RECOVERY_PREPARE_LOG.to_string(),

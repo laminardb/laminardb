@@ -114,6 +114,7 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
+            visibility_ms: "10000"
             slo_mode: certify
           - label: Single-node EO stateful joins
             test: single_node_eo_join_kill9_soak
@@ -122,7 +123,8 @@ jobs:
             topology: single
             discovery: gossip
             emulator: "1"
-            checkpoint_ms: "1000"
+            checkpoint_ms: "5000"
+            visibility_ms: "60000"
             slo_mode: observe
           - label: Cluster ALO stateful joins (gossip)
             test: three_node_alo_join_kill9_soak
@@ -132,6 +134,7 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
+            visibility_ms: "10000"
             slo_mode: certify
           - label: Cluster ALO stateful joins (static)
             test: three_node_alo_join_kill9_soak
@@ -141,6 +144,7 @@ jobs:
             discovery: static
             emulator: "0"
             checkpoint_ms: "250"
+            visibility_ms: "10000"
             slo_mode: certify
           - label: Cluster EO stateful joins (gossip)
             test: three_node_eo_join_kill9_soak
@@ -149,7 +153,8 @@ jobs:
             topology: cluster
             discovery: gossip
             emulator: "1"
-            checkpoint_ms: "1000"
+            checkpoint_ms: "5000"
+            visibility_ms: "60000"
             slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
@@ -158,7 +163,8 @@ jobs:
             topology: cluster
             discovery: static
             emulator: "1"
-            checkpoint_ms: "1000"
+            checkpoint_ms: "5000"
+            visibility_ms: "60000"
             slo_mode: observe
     steps:
       - uses: actions/checkout@v6
@@ -220,11 +226,12 @@ jobs:
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
-          # A 1s EO cadence remains 10x tighter than the production default while avoiding a
-          # continuous 92 Delta-table commits/s against one MinIO emulator. MinIO validates the
+          # A 5s EO cadence remains 2x tighter than the production default without turning one
+          # MinIO emulator into the bottleneck for 23 exact sinks. The emulator validates the
           # exact protocol, not cloud-provider latency; ALO retains the 250ms certifying profile.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
+          LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
