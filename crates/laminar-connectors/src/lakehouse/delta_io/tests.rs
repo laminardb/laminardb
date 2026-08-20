@@ -154,6 +154,21 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(matches!(transient, ConnectorError::ReadError(_)));
     assert!(transient.is_transient());
 
+    let kernel_transient = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(
+            delta_object_store::Error::Generic {
+                store: "test",
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Request,
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+                )),
+            },
+        )),
+    );
+    assert!(matches!(kernel_transient, ConnectorError::ReadError(_)));
+    assert!(kernel_transient.is_transient());
+
     let permanent = classify_delta_metadata_error(
         "read cursor",
         &deltalake::DeltaTableError::ObjectStore {

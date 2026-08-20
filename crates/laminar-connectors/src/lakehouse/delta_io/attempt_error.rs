@@ -68,11 +68,30 @@ fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreErro
 }
 
 #[cfg(feature = "delta-lake")]
+fn kernel_error_has_retryable_transport(error: &delta_kernel::error::Error) -> bool {
+    match error {
+        delta_kernel::error::Error::Backtraced { source, .. } => {
+            kernel_error_has_retryable_transport(source)
+        }
+        delta_kernel::error::Error::ObjectStore(error) => {
+            object_store_error_has_retryable_transport(error)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "delta-lake")]
 pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableError) -> bool {
     match error {
+        deltalake::DeltaTableError::KernelError(error) => {
+            kernel_error_has_retryable_transport(error)
+        }
         deltalake::DeltaTableError::ObjectStore { source }
         | deltalake::DeltaTableError::Transaction {
             source: deltalake::kernel::transaction::TransactionError::ObjectStore { source },
+        }
+        | deltalake::DeltaTableError::Kernel {
+            source: deltalake::kernel::Error::ObjectStore(source),
         } => object_store_error_has_retryable_transport(source),
         _ => false,
     }
