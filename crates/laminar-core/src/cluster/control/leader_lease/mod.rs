@@ -1,5 +1,7 @@
 //! Durable, append-only leader fencing.
 
+mod artifact_admission;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -4302,19 +4304,6 @@ impl LeaderLeaseStore {
             decision.target_version()
         ))
         .into())
-    }
-
-    /// Read the unresolved cluster checkpoint artifact inventory, if any.
-    ///
-    /// # Errors
-    /// Fails when the durable authority head is unavailable or invalid.
-    pub async fn cluster_checkpoint_artifacts(
-        &self,
-    ) -> Result<Option<CheckpointArtifactInventory>, ClusterCheckpointAuthorityError> {
-        Ok(self
-            .load_record()
-            .await?
-            .and_then(|head| head.active_checkpoint_artifacts))
     }
 
     async fn reject_consumed_checkpoint_assignment(

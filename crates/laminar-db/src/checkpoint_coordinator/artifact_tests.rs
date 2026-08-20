@@ -8,7 +8,7 @@ use laminar_core::checkpoint_decision::{
 #[cfg(feature = "cluster")]
 use laminar_core::cluster::control::{
     BarrierAck, BarrierAckDisposition, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
-    LeaderLeaseStore, LeaseOutcome, ACK_KEY,
+    LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ACK_KEY,
 };
 #[cfg(feature = "cluster")]
 use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
@@ -121,6 +121,7 @@ impl object_store::ObjectStore for ManifestCommitThenIoStore {
 struct AmbiguousFollowerSink {
     rollbacks: Arc<std::sync::atomic::AtomicU64>,
     schema: arrow::datatypes::SchemaRef,
+    expected_admission: Option<(Arc<LeaderLeaseStore>, CheckpointAttempt, LeaderProof)>,
 }
 
 #[cfg(feature = "cluster")]
@@ -141,6 +142,34 @@ impl laminar_connectors::connector::SinkConnector for AmbiguousFollowerSink {
         Ok(laminar_connectors::connector::WriteResult {
             records_written: 0,
             bytes_written: 0,
+        })
+    }
+
+    async fn begin_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        let Some((authority, expected_attempt, expected_proof)) = &self.expected_admission else {
+            return Ok(());
+        };
+        let admission = authority
+            .cluster_checkpoint_artifact_admission()
+            .await
+            .map_err(|error| {
+                laminar_connectors::error::ConnectorError::ConnectionFailed(error.to_string())
+            })?;
+        if admission.as_ref().is_some_and(|(inventory, proof)| {
+            inventory.attempt == *expected_attempt
+                && proof == expected_proof
+                && inventory.attempt.epoch == epoch
+        }) {
+            return Ok(());
+        }
+        Err(laminar_connectors::error::ConnectorError::InvalidState {
+            expected: format!(
+                "durable checkpoint admission for {expected_attempt:?} before sink begin"
+            ),
+            actual: format!("{admission:?}"),
         })
     }
 
@@ -1017,6 +1046,116 @@ async fn follower_assignment_authority_validation_is_bounded_by_attempt_deadline
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
+    use laminar_connectors::connector::{
+        SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
+    };
+
+    let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 1_000));
+    let boot = uuid::Uuid::from_u128(1);
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot,
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("empty checkpoint authority must grant its first leader term");
+    };
+    let proof = lease.proof();
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[1],
+        vec![CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: boot,
+        }],
+    )
+    .unwrap();
+    let control_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(1)));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        NodeId(1),
+        Arc::clone(&control_kv),
+        control_kv,
+        None,
+        members_rx,
+        boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))))
+        .unwrap();
+    let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
+    controller
+        .set_leader_lease_watch(
+            lease_rx,
+            owner,
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))),
+        )
+        .unwrap();
+    controller.set_leader_lease_store(Arc::clone(&authority));
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+    let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "leader-sink-epoch")
+        .with_participant_id(1);
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_durable_decision_store(decisions)
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator.set_assignment_version(fence.assignment_version);
+    coordinator.set_cluster_controller(controller);
+    let sink = AmbiguousFollowerSink {
+        rollbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        schema: Arc::new(arrow::datatypes::Schema::empty()),
+        expected_admission: Some((
+            Arc::clone(&authority),
+            CheckpointAttempt::canonical(1),
+            proof.clone(),
+        )),
+    };
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let sink_handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "probe".into(),
+        sink_id: Arc::from("probe"),
+        connector: Box::new(sink),
+        contract: SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coordinator.register_sink("probe", sink_handle.clone());
+
+    coordinator.begin_initial_epoch().await.unwrap();
+    let (inventory, admitted_proof) = authority
+        .cluster_checkpoint_artifact_admission()
+        .await
+        .unwrap()
+        .expect("leader must publish durable attempt authority");
+    assert_eq!(inventory.attempt, CheckpointAttempt::canonical(1));
+    assert_eq!(inventory.assignment_fence.as_ref(), Some(&fence));
+    assert_eq!(admitted_proof, proof);
+    assert!(sink_handle.open_epoch_admission(1).is_ok());
+    sink_handle.close().await.unwrap();
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_commit() {
     use laminar_connectors::connector::{
         SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
@@ -1109,6 +1248,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
     let sink = AmbiguousFollowerSink {
         rollbacks: Arc::clone(&rollbacks),
         schema: Arc::new(arrow::datatypes::Schema::empty()),
+        expected_admission: None,
     };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
@@ -1138,14 +1278,8 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         .begin_checkpoint_artifacts_until(attempt, Some(fence.clone()), Some(&proof), deadline)
         .await
         .unwrap();
-    sink_handle
-        .begin_epoch_until(attempt.epoch, deadline)
-        .await
-        .unwrap();
-    let admission = sink_handle
-        .begun_epoch_admission(attempt.epoch)
-        .expect("sink epoch must be begun before publication");
-    sink_handle.publish_open_epoch(admission).unwrap();
+    coordinator.begin_initial_epoch().await.unwrap();
+    assert_eq!(coordinator.allocator.peek_epoch(), attempt.epoch);
     sink_handle
         .seal_epoch_for_protocol_until(attempt.epoch, deadline)
         .await
@@ -1252,10 +1386,20 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
             &proof,
             attempt.epoch,
             attempt.checkpoint_id,
-            fence,
+            fence.clone(),
             laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
             Some(reference.clone()),
         )
+        .await
+        .unwrap();
+    let successor = CheckpointArtifactInventory {
+        deployment_id,
+        pipeline_identity: PipelineIdentity::empty(),
+        attempt: CheckpointAttempt::canonical(8),
+        assignment_fence: Some(fence),
+    };
+    authority
+        .begin_cluster_checkpoint_artifacts(&proof, successor.clone())
         .await
         .unwrap();
 
@@ -1263,6 +1407,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         .follower_finish_deferred(attempt.epoch, attempt.checkpoint_id, true, Instant::now(),)
         .await
         .unwrap());
+    assert_eq!(coordinator.allocator.peek_epoch(), successor.attempt.epoch);
     assert!(!coordinator.prepared.contains_key(&attempt));
     assert_eq!(coordinator.last_committed_ref(), Some(&reference));
     assert_eq!(

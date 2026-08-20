@@ -41,52 +41,80 @@ pub(super) fn spawn_supervised_restart(
     Ok(handle.spawn(attempt_supervised_restart(db, history, metrics)))
 }
 
-/// One recover-from-checkpoint restart, honoring the restart budget.
+/// Recover from a fault, retrying transient startup failures within the restart budget.
 pub(super) async fn attempt_supervised_restart(
     db: Arc<LaminarDB>,
     history: Arc<parking_lot::Mutex<Vec<std::time::Instant>>>,
     metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
 ) {
-    if let Err(error) = db.ensure_catalog_cleanup_unfenced("supervised restart") {
-        tracing::error!(%error, "supervisor rejected restart of terminally fenced database");
-        return;
-    }
     let policy = db.config.restart_policy.clone();
-    let slot = {
-        let mut hist = history.lock();
-        claim_restart_slot(
-            &mut hist,
-            std::time::Instant::now(),
-            policy.max_restarts,
-            policy.window,
-        )
-    };
-    let Some(attempt) = slot else {
-        tracing::error!(
-            max = policy.max_restarts,
-            "pipeline faulted too many times within the restart window; \
-             staying faulted for manual recovery"
+    let mut restartable_state = DbState::Faulted;
+    let mut fault = db.last_fault().unwrap_or_else(|| "unknown".to_string());
+    loop {
+        if let Err(error) = db.ensure_catalog_cleanup_unfenced("supervised restart") {
+            tracing::error!(%error, "supervisor rejected restart of terminally fenced database");
+            return;
+        }
+        if DbState::load(&db.state) != restartable_state {
+            return;
+        }
+        let slot = {
+            let mut hist = history.lock();
+            claim_restart_slot(
+                &mut hist,
+                std::time::Instant::now(),
+                policy.max_restarts,
+                policy.window,
+            )
+        };
+        let Some(attempt) = slot else {
+            tracing::error!(
+                max = policy.max_restarts,
+                "pipeline faulted too many times within the restart window; \
+                 staying non-running for manual recovery"
+            );
+            return;
+        };
+        let backoff = backoff_for_attempt(policy.initial_backoff, policy.max_backoff, attempt);
+        tokio::time::sleep(backoff).await;
+        // A concurrent start/stop/shutdown supersedes this supervisor. Do not attempt a restart or
+        // inflate the restart metric after ownership has moved elsewhere.
+        if DbState::load(&db.state) != restartable_state {
+            return;
+        }
+        if let Some(ref m) = metrics {
+            m.pipeline_restarts_total.inc();
+        }
+        tracing::warn!(
+            fault = %fault, ?backoff,
+            "auto-restarting faulted pipeline from last checkpoint"
         );
-        return;
-    };
-    let backoff = backoff_for_attempt(policy.initial_backoff, policy.max_backoff, attempt);
-    tokio::time::sleep(backoff).await;
-    // A concurrent stop/shutdown moves the state out of Faulted; don't fight it — and don't count a
-    // restart that won't happen, so a benign stop during backoff doesn't inflate the metric.
-    if !matches!(DbState::load(&db.state), DbState::Faulted) {
-        return;
-    }
-    if let Some(ref m) = metrics {
-        m.pipeline_restarts_total.inc();
-    }
-    // Capture the reason before start() clears `last_fault`, so it survives in the log.
-    let fault = db.last_fault().unwrap_or_else(|| "unknown".to_string());
-    tracing::warn!(
-        fault = %fault, ?backoff,
-        "auto-restarting faulted pipeline from last checkpoint"
-    );
-    if let Err(e) = db.start().await {
-        tracing::error!(error = %e, "auto-restart failed; pipeline left non-running");
+        match db.start().await {
+            Ok(()) => return,
+            Err(error) if error.is_transient() => {
+                let observed = DbState::load(&db.state);
+                if !matches!(observed, DbState::Created | DbState::Faulted) {
+                    tracing::error!(
+                        %error, state = ?observed,
+                        "transient auto-restart failure was superseded by another lifecycle owner"
+                    );
+                    return;
+                }
+                tracing::warn!(
+                    %error, state = ?observed,
+                    "auto-restart failed transiently; retrying within restart budget"
+                );
+                fault = error.to_string();
+                restartable_state = observed;
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "auto-restart failed permanently; pipeline left non-running"
+                );
+                return;
+            }
+        }
     }
 }
 

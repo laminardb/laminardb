@@ -6,6 +6,13 @@ use super::{
 };
 
 #[cfg(feature = "delta-lake")]
+const COORDINATED_TABLE_OPEN_MAX_ATTEMPTS: usize = 3;
+#[cfg(feature = "delta-lake")]
+const COORDINATED_TABLE_OPEN_RETRY_INITIAL: Duration = Duration::from_millis(50);
+#[cfg(feature = "delta-lake")]
+const COORDINATED_TABLE_OPEN_RETRY_MAX: Duration = Duration::from_millis(200);
+
+#[cfg(feature = "delta-lake")]
 pub(super) async fn run_tracked_delta_task<F>(guard: ConnectorTaskGuard, task: F) -> F::Output
 where
     F: Future,
@@ -91,6 +98,47 @@ impl UnresolvedDeltaPublication {
 }
 
 #[cfg(feature = "delta-lake")]
+async fn retry_coordinated_table_open_until<F, Fut, T>(
+    deadline: tokio::time::Instant,
+    mut open: F,
+) -> Result<T, ConnectorError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ConnectorError>>,
+{
+    let mut attempts = 0;
+    let mut backoff = COORDINATED_TABLE_OPEN_RETRY_INITIAL;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ConnectorError::TransactionError(
+                "Delta coordinated table open exceeded the publication deadline".into(),
+            ));
+        }
+        attempts += 1;
+        let result = tokio::time::timeout_at(deadline, open())
+            .await
+            .map_err(|_| {
+                ConnectorError::TransactionError(
+                    "Delta coordinated table open exceeded the publication deadline".into(),
+                )
+            })?;
+        match result {
+            Ok(table) => return Ok(table),
+            Err(error)
+                if error.is_transient() && attempts < COORDINATED_TABLE_OPEN_MAX_ATTEMPTS =>
+            {
+                let now = tokio::time::Instant::now();
+                tokio::time::sleep_until((now + backoff).min(deadline)).await;
+                backoff = backoff
+                    .saturating_mul(2)
+                    .min(COORDINATED_TABLE_OPEN_RETRY_MAX);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(feature = "delta-lake")]
 pub(super) async fn publish_coordinated_delta_batch(
     table_path: String,
     storage_options: std::collections::HashMap<String, String>,
@@ -104,16 +152,12 @@ pub(super) async fn publish_coordinated_delta_batch(
     let storage_options =
         super::super::delta_io::bound_coordinated_storage_options(storage_options);
     let result = async {
-        let table = tokio::time::timeout_at(
-            deadline,
-            super::super::delta_io::open_or_create_table(&table_path, storage_options, None),
-        )
-        .await
-        .map_err(|_| {
-            ConnectorError::TransactionError(
-                "Delta coordinated table open exceeded the publication deadline".into(),
-            )
-        })??;
+        // RECOVERY: `schema = None` keeps retries metadata-only. The conditional commit below is
+        // dispatched exactly once and retains its existing outcome-unknown reconciliation path.
+        let table = retry_coordinated_table_open_until(deadline, || {
+            super::super::delta_io::open_or_create_table(&table_path, storage_options.clone(), None)
+        })
+        .await?;
         let descriptor_count =
             super::super::delta_io::commit_batch_coordinated(&table, &batch, deadline).await?;
         info!(
@@ -143,4 +187,44 @@ pub(super) async fn publish_coordinated_delta_batch(
         ));
     }
     result
+}
+
+#[cfg(all(test, feature = "delta-lake"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn coordinated_table_open_retries_only_transient_failures() {
+        let attempts = AtomicUsize::new(0);
+        let opened = retry_coordinated_table_open_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || async {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                    Err(ConnectorError::ConnectionFailed(
+                        "temporary GET failure".into(),
+                    ))
+                } else {
+                    Ok(7_u64)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(opened, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_coordinated_table_open_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ConnectorError::ConfigurationError("bad credentials".into()))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 }

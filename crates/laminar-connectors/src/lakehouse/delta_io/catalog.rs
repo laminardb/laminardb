@@ -1,6 +1,8 @@
 //! Catalog-specific table URI and storage-option resolution.
 
-use super::{info, ConnectorError, HashMap};
+#[cfg(feature = "delta-lake-glue")]
+use super::info;
+use super::{ConnectorError, HashMap};
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
