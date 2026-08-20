@@ -2269,8 +2269,8 @@ impl LaminarDB {
             DbError::Checkpoint("assignment activation has no cluster controller".into())
         })?;
         let installed_transition = controller.checkpoint_drain_transition();
-        // INVARIANT: only terminal drain reconciliation may clear a locally active transition.
-        // A watcher whose durable read predates leader publication must retry from the new head.
+        // INVARIANT: an absent drain in an audited snapshot cannot clear a locally active
+        // transition. A watcher whose read predates leader publication retries from the new head.
         if !assignment_transition_allows_activation(
             fence,
             drain_transition.as_ref(),
