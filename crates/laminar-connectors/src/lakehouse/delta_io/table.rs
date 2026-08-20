@@ -47,7 +47,9 @@ pub(crate) fn widen_millisecond_timestamps(schema: &SchemaRef) -> SchemaRef {
 /// Casts via the kernel's own `cast_record_batch` (strict, no column
 /// addition) so schema validation is not weakened.
 #[cfg(feature = "delta-lake")]
-fn widen_batch_millisecond_timestamps(batch: RecordBatch) -> Result<RecordBatch, ConnectorError> {
+pub(crate) fn widen_batch_millisecond_timestamps(
+    batch: RecordBatch,
+) -> Result<RecordBatch, ConnectorError> {
     let target = widen_millisecond_timestamps(&batch.schema());
     if Arc::ptr_eq(&target, &batch.schema()) {
         return Ok(batch);

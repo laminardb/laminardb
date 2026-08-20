@@ -46,7 +46,9 @@ pub(crate) use merge::merge_changelog;
 #[cfg(feature = "delta-lake")]
 pub(crate) use read::read_batches_at_version;
 #[cfg(feature = "delta-lake")]
-pub(crate) use table::{widen_millisecond_timestamps, write_batches};
+pub(crate) use table::{
+    widen_batch_millisecond_timestamps, widen_millisecond_timestamps, write_batches,
+};
 
 #[cfg(all(feature = "delta-lake", test))]
 pub(super) use descriptor::decode_commit_descriptors;
