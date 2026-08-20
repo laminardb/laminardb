@@ -95,8 +95,9 @@ impl UnresolvedDeltaPublication {
 }
 
 #[cfg(feature = "delta-lake")]
-async fn retry_coordinated_table_open_until<F, Fut, T>(
+pub(super) async fn retry_coordinated_metadata_until<F, Fut, T>(
     deadline: tokio::time::Instant,
+    operation: &'static str,
     mut open: F,
 ) -> Result<T, ConnectorError>
 where
@@ -111,19 +112,19 @@ where
                 format!(" after transient failure: {error}")
             });
             return Err(ConnectorError::TransactionError(format!(
-                "Delta coordinated table open exceeded the publication deadline{context}"
+                "Delta coordinated {operation} exceeded its deadline{context}"
             )));
         }
         let result = tokio::time::timeout_at(deadline, open())
             .await
             .map_err(|_| {
-                ConnectorError::TransactionError(
-                    "Delta coordinated table open exceeded the publication deadline".into(),
-                )
+                ConnectorError::TransactionError(format!(
+                    "Delta coordinated {operation} exceeded its deadline"
+                ))
             })?;
         match result {
             Ok(table) => return Ok(table),
-            Err(error) if error.is_transient() => {
+            Err(error) if error.is_transient() && !error.is_outcome_unknown() => {
                 last_transient = Some(error.to_string());
                 let now = tokio::time::Instant::now();
                 let backoff = COORDINATED_TABLE_OPEN_BACKOFF.delay(retry);
@@ -151,7 +152,7 @@ pub(super) async fn publish_coordinated_delta_batch(
     let result = async {
         // RECOVERY: `schema = None` keeps retries metadata-only. The conditional commit below is
         // dispatched exactly once and retains its existing outcome-unknown reconciliation path.
-        let table = retry_coordinated_table_open_until(deadline, || {
+        let table = retry_coordinated_metadata_until(deadline, "table open", || {
             super::super::delta_io::open_or_create_table(&table_path, storage_options.clone(), None)
         })
         .await?;
@@ -194,8 +195,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn coordinated_table_open_retries_only_transient_failures() {
         let attempts = AtomicUsize::new(0);
-        let opened = retry_coordinated_table_open_until(
+        let opened = retry_coordinated_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(10),
+            "test read",
             || async {
                 if attempts.fetch_add(1, Ordering::SeqCst) < 5 {
                     Err(ConnectorError::ConnectionFailed(
@@ -212,8 +214,9 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 6);
 
         let attempts = AtomicUsize::new(0);
-        let error = retry_coordinated_table_open_until(
+        let error = retry_coordinated_metadata_until(
             tokio::time::Instant::now() + Duration::from_secs(1),
+            "test read",
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err::<(), _>(ConnectorError::ConfigurationError("bad credentials".into()))
@@ -225,8 +228,26 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
         let attempts = AtomicUsize::new(0);
-        let error = retry_coordinated_table_open_until(
+        let error = retry_coordinated_metadata_until(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            "test read",
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ConnectorError::outcome_unknown(
+                    "unexpected mutation uncertainty",
+                    true,
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_outcome_unknown());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_coordinated_metadata_until(
             tokio::time::Instant::now() + Duration::from_millis(500),
+            "test read",
             || async {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 Err::<(), _>(ConnectorError::ConnectionFailed(

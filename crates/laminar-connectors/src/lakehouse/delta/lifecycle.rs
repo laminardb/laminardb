@@ -8,7 +8,7 @@ use super::{
 };
 #[cfg(feature = "delta-lake")]
 use super::{
-    publish_coordinated_delta_batch, UnresolvedDeltaPublication,
+    publish_coordinated_delta_batch, retry_coordinated_metadata_until, UnresolvedDeltaPublication,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 
@@ -598,15 +598,21 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
         &self,
         namespace: &crate::connector::CoordinatedCommitNamespace,
     ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
-        let table = super::super::delta_io::open_or_create_table(
-            &self.resolved_table_path,
-            self.resolved_storage_options.clone(),
-            None,
-        )
-        .await?;
         let external_key = namespace.external_key();
-        let observed =
-            super::super::delta_io::get_coordinated_cursor(&table, &external_key).await?;
+        let deadline = self.operation_deadline();
+        // RECOVERY: both operations are metadata reads. Retrying typed transient failures cannot
+        // duplicate publication; the sink-task command still clamps this future to its caller's
+        // earlier checkpoint deadline.
+        let observed = retry_coordinated_metadata_until(deadline, "cursor read", || async {
+            let table = super::super::delta_io::open_or_create_table(
+                &self.resolved_table_path,
+                self.resolved_storage_options.clone(),
+                None,
+            )
+            .await?;
+            super::super::delta_io::get_coordinated_cursor(&table, &external_key).await
+        })
+        .await?;
         let mut unresolved = self.coordinated_unresolved_publication.lock();
         if unresolved.as_ref().is_some_and(|pending| {
             pending.external_key == external_key && pending.reconciled_by(observed)
