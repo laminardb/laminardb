@@ -2207,6 +2207,131 @@ async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
 }
 
 #[tokio::test]
+async fn missing_source_drain_receipt_requires_stopped_recovery() {
+    use laminar_connectors::connector::DeliveryGuarantee;
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeState;
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let peer_id = NodeId(2);
+    let self_boot = Uuid::from_u128(11);
+    let peer_boot = Uuid::from_u128(22);
+    let vnode_count = 2;
+    let current = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&vec![self_id; vnode_count as usize]),
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: self_boot,
+            }],
+        )
+        .unwrap();
+    let durable = Arc::new(store());
+    durable.save_if_absent(&current).await.unwrap();
+
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    kv.seed(
+        peer_id,
+        "control:recovery-incarnation",
+        peer_boot.to_string(),
+    );
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let (_members_tx, members_rx) =
+        tokio::sync::watch::channel(vec![member(peer_id, NodeState::Active)]);
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        self_id,
+        control,
+        recovery,
+        Some(Arc::clone(&durable)),
+        members_rx,
+        self_boot,
+    ));
+    controller.publish_recovery_incarnation().await.unwrap();
+    controller.set_active(true);
+    let _leader_lease = grant_test_leadership(&controller).await;
+    install_test_process_authority(
+        &controller,
+        &[
+            current.participants[0],
+            CheckpointParticipant {
+                node_id: peer_id.0,
+                boot_incarnation: peer_boot,
+            },
+        ],
+    )
+    .await;
+
+    let registry = Arc::new(VnodeRegistry::single_owner(vnode_count, self_id));
+    let db = LaminarDB::builder()
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(Arc::clone(&durable))
+        .build()
+        .await
+        .unwrap();
+    DbState::Running.store(&db.state);
+    controller.publish_checkpoint_assignment_fence(Some(current.assignment_fence().unwrap()));
+    db.publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), true)
+        .await
+        .unwrap();
+    let stalled =
+        crate::pipeline::streaming_coordinator::install_replacement_source_drain_task_for_test(
+            &db.owned_source_tasks,
+            "stalled-source",
+        );
+    let mut config = RebalanceConfig::test_defaults();
+    config.checkpoint_timeout = Duration::from_secs(1);
+    config.drain_ack_timeout = Duration::from_millis(25);
+
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, peer_id],
+        config,
+    )
+    .await
+    .expect_err("a missing FIFO receipt must force stopped recovery");
+    assert!(error.contains("coordinated recovery requested"), "{error}");
+
+    let head = durable.load().await.unwrap().unwrap();
+    assert!(
+        head.draining,
+        "the exact draining head must remain authoritative"
+    );
+    assert_eq!(head.version, current.version + 1);
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(
+        controller
+            .checkpoint_authority()
+            .unwrap()
+            .assignment_drain_decision(head.version)
+            .await
+            .unwrap()
+            .is_none(),
+        "an unacknowledged FIFO cut must not be live-aborted"
+    );
+    assert_ne!(
+        db.pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+    assert!(!controller.read_fault_reports().await.unwrap().is_empty());
+
+    stalled.request_shutdown();
+    assert!(
+        stalled
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+    );
+}
+
+#[tokio::test]
 async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
     let (

@@ -3599,24 +3599,18 @@ fn execute_graceful_rotation_owned(
                             "{failure}; drain is no longer authoritative: {error}"
                         ));
                     }
-                    if let Err(abort_error) = finalize_drain_snapshot(
-                        &db,
-                        &store,
-                        &controller,
-                        &drain,
-                        &current,
-                        AssignmentDrainVerdict::Abort,
-                        None,
-                        config,
-                        DrainFinalizationMode::Live,
-                    )
-                    .await
+                    // RECOVERY: a missing receipt means at least one provider FIFO cut is
+                    // unknown. Live Abort adoption fences predecessor execution before that
+                    // source can finish draining its queued pre-cut payload. Keep the draining
+                    // head authoritative and let stopped recovery materialize Abort only after
+                    // the complete predecessor roster is fenced.
+                    if let Err(recovery_error) = ensure_local_recovery_fault(&db, &controller).await
                     {
                         return Err(format!(
-                            "{failure}; assignment drain abort failed: {abort_error}"
+                            "{failure}; coordinated recovery request failed: {recovery_error}"
                         ));
                     }
-                    return Err(failure.into());
+                    return Err(format!("{failure}; coordinated recovery requested"));
                 }
                 audit_exact_drain_head(
                     &store,
