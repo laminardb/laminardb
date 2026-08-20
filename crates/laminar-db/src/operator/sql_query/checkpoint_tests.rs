@@ -1056,7 +1056,7 @@ async fn restored_frontier_bootstrap_precedes_live_source_frontier() {
 
 #[cfg(feature = "cluster")]
 #[test]
-fn rowless_local_observation_preserves_the_last_proven_frontier() {
+fn stale_graph_observation_preserves_the_installed_frontier_floor() {
     let (context, _) = context_and_batch();
     let mut operator = SqlQueryOperator::new_with_key_groups(
         "sum",
@@ -1081,17 +1081,24 @@ fn rowless_local_observation_preserves_the_last_proven_frontier() {
             idle: false,
         },
     ] {
-        let normalized = operator.normalized_local_frontier(observed, false).unwrap();
-        assert_eq!(normalized.watermark, proven.watermark);
-        assert_eq!(normalized.idle, observed.idle);
-        assert!(operator.normalized_local_frontier(observed, true).is_err());
+        for has_data in [false, true] {
+            let normalized = operator
+                .normalized_local_frontier(observed, has_data)
+                .unwrap();
+            assert_eq!(normalized.watermark, proven.watermark);
+            assert_eq!(normalized.idle, observed.idle);
+        }
     }
 
     let invalid = InputFrontier {
         watermark: Some(i64::MIN),
         idle: false,
     };
-    assert!(operator.normalized_local_frontier(invalid, false).is_err());
+    for has_data in [false, true] {
+        assert!(operator
+            .normalized_local_frontier(invalid, has_data)
+            .is_err());
+    }
 }
 
 #[cfg(feature = "cluster")]

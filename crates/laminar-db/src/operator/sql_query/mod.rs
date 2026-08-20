@@ -1464,8 +1464,8 @@ impl SqlQueryOperator {
             || matches!((previous.watermark, next.watermark), (Some(previous), Some(next)) if next < previous)
         {
             return Err(DbError::ShuffleTerminal(format!(
-                "aggregate '{}' {context} frontier regressed or became uninitialized",
-                self.op_name
+                "aggregate '{}' {context} frontier regressed or became uninitialized: previous={previous:?}, next={next:?}",
+                self.op_name,
             )));
         }
         Ok(())
@@ -1983,7 +1983,10 @@ impl SqlQueryOperator {
             )));
         }
         let mut normalized = input;
-        if (!has_data || self.local_frontier.idle) && input.watermark != Some(i64::MIN) {
+        // RECOVERY: the installed local cut remains authoritative while a restored or reassigned
+        // upstream graph frontier catches up. Clamp canonical observations even when delayed
+        // FULL/ANTI output carries data; a literal `Some(i64::MIN)` remains terminal below.
+        if input.watermark != Some(i64::MIN) {
             normalized.watermark = Self::max_watermark(
                 normalized.watermark,
                 if normalized.idle || !self.local_frontier.idle {
