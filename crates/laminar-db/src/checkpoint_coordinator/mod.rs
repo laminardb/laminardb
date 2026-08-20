@@ -694,6 +694,40 @@ pub(crate) struct RegisteredSink {
     handle: crate::sink_task::SinkTaskHandle,
 }
 
+#[cfg(feature = "cluster")]
+fn recovery_sink_fence(
+    checkpoint_proof: Option<&LeaderProof>,
+    continuation_proof: Option<&LeaderProof>,
+) -> Result<Option<u64>, DbError> {
+    let Some(continuation_proof) = continuation_proof else {
+        return Ok(None);
+    };
+    if !continuation_proof.is_canonical() {
+        return Err(DbError::Checkpoint(
+            "cluster recovery continuation has a non-canonical leader proof".into(),
+        ));
+    }
+    let checkpoint_proof = checkpoint_proof
+        .filter(|proof| proof.is_canonical())
+        .ok_or_else(|| {
+            DbError::Checkpoint(
+                "cluster recovery checkpoint has no canonical publishing leader proof".into(),
+            )
+        })?;
+    if continuation_proof.fencing_token < checkpoint_proof.fencing_token {
+        return Err(DbError::Checkpoint(format!(
+            "cluster recovery leader fencing token {} regressed below checkpoint token {}",
+            continuation_proof.fencing_token, checkpoint_proof.fencing_token
+        )));
+    }
+
+    // RECOVERY: the immutable checkpoint outcome binds the exact Delta publication batch to the
+    // leader term that committed it. A successor is the designated reconciler, but changing the
+    // batch token would make an already-published exact cursor look conflicting instead of
+    // idempotent after failover.
+    Ok(Some(checkpoint_proof.fencing_token))
+}
+
 struct PackedCheckpoint {
     manifest: CheckpointManifest,
     node_data: Vec<Bytes>,
@@ -2375,7 +2409,7 @@ impl CheckpointCoordinator {
             CheckpointScope::Cluster => {
                 #[cfg(feature = "cluster")]
                 {
-                    continuation_proof.as_ref().map(|proof| proof.fencing_token)
+                    recovery_sink_fence(outcome.leader_proof.as_ref(), continuation_proof.as_ref())?
                 }
                 #[cfg(not(feature = "cluster"))]
                 {

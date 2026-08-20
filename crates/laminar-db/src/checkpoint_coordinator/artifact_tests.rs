@@ -1155,6 +1155,39 @@ async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn cluster_recovery_reuses_the_checkpoint_bound_external_fence() {
+    use laminar_core::checkpoint::{LeaderProof, LeaderProofOwner};
+
+    let proof = |node_id, fencing_token| LeaderProof {
+        owner: LeaderProofOwner {
+            node_id,
+            boot_id: uuid::Uuid::from_u128(u128::from(node_id)),
+            process_term: 1,
+        },
+        fencing_token,
+    };
+    let checkpoint = proof(1, 7);
+    let successor = proof(2, 9);
+
+    assert_eq!(
+        recovery_sink_fence(Some(&checkpoint), Some(&successor)).unwrap(),
+        Some(checkpoint.fencing_token),
+        "the current leader designates publication, but the committed cut retains its exact token"
+    );
+    assert_eq!(
+        recovery_sink_fence(Some(&checkpoint), None).unwrap(),
+        None,
+        "a follower must not publish the external cut"
+    );
+    let regressed = proof(2, 6);
+    assert!(recovery_sink_fence(Some(&checkpoint), Some(&regressed))
+        .unwrap_err()
+        .to_string()
+        .contains("regressed"));
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_commit() {
     use laminar_connectors::connector::{

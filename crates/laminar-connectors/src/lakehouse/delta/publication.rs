@@ -6,11 +6,8 @@ use super::{
 };
 
 #[cfg(feature = "delta-lake")]
-const COORDINATED_TABLE_OPEN_MAX_ATTEMPTS: usize = 3;
-#[cfg(feature = "delta-lake")]
-const COORDINATED_TABLE_OPEN_RETRY_INITIAL: Duration = Duration::from_millis(50);
-#[cfg(feature = "delta-lake")]
-const COORDINATED_TABLE_OPEN_RETRY_MAX: Duration = Duration::from_millis(200);
+const COORDINATED_TABLE_OPEN_BACKOFF: crate::retry::Backoff =
+    crate::retry::Backoff::new(Duration::from_millis(50), Duration::from_secs(1), 0.25);
 
 #[cfg(feature = "delta-lake")]
 pub(super) async fn run_tracked_delta_task<F>(guard: ConnectorTaskGuard, task: F) -> F::Output
@@ -106,15 +103,17 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, ConnectorError>>,
 {
-    let mut attempts = 0;
-    let mut backoff = COORDINATED_TABLE_OPEN_RETRY_INITIAL;
+    let mut retry = 0;
+    let mut last_transient = None;
     loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(ConnectorError::TransactionError(
-                "Delta coordinated table open exceeded the publication deadline".into(),
-            ));
+            let context = last_transient.map_or_else(String::new, |error| {
+                format!(" after transient failure: {error}")
+            });
+            return Err(ConnectorError::TransactionError(format!(
+                "Delta coordinated table open exceeded the publication deadline{context}"
+            )));
         }
-        attempts += 1;
         let result = tokio::time::timeout_at(deadline, open())
             .await
             .map_err(|_| {
@@ -124,14 +123,12 @@ where
             })?;
         match result {
             Ok(table) => return Ok(table),
-            Err(error)
-                if error.is_transient() && attempts < COORDINATED_TABLE_OPEN_MAX_ATTEMPTS =>
-            {
+            Err(error) if error.is_transient() => {
+                last_transient = Some(error.to_string());
                 let now = tokio::time::Instant::now();
+                let backoff = COORDINATED_TABLE_OPEN_BACKOFF.delay(retry);
+                retry = retry.saturating_add(1);
                 tokio::time::sleep_until((now + backoff).min(deadline)).await;
-                backoff = backoff
-                    .saturating_mul(2)
-                    .min(COORDINATED_TABLE_OPEN_RETRY_MAX);
             }
             Err(error) => return Err(error),
         }
@@ -198,9 +195,9 @@ mod tests {
     async fn coordinated_table_open_retries_only_transient_failures() {
         let attempts = AtomicUsize::new(0);
         let opened = retry_coordinated_table_open_until(
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(10),
             || async {
-                if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                if attempts.fetch_add(1, Ordering::SeqCst) < 5 {
                     Err(ConnectorError::ConnectionFailed(
                         "temporary GET failure".into(),
                     ))
@@ -212,7 +209,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(opened, 7);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 6);
 
         let attempts = AtomicUsize::new(0);
         let error = retry_coordinated_table_open_until(
@@ -226,5 +223,21 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, ConnectorError::ConfigurationError(_)));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        let attempts = AtomicUsize::new(0);
+        let error = retry_coordinated_table_open_until(
+            tokio::time::Instant::now() + Duration::from_millis(500),
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ConnectorError::ConnectionFailed(
+                    "persistent GET failure".into(),
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ConnectorError::TransactionError(_)));
+        assert!(error.to_string().contains("persistent GET failure"));
+        assert!(attempts.load(Ordering::SeqCst) > 1);
     }
 }

@@ -483,6 +483,11 @@ impl LaminarDB {
     pub(super) async fn cleanup_failed_start(&self) -> Result<(), DbError> {
         const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
+        // INVARIANT: startup installs its generation token before preparing connectors. Cancel it
+        // even when startup fails before runtime launch so recovery can prove the Created process
+        // has no live generation and a partially launched task observes the same terminal signal.
+        self.runtime_shutdown.read().cancel();
+        self.shutdown_signal.notify_one();
         self.quiesce_checkpoint_decision_until(deadline).await?;
         {
             let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())

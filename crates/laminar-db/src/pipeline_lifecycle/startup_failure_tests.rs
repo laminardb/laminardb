@@ -34,3 +34,15 @@ async fn startup_attempt_preserves_every_terminal_error_variant() {
         } if context == "restore budget"
     ));
 }
+
+#[tokio::test]
+async fn failed_start_cleanup_cancels_the_prepared_runtime_generation() {
+    let db = LaminarDB::open().unwrap();
+    let prepared = tokio_util::sync::CancellationToken::new();
+    *db.runtime_shutdown.write() = prepared.clone();
+
+    db.cleanup_failed_start().await.unwrap();
+
+    assert!(prepared.is_cancelled());
+    db.shutdown().await.unwrap();
+}

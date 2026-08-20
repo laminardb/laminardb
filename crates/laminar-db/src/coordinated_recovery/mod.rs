@@ -1920,6 +1920,12 @@ impl RecoveryMonitor {
             }
         };
         if let Err(error) = start_pipeline(db, Some(target)).await {
+            tracing::warn!(
+                gen = gen_id,
+                terminal = error.requires_pipeline_halt(),
+                %error,
+                "recovery pipeline restart failed"
+            );
             if error.requires_pipeline_halt() {
                 return RestoreAckOutcome::Terminal;
             }
