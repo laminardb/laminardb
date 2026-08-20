@@ -79,6 +79,11 @@ fn object_store_error_is_retryable(
                 _ => return false,
             }
         }
+        // COMPAT: object_store's private transparent request wrapper skips
+        // HttpError in Error::source(), but exposes its reqwest transport error.
+        if let Some(request) = current.downcast_ref::<delta_reqwest::Error>() {
+            return request.is_timeout() || request.is_request() || request.is_body();
+        }
         // COMPAT: object_store can classify newer reqwest/hyper chains as Unknown. Only a
         // concrete transport I/O cause below that typed HTTP boundary is safe to retry.
         if unknown_http

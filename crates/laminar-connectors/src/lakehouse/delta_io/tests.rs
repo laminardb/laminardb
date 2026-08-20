@@ -234,6 +234,45 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(!untyped.is_transient());
 }
 
+#[tokio::test]
+async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
+    use delta_object_store::aws::AmazonS3Builder;
+    use delta_object_store::{ObjectStore as _, RetryConfig};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        drop(connection);
+    });
+    let store = AmazonS3Builder::new()
+        .with_access_key_id("test")
+        .with_secret_access_key("test")
+        .with_region("test")
+        .with_bucket_name("test")
+        .with_endpoint(endpoint)
+        .with_allow_http(true)
+        .with_retry(RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        })
+        .build()
+        .unwrap();
+    let error = store
+        .head(&delta_object_store::path::Path::from("object"))
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let error =
+        deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(error));
+    let classified = classify_delta_metadata_error("read cursor", &error);
+    assert!(
+        matches!(classified, ConnectorError::ReadError(_)),
+        "S3 transport chain was classified as {classified}"
+    );
+}
+
 #[test]
 fn only_proven_optimistic_collisions_are_retryable_conflicts() {
     use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
