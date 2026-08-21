@@ -39,8 +39,11 @@ use tokio::sync::watch;
 
 use super::control::{AssignmentSnapshotStore, ChitchatKv, ClusterController, ClusterKv};
 use super::discovery::{
-    Discovery, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo, NodeMetadata, NodeState,
+    Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
+    NodeMetadata, NodeState,
 };
+
+const GOSSIP_BIND_ATTEMPTS: usize = 16;
 
 /// Shared per-cluster partition rules. Each (src, dst) pair in the
 /// set causes sends from `src` to `dst` to be silently dropped. The
@@ -318,14 +321,41 @@ impl Socket for PartitionableSocket {
     }
 }
 
-/// Returns a free loopback UDP port. Binds and drops a socket to
-/// discover an ephemeral port; race with concurrent binders is
-/// accepted for test use.
-fn grab_port() -> u16 {
+/// Returns a currently available loopback UDP address.
+fn available_gossip_addr() -> String {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     let port = sock.local_addr().expect("local_addr").port();
-    drop(sock);
-    port
+    format!("127.0.0.1:{port}")
+}
+
+async fn start_discovery(
+    mut config: GossipDiscoveryConfig,
+    rules: Option<&Arc<NetworkRules>>,
+) -> (GossipDiscovery, String) {
+    let mut last_bind_error = None;
+    for _ in 0..GOSSIP_BIND_ATTEMPTS {
+        let gossip_addr = config.gossip_address.clone();
+        let mut discovery = GossipDiscovery::new(config.clone());
+        let result = match rules {
+            Some(rules) => {
+                let transport = PartitionableTransport::new(Arc::clone(rules));
+                discovery.start_with_transport(&transport).await
+            }
+            None => discovery.start().await,
+        };
+        match result {
+            Ok(()) => return (discovery, gossip_addr),
+            Err(DiscoveryError::Bind(error)) => {
+                last_bind_error = Some(error);
+                config.gossip_address = available_gossip_addr();
+            }
+            Err(error) => panic!("chitchat start failed: {error}"),
+        }
+    }
+    panic!(
+        "chitchat failed to bind a loopback port after {GOSSIP_BIND_ATTEMPTS} attempts: {}",
+        last_bind_error.as_deref().unwrap_or("unknown bind error")
+    );
 }
 
 /// One instance of the mini-cluster: a gossip discovery + controller.
@@ -470,9 +500,6 @@ impl MiniCluster {
         // multiple contact points regardless of which one answers
         // first.
         let seeds: Vec<String> = self.nodes.iter().map(|n| n.gossip_addr.clone()).collect();
-        let port = grab_port();
-        let gossip_addr = format!("127.0.0.1:{port}");
-
         let process_generation = 2;
         let local_node = NodeInfo {
             id: instance_id,
@@ -484,7 +511,7 @@ impl MiniCluster {
         };
 
         let cfg = GossipDiscoveryConfig {
-            gossip_address: gossip_addr.clone(),
+            gossip_address: available_gossip_addr(),
             seed_nodes: seeds,
             gossip_interval: Duration::from_millis(50),
             phi_threshold: 3.0,
@@ -495,17 +522,7 @@ impl MiniCluster {
             local_node,
             advertise_host: None,
         };
-        let mut discovery = GossipDiscovery::new(cfg);
-        match &self.rules {
-            Some(rules) => {
-                let transport = PartitionableTransport::new(Arc::clone(rules));
-                discovery
-                    .start_with_transport(&transport)
-                    .await
-                    .expect("partitionable chitchat start on rejoin");
-            }
-            None => discovery.start().await.expect("chitchat start on rejoin"),
-        }
+        let (discovery, gossip_addr) = start_discovery(cfg, self.rules.as_ref()).await;
 
         let handle = discovery
             .chitchat_handle()
@@ -535,17 +552,10 @@ impl MiniCluster {
     ) -> Self {
         assert!(n >= 1, "MiniCluster needs at least one node");
 
-        let ports: Vec<u16> = (0..n).map(|_| grab_port()).collect();
-        let seed = format!("127.0.0.1:{}", ports[0]);
-        let transport = rules
-            .as_ref()
-            .map(|r| PartitionableTransport::new(Arc::clone(r)));
-
-        let mut nodes = Vec::with_capacity(n);
-        for (idx, port) in ports.iter().enumerate() {
+        let mut nodes: Vec<NodeHandle> = Vec::with_capacity(n);
+        for idx in 0..n {
             let instance_id = NodeId((idx as u64) + 1); // skip UNASSIGNED=0
             let process_generation = 1;
-            let gossip_addr = format!("127.0.0.1:{port}");
 
             let local_node = NodeInfo {
                 id: instance_id,
@@ -559,13 +569,13 @@ impl MiniCluster {
             let seeds = if idx == 0 {
                 Vec::new()
             } else {
-                vec![seed.clone()]
+                vec![nodes[0].gossip_addr.clone()]
             };
             // Aggressive timings: tests trade false-positive risk for
             // fast failover feedback. Production configs use the
             // chitchat defaults (phi=8.0, grace≈3s).
             let cfg = GossipDiscoveryConfig {
-                gossip_address: gossip_addr.clone(),
+                gossip_address: available_gossip_addr(),
                 seed_nodes: seeds,
                 gossip_interval: Duration::from_millis(50),
                 phi_threshold: 3.0,
@@ -576,14 +586,7 @@ impl MiniCluster {
                 local_node,
                 advertise_host: None,
             };
-            let mut discovery = GossipDiscovery::new(cfg);
-            match &transport {
-                Some(t) => discovery
-                    .start_with_transport(t)
-                    .await
-                    .expect("partitionable chitchat start"),
-                None => discovery.start().await.expect("chitchat start on loopback"),
-            }
+            let (discovery, gossip_addr) = start_discovery(cfg, rules.as_ref()).await;
 
             let handle = discovery
                 .chitchat_handle()
