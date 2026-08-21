@@ -124,7 +124,7 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "5000"
-            visibility_ms: "60000"
+            visibility_ms: "90000"
             slo_mode: observe
           - label: Cluster ALO stateful joins (gossip)
             test: three_node_alo_join_kill9_soak
@@ -154,7 +154,7 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "5000"
-            visibility_ms: "60000"
+            visibility_ms: "90000"
             slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
@@ -164,7 +164,7 @@ jobs:
             discovery: static
             emulator: "1"
             checkpoint_ms: "5000"
-            visibility_ms: "60000"
+            visibility_ms: "90000"
             slo_mode: observe
     steps:
       - uses: actions/checkout@v6
@@ -227,9 +227,9 @@ jobs:
           LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           # A 5s EO cadence remains 2x tighter than the production default without turning one
-          # MinIO emulator into the bottleneck for 23 exact sinks. Blacksmith is not pinned target
-          # hardware, so every matrix leg retains exact timing evidence without claiming latency
-          # certification; run the test's default certify mode on production-class hardware.
+          # MinIO emulator into the bottleneck for 23 exact sinks. The EO visibility limit uses the
+          # same 90s protocol-liveness window as recovery on this emulator; the test's 10s default
+          # remains the certifying threshold for production-class object storage.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}

@@ -7384,25 +7384,11 @@ fn wait_delta_exact_outputs(
     let mut observations = vec![String::new(); outputs.len()];
     while completed.iter().any(Option::is_none) {
         assert_running_nodes(nodes);
-        let polled = std::thread::scope(|scope| {
-            let workers = outputs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| completed[*index].is_none())
-                .map(|(index, output)| (index, scope.spawn(move || delta_exact_snapshot(output))))
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|(index, worker)| {
-                    let result = worker
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    (index, result)
-                })
-                .collect::<Vec<_>>()
-        });
-        for (index, result) in polled {
-            let output = &outputs[index];
+        for (index, output) in outputs.iter().enumerate() {
+            if completed[index].is_some() {
+                continue;
+            }
+            let result = delta_exact_snapshot(output);
             match result {
                 Ok((snapshot, observed_at)) => {
                     let visibility = observed_at.saturating_duration_since(output.frozen_input_at);
