@@ -7,7 +7,10 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::super::lease_deadline::LeaseDeadline;
-use super::{now_millis, ProcessLease, ProcessLeaseError, ProcessLeaseOutcome, ProcessLeaseStore};
+use super::{
+    now_millis, ProcessLease, ProcessLeaseError, ProcessLeaseOutcome, ProcessLeaseStore,
+    PROCESS_LEASE_RENEW_RETRY_DELAY,
+};
 
 /// Internal renewal timings for the stable-node lease.
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +192,13 @@ impl ProcessLeaseManager {
                         return;
                     }
                     Ok(Err(error)) => {
+                        if matches!(&error, ProcessLeaseError::Io(_)) {
+                            // RECOVERY: Preserve the original absolute fence, but do not discard
+                            // its remaining retry budget after a completed transient I/O failure.
+                            ticker.reset_after(
+                                PROCESS_LEASE_RENEW_RETRY_DELAY.min(self.config.renew_interval),
+                            );
+                        }
                         tracing::warn!(%error, "stable node identity lease renewal failed");
                     }
                     Err(_) => {

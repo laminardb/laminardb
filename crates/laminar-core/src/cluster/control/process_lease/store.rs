@@ -553,7 +553,13 @@ impl ProcessLeaseStore {
             let sequences = match self.list_seqs().await {
                 Ok(sequences) => sequences,
                 Err(error) => {
-                    self.schedule_history_prune(true);
+                    // RECOVERY: A transient LIST failure says nothing about retention health.
+                    // Starting a prune would duplicate authority I/O during the outage and could
+                    // force the next renewal through synchronous repair. Invalid inventory still
+                    // triggers the bounded repair path.
+                    if matches!(&error, ProcessLeaseError::Invalid(_)) {
+                        self.schedule_history_prune(true);
+                    }
                     return Err(error);
                 }
             };

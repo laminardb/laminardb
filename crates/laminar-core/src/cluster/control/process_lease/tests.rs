@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -385,6 +385,10 @@ struct PutBarrierStore {
     path: OsPath,
     arrivals: Option<tokio::sync::Barrier>,
     delay_response: bool,
+    fail_once: AtomicBool,
+    failed_once: AtomicBool,
+    failure_observed: tokio::sync::Semaphore,
+    retry_observed: tokio::sync::Semaphore,
     committed: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     conflict_as_precondition: bool,
@@ -416,8 +420,19 @@ impl ObjectStore for PutBarrierStore {
             if let Some(arrivals) = &self.arrivals {
                 arrivals.wait().await;
             }
+            if self.fail_once.swap(false, Ordering::AcqRel) {
+                self.failed_once.store(true, Ordering::Release);
+                self.failure_observed.add_permits(1);
+                return Err(object_store::Error::Generic {
+                    store: "PutBarrierStore",
+                    source: Box::new(std::io::Error::other("injected transient put failure")),
+                });
+            }
         }
         let result = self.inner.put_opts(location, payload, options).await;
+        if location == &self.path && result.is_ok() && self.failed_once.load(Ordering::Acquire) {
+            self.retry_observed.add_permits(1);
+        }
         if location == &self.path && self.delay_response {
             self.committed.add_permits(1);
             self.release
@@ -491,6 +506,8 @@ struct GetBarrierStore {
     inner: Arc<dyn ObjectStore>,
     path: OsPath,
     armed: AtomicBool,
+    fail_list_once: AtomicBool,
+    list_calls: AtomicU64,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
 }
@@ -558,6 +575,15 @@ impl ObjectStore for GetBarrierStore {
         &self,
         prefix: Option<&OsPath>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.list_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_list_once.swap(false, Ordering::AcqRel) {
+            return Box::pin(futures::stream::once(async {
+                Err(object_store::Error::Generic {
+                    store: "GetBarrierStore",
+                    source: Box::new(std::io::Error::other("injected transient list failure")),
+                })
+            }));
+        }
         self.inner.list(prefix)
     }
 
@@ -576,6 +602,38 @@ impl ObjectStore for GetBarrierStore {
     ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
+}
+
+#[tokio::test]
+async fn transient_head_list_failure_does_not_start_retention_pruning() {
+    let node = NodeId(7);
+    let owner = Uuid::from_u128(1);
+    let faulted = Arc::new(GetBarrierStore {
+        inner: Arc::new(InMemory::new()),
+        path: lease_path(node, 1),
+        armed: AtomicBool::new(false),
+        fail_list_once: AtomicBool::new(false),
+        list_calls: AtomicU64::new(0),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let object_store: Arc<dyn ObjectStore> = faulted.clone();
+    let store = ProcessLeaseStore::new(object_store, node, 1_000);
+    store.try_acquire(owner, 0).await.unwrap();
+    let list_calls = faulted.list_calls.load(Ordering::Acquire);
+    faulted.fail_list_once.store(true, Ordering::Release);
+
+    assert!(matches!(store.load().await, Err(ProcessLeaseError::Io(_))));
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        faulted.list_calls.load(Ordering::Acquire),
+        list_calls + 1,
+        "transient authority I/O must not launch a concurrent history prune"
+    );
+    assert!(store.prune_healthy.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -606,6 +664,8 @@ async fn participant_term_verification_rechecks_the_head_after_fence_evidence() 
         inner: Arc::clone(&backing),
         path: successor_fence_path(node, second, second_head.term),
         armed: AtomicBool::new(true),
+        fail_list_once: AtomicBool::new(false),
+        list_calls: AtomicU64::new(0),
         entered: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
     });
@@ -653,6 +713,10 @@ async fn create_cas_has_one_winner() {
         path: lease_path(node, 1),
         arrivals: Some(tokio::sync::Barrier::new(2)),
         delay_response: false,
+        fail_once: AtomicBool::new(false),
+        failed_once: AtomicBool::new(false),
+        failure_observed: tokio::sync::Semaphore::new(0),
+        retry_observed: tokio::sync::Semaphore::new(0),
         committed: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         conflict_as_precondition: true,
@@ -772,6 +836,10 @@ async fn delayed_acquisition_response_cannot_publish_a_fresh_local_deadline() {
         path: lease_path(node, 1),
         arrivals: None,
         delay_response: true,
+        fail_once: AtomicBool::new(false),
+        failed_once: AtomicBool::new(false),
+        failure_observed: tokio::sync::Semaphore::new(0),
+        retry_observed: tokio::sync::Semaphore::new(0),
         committed: tokio::sync::Semaphore::new(0),
         release: tokio::sync::Semaphore::new(0),
         conflict_as_precondition: false,
@@ -819,6 +887,69 @@ async fn delayed_acquisition_response_cannot_publish_a_fresh_local_deadline() {
         error.to_string().contains("response arrived after"),
         "{error}"
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn transient_renewal_io_failure_retries_before_the_normal_cadence() {
+    let node = NodeId(7);
+    let owner = Uuid::from_u128(1);
+    let ttl = Duration::from_secs(15);
+    let renew_interval = Duration::from_secs(5);
+    let faulted = Arc::new(PutBarrierStore {
+        inner: Arc::new(InMemory::new()),
+        path: lease_path(node, 2),
+        arrivals: None,
+        delay_response: false,
+        fail_once: AtomicBool::new(true),
+        failed_once: AtomicBool::new(false),
+        failure_observed: tokio::sync::Semaphore::new(0),
+        retry_observed: tokio::sync::Semaphore::new(0),
+        committed: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+        conflict_as_precondition: false,
+    });
+    let object_store: Arc<dyn ObjectStore> = faulted.clone();
+    let store = Arc::new(ProcessLeaseStore::new(object_store, node, 15_000));
+    let acquisition_started_at = Instant::now();
+    let ProcessLeaseOutcome::Acquired(initial) = store.try_acquire(owner, 0).await.unwrap() else {
+        panic!("initial process lease must be acquired");
+    };
+    let manager = ProcessLeaseManager::new(
+        Arc::clone(&store),
+        owner,
+        ProcessLeaseConfig {
+            ttl,
+            renew_interval,
+        },
+        acquisition_started_at,
+        &initial,
+    )
+    .unwrap();
+    let deadline = manager.deadline();
+    let live = manager.live_watch();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let task = manager.spawn(shutdown.clone());
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(renew_interval).await;
+    faulted.failure_observed.acquire().await.unwrap().forget();
+    tokio::time::advance(PROCESS_LEASE_RENEW_RETRY_DELAY.saturating_sub(Duration::from_millis(1)))
+        .await;
+    tokio::task::yield_now().await;
+    assert_eq!(faulted.retry_observed.available_permits(), 0);
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    faulted.retry_observed.acquire().await.unwrap().forget();
+    assert!(deadline.is_live());
+    assert!(*live.borrow());
+    assert!(matches!(
+        store.load().await.unwrap(),
+        Some(ProcessLease { seq: 2, .. })
+    ));
+
+    shutdown.cancel();
+    task.await.unwrap();
 }
 
 #[cfg(feature = "cluster")]

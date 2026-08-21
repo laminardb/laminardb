@@ -29,6 +29,7 @@ const PROCESS_LEASE_PRUNE_READ_CONCURRENCY: usize = 32;
 const PROCESS_LEASE_WRITES_PER_PRUNE: u64 = 64;
 const PROCESS_LEASE_MAX_PRUNE_BATCHES: usize = 4;
 const PROCESS_LEASE_PRUNE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_LEASE_RENEW_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 fn lease_prefix(node: NodeId) -> String {
     format!("control/process-lease/node={}/", node.0)
