@@ -204,11 +204,15 @@ impl WindowRewriter {
         match arg {
             FunctionArg::Unnamed(arg_expr) => match arg_expr {
                 FunctionArgExpr::Expr(expr) => Some(expr.clone()),
-                FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => None,
+                FunctionArgExpr::Wildcard
+                | FunctionArgExpr::WildcardWithOptions(_)
+                | FunctionArgExpr::QualifiedWildcard(_) => None,
             },
             FunctionArg::Named { arg, .. } | FunctionArg::ExprNamed { arg, .. } => match arg {
                 FunctionArgExpr::Expr(expr) => Some(expr.clone()),
-                FunctionArgExpr::Wildcard | FunctionArgExpr::QualifiedWildcard(_) => None,
+                FunctionArgExpr::Wildcard
+                | FunctionArgExpr::WildcardWithOptions(_)
+                | FunctionArgExpr::QualifiedWildcard(_) => None,
             },
         }
     }

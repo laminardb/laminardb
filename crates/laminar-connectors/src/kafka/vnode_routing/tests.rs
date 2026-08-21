@@ -7,7 +7,7 @@ const TOPIC: &str = "orders.v1";
 
 #[test]
 fn mapping_has_hard_coded_abi_vectors() {
-    assert_eq!(laminar_core::state::PARTITIONING_ABI_VERSION, 1);
+    assert_eq!(laminar_core::state::PARTITIONING_ABI_VERSION, 2);
     let actual: Vec<u32> = (0..8)
         .map(|partition| partition_vnode(SOURCE, TOPIC, partition, 256).unwrap())
         .collect();

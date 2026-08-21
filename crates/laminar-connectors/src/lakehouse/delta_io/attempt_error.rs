@@ -54,7 +54,7 @@ fn object_store_error_is_retryable(
     error: &deltalake::ObjectStoreError,
     policy: DeltaHttpRetryPolicy,
 ) -> bool {
-    use delta_object_store::client::{HttpError, HttpErrorKind};
+    use object_store::client::{HttpError, HttpErrorKind};
 
     // Typed permanent/conditional variants fail closed. Unknown HTTP failures are
     // retryable only for bounded idempotent reads; writes require a concrete I/O cause.

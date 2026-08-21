@@ -42,13 +42,12 @@ pub(super) fn contains_builtin_join_without_cluster_lifecycle(
         SymmetricHashJoinExec,
     };
 
-    let plan_type = plan.as_any();
-    plan_type.is::<CrossJoinExec>()
-        || plan_type.is::<HashJoinExec>()
-        || plan_type.is::<NestedLoopJoinExec>()
-        || plan_type.is::<PiecewiseMergeJoinExec>()
-        || plan_type.is::<SortMergeJoinExec>()
-        || plan_type.is::<SymmetricHashJoinExec>()
+    plan.is::<CrossJoinExec>()
+        || plan.is::<HashJoinExec>()
+        || plan.is::<NestedLoopJoinExec>()
+        || plan.is::<PiecewiseMergeJoinExec>()
+        || plan.is::<SortMergeJoinExec>()
+        || plan.is::<SymmetricHashJoinExec>()
         || plan
             .children()
             .into_iter()

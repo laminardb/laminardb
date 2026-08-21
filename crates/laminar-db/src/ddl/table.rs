@@ -50,6 +50,7 @@ fn reject_standard_table_extensions(create: &sqlparser::ast::CreateTable) -> Res
     reject_clause(create.transient, "TRANSIENT")?;
     reject_clause(create.volatile, "VOLATILE")?;
     reject_clause(create.iceberg, "ICEBERG")?;
+    reject_clause(create.snapshot, "SNAPSHOT")?;
     reject_clause(
         !matches!(
             &create.hive_distribution,
@@ -86,8 +87,14 @@ fn reject_key_and_layout_clauses(create: &sqlparser::ast::CreateTable) -> Result
     reject_clause(create.cluster_by.is_some(), "CLUSTER BY")?;
     reject_clause(create.clustered_by.is_some(), "CLUSTERED BY")?;
     reject_clause(create.inherits.is_some(), "INHERITS")?;
+    reject_clause(create.partition_of.is_some(), "PARTITION OF")?;
+    reject_clause(create.for_values.is_some(), "FOR VALUES")?;
     reject_clause(create.strict, "STRICT")?;
     reject_clause(create.copy_grants, "COPY GRANTS")?;
+    reject_clause(create.diststyle.is_some(), "DISTSTYLE")?;
+    reject_clause(create.distkey.is_some(), "DISTKEY")?;
+    reject_clause(create.sortkey.is_some(), "SORTKEY")?;
+    reject_clause(create.backup.is_some(), "BACKUP")?;
     Ok(())
 }
 
@@ -115,6 +122,10 @@ fn reject_policy_clauses(create: &sqlparser::ast::CreateTable) -> Result<(), DbE
         "AGGREGATION POLICY",
     )?;
     reject_clause(create.with_row_access_policy.is_some(), "ROW ACCESS POLICY")?;
+    reject_clause(
+        create.with_storage_lifecycle_policy.is_some(),
+        "STORAGE LIFECYCLE POLICY",
+    )?;
     reject_clause(create.with_tags.is_some(), "TAG")?;
     reject_clause(create.external_volume.is_some(), "EXTERNAL_VOLUME")?;
     reject_clause(create.base_location.is_some(), "BASE_LOCATION")?;
@@ -149,6 +160,7 @@ pub(super) fn validate_create_table_envelope(
         transient: _,
         volatile: _,
         iceberg: _,
+        snapshot: _,
         name: _,
         columns: _,
         constraints: _,
@@ -171,6 +183,8 @@ pub(super) fn validate_create_table_envelope(
         cluster_by: _,
         clustered_by: _,
         inherits: _,
+        partition_of: _,
+        for_values: _,
         strict: _,
         copy_grants: _,
         enable_schema_evolution: _,
@@ -180,6 +194,7 @@ pub(super) fn validate_create_table_envelope(
         default_ddl_collation: _,
         with_aggregation_policy: _,
         with_row_access_policy: _,
+        with_storage_lifecycle_policy: _,
         with_tags: _,
         external_volume: _,
         base_location: _,
@@ -191,6 +206,10 @@ pub(super) fn validate_create_table_envelope(
         refresh_mode: _,
         initialize: _,
         require_user: _,
+        diststyle: _,
+        distkey: _,
+        sortkey: _,
+        backup: _,
     } = create;
 
     if create.or_replace {
@@ -258,10 +277,16 @@ fn collect_column_shape(create: &sqlparser::ast::CreateTable) -> Result<ColumnSh
                         )));
                     }
                 }
-                ColumnOption::Unique {
-                    is_primary: true,
-                    characteristics: None,
-                } => primary_keys.push(vec![identity.clone()]),
+                ColumnOption::PrimaryKey(primary_key)
+                    if primary_key.name.is_none()
+                        && primary_key.index_name.is_none()
+                        && primary_key.index_type.is_none()
+                        && primary_key.columns.is_empty()
+                        && primary_key.index_options.is_empty()
+                        && primary_key.characteristics.is_none() =>
+                {
+                    primary_keys.push(vec![identity.clone()]);
+                }
                 unsupported => {
                     return Err(DbError::InvalidOperation(format!(
                         "unsupported CREATE TABLE option for column '{name}': {unsupported}"
@@ -279,23 +304,23 @@ fn collect_column_shape(create: &sqlparser::ast::CreateTable) -> Result<ColumnSh
 fn collect_primary_key_constraints(
     create: &sqlparser::ast::CreateTable,
 ) -> Result<Vec<Vec<String>>, DbError> {
-    use sqlparser::ast::{Expr, TableConstraint};
+    use sqlparser::ast::{Expr, PrimaryKeyConstraint, TableConstraint};
 
     let mut primary_keys = Vec::new();
     for constraint in &create.constraints {
-        let TableConstraint::PrimaryKey {
+        let TableConstraint::PrimaryKey(primary_key) = constraint else {
+            return Err(DbError::InvalidOperation(format!(
+                "unsupported CREATE TABLE constraint: {constraint}"
+            )));
+        };
+        let PrimaryKeyConstraint {
             name,
             index_name,
             index_type,
             columns,
             index_options,
             characteristics,
-        } = constraint
-        else {
-            return Err(DbError::InvalidOperation(format!(
-                "unsupported CREATE TABLE constraint: {constraint}"
-            )));
-        };
+        } = primary_key;
 
         if name.is_some()
             || index_name.is_some()

@@ -111,7 +111,7 @@ fn validate_temporal_select_shape(select: &sqlparser::ast::Select) -> Result<(),
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
     {
         return Err(temporal_projection_error(
             "DISTINCT, TOP, INTO, PREWHERE, grouping, HAVING, sorting, windows, QUALIFY, and other SELECT modifiers are not supported",
@@ -300,6 +300,11 @@ fn validate_temporal_projection_items(
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 validate_temporal_expr(expr, analysis, config)?;
             }
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(temporal_projection_error(
+                    "multi-alias projection expressions are not supported",
+                ));
+            }
             SelectItem::Wildcard(options) if !wildcard_has_options(options) => {}
             SelectItem::Wildcard(_) => {
                 return Err(temporal_projection_error(
@@ -462,6 +467,7 @@ fn build_temporal_projection_sql(
                     rewrite_temporal_expr(expr, left_qualifier, right_qualifier, config);
                 format!("{rewritten} AS {alias}")
             }
+            SelectItem::ExprWithAliases { .. } => item.to_string(),
             SelectItem::Wildcard(_) => "*".to_string(),
             SelectItem::QualifiedWildcard(name, _) => {
                 let table = name.to_string();

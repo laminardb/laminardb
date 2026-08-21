@@ -37,8 +37,9 @@ pub async fn scan_incremental(
         ConnectorError::ReadError(format!("snapshot {new_snapshot_id} not found"))
     })?;
 
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, metadata)
+    let manifest_list = table
+        .manifest_list_reader(snapshot)
+        .load()
         .await
         .map_err(|e| ConnectorError::ReadError(format!("load manifest list: {e}")))?;
 
@@ -146,7 +147,8 @@ async fn read_files_via_scan(
         .read(Box::pin(tokio_stream::iter(
             target_tasks.into_iter().map(Ok),
         )))
-        .map_err(|e| ConnectorError::ReadError(format!("build reader: {e}")))?;
+        .map_err(|e| ConnectorError::ReadError(format!("build reader: {e}")))?
+        .stream();
 
     let mut batch_stream = std::pin::pin!(batch_stream);
     let mut batches = Vec::new();

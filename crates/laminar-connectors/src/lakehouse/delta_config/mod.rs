@@ -627,7 +627,7 @@ impl ParquetWriteConfig {
             .set_compression(compression)
             .set_dictionary_enabled(self.dictionary_enabled)
             .set_statistics_enabled(statistics)
-            .set_max_row_group_size(self.max_row_group_size);
+            .set_max_row_group_row_count(Some(self.max_row_group_size));
 
         for col_name in &self.bloom_filter_columns {
             let col_path = ColumnPath::from(col_name.as_str());

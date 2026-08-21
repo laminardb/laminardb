@@ -981,10 +981,10 @@ fn test_expr_to_sql_binary_expr() {
 #[test]
 fn test_expr_to_sql_cast() {
     use datafusion_expr::Expr;
-    let e = Expr::Cast(datafusion_expr::expr::Cast {
-        expr: Box::new(datafusion_expr::col("x")),
-        data_type: DataType::Float64,
-    });
+    let e = Expr::Cast(datafusion_expr::expr::Cast::new(
+        Box::new(datafusion_expr::col("x")),
+        DataType::Float64,
+    ));
     let sql = expr_to_sql(&e);
     assert!(sql.contains("CAST"), "should contain CAST: {sql}");
     assert!(sql.contains("Float64"), "should contain target type: {sql}");

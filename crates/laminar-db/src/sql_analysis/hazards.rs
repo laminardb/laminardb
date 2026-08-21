@@ -243,7 +243,7 @@ pub(crate) fn managed_core_window_source(
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
         || !matches!(select.flavor, SelectFlavor::Standard)
     {
         return None;

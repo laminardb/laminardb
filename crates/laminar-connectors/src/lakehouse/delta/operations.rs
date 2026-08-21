@@ -191,10 +191,7 @@ impl DeltaLakeSink {
             }
         }
 
-        self.delta_version = table
-            .version()
-            .and_then(|version| u64::try_from(version).ok())
-            .unwrap_or(0);
+        self.delta_version = table.version().unwrap_or(0);
         self.table = Some(table);
 
         // Pre-build caches used on every commit. Rebuilding WriterProperties
@@ -428,10 +425,7 @@ impl DeltaLakeSink {
         )
         .await?;
 
-        self.delta_version = table
-            .version()
-            .and_then(|version| u64::try_from(version).ok())
-            .unwrap_or(0);
+        self.delta_version = table.version().unwrap_or(0);
         self.table = Some(table);
         Ok(())
     }
@@ -835,10 +829,7 @@ impl DeltaLakeSink {
             }
         }
 
-        self.delta_version = table
-            .version()
-            .and_then(|version| u64::try_from(version).ok())
-            .unwrap_or(0);
+        self.delta_version = table.version().unwrap_or(0);
         self.table = Some(table);
         self.staged_batches.clear();
         self.staged_rows = 0;

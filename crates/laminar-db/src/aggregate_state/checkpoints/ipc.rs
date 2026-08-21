@@ -473,17 +473,12 @@ where
                         buffer_index += 1;
                     }
                     IpcPhysicalShape::Variable(offset_width) => {
-                        // Arrow's canonical V5 writer emits a zero-length offsets buffer for an
-                        // empty variable-width array; nonempty arrays retain the terminal offset.
-                        let length = if rows == 0 {
-                            0
-                        } else {
-                            rows.checked_add(1)
-                                .and_then(|rows| rows.checked_mul(offset_width))
-                                .ok_or_else(|| {
-                                    invalid_ipc_shape(context, "offset-buffer length overflows")
-                                })?
-                        };
+                        let length = rows
+                            .checked_add(1)
+                            .and_then(|rows| rows.checked_mul(offset_width))
+                            .ok_or_else(|| {
+                                invalid_ipc_shape(context, "offset-buffer length overflows")
+                            })?;
                         expect_len(buffer_index, length)?;
                         buffer_index += 2;
                         if buffer_index > buffers.len() {

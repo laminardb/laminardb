@@ -7,7 +7,6 @@
 //! assumed to have arrived. Queries can use `WHERE event_time > watermark()`
 //! to filter stale data.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -78,10 +77,6 @@ impl Hash for WatermarkUdf {
 }
 
 impl ScalarUDFImpl for WatermarkUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         "watermark"
     }

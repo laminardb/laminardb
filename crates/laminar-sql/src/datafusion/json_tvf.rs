@@ -16,7 +16,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Int64Array, LargeBinaryArray, StringArray};
-use datafusion::catalog::{TableFunctionImpl, TableProvider};
+use datafusion::catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider};
 use datafusion::datasource::MemTable;
 use datafusion_common::{plan_err, Result, ScalarValue};
 use datafusion_expr::Expr;
@@ -181,7 +181,8 @@ fn jsonb_object_entries(data: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 pub struct JsonbArrayElementsTvf;
 
 impl TableFunctionImpl for JsonbArrayElementsTvf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> Result<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 1 {
             return plan_err!("jsonb_array_elements requires exactly 1 argument");
         }
@@ -220,7 +221,8 @@ impl TableFunctionImpl for JsonbArrayElementsTvf {
 pub struct JsonbArrayElementsTextTvf;
 
 impl TableFunctionImpl for JsonbArrayElementsTextTvf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> Result<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 1 {
             return plan_err!("jsonb_array_elements_text requires exactly 1 argument");
         }
@@ -260,7 +262,8 @@ impl TableFunctionImpl for JsonbArrayElementsTextTvf {
 pub struct JsonbEachTvf;
 
 impl TableFunctionImpl for JsonbEachTvf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> Result<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 1 {
             return plan_err!("jsonb_each requires exactly 1 argument");
         }
@@ -303,7 +306,8 @@ impl TableFunctionImpl for JsonbEachTvf {
 pub struct JsonbEachTextTvf;
 
 impl TableFunctionImpl for JsonbEachTextTvf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> Result<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 1 {
             return plan_err!("jsonb_each_text requires exactly 1 argument");
         }
@@ -348,7 +352,8 @@ impl TableFunctionImpl for JsonbEachTextTvf {
 pub struct JsonbObjectKeysTvf;
 
 impl TableFunctionImpl for JsonbObjectKeysTvf {
-    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_with_args(&self, args: TableFunctionArgs<'_, '_>) -> Result<Arc<dyn TableProvider>> {
+        let args = args.exprs();
         if args.len() != 1 {
             return plan_err!("jsonb_object_keys requires exactly 1 argument");
         }
@@ -408,7 +413,12 @@ mod tests {
     #[test]
     fn test_array_elements_basic() {
         let tvf = JsonbArrayElementsTvf;
-        let provider = tvf.call(&[make_jsonb_expr("[1, 2, 3]")]).unwrap();
+        let expressions = [make_jsonb_expr("[1, 2, 3]")];
+        let ctx = create_session_context();
+        let state = ctx.state();
+        let provider = tvf
+            .call_with_args(TableFunctionArgs::new(&expressions, &state))
+            .unwrap();
         let schema = provider.schema();
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(schema.field(0).name(), "value");

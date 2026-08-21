@@ -13,7 +13,6 @@
 //!                  LookupSnapshot (pre-indexed RecordBatch)
 //! ```
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -221,7 +220,7 @@ pub struct LookupJoinExec {
     stream_key_indices: Vec<usize>,
     join_type: LookupJoinType,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Prebuilt `RowConverter` for encoding probe keys. Shared across
     /// every `execute()` call so we don't rebuild per-type encoders on
     /// every cycle of a cached physical plan.
@@ -274,14 +273,14 @@ impl LookupJoinExec {
             output_schema
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             },
-        );
+        ));
 
         let stream_field_count = input.schema().fields().len();
         let projection = (0..(stream_field_count + lookup_batch.num_columns())).collect();
@@ -340,15 +339,11 @@ impl ExecutionPlan for LookupJoinExec {
         "LookupJoinExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

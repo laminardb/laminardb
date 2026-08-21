@@ -94,11 +94,12 @@ fn empty_fixture_table() -> Table {
             "t".to_string(),
         ))
         .file_io(iceberg::io::FileIO::new_with_memory())
+        .runtime(iceberg::Runtime::try_current().unwrap())
         .build()
         .unwrap()
 }
 
-#[test]
-fn test_current_snapshot_id_empty_table() {
+#[tokio::test]
+async fn test_current_snapshot_id_empty_table() {
     assert!(current_snapshot_id(&empty_fixture_table()).is_none());
 }

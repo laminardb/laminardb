@@ -200,10 +200,10 @@ impl<'a> PreAggBuilder<'a> {
                 let projected_expr = if raw_type == dt {
                     arg_expr.clone()
                 } else {
-                    datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast {
-                        expr: Box::new(arg_expr.clone()),
-                        data_type: dt.clone(),
-                    })
+                    datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast::new(
+                        Box::new(arg_expr.clone()),
+                        dt.clone(),
+                    ))
                 };
                 self.pre_agg_select_items.push(format!(
                     "{} AS \"__agg_input_{col_idx}\"",
@@ -509,11 +509,11 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
         }
         Expr::Cast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("CAST({inner} AS {})", cast.data_type)
+            format!("CAST({inner} AS {})", cast.field.data_type())
         }
         Expr::TryCast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("TRY_CAST({inner} AS {})", cast.data_type)
+            format!("TRY_CAST({inner} AS {})", cast.field.data_type())
         }
         Expr::ScalarFunction(func) => {
             let args: Vec<String> = func.args.iter().map(expr_to_sql).collect();

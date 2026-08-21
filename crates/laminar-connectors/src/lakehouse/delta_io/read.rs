@@ -1,6 +1,9 @@
 //! Bounded snapshot and change-data-feed reads.
 
-use super::{debug, Arc, ConnectorError, DeltaTable, RecordBatch, SchemaRef};
+use super::{
+    debug, from_delta_version, to_delta_version, Arc, ConnectorError, DeltaTable, RecordBatch,
+    SchemaRef,
+};
 
 /// Returns the table's partition columns, or an empty list if the snapshot is
 /// unavailable. Best-effort: used for clustering diagnostics, never for
@@ -9,7 +12,7 @@ use super::{debug, Arc, ConnectorError, DeltaTable, RecordBatch, SchemaRef};
 #[must_use]
 pub fn get_partition_columns(table: &DeltaTable) -> Vec<String> {
     match table.snapshot() {
-        Ok(snapshot) => snapshot.snapshot().metadata().partition_columns().clone(),
+        Ok(snapshot) => snapshot.snapshot().metadata().partition_columns().to_vec(),
         Err(_) => Vec::new(),
     }
 }
@@ -46,10 +49,11 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
 pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
     let log_store = table.log_store();
     let current = table.version().unwrap_or(0);
-    log_store
+    let version = log_store
         .get_latest_version(current)
         .await
-        .map_err(|e| ConnectorError::ReadError(format!("failed to get latest version: {e}")))
+        .map_err(|e| ConnectorError::ReadError(format!("failed to get latest version: {e}")))?;
+    from_delta_version(version)
 }
 
 /// Reads record batches from a specific Delta Lake table version.
@@ -81,8 +85,9 @@ pub(crate) async fn read_batches_at_version(
     use tokio_stream::StreamExt;
 
     // Load the specific version.
+    let delta_version = to_delta_version(version)?;
     table
-        .load_version(version)
+        .load_version(delta_version)
         .await
         .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
 
@@ -183,10 +188,12 @@ pub async fn read_cdf_batches(
     // Clone session state so the RwLockReadGuard is dropped before await.
     let session_state = ctx.state();
 
+    let start_delta_version = to_delta_version(start_version)?;
+    let end_delta_version = to_delta_version(end_version)?;
     let cdf_builder = table
         .scan_cdf()
-        .with_starting_version(start_version)
-        .with_ending_version(end_version);
+        .with_starting_version(start_delta_version)
+        .with_ending_version(end_delta_version);
 
     let plan = cdf_builder
         .build(&session_state, None)

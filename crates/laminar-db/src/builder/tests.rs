@@ -729,7 +729,6 @@ fn test_builder_debug() {
 
 #[tokio::test]
 async fn builder_preserves_custom_function_registry_for_graph_contexts() {
-    use std::any::Any;
     use std::hash::{Hash, Hasher};
 
     use arrow::datatypes::DataType;
@@ -766,9 +765,6 @@ async fn builder_preserves_custom_function_registry_for_graph_contexts() {
     }
 
     impl ScalarUDFImpl for FortyTwo {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn name(&self) -> &'static str {
             "forty_two"
         }

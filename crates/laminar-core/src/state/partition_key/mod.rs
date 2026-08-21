@@ -100,7 +100,7 @@ pub enum PartitionKeyCodecError {
 }
 
 /// Vectorized encoder for the exact typed-key representation covered by
-/// [`super::PARTITIONING_ABI_VERSION`] 1.
+/// [`super::PARTITIONING_ABI_VERSION`] 2.
 ///
 /// Floats, nested values, and run-end encoding remain fail-closed. Dictionary
 /// indices are physical representation: supported dictionaries encode their

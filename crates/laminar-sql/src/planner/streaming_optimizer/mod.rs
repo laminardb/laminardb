@@ -109,7 +109,7 @@ fn walk_plan(plan: &Arc<dyn ExecutionPlan>, violations: &mut Vec<StreamingViolat
     };
 
     // Check 1: SortExec on unbounded input
-    if plan.as_any().downcast_ref::<SortExec>().is_some() && has_unbounded_child(plan) {
+    if plan.downcast_ref::<SortExec>().is_some() && has_unbounded_child(plan) {
         violations.push(StreamingViolation {
             operator: name.to_string(),
             reason: "Sort requires buffering all input; unbounded source will \
@@ -120,7 +120,7 @@ fn walk_plan(plan: &Arc<dyn ExecutionPlan>, violations: &mut Vec<StreamingViolat
     }
 
     // Check 2: Final AggregateExec on unbounded input
-    if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
+    if let Some(agg) = plan.downcast_ref::<AggregateExec>() {
         if matches!(
             agg.mode(),
             &AggregateMode::Final | &AggregateMode::FinalPartitioned

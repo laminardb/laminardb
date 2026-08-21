@@ -230,7 +230,7 @@ pub(crate) fn mutable_changelog_has_unsafe_modifiers(sql: &str) -> bool {
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
 }
 
 /// A flattened bounded-join projection has only the two outer join inputs in scope. Rewriting

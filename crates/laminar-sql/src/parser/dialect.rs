@@ -33,7 +33,7 @@ impl Dialect for LaminarDialect {
         true
     }
 
-    fn supports_timestamp_versioning(&self) -> bool {
+    fn supports_table_versioning(&self) -> bool {
         true
     }
 }

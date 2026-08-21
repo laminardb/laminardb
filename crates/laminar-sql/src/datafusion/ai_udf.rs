@@ -14,7 +14,6 @@
 //! functions). The crate does not depend on `laminar-ai`, so the two lists are
 //! intentionally independent.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -63,10 +62,6 @@ impl Hash for AiFunctionMarker {
 }
 
 impl ScalarUDFImpl for AiFunctionMarker {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &'static str {
         self.name
     }

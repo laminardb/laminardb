@@ -4,7 +4,6 @@
 //! that reads from a `StreamSource`. It serves as the leaf node in query
 //! plans for streaming data.
 
-use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
@@ -41,7 +40,7 @@ pub struct StreamingScanExec {
     /// Filters pushed down to source
     filters: Vec<Expr>,
     /// Cached plan properties
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl StreamingScanExec {
@@ -74,15 +73,17 @@ impl StreamingScanExec {
         // SchedulingType::NonCooperative causes DataFusion's EnsureCooperative
         // optimizer rule to auto-wrap this leaf with CooperativeExec, which
         // yields to the Tokio executor periodically.
-        let properties = PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Unbounded {
-                requires_infinite_memory: false,
-            },
-        )
-        .with_scheduling_type(SchedulingType::NonCooperative);
+        let properties = Arc::new(
+            PlanProperties::new(
+                eq_properties,
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Unbounded {
+                    requires_infinite_memory: false,
+                },
+            )
+            .with_scheduling_type(SchedulingType::NonCooperative),
+        );
 
         Self {
             source,
@@ -185,15 +186,11 @@ impl ExecutionPlan for StreamingScanExec {
         "StreamingScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

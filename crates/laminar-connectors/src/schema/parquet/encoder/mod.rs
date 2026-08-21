@@ -106,7 +106,7 @@ impl FormatEncoder for ParquetEncoder {
 
         let mut props_builder = WriterProperties::builder()
             .set_compression(self.config.compression)
-            .set_max_row_group_size(self.config.max_row_group_size);
+            .set_max_row_group_row_count(Some(self.config.max_row_group_size));
 
         if !self.config.write_statistics {
             props_builder = props_builder

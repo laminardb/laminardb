@@ -14,6 +14,9 @@ use super::{
 use std::{future::Future, time::Duration};
 
 #[cfg(feature = "delta-lake")]
+use object_store::ObjectStoreExt;
+
+#[cfg(feature = "delta-lake")]
 const COORDINATED_METADATA_BACKOFF: crate::retry::Backoff =
     crate::retry::Backoff::new(Duration::from_millis(50), Duration::from_secs(1), 0.25);
 
@@ -203,7 +206,9 @@ async fn refresh_publication_cursor_once(
             ));
         }
     }
-    let mut current = table.clone();
+    // RECOVERY: reload from storage so a drop-and-recreate at the same version
+    // cannot inherit the staged table's cached snapshot.
+    let mut current = DeltaTable::new(table.log_store(), table.config.clone());
     validate_coordinated_log_store(&current)?;
     let context = format!("refresh Delta coordinated publication snapshot {phase}");
     current
@@ -409,7 +414,7 @@ where
         .snapshot()
         .map_err(|error| ConnectorError::TransactionError(format!("snapshot: {error}")))?;
     validate_staged_table_binding(&current, &adds, binding.as_ref())?;
-    let partition_columns = snapshot.metadata().partition_columns().clone();
+    let partition_columns = snapshot.metadata().partition_columns().to_vec();
     let objects = validate_coordinated_descriptors(&adds, &partition_columns, deadline)?;
     validate_coordinated_objects(
         &current,

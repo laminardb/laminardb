@@ -313,7 +313,7 @@ fn analyze_select(analysis: &mut AggregationAnalysis, select: &Select) {
     // Check SELECT items for aggregate functions
     for item in &select.projection {
         match item {
-            SelectItem::UnnamedExpr(expr) => {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAliases { expr, .. } => {
                 if let Some(agg) = extract_aggregate(expr, None) {
                     analysis.aggregates.push(agg);
                 }

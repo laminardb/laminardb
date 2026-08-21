@@ -71,8 +71,8 @@ fn assert_array_golden(array: ArrayRef, expected: &[GoldenTriple]) {
 }
 
 #[test]
-fn partitioning_abi_v1_typed_key_bytes_hashes_and_vnodes_are_golden() {
-    assert_eq!(PARTITIONING_ABI_VERSION, 1);
+fn partitioning_abi_v2_typed_key_bytes_hashes_and_vnodes_are_golden() {
+    assert_eq!(PARTITIONING_ABI_VERSION, 2);
 
     let decimal = Decimal128Array::from(vec![Some(-12_345), None, Some(0), Some(99_999)])
         .with_precision_and_scale(10, 2)
@@ -145,7 +145,7 @@ fn partitioning_abi_v1_typed_key_bytes_hashes_and_vnodes_are_golden() {
 }
 
 #[test]
-fn partitioning_abi_v1_integer_widths_and_boundaries_are_golden() {
+fn partitioning_abi_v2_integer_widths_and_boundaries_are_golden() {
     assert_array_golden(
         Arc::new(Int8Array::from(vec![i8::MIN, -1, 0, 1, i8::MAX])),
         &[
@@ -221,7 +221,7 @@ fn partitioning_abi_v1_integer_widths_and_boundaries_are_golden() {
 }
 
 #[test]
-fn partitioning_abi_v1_decimal_widths_are_golden() {
+fn partitioning_abi_v2_decimal_widths_are_golden() {
     assert_array_golden(
         Arc::new(
             Decimal32Array::from(vec![Some(-123), Some(0), Some(456), None])
@@ -314,7 +314,7 @@ fn partitioning_abi_v1_decimal_widths_are_golden() {
 }
 
 #[test]
-fn partitioning_abi_v1_variable_width_representations_are_equivalent() {
+fn partitioning_abi_v2_variable_width_representations_are_equivalent() {
     let strings = vec![
         None,
         Some(""),
@@ -371,7 +371,7 @@ fn partitioning_abi_v1_variable_width_representations_are_equivalent() {
 }
 
 #[test]
-fn partitioning_abi_v1_timestamps_null_and_boolean_are_golden() {
+fn partitioning_abi_v2_timestamps_null_and_boolean_are_golden() {
     let values = vec![i64::MIN, -1, 0, 1, i64::MAX];
     let expected_timestamps = [
         ("010000000000000000", 3_547_760_990_396_968_576, 111),
@@ -404,12 +404,12 @@ fn partitioning_abi_v1_timestamps_null_and_boolean_are_golden() {
     );
     assert_array_golden(
         Arc::new(NullArray::new(1)),
-        &[("", 3_244_421_341_483_603_138, 39)],
+        &[("0203", 4_771_980_914_496_010_191, 215)],
     );
 }
 
 #[test]
-fn partitioning_abi_v1_composites_are_unambiguous_and_dictionaries_are_hydrated() {
+fn partitioning_abi_v2_composites_are_unambiguous_and_dictionaries_are_hydrated() {
     assert_eq!(
         encoded_triples_for_columns(vec![
             Arc::new(StringArray::from(vec![
@@ -492,7 +492,7 @@ fn partitioning_abi_v1_composites_are_unambiguous_and_dictionaries_are_hydrated(
 }
 
 #[test]
-fn partitioning_abi_v1_remaining_physical_families_are_golden() {
+fn partitioning_abi_v2_remaining_physical_families_are_golden() {
     let fixed =
         FixedSizeBinaryArray::from(vec![Some(b"ab" as &[u8]), None, Some(b"\x00\xff" as &[u8])]);
     let i32_expected = [
@@ -573,7 +573,7 @@ fn partitioning_abi_v1_remaining_physical_families_are_golden() {
 }
 
 #[test]
-fn partitioning_abi_v1_type_gate_is_explicit_and_fail_closed() {
+fn partitioning_abi_v2_type_gate_is_explicit_and_fail_closed() {
     assert!(matches!(
         PartitionKeyCodecV1::try_new(Vec::new()),
         Err(PartitionKeyCodecError::EmptyKeySchema)
@@ -635,7 +635,7 @@ fn partitioning_abi_v1_type_gate_is_explicit_and_fail_closed() {
 }
 
 #[test]
-fn partitioning_abi_v1_validates_temporal_and_decimal_parameters() {
+fn partitioning_abi_v2_validates_temporal_and_decimal_parameters() {
     let accepted = [
         DataType::Time32(TimeUnit::Second),
         DataType::Time32(TimeUnit::Millisecond),

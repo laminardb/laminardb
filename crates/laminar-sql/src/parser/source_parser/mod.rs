@@ -218,13 +218,7 @@ fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
                 .options
                 .iter()
                 .filter(|option| {
-                    matches!(
-                        &option.option,
-                        sqlparser::ast::ColumnOption::Unique {
-                            is_primary: true,
-                            ..
-                        }
-                    )
+                    matches!(&option.option, sqlparser::ast::ColumnOption::PrimaryKey(_))
                 })
                 .collect();
             match inline_primary_keys.as_slice() {
@@ -235,13 +229,11 @@ fn parse_source_body(parser: &mut Parser) -> Result<SourceBody, ParseError> {
                             "CREATE SOURCE does not support named PRIMARY KEY constraints".into(),
                         ));
                     }
-                    let sqlparser::ast::ColumnOption::Unique {
-                        characteristics, ..
-                    } = &option.option
+                    let sqlparser::ast::ColumnOption::PrimaryKey(constraint) = &option.option
                     else {
                         unreachable!("filtered to inline primary-key options")
                     };
-                    if characteristics.is_some() {
+                    if constraint.characteristics.is_some() {
                         return Err(ParseError::StreamingError(
                             "CREATE SOURCE does not support PRIMARY KEY constraint characteristics"
                                 .into(),

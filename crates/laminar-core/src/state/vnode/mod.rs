@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 /// Any change to Arrow row encoding, key hashing, or modulo mapping requires a
 /// version bump; recovery rejects checkpoints with a different identity. Placement
 /// is not part of this ABI: durable assignment publications are the ownership authority.
-pub const PARTITIONING_ABI_VERSION: u16 = 1;
+pub const PARTITIONING_ABI_VERSION: u16 = 2;
 
 /// Validated number of stable key groups in a pipeline.
 ///

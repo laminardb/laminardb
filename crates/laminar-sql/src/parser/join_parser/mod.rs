@@ -508,6 +508,11 @@ fn get_join_constraint(op: &JoinOperator) -> Result<&JoinConstraint, ParseError>
         JoinOperator::CrossJoin(_) | JoinOperator::CrossApply | JoinOperator::OuterApply => Err(
             ParseError::StreamingError("CROSS JOIN not supported for streaming".to_string()),
         ),
+        JoinOperator::ArrayJoin | JoinOperator::LeftArrayJoin | JoinOperator::InnerArrayJoin => {
+            Err(ParseError::StreamingError(
+                "ARRAY JOIN not supported for streaming".to_string(),
+            ))
+        }
     }
 }
 
