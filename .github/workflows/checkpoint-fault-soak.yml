@@ -114,6 +114,7 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
+            rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
           - label: Single-node EO stateful joins
@@ -123,7 +124,8 @@ jobs:
             topology: single
             discovery: gossip
             emulator: "1"
-            checkpoint_ms: "5000"
+            checkpoint_ms: "10000"
+            rps: "250"
             visibility_ms: "90000"
             slo_mode: observe
           - label: Cluster ALO stateful joins (gossip)
@@ -134,6 +136,7 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
+            rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
           - label: Cluster ALO stateful joins (static)
@@ -144,6 +147,7 @@ jobs:
             discovery: static
             emulator: "0"
             checkpoint_ms: "250"
+            rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
           - label: Cluster EO stateful joins (gossip)
@@ -153,7 +157,8 @@ jobs:
             topology: cluster
             discovery: gossip
             emulator: "1"
-            checkpoint_ms: "5000"
+            checkpoint_ms: "10000"
+            rps: "250"
             visibility_ms: "90000"
             slo_mode: observe
           - label: Cluster EO stateful joins (static)
@@ -163,7 +168,8 @@ jobs:
             topology: cluster
             discovery: static
             emulator: "1"
-            checkpoint_ms: "5000"
+            checkpoint_ms: "10000"
+            rps: "250"
             visibility_ms: "90000"
             slo_mode: observe
     steps:
@@ -226,17 +232,17 @@ jobs:
           LAMINAR_SOAK_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
-          # A 5s EO cadence remains 2x tighter than the production default without turning one
-          # MinIO emulator into the bottleneck for 23 exact sinks. The EO visibility limit uses the
-          # same 90s protocol-liveness window as recovery on this emulator; the test's 10s default
-          # remains the certifying threshold for production-class object storage.
+          # MinIO EO is protocol validation, not a throughput certificate. Use the production
+          # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor without
+          # making the emulator the bottleneck for 23 exact sinks. The test's strict defaults
+          # remain the certifying profile for production-class object storage.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
-          LAMINAR_SOAK_RPS: "400"
+          LAMINAR_SOAK_RPS: ${{ matrix.rps }}
           # Blacksmith CPU generations produced a repeatable 3x spread for identical binaries.
           # Use a 10/50ms runner envelope here; pinned target hardware keeps the strict defaults.
           LAMINAR_SOAK_HOT_P50_MS: "10"
