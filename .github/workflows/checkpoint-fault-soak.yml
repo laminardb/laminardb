@@ -339,6 +339,9 @@ jobs:
           LAMINAR_SOAK_KILLS: "0"
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
+          # Blacksmith is not pinned target hardware. Preserve exact timing evidence here without
+          # claiming production latency certification; the test default remains `certify`.
+          LAMINAR_SOAK_CHECKPOINT_SLO_MODE: observe
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
