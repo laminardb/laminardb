@@ -6382,6 +6382,7 @@ struct DeltaCoreWindowSnapshot {
 struct DeltaOutputOracle {
     table_uri: String,
     storage_options: HashMap<String, String>,
+    join_table: tokio::sync::Mutex<Option<deltalake::DeltaTable>>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -6391,6 +6392,7 @@ impl DeltaOutputOracle {
         Self {
             table_uri,
             storage_options: storage.options(),
+            join_table: tokio::sync::Mutex::new(None),
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -6398,14 +6400,36 @@ impl DeltaOutputOracle {
         }
     }
 
+    async fn refresh_join_table(&self) -> Result<deltalake::DeltaTable, String> {
+        // INVARIANT: Metadata refreshes for one oracle are serialized so every returned clone
+        // retains one immutable version while later observations reuse the object-store client.
+        let mut cached = self.join_table.lock().await;
+        if let Some(table) = cached.as_mut() {
+            let latest = table
+                .get_latest_version()
+                .await
+                .map_err(|error| format!("read latest Delta output version: {error}"))?;
+            if table.version() != Some(latest) {
+                table
+                    .load_version(latest)
+                    .await
+                    .map_err(|error| format!("load Delta output version {latest}: {error}"))?;
+            }
+            return Ok(table.clone());
+        }
+
+        let uri = deltalake::ensure_table_uri(&self.table_uri)
+            .map_err(|error| format!("invalid Delta table URI: {error}"))?;
+        let table = deltalake::open_table_with_storage_options(uri, self.storage_options.clone())
+            .await
+            .map_err(|error| format!("open Delta output: {error}"))?;
+        *cached = Some(table.clone());
+        Ok(table)
+    }
+
     fn open_join_snapshot(&self) -> Result<OpenDeltaJoinSnapshot, String> {
         self.runtime.block_on(async {
-            let uri = deltalake::ensure_table_uri(&self.table_uri)
-                .map_err(|error| format!("invalid Delta table URI: {error}"))?;
-            let table =
-                deltalake::open_table_with_storage_options(uri, self.storage_options.clone())
-                    .await
-                    .map_err(|error| format!("open Delta output: {error}"))?;
+            let table = self.refresh_join_table().await?;
             let version = table
                 .version()
                 .ok_or_else(|| "Delta output has no committed table version".to_owned())?;
