@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::{BufMut, BytesMut};
-use laminar_db::subscription::SubscribeStart;
+use laminar_db::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
 use laminar_db::LaminarDB;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -1300,6 +1300,32 @@ async fn push_one_trade(db: &Arc<LaminarDB>, symbol: &str, price: f64) -> arrow_
     schema
 }
 
+/// Wait until the coordinator has published rows to every attached subscriber.
+/// The probe and pgwire cursor must both be opened before ingestion starts.
+async fn wait_for_published_rows(portal: &mut SubscriptionPortal, expected_rows: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut observed_rows = 0;
+        while observed_rows < expected_rows {
+            match portal
+                .next_frame()
+                .await
+                .expect("publication probe remains open")
+            {
+                PortalFrame::Batch { batch, .. } => observed_rows += batch.num_rows(),
+                PortalFrame::Barrier { .. } => {}
+                PortalFrame::Lagged(skipped) => {
+                    panic!("publication probe lagged by {skipped} frames")
+                }
+                PortalFrame::Error { message } => {
+                    panic!("publication probe failed: {message}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("coordinator publishes rows before the test deadline");
+}
+
 /// Ingest a row and return both the running server and the underlying db
 /// so tests can keep pushing rows after the listener is up.
 async fn spawn_with_data() -> (
@@ -1317,40 +1343,6 @@ async fn spawn_with_data() -> (
     )
     .await
     .expect("create mv");
-    db.start().await.expect("db starts");
-
-    let (addr, handle) = super::serve(
-        Arc::clone(&db),
-        "127.0.0.1:0",
-        HashMap::new(),
-        false,
-        None,
-        256,
-        10,
-    )
-    .await
-    .expect("pgwire serve");
-    (db, addr, handle)
-}
-
-/// Same as `spawn_with_data`, but `prices` is a STREAM with retained
-/// history. Lets cursor tests push rows *before* SUBSCRIBE attaches
-/// without losing them — the receiver replays on attach.
-async fn spawn_with_retained_data() -> (
-    Arc<LaminarDB>,
-    std::net::SocketAddr,
-    tokio::task::JoinHandle<()>,
-) {
-    let db = LaminarDB::open().expect("db opens");
-    db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
-        .await
-        .expect("create source");
-    db.execute(
-        "CREATE STREAM prices AS SELECT symbol, price FROM trades \
-         WITH ('retain_history' = '4mb')",
-    )
-    .await
-    .expect("create stream");
     db.start().await.expect("db starts");
 
     let (addr, handle) = super::serve(
@@ -1880,21 +1872,25 @@ async fn extended_query_ddl_rejected() {
 
 /// `\set FETCH_COUNT N` flow: BEGIN; DECLARE …; FETCH N FROM …; CLOSE; COMMIT.
 /// All over SimpleQuery — the path psql uses when `FETCH_COUNT` is set.
-/// Uses the retained-history variant so we can push before SUBSCRIBE.
 #[tokio::test]
 async fn cursor_declare_fetch_close_happy_path() {
-    let (db, addr, handle) = spawn_with_retained_data().await;
+    let (db, addr, handle) = spawn_with_data().await;
     let client = connect(addr).await;
-
-    for i in 0..4 {
-        push_one_trade(&db, &format!("S{i}"), i as f64).await;
-    }
+    let mut publication_probe = db
+        .open_subscription("prices", None, SubscribeStart::Tail)
+        .await
+        .expect("open publication probe");
 
     client.simple_query("BEGIN").await.expect("BEGIN");
     client
         .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
         .await
         .expect("DECLARE");
+
+    for i in 0..4 {
+        push_one_trade(&db, &format!("S{i}"), i as f64).await;
+    }
+    wait_for_published_rows(&mut publication_probe, 4).await;
 
     let messages = client
         .simple_query("FETCH 2 FROM c")
@@ -2147,8 +2143,18 @@ async fn cursor_fetch_unknown_name_errors() {
 /// the batch internally, return row[0], and discard row[1].
 #[tokio::test]
 async fn cursor_fetch_preserves_leftover_rows_in_one_batch() {
-    let (db, addr, handle) = spawn_with_retained_data().await;
+    let (db, addr, handle) = spawn_with_data().await;
     let client = connect(addr).await;
+    let mut publication_probe = db
+        .open_subscription("prices", None, SubscribeStart::Tail)
+        .await
+        .expect("open publication probe");
+
+    client.simple_query("BEGIN").await.expect("BEGIN");
+    client
+        .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+        .await
+        .expect("DECLARE");
 
     let src = db.source_untyped("trades").expect("source");
     let batch = arrow_array::RecordBatch::try_new(
@@ -2160,12 +2166,7 @@ async fn cursor_fetch_preserves_leftover_rows_in_one_batch() {
     )
     .expect("batch");
     src.push_arrow(batch).expect("push");
-
-    client.simple_query("BEGIN").await.expect("BEGIN");
-    client
-        .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
-        .await
-        .expect("DECLARE");
+    wait_for_published_rows(&mut publication_probe, 2).await;
 
     let first = client
         .simple_query("FETCH 1 FROM c")
@@ -2232,15 +2233,21 @@ async fn cursor_duplicate_declare_rejected() {
 /// Cursor name lookup is case-insensitive (PG identifier folding rules).
 #[tokio::test]
 async fn cursor_name_case_insensitive() {
-    let (db, addr, handle) = spawn_with_retained_data().await;
+    let (db, addr, handle) = spawn_with_data().await;
     let client = connect(addr).await;
-    push_one_trade(&db, "AAPL", 1.0).await;
+    let mut publication_probe = db
+        .open_subscription("prices", None, SubscribeStart::Tail)
+        .await
+        .expect("open publication probe");
 
     client.simple_query("BEGIN").await.expect("BEGIN");
     client
         .simple_query("DECLARE MyCursor CURSOR FOR SUBSCRIBE prices")
         .await
         .expect("DECLARE");
+
+    push_one_trade(&db, "AAPL", 1.0).await;
+    wait_for_published_rows(&mut publication_probe, 1).await;
 
     let messages = client
         .simple_query("FETCH 1 FROM mycursor")
