@@ -471,7 +471,7 @@ impl CoreWindowState {
                 let slide_ms = i64::try_from(
                     window_config
                         .slide
-                        .map_or(window_config.size, |s| s)
+                        .unwrap_or(window_config.size)
                         .as_millis(),
                 )
                 .map_err(|_| {
@@ -501,7 +501,7 @@ impl CoreWindowState {
                 let gap_ms = i64::try_from(
                     window_config
                         .gap
-                        .map_or(std::time::Duration::ZERO, |g| g)
+                        .unwrap_or(std::time::Duration::ZERO)
                         .as_millis(),
                 )
                 .map_err(|_| {

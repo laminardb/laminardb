@@ -5438,6 +5438,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         })
     }
 
+    // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn complete_pending_vnode_transition(
         &mut self,
     ) -> Result<bool, crate::pipeline::CycleError> {
@@ -6601,6 +6603,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     /// Service follower announcements observed from the cluster leader.
     /// All local checkpoint admission is owned exclusively by `StreamingCoordinator`.
+    // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn service_checkpoint_control(
         &mut self,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
@@ -7066,6 +7070,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.graph.has_runnable_deferred_work()
     }
 
+    // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn cancel_source_barrier_attempt(
         &mut self,
         attempt: CheckpointAttempt,

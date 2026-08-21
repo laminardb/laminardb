@@ -682,7 +682,7 @@ fn parse_sha256(value: &OsStr) -> Result<[u8; 32], String> {
         ));
     }
     let mut decoded = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
     }
     Ok(decoded)

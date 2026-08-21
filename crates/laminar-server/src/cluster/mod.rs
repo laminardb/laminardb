@@ -69,7 +69,8 @@ pub struct ClusterHandle {
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
     /// This node's own membership record. Cloned and re-announced with
-    /// [`NodeState::Draining`] on shutdown so peers stop routing to us.
+    /// [`laminar_core::cluster::discovery::NodeState::Draining`] on shutdown so peers stop routing
+    /// to us.
     local_node: NodeInfo,
     /// Cluster control plane. `begin_drain` is called on shutdown so the leader excludes us from
     /// vnode assignment.

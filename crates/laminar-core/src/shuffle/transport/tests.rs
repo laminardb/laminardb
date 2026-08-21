@@ -1342,6 +1342,7 @@ async fn stale_assignment_stream_is_rejected_before_folding() {
         receiver.recv().await.unwrap().message(),
         ShuffleMessage::Data { .. }
     ));
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
 
     let next_assignment = assignment_fence(2, &[1, 2]);
     receiver

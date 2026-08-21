@@ -2788,9 +2788,7 @@ impl OperatorGraph {
             for port_buf in &mut self.input_bufs[id] {
                 port_buf.clear();
             }
-            for slot in &mut self.input_buf_bytes[id] {
-                *slot = 0;
-            }
+            self.input_buf_bytes[id].fill(0);
             self.order_configs.remove(&id);
             self.depends_on_stream.remove(&id);
             self.edges.retain(|e| e.source != id && e.target != id);

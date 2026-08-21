@@ -470,7 +470,7 @@ pub(crate) async fn execute_config_ddl(
             .map_err(|source| ServerError::Ddl {
                 section: "cluster catalog".to_string(),
                 name: "startup inventory".to_string(),
-                source,
+                source: Box::new(source),
             })?;
         info!(
             entries = definitions.len(),
@@ -485,7 +485,7 @@ pub(crate) async fn execute_config_ddl(
         db.execute(&sql).await.map_err(|source| ServerError::Ddl {
             section: section.to_string(),
             name: name.clone(),
-            source,
+            source: Box::new(source),
         })?;
         info!(section, %name, "Applied configuration DDL");
     }
@@ -765,17 +765,16 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
     ddl
 }
 
-#[allow(clippy::result_large_err)]
 pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     if lookup.schema.is_empty() {
         return Err(ServerError::Ddl {
             section: "lookup".to_string(),
             name: lookup.name.clone(),
-            source: DbError::Config(format!(
+            source: Box::new(DbError::Config(format!(
                 "[[lookup]] '{}' requires a [[lookup.schema]] section with at least \
                  one column definition",
                 lookup.name,
-            )),
+            ))),
         });
     }
 
@@ -841,7 +840,7 @@ pub enum ServerError {
     Ddl {
         section: String,
         name: String,
-        source: DbError,
+        source: Box<DbError>,
     },
     #[error("failed to start pipeline: {0}")]
     Start(String),

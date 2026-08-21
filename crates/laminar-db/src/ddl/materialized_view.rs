@@ -384,7 +384,7 @@ impl LaminarDB {
             return Err(incremental_mv_consumer_error(&mv, consumer));
         }
         let supported = changelog_enrich
-            || self.ctx.sql(query_sql).await.ok().is_some_and(|df| {
+            || self.ctx.sql(query_sql).await.is_ok_and(|df| {
                 let plan = df.logical_plan();
                 crate::aggregate_state::find_aggregate(plan).is_some()
                     || crate::sql_analysis::extract_projection_filter(plan).is_some()
