@@ -374,7 +374,7 @@ struct MatrixAggregateOutput {
     right_sum: Option<i64>,
 }
 
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 type DeltaAggregateRows = Vec<(String, MatrixAggregateOutput, i64)>;
 
 #[cfg(feature = "kafka")]
@@ -6419,24 +6419,21 @@ impl DeltaOutputOracle {
 
     fn snapshot(&self) -> Result<DeltaJoinSnapshot, String> {
         let opened = self.open_join_snapshot()?;
-        self.scan_join_snapshot(opened)
+        self.scan_join_snapshot(&opened)
     }
 
     fn scan_join_snapshot(
         &self,
-        opened: OpenDeltaJoinSnapshot,
+        opened: &OpenDeltaJoinSnapshot,
     ) -> Result<DeltaJoinSnapshot, String> {
-        self.runtime.block_on(async move {
-            let OpenDeltaJoinSnapshot {
-                table,
-                version,
-                observed_at,
-            } = opened;
+        self.runtime.block_on(async {
             let context = deltalake::datafusion::prelude::SessionContext::new();
-            table
+            opened
+                .table
                 .update_datafusion_session(&context.state())
                 .map_err(|error| format!("register Delta object store: {error}"))?;
-            let provider = table
+            let provider = opened
+                .table
                 .table_provider()
                 .build()
                 .await
@@ -6501,8 +6498,8 @@ impl DeltaOutputOracle {
                 }
             }
             Ok(DeltaJoinSnapshot {
-                version,
-                observed_at,
+                version: opened.version,
+                observed_at: opened.observed_at,
                 rows,
                 pairs,
                 duplicate_rows,
@@ -6987,7 +6984,7 @@ where
             let detail = last_error
                 .as_deref()
                 .unwrap_or("deadline elapsed before the first observation");
-            panic!("{label} Delta quiet re-read failed through its deadline: {detail}");
+            panic!("{label} Delta snapshot read failed through its deadline: {detail}");
         }
         match snapshot() {
             Ok(snapshot) => return snapshot,
@@ -7362,11 +7359,10 @@ struct DeltaExactOutput<'a> {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-fn delta_exact_snapshot(
+fn validate_delta_exact_snapshot(
     output: &DeltaExactOutput<'_>,
-    opened: OpenDeltaJoinSnapshot,
+    snapshot: DeltaJoinSnapshot,
 ) -> Result<DeltaJoinSnapshot, String> {
-    let snapshot = output.oracle.scan_join_snapshot(opened)?;
     assert_eq!(
         snapshot.duplicate_rows, 0,
         "{} Delta snapshot version {} contains {} duplicate rows; first duplicate {:?}",
@@ -7401,6 +7397,132 @@ fn delta_exact_snapshot(
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn open_delta_visibility_boundaries(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    visibility_slo: Duration,
+) -> Vec<OpenDeltaJoinSnapshot> {
+    let deadlines = outputs
+        .iter()
+        .map(|output| output.frozen_input_at + visibility_slo)
+        .collect::<Vec<_>>();
+    let mut latest = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
+    let mut observations = vec![String::new(); outputs.len()];
+    loop {
+        assert_running_nodes(nodes);
+        let now = Instant::now();
+        let active = deadlines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, deadline)| (now < *deadline).then_some(index))
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            break;
+        }
+        let opened = std::thread::scope(|scope| {
+            let workers = active
+                .iter()
+                .map(|index| {
+                    let output = &outputs[*index];
+                    (*index, scope.spawn(|| output.oracle.open_join_snapshot()))
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|(index, worker)| {
+                    let result = worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (index, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (index, opened) in opened {
+            match opened {
+                Ok(opened) if opened.observed_at <= deadlines[index] => {
+                    latest[index] = Some(opened);
+                }
+                Ok(opened) => {
+                    let overrun = opened
+                        .observed_at
+                        .saturating_duration_since(deadlines[index]);
+                    observations[index] = format!(
+                        "metadata observation completed {overrun:?} after the SLO boundary"
+                    );
+                }
+                Err(error) => observations[index] = error,
+            }
+        }
+        let Some(remaining) = deadlines
+            .iter()
+            .filter_map(|deadline| remaining_at(*deadline, Instant::now()))
+            .min()
+        else {
+            continue;
+        };
+        let poll_interval = if remaining <= Duration::from_secs(2) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        std::thread::sleep(remaining.min(poll_interval));
+    }
+
+    latest
+        .into_iter()
+        .enumerate()
+        .map(|(index, opened)| {
+            opened.unwrap_or_else(|| {
+                panic!(
+                    "{} Delta metadata had no observable version at or before its {visibility_slo:?} visibility boundary: {}",
+                    outputs[index].label, observations[index]
+                )
+            })
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn scan_delta_visibility_boundaries(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    opened: &[OpenDeltaJoinSnapshot],
+    window: Duration,
+    visibility_slo: Duration,
+) -> Vec<DeltaJoinSnapshot> {
+    let mut completed = Vec::with_capacity(outputs.len());
+    for (output, opened) in outputs.iter().zip(opened) {
+        let scan_deadline = Instant::now() + window;
+        let snapshot = retry_delta_snapshot_until(nodes, scan_deadline, output.label, || {
+            output.oracle.scan_join_snapshot(opened)
+        });
+        let snapshot = validate_delta_exact_snapshot(output, snapshot).unwrap_or_else(|error| {
+            panic!(
+                "{} was not exact at its pre-SLO Delta boundary: {error}",
+                output.label
+            )
+        });
+        let visibility = snapshot
+            .observed_at
+            .saturating_duration_since(output.frozen_input_at);
+        assert!(
+            visibility <= visibility_slo,
+            "{} exact Delta boundary was observed after {visibility:?}; SLO is {visibility_slo:?}",
+            output.label
+        );
+        eprintln!(
+            "soak: PROFILE {} exact Delta visibility_upper_bound_ms={:.3} rows={} table_version={}",
+            output.label,
+            visibility.as_secs_f64() * 1_000.0,
+            snapshot.rows,
+            snapshot.version
+        );
+        completed.push(snapshot);
+    }
+    completed
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn wait_delta_exact_outputs(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
@@ -7417,78 +7539,14 @@ fn wait_delta_exact_outputs(
             output.label
         );
     }
-    let deadline = Instant::now() + window;
     let visibility_slo = Duration::from_millis(env_u64(
         "LAMINAR_SOAK_EO_VISIBILITY_MS",
         DEFAULT_EO_VISIBILITY_MS,
     ));
-    let mut completed = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
-    let mut observations = vec![String::new(); outputs.len()];
-    while completed.iter().any(Option::is_none) {
-        assert_running_nodes(nodes);
-        // Capture every pending immutable table version before any full data scan. This makes the
-        // visibility timestamp independent of scan order while keeping the expensive scans
-        // sequential on constrained object-store emulators.
-        let opened = std::thread::scope(|scope| {
-            let workers = outputs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| completed[*index].is_none())
-                .map(|(index, output)| (index, scope.spawn(|| output.oracle.open_join_snapshot())))
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|(index, worker)| {
-                    let result = worker
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    (index, result)
-                })
-                .collect::<Vec<_>>()
-        });
-        for (index, opened) in opened {
-            let output = &outputs[index];
-            let result = opened.and_then(|opened| delta_exact_snapshot(output, opened));
-            match result {
-                Ok(snapshot) => {
-                    let visibility = snapshot
-                        .observed_at
-                        .saturating_duration_since(output.frozen_input_at);
-                    assert!(
-                        visibility <= visibility_slo,
-                        "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
-                        output.label
-                    );
-                    eprintln!(
-                        "soak: PROFILE {} exact Delta visibility_ms={:.3} rows={} table_version={}",
-                        output.label,
-                        visibility.as_secs_f64() * 1_000.0,
-                        snapshot.rows,
-                        snapshot.version
-                    );
-                    completed[index] = Some(snapshot);
-                }
-                Err(observation) => observations[index] = observation,
-            }
-        }
-        if completed.iter().any(Option::is_none) {
-            assert!(
-                Instant::now() < deadline,
-                "Delta outputs did not expose every exact frozen input cut: {:?}",
-                outputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| completed[*index].is_none())
-                    .map(|(index, output)| (output.label, observations[index].as_str()))
-                    .collect::<Vec<_>>()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-    completed
-        .into_iter()
-        .map(|snapshot| snapshot.expect("every Delta output completed"))
-        .collect()
+    // WHY: Full-table scans are verifier work. Timestamp the immutable publication boundary first
+    // so scan order and transient read retries cannot consume or move the delivery SLO.
+    let opened = open_delta_visibility_boundaries(nodes, outputs, visibility_slo);
+    scan_delta_visibility_boundaries(nodes, outputs, &opened, window, visibility_slo)
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -7509,8 +7567,8 @@ fn assert_delta_exact_outputs_stable(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
-    let reread_deadline = Instant::now() + window;
     for (output, completed) in outputs.iter().zip(completed) {
+        let reread_deadline = Instant::now() + window;
         let stable = retry_delta_snapshot_until(nodes, reread_deadline, output.label, || {
             output.oracle.snapshot()
         });
