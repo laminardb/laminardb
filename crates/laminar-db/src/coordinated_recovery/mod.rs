@@ -2563,7 +2563,11 @@ async fn start_pipeline(db: &Arc<LaminarDB>, target: Option<u64>) -> Result<(), 
     }
     run_lifecycle_result(db, RECOVERY_START_LIFECYCLE_TIMEOUT, move |db| async move {
         db.set_recover_target_epoch(target);
-        db.start_for_coordinated_recovery().await
+        let result = db.start_for_coordinated_recovery().await;
+        // An acknowledgement retry may find the graph already Running, in which case startup does
+        // not consume the armed target. Never let that old cut block the next stopped assignment.
+        db.set_recover_target_epoch(None);
+        result
     })
     .await
 }

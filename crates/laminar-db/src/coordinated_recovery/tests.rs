@@ -1293,6 +1293,41 @@ async fn coordinated_restart_requires_a_committed_assignment_head() {
 }
 
 #[tokio::test]
+async fn idempotent_recovery_start_clears_its_unconsumed_target() {
+    let (controller, _members_tx, _kv) = controller(Vec::new()).await;
+    let controller = Arc::new(controller);
+    let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .assignment_snapshot_store(Arc::clone(&assignments))
+        .build()
+        .await
+        .unwrap();
+    let participant = CheckpointParticipant {
+        node_id: controller.instance_id().0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[controller.instance_id()]),
+            vec![participant],
+        )
+        .unwrap();
+    assignments.save_if_absent(&committed).await.unwrap();
+    crate::db::DbState::Running.store(&db.state);
+
+    start_pipeline(&db, Some(41)).await.unwrap();
+
+    assert!(
+        db.recover_target_epoch.lock().is_none(),
+        "an acknowledgement retry against a running graph must not retain its old recovery cut"
+    );
+}
+
+#[tokio::test]
 async fn recovery_reconstructs_a_suspended_fence_from_exact_durable_adoption() {
     use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
