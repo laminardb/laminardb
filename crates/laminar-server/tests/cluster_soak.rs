@@ -6337,10 +6337,18 @@ fn assert_kafka_matrix_aggregates(
 #[derive(Debug)]
 struct DeltaJoinSnapshot {
     version: i64,
+    observed_at: Instant,
     rows: usize,
     pairs: BTreeSet<(u64, u64)>,
     duplicate_rows: usize,
     first_duplicate: Option<(u64, u64)>,
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+struct OpenDeltaJoinSnapshot {
+    table: deltalake::DeltaTable,
+    version: i64,
+    observed_at: Instant,
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -6390,7 +6398,7 @@ impl DeltaOutputOracle {
         }
     }
 
-    fn snapshot(&self) -> Result<DeltaJoinSnapshot, String> {
+    fn open_join_snapshot(&self) -> Result<OpenDeltaJoinSnapshot, String> {
         self.runtime.block_on(async {
             let uri = deltalake::ensure_table_uri(&self.table_uri)
                 .map_err(|error| format!("invalid Delta table URI: {error}"))?;
@@ -6401,6 +6409,29 @@ impl DeltaOutputOracle {
             let version = table
                 .version()
                 .ok_or_else(|| "Delta output has no committed table version".to_owned())?;
+            Ok(OpenDeltaJoinSnapshot {
+                table,
+                version,
+                observed_at: Instant::now(),
+            })
+        })
+    }
+
+    fn snapshot(&self) -> Result<DeltaJoinSnapshot, String> {
+        let opened = self.open_join_snapshot()?;
+        self.scan_join_snapshot(opened)
+    }
+
+    fn scan_join_snapshot(
+        &self,
+        opened: OpenDeltaJoinSnapshot,
+    ) -> Result<DeltaJoinSnapshot, String> {
+        self.runtime.block_on(async move {
+            let OpenDeltaJoinSnapshot {
+                table,
+                version,
+                observed_at,
+            } = opened;
             let context = deltalake::datafusion::prelude::SessionContext::new();
             table
                 .update_datafusion_session(&context.state())
@@ -6471,6 +6502,7 @@ impl DeltaOutputOracle {
             }
             Ok(DeltaJoinSnapshot {
                 version,
+                observed_at,
                 rows,
                 pairs,
                 duplicate_rows,
@@ -7332,9 +7364,9 @@ struct DeltaExactOutput<'a> {
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn delta_exact_snapshot(
     output: &DeltaExactOutput<'_>,
-) -> Result<(DeltaJoinSnapshot, Instant), String> {
-    let snapshot = output.oracle.snapshot()?;
-    let observed_at = Instant::now();
+    opened: OpenDeltaJoinSnapshot,
+) -> Result<DeltaJoinSnapshot, String> {
+    let snapshot = output.oracle.scan_join_snapshot(opened)?;
     assert_eq!(
         snapshot.duplicate_rows, 0,
         "{} Delta snapshot version {} contains {} duplicate rows; first duplicate {:?}",
@@ -7351,7 +7383,7 @@ fn delta_exact_snapshot(
         );
     }
     if snapshot.rows == output.expected.len() && snapshot.pairs.len() == output.expected.len() {
-        return Ok((snapshot, observed_at));
+        return Ok(snapshot);
     }
     let missing = output
         .expected
@@ -7394,14 +7426,34 @@ fn wait_delta_exact_outputs(
     let mut observations = vec![String::new(); outputs.len()];
     while completed.iter().any(Option::is_none) {
         assert_running_nodes(nodes);
-        for (index, output) in outputs.iter().enumerate() {
-            if completed[index].is_some() {
-                continue;
-            }
-            let result = delta_exact_snapshot(output);
+        // Capture every pending immutable table version before any full data scan. This makes the
+        // visibility timestamp independent of scan order while keeping the expensive scans
+        // sequential on constrained object-store emulators.
+        let opened = std::thread::scope(|scope| {
+            let workers = outputs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| completed[*index].is_none())
+                .map(|(index, output)| (index, scope.spawn(|| output.oracle.open_join_snapshot())))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|(index, worker)| {
+                    let result = worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    (index, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (index, opened) in opened {
+            let output = &outputs[index];
+            let result = opened.and_then(|opened| delta_exact_snapshot(output, opened));
             match result {
-                Ok((snapshot, observed_at)) => {
-                    let visibility = observed_at.saturating_duration_since(output.frozen_input_at);
+                Ok(snapshot) => {
+                    let visibility = snapshot
+                        .observed_at
+                        .saturating_duration_since(output.frozen_input_at);
                     assert!(
                         visibility <= visibility_slo,
                         "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
