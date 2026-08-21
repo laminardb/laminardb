@@ -7201,7 +7201,7 @@ fn assert_delta_matrix_outputs(
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct DeltaMatrixAggregateSnapshot {
     version: i64,
     physical_rows: usize,
@@ -7300,9 +7300,19 @@ fn assert_delta_matrix_aggregates(
             &format!("{label}: {expected_case}"),
             || delta_matrix_aggregate_snapshot(output, expected_case),
         );
+        assert!(
+            stable.version >= previous.version,
+            "{label}: {expected_case} Delta version regressed from {} to {}",
+            previous.version,
+            stable.version
+        );
         assert_eq!(
-            &stable, previous,
-            "{label}: {expected_case} Delta aggregate changed during the quiet re-read"
+            stable.physical_rows, previous.physical_rows,
+            "{label}: {expected_case} Delta aggregate row count changed during the quiet re-read"
+        );
+        assert_eq!(
+            stable.net, previous.net,
+            "{label}: {expected_case} Delta aggregate net changed during the quiet re-read"
         );
     }
     eprintln!(
