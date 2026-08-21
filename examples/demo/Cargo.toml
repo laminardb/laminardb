@@ -2,7 +2,7 @@
 
 [package]
 name = "laminardb-demo"
-version = "0.28.0"
+version = "0.30.0"
 edition = "2021"
 publish = false
 description = "Market Data Demo: Real-time analytics with Ratatui TUI for LaminarDB"

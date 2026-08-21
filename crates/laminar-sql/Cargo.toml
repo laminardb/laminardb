@@ -15,7 +15,7 @@ cluster = ["laminar-core/cluster"]
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.28.0" }
+laminar-core = { path = "../laminar-core", version = "0.30.0" }
 
 # DataFusion for SQL processing
 datafusion = { workspace = true }

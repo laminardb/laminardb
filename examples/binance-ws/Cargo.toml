@@ -2,7 +2,7 @@
 
 [package]
 name = "binance-ws"
-version = "0.28.0"
+version = "0.30.0"
 edition = "2021"
 publish = false
 description = "Binance VWAP signals: minimal LaminarDB streaming example"
