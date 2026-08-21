@@ -139,7 +139,10 @@ const SOAK_PRODUCER_MAX_IN_FLIGHT: usize = 4_096;
 #[cfg(feature = "kafka")]
 const MAX_TEMPORAL_LOAD_RPS: u64 = 1_000;
 #[cfg(feature = "kafka")]
-const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(15);
+// WHY: A checkpoint fence can delay a bounded publication burst at either sample boundary. A
+// 30-second window prevents an ordinary one-second fence from consuming most of the 10% capacity
+// allowance without masking sustained under-capacity.
+const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(30);
 #[cfg(feature = "kafka")]
 const ACTIVE_LOAD_MINIMUM_RATIO: f64 = 0.9;
 #[cfg(feature = "kafka")]
