@@ -4790,17 +4790,6 @@ fn assert_active_load_throughput(
         std::thread::sleep(Duration::from_millis(100));
     }
     let (_, offered_end_at, offered_end) = timed_snapshot(|| producer.enqueued());
-    let output_samples = output_starts
-        .into_iter()
-        .map(|(label, output, started_at, start)| {
-            let (_, ended_at, end) = timed_snapshot(|| {
-                output
-                    .high_watermarks()
-                    .unwrap_or_else(|| panic!("active-load {label} output end"))
-            });
-            (label, started_at, start, ended_at, end)
-        })
-        .collect::<Vec<_>>();
     let committed_at_deadline = committed_starts
         .iter()
         .map(|(label, input, _, _, _)| {
@@ -4854,7 +4843,14 @@ fn assert_active_load_throughput(
             );
         }
     }
-    for (label, emitted_start_at, output_start, emitted_end_at, output_end) in output_samples {
+    // INVARIANT: The committed source frontiers above advance after the checkpoint tail. Observe
+    // output afterward so an in-flight terminal batch cannot look like sustained under-throughput.
+    for (label, output, emitted_start_at, output_start) in output_starts {
+        let (_, emitted_end_at, output_end) = timed_snapshot(|| {
+            output
+                .high_watermarks()
+                .unwrap_or_else(|| panic!("active-load {label} output end"))
+        });
         let emitted = monotonic_offset_delta(label, &output_start, &output_end);
         let emitted_elapsed = emitted_end_at
             .duration_since(emitted_start_at)
