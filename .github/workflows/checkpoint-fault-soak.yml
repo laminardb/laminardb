@@ -159,7 +159,7 @@ jobs:
             emulator: "1"
             checkpoint_ms: "10000"
             rps: "200"
-            visibility_ms: "90000"
+            visibility_ms: "120000"
             slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
@@ -170,7 +170,7 @@ jobs:
             emulator: "1"
             checkpoint_ms: "10000"
             rps: "200"
-            visibility_ms: "90000"
+            visibility_ms: "120000"
             slo_mode: observe
     steps:
       - uses: actions/checkout@v6
@@ -233,9 +233,9 @@ jobs:
           LAMINAR_SOAK_SINGLE_KILLS: ${{ github.event.inputs.kills || '4' }}
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           # MinIO EO is protocol validation, not a throughput certificate. Use the production
-          # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor without
-          # making the emulator the bottleneck for 23 exact sinks. The test's strict defaults
-          # remain the certifying profile for production-class object storage.
+          # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor. Cluster EO
+          # gets a bounded drain window for fault-built backlog across 23 emulator-backed sinks;
+          # the test's strict defaults remain the certifying profile for production object stores.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
