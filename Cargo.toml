@@ -127,7 +127,7 @@ chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 # xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
 # bump and updated golden vectors.
-xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }

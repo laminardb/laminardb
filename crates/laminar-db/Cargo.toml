@@ -58,7 +58,7 @@ laminar-connectors = { path = "../laminar-connectors", version = "0.28.0", defau
 quick_cache = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 governor = { version = "0.8", optional = true }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 hf-hub = { version = "0.4", default-features = false, features = [
