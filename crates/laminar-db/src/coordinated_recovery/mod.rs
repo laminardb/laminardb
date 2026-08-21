@@ -2657,9 +2657,10 @@ where
     let spawned = std::thread::Builder::new()
         .name("laminar-coord-recover".into())
         .spawn(move || {
-            let _active = active;
-            let res = handle.block_on(f(db));
-            let _ = tx.send(res);
+            let result = handle.block_on(f(db));
+            // INVARIANT: completion is observable only after the overlap fence is released.
+            drop(active);
+            let _ = tx.send(result);
         });
     if let Err(e) = spawned {
         return Err(crate::DbError::Pipeline(format!(
