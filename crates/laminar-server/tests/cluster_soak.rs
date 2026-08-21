@@ -4695,22 +4695,22 @@ fn timed_snapshot<T>(snapshot: impl FnOnce() -> T) -> (Instant, Instant, T) {
 }
 
 #[cfg(feature = "kafka")]
-fn wait_for_committed_offset_advance(
+fn wait_for_offset_advance(
     nodes: &mut [Node],
     producer: &mut ProducerGuard,
-    input: &KafkaJoinCommitOracle,
     baseline: &[i64],
     window: Duration,
     label: &str,
+    mut current_offsets: impl FnMut() -> Option<Vec<i64>>,
 ) -> (Instant, Vec<i64>) {
     let mut observed = None;
     wait_for(
-        &format!("{label}: every Kafka source partition to advance its committed offset"),
+        &format!("{label}: every Kafka partition offset to advance"),
         window,
         || {
             assert_running_nodes(nodes);
             producer.assert_running();
-            let Some(current) = input.committed_offsets() else {
+            let Some(current) = current_offsets() else {
                 return false;
             };
             match all_partition_offsets_advanced(baseline, &current) {
@@ -4719,11 +4719,11 @@ fn wait_for_committed_offset_advance(
                     true
                 }
                 Ok(false) => false,
-                Err(error) => panic!("{label}: invalid Kafka committed-offset frontier: {error}"),
+                Err(error) => panic!("{label}: invalid Kafka offset frontier: {error}"),
             }
         },
     );
-    observed.expect("committed-offset wait completed without an offset frontier")
+    observed.expect("offset wait completed without an observed frontier")
 }
 
 #[cfg(feature = "kafka")]
@@ -4747,14 +4747,35 @@ fn assert_active_load_throughput(
             .committed_offsets()
             .unwrap_or_else(|| panic!("active-load {label} initial committed-offset snapshot"));
         initialized_offset_sum(&format!("active-load {label} initial offsets"), &seed);
-        wait_for_committed_offset_advance(
+        wait_for_offset_advance(
             nodes,
             producer,
-            input,
             &seed,
             recovery_ceiling,
             &format!("active-load {label} durable baseline"),
+            || input.committed_offsets(),
         );
+    }
+    // INVARIANT: ALO output can publish ahead of its source checkpoint. Delimit output samples
+    // with output publication advances, not committed source cuts, so both endpoints represent
+    // the same externally observable boundary.
+    let mut output_starts = Vec::new();
+    for &(label, output) in outputs {
+        let Some(output) = output else {
+            continue;
+        };
+        let seed = output
+            .high_watermarks()
+            .unwrap_or_else(|| panic!("active-load {label} initial output snapshot"));
+        let (started_at, offsets) = wait_for_offset_advance(
+            nodes,
+            producer,
+            &seed,
+            recovery_ceiling,
+            &format!("active-load {label} output baseline"),
+            || output.high_watermarks(),
+        );
+        output_starts.push((label, output, started_at, offsets));
     }
     let committed_starts = inputs
         .iter()
@@ -4770,19 +4791,6 @@ fn assert_active_load_throughput(
         })
         .collect::<Vec<_>>();
     let (offered_start_at, _, offered_start) = timed_snapshot(|| producer.enqueued());
-    let output_starts = outputs
-        .iter()
-        .filter_map(|&(label, output)| {
-            output.map(|output| {
-                let (started_at, _, offsets) = timed_snapshot(|| {
-                    output
-                        .high_watermarks()
-                        .unwrap_or_else(|| panic!("active-load {label} output start"))
-                });
-                (label, output, started_at, offsets)
-            })
-        })
-        .collect::<Vec<_>>();
     let sample_started = Instant::now();
     while sample_started.elapsed() < ACTIVE_LOAD_SAMPLE_WINDOW {
         assert_running_nodes(nodes);
@@ -4796,6 +4804,14 @@ fn assert_active_load_throughput(
             input
                 .committed_offsets()
                 .unwrap_or_else(|| panic!("active-load {label} deadline offsets"))
+        })
+        .collect::<Vec<_>>();
+    let output_at_deadline = output_starts
+        .iter()
+        .map(|(label, output, _, _)| {
+            output
+                .high_watermarks()
+                .unwrap_or_else(|| panic!("active-load {label} output deadline"))
         })
         .collect::<Vec<_>>();
     let offered_pairs = offered_end
@@ -4818,13 +4834,13 @@ fn assert_active_load_throughput(
     {
         all_partition_offsets_advanced(&start_offsets, &deadline_offsets)
             .unwrap_or_else(|error| panic!("active-load {label} durable deadline: {error}"));
-        let (ended_at, end_offsets) = wait_for_committed_offset_advance(
+        let (ended_at, end_offsets) = wait_for_offset_advance(
             nodes,
             producer,
-            input,
             &deadline_offsets,
             recovery_ceiling,
             &format!("active-load {label} durable endpoint"),
+            || input.committed_offsets(),
         );
         let end =
             initialized_offset_sum(&format!("active-load {label} final offsets"), &end_offsets);
@@ -4843,14 +4859,17 @@ fn assert_active_load_throughput(
             );
         }
     }
-    // INVARIANT: The committed source frontiers above advance after the checkpoint tail. Observe
-    // output afterward so an in-flight terminal batch cannot look like sustained under-throughput.
-    for (label, output, emitted_start_at, output_start) in output_starts {
-        let (_, emitted_end_at, output_end) = timed_snapshot(|| {
-            output
-                .high_watermarks()
-                .unwrap_or_else(|| panic!("active-load {label} output end"))
-        });
+    for ((label, output, emitted_start_at, output_start), deadline_offsets) in
+        output_starts.into_iter().zip(output_at_deadline)
+    {
+        let (emitted_end_at, output_end) = wait_for_offset_advance(
+            nodes,
+            producer,
+            &deadline_offsets,
+            recovery_ceiling,
+            &format!("active-load {label} output endpoint"),
+            || output.high_watermarks(),
+        );
         let emitted = monotonic_offset_delta(label, &output_start, &output_end);
         let emitted_elapsed = emitted_end_at
             .duration_since(emitted_start_at)
