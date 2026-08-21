@@ -1,3 +1,9 @@
+use super::debezium::decode_debezium_mutations;
+use super::drain::{
+    claim_kafka_drain_execution, kafka_assignment_fence_matches,
+    validate_kafka_partition_error_list, KAFKA_DRAIN_EXECUTION_CANCELLED,
+    KAFKA_DRAIN_EXECUTION_PENDING,
+};
 use super::*;
 use crate::connector::SourceBatchCursor;
 use crate::kafka::offsets::{KAFKA_CHECKPOINT_VERSION, KAFKA_CHECKPOINT_VERSION_KEY};

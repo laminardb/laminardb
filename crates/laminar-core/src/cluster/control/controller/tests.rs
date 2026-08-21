@@ -2337,6 +2337,105 @@ async fn checkpoint_prepare_authority_timeout_does_not_refresh_gossip_identity_c
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn expired_checkpoint_prepare_is_ignored_after_durable_abort() {
+    use crate::checkpoint_decision::CheckpointVerdict;
+    use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
+
+    let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+    let control_kv: Arc<dyn ClusterKv> = follower_kv.clone();
+    let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+    let follower = ClusterController::new(NodeId(2), control_kv, None, members_rx);
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let gate = Arc::new(AuthorityIoGateStore::new(
+        backing,
+        AuthorityIoGateOperation::Get,
+    ));
+    let gated_backing: Arc<dyn object_store::ObjectStore> = gate.clone();
+    let authority = Arc::new(super::super::LeaderLeaseStore::new(gated_backing, 1_000));
+    let leader_boot = Uuid::from_u128(11);
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: leader_boot,
+        process_term: 3,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("empty leader authority must be acquired");
+    };
+    follower.set_leader_lease_store(authority.clone());
+
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        7,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: leader_boot,
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: follower.recovery_incarnation(),
+            },
+        ],
+    )
+    .unwrap();
+    follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    let announcement = BarrierAnnouncement {
+        epoch: 9,
+        checkpoint_id: 9,
+        assignment_fence: Some(fence.clone()),
+        leader_proof: Some(lease.proof()),
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    follower_kv.seed(
+        NodeId(1),
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&announcement).unwrap(),
+    );
+
+    let observed = follower
+        .observe_checkpoint_prepare_until(Duration::from_millis(100))
+        .await
+        .unwrap();
+    assert!(matches!(
+        observed,
+        Some(CheckpointPrepareObservation::AssignmentReady(_))
+    ));
+    authority
+        .record_cluster_outcome(
+            &lease.proof(),
+            announcement.epoch,
+            announcement.checkpoint_id,
+            fence,
+            CheckpointVerdict::Abort,
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(101)).await;
+
+    assert!(follower
+        .observe_checkpoint_prepare_until(Duration::from_millis(100))
+        .await
+        .unwrap()
+        .is_none());
+
+    gate.arm();
+    assert!(follower
+        .observe_checkpoint_prepare_until(Duration::from_millis(100))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        gate.armed.load(Ordering::Acquire),
+        "the cached terminal floor must avoid another authority read"
+    );
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn checkpoint_prepare_reports_exact_local_assignment_disposition() {
     use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};

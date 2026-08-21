@@ -1022,6 +1022,40 @@ fn exactly_once_is_coordinated_append_only() {
     assert!(sink.contract(&ConnectorConfig::new("delta-lake")).is_err());
 }
 
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_millisecond_timestamp_is_widened_before_materialization() {
+    use arrow_array::TimestampMillisecondArray;
+    use arrow_schema::TimeUnit;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_millisecond_timestamp");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "probe_time",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![Some(1_500)]))],
+    )
+    .unwrap();
+    let mut sink =
+        DeltaLakeSink::with_schema(coordinated_config(&table_dir.to_string_lossy()), schema);
+
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    sink.begin_epoch(1).await.unwrap();
+    sink.write_batch(&batch).await.unwrap();
+    let descriptor = sink.pre_commit(1).await.unwrap();
+
+    assert!(descriptor.is_some());
+    sink.rollback_epoch(1).await.unwrap();
+    sink.close().await.unwrap();
+}
+
 /// An exact epoch larger than the former 4x in-memory cap is staged across
 /// uniquely named, log-invisible Parquet files and published by one checkpoint
 /// without replay.

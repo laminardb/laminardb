@@ -1,4 +1,31 @@
+use std::collections::{BinaryHeap, HashMap};
+use std::path::PathBuf;
+
+use laminar_core::cluster::discovery::{
+    NodeId, NodeInfo, NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
+};
+use object_store::ObjectStoreExt as _;
+use tokio::sync::watch;
+
+use super::assignment::{
+    assignment_seed_participants, is_same_formation_genesis, resolve_vnode_assignment,
+    startup_leader_authority_timeout, wait_for_startup_assignment_fence,
+    wait_for_startup_leader_authority,
+};
+use super::control_kv::{
+    list_control_sequences, object_store_control_key_prefix, object_store_control_record_path,
+    recovery_generation_path, retain_oldest_control_record, ObjectStoreClusterKv,
+    ObjectStoreControlRecord, StaticClusterKv, OBJECT_STORE_CONTROL_MAX_ENVELOPE_BYTES,
+    OBJECT_STORE_CONTROL_PRUNE_BATCH_RECORDS, OBJECT_STORE_CONTROL_SCAN_CONCURRENCY,
+    OBJECT_STORE_CONTROL_VERSION, RECOVERY_GENERATION_KEY, RECOVERY_GENERATION_PREFIX,
+};
+use super::discovery::stop_discovery_with_bound;
+use super::leases::spawn_process_lease_terminal_monitor;
+use super::services::start_cluster_http_api_before_activation;
+use super::shutdown::{wait_for_cluster_shutdown_trigger, ClusterShutdownTrigger};
 use super::*;
+use crate::cluster_config::ClusterConfig;
+use crate::config::ServerConfig;
 
 #[tokio::test]
 async fn cluster_entry_rejects_invalid_temporal_retention_before_discovery() {
@@ -432,6 +459,57 @@ async fn exited_leader_lease_manager_triggers_cluster_runtime_shutdown() {
     assert_eq!(trigger, ClusterShutdownTrigger::LeaderLeaseExited);
     leader_lease.stop().await;
     let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+}
+
+#[tokio::test]
+async fn exited_rebalance_task_triggers_cluster_runtime_shutdown() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(std::future::pending::<()>());
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(std::future::pending::<()>());
+    let mut rebalance_tasks = vec![tokio::spawn(async {})];
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+    )
+    .await
+    .expect("an exited rebalance control task must wake cluster shutdown")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::RebalanceTaskExited);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+    for task in &mut rebalance_tasks {
+        let _ = abort_and_join_cluster_task(task, "test rebalance task").await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_trigger_prefers_process_lease_loss_when_every_trigger_is_ready() {
+    let terminal = tokio_util::sync::CancellationToken::new();
+    terminal.cancel();
+    let leader_shutdown = tokio_util::sync::CancellationToken::new();
+    let leader_task = tokio::spawn(async {});
+    let mut leader_lease = LeaderLeaseRuntime::new(leader_shutdown, leader_task);
+    let mut api_handle = tokio::spawn(async {});
+    let mut rebalance_tasks = vec![tokio::spawn(async {})];
+
+    let trigger = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        wait_for_cluster_shutdown_trigger(&terminal, &leader_lease, &api_handle, &rebalance_tasks),
+    )
+    .await
+    .expect("a ready shutdown trigger must be selected promptly")
+    .unwrap();
+
+    assert_eq!(trigger, ClusterShutdownTrigger::ProcessLeaseLost);
+    leader_lease.stop().await;
+    let _ = abort_and_join_cluster_task(&mut api_handle, "test HTTP API server").await;
+    for task in &mut rebalance_tasks {
+        let _ = abort_and_join_cluster_task(task, "test rebalance task").await;
+    }
 }
 
 #[tokio::test]
@@ -941,6 +1019,92 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
     };
     assert!(matches!(error, ClusterStartupError::HttpStartup(_)));
     assert!(!controller.live_instances().contains(&node));
+}
+
+#[tokio::test]
+async fn static_cluster_kv_serves_reads_and_scans_from_membership_metadata() {
+    use laminar_core::cluster::control::ClusterKv as _;
+
+    fn tagged(node: u64, key: &str, value: &str) -> NodeInfo {
+        let mut metadata = NodeMetadata::default();
+        metadata.tags.insert(key.to_string(), value.to_string());
+        NodeInfo {
+            id: NodeId(node),
+            name: format!("node-{node}"),
+            rpc_address: String::new(),
+            state: NodeState::Active,
+            metadata,
+            last_heartbeat_ms: 0,
+        }
+    }
+
+    let (membership_tx, membership_rx) = watch::channel(vec![
+        tagged(7, "shuffle", "127.0.0.1:7007"),
+        tagged(9, "unrelated", "value"),
+    ]);
+    let kv = StaticClusterKv::new(membership_rx);
+
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7007")
+    );
+    assert_eq!(kv.read_from(NodeId(9), "shuffle").await, None);
+    assert_eq!(kv.read_from(NodeId(1234), "shuffle").await, None);
+    assert_eq!(
+        kv.scan("shuffle").await,
+        vec![(NodeId(7), "127.0.0.1:7007".to_string())]
+    );
+
+    kv.write("shuffle", "ignored".to_string()).await;
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7007"),
+        "static discovery KV writes must remain no-ops"
+    );
+
+    membership_tx
+        .send(vec![tagged(7, "shuffle", "127.0.0.1:7008")])
+        .unwrap();
+    assert_eq!(
+        kv.read_from(NodeId(7), "shuffle").await.as_deref(),
+        Some("127.0.0.1:7008"),
+        "reads must track the current membership snapshot"
+    );
+}
+
+#[tokio::test]
+async fn stopping_discovery_releases_the_static_listener() {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let local_node = NodeInfo {
+        id: NodeId(51),
+        name: "stop-test".into(),
+        rpc_address: "127.0.0.1:0".into(),
+        state: NodeState::Joining,
+        metadata: NodeMetadata {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ..NodeMetadata::default()
+        },
+        last_heartbeat_ms: 0,
+    };
+    let mut discovery = DiscoveryImpl::Static(StaticDiscovery::new(StaticDiscoveryConfig {
+        local_node,
+        seeds: vec![format!("127.0.0.1:{listen_port}")],
+        heartbeat_interval: std::time::Duration::from_secs(1),
+        suspect_threshold: 3,
+        dead_threshold: 10,
+        listen_address: format!("127.0.0.1:{listen_port}"),
+        process_generation: 1,
+        process_incarnation: uuid::Uuid::new_v4(),
+    }));
+    discovery.start().await.unwrap();
+
+    assert!(stop_discovery_with_bound(&mut discovery).await);
+
+    std::net::TcpListener::bind(format!("127.0.0.1:{listen_port}"))
+        .expect("the static discovery listener must be released after stop");
 }
 
 #[tokio::test]
@@ -1997,6 +2161,36 @@ async fn assignment_seed_rejects_peer_tag_that_is_not_durable_lease_owner() {
     assert!(
         error.to_string().contains("durable lease belongs"),
         "{error}"
+    );
+}
+
+#[tokio::test]
+async fn assignment_seed_retries_transient_process_lease_reads() {
+    use laminar_core::cluster::testing::{FaultyObjectStore, ObjectStoreFault};
+
+    let inner: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let self_id = NodeId(1);
+    let self_boot = uuid::Uuid::from_u128(11);
+    acquire_test_process_lease(Arc::clone(&inner), self_id, self_boot, 1_000).await;
+
+    let faulty = Arc::new(FaultyObjectStore::new(inner));
+    faulty.set_fault(ObjectStoreFault::FailReads);
+    let store: Arc<dyn object_store::ObjectStore> = faulty.clone();
+    let clear_fault = async {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        faulty.set_fault(ObjectStoreFault::None);
+    };
+    let (participants, ()) = tokio::join!(
+        assignment_seed_participants(self_id, self_boot, &[], &store, 1_000),
+        clear_fault,
+    );
+
+    assert_eq!(
+        participants.unwrap(),
+        vec![laminar_core::checkpoint::CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: self_boot,
+        }]
     );
 }
 

@@ -2069,6 +2069,80 @@ fn spawn_batch_recording_sink(
     (handle, batches)
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn terminal_handoff_completion_leaves_sink_sealed_for_target_assignment() {
+    use laminar_connectors::connector::{SinkConsistency, SinkInputMode, SinkTopology};
+
+    let contract = SinkContract::new(
+        SinkConsistency::CheckpointCommittable,
+        SinkTopology::MultiWriter,
+        SinkInputMode::AppendOnly,
+    );
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (sink, _batches) = spawn_batch_recording_sink(
+        "terminal-handoff",
+        contract,
+        Arc::new(arrow_schema::Schema::empty()),
+        event_tx,
+    );
+    let attempt = CheckpointAttempt::canonical(7);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    sink.begin_epoch_until(attempt.epoch, deadline)
+        .await
+        .unwrap();
+    let admission = sink.begun_epoch_admission(attempt.epoch).unwrap();
+    sink.publish_open_epoch(admission).unwrap();
+
+    let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let checkpoint_fault = Arc::new(parking_lot::Mutex::new(None));
+    let mut epoch_guard =
+        EpochInFlightGuard::claim(&in_flight, &checkpoint_fault, attempt, [sink.clone()]).unwrap();
+    epoch_guard.seal_sink_epoch_until(deadline).await.unwrap();
+    let (complete_tx, _complete_rx) =
+        crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
+    let mut tail = LeaderTail {
+        in_flight: epoch_guard,
+        coordinator: Arc::new(tokio::sync::Mutex::new(None)),
+        complete_tx,
+        request: crate::checkpoint_coordinator::CheckpointRequest::default(),
+        operator_state: None,
+        operator_state_staged_cap_bytes: 0,
+        mutable_operator_capture_guard: None,
+        fan_out: FxHashMap::default(),
+        local_watermark: CheckpointWatermark::Uninitialized,
+        handoff: HandoffCapture::new(laminar_core::checkpoint::flags::HANDOFF, false),
+        attempt,
+        attempt_started: std::time::Instant::now(),
+        attempt_deadline: deadline,
+        checkpoint_timeout: Duration::from_secs(1),
+        serialization_timeout: Duration::from_secs(1),
+        checkpoint_cleanup_timeout: Duration::from_secs(1),
+        fault_on_retryable_failure: true,
+        fault_on_unclassified_error: true,
+        checkpoint_fault: Arc::clone(&checkpoint_fault),
+        controller: None,
+        leader_proof: None,
+        full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let result = crate::checkpoint_coordinator::CheckpointResult {
+        success: true,
+        checkpoint_id: attempt.checkpoint_id,
+        epoch: attempt.epoch,
+        duration: Duration::ZERO,
+        error: None,
+        failure_disposition: None,
+    };
+
+    ConnectorPipelineCallback::complete_successful_leader_tail(&mut tail, result).await;
+
+    assert!(checkpoint_fault.lock().is_none());
+    sink.begin_epoch_until(8, deadline).await.unwrap();
+    sink.close().await.unwrap();
+}
+
 fn recorded_i64_values(batches: &[RecordBatch]) -> Vec<i64> {
     batches
         .iter()
@@ -3703,7 +3777,7 @@ async fn unclassified_checkpoint_tail_error_faults_only_durable_delivery() {
             mutable_operator_capture_guard: None,
             fan_out: FxHashMap::default(),
             local_watermark: CheckpointWatermark::Uninitialized,
-            handoff_replay_pending: false,
+            handoff: HandoffCapture::default(),
             attempt: CheckpointAttempt::canonical(7),
             attempt_started: std::time::Instant::now(),
             attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(1),
@@ -4058,7 +4132,7 @@ async fn reserved_attempt_failure_is_reported_only_after_cleanup_resolves() {
         mutable_operator_capture_guard: None,
         fan_out: FxHashMap::default(),
         local_watermark: CheckpointWatermark::Uninitialized,
-        handoff_replay_pending: false,
+        handoff: HandoffCapture::default(),
         attempt,
         attempt_started: std::time::Instant::now(),
         attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
@@ -5754,7 +5828,7 @@ async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement_body
         mutable_operator_capture_guard: None,
         fan_out: FxHashMap::default(),
         local_watermark: CheckpointWatermark::Uninitialized,
-        handoff_replay_pending: false,
+        handoff: HandoffCapture::default(),
         attempt,
         attempt_started: std::time::Instant::now(),
         attempt_deadline: tokio::time::Instant::now() + Duration::from_secs(2),

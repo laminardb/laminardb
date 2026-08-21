@@ -217,7 +217,7 @@ impl SourceCheckpointDelta {
         &self.input_channels
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "kafka"))]
     pub(crate) fn changes(&self) -> &HashMap<String, Option<String>> {
         &self.offset_changes
     }

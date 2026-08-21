@@ -1,9 +1,78 @@
 use super::{backoff_for_attempt, claim_restart_slot, spawn_supervised_restart};
 use crate::config::RestartPolicy;
 use crate::db::{DbState, LaminarDB};
+use async_trait::async_trait;
+use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+use laminar_connectors::connector::{
+    DeliveryGuarantee, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
+    SourceInputMode, SourceStart, SourceTopology,
+};
+use laminar_connectors::error::ConnectorError;
 use laminar_core::catalog::CatalogObjectKind;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+struct TransientStartSource {
+    failures_remaining: Arc<AtomicUsize>,
+    poll_failure: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl SourceConnector for TransientStartSource {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
+    }
+
+    async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(ConnectorError::ConnectionFailed(
+                "injected transient metadata read".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn poll_batch(
+        &mut self,
+        _max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        if self.poll_failure.swap(false, Ordering::AcqRel) {
+            return Err(ConnectorError::ConfigurationError(
+                "injected terminal source poll failure".into(),
+            ));
+        }
+        Ok(None)
+    }
+
+    fn schema(&self) -> arrow_schema::SchemaRef {
+        Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]))
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        SourceCheckpoint::new()
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
 
 #[test]
 fn restart_budget_caps_within_window_and_prunes_stale() {
@@ -90,6 +159,95 @@ async fn supervised_restart_recovers_faulted_pipeline() {
     assert_eq!(db.pipeline_state(), "Running");
     assert!(db.last_fault().is_none());
     assert_eq!(metrics.pipeline_restarts_total.get(), 1);
+    db.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supervised_restart_retries_transient_start_failures_within_budget() {
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let failures_remaining = Arc::new(AtomicUsize::new(0));
+    let poll_failure = Arc::new(AtomicBool::new(false));
+    let factory_failures = Arc::clone(&failures_remaining);
+    let factory_poll_failure = Arc::clone(&poll_failure);
+    let db = LaminarDB::builder()
+        .storage_dir(checkpoint_dir.path())
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        })
+        .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+        .restart_policy(RestartPolicy {
+            max_restarts: 3,
+            window: Duration::from_secs(30),
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(4),
+        })
+        .register_connector(move |registry| {
+            let factory_failures = Arc::clone(&factory_failures);
+            let factory_poll_failure = Arc::clone(&factory_poll_failure);
+            registry.register_source(
+                "transient-start",
+                ConnectorInfo {
+                    name: "transient-start".into(),
+                    display_name: "Transient start test source".into(),
+                    version: "1".into(),
+                    is_source: true,
+                    is_sink: false,
+                    config_keys: Vec::new(),
+                },
+                Arc::new(move |_| {
+                    Ok(Box::new(TransientStartSource {
+                        failures_remaining: Arc::clone(&factory_failures),
+                        poll_failure: Arc::clone(&factory_poll_failure),
+                    }))
+                }),
+            )
+        })
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE trades (id BIGINT NOT NULL) FROM \"transient-start\"")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM out AS SELECT id FROM trades")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    let checkpoint = db.checkpoint().await.unwrap();
+    assert!(checkpoint.success, "{:?}", checkpoint.error);
+
+    failures_remaining.store(2, Ordering::Release);
+    poll_failure.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while db.pipeline_state() != "Faulted" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source poll failure must fault the pipeline");
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+        &prometheus::Registry::new(),
+    ));
+    let join = spawn_supervised_restart(
+        Arc::clone(&db),
+        Arc::clone(&db.restart_history),
+        Some(Arc::clone(&metrics)),
+    )
+    .expect("spawn restart thread");
+    join.await.expect("restart task");
+
+    assert_eq!(
+        db.pipeline_state(),
+        "Running",
+        "remaining={}, restarts={}, history={}, fault={:?}",
+        failures_remaining.load(Ordering::Acquire),
+        metrics.pipeline_restarts_total.get(),
+        db.restart_history.lock().len(),
+        db.last_fault()
+    );
+    assert_eq!(failures_remaining.load(Ordering::Acquire), 0);
+    assert_eq!(metrics.pipeline_restarts_total.get(), 3);
+    assert_eq!(db.restart_history.lock().len(), 3);
     db.shutdown().await.unwrap();
 }
 

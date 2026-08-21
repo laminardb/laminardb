@@ -136,6 +136,144 @@ fn cdf_contract_failures_are_terminal() {
 }
 
 #[test]
+fn delta_metadata_retryability_uses_typed_transport_errors() {
+    use delta_object_store::client::{HttpError, HttpErrorKind};
+
+    let transient = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "test",
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Timeout,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                )),
+            },
+        },
+    );
+    assert!(matches!(transient, ConnectorError::ReadError(_)));
+    assert!(transient.is_transient());
+
+    let kernel_transient = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(
+            delta_object_store::Error::Generic {
+                store: "test",
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Request,
+                    std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"),
+                )),
+            },
+        )),
+    );
+    assert!(matches!(kernel_transient, ConnectorError::ReadError(_)));
+    assert!(kernel_transient.is_transient());
+
+    let kernel_unknown_error = deltalake::DeltaTableError::KernelError(
+        delta_kernel::error::Error::ObjectStore(delta_object_store::Error::Generic {
+            store: "test",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::other("opaque request failure"),
+            )),
+        }),
+    );
+    let kernel_unknown_transport =
+        classify_delta_metadata_error("read cursor", &kernel_unknown_error);
+    assert!(matches!(
+        kernel_unknown_transport,
+        ConnectorError::ReadError(_)
+    ));
+    assert!(kernel_unknown_transport.is_transient());
+    assert!(
+        !delta_error_has_retryable_transport(&kernel_unknown_error),
+        "an unknown HTTP write outcome must retain conservative publication semantics"
+    );
+
+    let object_store_unknown = classify_delta_object_store_metadata_error(
+        "HEAD staged object",
+        &deltalake::ObjectStoreError::Generic {
+            store: "test",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::other("opaque request failure"),
+            )),
+        },
+    );
+    assert!(matches!(object_store_unknown, ConnectorError::ReadError(_)));
+    assert!(object_store_unknown.is_transient());
+
+    let permanent = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::PermissionDenied {
+                path: "table".into(),
+                source: Box::new(HttpError::new(
+                    HttpErrorKind::Timeout,
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                )),
+            },
+        },
+    );
+    assert!(matches!(permanent, ConnectorError::TransactionError(_)));
+    assert!(!permanent.is_transient());
+
+    let untyped = classify_delta_metadata_error(
+        "read cursor",
+        &deltalake::DeltaTableError::ObjectStore {
+            source: deltalake::ObjectStoreError::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "untyped timeout",
+                )),
+            },
+        },
+    );
+    assert!(matches!(untyped, ConnectorError::TransactionError(_)));
+    assert!(!untyped.is_transient());
+}
+
+#[tokio::test]
+async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
+    use delta_object_store::aws::AmazonS3Builder;
+    use delta_object_store::{ObjectStore as _, RetryConfig};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        drop(connection);
+    });
+    let store = AmazonS3Builder::new()
+        .with_access_key_id("test")
+        .with_secret_access_key("test")
+        .with_region("test")
+        .with_bucket_name("test")
+        .with_endpoint(endpoint)
+        .with_allow_http(true)
+        .with_retry(RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        })
+        .build()
+        .unwrap();
+    let error = store
+        .head(&delta_object_store::path::Path::from("object"))
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let error =
+        deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(error));
+    let classified = classify_delta_metadata_error("read cursor", &error);
+    assert!(
+        matches!(classified, ConnectorError::ReadError(_)),
+        "S3 transport chain was classified as {classified}"
+    );
+}
+
+#[test]
 fn only_proven_optimistic_collisions_are_retryable_conflicts() {
     use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
 
@@ -461,6 +599,71 @@ async fn test_write_batch_creates_parquet() {
     assert!(
         !parquet_files.is_empty(),
         "should have created Parquet files"
+    );
+}
+
+/// Regression: `Timestamp(Millisecond)` used to fail table creation with
+/// "Invalid data type for Delta Lake"; the boundary must widen it to
+/// microseconds with timezone metadata preserved.
+#[tokio::test]
+async fn test_millisecond_timestamp_columns_widen_to_microseconds() {
+    use arrow_array::TimestampMillisecondArray;
+    use arrow_schema::TimeUnit;
+    use deltalake::kernel::engine::arrow_conversion::TryFromKernel as _;
+
+    let temp_dir = TempDir::new().unwrap();
+    let table_path = temp_dir.path().to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "probe_time",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        ),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Millisecond, Some(Arc::from("UTC"))),
+            true,
+        ),
+    ]));
+
+    let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
+        .await
+        .unwrap();
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(1_500)])),
+            Arc::new(TimestampMillisecondArray::from(vec![Some(2_500)]).with_timezone("UTC")),
+        ],
+    )
+    .unwrap();
+
+    let (table, version) = write_batches(
+        table,
+        vec![batch],
+        SaveMode::Append,
+        None,
+        false,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(version, 1);
+
+    let kernel_schema = table.snapshot().unwrap().schema();
+    let stored = arrow_schema::Schema::try_from_kernel(kernel_schema.as_ref()).unwrap();
+    assert_eq!(
+        stored.field_with_name("probe_time").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    assert_eq!(
+        stored.field_with_name("event_time").unwrap().data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))
     );
 }
 

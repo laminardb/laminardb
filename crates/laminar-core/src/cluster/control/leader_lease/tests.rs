@@ -4746,6 +4746,10 @@ async fn cluster_checkpoint_artifacts_block_successors_and_survive_abort_until_c
         store.cluster_checkpoint_artifacts().await.unwrap(),
         Some(inventory.clone())
     );
+    assert_eq!(
+        store.cluster_checkpoint_artifact_admission().await.unwrap(),
+        Some((inventory.clone(), proof.clone()))
+    );
 
     let mut successor = inventory.clone();
     successor.attempt = crate::checkpoint::CheckpointAttempt::canonical(2);

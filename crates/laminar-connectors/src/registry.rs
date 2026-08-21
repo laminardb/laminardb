@@ -550,9 +550,8 @@ mod tests {
                 mock_info("identity-sink", false, true),
                 Arc::new(
                     move |_config, registry: Option<&Arc<prometheus::Registry>>| {
-                        assert!(
-                            registry.is_some_and(|registry| Arc::ptr_eq(registry, &sink_metrics))
-                        );
+                        assert!(registry
+                            .is_some_and(|registry| { Arc::ptr_eq(registry, &sink_metrics) }));
                         Ok(Box::new(MockSinkConnector::new()))
                     },
                 ),
@@ -722,9 +721,7 @@ mod tests {
                         Box<dyn SourceConnector>,
                         ConnectorError,
                     > {
-                        Err(ConnectorError::Internal(
-                            "source construction failed".into(),
-                        ))
+                        Err(ConnectorError::Internal("source construction failed".into()))
                     },
                 ),
             )

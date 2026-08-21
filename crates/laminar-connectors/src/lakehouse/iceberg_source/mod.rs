@@ -1,0 +1,272 @@
+//! Apache Iceberg source connector implementation.
+//!
+//! [`IcebergSource`] implements [`SourceConnector`] for polling Iceberg
+//! snapshots. It is a **reference/lookup table** source — Iceberg tables
+//! are snapshot-based with no push mechanism.
+//!
+//! On each poll cycle the source checks for a newer snapshot. If one exists,
+//! only the newly added data files are read via manifest-level diff
+//! (see `iceberg_incremental::scan_incremental`). The first read is a full scan.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Instant;
+
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+use async_trait::async_trait;
+#[cfg(feature = "iceberg")]
+use tracing::debug;
+#[cfg(feature = "iceberg")]
+use tracing::info;
+
+use crate::checkpoint::SourceCheckpoint;
+use crate::config::{ConnectorConfig, ConnectorState};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+    SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
+use crate::error::ConnectorError;
+
+use super::iceberg_config::IcebergSourceConfig;
+
+/// Apache Iceberg source connector.
+///
+/// Polls for new snapshots on a configurable interval and emits
+/// `RecordBatch` data. Supports pinning to a specific snapshot.
+#[allow(dead_code)] // Fields used by feature-gated I/O methods.
+pub struct IcebergSource {
+    /// Source configuration — reparsed from `ConnectorConfig` in `start()`.
+    config: IcebergSourceConfig,
+    /// Discovered Arrow schema.
+    schema: Option<SchemaRef>,
+    /// Connector lifecycle state.
+    state: ConnectorState,
+    /// Buffered batches from the most recent scan.
+    buffer: VecDeque<RecordBatch>,
+    /// Last fully-ingested snapshot ID.
+    last_snapshot_id: Option<i64>,
+    /// Time of last snapshot poll.
+    last_poll_time: Option<Instant>,
+    /// Cached catalog connection.
+    #[cfg(feature = "iceberg")]
+    catalog: Option<Arc<dyn iceberg::Catalog>>,
+    /// Cached table handle.
+    #[cfg(feature = "iceberg")]
+    table: Option<iceberg::table::Table>,
+}
+
+impl IcebergSource {
+    /// Creates a new Iceberg source with the given configuration.
+    #[must_use]
+    pub fn new(config: IcebergSourceConfig, _registry: Option<&prometheus::Registry>) -> Self {
+        Self {
+            config,
+            schema: None,
+            state: ConnectorState::Created,
+            buffer: VecDeque::new(),
+            last_snapshot_id: None,
+            last_poll_time: None,
+            #[cfg(feature = "iceberg")]
+            catalog: None,
+            #[cfg(feature = "iceberg")]
+            table: None,
+        }
+    }
+
+    /// Checks for a new snapshot and loads data if available.
+    #[cfg(feature = "iceberg")]
+    async fn refresh(&mut self) -> Result<(), ConnectorError> {
+        if let Some(last) = self.last_poll_time {
+            if last.elapsed() < self.config.poll_interval {
+                return Ok(());
+            }
+        }
+        self.last_poll_time = Some(Instant::now());
+
+        // Reload table metadata to see new snapshots.
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "started".into(),
+                actual: "catalog not initialized".into(),
+            })?;
+        let table = super::iceberg_io::load_table(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+        )
+        .await?;
+        self.table = Some(table);
+
+        let table = self.table.as_ref().unwrap();
+        let current_snap = super::iceberg_io::current_snapshot_id(table);
+
+        // If pinned to a specific snapshot, only load once.
+        if let Some(pinned) = self.config.snapshot_id {
+            if self.last_snapshot_id.is_some() {
+                return Ok(());
+            }
+            let batches =
+                super::iceberg_io::scan_table(table, Some(pinned), &self.config.select_columns)
+                    .await?;
+            self.buffer.extend(batches);
+            self.last_snapshot_id = Some(pinned);
+            return Ok(());
+        }
+
+        if current_snap == self.last_snapshot_id {
+            return Ok(());
+        }
+
+        // Incremental read if we have a previous snapshot, full scan otherwise.
+        let batches = if let (Some(old), Some(new)) = (self.last_snapshot_id, current_snap) {
+            super::iceberg_incremental::scan_incremental(
+                table,
+                old,
+                new,
+                &self.config.select_columns,
+            )
+            .await?
+        } else {
+            super::iceberg_io::scan_table(table, current_snap, &self.config.select_columns).await?
+        };
+
+        if self.schema.is_none() {
+            if let Some(first) = batches.first() {
+                self.schema = Some(first.schema());
+            }
+        }
+
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        debug!(snapshot = ?current_snap, rows, "iceberg source loaded snapshot");
+
+        self.buffer.extend(batches);
+        self.last_snapshot_id = current_snap;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl SourceConnector for IcebergSource {
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let (config, position, _) = request.into_parts();
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Iceberg is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
+        // Re-parse config from runtime ConnectorConfig (not factory defaults).
+        if !config.properties().is_empty() {
+            self.config = IcebergSourceConfig::from_config(config)?;
+        }
+
+        #[cfg(feature = "iceberg")]
+        {
+            let catalog = super::iceberg_io::build_catalog(&self.config.catalog).await?;
+            let table = super::iceberg_io::load_table(
+                catalog.as_ref(),
+                &self.config.catalog.namespace,
+                &self.config.catalog.table_name,
+            )
+            .await?;
+
+            let iceberg_schema = table.current_schema_ref();
+            let arrow_schema =
+                iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(|e| {
+                    ConnectorError::SchemaMismatch(format!("iceberg→arrow schema: {e}"))
+                })?;
+            self.schema = Some(Arc::new(arrow_schema));
+
+            info!(
+                table = self.config.catalog.table_name,
+                namespace = self.config.catalog.namespace,
+                "iceberg source connected"
+            );
+
+            self.catalog = Some(catalog);
+            self.table = Some(table);
+            self.state = ConnectorState::Running;
+            return Ok(());
+        }
+
+        #[cfg(not(feature = "iceberg"))]
+        {
+            self.state = ConnectorState::Failed;
+            Err(ConnectorError::ConfigurationError(
+                "Apache Iceberg requires the 'iceberg' feature".into(),
+            ))
+        }
+    }
+
+    async fn poll_batch(
+        &mut self,
+        max_records: usize,
+    ) -> Result<Option<SourceBatch>, ConnectorError> {
+        if let Some(batch) = self.buffer.pop_front() {
+            if batch.num_rows() <= max_records {
+                return Ok(Some(SourceBatch::new(batch)));
+            }
+            let take = batch.slice(0, max_records);
+            let remainder = batch.slice(max_records, batch.num_rows() - max_records);
+            self.buffer.push_front(remainder);
+            return Ok(Some(SourceBatch::new(take)));
+        }
+
+        #[cfg(feature = "iceberg")]
+        self.refresh().await?;
+
+        Ok(self.buffer.pop_front().map(SourceBatch::new))
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema
+            .clone()
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()))
+    }
+
+    fn checkpoint(&self) -> SourceCheckpoint {
+        let mut cp = SourceCheckpoint::new();
+        if let Some(sid) = self.last_snapshot_id {
+            cp.set_offset("snapshot_id", sid.to_string());
+        }
+        cp.set_metadata("connector_type", "iceberg");
+        cp
+    }
+
+    fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        let snapshot_id = if config.properties().is_empty() {
+            self.config.snapshot_id
+        } else {
+            IcebergSourceConfig::from_config(config)?.snapshot_id
+        };
+        if snapshot_id.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg streaming source requires snapshot.id to pin an immutable snapshot".into(),
+            ));
+        }
+
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        #[cfg(feature = "iceberg")]
+        {
+            self.catalog = None;
+            self.table = None;
+        }
+        self.state = ConnectorState::Closed;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;

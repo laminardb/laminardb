@@ -353,6 +353,13 @@ impl CheckpointCompletion {
                 admitted.epoch, admitted.checkpoint_id, completed.epoch, completed.checkpoint_id,
             ));
         }
+        // COMPAT: the fault-soak evidence scrapes this exact line as the durable commit signal
+        // at the single validation chokepoint a committed leader completion passes through.
+        tracing::info!(
+            checkpoint_id = admitted.checkpoint_id,
+            epoch = admitted.epoch,
+            "checkpoint completed"
+        );
         Ok(Self::Committed {
             attempt: admitted,
             result,

@@ -51,9 +51,13 @@ wal/
 /tools/*
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
+!/tools/readability-check/
+/tools/readability-check/Cargo.lock
+/tools/readability-check/target/
 
 # Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md
+AGENTS.md
 .claude/
 docs/architecture/
 docs/adr/
@@ -84,3 +88,4 @@ agent_rules.md
 /examples/binance-ws/target/debug
 /examples/binance-ws/target
 /examples/binance-ws/target
+/examples/demo/target

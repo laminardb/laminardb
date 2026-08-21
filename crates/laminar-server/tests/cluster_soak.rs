@@ -42,6 +42,8 @@
 //! - `LAMINAR_SOAK_CHECKPOINT_SLO_MODE`  `certify` (default) enforces the checkpoint latency
 //!   sample-size and percentile SLOs; `observe` retains exact timing evidence and diagnostics for
 //!   functional smoke runs without claiming performance certification
+//! - `LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE`  `certify` (default) enforces frozen-input-to-Delta
+//!   visibility; `observe` records the immutable boundary but still requires bounded exact output
 //! - `LAMINAR_SOAK_KILLS`  total fault rounds (local exact requires at least two)
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
@@ -139,7 +141,10 @@ const SOAK_PRODUCER_MAX_IN_FLIGHT: usize = 4_096;
 #[cfg(feature = "kafka")]
 const MAX_TEMPORAL_LOAD_RPS: u64 = 1_000;
 #[cfg(feature = "kafka")]
-const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(15);
+// WHY: A checkpoint fence can delay a bounded publication burst at either sample boundary. A
+// 30-second window prevents an ordinary one-second fence from consuming most of the 10% capacity
+// allowance without masking sustained under-capacity.
+const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(30);
 #[cfg(feature = "kafka")]
 const ACTIVE_LOAD_MINIMUM_RATIO: f64 = 0.9;
 #[cfg(feature = "kafka")]
@@ -150,6 +155,8 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const SOAK_CHECKPOINT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_CHECKPOINT_SLO_MODE";
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+const SOAK_EO_VISIBILITY_SLO_MODE_ENV: &str = "LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE";
 #[cfg(feature = "kafka")]
 const CHECKPOINT_STATE_CAPTURE_SLO_SECONDS: f64 = 0.064;
 #[cfg(feature = "kafka")]
@@ -176,6 +183,13 @@ const CHECKPOINT_CONTINUATION_FAILED_LOG: &str = "checkpoint continuation failed
 const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded";
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
+#[cfg(feature = "kafka")]
+const RECOVERY_SUPERSEDED_LOG: &str = "recovery round was superseded:";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_HANDOFF_LOG: &str =
+    "retrying stopped recovery with a direct Prepare-to-Prepare handoff";
+#[cfg(feature = "kafka")]
+const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -367,7 +381,7 @@ struct MatrixAggregateOutput {
     right_sum: Option<i64>,
 }
 
-#[cfg(feature = "kafka")]
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 type DeltaAggregateRows = Vec<(String, MatrixAggregateOutput, i64)>;
 
 #[cfg(feature = "kafka")]
@@ -429,30 +443,30 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(feature = "kafka")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckpointSloMode {
+enum SloMode {
     Certify,
     Observe,
 }
 
 #[cfg(feature = "kafka")]
-impl CheckpointSloMode {
-    fn parse(value: Option<&str>) -> Result<Self, String> {
+impl SloMode {
+    fn parse(environment: &str, value: Option<&str>) -> Result<Self, String> {
         match value {
             None | Some("certify") => Ok(Self::Certify),
             Some("observe") => Ok(Self::Observe),
             Some(value) => Err(format!(
-                "{SOAK_CHECKPOINT_SLO_MODE_ENV} must be 'certify' or 'observe', got {value:?}"
+                "{environment} must be 'certify' or 'observe', got {value:?}"
             )),
         }
     }
 
-    fn from_environment() -> Result<Self, String> {
-        match std::env::var(SOAK_CHECKPOINT_SLO_MODE_ENV) {
-            Ok(value) => Self::parse(Some(&value)),
-            Err(std::env::VarError::NotPresent) => Self::parse(None),
-            Err(std::env::VarError::NotUnicode(value)) => Err(format!(
-                "{SOAK_CHECKPOINT_SLO_MODE_ENV} is not valid Unicode: {value:?}"
-            )),
+    fn from_environment(environment: &str) -> Result<Self, String> {
+        match std::env::var(environment) {
+            Ok(value) => Self::parse(environment, Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(environment, None),
+            Err(std::env::VarError::NotUnicode(value)) => {
+                Err(format!("{environment} is not valid Unicode: {value:?}"))
+            }
         }
     }
 
@@ -472,8 +486,46 @@ impl CheckpointSloMode {
 }
 
 #[cfg(feature = "kafka")]
+fn resolve_visibility_slo_mode(delivery: JoinDelivery) -> SloMode {
+    match delivery {
+        JoinDelivery::AtLeastOnce => SloMode::Certify,
+        JoinDelivery::ExactlyOnce => {
+            #[cfg(feature = "delta-lake-s3")]
+            {
+                SloMode::from_environment(SOAK_EO_VISIBILITY_SLO_MODE_ENV)
+                    .unwrap_or_else(|error| panic!("invalid EO visibility SLO mode: {error}"))
+            }
+            #[cfg(not(feature = "delta-lake-s3"))]
+            {
+                SloMode::Certify
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn enforce_or_report_visibility_slo(
+    mode: SloMode,
+    label: &str,
+    visibility: Duration,
+    visibility_slo: Duration,
+) {
+    if visibility <= visibility_slo {
+        return;
+    }
+    match mode {
+        SloMode::Certify => {
+            panic!("{label} visibility {visibility:?} exceeded {visibility_slo:?}")
+        }
+        SloMode::Observe => eprintln!(
+            "soak: PROFILE {label} visibility {visibility:?} exceeded the non-certifying {visibility_slo:?} SLO boundary"
+        ),
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn required_live_checkpoint_observations(
-    mode: CheckpointSloMode,
+    mode: SloMode,
     certification_floor: u64,
     finalized: u64,
 ) -> u64 {
@@ -675,7 +727,7 @@ fn parse_sha256(value: &OsStr) -> Result<[u8; 32], String> {
         ));
     }
     let mut decoded = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (lower_hex_nibble(pair[0]) << 4) | lower_hex_nibble(pair[1]);
     }
     Ok(decoded)
@@ -3969,21 +4021,21 @@ impl CheckpointLatencyEvidence {
 
     fn validate_for_mode(
         &self,
-        slo_mode: CheckpointSloMode,
+        slo_mode: SloMode,
         certify_state_capture: bool,
     ) -> Result<CheckpointLatencySnapshot, String> {
         match slo_mode {
-            CheckpointSloMode::Certify => self.validate_slos(certify_state_capture),
+            SloMode::Certify => self.validate_slos(certify_state_capture),
             // Observation mode is deliberately not an evidence opt-out. Require every process
             // generation to contribute valid, nonzero checkpoint, stall, and capture samples, but
             // leave sample-size and percentile certification to an explicit certifying run.
-            CheckpointSloMode::Observe => self
+            SloMode::Observe => self
                 .validated_observations(true)
                 .map(|(aggregate, _)| aggregate),
         }
     }
 
-    fn report(&self, minimum_live_state_bytes: u64, slo_mode: CheckpointSloMode) {
+    fn report(&self, minimum_live_state_bytes: u64, slo_mode: SloMode) {
         let aggregate = self.aggregate().unwrap_or_else(|error| panic!("{error}"));
         for (generation, snapshot) in &self.generations {
             eprintln!(
@@ -4019,7 +4071,7 @@ impl CheckpointLatencyEvidence {
             aggregate.pipeline_stall_observations as u64,
             aggregate.checkpoint_observations as u64,
         );
-        if slo_mode == CheckpointSloMode::Observe {
+        if slo_mode == SloMode::Observe {
             eprintln!(
                 "soak: PROFILE checkpoint latency is observational and non-certifying; exact timing evidence remains enforced"
             );
@@ -4688,22 +4740,22 @@ fn timed_snapshot<T>(snapshot: impl FnOnce() -> T) -> (Instant, Instant, T) {
 }
 
 #[cfg(feature = "kafka")]
-fn wait_for_committed_offset_advance(
+fn wait_for_offset_advance(
     nodes: &mut [Node],
     producer: &mut ProducerGuard,
-    input: &KafkaJoinCommitOracle,
     baseline: &[i64],
     window: Duration,
     label: &str,
+    mut current_offsets: impl FnMut() -> Option<Vec<i64>>,
 ) -> (Instant, Vec<i64>) {
     let mut observed = None;
     wait_for(
-        &format!("{label}: every Kafka source partition to advance its committed offset"),
+        &format!("{label}: every Kafka partition offset to advance"),
         window,
         || {
             assert_running_nodes(nodes);
             producer.assert_running();
-            let Some(current) = input.committed_offsets() else {
+            let Some(current) = current_offsets() else {
                 return false;
             };
             match all_partition_offsets_advanced(baseline, &current) {
@@ -4712,11 +4764,11 @@ fn wait_for_committed_offset_advance(
                     true
                 }
                 Ok(false) => false,
-                Err(error) => panic!("{label}: invalid Kafka committed-offset frontier: {error}"),
+                Err(error) => panic!("{label}: invalid Kafka offset frontier: {error}"),
             }
         },
     );
-    observed.expect("committed-offset wait completed without an offset frontier")
+    observed.expect("offset wait completed without an observed frontier")
 }
 
 #[cfg(feature = "kafka")]
@@ -4727,6 +4779,7 @@ fn assert_active_load_throughput(
     outputs: &[(&str, Option<&KafkaOutputOracle>)],
     target_rps: u64,
     recovery_ceiling: Duration,
+    delivery: JoinDelivery,
 ) {
     assert!(!inputs.is_empty(), "active-load sample has no input oracle");
     assert_running_nodes(nodes);
@@ -4739,14 +4792,35 @@ fn assert_active_load_throughput(
             .committed_offsets()
             .unwrap_or_else(|| panic!("active-load {label} initial committed-offset snapshot"));
         initialized_offset_sum(&format!("active-load {label} initial offsets"), &seed);
-        wait_for_committed_offset_advance(
+        wait_for_offset_advance(
             nodes,
             producer,
-            input,
             &seed,
             recovery_ceiling,
             &format!("active-load {label} durable baseline"),
+            || input.committed_offsets(),
         );
+    }
+    // INVARIANT: ALO output can publish ahead of its source checkpoint. Delimit output samples
+    // with output publication advances, not committed source cuts, so both endpoints represent
+    // the same externally observable boundary.
+    let mut output_starts = Vec::new();
+    for &(label, output) in outputs {
+        let Some(output) = output else {
+            continue;
+        };
+        let seed = output
+            .high_watermarks()
+            .unwrap_or_else(|| panic!("active-load {label} initial output snapshot"));
+        let (started_at, offsets) = wait_for_offset_advance(
+            nodes,
+            producer,
+            &seed,
+            recovery_ceiling,
+            &format!("active-load {label} output baseline"),
+            || output.high_watermarks(),
+        );
+        output_starts.push((label, output, started_at, offsets));
     }
     let committed_starts = inputs
         .iter()
@@ -4762,19 +4836,6 @@ fn assert_active_load_throughput(
         })
         .collect::<Vec<_>>();
     let (offered_start_at, _, offered_start) = timed_snapshot(|| producer.enqueued());
-    let output_starts = outputs
-        .iter()
-        .filter_map(|&(label, output)| {
-            output.map(|output| {
-                let (started_at, _, offsets) = timed_snapshot(|| {
-                    output
-                        .high_watermarks()
-                        .unwrap_or_else(|| panic!("active-load {label} output start"))
-                });
-                (label, output, started_at, offsets)
-            })
-        })
-        .collect::<Vec<_>>();
     let sample_started = Instant::now();
     while sample_started.elapsed() < ACTIVE_LOAD_SAMPLE_WINDOW {
         assert_running_nodes(nodes);
@@ -4782,23 +4843,20 @@ fn assert_active_load_throughput(
         std::thread::sleep(Duration::from_millis(100));
     }
     let (_, offered_end_at, offered_end) = timed_snapshot(|| producer.enqueued());
-    let output_samples = output_starts
-        .into_iter()
-        .map(|(label, output, started_at, start)| {
-            let (_, ended_at, end) = timed_snapshot(|| {
-                output
-                    .high_watermarks()
-                    .unwrap_or_else(|| panic!("active-load {label} output end"))
-            });
-            (label, started_at, start, ended_at, end)
-        })
-        .collect::<Vec<_>>();
     let committed_at_deadline = committed_starts
         .iter()
         .map(|(label, input, _, _, _)| {
             input
                 .committed_offsets()
                 .unwrap_or_else(|| panic!("active-load {label} deadline offsets"))
+        })
+        .collect::<Vec<_>>();
+    let output_at_deadline = output_starts
+        .iter()
+        .map(|(label, output, _, _)| {
+            output
+                .high_watermarks()
+                .unwrap_or_else(|| panic!("active-load {label} output deadline"))
         })
         .collect::<Vec<_>>();
     let offered_pairs = offered_end
@@ -4821,13 +4879,13 @@ fn assert_active_load_throughput(
     {
         all_partition_offsets_advanced(&start_offsets, &deadline_offsets)
             .unwrap_or_else(|error| panic!("active-load {label} durable deadline: {error}"));
-        let (ended_at, end_offsets) = wait_for_committed_offset_advance(
+        let (ended_at, end_offsets) = wait_for_offset_advance(
             nodes,
             producer,
-            input,
             &deadline_offsets,
             recovery_ceiling,
             &format!("active-load {label} durable endpoint"),
+            || input.committed_offsets(),
         );
         let end =
             initialized_offset_sum(&format!("active-load {label} final offsets"), &end_offsets);
@@ -4839,12 +4897,24 @@ fn assert_active_load_throughput(
         eprintln!(
             "soak: ACTIVE LOAD {label}_durable={pair_rps:.1} logical_pair_equivalents/s/{rows} rows/{elapsed:.1}s"
         );
-        assert!(
-            pair_rps >= minimum_pair_rps,
-            "{label} durably advanced at only {pair_rps:.1} logical-pair equivalents/s against target {target_rps}"
-        );
+        if delivery == JoinDelivery::AtLeastOnce {
+            assert!(
+                pair_rps >= minimum_pair_rps,
+                "{label} durably advanced at only {pair_rps:.1} logical-pair equivalents/s against target {target_rps}"
+            );
+        }
     }
-    for (label, emitted_start_at, output_start, emitted_end_at, output_end) in output_samples {
+    for ((label, output, emitted_start_at, output_start), deadline_offsets) in
+        output_starts.into_iter().zip(output_at_deadline)
+    {
+        let (emitted_end_at, output_end) = wait_for_offset_advance(
+            nodes,
+            producer,
+            &deadline_offsets,
+            recovery_ceiling,
+            &format!("active-load {label} output endpoint"),
+            || output.high_watermarks(),
+        );
         let emitted = monotonic_offset_delta(label, &output_start, &output_end);
         let emitted_elapsed = emitted_end_at
             .duration_since(emitted_start_at)
@@ -4853,9 +4923,16 @@ fn assert_active_load_throughput(
         eprintln!(
             "soak: ACTIVE LOAD {label}_output={emitted_rps:.1} rps/{emitted} records/{emitted_elapsed:.1}s"
         );
-        assert!(
-            emitted_rps >= minimum_pair_rps,
-            "{label} output advanced at only {emitted_rps:.1} rps against target {target_rps} rps"
+        if delivery == JoinDelivery::AtLeastOnce {
+            assert!(
+                emitted_rps >= minimum_pair_rps,
+                "{label} output advanced at only {emitted_rps:.1} rps against target {target_rps} rps"
+            );
+        }
+    }
+    if delivery == JoinDelivery::ExactlyOnce {
+        eprintln!(
+            "soak: ACTIVE LOAD durable/output rates are observational for MinIO EO protocol validation"
         );
     }
 }
@@ -6320,10 +6397,18 @@ fn assert_kafka_matrix_aggregates(
 #[derive(Debug)]
 struct DeltaJoinSnapshot {
     version: i64,
+    observed_at: Instant,
     rows: usize,
     pairs: BTreeSet<(u64, u64)>,
     duplicate_rows: usize,
     first_duplicate: Option<(u64, u64)>,
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+struct OpenDeltaJoinSnapshot {
+    table: deltalake::DeltaTable,
+    version: i64,
+    observed_at: Instant,
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -6357,6 +6442,7 @@ struct DeltaCoreWindowSnapshot {
 struct DeltaOutputOracle {
     table_uri: String,
     storage_options: HashMap<String, String>,
+    join_table: tokio::sync::Mutex<Option<deltalake::DeltaTable>>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -6366,6 +6452,7 @@ impl DeltaOutputOracle {
         Self {
             table_uri,
             storage_options: storage.options(),
+            join_table: tokio::sync::Mutex::new(None),
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -6373,22 +6460,64 @@ impl DeltaOutputOracle {
         }
     }
 
-    fn snapshot(&self) -> Result<DeltaJoinSnapshot, String> {
-        self.runtime.block_on(async {
-            let uri = deltalake::ensure_table_uri(&self.table_uri)
-                .map_err(|error| format!("invalid Delta table URI: {error}"))?;
-            let table =
-                deltalake::open_table_with_storage_options(uri, self.storage_options.clone())
+    async fn refresh_join_table(&self) -> Result<deltalake::DeltaTable, String> {
+        // INVARIANT: Metadata refreshes for one oracle are serialized so every returned clone
+        // retains one immutable version while later observations reuse the object-store client.
+        let mut cached = self.join_table.lock().await;
+        if let Some(table) = cached.as_mut() {
+            let latest = table
+                .get_latest_version()
+                .await
+                .map_err(|error| format!("read latest Delta output version: {error}"))?;
+            if table.version() != Some(latest) {
+                table
+                    .load_version(latest)
                     .await
-                    .map_err(|error| format!("open Delta output: {error}"))?;
+                    .map_err(|error| format!("load Delta output version {latest}: {error}"))?;
+            }
+            return Ok(table.clone());
+        }
+
+        let uri = deltalake::ensure_table_uri(&self.table_uri)
+            .map_err(|error| format!("invalid Delta table URI: {error}"))?;
+        let table = deltalake::open_table_with_storage_options(uri, self.storage_options.clone())
+            .await
+            .map_err(|error| format!("open Delta output: {error}"))?;
+        *cached = Some(table.clone());
+        Ok(table)
+    }
+
+    fn open_join_snapshot(&self) -> Result<OpenDeltaJoinSnapshot, String> {
+        self.runtime.block_on(async {
+            let table = self.refresh_join_table().await?;
             let version = table
                 .version()
                 .ok_or_else(|| "Delta output has no committed table version".to_owned())?;
+            Ok(OpenDeltaJoinSnapshot {
+                table,
+                version,
+                observed_at: Instant::now(),
+            })
+        })
+    }
+
+    fn snapshot(&self) -> Result<DeltaJoinSnapshot, String> {
+        let opened = self.open_join_snapshot()?;
+        self.scan_join_snapshot(&opened)
+    }
+
+    fn scan_join_snapshot(
+        &self,
+        opened: &OpenDeltaJoinSnapshot,
+    ) -> Result<DeltaJoinSnapshot, String> {
+        self.runtime.block_on(async {
             let context = deltalake::datafusion::prelude::SessionContext::new();
-            table
+            opened
+                .table
                 .update_datafusion_session(&context.state())
                 .map_err(|error| format!("register Delta object store: {error}"))?;
-            let provider = table
+            let provider = opened
+                .table
                 .table_provider()
                 .build()
                 .await
@@ -6453,7 +6582,8 @@ impl DeltaOutputOracle {
                 }
             }
             Ok(DeltaJoinSnapshot {
-                version,
+                version: opened.version,
+                observed_at: opened.observed_at,
                 rows,
                 pairs,
                 duplicate_rows,
@@ -6922,11 +7052,44 @@ impl DeltaOutputOracle {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn retry_delta_snapshot_until<T, F>(
+    nodes: &mut [Node],
+    deadline: Instant,
+    label: &str,
+    mut snapshot: F,
+) -> T
+where
+    F: FnMut() -> Result<T, String>,
+{
+    let mut last_error = None;
+    loop {
+        assert_running_nodes(nodes);
+        if remaining_at(deadline, Instant::now()).is_none() {
+            let detail = last_error
+                .as_deref()
+                .unwrap_or("deadline elapsed before the first observation");
+            panic!("{label} Delta snapshot read failed through its deadline: {detail}");
+        }
+        match snapshot() {
+            Ok(snapshot) => return snapshot,
+            Err(error) => {
+                last_error = Some(error);
+                let Some(remaining) = remaining_at(deadline, Instant::now()) else {
+                    continue;
+                };
+                std::thread::sleep(remaining.min(Duration::from_millis(100)));
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn assert_delta_core_window_outputs(
     nodes: &mut [Node],
     outputs: &BTreeMap<String, DeltaOutputOracle>,
     expected: &BTreeMap<CoreWindowOutput, u64>,
     frozen_input_at: Instant,
+    slo_mode: SloMode,
     window: Duration,
     label: &str,
 ) {
@@ -6971,9 +7134,11 @@ fn assert_delta_core_window_outputs(
             && validate_core_window_outputs(&observed, expected, true).is_ok()
         {
             let visibility = frozen_input_at.elapsed();
-            assert!(
-                visibility <= visibility_slo,
-                "{label}: CoreWindow output visibility {visibility:?} exceeded {visibility_slo:?}"
+            enforce_or_report_visibility_slo(
+                slo_mode,
+                &format!("{label}: CoreWindow output"),
+                visibility,
+                visibility_slo,
             );
             eprintln!(
                 "soak: PROFILE {label} CoreWindow visibility_ms={:.3}",
@@ -6997,13 +7162,15 @@ fn assert_delta_core_window_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (kind, output) in outputs {
         let previous = completed
             .get(kind)
             .expect("every Delta CoreWindow canary completed");
-        let stable = output
-            .core_window_snapshot()
-            .unwrap_or_else(|error| panic!("{label}: {kind} Delta quiet re-read failed: {error}"));
+        let stable =
+            retry_delta_snapshot_until(nodes, reread_deadline, &format!("{label}: {kind}"), || {
+                output.core_window_snapshot()
+            });
         assert!(
             stable.version >= previous.version,
             "{label}: {kind} Delta version regressed from {} to {}",
@@ -7113,13 +7280,17 @@ fn assert_delta_matrix_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (join_case, output) in outputs {
         let previous = completed
             .get(join_case)
             .expect("every Delta raw matrix case completed");
-        let stable = output.matrix_snapshot().unwrap_or_else(|error| {
-            panic!("{label}: {join_case} Delta quiet re-read failed: {error}")
-        });
+        let stable = retry_delta_snapshot_until(
+            nodes,
+            reread_deadline,
+            &format!("{label}: {join_case}"),
+            || output.matrix_snapshot(),
+        );
         assert!(
             stable.version >= previous.version,
             "{label}: {join_case} Delta version regressed from {} to {}",
@@ -7146,7 +7317,7 @@ fn assert_delta_matrix_outputs(
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct DeltaMatrixAggregateSnapshot {
     version: i64,
     physical_rows: usize,
@@ -7234,17 +7405,30 @@ fn assert_delta_matrix_aggregates(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (expected_case, output) in outputs {
         let previous = completed
             .get(expected_case)
             .expect("every Delta aggregate case completed");
-        let stable =
-            delta_matrix_aggregate_snapshot(output, expected_case).unwrap_or_else(|error| {
-                panic!("{label}: {expected_case} quiet re-read failed: {error}")
-            });
+        let stable = retry_delta_snapshot_until(
+            nodes,
+            reread_deadline,
+            &format!("{label}: {expected_case}"),
+            || delta_matrix_aggregate_snapshot(output, expected_case),
+        );
+        assert!(
+            stable.version >= previous.version,
+            "{label}: {expected_case} Delta version regressed from {} to {}",
+            previous.version,
+            stable.version
+        );
         assert_eq!(
-            &stable, previous,
-            "{label}: {expected_case} Delta aggregate changed during the quiet re-read"
+            stable.physical_rows, previous.physical_rows,
+            "{label}: {expected_case} Delta aggregate row count changed during the quiet re-read"
+        );
+        assert_eq!(
+            stable.net, previous.net,
+            "{label}: {expected_case} Delta aggregate net changed during the quiet re-read"
         );
     }
     eprintln!(
@@ -7262,11 +7446,17 @@ struct DeltaExactOutput<'a> {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-fn delta_exact_snapshot(
+struct DeltaVisibilityBoundaries {
+    opened: Vec<Option<OpenDeltaJoinSnapshot>>,
+    visibility_slo: Duration,
+    slo_mode: SloMode,
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn validate_delta_exact_snapshot(
     output: &DeltaExactOutput<'_>,
-) -> Result<(DeltaJoinSnapshot, Instant), String> {
-    let snapshot = output.oracle.snapshot()?;
-    let observed_at = Instant::now();
+    snapshot: DeltaJoinSnapshot,
+) -> Result<DeltaJoinSnapshot, String> {
     assert_eq!(
         snapshot.duplicate_rows, 0,
         "{} Delta snapshot version {} contains {} duplicate rows; first duplicate {:?}",
@@ -7283,7 +7473,7 @@ fn delta_exact_snapshot(
         );
     }
     if snapshot.rows == output.expected.len() && snapshot.pairs.len() == output.expected.len() {
-        return Ok((snapshot, observed_at));
+        return Ok(snapshot);
     }
     let missing = output
         .expected
@@ -7301,37 +7491,36 @@ fn delta_exact_snapshot(
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-fn wait_delta_exact_outputs(
+fn open_delta_visibility_boundaries(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
-    window: Duration,
-) -> Vec<DeltaJoinSnapshot> {
-    assert!(
-        !outputs.is_empty(),
-        "Delta exact-output check has no outputs"
-    );
-    for output in outputs {
-        assert!(
-            !output.expected.is_empty(),
-            "{} join oracle expected no output pairs",
-            output.label
-        );
-    }
-    let deadline = Instant::now() + window;
-    let visibility_slo = Duration::from_millis(env_u64(
-        "LAMINAR_SOAK_EO_VISIBILITY_MS",
-        DEFAULT_EO_VISIBILITY_MS,
-    ));
-    let mut completed = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
+    visibility_slo: Duration,
+    slo_mode: SloMode,
+) -> Vec<Option<OpenDeltaJoinSnapshot>> {
+    let deadlines = outputs
+        .iter()
+        .map(|output| output.frozen_input_at + visibility_slo)
+        .collect::<Vec<_>>();
+    let mut latest = (0..outputs.len()).map(|_| None).collect::<Vec<_>>();
     let mut observations = vec![String::new(); outputs.len()];
-    while completed.iter().any(Option::is_none) {
+    loop {
         assert_running_nodes(nodes);
-        let polled = std::thread::scope(|scope| {
-            let workers = outputs
+        let now = Instant::now();
+        let active = deadlines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, deadline)| (now < *deadline).then_some(index))
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            break;
+        }
+        let opened = std::thread::scope(|scope| {
+            let workers = active
                 .iter()
-                .enumerate()
-                .filter(|(index, _)| completed[*index].is_none())
-                .map(|(index, output)| (index, scope.spawn(move || delta_exact_snapshot(output))))
+                .map(|index| {
+                    let output = &outputs[*index];
+                    (*index, scope.spawn(|| output.oracle.open_join_snapshot()))
+                })
                 .collect::<Vec<_>>();
             workers
                 .into_iter()
@@ -7343,45 +7532,238 @@ fn wait_delta_exact_outputs(
                 })
                 .collect::<Vec<_>>()
         });
-        for (index, result) in polled {
-            let output = &outputs[index];
-            match result {
-                Ok((snapshot, observed_at)) => {
-                    let visibility = observed_at.saturating_duration_since(output.frozen_input_at);
-                    assert!(
-                        visibility <= visibility_slo,
-                        "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
-                        output.label
-                    );
-                    eprintln!(
-                        "soak: PROFILE {} exact Delta visibility_ms={:.3} rows={} table_version={}",
-                        output.label,
-                        visibility.as_secs_f64() * 1_000.0,
-                        snapshot.rows,
-                        snapshot.version
-                    );
-                    completed[index] = Some(snapshot);
+        for (index, opened) in opened {
+            match opened {
+                Ok(opened) if opened.observed_at <= deadlines[index] => {
+                    latest[index] = Some(opened);
                 }
-                Err(observation) => observations[index] = observation,
+                Ok(opened) => {
+                    let overrun = opened
+                        .observed_at
+                        .saturating_duration_since(deadlines[index]);
+                    observations[index] = format!(
+                        "metadata observation completed {overrun:?} after the SLO boundary"
+                    );
+                }
+                Err(error) => observations[index] = error,
             }
         }
-        if completed.iter().any(Option::is_none) {
-            assert!(
-                Instant::now() < deadline,
-                "Delta outputs did not expose every exact frozen input cut: {:?}",
-                outputs
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| completed[*index].is_none())
-                    .map(|(index, output)| (output.label, observations[index].as_str()))
-                    .collect::<Vec<_>>()
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let Some(remaining) = deadlines
+            .iter()
+            .filter_map(|deadline| remaining_at(*deadline, Instant::now()))
+            .min()
+        else {
+            continue;
+        };
+        let poll_interval = if remaining <= Duration::from_secs(2) {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        std::thread::sleep(remaining.min(poll_interval));
+    }
+
+    latest
+        .into_iter()
+        .enumerate()
+        .map(|(index, opened)| {
+            if opened.is_some() {
+                return opened;
+            }
+            let observation = if observations[index].is_empty() {
+                "no metadata observation completed before the boundary"
+            } else {
+                &observations[index]
+            };
+            match slo_mode {
+                SloMode::Certify => panic!(
+                    "{} Delta metadata had no observable version at or before its {visibility_slo:?} visibility boundary: {observation}",
+                    outputs[index].label
+                ),
+                SloMode::Observe => eprintln!(
+                    "soak: PROFILE {} Delta metadata missed the non-certifying {visibility_slo:?} visibility boundary: {observation}",
+                    outputs[index].label
+                ),
+            }
+            None
+        })
+        .collect()
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn scan_delta_visibility_boundaries(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    opened: &[Option<OpenDeltaJoinSnapshot>],
+    window: Duration,
+    visibility_slo: Duration,
+    slo_mode: SloMode,
+) -> Vec<Option<DeltaJoinSnapshot>> {
+    let mut completed = Vec::with_capacity(outputs.len());
+    for (output, opened) in outputs.iter().zip(opened) {
+        let Some(opened) = opened else {
+            completed.push(None);
+            continue;
+        };
+        let scan_deadline = Instant::now() + window;
+        let snapshot = retry_delta_snapshot_until(nodes, scan_deadline, output.label, || {
+            output.oracle.scan_join_snapshot(opened)
+        });
+        let snapshot = match validate_delta_exact_snapshot(output, snapshot) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                match slo_mode {
+                    SloMode::Certify => panic!(
+                        "{} was not exact at its pre-SLO Delta boundary: {error}",
+                        output.label
+                    ),
+                    SloMode::Observe => eprintln!(
+                        "soak: PROFILE {} missed the non-certifying {visibility_slo:?} exact Delta boundary: {error}",
+                        output.label
+                    ),
+                }
+                completed.push(None);
+                continue;
+            }
+        };
+        let visibility = snapshot
+            .observed_at
+            .saturating_duration_since(output.frozen_input_at);
+        assert!(
+            visibility <= visibility_slo,
+            "{} exact Delta boundary was observed after {visibility:?}; SLO is {visibility_slo:?}",
+            output.label
+        );
+        eprintln!(
+            "soak: PROFILE {} exact Delta visibility_upper_bound_ms={:.3} rows={} table_version={}",
+            output.label,
+            visibility.as_secs_f64() * 1_000.0,
+            snapshot.rows,
+            snapshot.version
+        );
+        completed.push(Some(snapshot));
     }
     completed
-        .into_iter()
-        .map(|snapshot| snapshot.expect("every Delta output completed"))
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn capture_delta_visibility_boundaries(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    slo_mode: SloMode,
+) -> DeltaVisibilityBoundaries {
+    assert!(
+        !outputs.is_empty(),
+        "Delta exact-output check has no outputs"
+    );
+    for output in outputs {
+        assert!(
+            !output.expected.is_empty(),
+            "{} join oracle expected no output pairs",
+            output.label
+        );
+    }
+    let visibility_slo = Duration::from_millis(env_u64(
+        "LAMINAR_SOAK_EO_VISIBILITY_MS",
+        DEFAULT_EO_VISIBILITY_MS,
+    ));
+    // WHY: Full-table scans are verifier work. Timestamp the immutable publication boundary first
+    // so scan order and transient read retries cannot consume or move the delivery SLO.
+    let opened = open_delta_visibility_boundaries(nodes, outputs, visibility_slo, slo_mode);
+    DeltaVisibilityBoundaries {
+        opened,
+        visibility_slo,
+        slo_mode,
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn wait_delta_exact_output_after_boundary(
+    nodes: &mut [Node],
+    output: &DeltaExactOutput<'_>,
+    boundary_version: Option<i64>,
+    window: Duration,
+) -> DeltaJoinSnapshot {
+    let deadline = Instant::now() + window;
+    let mut latest_version = boundary_version;
+    loop {
+        assert_running_nodes(nodes);
+        let observation = match output.oracle.open_join_snapshot() {
+            Ok(opened) if latest_version.is_some_and(|version| opened.version <= version) => {
+                format!(
+                    "latest version {} has not advanced past the incomplete boundary",
+                    opened.version
+                )
+            }
+            Ok(opened) => {
+                let snapshot = retry_delta_snapshot_until(nodes, deadline, output.label, || {
+                    output.oracle.scan_join_snapshot(&opened)
+                });
+                latest_version = Some(snapshot.version);
+                match validate_delta_exact_snapshot(output, snapshot) {
+                    Ok(snapshot) => return snapshot,
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{} did not become exact after its observed Delta boundary: {observation}",
+            output.label
+        );
+        let Some(remaining) = remaining_at(deadline, Instant::now()) else {
+            continue;
+        };
+        std::thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn wait_delta_exact_outputs(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    boundaries: &DeltaVisibilityBoundaries,
+    window: Duration,
+) -> Vec<DeltaJoinSnapshot> {
+    assert_eq!(
+        outputs.len(),
+        boundaries.opened.len(),
+        "Delta visibility boundaries do not match the checked outputs"
+    );
+    let at_boundary = scan_delta_visibility_boundaries(
+        nodes,
+        outputs,
+        &boundaries.opened,
+        window,
+        boundaries.visibility_slo,
+        boundaries.slo_mode,
+    );
+    outputs
+        .iter()
+        .zip(&boundaries.opened)
+        .zip(at_boundary)
+        .map(|((output, opened), snapshot)| {
+            snapshot.unwrap_or_else(|| {
+                let snapshot = wait_delta_exact_output_after_boundary(
+                    nodes,
+                    output,
+                    opened.as_ref().map(|opened| opened.version),
+                    window,
+                );
+                let visibility = snapshot
+                    .observed_at
+                    .saturating_duration_since(output.frozen_input_at);
+                eprintln!(
+                    "soak: PROFILE {} exact Delta protocol visibility_ms={:.3} rows={} table_version={} after non-certifying boundary",
+                    output.label,
+                    visibility.as_secs_f64() * 1_000.0,
+                    snapshot.rows,
+                    snapshot.version
+                );
+                snapshot
+            })
+        })
         .collect()
 }
 
@@ -7390,6 +7772,7 @@ fn assert_delta_exact_outputs_stable(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
     completed: &[DeltaJoinSnapshot],
+    window: Duration,
 ) {
     assert!(!outputs.is_empty(), "Delta stability check has no outputs");
     assert_eq!(
@@ -7403,10 +7786,10 @@ fn assert_delta_exact_outputs_stable(
         std::thread::sleep(Duration::from_millis(100));
     }
     for (output, completed) in outputs.iter().zip(completed) {
-        let stable = output
-            .oracle
-            .snapshot()
-            .unwrap_or_else(|error| panic!("{} Delta quiet re-read failed: {error}", output.label));
+        let reread_deadline = Instant::now() + window;
+        let stable = retry_delta_snapshot_until(nodes, reread_deadline, output.label, || {
+            output.oracle.snapshot()
+        });
         assert!(
             stable.version >= completed.version,
             "{} Delta version regressed from {} to {}",
@@ -7449,6 +7832,7 @@ struct DeltaTemporalExactOutput<'a> {
 fn assert_delta_temporal_outputs(
     nodes: &mut [Node],
     outputs: &[DeltaTemporalExactOutput<'_>],
+    slo_mode: SloMode,
     window: Duration,
 ) {
     let deadline = Instant::now() + window;
@@ -7490,10 +7874,11 @@ fn assert_delta_temporal_outputs(
                     {
                         let visibility =
                             Instant::now().saturating_duration_since(output.frozen_input_at);
-                        assert!(
-                            visibility <= visibility_slo,
-                            "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
-                            output.label
+                        enforce_or_report_visibility_slo(
+                            slo_mode,
+                            &format!("{} exact Delta output", output.label),
+                            visibility,
+                            visibility_slo,
                         );
                         eprintln!(
                             "soak: PROFILE {} exact Delta visibility_ms={:.3} rows={} table_version={}",
@@ -7541,12 +7926,12 @@ fn assert_delta_temporal_outputs(
         assert_running_nodes(nodes);
         std::thread::sleep(Duration::from_millis(100));
     }
+    let reread_deadline = Instant::now() + window;
     for (output, completed) in outputs.iter().zip(completed) {
         let previous = completed.expect("every Delta temporal output completed");
-        let stable = output
-            .oracle
-            .temporal_snapshot(output.kind)
-            .unwrap_or_else(|error| panic!("{} Delta quiet re-read failed: {error}", output.label));
+        let stable = retry_delta_snapshot_until(nodes, reread_deadline, output.label, || {
+            output.oracle.temporal_snapshot(output.kind)
+        });
         assert!(
             stable.version >= previous.version,
             "{} Delta version regressed from {} to {}",
@@ -7618,11 +8003,22 @@ fn validate_explicit_pipeline_fault_totals(
         ));
     }
     for (node_id, (baseline, total)) in baselines.iter().zip(totals).enumerate() {
-        let expected = baseline + if node_id == victim { 1.0 } else { 0.0 };
-        if *total != expected {
-            return Err(format!(
-                "node{node_id} pipeline fault total is {total}, expected {expected} after explicit fault on node{victim}"
-            ));
+        if node_id == victim {
+            if *total != baseline + 1.0 {
+                return Err(format!(
+                    "node{node_id} pipeline fault total is {total}, expected {} after explicit fault on node{victim}",
+                    baseline + 1.0
+                ));
+            }
+        } else {
+            // A non-victim may fault exactly once: its in-flight shuffle send to the faulted
+            // victim may have been partially admitted, so it fail-closed joins the same
+            // recovery round. More than that single cascade participation is amplification.
+            if *total > baseline + 1.0 {
+                return Err(format!(
+                    "node{node_id} pipeline fault total is {total}, amplifying the explicit fault on node{victim}"
+                ));
+            }
         }
     }
     Ok(())
@@ -7664,6 +8060,76 @@ fn validate_recovery_checkpoint_failure_totals(
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryPrepareSequence {
+    final_prepare_line: usize,
+    abandoned_rounds: u32,
+}
+
+#[cfg(feature = "kafka")]
+fn validate_recovery_prepare_sequence(
+    fault_logs: &[String],
+    leader: usize,
+) -> Result<RecoveryPrepareSequence, String> {
+    let leader_log = fault_logs
+        .get(leader)
+        .ok_or_else(|| format!("recovery leader node{leader} has no fault log"))?;
+    let leader_lines = leader_log.lines().collect::<Vec<_>>();
+    let prepares = leader_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains(RECOVERY_PREPARE_LOG).then_some(index))
+        .collect::<Vec<_>>();
+    let total_prepares = fault_logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
+        .sum::<usize>();
+    if total_prepares != prepares.len() {
+        return Err("recovery Prepare was emitted by a non-leader process".into());
+    }
+    match prepares.as_slice() {
+        [prepare] => Ok(RecoveryPrepareSequence {
+            final_prepare_line: *prepare,
+            abandoned_rounds: 0,
+        }),
+        [first, second] => {
+            let between = &leader_lines[first + 1..*second];
+            let superseded = between
+                .iter()
+                .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
+                .ok_or_else(|| {
+                    "two recovery Prepare records have no intervening superseded-round fence"
+                        .to_string()
+                })?;
+            if !between[superseded + 1..]
+                .iter()
+                .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
+            {
+                return Err(
+                    "two recovery Prepare records have no ordered direct handoff fence".into(),
+                );
+            }
+            let retry_holds = between
+                .iter()
+                .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
+                .count();
+            if retry_holds != 1 {
+                return Err(format!(
+                    "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
+                ));
+            }
+            Ok(RecoveryPrepareSequence {
+                final_prepare_line: *second,
+                abandoned_rounds: 1,
+            })
+        }
+        _ => Err(format!(
+            "explicit fault created {total_prepares} recovery Prepare generations; expected one, or one fenced direct replacement"
+        )),
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn validate_recovery_checkpoint_failure_evidence(
     baselines: &[f64],
     totals: &[f64],
@@ -7702,25 +8168,11 @@ fn validate_recovery_checkpoint_failure_evidence(
             leader_failure = failures.first().copied();
         }
     }
+    let prepare = validate_recovery_prepare_sequence(fault_logs, leader)?.final_prepare_line;
     let Some(failed) = leader_failure else {
         return Ok(None);
     };
-    let prepare_count = fault_logs
-        .iter()
-        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
-        .sum::<usize>();
-    if prepare_count != 1 {
-        return Err(format!(
-            "checkpoint failure metric was recorded with {prepare_count} recovery Prepare records"
-        ));
-    }
     let leader_fault_lines = fault_logs[leader].lines().collect::<Vec<_>>();
-    let prepare = leader_fault_lines
-        .iter()
-        .position(|line| line.contains(RECOVERY_PREPARE_LOG))
-        .ok_or_else(|| {
-            "checkpoint failure was not preceded by the recovery leader's Prepare".to_string()
-        })?;
     let mut fault_failure = None;
     for (index, line) in leader_fault_lines.iter().enumerate() {
         if checkpoint_failure_metric_from_log_line(line)? == Some(failed) {
@@ -7734,11 +8186,14 @@ fn validate_recovery_checkpoint_failure_evidence(
             failed.checkpoint_id, failed.epoch
         )
     })?;
-    if prepare >= fault_failure {
-        return Err(format!(
-            "checkpoint {} epoch {} failure was not caused by the injected recovery Prepare",
-            failed.checkpoint_id, failed.epoch
-        ));
+    // A checkpoint already in flight at the fault boundary can observe the victim's closed
+    // shuffle scope before the recovery leader durably announces Prepare. Both orders are valid;
+    // the captured log boundary and the single recovery generation provide the causal fence.
+    if !leader_fault_lines[prepare + 1..]
+        .iter()
+        .any(|line| line.contains(RECOVERY_RELEASE_LOG))
+    {
+        return Err("recovery Prepare was not followed by recovery Release".into());
     }
     if !leader_fault_lines[fault_failure + 1..]
         .iter()
@@ -7821,14 +8276,8 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .zip(&evidence.log_offsets)
         .map(|(node, offset)| node.log_since(*offset))
         .collect::<Vec<_>>();
-    let prepare_count: usize = logs
-        .iter()
-        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
-        .sum();
-    assert_eq!(
-        prepare_count, 1,
-        "explicit fault created {prepare_count} recovery Prepare generations instead of exactly one"
-    );
+    let prepare_sequence = validate_recovery_prepare_sequence(&logs, evidence.recovery_leader)
+        .unwrap_or_else(|error| panic!("explicit recovery Prepare sequence invalid: {error}"));
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
         .expect("read recovery leader log for checkpoint failure evidence");
     let interrupted = validate_recovery_checkpoint_failure_evidence(
@@ -7873,10 +8322,16 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         let failures = node
             .metric("laminardb_coordinated_recovery_failures_total")
             .expect("node stopped exposing coordinated recovery failure count");
+        let expected_failures = evidence.recovery_failure_baselines[index]
+            + if index == evidence.recovery_leader {
+                f64::from(prepare_sequence.abandoned_rounds)
+            } else {
+                0.0
+            };
         assert_eq!(
-            failures, evidence.recovery_failure_baselines[index],
-            "node{} recorded a coordinated recovery failure",
-            node.id
+            failures, expected_failures,
+            "node{} coordinated recovery failure count did not match the certified Prepare sequence",
+            node.id,
         );
         let checkpoint_failures = node
             .metric("laminardb_checkpoints_failed_total")
@@ -8246,9 +8701,12 @@ fn assert_temporal_canaries(
     delivery: JoinDelivery,
     input: &TemporalPostFaultInput,
     frontier_released_at: Instant,
+    slo_mode: SloMode,
     window: Duration,
     topology: &str,
 ) {
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let _ = slo_mode;
     let asof_label = format!(
         "{topology} {} nullable temporal ASOF canary",
         delivery.label()
@@ -8307,6 +8765,7 @@ fn assert_temporal_canaries(
                         label: &probe_label,
                     },
                 ],
+                slo_mode,
                 window,
             );
             #[cfg(not(feature = "delta-lake-s3"))]
@@ -8446,6 +8905,8 @@ fn delta_append_sink_config(
     table_uri: &str,
     storage: &DeltaSoakStorage,
 ) -> String {
+    // Cluster catalog DDL rejects literal secrets; `$${...}` survives server TOML substitution
+    // as a `${...}` env reference the catalog accepts and the connector resolves from the env.
     format!(
         r#"
 [[sink]]
@@ -8457,13 +8918,12 @@ connector = "delta-lake"
 "write.mode" = "append"
 "storage.aws_endpoint" = "{endpoint}"
 "storage.aws_access_key_id" = "{access_key}"
-"storage.aws_secret_access_key" = "{secret_key}"
+"storage.aws_secret_access_key" = "$${{LAMINAR_SOAK_S3_SECRET_KEY}}"
 "storage.aws_region" = "{region}"
 "storage.aws_allow_http" = "true"
 "#,
         endpoint = storage.endpoint,
         access_key = storage.access_key,
-        secret_key = storage.secret_key,
         region = storage.region,
     )
 }
@@ -10516,8 +10976,9 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
     let retained_interval_ms = join_interval_ms();
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
-    let checkpoint_slo_mode = CheckpointSloMode::from_environment()
+    let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     let kills = env_u64("LAMINAR_SOAK_SINGLE_KILLS", 1);
     if delivery == JoinDelivery::AtLeastOnce {
         assert!(
@@ -11085,6 +11546,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                     .expect("single EO Delta CoreWindow oracles"),
                 &expected_windows,
                 window_frozen_input_at,
+                visibility_slo_mode,
                 recovery_ceiling,
                 "single-node EO CoreWindow canaries",
             );
@@ -11117,6 +11579,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         ],
         source_rps,
         recovery_ceiling,
+        delivery,
     );
     observe_live_join_state(
         &nodes,
@@ -11259,11 +11722,12 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         delivery,
         &temporal_post,
         temporal_frontier_released_at,
+        visibility_slo_mode,
         recovery_ceiling,
         "single-node",
     );
     #[cfg(feature = "delta-lake-s3")]
-    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+    let delta_visibility_boundaries = (delivery == JoinDelivery::ExactlyOnce).then(|| {
         let outputs = delta_join_exact_outputs(
             &output_oracles,
             &produced_prefix,
@@ -11271,7 +11735,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             "single-node EO bounded join",
             "single-node EO temporal ASOF load",
         );
-        wait_delta_exact_outputs(&mut nodes, &outputs, recovery_ceiling)
+        capture_delta_visibility_boundaries(&mut nodes, &outputs, visibility_slo_mode)
     });
     let produced_count = produced_prefix.count;
     assert!(
@@ -11307,6 +11771,24 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: single {delivery_label} frozen bounded and temporal input prefix is durable through checkpoint {}",
         latest_checkpoint.checkpoint_id
     );
+    #[cfg(feature = "delta-lake-s3")]
+    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+        let outputs = delta_join_exact_outputs(
+            &output_oracles,
+            &produced_prefix,
+            _bounded_frozen_input_at,
+            "single-node EO bounded join",
+            "single-node EO temporal ASOF load",
+        );
+        wait_delta_exact_outputs(
+            &mut nodes,
+            &outputs,
+            delta_visibility_boundaries
+                .as_ref()
+                .expect("single EO visibility boundaries captured before final cuts"),
+            recovery_ceiling,
+        )
+    });
     match delivery {
         JoinDelivery::AtLeastOnce => {
             assert_frozen_kafka_outputs(
@@ -11364,6 +11846,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                     completed_delta_outputs
                         .as_deref()
                         .expect("single EO outputs completed before final cuts"),
+                    recovery_ceiling,
                 );
                 assert_delta_matrix_outputs(
                     &mut nodes,
@@ -11436,8 +11919,9 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
     let retained_interval_ms = join_interval_ms();
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
-    let checkpoint_slo_mode = CheckpointSloMode::from_environment()
+    let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     assert!(
         interval_ms >= 100,
         "LAMINAR_SOAK_INTERVAL_MS must be at least 100"
@@ -12264,6 +12748,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         ],
         source_rps,
         recovery_ceiling,
+        delivery,
     );
     observe_live_join_state(
         &nodes,
@@ -12465,6 +12950,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         delivery,
         &temporal_post,
         temporal_frontier_released_at,
+        visibility_slo_mode,
         recovery_ceiling,
         "three-node",
     );
@@ -12493,6 +12979,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                     .expect("cluster EO Delta CoreWindow oracles"),
                 &expected_windows,
                 window_frontier_released_at,
+                visibility_slo_mode,
                 recovery_ceiling,
                 "three-node EO CoreWindow canaries",
             );
@@ -12501,7 +12988,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         }
     }
     #[cfg(feature = "delta-lake-s3")]
-    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+    let delta_visibility_boundaries = (delivery == JoinDelivery::ExactlyOnce).then(|| {
         let outputs = delta_join_exact_outputs(
             &output_oracles,
             &produced_prefix,
@@ -12509,7 +12996,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             "three-node EO bounded join",
             "three-node EO temporal ASOF load",
         );
-        wait_delta_exact_outputs(&mut nodes, &outputs, recovery_ceiling)
+        capture_delta_visibility_boundaries(&mut nodes, &outputs, visibility_slo_mode)
     });
     let produced_count = produced_prefix.count;
     assert!(produced_count > 0, "soak producer emitted no input records");
@@ -12549,6 +13036,24 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: frozen bounded and temporal input prefix is durable through checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
+    #[cfg(feature = "delta-lake-s3")]
+    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+        let outputs = delta_join_exact_outputs(
+            &output_oracles,
+            &produced_prefix,
+            _bounded_frozen_input_at,
+            "three-node EO bounded join",
+            "three-node EO temporal ASOF load",
+        );
+        wait_delta_exact_outputs(
+            &mut nodes,
+            &outputs,
+            delta_visibility_boundaries
+                .as_ref()
+                .expect("cluster EO visibility boundaries captured before final cuts"),
+            recovery_ceiling,
+        )
+    });
     match delivery {
         JoinDelivery::AtLeastOnce => {
             assert_frozen_kafka_outputs(
@@ -12598,6 +13103,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                     completed_delta_outputs
                         .as_deref()
                         .expect("cluster EO outputs completed before final cuts"),
+                    recovery_ceiling,
                 );
                 assert_delta_matrix_outputs(
                     &mut nodes,
@@ -13747,11 +14253,12 @@ fn checkpoint_epoch_progress_requires_strict_advance() {
 
 #[cfg(feature = "kafka")]
 #[test]
-fn explicit_fault_oracle_requires_one_fault_on_only_the_victim() {
+fn explicit_fault_oracle_bounds_cascade_participation_to_one() {
     let baselines = [3.0, 7.0, 2.0];
     assert!(validate_explicit_pipeline_fault_totals(&baselines, &[3.0, 8.0, 2.0], 1).is_ok());
+    assert!(validate_explicit_pipeline_fault_totals(&baselines, &[4.0, 8.0, 2.0], 1).is_ok());
     assert!(
-        validate_explicit_pipeline_fault_totals(&baselines, &[4.0, 8.0, 2.0], 1)
+        validate_explicit_pipeline_fault_totals(&baselines, &[5.0, 8.0, 2.0], 1)
             .unwrap_err()
             .contains("node0")
     );
@@ -13778,6 +14285,61 @@ fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
             .unwrap_err()
             .contains("node1")
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
+    let one = vec![RECOVERY_PREPARE_LOG.to_string(), String::new()];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&one, 0).unwrap(),
+        RecoveryPrepareSequence {
+            final_prepare_line: 0,
+            abandoned_rounds: 0,
+        }
+    );
+
+    let replacement = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_RETRY_HOLD_LOG}\n{RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
+        RecoveryPrepareSequence {
+            final_prepare_line: 4,
+            abandoned_rounds: 1,
+        }
+    );
+
+    let unfenced = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_PREPARE_LOG}"),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&unfenced, 0)
+        .unwrap_err()
+        .contains("superseded-round fence"));
+
+    let missing_retry_hold = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_SUPERSEDED_LOG} fault set changed\n\
+             {RECOVERY_PREPARE_HANDOFF_LOG}\n{RECOVERY_PREPARE_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&missing_retry_hold, 0)
+        .unwrap_err()
+        .contains("retry holds"));
+
+    let wrong_process = vec![
+        RECOVERY_PREPARE_LOG.to_string(),
+        RECOVERY_PREPARE_LOG.to_string(),
+    ];
+    assert!(validate_recovery_prepare_sequence(&wrong_process, 0)
+        .unwrap_err()
+        .contains("non-leader"));
 }
 
 #[cfg(feature = "kafka")]
@@ -13816,23 +14378,25 @@ fn recovery_checkpoint_failure_evidence_binds_the_interrupted_attempt() {
         Some(failed)
     );
 
+    let pre_prepare_leader_log = format!(
+        "checkpoint_id=4 epoch=4 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\n{metric}\n{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=5 epoch=5 checkpoint completed"
+    );
     let pre_prepare_failure_logs = vec![
         format!("{metric}\n{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}"),
         RECOVERY_RELEASE_LOG.into(),
         RECOVERY_RELEASE_LOG.into(),
     ];
-    let error = validate_recovery_checkpoint_failure_evidence(
-        &baselines,
-        &totals,
-        0,
-        &pre_prepare_failure_logs,
-        &leader_log,
-        resumed,
-    )
-    .unwrap_err();
-    assert!(
-        error.contains("not caused by the injected recovery"),
-        "{error}"
+    assert_eq!(
+        validate_recovery_checkpoint_failure_evidence(
+            &baselines,
+            &totals,
+            0,
+            &pre_prepare_failure_logs,
+            &pre_prepare_leader_log,
+            resumed,
+        )
+        .unwrap(),
+        Some(failed)
     );
 
     let no_failure_logs = vec![
@@ -15191,24 +15755,50 @@ fn test_checkpoint_latency_snapshot(
 
 #[cfg(feature = "kafka")]
 #[test]
-fn checkpoint_slo_mode_is_explicit_and_fail_closed() {
-    assert_eq!(
-        CheckpointSloMode::parse(None).unwrap(),
-        CheckpointSloMode::Certify
-    );
-    assert_eq!(
-        CheckpointSloMode::parse(Some("certify")).unwrap(),
-        CheckpointSloMode::Certify
-    );
-    assert_eq!(
-        CheckpointSloMode::parse(Some("observe")).unwrap(),
-        CheckpointSloMode::Observe
-    );
-    for invalid in ["", "Observe", "off", "0"] {
-        let error = CheckpointSloMode::parse(Some(invalid)).unwrap_err();
-        assert!(error.contains(SOAK_CHECKPOINT_SLO_MODE_ENV), "{error}");
-        assert!(error.contains("'certify' or 'observe'"), "{error}");
+fn slo_mode_is_explicit_and_fail_closed() {
+    for environment in [
+        SOAK_CHECKPOINT_SLO_MODE_ENV,
+        #[cfg(feature = "delta-lake-s3")]
+        SOAK_EO_VISIBILITY_SLO_MODE_ENV,
+    ] {
+        assert_eq!(SloMode::parse(environment, None).unwrap(), SloMode::Certify);
+        assert_eq!(
+            SloMode::parse(environment, Some("certify")).unwrap(),
+            SloMode::Certify
+        );
+        assert_eq!(
+            SloMode::parse(environment, Some("observe")).unwrap(),
+            SloMode::Observe
+        );
+        for invalid in ["", "Observe", "off", "0"] {
+            let error = SloMode::parse(environment, Some(invalid)).unwrap_err();
+            assert!(error.contains(environment), "{error}");
+            assert!(error.contains("'certify' or 'observe'"), "{error}");
+        }
     }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[test]
+fn observed_visibility_slo_miss_remains_non_certifying() {
+    enforce_or_report_visibility_slo(
+        SloMode::Observe,
+        "test Delta output",
+        Duration::from_millis(11),
+        Duration::from_millis(10),
+    );
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[test]
+#[should_panic(expected = "test Delta output visibility 11ms exceeded 10ms")]
+fn certified_visibility_slo_miss_fails_closed() {
+    enforce_or_report_visibility_slo(
+        SloMode::Certify,
+        "test Delta output",
+        Duration::from_millis(11),
+        Duration::from_millis(10),
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -15216,7 +15806,7 @@ fn checkpoint_slo_mode_is_explicit_and_fail_closed() {
 fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             0,
         ),
@@ -15224,7 +15814,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     );
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             47,
         ),
@@ -15232,7 +15822,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     );
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
         ),
@@ -15241,7 +15831,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     for finalized in [0, 1, MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS, u64::MAX] {
         assert_eq!(
             required_live_checkpoint_observations(
-                CheckpointSloMode::Observe,
+                SloMode::Observe,
                 MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
                 finalized,
             ),
@@ -15263,12 +15853,8 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         test_checkpoint_latency_snapshot(100.0, 100.0, 88.0),
     )
     .unwrap();
-    assert!(slow
-        .validate_for_mode(CheckpointSloMode::Observe, true)
-        .is_ok());
-    let error = slow
-        .validate_for_mode(CheckpointSloMode::Certify, true)
-        .unwrap_err();
+    assert!(slow.validate_for_mode(SloMode::Observe, true).is_ok());
+    let error = slow.validate_for_mode(SloMode::Certify, true).unwrap_err();
     assert!(error.contains("88.00%"), "{error}");
 
     let mut slow_capture = CheckpointLatencyEvidence::default();
@@ -15278,10 +15864,10 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, snapshot)
         .unwrap();
     assert!(slow_capture
-        .validate_for_mode(CheckpointSloMode::Observe, true)
+        .validate_for_mode(SloMode::Observe, true)
         .is_ok());
     let error = slow_capture
-        .validate_for_mode(CheckpointSloMode::Certify, true)
+        .validate_for_mode(SloMode::Certify, true)
         .unwrap_err();
     assert!(error.contains("state-capture SLO"), "{error}");
     assert!(error.contains("88.00%"), "{error}");
@@ -15291,7 +15877,7 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, test_checkpoint_latency_snapshot(1.0, 0.0, 0.0))
         .unwrap();
     let error = missing_stall
-        .validate_for_mode(CheckpointSloMode::Observe, true)
+        .validate_for_mode(SloMode::Observe, true)
         .unwrap_err();
     assert!(
         error.contains("captured no checkpoint pipeline-stall observations"),
@@ -15307,7 +15893,7 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, snapshot)
         .unwrap();
     let error = missing_capture
-        .validate_for_mode(CheckpointSloMode::Observe, false)
+        .validate_for_mode(SloMode::Observe, false)
         .unwrap_err();
     assert!(
         error.contains("captured no checkpoint state-capture observations"),

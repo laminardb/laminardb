@@ -1342,6 +1342,7 @@ async fn stale_assignment_stream_is_rejected_before_folding() {
         receiver.recv().await.unwrap().message(),
         ShuffleMessage::Data { .. }
     ));
+    wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
 
     let next_assignment = assignment_fence(2, &[1, 2]);
     receiver
@@ -1952,6 +1953,8 @@ async fn receiver_records_a_delivery_loss_incident() {
     // Frame 2 arrives with a gap where frame 1 should have been.
     sender.send_to(2, &data()).await.unwrap();
     let _ = recv.recv().await.unwrap();
+    // INVARIANT: Queue publication precedes the receiver task's delivery-sequence commit.
+    wait_until(|| incidents.load(O::Acquire) >= 1).await;
     assert_eq!(
         incidents.load(O::Acquire),
         1,
@@ -2011,6 +2014,8 @@ async fn repeated_current_recovery_generation_does_not_hide_sequence_gap() {
         .unwrap();
     let _ = recv.recv().await.unwrap();
 
+    // INVARIANT: Queue publication precedes the receiver task's delivery-sequence commit.
+    wait_until(|| incidents.load(O::Acquire) >= 1).await;
     assert_eq!(
         incidents.load(O::Acquire),
         1,

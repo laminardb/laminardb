@@ -1,3 +1,13 @@
+#[cfg(feature = "cluster")]
+use super::grpc::{
+    ack_disposition_to_wire, assignment_fence_from_wire, leader_proof_challenge_from_wire,
+    leader_proof_from_wire, send_phase_rpc, validate_phase_ack, BarrierClientEntry,
+};
+#[cfg(feature = "cluster")]
+use super::prepare::{retryable_prepare_status, validate_capture_ack};
+use super::protocol::announcement_attempt;
+#[cfg(feature = "cluster")]
+use super::protocol::BarrierEndpointRecord;
 use super::*;
 
 fn kv(id: NodeId) -> Arc<InMemoryKv> {

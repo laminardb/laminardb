@@ -1,9 +1,34 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow::array::RecordBatch;
+use crossfire::{mpsc, oneshot};
+use laminar_connectors::connector::{
+    ConnectorCancellationPolicy, ConnectorTaskTracker, CoordinatedCommitBatch,
+    CoordinatedCommitContext, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+    CoordinatedCommitter, SinkConnector, SinkContract,
+};
+use laminar_connectors::error::ConnectorError;
+use tokio::time::Instant;
+
+use super::actor::{
+    spawn_sink_actor, supervise_sink_task, OwnedSinkTask, SinkActorLifetime, SinkActorState,
+    SinkCloseState,
+};
+use super::close::{spawn_sink_close_driver_future, wait_for_sink_close};
+#[cfg(feature = "cluster")]
+use super::operation::{await_connector_operation_fenced, ConnectorOperationOutcome};
+use super::operation::{bounded_connector_operation, operation_deadline};
+use super::protocol::{SinkCommand, SinkOperation, SINK_CLOSE_TIMEOUT};
 use super::*;
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use laminar_connectors::connector::{
     ConnectorTaskOwner, SinkConsistency, SinkInputMode, SinkTopology, WriteResult,
 };
+#[cfg(feature = "cluster")]
+use laminar_core::cluster::control::ClusterController;
 use laminar_core::streaming::AsyncConsumer;
 use std::sync::atomic::{AtomicU64, Ordering};
 

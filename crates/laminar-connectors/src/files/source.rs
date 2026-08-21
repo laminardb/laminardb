@@ -214,16 +214,6 @@ impl SourceConnector for FileSource {
         Some(self.task_tracker.clone())
     }
 
-    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-        // Replayability is backed by an exact processed-path inventory plus an
-        // exact file/row cursor for a partially emitted file.
-        Ok(SourceContract::new(
-            SourceConsistency::Replayable,
-            SourceTopology::Singleton,
-            SourceInputMode::AppendOnly,
-        ))
-    }
-
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         if self.is_open || self.discovery.is_some() || self.restart_forbidden {
             return Err(ConnectorError::InvalidState {
@@ -572,6 +562,16 @@ impl SourceConnector for FileSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.close_until(tokio::time::Instant::now() + DISCOVERY_CLOSE_TIMEOUT)
             .await
+    }
+
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        // Replayability is backed by an exact processed-path inventory plus an
+        // exact file/row cursor for a partially emitted file.
+        Ok(SourceContract::new(
+            SourceConsistency::Replayable,
+            SourceTopology::Singleton,
+            SourceInputMode::AppendOnly,
+        ))
     }
 }
 
