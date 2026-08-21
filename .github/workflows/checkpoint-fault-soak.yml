@@ -158,7 +158,7 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "250"
+            rps: "200"
             visibility_ms: "90000"
             slo_mode: observe
           - label: Cluster EO stateful joins (static)
@@ -169,7 +169,7 @@ jobs:
             discovery: static
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "250"
+            rps: "200"
             visibility_ms: "90000"
             slo_mode: observe
     steps:
