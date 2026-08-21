@@ -3,10 +3,10 @@
 use super::super::{
     abort_grpc_tasks, barrier_v1, encode_barrier_endpoint, evict_barrier_client,
     get_barrier_client, leader_proof_ack_matches, leader_proof_to_wire, merge_direct_announcement,
-    validate_announcement_attempt, watch, AnnouncementPublicationState, Arc, AtomicBool,
+    validate_announcement_attempt, watch, AnnouncementPublicationState, Arc, AtomicBool, AtomicU64,
     BarrierAnnouncement, BarrierClientResolutionError, BarrierCoordinator, BarrierIdentity,
     BarrierProcessIdentity, ClusterKv, ExpectedBarrierProcess, FxHashMap, GrpcBarrierServer,
-    GrpcState, LocalLeaderProofProvider, NodeId, NodeInfo, Phase, PrepareAckState,
+    GrpcState, LocalLeaderProofProvider, NodeId, NodeInfo, Ordering, Phase, PrepareAckState,
     BARRIER_ADDR_KEY, MAX_RETAINED_BARRIER_IDENTITIES,
 };
 
@@ -21,6 +21,8 @@ impl BarrierCoordinator {
             grpc: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             prepare_observed_at: parking_lot::Mutex::new(FxHashMap::default()),
+            #[cfg(feature = "cluster")]
+            settled_prepare_floor: AtomicU64::new(0),
             #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -306,6 +308,20 @@ impl BarrierCoordinator {
             (Some(received), None) | (None, Some(received)) => Some(received),
             (None, None) => None,
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(in crate::cluster::control) fn prepare_settlement_covers(
+        &self,
+        checkpoint_id: u64,
+    ) -> bool {
+        checkpoint_id != 0 && self.settled_prepare_floor.load(Ordering::Acquire) >= checkpoint_id
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(in crate::cluster::control) fn record_prepare_settlement(&self, checkpoint_id: u64) {
+        self.settled_prepare_floor
+            .fetch_max(checkpoint_id, Ordering::AcqRel);
     }
 
     /// Install one direct Prepare receipt through the real relay for deterministic controller

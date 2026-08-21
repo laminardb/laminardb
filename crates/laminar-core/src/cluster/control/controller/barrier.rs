@@ -127,6 +127,16 @@ impl ClusterController {
         if announcement.phase != super::super::Phase::Prepare {
             return Ok(None);
         }
+        let attempt = crate::checkpoint::CheckpointAttempt::new(
+            announcement.epoch,
+            announcement.checkpoint_id,
+        );
+        if self
+            .barrier
+            .prepare_settlement_covers(attempt.checkpoint_id)
+        {
+            return Ok(None);
+        }
         let received_at = self
             .barrier
             .prepare_received_at_or_insert(&announcement, observation_started.into_std())
@@ -135,16 +145,29 @@ impl ClusterController {
             .checked_add(checkpoint_timeout)
             .ok_or_else(|| "checkpoint Prepare attempt deadline overflowed".to_string())?;
         if tokio::time::Instant::now() >= attempt_deadline {
-            return Err(
-                "checkpoint Prepare attempt deadline elapsed before authority validation".into(),
-            );
+            return self
+                .ignore_durably_settled_prepare(
+                    attempt,
+                    observation_deadline,
+                    "checkpoint Prepare attempt deadline elapsed before authority validation",
+                )
+                .await;
         }
-        tokio::time::timeout_at(
+        let validation = tokio::time::timeout_at(
             attempt_deadline,
             self.barrier.validate_checkpoint_prepare(&announcement),
         )
-        .await
-        .map_err(|_| "checkpoint Prepare authority validation timed out".to_string())??;
+        .await;
+        let validation_error = match validation {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("checkpoint Prepare authority validation timed out".to_string()),
+        };
+        if let Some(error) = validation_error {
+            return self
+                .ignore_durably_settled_prepare(attempt, observation_deadline, &error)
+                .await;
+        }
         let proof = announcement
             .leader_proof
             .as_ref()
@@ -188,6 +211,57 @@ impl ClusterController {
             },
             None => CheckpointPrepareObservation::AssignmentReady(announcement),
         }))
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn ignore_durably_settled_prepare(
+        &self,
+        attempt: crate::checkpoint::CheckpointAttempt,
+        deadline: tokio::time::Instant,
+        validation_error: &str,
+    ) -> Result<Option<CheckpointPrepareObservation>, String> {
+        if self
+            .barrier
+            .prepare_settlement_covers(attempt.checkpoint_id)
+        {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(validation_error.to_owned());
+        }
+        let authority = self.checkpoint_authority().map_err(|error| {
+            format!(
+                "{validation_error}; checkpoint Prepare settlement authority is unavailable: {error}"
+            )
+        })?;
+        let settlement =
+            tokio::time::timeout_at(deadline, authority.cluster_attempt_settlement(attempt))
+                .await
+                .map_err(|_| {
+                    format!("{validation_error}; checkpoint Prepare settlement audit timed out")
+                })?
+                .map_err(|error| {
+                    format!(
+                        "{validation_error}; checkpoint Prepare settlement audit failed: {error}"
+                    )
+                })?;
+        let Some(settlement) = settlement else {
+            return Err(validation_error.to_owned());
+        };
+        let settled =
+            crate::checkpoint::CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
+        match settled.relation_to(attempt) {
+            crate::checkpoint::CheckpointAttemptRelation::Exact
+            | crate::checkpoint::CheckpointAttemptRelation::Newer => {
+                self.barrier
+                    .record_prepare_settlement(settled.checkpoint_id);
+                Ok(None)
+            }
+            crate::checkpoint::CheckpointAttemptRelation::Older
+            | crate::checkpoint::CheckpointAttemptRelation::Conflict => Err(format!(
+                "{validation_error}; checkpoint Prepare settlement {settled:?} does not close {attempt:?}"
+            )),
+        }
     }
 
     /// Subscribe to direct checkpoint announcements. Consumers must retain a bounded KV poll:

@@ -2,7 +2,7 @@
 //! under `cluster`, falling back to gossip-KV announce/ack/poll.
 
 #[cfg(feature = "cluster")]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,10 @@ pub struct BarrierCoordinator {
     /// same non-refreshing attempt deadline across repeated observations.
     #[cfg(feature = "cluster")]
     prepare_observed_at: parking_lot::Mutex<FxHashMap<BarrierIdentity, std::time::Instant>>,
+    /// Highest checkpoint ID whose immutable terminal authority closes any retained Prepare at or
+    /// below it. Recovery may settle an attempt after its mutable transport hint becomes stale.
+    #[cfg(feature = "cluster")]
+    settled_prepare_floor: AtomicU64,
     #[cfg(feature = "cluster")]
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
     #[cfg(feature = "cluster")]
