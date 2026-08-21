@@ -42,6 +42,8 @@
 //! - `LAMINAR_SOAK_CHECKPOINT_SLO_MODE`  `certify` (default) enforces the checkpoint latency
 //!   sample-size and percentile SLOs; `observe` retains exact timing evidence and diagnostics for
 //!   functional smoke runs without claiming performance certification
+//! - `LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE`  `certify` (default) enforces frozen-input-to-Delta
+//!   visibility; `observe` records the immutable boundary but still requires bounded exact output
 //! - `LAMINAR_SOAK_KILLS`  total fault rounds (local exact requires at least two)
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
@@ -153,6 +155,8 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const SOAK_CHECKPOINT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_CHECKPOINT_SLO_MODE";
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+const SOAK_EO_VISIBILITY_SLO_MODE_ENV: &str = "LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE";
 #[cfg(feature = "kafka")]
 const CHECKPOINT_STATE_CAPTURE_SLO_SECONDS: f64 = 0.064;
 #[cfg(feature = "kafka")]
@@ -439,30 +443,30 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(feature = "kafka")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CheckpointSloMode {
+enum SloMode {
     Certify,
     Observe,
 }
 
 #[cfg(feature = "kafka")]
-impl CheckpointSloMode {
-    fn parse(value: Option<&str>) -> Result<Self, String> {
+impl SloMode {
+    fn parse(environment: &str, value: Option<&str>) -> Result<Self, String> {
         match value {
             None | Some("certify") => Ok(Self::Certify),
             Some("observe") => Ok(Self::Observe),
             Some(value) => Err(format!(
-                "{SOAK_CHECKPOINT_SLO_MODE_ENV} must be 'certify' or 'observe', got {value:?}"
+                "{environment} must be 'certify' or 'observe', got {value:?}"
             )),
         }
     }
 
-    fn from_environment() -> Result<Self, String> {
-        match std::env::var(SOAK_CHECKPOINT_SLO_MODE_ENV) {
-            Ok(value) => Self::parse(Some(&value)),
-            Err(std::env::VarError::NotPresent) => Self::parse(None),
-            Err(std::env::VarError::NotUnicode(value)) => Err(format!(
-                "{SOAK_CHECKPOINT_SLO_MODE_ENV} is not valid Unicode: {value:?}"
-            )),
+    fn from_environment(environment: &str) -> Result<Self, String> {
+        match std::env::var(environment) {
+            Ok(value) => Self::parse(environment, Some(&value)),
+            Err(std::env::VarError::NotPresent) => Self::parse(environment, None),
+            Err(std::env::VarError::NotUnicode(value)) => {
+                Err(format!("{environment} is not valid Unicode: {value:?}"))
+            }
         }
     }
 
@@ -482,8 +486,46 @@ impl CheckpointSloMode {
 }
 
 #[cfg(feature = "kafka")]
+fn resolve_visibility_slo_mode(delivery: JoinDelivery) -> SloMode {
+    match delivery {
+        JoinDelivery::AtLeastOnce => SloMode::Certify,
+        JoinDelivery::ExactlyOnce => {
+            #[cfg(feature = "delta-lake-s3")]
+            {
+                SloMode::from_environment(SOAK_EO_VISIBILITY_SLO_MODE_ENV)
+                    .unwrap_or_else(|error| panic!("invalid EO visibility SLO mode: {error}"))
+            }
+            #[cfg(not(feature = "delta-lake-s3"))]
+            {
+                SloMode::Certify
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn enforce_or_report_visibility_slo(
+    mode: SloMode,
+    label: &str,
+    visibility: Duration,
+    visibility_slo: Duration,
+) {
+    if visibility <= visibility_slo {
+        return;
+    }
+    match mode {
+        SloMode::Certify => {
+            panic!("{label} visibility {visibility:?} exceeded {visibility_slo:?}")
+        }
+        SloMode::Observe => eprintln!(
+            "soak: PROFILE {label} visibility {visibility:?} exceeded the non-certifying {visibility_slo:?} SLO boundary"
+        ),
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn required_live_checkpoint_observations(
-    mode: CheckpointSloMode,
+    mode: SloMode,
     certification_floor: u64,
     finalized: u64,
 ) -> u64 {
@@ -3979,21 +4021,21 @@ impl CheckpointLatencyEvidence {
 
     fn validate_for_mode(
         &self,
-        slo_mode: CheckpointSloMode,
+        slo_mode: SloMode,
         certify_state_capture: bool,
     ) -> Result<CheckpointLatencySnapshot, String> {
         match slo_mode {
-            CheckpointSloMode::Certify => self.validate_slos(certify_state_capture),
+            SloMode::Certify => self.validate_slos(certify_state_capture),
             // Observation mode is deliberately not an evidence opt-out. Require every process
             // generation to contribute valid, nonzero checkpoint, stall, and capture samples, but
             // leave sample-size and percentile certification to an explicit certifying run.
-            CheckpointSloMode::Observe => self
+            SloMode::Observe => self
                 .validated_observations(true)
                 .map(|(aggregate, _)| aggregate),
         }
     }
 
-    fn report(&self, minimum_live_state_bytes: u64, slo_mode: CheckpointSloMode) {
+    fn report(&self, minimum_live_state_bytes: u64, slo_mode: SloMode) {
         let aggregate = self.aggregate().unwrap_or_else(|error| panic!("{error}"));
         for (generation, snapshot) in &self.generations {
             eprintln!(
@@ -4029,7 +4071,7 @@ impl CheckpointLatencyEvidence {
             aggregate.pipeline_stall_observations as u64,
             aggregate.checkpoint_observations as u64,
         );
-        if slo_mode == CheckpointSloMode::Observe {
+        if slo_mode == SloMode::Observe {
             eprintln!(
                 "soak: PROFILE checkpoint latency is observational and non-certifying; exact timing evidence remains enforced"
             );
@@ -7047,6 +7089,7 @@ fn assert_delta_core_window_outputs(
     outputs: &BTreeMap<String, DeltaOutputOracle>,
     expected: &BTreeMap<CoreWindowOutput, u64>,
     frozen_input_at: Instant,
+    slo_mode: SloMode,
     window: Duration,
     label: &str,
 ) {
@@ -7091,9 +7134,11 @@ fn assert_delta_core_window_outputs(
             && validate_core_window_outputs(&observed, expected, true).is_ok()
         {
             let visibility = frozen_input_at.elapsed();
-            assert!(
-                visibility <= visibility_slo,
-                "{label}: CoreWindow output visibility {visibility:?} exceeded {visibility_slo:?}"
+            enforce_or_report_visibility_slo(
+                slo_mode,
+                &format!("{label}: CoreWindow output"),
+                visibility,
+                visibility_slo,
             );
             eprintln!(
                 "soak: PROFILE {label} CoreWindow visibility_ms={:.3}",
@@ -7401,6 +7446,13 @@ struct DeltaExactOutput<'a> {
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+struct DeltaVisibilityBoundaries {
+    opened: Vec<Option<OpenDeltaJoinSnapshot>>,
+    visibility_slo: Duration,
+    slo_mode: SloMode,
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn validate_delta_exact_snapshot(
     output: &DeltaExactOutput<'_>,
     snapshot: DeltaJoinSnapshot,
@@ -7443,7 +7495,8 @@ fn open_delta_visibility_boundaries(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
     visibility_slo: Duration,
-) -> Vec<OpenDeltaJoinSnapshot> {
+    slo_mode: SloMode,
+) -> Vec<Option<OpenDeltaJoinSnapshot>> {
     let deadlines = outputs
         .iter()
         .map(|output| output.frozen_input_at + visibility_slo)
@@ -7514,12 +7567,25 @@ fn open_delta_visibility_boundaries(
         .into_iter()
         .enumerate()
         .map(|(index, opened)| {
-            opened.unwrap_or_else(|| {
-                panic!(
-                    "{} Delta metadata had no observable version at or before its {visibility_slo:?} visibility boundary: {}",
-                    outputs[index].label, observations[index]
-                )
-            })
+            if opened.is_some() {
+                return opened;
+            }
+            let observation = if observations[index].is_empty() {
+                "no metadata observation completed before the boundary"
+            } else {
+                &observations[index]
+            };
+            match slo_mode {
+                SloMode::Certify => panic!(
+                    "{} Delta metadata had no observable version at or before its {visibility_slo:?} visibility boundary: {observation}",
+                    outputs[index].label
+                ),
+                SloMode::Observe => eprintln!(
+                    "soak: PROFILE {} Delta metadata missed the non-certifying {visibility_slo:?} visibility boundary: {observation}",
+                    outputs[index].label
+                ),
+            }
+            None
         })
         .collect()
 }
@@ -7528,22 +7594,38 @@ fn open_delta_visibility_boundaries(
 fn scan_delta_visibility_boundaries(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
-    opened: &[OpenDeltaJoinSnapshot],
+    opened: &[Option<OpenDeltaJoinSnapshot>],
     window: Duration,
     visibility_slo: Duration,
-) -> Vec<DeltaJoinSnapshot> {
+    slo_mode: SloMode,
+) -> Vec<Option<DeltaJoinSnapshot>> {
     let mut completed = Vec::with_capacity(outputs.len());
     for (output, opened) in outputs.iter().zip(opened) {
+        let Some(opened) = opened else {
+            completed.push(None);
+            continue;
+        };
         let scan_deadline = Instant::now() + window;
         let snapshot = retry_delta_snapshot_until(nodes, scan_deadline, output.label, || {
             output.oracle.scan_join_snapshot(opened)
         });
-        let snapshot = validate_delta_exact_snapshot(output, snapshot).unwrap_or_else(|error| {
-            panic!(
-                "{} was not exact at its pre-SLO Delta boundary: {error}",
-                output.label
-            )
-        });
+        let snapshot = match validate_delta_exact_snapshot(output, snapshot) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                match slo_mode {
+                    SloMode::Certify => panic!(
+                        "{} was not exact at its pre-SLO Delta boundary: {error}",
+                        output.label
+                    ),
+                    SloMode::Observe => eprintln!(
+                        "soak: PROFILE {} missed the non-certifying {visibility_slo:?} exact Delta boundary: {error}",
+                        output.label
+                    ),
+                }
+                completed.push(None);
+                continue;
+            }
+        };
         let visibility = snapshot
             .observed_at
             .saturating_duration_since(output.frozen_input_at);
@@ -7559,17 +7641,17 @@ fn scan_delta_visibility_boundaries(
             snapshot.rows,
             snapshot.version
         );
-        completed.push(snapshot);
+        completed.push(Some(snapshot));
     }
     completed
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
-fn wait_delta_exact_outputs(
+fn capture_delta_visibility_boundaries(
     nodes: &mut [Node],
     outputs: &[DeltaExactOutput<'_>],
-    window: Duration,
-) -> Vec<DeltaJoinSnapshot> {
+    slo_mode: SloMode,
+) -> DeltaVisibilityBoundaries {
     assert!(
         !outputs.is_empty(),
         "Delta exact-output check has no outputs"
@@ -7587,8 +7669,102 @@ fn wait_delta_exact_outputs(
     ));
     // WHY: Full-table scans are verifier work. Timestamp the immutable publication boundary first
     // so scan order and transient read retries cannot consume or move the delivery SLO.
-    let opened = open_delta_visibility_boundaries(nodes, outputs, visibility_slo);
-    scan_delta_visibility_boundaries(nodes, outputs, &opened, window, visibility_slo)
+    let opened = open_delta_visibility_boundaries(nodes, outputs, visibility_slo, slo_mode);
+    DeltaVisibilityBoundaries {
+        opened,
+        visibility_slo,
+        slo_mode,
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn wait_delta_exact_output_after_boundary(
+    nodes: &mut [Node],
+    output: &DeltaExactOutput<'_>,
+    boundary_version: Option<i64>,
+    window: Duration,
+) -> DeltaJoinSnapshot {
+    let deadline = Instant::now() + window;
+    let mut latest_version = boundary_version;
+    loop {
+        assert_running_nodes(nodes);
+        let observation = match output.oracle.open_join_snapshot() {
+            Ok(opened) if latest_version.is_some_and(|version| opened.version <= version) => {
+                format!(
+                    "latest version {} has not advanced past the incomplete boundary",
+                    opened.version
+                )
+            }
+            Ok(opened) => {
+                let snapshot = retry_delta_snapshot_until(nodes, deadline, output.label, || {
+                    output.oracle.scan_join_snapshot(&opened)
+                });
+                latest_version = Some(snapshot.version);
+                match validate_delta_exact_snapshot(output, snapshot) {
+                    Ok(snapshot) => return snapshot,
+                    Err(error) => error,
+                }
+            }
+            Err(error) => error,
+        };
+        assert!(
+            Instant::now() < deadline,
+            "{} did not become exact after its observed Delta boundary: {observation}",
+            output.label
+        );
+        let Some(remaining) = remaining_at(deadline, Instant::now()) else {
+            continue;
+        };
+        std::thread::sleep(remaining.min(Duration::from_secs(1)));
+    }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+fn wait_delta_exact_outputs(
+    nodes: &mut [Node],
+    outputs: &[DeltaExactOutput<'_>],
+    boundaries: &DeltaVisibilityBoundaries,
+    window: Duration,
+) -> Vec<DeltaJoinSnapshot> {
+    assert_eq!(
+        outputs.len(),
+        boundaries.opened.len(),
+        "Delta visibility boundaries do not match the checked outputs"
+    );
+    let at_boundary = scan_delta_visibility_boundaries(
+        nodes,
+        outputs,
+        &boundaries.opened,
+        window,
+        boundaries.visibility_slo,
+        boundaries.slo_mode,
+    );
+    outputs
+        .iter()
+        .zip(&boundaries.opened)
+        .zip(at_boundary)
+        .map(|((output, opened), snapshot)| {
+            snapshot.unwrap_or_else(|| {
+                let snapshot = wait_delta_exact_output_after_boundary(
+                    nodes,
+                    output,
+                    opened.as_ref().map(|opened| opened.version),
+                    window,
+                );
+                let visibility = snapshot
+                    .observed_at
+                    .saturating_duration_since(output.frozen_input_at);
+                eprintln!(
+                    "soak: PROFILE {} exact Delta protocol visibility_ms={:.3} rows={} table_version={} after non-certifying boundary",
+                    output.label,
+                    visibility.as_secs_f64() * 1_000.0,
+                    snapshot.rows,
+                    snapshot.version
+                );
+                snapshot
+            })
+        })
+        .collect()
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -7656,6 +7832,7 @@ struct DeltaTemporalExactOutput<'a> {
 fn assert_delta_temporal_outputs(
     nodes: &mut [Node],
     outputs: &[DeltaTemporalExactOutput<'_>],
+    slo_mode: SloMode,
     window: Duration,
 ) {
     let deadline = Instant::now() + window;
@@ -7697,10 +7874,11 @@ fn assert_delta_temporal_outputs(
                     {
                         let visibility =
                             Instant::now().saturating_duration_since(output.frozen_input_at);
-                        assert!(
-                            visibility <= visibility_slo,
-                            "{} frozen input cut took {visibility:?} to become exactly visible in Delta; SLO is {visibility_slo:?}",
-                            output.label
+                        enforce_or_report_visibility_slo(
+                            slo_mode,
+                            &format!("{} exact Delta output", output.label),
+                            visibility,
+                            visibility_slo,
                         );
                         eprintln!(
                             "soak: PROFILE {} exact Delta visibility_ms={:.3} rows={} table_version={}",
@@ -8523,9 +8701,12 @@ fn assert_temporal_canaries(
     delivery: JoinDelivery,
     input: &TemporalPostFaultInput,
     frontier_released_at: Instant,
+    slo_mode: SloMode,
     window: Duration,
     topology: &str,
 ) {
+    #[cfg(not(feature = "delta-lake-s3"))]
+    let _ = slo_mode;
     let asof_label = format!(
         "{topology} {} nullable temporal ASOF canary",
         delivery.label()
@@ -8584,6 +8765,7 @@ fn assert_temporal_canaries(
                         label: &probe_label,
                     },
                 ],
+                slo_mode,
                 window,
             );
             #[cfg(not(feature = "delta-lake-s3"))]
@@ -10794,8 +10976,9 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
     let retained_interval_ms = join_interval_ms();
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
-    let checkpoint_slo_mode = CheckpointSloMode::from_environment()
+    let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     let kills = env_u64("LAMINAR_SOAK_SINGLE_KILLS", 1);
     if delivery == JoinDelivery::AtLeastOnce {
         assert!(
@@ -11363,6 +11546,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
                     .expect("single EO Delta CoreWindow oracles"),
                 &expected_windows,
                 window_frozen_input_at,
+                visibility_slo_mode,
                 recovery_ceiling,
                 "single-node EO CoreWindow canaries",
             );
@@ -11538,11 +11722,12 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         delivery,
         &temporal_post,
         temporal_frontier_released_at,
+        visibility_slo_mode,
         recovery_ceiling,
         "single-node",
     );
     #[cfg(feature = "delta-lake-s3")]
-    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+    let delta_visibility_boundaries = (delivery == JoinDelivery::ExactlyOnce).then(|| {
         let outputs = delta_join_exact_outputs(
             &output_oracles,
             &produced_prefix,
@@ -11550,7 +11735,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             "single-node EO bounded join",
             "single-node EO temporal ASOF load",
         );
-        wait_delta_exact_outputs(&mut nodes, &outputs, recovery_ceiling)
+        capture_delta_visibility_boundaries(&mut nodes, &outputs, visibility_slo_mode)
     });
     let produced_count = produced_prefix.count;
     assert!(
@@ -11586,6 +11771,24 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: single {delivery_label} frozen bounded and temporal input prefix is durable through checkpoint {}",
         latest_checkpoint.checkpoint_id
     );
+    #[cfg(feature = "delta-lake-s3")]
+    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+        let outputs = delta_join_exact_outputs(
+            &output_oracles,
+            &produced_prefix,
+            _bounded_frozen_input_at,
+            "single-node EO bounded join",
+            "single-node EO temporal ASOF load",
+        );
+        wait_delta_exact_outputs(
+            &mut nodes,
+            &outputs,
+            delta_visibility_boundaries
+                .as_ref()
+                .expect("single EO visibility boundaries captured before final cuts"),
+            recovery_ceiling,
+        )
+    });
     match delivery {
         JoinDelivery::AtLeastOnce => {
             assert_frozen_kafka_outputs(
@@ -11716,8 +11919,9 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 500);
     let retained_interval_ms = join_interval_ms();
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
-    let checkpoint_slo_mode = CheckpointSloMode::from_environment()
+    let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     assert!(
         interval_ms >= 100,
         "LAMINAR_SOAK_INTERVAL_MS must be at least 100"
@@ -12746,6 +12950,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         delivery,
         &temporal_post,
         temporal_frontier_released_at,
+        visibility_slo_mode,
         recovery_ceiling,
         "three-node",
     );
@@ -12774,6 +12979,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                     .expect("cluster EO Delta CoreWindow oracles"),
                 &expected_windows,
                 window_frontier_released_at,
+                visibility_slo_mode,
                 recovery_ceiling,
                 "three-node EO CoreWindow canaries",
             );
@@ -12782,7 +12988,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         }
     }
     #[cfg(feature = "delta-lake-s3")]
-    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+    let delta_visibility_boundaries = (delivery == JoinDelivery::ExactlyOnce).then(|| {
         let outputs = delta_join_exact_outputs(
             &output_oracles,
             &produced_prefix,
@@ -12790,7 +12996,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             "three-node EO bounded join",
             "three-node EO temporal ASOF load",
         );
-        wait_delta_exact_outputs(&mut nodes, &outputs, recovery_ceiling)
+        capture_delta_visibility_boundaries(&mut nodes, &outputs, visibility_slo_mode)
     });
     let produced_count = produced_prefix.count;
     assert!(produced_count > 0, "soak producer emitted no input records");
@@ -12830,6 +13036,24 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         "soak: frozen bounded and temporal input prefix is durable through checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
+    #[cfg(feature = "delta-lake-s3")]
+    let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
+        let outputs = delta_join_exact_outputs(
+            &output_oracles,
+            &produced_prefix,
+            _bounded_frozen_input_at,
+            "three-node EO bounded join",
+            "three-node EO temporal ASOF load",
+        );
+        wait_delta_exact_outputs(
+            &mut nodes,
+            &outputs,
+            delta_visibility_boundaries
+                .as_ref()
+                .expect("cluster EO visibility boundaries captured before final cuts"),
+            recovery_ceiling,
+        )
+    });
     match delivery {
         JoinDelivery::AtLeastOnce => {
             assert_frozen_kafka_outputs(
@@ -15531,24 +15755,50 @@ fn test_checkpoint_latency_snapshot(
 
 #[cfg(feature = "kafka")]
 #[test]
-fn checkpoint_slo_mode_is_explicit_and_fail_closed() {
-    assert_eq!(
-        CheckpointSloMode::parse(None).unwrap(),
-        CheckpointSloMode::Certify
-    );
-    assert_eq!(
-        CheckpointSloMode::parse(Some("certify")).unwrap(),
-        CheckpointSloMode::Certify
-    );
-    assert_eq!(
-        CheckpointSloMode::parse(Some("observe")).unwrap(),
-        CheckpointSloMode::Observe
-    );
-    for invalid in ["", "Observe", "off", "0"] {
-        let error = CheckpointSloMode::parse(Some(invalid)).unwrap_err();
-        assert!(error.contains(SOAK_CHECKPOINT_SLO_MODE_ENV), "{error}");
-        assert!(error.contains("'certify' or 'observe'"), "{error}");
+fn slo_mode_is_explicit_and_fail_closed() {
+    for environment in [
+        SOAK_CHECKPOINT_SLO_MODE_ENV,
+        #[cfg(feature = "delta-lake-s3")]
+        SOAK_EO_VISIBILITY_SLO_MODE_ENV,
+    ] {
+        assert_eq!(SloMode::parse(environment, None).unwrap(), SloMode::Certify);
+        assert_eq!(
+            SloMode::parse(environment, Some("certify")).unwrap(),
+            SloMode::Certify
+        );
+        assert_eq!(
+            SloMode::parse(environment, Some("observe")).unwrap(),
+            SloMode::Observe
+        );
+        for invalid in ["", "Observe", "off", "0"] {
+            let error = SloMode::parse(environment, Some(invalid)).unwrap_err();
+            assert!(error.contains(environment), "{error}");
+            assert!(error.contains("'certify' or 'observe'"), "{error}");
+        }
     }
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[test]
+fn observed_visibility_slo_miss_remains_non_certifying() {
+    enforce_or_report_visibility_slo(
+        SloMode::Observe,
+        "test Delta output",
+        Duration::from_millis(11),
+        Duration::from_millis(10),
+    );
+}
+
+#[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
+#[test]
+#[should_panic(expected = "test Delta output visibility 11ms exceeded 10ms")]
+fn certified_visibility_slo_miss_fails_closed() {
+    enforce_or_report_visibility_slo(
+        SloMode::Certify,
+        "test Delta output",
+        Duration::from_millis(11),
+        Duration::from_millis(10),
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -15556,7 +15806,7 @@ fn checkpoint_slo_mode_is_explicit_and_fail_closed() {
 fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             0,
         ),
@@ -15564,7 +15814,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     );
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             47,
         ),
@@ -15572,7 +15822,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     );
     assert_eq!(
         required_live_checkpoint_observations(
-            CheckpointSloMode::Certify,
+            SloMode::Certify,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
             MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
         ),
@@ -15581,7 +15831,7 @@ fn checkpoint_slo_observation_targets_preserve_certification_floor() {
     for finalized in [0, 1, MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS, u64::MAX] {
         assert_eq!(
             required_live_checkpoint_observations(
-                CheckpointSloMode::Observe,
+                SloMode::Observe,
                 MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS,
                 finalized,
             ),
@@ -15603,12 +15853,8 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         test_checkpoint_latency_snapshot(100.0, 100.0, 88.0),
     )
     .unwrap();
-    assert!(slow
-        .validate_for_mode(CheckpointSloMode::Observe, true)
-        .is_ok());
-    let error = slow
-        .validate_for_mode(CheckpointSloMode::Certify, true)
-        .unwrap_err();
+    assert!(slow.validate_for_mode(SloMode::Observe, true).is_ok());
+    let error = slow.validate_for_mode(SloMode::Certify, true).unwrap_err();
     assert!(error.contains("88.00%"), "{error}");
 
     let mut slow_capture = CheckpointLatencyEvidence::default();
@@ -15618,10 +15864,10 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, snapshot)
         .unwrap();
     assert!(slow_capture
-        .validate_for_mode(CheckpointSloMode::Observe, true)
+        .validate_for_mode(SloMode::Observe, true)
         .is_ok());
     let error = slow_capture
-        .validate_for_mode(CheckpointSloMode::Certify, true)
+        .validate_for_mode(SloMode::Certify, true)
         .unwrap_err();
     assert!(error.contains("state-capture SLO"), "{error}");
     assert!(error.contains("88.00%"), "{error}");
@@ -15631,7 +15877,7 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, test_checkpoint_latency_snapshot(1.0, 0.0, 0.0))
         .unwrap();
     let error = missing_stall
-        .validate_for_mode(CheckpointSloMode::Observe, true)
+        .validate_for_mode(SloMode::Observe, true)
         .unwrap_err();
     assert!(
         error.contains("captured no checkpoint pipeline-stall observations"),
@@ -15647,7 +15893,7 @@ fn checkpoint_slo_observe_mode_requires_evidence_without_certifying_performance(
         .record_generation(generation, snapshot)
         .unwrap();
     let error = missing_capture
-        .validate_for_mode(CheckpointSloMode::Observe, false)
+        .validate_for_mode(SloMode::Observe, false)
         .unwrap_err();
     assert!(
         error.contains("captured no checkpoint state-capture observations"),

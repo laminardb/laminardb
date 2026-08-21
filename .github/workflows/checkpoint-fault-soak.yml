@@ -117,6 +117,7 @@ jobs:
             rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
+            visibility_slo_mode: certify
           - label: Single-node EO stateful joins
             test: single_node_eo_join_kill9_soak
             features: cluster,kafka,delta-lake-s3
@@ -128,6 +129,7 @@ jobs:
             rps: "250"
             visibility_ms: "90000"
             slo_mode: observe
+            visibility_slo_mode: observe
           - label: Cluster ALO stateful joins (gossip)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka
@@ -139,6 +141,7 @@ jobs:
             rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
+            visibility_slo_mode: certify
           - label: Cluster ALO stateful joins (static)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka
@@ -150,6 +153,7 @@ jobs:
             rps: "400"
             visibility_ms: "10000"
             slo_mode: observe
+            visibility_slo_mode: certify
           - label: Cluster EO stateful joins (gossip)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3
@@ -161,6 +165,7 @@ jobs:
             rps: "150"
             visibility_ms: "120000"
             slo_mode: observe
+            visibility_slo_mode: observe
           - label: Cluster EO stateful joins (static)
             test: three_node_eo_join_kill9_soak
             features: cluster,aws,kafka,delta-lake-s3
@@ -172,6 +177,7 @@ jobs:
             rps: "150"
             visibility_ms: "120000"
             slo_mode: observe
+            visibility_slo_mode: observe
     steps:
       - uses: actions/checkout@v6
         with:
@@ -239,6 +245,7 @@ jobs:
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
+          LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE: ${{ matrix.visibility_slo_mode }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
