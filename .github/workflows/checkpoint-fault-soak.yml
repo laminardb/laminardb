@@ -98,10 +98,8 @@ jobs:
 
   join-validity:
     name: ${{ matrix.label }}
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: 16
     strategy:
       fail-fast: false
       matrix:
@@ -250,8 +248,7 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: ${{ matrix.rps }}
-          # Blacksmith CPU generations produced a repeatable 3x spread for identical binaries.
-          # Use a 10/50ms runner envelope here; pinned target hardware keeps the strict defaults.
+          # Hosted-runner timing is non-certifying; use the wider 10/50ms envelope.
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"
@@ -291,10 +288,8 @@ jobs:
 
   cluster-coordinated-recovery:
     name: Coordinated recovery (${{ matrix.role }}, ${{ matrix.discovery }})
-    runs-on: blacksmith-16vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: 16
     strategy:
       fail-fast: false
       matrix:
@@ -352,15 +347,13 @@ jobs:
           LAMINAR_SOAK_KILLS: "0"
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           LAMINAR_SOAK_INTERVAL_MS: "250"
-          # Blacksmith is not pinned target hardware. Preserve exact timing evidence here without
-          # claiming production latency certification; the test default remains `certify`.
+          # Hosted runners preserve timing evidence without claiming production certification.
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: observe
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: "400"
-          # Blacksmith CPU generations produced a repeatable 3x spread for identical binaries.
-          # Use a 10/50ms runner envelope here; pinned target hardware keeps the strict defaults.
+          # Use the wider 10/50ms envelope on non-certifying hosted runners.
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"
