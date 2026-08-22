@@ -62,21 +62,25 @@ impl<T: Send + 'static> Producer<T> {
     }
 
     /// Returns `true` if the receiver has been dropped.
+    #[must_use]
     pub fn is_closed(&self) -> bool {
         self.tx.is_disconnected()
     }
 
     /// Number of items currently buffered.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.tx.deref().len()
     }
 
     /// Buffer capacity.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.tx.deref().capacity().unwrap_or(0)
     }
 
     /// Whether the buffer is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tx.deref().is_empty()
     }
