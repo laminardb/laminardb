@@ -1,6 +1,5 @@
 //! JSONB existence and containment predicates.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -53,7 +52,7 @@ impl Hash for JsonbExists {
 }
 
 impl ScalarUDFImpl for JsonbExists {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -158,7 +157,7 @@ impl Hash for JsonbExistsAny {
 }
 
 impl ScalarUDFImpl for JsonbExistsAny {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -265,7 +264,7 @@ impl Hash for JsonbExistsAll {
 }
 
 impl ScalarUDFImpl for JsonbExistsAll {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -365,7 +364,7 @@ impl Hash for JsonbContains {
 }
 
 impl ScalarUDFImpl for JsonbContains {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -460,7 +459,7 @@ impl Hash for JsonbContainedBy {
 }
 
 impl ScalarUDFImpl for JsonbContainedBy {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

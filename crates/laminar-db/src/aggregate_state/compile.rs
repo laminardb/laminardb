@@ -200,10 +200,10 @@ impl<'a> PreAggBuilder<'a> {
                 let projected_expr = if raw_type == dt {
                     arg_expr.clone()
                 } else {
-                    datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast {
-                        expr: Box::new(arg_expr.clone()),
-                        data_type: dt.clone(),
-                    })
+                    datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast::new(
+                        Box::new(arg_expr.clone()),
+                        dt.clone(),
+                    ))
                 };
                 self.pre_agg_select_items.push(format!(
                     "{} AS \"__agg_input_{col_idx}\"",

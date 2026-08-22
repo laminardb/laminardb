@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use super::{
-    classify_delta_metadata_error, debug, info, CommitProperties, ConnectorError,
-    CoordinatedCommitCursor, DeltaTable, DeltaWriteAttemptError, HashMap, RecordBatch, SaveMode,
-    SchemaMode, SchemaRef, StorageProvider, Url, SET_TRANSACTION_RETENTION,
+    classify_delta_metadata_error, debug, from_delta_version, info, CommitProperties,
+    ConnectorError, CoordinatedCommitCursor, DeltaTable, DeltaWriteAttemptError, HashMap,
+    RecordBatch, SaveMode, SchemaMode, SchemaRef, StorageProvider, Url, SET_TRANSACTION_RETENTION,
 };
 #[cfg(feature = "delta-lake")]
 use arrow_schema::{DataType, Schema, TimeUnit};
@@ -203,7 +203,8 @@ pub(crate) async fn write_batches(
 ) -> Result<(DeltaTable, i64), DeltaWriteAttemptError> {
     if batches.is_empty() {
         debug!("no batches to write, skipping");
-        let version = table.version().unwrap_or(0);
+        let version = from_delta_version(table.version().unwrap_or(0))
+            .map_err(DeltaWriteAttemptError::Local)?;
         return Ok((table, version));
     }
 
@@ -229,7 +230,15 @@ pub(crate) async fn write_batches(
     // Forward target file size to delta-rs so Parquet files match the
     // user's configured size, not just the internal default.
     if let Some(size) = target_file_size {
-        write_builder = write_builder.with_target_file_size(size);
+        let size = u64::try_from(size)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                DeltaWriteAttemptError::Local(ConnectorError::ConfigurationError(
+                    "Delta target file size must be a non-zero u64".into(),
+                ))
+            })?;
+        write_builder = write_builder.with_target_file_size(Some(size));
     }
 
     // Enable schema evolution (additive column merge) if requested.
@@ -251,7 +260,8 @@ pub(crate) async fn write_batches(
     // Execute the write.
     let table = write_builder.await.map_err(DeltaWriteAttemptError::Delta)?;
 
-    let version = table.version().unwrap_or(0);
+    let version =
+        from_delta_version(table.version().unwrap_or(0)).map_err(DeltaWriteAttemptError::Local)?;
 
     info!(version, total_rows, "committed Delta Lake transaction");
 

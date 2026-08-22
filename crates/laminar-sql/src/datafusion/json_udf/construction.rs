@@ -1,6 +1,5 @@
 //! JSON type inspection, construction, and scalar conversion UDFs.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -56,7 +55,7 @@ impl Hash for JsonTypeof {
 }
 
 impl ScalarUDFImpl for JsonTypeof {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -142,7 +141,7 @@ impl Hash for JsonBuildObject {
 }
 
 impl ScalarUDFImpl for JsonBuildObject {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -238,7 +237,7 @@ impl Hash for JsonBuildArray {
 }
 
 impl ScalarUDFImpl for JsonBuildArray {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -314,7 +313,7 @@ impl Hash for ToJsonb {
 }
 
 impl ScalarUDFImpl for ToJsonb {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

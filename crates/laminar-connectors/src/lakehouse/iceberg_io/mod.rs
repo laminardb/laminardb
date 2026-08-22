@@ -46,11 +46,8 @@ fn storage_factory(
             ))
         })?;
 
-    // configured_scheme is the bare scheme ("s3"), NOT "s3://" —
-    // iceberg-storage-opendal formats the prefix as `{scheme}://{bucket}/`.
     let factory: Arc<dyn iceberg::io::StorageFactory> = match scheme.as_str() {
         "s3" | "s3a" => Arc::new(OpenDalStorageFactory::S3 {
-            configured_scheme: scheme,
             customized_credential_load: None,
         }),
         "fs" => Arc::new(OpenDalStorageFactory::Fs),

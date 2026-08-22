@@ -2,7 +2,7 @@
 
 [package]
 name = "laminardb-demo"
-version = "0.28.0"
+version = "0.30.0"
 edition = "2021"
 publish = false
 description = "Market Data Demo: Real-time analytics with Ratatui TUI for LaminarDB"
@@ -30,9 +30,9 @@ laminar-derive = { path = "../../crates/laminar-derive" }
 laminar-core = { path = "../../crates/laminar-core" }
 
 # Arrow
-arrow = "57.2"
-arrow-array = "57.2"
-arrow-schema = "57.2"
+arrow = "=58.4.0"
+arrow-array = "=58.4.0"
+arrow-schema = "=58.4.0"
 
 # Async
 tokio = { version = "1.50", features = ["full"] }

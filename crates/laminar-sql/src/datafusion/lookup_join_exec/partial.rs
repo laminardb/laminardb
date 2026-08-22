@@ -4,7 +4,7 @@
 //! into original stream-row order.
 
 use super::{
-    fmt, take, Any, Arc, Array, Boundedness, ColumnId, DataFusionError, Debug, DisplayAs,
+    fmt, take, Arc, Array, Boundedness, ColumnId, DataFusionError, Debug, DisplayAs,
     DisplayFormatType, EmissionType, EquivalenceProperties, ExecutionPlan, Formatter, LexOrdering,
     LookupJoinType, LookupMemoryCache, LookupSourceDyn, Partitioning, PlanProperties, RecordBatch,
     RecordBatchStreamAdapter, Result, RowConverter, Schema, SchemaRef, Semaphore,
@@ -21,7 +21,7 @@ pub struct PartialLookupJoinExec {
     stream_key_indices: Vec<usize>,
     join_type: LookupJoinType,
     schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     /// Prebuilt `RowConverter` — built once at planning time, reused on
     /// every `execute()`. Previously rebuilt per-cycle.
     converter: Arc<RowConverter>,
@@ -95,14 +95,14 @@ impl PartialLookupJoinExec {
             output_schema
         };
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&output_schema)),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             },
-        );
+        ));
 
         let stream_field_count = input.schema().fields().len();
         let converter = Arc::new(RowConverter::new(key_sort_fields)?);
@@ -152,19 +152,19 @@ impl DisplayAs for PartialLookupJoinExec {
 }
 
 impl ExecutionPlan for PartialLookupJoinExec {
-    fn name(&self) -> &'static str {
-        "PartialLookupJoinExec"
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "PartialLookupJoinExec"
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

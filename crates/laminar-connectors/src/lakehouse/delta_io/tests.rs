@@ -1,6 +1,7 @@
 use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use object_store::ObjectStoreExt as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -31,6 +32,23 @@ fn test_batch(n: usize) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[test]
+fn delta_version_conversion_checks_laminardb_boundaries() {
+    assert_eq!(to_delta_version(0).unwrap(), 0);
+    assert_eq!(to_delta_version(i64::MAX).unwrap(), i64::MAX as u64);
+    assert!(matches!(
+        to_delta_version(-1),
+        Err(ConnectorError::ConfigurationError(_))
+    ));
+
+    assert_eq!(from_delta_version(0).unwrap(), 0);
+    assert_eq!(from_delta_version(i64::MAX as u64).unwrap(), i64::MAX);
+    assert!(matches!(
+        from_delta_version(i64::MAX as u64 + 1),
+        Err(ConnectorError::ReadError(_))
+    ));
 }
 
 async fn create_cdf_table(table_path: &str, schema: &SchemaRef) -> DeltaTable {
@@ -137,7 +155,7 @@ fn cdf_contract_failures_are_terminal() {
 
 #[test]
 fn delta_metadata_retryability_uses_typed_transport_errors() {
-    use delta_object_store::client::{HttpError, HttpErrorKind};
+    use object_store::client::{HttpError, HttpErrorKind};
 
     let transient = classify_delta_metadata_error(
         "read cursor",
@@ -157,7 +175,7 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     let kernel_transient = classify_delta_metadata_error(
         "read cursor",
         &deltalake::DeltaTableError::KernelError(delta_kernel::error::Error::ObjectStore(
-            delta_object_store::Error::Generic {
+            object_store::Error::Generic {
                 store: "test",
                 source: Box::new(HttpError::new(
                     HttpErrorKind::Request,
@@ -170,7 +188,7 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(kernel_transient.is_transient());
 
     let kernel_unknown_error = deltalake::DeltaTableError::KernelError(
-        delta_kernel::error::Error::ObjectStore(delta_object_store::Error::Generic {
+        delta_kernel::error::Error::ObjectStore(object_store::Error::Generic {
             store: "test",
             source: Box::new(HttpError::new(
                 HttpErrorKind::Unknown,
@@ -236,8 +254,8 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
 
 #[tokio::test]
 async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
-    use delta_object_store::aws::AmazonS3Builder;
-    use delta_object_store::{ObjectStore as _, RetryConfig};
+    use object_store::aws::AmazonS3Builder;
+    use object_store::RetryConfig;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -259,7 +277,7 @@ async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
         .build()
         .unwrap();
     let error = store
-        .head(&delta_object_store::path::Path::from("object"))
+        .head(&object_store::path::Path::from("object"))
         .await
         .unwrap_err();
     server.await.unwrap();

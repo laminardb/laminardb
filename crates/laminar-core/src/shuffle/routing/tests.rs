@@ -306,7 +306,7 @@ fn row_hashing_rejects_invalid_dimensions_without_panicking() {
 }
 
 #[test]
-fn partitioning_abi_v1_arrow_row_golden_vectors() {
+fn partitioning_abi_v2_arrow_row_golden_vectors() {
     const KEY_GROUPS: u32 = 257;
 
     let strings = RecordBatch::try_new(
@@ -378,7 +378,7 @@ fn partitioning_abi_v1_arrow_row_golden_vectors() {
 }
 
 #[test]
-fn partitioning_abi_v1_rejects_non_scalar_and_floating_point_keys() {
+fn partitioning_abi_v2_rejects_non_scalar_and_floating_point_keys() {
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "key",

@@ -111,7 +111,7 @@ fn validate_temporal_select_shape(select: &sqlparser::ast::Select) -> Result<(),
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
     {
         return Err(temporal_projection_error(
             "DISTINCT, TOP, INTO, PREWHERE, grouping, HAVING, sorting, windows, QUALIFY, and other SELECT modifiers are not supported",

@@ -754,7 +754,7 @@ fn is_direct_single_source_shape(query: &Query, select: &Select) -> bool {
         || !select.named_window.is_empty()
         || select.qualify.is_some()
         || select.value_table_mode.is_some()
-        || select.connect_by.is_some()
+        || !select.connect_by.is_empty()
         || select.from.len() != 1
         || !select.from[0].joins.is_empty()
     {

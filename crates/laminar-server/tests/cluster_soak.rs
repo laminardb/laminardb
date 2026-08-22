@@ -6396,7 +6396,7 @@ fn assert_kafka_matrix_aggregates(
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[derive(Debug)]
 struct DeltaJoinSnapshot {
-    version: i64,
+    version: u64,
     observed_at: Instant,
     rows: usize,
     pairs: BTreeSet<(u64, u64)>,
@@ -6407,14 +6407,14 @@ struct DeltaJoinSnapshot {
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 struct OpenDeltaJoinSnapshot {
     table: deltalake::DeltaTable,
-    version: i64,
+    version: u64,
     observed_at: Instant,
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[derive(Clone, Debug)]
 struct DeltaMatrixSnapshot {
-    version: i64,
+    version: u64,
     rows: usize,
     outputs: BTreeSet<MatrixOutput>,
     duplicate_rows: usize,
@@ -6424,7 +6424,7 @@ struct DeltaMatrixSnapshot {
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[derive(Clone, Debug)]
 struct DeltaTemporalSnapshot {
-    version: i64,
+    version: u64,
     rows: usize,
     outputs: BTreeSet<TemporalOutput>,
     duplicate_rows: usize,
@@ -6434,7 +6434,7 @@ struct DeltaTemporalSnapshot {
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[derive(Clone, Debug)]
 struct DeltaCoreWindowSnapshot {
-    version: i64,
+    version: u64,
     outputs: BTreeMap<CoreWindowOutput, u64>,
 }
 
@@ -6835,7 +6835,7 @@ impl DeltaOutputOracle {
         })
     }
 
-    fn aggregate_rows(&self) -> Result<(i64, DeltaAggregateRows), String> {
+    fn aggregate_rows(&self) -> Result<(u64, DeltaAggregateRows), String> {
         self.runtime.block_on(async {
             let uri = deltalake::ensure_table_uri(&self.table_uri)
                 .map_err(|error| format!("invalid Delta aggregate table URI: {error}"))?;
@@ -7319,7 +7319,7 @@ fn assert_delta_matrix_outputs(
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 #[derive(Debug)]
 struct DeltaMatrixAggregateSnapshot {
-    version: i64,
+    version: u64,
     physical_rows: usize,
     net: BTreeMap<MatrixAggregateOutput, i64>,
 }
@@ -7681,7 +7681,7 @@ fn capture_delta_visibility_boundaries(
 fn wait_delta_exact_output_after_boundary(
     nodes: &mut [Node],
     output: &DeltaExactOutput<'_>,
-    boundary_version: Option<i64>,
+    boundary_version: Option<u64>,
     window: Duration,
 ) -> DeltaJoinSnapshot {
     let deadline = Instant::now() + window;

@@ -11,7 +11,6 @@
 //! - `[n]` — array element by index
 //! - `[*]` — wildcard array elements
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -307,7 +306,7 @@ impl Hash for JsonbPathExistsUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathExistsUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -431,7 +430,7 @@ fn jsonb_is_true(data: &[u8]) -> Option<bool> {
 }
 
 impl ScalarUDFImpl for JsonbPathMatchUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

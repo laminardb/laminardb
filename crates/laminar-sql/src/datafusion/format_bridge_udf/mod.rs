@@ -7,7 +7,6 @@
 //! - [`ToJsonUdf`] — `to_json(value) -> text`
 //! - [`FromJsonUdf`] — `from_json(string) -> jsonb`
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -100,7 +99,7 @@ impl Hash for ParseEpochUdf {
 }
 
 impl ScalarUDFImpl for ParseEpochUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -220,7 +219,7 @@ impl Hash for ParseTimestampUdf {
 }
 
 impl ScalarUDFImpl for ParseTimestampUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -346,7 +345,7 @@ impl Hash for ToJsonUdf {
 }
 
 impl ScalarUDFImpl for ToJsonUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -487,7 +486,7 @@ impl Hash for FromJsonUdf {
 }
 
 impl ScalarUDFImpl for FromJsonUdf {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

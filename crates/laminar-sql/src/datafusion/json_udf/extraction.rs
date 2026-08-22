@@ -1,6 +1,5 @@
 //! JSONB field, index, and path extraction UDFs.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -56,7 +55,7 @@ impl Hash for JsonbGet {
 }
 
 impl ScalarUDFImpl for JsonbGet {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -155,7 +154,7 @@ impl Hash for JsonbGetIdx {
 }
 
 impl ScalarUDFImpl for JsonbGetIdx {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -257,7 +256,7 @@ impl Hash for JsonbGetText {
 }
 
 impl ScalarUDFImpl for JsonbGetText {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -359,7 +358,7 @@ impl Hash for JsonbGetTextIdx {
 }
 
 impl ScalarUDFImpl for JsonbGetTextIdx {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -471,7 +470,7 @@ impl Hash for JsonbGetPath {
 }
 
 impl ScalarUDFImpl for JsonbGetPath {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -605,7 +604,7 @@ impl Hash for JsonbGetPathText {
 }
 
 impl ScalarUDFImpl for JsonbGetPathText {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

@@ -1,7 +1,6 @@
 //! Read-only `laminar.models` and `laminar.ai_calls` catalog views.
 //! Each is a [`SystemView`] that snapshots the live [`AiRuntime`] on every scan.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
@@ -72,9 +71,10 @@ impl std::fmt::Debug for SystemView {
 
 #[async_trait]
 impl TableProvider for SystemView {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

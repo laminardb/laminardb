@@ -20,8 +20,8 @@ fn partitioning_key_group_count_rejects_every_out_of_range_value() {
 }
 
 #[test]
-fn partitioning_abi_v1_raw_key_hash_golden_vectors() {
-    assert_eq!(PARTITIONING_ABI_VERSION, 1);
+fn partitioning_abi_v2_raw_key_hash_golden_vectors() {
+    assert_eq!(PARTITIONING_ABI_VERSION, 2);
     let actual = [
         key_hash(b""),
         key_hash(b"a"),
@@ -44,7 +44,7 @@ fn partitioning_abi_v1_raw_key_hash_golden_vectors() {
 #[test]
 fn rendezvous_placement_policy_golden_vector() {
     // Placement can evolve through an assignment transition; this vector
-    // detects accidental churn in the current policy but is not ABI v1.
+    // detects accidental churn in the current policy but is not part of the partitioning ABI.
     let actual = rendezvous_assignment(12, &[NodeId(7), NodeId(3), NodeId(5)]);
     assert_eq!(
         actual.as_ref(),

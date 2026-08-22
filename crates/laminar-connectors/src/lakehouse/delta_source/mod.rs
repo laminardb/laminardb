@@ -238,6 +238,7 @@ impl SourceConnector for DeltaSource {
             let table_version = table.version().ok_or_else(|| {
                 ConnectorError::ReadError("opened Delta table has no committed version".into())
             })?;
+            let table_version = delta_io::from_delta_version(table_version)?;
             self.current_version =
                 initial_current_version(self.config.starting_version, table_version);
             self.known_latest_version = table_version;
@@ -363,38 +364,30 @@ impl SourceConnector for DeltaSource {
                 ConnectorError::ConfigurationError("Delta source version cursor overflowed".into())
             })?;
 
-            {
-                let table = self
-                    .table
-                    .as_ref()
-                    .ok_or_else(|| ConnectorError::InvalidState {
-                        expected: "table initialized".into(),
-                        actual: "table not initialized".into(),
-                    })?;
-                let log_store = table.log_store();
-                match log_store.read_commit_entry(target_version).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        return Err(ConnectorError::ConfigurationError(format!(
-                            "Delta commit {target_version} is unavailable; incremental streaming cannot fall back to a snapshot"
-                        )));
-                    }
-                    Err(error) => {
-                        return Err(ConnectorError::ReadError(format!(
-                            "failed to verify Delta commit {target_version}: {error}"
-                        )));
-                    }
-                }
-            }
-
-            let scan_table = self
+            let table = self
                 .table
                 .as_ref()
                 .ok_or_else(|| ConnectorError::InvalidState {
                     expected: "table initialized".into(),
                     actual: "table not initialized".into(),
-                })?
-                .clone();
+                })?;
+            let log_store = table.log_store();
+            let delta_version = delta_io::to_delta_version(target_version)?;
+            match log_store.read_commit_entry(delta_version).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "Delta commit {target_version} is unavailable; incremental streaming cannot fall back to a snapshot"
+                    )));
+                }
+                Err(error) => {
+                    return Err(ConnectorError::ReadError(format!(
+                        "failed to verify Delta commit {target_version}: {error}"
+                    )));
+                }
+            }
+
+            let scan_table = table.clone();
             let cdf_batches = delta_io::read_cdf_batches(
                 scan_table,
                 target_version,

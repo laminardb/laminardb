@@ -49,6 +49,7 @@ data/
 checkpoints/
 wal/
 /tools/*
+!/tools/check_analytical_dependencies.py
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
 !/tools/readability-check/

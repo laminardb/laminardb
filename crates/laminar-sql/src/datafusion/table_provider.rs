@@ -4,7 +4,6 @@
 //! `TableProvider` trait, allowing streaming sources to be registered as
 //! tables in a `SessionContext` and queried with SQL.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -69,7 +68,7 @@ impl StreamingTableProvider {
 
 #[async_trait]
 impl TableProvider for StreamingTableProvider {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

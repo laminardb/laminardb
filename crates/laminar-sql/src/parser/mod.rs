@@ -288,7 +288,7 @@ fn convert_standard_statement(stmt: sqlparser::ast::Statement) -> StreamingState
             // Try to extract VALUES rows from source query
             if let Some(ref source) = insert.source {
                 if let sqlparser::ast::SetExpr::Values(ref values) = *source.body {
-                    let rows: Vec<Vec<sqlparser::ast::Expr>> = values.rows.clone();
+                    let rows = values.rows.clone();
                     return StreamingStatement::InsertInto {
                         table_name,
                         columns,

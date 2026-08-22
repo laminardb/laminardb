@@ -28,11 +28,11 @@ required-features = ["cluster"]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.28.0" }
-laminar-db = { path = "../laminar-db", version = "0.28.0", default-features = false, features = ["api", "remote", "local"] }
-laminar-sql = { path = "../laminar-sql", version = "0.28.0" }
+laminar-core = { path = "../laminar-core", version = "0.30.0" }
+laminar-db = { path = "../laminar-db", version = "0.30.0", default-features = false, features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.30.0" }
 # Read-only Delta snapshot oracle for the ignored end-to-end EO soak.
-deltalake = { version = "0.31", optional = true, default-features = false, features = ["rustls"] }
+deltalake = { workspace = true, optional = true, features = ["rustls"] }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }
@@ -78,7 +78,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { version = "=0.40.4", default-features = false, features = [
+pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.30.0", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",

@@ -16,7 +16,6 @@
 //! | `map_contains_key(map, key)` | Map, K | Boolean |
 //! | `map_from_arrays(keys, vals)` | List, List | Map |
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -110,9 +109,10 @@ impl Hash for StructExtract {
 }
 
 impl ScalarUDFImpl for StructExtract {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "struct_extract"
     }
@@ -187,9 +187,10 @@ impl Hash for StructSet {
 }
 
 impl ScalarUDFImpl for StructSet {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "struct_set"
     }
@@ -291,9 +292,10 @@ impl Hash for StructDrop {
 }
 
 impl ScalarUDFImpl for StructDrop {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "struct_drop"
     }
@@ -381,9 +383,10 @@ impl Hash for StructRename {
 }
 
 impl ScalarUDFImpl for StructRename {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "struct_rename"
     }
@@ -472,9 +475,10 @@ impl Hash for StructMerge {
 }
 
 impl ScalarUDFImpl for StructMerge {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "struct_merge"
     }
@@ -568,9 +572,10 @@ impl Hash for MapKeys {
 }
 
 impl ScalarUDFImpl for MapKeys {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_keys"
     }
@@ -655,9 +660,10 @@ impl Hash for MapValues {
 }
 
 impl ScalarUDFImpl for MapValues {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_values"
     }
@@ -743,9 +749,10 @@ impl Hash for MapContainsKey {
 }
 
 impl ScalarUDFImpl for MapContainsKey {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_contains_key"
     }
@@ -844,9 +851,10 @@ impl Hash for MapFromArrays {
 }
 
 impl ScalarUDFImpl for MapFromArrays {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_from_arrays"
     }

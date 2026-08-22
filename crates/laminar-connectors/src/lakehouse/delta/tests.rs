@@ -102,7 +102,7 @@ fn typed_delta_failures_are_classified_without_message_heuristics() {
 #[cfg(feature = "delta-lake")]
 #[test]
 fn object_store_retryability_uses_typed_positive_allowlist() {
-    use delta_object_store::client::{HttpError, HttpErrorKind};
+    use object_store::client::{HttpError, HttpErrorKind};
 
     let transient =
         classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(

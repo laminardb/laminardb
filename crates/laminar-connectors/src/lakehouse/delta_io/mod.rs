@@ -149,6 +149,24 @@ use crate::connector::{
 use super::commit_descriptor::{DeltaCommitDescriptor, DeltaTableBinding};
 
 #[cfg(feature = "delta-lake")]
+pub(super) fn to_delta_version(version: i64) -> Result<u64, ConnectorError> {
+    u64::try_from(version).map_err(|_| {
+        ConnectorError::ConfigurationError(format!(
+            "Delta table version must be non-negative, got {version}"
+        ))
+    })
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn from_delta_version(version: u64) -> Result<i64, ConnectorError> {
+    i64::try_from(version).map_err(|_| {
+        ConnectorError::ReadError(format!(
+            "Delta table version {version} exceeds LaminarDB's supported range"
+        ))
+    })
+}
+
+#[cfg(feature = "delta-lake")]
 const SET_TRANSACTION_RETENTION: &str = "delta.setTransactionRetentionDuration";
 
 #[cfg(feature = "delta-lake")]

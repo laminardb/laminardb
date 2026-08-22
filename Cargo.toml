@@ -15,7 +15,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.28.0"
+version = "0.30.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -70,24 +70,26 @@ globset = "0.4"
 
 # Arrow row encoding participates in the partitioning ABI. Upgrade these exact
 # pins only with an ABI version bump and updated golden vectors.
-arrow = { version = "=57.2.0", default-features = true }
-arrow-array = "=57.2.0"
-arrow-schema = "=57.2.0"
-arrow-cast = "=57.2.0"
-arrow-csv = "=57.2.0"
-arrow-ipc = "=57.2.0"
-arrow-json = "=57.2.0"
-arrow-row = "=57.2.0"
-arrow-select = "=57.2.0"
-datafusion = "52.3"
-datafusion-common = "52.0"
-datafusion-expr = "52.0"
-datafusion-functions-aggregate-common = "52.3"
-datafusion-sql = "52.0"
-datafusion-optimizer = "52.0"
+arrow = { version = "=58.4.0", default-features = true }
+arrow-array = "=58.4.0"
+arrow-avro = "=58.4.0"
+arrow-schema = "=58.4.0"
+arrow-cast = "=58.4.0"
+arrow-csv = "=58.4.0"
+arrow-ipc = "=58.4.0"
+arrow-json = "=58.4.0"
+arrow-row = "=58.4.0"
+arrow-select = "=58.4.0"
+parquet = { version = "=58.4.0", default-features = false }
+datafusion = "=53.1.0"
+datafusion-common = "=53.1.0"
+datafusion-expr = "=53.1.0"
+datafusion-functions-aggregate-common = "=53.1.0"
+datafusion-sql = "=53.1.0"
+datafusion-optimizer = "=53.1.0"
 # `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used
 # to collect referenced columns for lookup projection pushdown.
-sqlparser = { version = "0.59", features = ["visitor"] }
+sqlparser = { version = "=0.61.0", features = ["visitor"] }
 
 # Async
 tokio-stream = "0.1"
@@ -115,12 +117,17 @@ subtle = "2.6"
 prometheus = { version = "0.14", features = ["process"] }
 
 # Object store (S3/GCS/Azure/local filesystem) — shared across crates.
-object_store = "0.13"
+object_store = "=0.13.2"
+
+# Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
+deltalake = { version = "=0.32.4", default-features = false }
+deltalake-catalog-glue = { version = "=0.16.0", default-features = false }
+delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
 
 # Apache Iceberg
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-storage-opendal = "0.9.1"
+iceberg = "=0.10.1"
+iceberg-catalog-rest = "=0.10.1"
+iceberg-storage-opendal = "=0.10.1"
 
 # Cluster (distributed mode)
 chitchat = "0.10"
@@ -133,10 +140,6 @@ xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.11"
 tempfile = "3.27"
-
-[patch.crates-io]
-pgwire = { path = "vendor/pgwire" }
-pgwire-replication = { path = "vendor/pgwire-replication" }
 
 [profile.release]
 lto = "thin"

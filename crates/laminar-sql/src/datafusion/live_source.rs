@@ -6,7 +6,6 @@
 //! plan. The internal `LiveSourceExec` reads from the shared slot at `execute()` time,
 //! so the cached plan always sees fresh data.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -21,7 +20,6 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion_common::Statistics;
 use datafusion_expr::TableType;
 use parking_lot::Mutex;
 
@@ -77,7 +75,7 @@ impl std::fmt::Debug for LiveSourceProvider {
 
 #[async_trait]
 impl TableProvider for LiveSourceProvider {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -113,7 +111,7 @@ pub(crate) struct LiveSourceExec {
     slot: BatchSlot,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl LiveSourceExec {
@@ -128,12 +126,12 @@ impl LiveSourceExec {
             }
             None => source_schema,
         };
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema.clone()),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self {
             slot,
             schema,
@@ -163,19 +161,19 @@ impl DisplayAs for LiveSourceExec {
 }
 
 impl ExecutionPlan for LiveSourceExec {
-    fn name(&self) -> &'static str {
-        "LiveSourceExec"
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "LiveSourceExec"
     }
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -229,10 +227,6 @@ impl ExecutionPlan for LiveSourceExec {
             self.schema.clone(),
             output,
         )))
-    }
-
-    fn statistics(&self) -> datafusion_common::Result<Statistics> {
-        Ok(Statistics::default())
     }
 }
 

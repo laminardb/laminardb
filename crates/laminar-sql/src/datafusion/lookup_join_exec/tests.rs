@@ -9,10 +9,17 @@ fn batch_exec(batch: RecordBatch) -> Arc<dyn ExecutionPlan> {
     let schema = batch.schema();
     let batches = vec![batch];
     let stream_schema = Arc::clone(&schema);
+    let properties = Arc::new(PlanProperties::new(
+        EquivalenceProperties::new(Arc::clone(&schema)),
+        Partitioning::UnknownPartitioning(1),
+        EmissionType::Final,
+        Boundedness::Bounded,
+    ));
     Arc::new(StreamExecStub {
         schema,
         batches: std::sync::Mutex::new(Some(batches)),
         stream_schema,
+        properties,
     })
 }
 
@@ -21,6 +28,7 @@ struct StreamExecStub {
     schema: SchemaRef,
     batches: std::sync::Mutex<Option<Vec<RecordBatch>>>,
     stream_schema: SchemaRef,
+    properties: Arc<PlanProperties>,
 }
 
 impl Debug for StreamExecStub {
@@ -36,23 +44,18 @@ impl DisplayAs for StreamExecStub {
 }
 
 impl ExecutionPlan for StreamExecStub {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "StreamExecStub"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-    fn properties(&self) -> &PlanProperties {
-        // Leak a static PlanProperties for test simplicity
-        Box::leak(Box::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&self.schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Final,
-            Boundedness::Bounded,
-        )))
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]

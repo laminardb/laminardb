@@ -14,7 +14,6 @@
 //! They are evaluated using DataFusion's SQL engine against a temporary
 //! table containing the element values. Native lambda syntax is deferred.
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -153,9 +152,10 @@ impl Hash for ArrayTransform {
 }
 
 impl ScalarUDFImpl for ArrayTransform {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "array_transform"
     }
@@ -246,9 +246,10 @@ impl Hash for ArrayFilter {
 }
 
 impl ScalarUDFImpl for ArrayFilter {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "array_filter"
     }
@@ -374,9 +375,10 @@ impl Hash for ArrayReduce {
 }
 
 impl ScalarUDFImpl for ArrayReduce {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "array_reduce"
     }
@@ -483,9 +485,10 @@ impl Hash for MapFilter {
 }
 
 impl ScalarUDFImpl for MapFilter {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_filter"
     }
@@ -620,9 +623,10 @@ impl Hash for MapTransformValues {
 }
 
 impl ScalarUDFImpl for MapTransformValues {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
     fn name(&self) -> &'static str {
         "map_transform_values"
     }

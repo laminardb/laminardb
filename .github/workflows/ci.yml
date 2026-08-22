@@ -252,6 +252,26 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features files
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
+  dependency-generations:
+    name: Analytical Dependency Generations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Reject divergent analytical dependency generations
+        run: python3 tools/check_analytical_dependencies.py
+      - name: Verify maintained fork packages can be assembled
+        run: |
+          cargo package --manifest-path vendor/pgwire/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
+      - name: Verify workspace packages can be assembled
+        run: |
+          # The release publishes both maintained forks before the Laminar crates.
+          cargo package --workspace --locked --no-verify \
+            --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
+            --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"'
+
   # ============================================
   # MSRV Check
   # ============================================
@@ -404,7 +424,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, dependency-generations, msrv, docs, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -415,6 +435,7 @@ jobs:
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
+             [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
              [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]]; then

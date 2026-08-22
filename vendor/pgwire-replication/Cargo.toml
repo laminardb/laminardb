@@ -12,8 +12,8 @@
 [package]
 edition = "2021"
 rust-version = "1.88"
-name = "pgwire-replication"
-version = "0.3.2"
+name = "laminardb-pgwire-replication"
+version = "0.30.0"
 authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]
 build = false
 exclude = ["Cargo.lock"]
@@ -22,9 +22,9 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Tokio-based Postgres wire-protocol logical replication client (pgoutput) with TLS and SCRAM."
-homepage = "https://github.com/vnvo/pgwire-replication"
-documentation = "https://docs.rs/pgwire-replication"
+description = "LaminarDB-maintained PostgreSQL logical replication client"
+homepage = "https://laminardb.io"
+documentation = "https://docs.rs/laminardb-pgwire-replication"
 keywords = [
     "postgres",
     "pgoutput",
@@ -38,7 +38,7 @@ categories = [
     "asynchronous",
 ]
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/vnvo/pgwire-replication"
+repository = "https://github.com/laminardb/laminardb"
 resolver = "2"
 
 [package.metadata.docs.rs]

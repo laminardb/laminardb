@@ -9,7 +9,6 @@
 //! - **Flatten**: `jsonb_flatten`, `jsonb_unflatten`
 //! - **Schema**: `json_to_columns`, `json_infer_schema`
 
-use std::any::Any;
 #[allow(clippy::disallowed_types)] // cold path: DataFusion integration
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -77,7 +76,7 @@ impl Hash for JsonbMerge {
 }
 
 impl ScalarUDFImpl for JsonbMerge {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -212,7 +211,7 @@ fn deep_merge(
 }
 
 impl ScalarUDFImpl for JsonbDeepMerge {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -332,7 +331,7 @@ fn strip_nulls(val: serde_json::Value) -> serde_json::Value {
 }
 
 impl ScalarUDFImpl for JsonbStripNulls {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -439,7 +438,7 @@ impl Hash for JsonbRenameKeys {
 }
 
 impl ScalarUDFImpl for JsonbRenameKeys {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -584,7 +583,7 @@ impl Hash for JsonbPick {
 }
 
 impl ScalarUDFImpl for JsonbPick {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -714,7 +713,7 @@ impl Hash for JsonbExcept {
 }
 
 impl ScalarUDFImpl for JsonbExcept {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

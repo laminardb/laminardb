@@ -1,5 +1,4 @@
 use super::*;
-use std::any::Any;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -13,20 +12,20 @@ use datafusion_common::config::ConfigOptions;
 #[derive(Debug)]
 struct MockUnboundedExec {
     schema: SchemaRef,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
 }
 
 impl MockUnboundedExec {
     fn new(schema: SchemaRef) -> Self {
         let eq = EquivalenceProperties::new(Arc::clone(&schema));
-        let props = PlanProperties::new(
+        let props = Arc::new(PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
             },
-        );
+        ));
         Self { schema, props }
     }
 }
@@ -38,19 +37,19 @@ impl DisplayAs for MockUnboundedExec {
 }
 
 impl ExecutionPlan for MockUnboundedExec {
-    fn name(&self) -> &'static str {
-        "MockUnboundedExec"
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "MockUnboundedExec"
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
@@ -79,18 +78,18 @@ impl ExecutionPlan for MockUnboundedExec {
 #[derive(Debug)]
 struct MockBoundedExec {
     schema: SchemaRef,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
 }
 
 impl MockBoundedExec {
     fn new(schema: SchemaRef) -> Self {
         let eq = EquivalenceProperties::new(Arc::clone(&schema));
-        let props = PlanProperties::new(
+        let props = Arc::new(PlanProperties::new(
             eq,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        );
+        ));
         Self { schema, props }
     }
 }
@@ -102,19 +101,19 @@ impl DisplayAs for MockBoundedExec {
 }
 
 impl ExecutionPlan for MockBoundedExec {
-    fn name(&self) -> &'static str {
-        "MockBoundedExec"
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "MockBoundedExec"
     }
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
@@ -143,7 +142,7 @@ impl ExecutionPlan for MockBoundedExec {
 #[derive(Debug)]
 struct MockPassthroughExec {
     child: Arc<dyn ExecutionPlan>,
-    props: PlanProperties,
+    props: Arc<PlanProperties>,
 }
 
 impl MockPassthroughExec {
@@ -160,19 +159,19 @@ impl DisplayAs for MockPassthroughExec {
 }
 
 impl ExecutionPlan for MockPassthroughExec {
-    fn name(&self) -> &'static str {
-        "MockPassthroughExec"
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    fn name(&self) -> &'static str {
+        "MockPassthroughExec"
     }
 
     fn schema(&self) -> SchemaRef {
         self.child.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.props
     }
 
