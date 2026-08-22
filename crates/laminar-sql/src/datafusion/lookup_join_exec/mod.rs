@@ -335,6 +335,10 @@ impl DisplayAs for LookupJoinExec {
 }
 
 impl ExecutionPlan for LookupJoinExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "LookupJoinExec"
     }

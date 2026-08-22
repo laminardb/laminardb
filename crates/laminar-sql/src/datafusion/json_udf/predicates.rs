@@ -52,6 +52,10 @@ impl Hash for JsonbExists {
 }
 
 impl ScalarUDFImpl for JsonbExists {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_exists"
     }
@@ -153,6 +157,10 @@ impl Hash for JsonbExistsAny {
 }
 
 impl ScalarUDFImpl for JsonbExistsAny {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_exists_any"
     }
@@ -256,6 +264,10 @@ impl Hash for JsonbExistsAll {
 }
 
 impl ScalarUDFImpl for JsonbExistsAll {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_exists_all"
     }
@@ -352,6 +364,10 @@ impl Hash for JsonbContains {
 }
 
 impl ScalarUDFImpl for JsonbContains {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_contains"
     }
@@ -443,6 +459,10 @@ impl Hash for JsonbContainedBy {
 }
 
 impl ScalarUDFImpl for JsonbContainedBy {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_contained_by"
     }

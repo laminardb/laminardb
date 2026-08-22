@@ -39,7 +39,6 @@ confidence-threshold = 0.8
 
 [bans]
 # Analytical dependency generations are enforced by the required CI graph check.
-# SQLParser 0.61 remains isolated to delta-rs while the workspace uses 0.62.
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"

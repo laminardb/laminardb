@@ -37,7 +37,7 @@ impl ConcreteAggregateState {
             return Err(unsupported(spec, "exactly one aggregate input is required"));
         }
 
-        let implementation = spec.udf.inner();
+        let implementation = spec.udf.inner().as_any();
         if implementation.is::<Count>() {
             if spec.return_type != DataType::Int64 {
                 return Err(unsupported(spec, "COUNT must return Int64"));

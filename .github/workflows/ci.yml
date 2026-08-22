@@ -261,6 +261,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Reject divergent analytical dependency generations
         run: python3 tools/check_analytical_dependencies.py
+      - name: Verify maintained fork packages can be assembled
+        run: |
+          cargo package --manifest-path vendor/pgwire/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
+      - name: Verify workspace packages can be assembled
+        run: |
+          # The release publishes both maintained forks before the Laminar crates.
+          cargo package --workspace --locked --no-verify \
+            --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
+            --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"'
 
   # ============================================
   # MSRV Check

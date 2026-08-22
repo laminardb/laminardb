@@ -152,6 +152,10 @@ impl DisplayAs for PartialLookupJoinExec {
 }
 
 impl ExecutionPlan for PartialLookupJoinExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "PartialLookupJoinExec"
     }

@@ -12,8 +12,8 @@
 [package]
 edition = "2024"
 rust-version = "1.89"
-name = "pgwire"
-version = "0.40.4"
+name = "laminardb-pgwire"
+version = "0.30.0"
 authors = ["Ning Sun <sunng@pm.me>"]
 build = false
 autolib = false
@@ -21,9 +21,9 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Postgresql wire protocol implemented as a library"
-homepage = "https://github.com/sunng87/pgwire"
-documentation = "https://docs.rs/crate/pgwire/"
+description = "LaminarDB-maintained PostgreSQL wire protocol server"
+homepage = "https://laminardb.io"
+documentation = "https://docs.rs/laminardb-pgwire"
 readme = "README.md"
 keywords = [
     "database",
@@ -31,7 +31,7 @@ keywords = [
 ]
 categories = ["database"]
 license = "MIT/Apache-2.0"
-repository = "https://github.com/sunng87/pgwire"
+repository = "https://github.com/laminardb/laminardb"
 
 [features]
 _aws-lc-rs = [
@@ -122,77 +122,6 @@ simple-oidc-validator = [
 [lib]
 name = "pgwire"
 path = "src/lib.rs"
-
-[[example]]
-name = "bench"
-path = "examples/bench.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "cancel"
-path = "examples/cancel.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "client"
-path = "examples/client.rs"
-required-features = ["client-api"]
-
-[[example]]
-name = "copy"
-path = "examples/copy.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "cursor"
-path = "examples/cursor.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "gluesql"
-path = "examples/gluesql.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "keycloak_oauth"
-path = "examples/keycloak_oauth.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "oauth"
-path = "examples/oauth.rs"
-required-features = [
-    "server-api-aws-lc-rs",
-    "simple-oidc-validator",
-]
-
-[[example]]
-name = "scram"
-path = "examples/scram.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "secure_server"
-path = "examples/secure_server.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "server"
-path = "examples/server.rs"
-required-features = ["server-api-aws-lc-rs"]
-
-[[example]]
-name = "sqlite"
-path = "examples/sqlite.rs"
-required-features = [
-    "server-api-aws-lc-rs",
-    "_sqlite",
-]
-
-[[example]]
-name = "transaction"
-path = "examples/transaction.rs"
-required-features = ["server-api-aws-lc-rs"]
 
 [dependencies.async-trait]
 version = "0.1"

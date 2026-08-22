@@ -99,6 +99,10 @@ impl Hash for ParseEpochUdf {
 }
 
 impl ScalarUDFImpl for ParseEpochUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "parse_epoch"
     }
@@ -215,6 +219,10 @@ impl Hash for ParseTimestampUdf {
 }
 
 impl ScalarUDFImpl for ParseTimestampUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "parse_timestamp"
     }
@@ -337,6 +345,10 @@ impl Hash for ToJsonUdf {
 }
 
 impl ScalarUDFImpl for ToJsonUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "to_json"
     }
@@ -474,6 +486,10 @@ impl Hash for FromJsonUdf {
 }
 
 impl ScalarUDFImpl for FromJsonUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "from_json"
     }

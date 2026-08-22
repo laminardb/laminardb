@@ -8,14 +8,17 @@ import sys
 EXPECTED_GENERATIONS = (
     ("Arrow", r"^arrow(?:$|-)", ("58.4.0",)),
     ("Parquet", r"^parquet$", ("58.4.0",)),
-    ("DataFusion", r"^datafusion(?:$|-)", ("54.1.0",)),
+    ("DataFusion", r"^datafusion(?:$|-)", ("53.1.0",)),
     ("object_store", r"^object_store$", ("0.13.2",)),
-    ("Delta Lake", r"^deltalake(?:$|-)", ("1.0.0",)),
-    ("Delta kernel", r"^buoyant_kernel$", ("0.24.0",)),
+    (
+        "Delta Lake",
+        r"^deltalake(?:$|-)",
+        ("0.15.0", "0.16.0", "0.16.1", "0.32.4", "1.0.0"),
+    ),
+    ("Delta kernel", r"^buoyant_kernel$", ("0.22.2",)),
     ("Iceberg", r"^iceberg(?:$|-)", ("0.10.1",)),
     ("OpenDAL", r"^opendal(?:$|-)", ("0.57.0",)),
-    # delta-rs owns 0.61 for Delta predicates; DataFusion and LaminarDB use 0.62.
-    ("SQLParser", r"^sqlparser$", ("0.61.0", "0.62.0")),
+    ("SQLParser", r"^sqlparser$", ("0.61.0",)),
 )
 
 
@@ -45,21 +48,52 @@ def main() -> int:
     packages = load_packages()
     failed = False
 
+    git_sources = sorted(
+        {
+            str(package["source"])
+            for package in packages
+            if str(package["source"]).startswith("git+")
+        }
+    )
+    if git_sources:
+        print(f"Git dependencies are not publishable: {git_sources}", file=sys.stderr)
+        failed = True
+    else:
+        print("Git dependencies: none")
+
     for family, pattern, expected in EXPECTED_GENERATIONS:
+        matching_packages = [
+            package
+            for package in packages
+            if re.match(pattern, str(package["name"]))
+        ]
         versions = sorted(
             {
                 str(package["version"])
-                for package in packages
-                if re.match(pattern, str(package["name"]))
+                for package in matching_packages
             }
         )
-        if tuple(versions) != expected:
+        unexpected_sources = sorted(
+            {
+                str(package["source"])
+                for package in matching_packages
+                if not str(package["source"]).startswith("registry+")
+            }
+        )
+        generation_matches = tuple(versions) == expected
+        if not generation_matches:
             print(
                 f"{family}: found {versions or ['<absent>']}, expected {list(expected)}",
                 file=sys.stderr,
             )
             failed = True
-        else:
+        if unexpected_sources:
+            print(
+                f"{family}: non-registry sources are not publishable: {unexpected_sources}",
+                file=sys.stderr,
+            )
+            failed = True
+        if generation_matches and not unexpected_sources:
             print(f"{family}: {', '.join(versions)}")
 
     return int(failed)

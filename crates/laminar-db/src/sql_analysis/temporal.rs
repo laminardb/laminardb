@@ -300,11 +300,6 @@ fn validate_temporal_projection_items(
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                 validate_temporal_expr(expr, analysis, config)?;
             }
-            SelectItem::ExprWithAliases { .. } => {
-                return Err(temporal_projection_error(
-                    "multi-alias projection expressions are not supported",
-                ));
-            }
             SelectItem::Wildcard(options) if !wildcard_has_options(options) => {}
             SelectItem::Wildcard(_) => {
                 return Err(temporal_projection_error(
@@ -467,7 +462,6 @@ fn build_temporal_projection_sql(
                     rewrite_temporal_expr(expr, left_qualifier, right_qualifier, config);
                 format!("{rewritten} AS {alias}")
             }
-            SelectItem::ExprWithAliases { .. } => item.to_string(),
             SelectItem::Wildcard(_) => "*".to_string(),
             SelectItem::QualifiedWildcard(name, _) => {
                 let table = name.to_string();

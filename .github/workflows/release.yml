@@ -110,6 +110,10 @@ jobs:
           # Update workspace version in root Cargo.toml
           perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
 
+          # Keep the publishable maintained forks on the release version.
+          perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
+
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
             perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
@@ -318,6 +322,10 @@ jobs:
           # Update workspace version in root Cargo.toml
           perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
 
+          # Keep the publishable maintained forks on the release version.
+          perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
+
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
             perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
@@ -336,6 +344,17 @@ jobs:
           # which aren't on crates.io yet. Safe to remove: CI already tested.
           perl -i -ne 'print unless /^laminar-(?:core|connectors)\s*=/' \
             crates/laminar-derive/Cargo.toml
+
+      - name: Publish laminardb-pgwire
+        run: cargo publish --manifest-path vendor/pgwire/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-pgwire-replication
+        run: cargo publish --manifest-path vendor/pgwire-replication/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Wait for fork index entries
+        run: sleep 30
 
       - name: Publish laminar-derive
         run: cargo publish -p laminar-derive --registry crates-io --allow-dirty --no-verify
@@ -373,12 +392,8 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Publish laminar-auth
-        run: cargo publish -p laminar-auth --registry crates-io --allow-dirty --no-verify
-        continue-on-error: true
-
-      - name: Publish laminar-observe
-        run: cargo publish -p laminar-observe --registry crates-io --allow-dirty --no-verify
+      - name: Publish laminar-server
+        run: cargo publish -p laminar-server --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
   # ============================================

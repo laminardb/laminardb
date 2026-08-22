@@ -147,13 +147,6 @@ pub(crate) fn detect_lookup_enrich_query(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return (None, None);
     };
-    if select
-        .projection
-        .iter()
-        .any(|item| matches!(item, SelectItem::ExprWithAliases { .. }))
-    {
-        return (None, None);
-    }
     let has_group_by = match &select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
         sqlparser::ast::GroupByExpr::All(_) => false,
@@ -271,7 +264,6 @@ fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> Stri
         SelectItem::ExprWithAlias { expr, alias } => {
             format!("{} AS {alias}", rewrite_lookup_expr(expr, ctx))
         }
-        SelectItem::ExprWithAliases { .. } => item.to_string(),
         SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
         SelectItem::QualifiedWildcard(name, _) => {
             let table = name.to_string();

@@ -75,6 +75,10 @@ impl std::fmt::Debug for LiveSourceProvider {
 
 #[async_trait]
 impl TableProvider for LiveSourceProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -157,6 +161,10 @@ impl DisplayAs for LiveSourceExec {
 }
 
 impl ExecutionPlan for LiveSourceExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "LiveSourceExec"
     }

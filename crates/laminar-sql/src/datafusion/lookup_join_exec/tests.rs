@@ -44,6 +44,10 @@ impl DisplayAs for StreamExecStub {
 }
 
 impl ExecutionPlan for StreamExecStub {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "StreamExecStub"
     }

@@ -306,6 +306,10 @@ impl Hash for JsonbPathExistsUdf {
 }
 
 impl ScalarUDFImpl for JsonbPathExistsUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_path_exists"
     }
@@ -426,6 +430,10 @@ fn jsonb_is_true(data: &[u8]) -> Option<bool> {
 }
 
 impl ScalarUDFImpl for JsonbPathMatchUdf {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_path_match"
     }

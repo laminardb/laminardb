@@ -1467,10 +1467,7 @@ mod tests {
         let config = ReplicationConfig::default();
         let query = start_replication_query(&config);
 
-        assert!(
-            query.contains("SLOT slot LOGICAL"),
-            "{query}"
-        );
+        assert!(query.contains("SLOT slot LOGICAL"), "{query}");
         assert!(query.contains("publication_names 'pub'"), "{query}");
         assert!(query.contains("messages 'false'"), "{query}");
     }

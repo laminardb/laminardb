@@ -73,6 +73,10 @@ macro_rules! window_udf {
         }
 
         impl ScalarUDFImpl for $type {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
             fn name(&self) -> &'static str { $sql_name }
             fn signature(&self) -> &Signature { &self.signature }
             fn return_type(&self, _: &[DataType]) -> Result<DataType> {

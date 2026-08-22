@@ -23,7 +23,7 @@ tokio-postgres = { version = "0.7", optional = true, features = ["with-chrono-0_
 postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_4"] }
 pgpq = { version = "0.11", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
-pgwire-replication = { version = "=0.3.2", optional = true }
+pgwire-replication = { package = "laminardb-pgwire-replication", path = "../../vendor/pgwire-replication", version = "=0.30.0", optional = true }
 # Client-side verified TLS for PostgreSQL CDC, sink, and lookup connections.
 tokio-postgres-rustls = { version = "0.13", optional = true }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs", "tls12"] }

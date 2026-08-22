@@ -37,6 +37,10 @@ impl DisplayAs for MockUnboundedExec {
 }
 
 impl ExecutionPlan for MockUnboundedExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "MockUnboundedExec"
     }
@@ -97,6 +101,10 @@ impl DisplayAs for MockBoundedExec {
 }
 
 impl ExecutionPlan for MockBoundedExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "MockBoundedExec"
     }
@@ -151,6 +159,10 @@ impl DisplayAs for MockPassthroughExec {
 }
 
 impl ExecutionPlan for MockPassthroughExec {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "MockPassthroughExec"
     }

@@ -55,6 +55,10 @@ impl Hash for JsonbGet {
 }
 
 impl ScalarUDFImpl for JsonbGet {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get"
     }
@@ -150,6 +154,10 @@ impl Hash for JsonbGetIdx {
 }
 
 impl ScalarUDFImpl for JsonbGetIdx {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get_idx"
     }
@@ -248,6 +256,10 @@ impl Hash for JsonbGetText {
 }
 
 impl ScalarUDFImpl for JsonbGetText {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get_text"
     }
@@ -346,6 +358,10 @@ impl Hash for JsonbGetTextIdx {
 }
 
 impl ScalarUDFImpl for JsonbGetTextIdx {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get_text_idx"
     }
@@ -454,6 +470,10 @@ impl Hash for JsonbGetPath {
 }
 
 impl ScalarUDFImpl for JsonbGetPath {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get_path"
     }
@@ -584,6 +604,10 @@ impl Hash for JsonbGetPathText {
 }
 
 impl ScalarUDFImpl for JsonbGetPathText {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "jsonb_get_path_text"
     }

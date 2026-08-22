@@ -68,6 +68,10 @@ impl StreamingTableProvider {
 
 #[async_trait]
 impl TableProvider for StreamingTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.source.schema()
     }
@@ -255,7 +259,7 @@ mod tests {
             .unwrap();
 
         // Verify it's a StreamingScanExec
-        assert!(exec.is::<StreamingScanExec>());
+        assert!(exec.as_any().is::<StreamingScanExec>());
         assert_eq!(exec.schema(), schema);
     }
 

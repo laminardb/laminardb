@@ -37,6 +37,10 @@ impl ReferenceTableProvider {
 
 #[async_trait]
 impl TableProvider for ReferenceTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -98,6 +102,10 @@ impl SourceSnapshotProvider {
 
 #[async_trait]
 impl TableProvider for SourceSnapshotProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.source_entry.schema.clone()
     }
@@ -163,6 +171,10 @@ impl MvTableProvider {
 
 #[async_trait]
 impl TableProvider for MvTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

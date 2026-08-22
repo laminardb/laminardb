@@ -55,6 +55,10 @@ impl Hash for JsonTypeof {
 }
 
 impl ScalarUDFImpl for JsonTypeof {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "json_typeof"
     }
@@ -137,6 +141,10 @@ impl Hash for JsonBuildObject {
 }
 
 impl ScalarUDFImpl for JsonBuildObject {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "json_build_object"
     }
@@ -229,6 +237,10 @@ impl Hash for JsonBuildArray {
 }
 
 impl ScalarUDFImpl for JsonBuildArray {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "json_build_array"
     }
@@ -301,6 +313,10 @@ impl Hash for ToJsonb {
 }
 
 impl ScalarUDFImpl for ToJsonb {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "to_jsonb"
     }

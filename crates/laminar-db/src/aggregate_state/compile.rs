@@ -509,11 +509,11 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
         }
         Expr::Cast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("CAST({inner} AS {})", cast.field.data_type())
+            format!("CAST({inner} AS {})", cast.data_type)
         }
         Expr::TryCast(cast) => {
             let inner = expr_to_sql(&cast.expr);
-            format!("TRY_CAST({inner} AS {})", cast.field.data_type())
+            format!("TRY_CAST({inner} AS {})", cast.data_type)
         }
         Expr::ScalarFunction(func) => {
             let args: Vec<String> = func.args.iter().map(expr_to_sql).collect();

@@ -93,14 +93,6 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         return None;
     };
 
-    if select
-        .projection
-        .iter()
-        .any(|item| matches!(item, SelectItem::ExprWithAliases { .. }))
-    {
-        return None;
-    }
-
     if select.from.len() != 1 || select.from[0].joins.len() != 1 {
         return None;
     }
@@ -212,9 +204,9 @@ pub(crate) fn has_unqualified_interval_output_column(sql: &str) -> bool {
         .is_break()
     };
     select.projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(expr)
-        | SelectItem::ExprWithAlias { expr, .. }
-        | SelectItem::ExprWithAliases { expr, .. } => has_unqualified(expr),
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            has_unqualified(expr)
+        }
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => false,
     }) || select.selection.as_ref().is_some_and(has_unqualified)
 }
@@ -333,7 +325,6 @@ fn render_join_projection_item(
             let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
             format!("{rewritten} AS {alias}")
         }
-        SelectItem::ExprWithAliases { .. } => item.to_string(),
         SelectItem::Wildcard(_) => "*".to_string(),
         // DDL rejects qualified wildcards for bounded joins because the internal pair schema
         // renames right-side columns. Keeping the qualifier here makes any bypass fail closed.
