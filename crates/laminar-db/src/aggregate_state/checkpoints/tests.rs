@@ -95,6 +95,7 @@ fn dictionary_id_start(bytes: &[u8]) -> usize {
 fn one_group() -> AggStateCheckpoint {
     AggStateCheckpoint {
         fingerprint: FINGERPRINT,
+        next_output_sequence: 0,
         keys_ipc: ipc(vec![Arc::new(StringArray::from(vec!["key"]))]),
         acc_state_ipc: vec![ipc(vec![Arc::new(Int64Array::from(vec![1]))])],
         input_weights: vec![1],
@@ -117,6 +118,7 @@ fn aggregate_archive_preflight_accepts_canonical_boundaries() {
 
     let empty = AggStateCheckpoint {
         fingerprint: FINGERPRINT,
+        next_output_sequence: 0,
         keys_ipc: Vec::new(),
         acc_state_ipc: Vec::new(),
         input_weights: Vec::new(),

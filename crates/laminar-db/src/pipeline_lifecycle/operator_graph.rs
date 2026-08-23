@@ -85,8 +85,7 @@ impl LaminarDB {
         graph.set_temporal_join_idle_history_retention(
             self.config.temporal_join_idle_history_retention,
         );
-        graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
-        graph.set_reference_tables(reference_table_names);
+        self.install_operator_graph_catalog_context(&mut graph, stream_regs, reference_table_names);
         if let Some(ref prom) = *self.engine_metrics.lock() {
             graph.set_metrics(Arc::clone(prom));
         }
@@ -168,6 +167,30 @@ impl LaminarDB {
         graph.take_build_errors()?;
 
         Ok(graph)
+    }
+
+    fn install_operator_graph_catalog_context(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        reference_table_names: rustc_hash::FxHashSet<String>,
+    ) {
+        graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        graph.set_reference_tables(reference_table_names);
+        #[cfg(feature = "cluster")]
+        graph.set_subscription_certificates(
+            stream_regs
+                .iter()
+                .filter_map(|(name, registration)| {
+                    registration
+                        .subscription_certificate
+                        .as_ref()
+                        .map(|certificate| (name.clone(), Arc::new(certificate.clone())))
+                })
+                .collect(),
+        );
+        #[cfg(not(feature = "cluster"))]
+        let _ = stream_regs;
     }
 
     pub(super) fn build_pipeline_sources(

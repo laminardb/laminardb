@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
+use laminar_core::checkpoint::OutputDistributionCertificate;
+#[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
 use laminar_core::state::KeyGroupCount;
 #[cfg(feature = "cluster")]
@@ -32,12 +34,10 @@ use crate::aggregate_state::{
 #[cfg(feature = "cluster")]
 use crate::aggregate_state::{
     AggStateRestorePreflight, OwnedAggVnodeRestore, PreparedAggVnodeTransition,
-    RetiredAggVnodeTransition,
+    PreparedAggregateEmission, RetiredAggVnodeTransition,
 };
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-#[cfg(feature = "cluster")]
-use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{
@@ -55,6 +55,9 @@ use crate::sql_analysis::{
 // and the temporary old-plus-new Arrow buffers held while concatenating one group.
 const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
 const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
+
+#[cfg(feature = "cluster")]
+mod subscription_output;
 
 /// Whether Arrow concatenation is representation-stable for this local aggregate input type.
 ///
@@ -892,6 +895,10 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     cluster_assignment_digest: Option<[u8; 32]>,
     #[cfg(feature = "cluster")]
+    subscription_certificate: Option<Arc<OutputDistributionCertificate>>,
+    #[cfg(feature = "cluster")]
+    prepared_aggregate_emission: Option<PreparedAggregateEmission>,
+    #[cfg(feature = "cluster")]
     cluster_peers: Arc<[u64]>,
     #[cfg(feature = "cluster")]
     peer_channels: BTreeMap<u64, AggPeerChannel>,
@@ -980,6 +987,10 @@ impl SqlQueryOperator {
             cluster_assignment: None,
             #[cfg(feature = "cluster")]
             cluster_assignment_digest: None,
+            #[cfg(feature = "cluster")]
+            subscription_certificate: None,
+            #[cfg(feature = "cluster")]
+            prepared_aggregate_emission: None,
             #[cfg(feature = "cluster")]
             cluster_peers: Arc::from([]),
             #[cfg(feature = "cluster")]
@@ -1142,24 +1153,7 @@ impl SqlQueryOperator {
                 )));
             }
             #[cfg(feature = "cluster")]
-            if self.cluster_shuffle.is_some() {
-                let expected_state_class = if agg_state.num_group_cols() == 0 {
-                    OperatorStateClass::GlobalSingleton
-                } else {
-                    OperatorStateClass::VnodeKeyed
-                };
-                if self.capability.managed_state != Some(ManagedStateContract::SqlAggregateV1)
-                    || self.capability.state_class != expected_state_class
-                {
-                    return Err(DbError::Pipeline(format!(
-                        "[{}] query '{}': initialized aggregate state does not match its immutable cluster capability ({:?}, {:?})",
-                        laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
-                        self.op_name,
-                        self.capability.state_class,
-                        self.capability.managed_state
-                    )));
-                }
-            }
+            self.validate_cluster_aggregate(&agg_state)?;
             self.log_execution_path(agg_state.compiled_projection().is_some());
             self.state = QueryState::Agg(Box::new(agg_state));
             return Ok(());
@@ -2409,6 +2403,9 @@ impl SqlQueryOperator {
             output.extend(self.drain_remote_event(&assignment, &config)?);
             drained_remote = true;
         }
+        if drained_remote && self.prepared_aggregate_emission.is_some() {
+            return Ok(output);
+        }
         let completion = self.finish_pending_cluster_input().map_err(|error| {
             if drained_remote {
                 self.remote_replay_error(error)
@@ -2507,7 +2504,7 @@ impl SqlQueryOperator {
         &self,
         max_capture_bytes: u64,
     ) -> Result<AggCheckpointCapture, DbError> {
-        let (config, assignment, peers) = self.active_cluster_scope()?;
+        let (config, assignment, peers) = self.subscription_checkpoint_scope()?;
         if self.cluster_assignment_digest != Some(self.owner_map_digest(&assignment)) {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' checkpoint assignment digest is inconsistent",
@@ -2753,6 +2750,11 @@ impl SqlQueryOperator {
     }
 
     fn emit_agg_output(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "cluster")]
+        if let Some(output) = self.prepare_certified_subscription_output() {
+            return output;
+        }
+
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: emit_agg_output on non-agg".into(),
@@ -2804,7 +2806,7 @@ impl GraphOperator for SqlQueryOperator {
 
         #[cfg(feature = "cluster")]
         let (prepared_bytes, retired_bytes) = {
-            let staged = self
+            let staged_transition = self
                 .prepared_vnode_transition
                 .as_ref()
                 .map_or(0, |prepared| {
@@ -2813,6 +2815,8 @@ impl GraphOperator for SqlQueryOperator {
                         .accounted_state_bytes()
                         .saturating_add(prepared.topology.accounted_state_bytes())
                 });
+            let staged =
+                staged_transition.saturating_add(self.prepared_subscription_output_bytes());
             match self.vnode_transition_cleanup.as_ref() {
                 Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => (
                     staged
@@ -2990,6 +2994,23 @@ impl GraphOperator for SqlQueryOperator {
             .map(|frontier| frontier.watermark.unwrap_or(i64::MIN))
             .collect::<Vec<_>>();
         self.process(inputs, &watermarks).await
+    }
+
+    #[cfg(feature = "cluster")]
+    fn take_prepared_subscription_output(
+        &mut self,
+    ) -> Option<crate::subscription::PreparedSubscriptionOutput> {
+        self.take_prepared_subscription_output_frames()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_prepared_subscription_output(&mut self) {
+        self.publish_prepared_subscription_output();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_prepared_subscription_output(&mut self) {
+        self.discard_prepared_subscription_output();
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -3504,12 +3525,7 @@ impl GraphOperator for SqlQueryOperator {
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         #[cfg(feature = "cluster")]
-        if self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' cannot capture vnodes across pending shuffle work",
-                self.op_name
-            )));
-        }
+        self.require_vnode_state_boundary("capture vnode state")?;
         self.invalidate_local_aggregate_output_cache();
         let QueryState::Agg(aggregate) = &mut self.state else {
             return Ok(None);
@@ -3551,12 +3567,7 @@ impl GraphOperator for SqlQueryOperator {
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
         #[cfg(feature = "cluster")]
-        if self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' cannot restore vnode {vnode} across pending shuffle work",
-                self.op_name
-            )));
-        }
+        self.require_vnode_state_boundary("restore vnode state")?;
         self.invalidate_local_aggregate_output_cache();
         let restore_bytes = state
             .len()
@@ -3646,7 +3657,7 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
         transition: ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
-        self.invalidate_local_aggregate_output_cache();
+        self.begin_subscription_vnode_transition()?;
         if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' already owns vnode transition state",

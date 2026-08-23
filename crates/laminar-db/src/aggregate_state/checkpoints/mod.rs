@@ -39,6 +39,8 @@ pub(crate) struct GroupCheckpoint {
 #[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
+    /// First output-frame sequence not assigned by this vnode state.
+    pub next_output_sequence: u64,
     pub keys_ipc: Vec<u8>,
     pub acc_state_ipc: Vec<Vec<u8>>,
     pub input_weights: Vec<i64>,

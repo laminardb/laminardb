@@ -1,6 +1,7 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
+mod checkpoint_publication;
 mod checkpoint_tail;
 
 use std::collections::HashMap;
@@ -4921,6 +4922,8 @@ impl ConnectorPipelineCallback {
             {
                 Ok(Ok(results)) => results,
                 Ok(Err(error)) => {
+                    #[cfg(feature = "cluster")]
+                    self.graph.abort_prepared_subscription_outputs();
                     let mapped = Self::map_checkpoint_drain_error(&error, &self.shutdown_signal);
                     self.record_pipeline_halt(&mapped);
                     if let crate::pipeline::CycleError::Recovery(reason) = &mapped {
@@ -4935,55 +4938,8 @@ impl ConnectorPipelineCallback {
                     return Err(crate::pipeline::CycleError::Recovery(error));
                 }
             };
-            let (any_failed, _) = self.graph.take_cycle_failures();
-            if any_failed {
-                let error = "checkpoint graph drain encountered a partial operator-domain failure"
-                    .to_string();
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            // Consume this drain pass's normal-cycle deferral report. Checkpoint quiescence
-            // deliberately permits barrier-aligned shuffle replay: it is captured in operator
-            // channel state and blocks vnode handoff, not an ordinary checkpoint snapshot.
-            let _ = self.graph.take_cycle_deferrals();
-
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint materialized-view publication")?;
-            if let Err(error) =
-                <Self as crate::pipeline::PipelineCallback>::update_mv_stores(self, &results)
-            {
-                let error = format!(
-                    "checkpoint graph drain could not publish materialized-view output: {error}"
-                );
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint stream publication")?;
-            if let Err(error) =
-                <Self as crate::pipeline::PipelineCallback>::push_to_streams(self, &results)
-            {
-                let error =
-                    format!("checkpoint graph drain could not publish stream output: {error}");
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint sink publication")?;
-            if let Err(error) = <Self as crate::pipeline::PipelineCallback>::write_to_sinks(
-                self,
-                &results,
-                Some(deadline),
-            )
-            .await
-            {
-                if let crate::pipeline::CycleError::Recovery(reason) = &error {
-                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                }
-                return Err(error);
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint graph drain continuation")?;
+            self.publish_checkpoint_drain_results(&results, deadline)
+                .await?;
             // Checkpoint drains run while the pipeline is paused and belong to whole-attempt
             // checkpoint-duration accounting. Mixing them into the normal processing-cycle
             // histogram makes that hot-path signal report checkpoint latency instead.
@@ -5422,6 +5378,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         {
             Ok(results) => results,
             Err(error) => {
+                #[cfg(feature = "cluster")]
+                self.graph.abort_prepared_subscription_outputs();
                 let error = Self::map_graph_error(&error, &self.shutdown_signal);
                 self.record_pipeline_halt(&error);
                 return Err(error);
@@ -5429,6 +5387,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         };
         let (any_failed, failed_sources) = self.graph.take_cycle_failures();
         let (any_deferred, deferred_sources) = self.graph.take_cycle_deferrals();
+        #[cfg(feature = "cluster")]
+        {
+            let subscription_outputs = self.graph.take_prepared_subscription_outputs();
+            if let Err(error) = self.stage_subscription_outputs(subscription_outputs) {
+                self.graph.abort_prepared_subscription_outputs();
+                return Err(error);
+            }
+        }
         Ok(crate::pipeline::CycleOutcome {
             results,
             any_failed,
@@ -5528,6 +5494,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {
+        self.graph.commit_prepared_subscription_outputs();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {
+        self.graph.abort_prepared_subscription_outputs();
     }
 
     fn update_mv_stores(

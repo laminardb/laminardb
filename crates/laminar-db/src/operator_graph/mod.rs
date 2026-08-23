@@ -35,6 +35,9 @@ use laminar_sql::translator::{
     OrderOperatorConfig, TemporalJoinTranslatorConfig, WindowOperatorConfig,
 };
 
+mod catalog_context;
+#[cfg(feature = "cluster")]
+mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
 
@@ -369,6 +372,22 @@ pub(crate) trait GraphOperator: Send {
         self.process(inputs, &watermarks).await
     }
 
+    /// Transfer partition-aware frames while retaining their unpublished bookkeeping changes.
+    #[cfg(feature = "cluster")]
+    fn take_prepared_subscription_output(
+        &mut self,
+    ) -> Option<crate::subscription::PreparedSubscriptionOutput> {
+        None
+    }
+
+    /// Publish bookkeeping for the output transferred by the current graph cycle.
+    #[cfg(feature = "cluster")]
+    fn commit_prepared_subscription_output(&mut self) {}
+
+    /// Discard unpublished bookkeeping and restore retryable dirty-key ownership.
+    #[cfg(feature = "cluster")]
+    fn abort_prepared_subscription_output(&mut self) {}
+
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
 
     fn checkpoint_capture(
@@ -663,7 +682,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 5;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 6;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -1072,6 +1091,9 @@ pub(crate) struct OperatorGraph {
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
+    #[cfg(feature = "cluster")]
+    subscription_certificates:
+        FxHashMap<String, Arc<laminar_core::checkpoint::OutputDistributionCertificate>>,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1133,6 +1155,8 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
+            subscription_certificates: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
             installed_vnode_state: None,
@@ -1158,31 +1182,6 @@ impl OperatorGraph {
             whole_restore_open: true,
             execution_poisoned: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Register the static reference/dimension table names (valid right sides of a changelog
-    /// enrich join).
-    pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
-        self.reference_tables = tables;
-    }
-
-    /// Seed changelog producers before operators are built so admission is build-order independent.
-    pub fn set_changelog_tables(&mut self, tables: FxHashSet<String>) {
-        self.changelog_tables = tables;
-    }
-
-    /// Install the complete startup-certified mutable interval topology before graph construction.
-    pub(crate) fn set_ordered_interval_joins(
-        &mut self,
-        joins: FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
-    ) {
-        if !self.nodes.is_empty() {
-            self.build_errors.push(DbError::Config(
-                "ordered interval topology must be installed before graph operators".into(),
-            ));
-            return;
-        }
-        self.ordered_interval_joins = joins;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -2745,10 +2744,7 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let mut op = op;
         #[cfg(feature = "cluster")]
-        if let Some(ref cfg) = self.cluster_shuffle {
-            debug_assert_eq!(cfg.registry.vnode_count(), u32::from(self.key_group_count));
-            op.attach_cluster_shuffle(cfg.clone());
-        }
+        self.attach_sql_query_cluster_context(name, &mut op)?;
         Ok(Box::new(op))
     }
 

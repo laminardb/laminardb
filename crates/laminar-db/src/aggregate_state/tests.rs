@@ -448,6 +448,374 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+#[cfg(feature = "cluster")]
+async fn setup_weighted_count_state(key_group_count: KeyGroupCount) -> IncrementalAggState {
+    let ctx = laminar_sql::create_session_context();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+    ]));
+    let dummy = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["x"])),
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            Arc::new(arrow::array::Int64Array::from(vec![1])),
+        ],
+    )
+    .unwrap();
+    let table = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
+    ctx.register_table("events", Arc::new(table)).unwrap();
+    try_from_sql_for_key_groups(
+        &ctx,
+        "SELECT name, COUNT(*) AS total FROM events GROUP BY name",
+        true,
+        key_group_count,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+fn weighted_count_pre_agg_batch(names: &[&str], weights: &[i64]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Boolean, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(arrow::array::StringArray::from(names.to_vec())),
+            Arc::new(arrow::array::BooleanArray::from(vec![true; names.len()])),
+            Arc::new(arrow::array::Int64Array::from(weights.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+#[cfg(feature = "cluster")]
+fn subscription_generation(byte: u8) -> laminar_core::checkpoint::StreamGeneration {
+    laminar_core::checkpoint::StreamGeneration::from_digest(
+        laminar_core::checkpoint::SubscriptionDigest::from_bytes([byte; 32]),
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn take_partition_frames(
+    prepared: &mut super::emission::PreparedAggregateEmission,
+) -> Vec<crate::subscription::PartitionedOutputBatch> {
+    prepared.take_frames()
+}
+
+#[cfg(feature = "cluster")]
+fn frame_signature(
+    frames: &[crate::subscription::PartitionedOutputBatch],
+) -> Vec<(u16, u64, String)> {
+    frames
+        .iter()
+        .map(|frame| {
+            (
+                frame.id.partition.get(),
+                frame.id.sequence.get(),
+                arrow::util::pretty::pretty_format_batches(std::slice::from_ref(&frame.batch))
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional() {
+    let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+    let (_, mut state) = setup_agg_state_for_key_groups(
+        "SELECT name, SUM(value) AS total FROM events GROUP BY name",
+        true,
+        key_groups,
+    )
+    .await;
+    state
+        .process_batch(
+            &sum_pre_agg_batch(&["z", "b", "q", "a", "m", "c"], &[1.0; 6]),
+            10,
+        )
+        .unwrap();
+    let before_prepare = state.working_set_snapshot_for_test();
+    let mut first = state
+        .prepare_partitioned_emit(subscription_generation(1))
+        .unwrap();
+    let first_frames = take_partition_frames(&mut first);
+    assert!(first_frames.len() > 1, "keys must exercise multiple vnodes");
+    for frame in &first_frames {
+        assert_eq!(frame.id.sequence.get(), 0);
+        let routed = crate::operator::sql_query::hash_rows_to_vnodes(
+            &frame.batch,
+            1,
+            u32::from(key_groups.get()),
+        )
+        .unwrap();
+        assert!(routed
+            .iter()
+            .all(|vnode| *vnode == u32::from(frame.id.partition.get())));
+        let names = frame
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert!((1..names.len()).all(|row| names.value(row - 1) < names.value(row)));
+    }
+
+    state.abort_partitioned_emit(first);
+    assert_eq!(state.working_set_snapshot_for_test(), before_prepare);
+    let mut retried = state
+        .prepare_partitioned_emit(subscription_generation(1))
+        .unwrap();
+    let retried_frames = take_partition_frames(&mut retried);
+    assert_eq!(
+        frame_signature(&first_frames),
+        frame_signature(&retried_frames)
+    );
+    state.commit_partitioned_emit(retried);
+
+    state
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[2.0, 3.0]), 20)
+        .unwrap();
+    let mut update = state
+        .prepare_partitioned_emit(subscription_generation(1))
+        .unwrap();
+    let update_frames = take_partition_frames(&mut update);
+    for frame in &update_frames {
+        assert_eq!(frame.id.sequence.get(), 1);
+        let weights = frame
+            .batch
+            .column(frame.batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(weights.values().chunks_exact(2).all(|pair| pair == [-1, 1]));
+    }
+    state.commit_partitioned_emit(update);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn partition_sequence_checkpoint_restore_and_global_singleton_continue_exactly() {
+    let key_groups = KeyGroupCount::try_from(4_u16).unwrap();
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, mut original) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    original
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[1.0, 2.0]), 10)
+        .unwrap();
+    let mut prepared = original
+        .prepare_partitioned_emit(subscription_generation(2))
+        .unwrap();
+    let first_frames = take_partition_frames(&mut prepared);
+    original.commit_partitioned_emit(prepared);
+    let checkpoints = capture_all_vnodes(&mut original).unwrap();
+
+    let (_, mut restored) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    for (vnode, checkpoint) in checkpoints {
+        restored
+            .restore_vnode(vnode, u32::from(key_groups.get()), checkpoint)
+            .unwrap();
+    }
+    restored
+        .process_batch(&sum_pre_agg_batch(&["a", "b"], &[1.0, 1.0]), 20)
+        .unwrap();
+    let mut continuation = restored
+        .prepare_partitioned_emit(subscription_generation(2))
+        .unwrap();
+    let continued_frames = take_partition_frames(&mut continuation);
+    for frame in &continued_frames {
+        let previous = first_frames
+            .iter()
+            .find(|first| first.id.partition == frame.id.partition)
+            .unwrap();
+        assert_eq!(frame.id.sequence.get(), previous.id.sequence.get() + 1);
+    }
+    restored.commit_partitioned_emit(continuation);
+
+    let (_, mut global) =
+        setup_agg_state_for_key_groups("SELECT SUM(value) AS total FROM events", true, key_groups)
+            .await;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Float64,
+            true,
+        )])),
+        vec![Arc::new(arrow::array::Float64Array::from(vec![1.0]))],
+    )
+    .unwrap();
+    global.process_batch(&batch, 10).unwrap();
+    let mut global_output = global
+        .prepare_partitioned_emit(subscription_generation(3))
+        .unwrap();
+    let frames = take_partition_frames(&mut global_output);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].id.partition.get(), 0);
+    assert_eq!(frames[0].id.sequence.get(), 0);
+    global.commit_partitioned_emit(global_output);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn partitioned_output_splitting_and_hash_insertion_order_are_deterministic() {
+    let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let names = (0..1_025)
+        .map(|index| format!("key-{index:04}"))
+        .collect::<Vec<_>>();
+    let forward = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let reverse = names.iter().rev().map(String::as_str).collect::<Vec<_>>();
+    let values = vec![1.0; names.len()];
+    let (_, mut left) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    let (_, mut right) = setup_agg_state_for_key_groups(sql, true, key_groups).await;
+    left.process_batch(&sum_pre_agg_batch(&forward, &values), 10)
+        .unwrap();
+    right
+        .process_batch(&sum_pre_agg_batch(&reverse, &values), 10)
+        .unwrap();
+
+    let mut left_prepared = left
+        .prepare_partitioned_emit(subscription_generation(4))
+        .unwrap();
+    let mut right_prepared = right
+        .prepare_partitioned_emit(subscription_generation(4))
+        .unwrap();
+    let left_frames = take_partition_frames(&mut left_prepared);
+    let right_frames = take_partition_frames(&mut right_prepared);
+    assert_eq!(left_frames.len(), 2);
+    assert_eq!(left_frames[0].batch.num_rows(), 1_024);
+    assert_eq!(left_frames[1].batch.num_rows(), 1);
+    assert_eq!(left_frames[0].id.sequence.get(), 0);
+    assert_eq!(left_frames[1].id.sequence.get(), 1);
+    assert_eq!(
+        frame_signature(&left_frames),
+        frame_signature(&right_frames)
+    );
+    left.abort_partitioned_emit(left_prepared);
+    right.abort_partitioned_emit(right_prepared);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn sequence_overflow_and_later_vnode_failure_restore_every_dirty_set() {
+    let key_groups = KeyGroupCount::try_from(8_u16).unwrap();
+    let (_, mut state) = setup_agg_state_for_key_groups(
+        "SELECT name, SUM(value) AS total FROM events GROUP BY name",
+        true,
+        key_groups,
+    )
+    .await;
+    state
+        .process_batch(
+            &sum_pre_agg_batch(&["z", "b", "q", "a", "m", "c"], &[1.0; 6]),
+            10,
+        )
+        .unwrap();
+    let active = state.active_vnodes_for_test().to_vec();
+    assert!(active.len() > 1);
+    let last = *active.last().unwrap();
+    state
+        .vnode_states
+        .get_mut(last)
+        .unwrap()
+        .next_output_sequence = u64::MAX;
+    let before = state.working_set_snapshot_for_test();
+    let error = state
+        .prepare_partitioned_emit(subscription_generation(5))
+        .err()
+        .expect("sequence overflow must fail before frame assignment");
+    assert!(error.to_string().contains("sequence overflow"), "{error}");
+    assert_eq!(state.working_set_snapshot_for_test(), before);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn partitioned_deletion_only_and_empty_cycles_preserve_sequence() {
+    let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let mut state = setup_weighted_count_state(key_groups).await;
+    state
+        .process_batch(&weighted_count_pre_agg_batch(&["gone"], &[1]), 10)
+        .unwrap();
+    let initial = state
+        .prepare_partitioned_emit(subscription_generation(6))
+        .unwrap();
+    state.commit_partitioned_emit(initial);
+
+    state
+        .process_batch(&weighted_count_pre_agg_batch(&["gone"], &[-1]), 20)
+        .unwrap();
+    let mut deletion = state
+        .prepare_partitioned_emit(subscription_generation(6))
+        .unwrap();
+    let frames = take_partition_frames(&mut deletion);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].id.sequence.get(), 1);
+    let weights = frames[0]
+        .batch
+        .column(frames[0].batch.num_columns() - 1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(weights.values().as_ref(), &[-1]);
+    state.commit_partitioned_emit(deletion);
+    assert_eq!(state.logical_group_count_for_test(), 0);
+
+    let mut empty = state
+        .prepare_partitioned_emit(subscription_generation(6))
+        .unwrap();
+    assert!(take_partition_frames(&mut empty).is_empty());
+    state.commit_partitioned_emit(empty);
+    assert_eq!(
+        state
+            .working_set_snapshot_for_test()
+            .next_output_sequences
+            .get(&0),
+        Some(&2)
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn partitioned_nan_result_does_not_emit_a_spurious_update() {
+    let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+    let (_, mut state) = setup_agg_state_for_key_groups(
+        "SELECT name, SUM(value) AS total FROM events GROUP BY name",
+        true,
+        key_groups,
+    )
+    .await;
+    state
+        .process_batch(&sum_pre_agg_batch(&["nan"], &[f64::NAN]), 10)
+        .unwrap();
+    let initial = state
+        .prepare_partitioned_emit(subscription_generation(7))
+        .unwrap();
+    state.commit_partitioned_emit(initial);
+    state
+        .process_batch(&sum_pre_agg_batch(&["nan"], &[0.0]), 20)
+        .unwrap();
+
+    let mut unchanged = state
+        .prepare_partitioned_emit(subscription_generation(7))
+        .unwrap();
+    assert!(take_partition_frames(&mut unchanged).is_empty());
+    state.commit_partitioned_emit(unchanged);
+    assert_eq!(
+        state
+            .working_set_snapshot_for_test()
+            .next_output_sequences
+            .get(&0),
+        Some(&1)
+    );
+}
+
 #[tokio::test]
 async fn new_aggregate_state_is_retained_for_grouped_batches() {
     let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";

@@ -19,6 +19,7 @@ pub(super) struct AggregateVnodeState {
     pub(super) groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
     pub(super) last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(super) emit_dirty_keys: FxHashSet<arrow::row::OwnedRow>,
+    pub(super) next_output_sequence: u64,
     usage: AggregateStateUsage,
 }
 
@@ -36,6 +37,7 @@ impl Default for AggregateVnodeState {
             groups: FxHashMap::default(),
             last_emitted: FxHashMap::default(),
             emit_dirty_keys: FxHashSet::default(),
+            next_output_sequence: 0,
             usage: vnode_inline_usage::<AggregateVnodeState>(1),
         }
     }
@@ -73,11 +75,13 @@ impl AggregateVnodeState {
     pub(super) fn try_from_recovered(
         groups: FxHashMap<arrow::row::OwnedRow, GroupEntry>,
         last_emitted: FxHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+        next_output_sequence: u64,
         mark_emit_dirty: bool,
     ) -> Result<Self, (&'static str, std::collections::TryReserveError)> {
         let mut state = Self {
             groups,
             last_emitted,
+            next_output_sequence,
             ..Self::default()
         };
         if mark_emit_dirty {

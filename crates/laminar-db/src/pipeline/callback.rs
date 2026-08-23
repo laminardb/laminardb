@@ -522,6 +522,14 @@ pub trait PipelineCallback: Send + 'static {
         Ok(())
     }
 
+    /// Publish aggregate output bookkeeping after every cycle consumer accepted the output.
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {}
+
+    /// Restore retryable aggregate bookkeeping after cycle publication fails.
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {}
+
     /// Update materialized view stores with cycle results.
     ///
     /// # Errors
