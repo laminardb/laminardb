@@ -156,6 +156,42 @@ pub const MANIFEST_PERSIST_FAILED: &str = "LDB-6008";
 pub const CHECKPOINT_PRUNE_FAILED: &str = "LDB-6009";
 /// Source offset metadata missing during recovery.
 pub const OFFSET_METADATA_MISSING: &str = "LDB-6011";
+/// The final operator has no planner-certified subscription distribution.
+pub const SUBSCRIPTION_PLAN_UNSUPPORTED: &str = "LDB-6020";
+/// Subscription history belongs to another stream incarnation.
+pub const SUBSCRIPTION_GENERATION_MISMATCH: &str = "LDB-6021";
+/// Requested subscription checkpoint has not committed.
+pub const SUBSCRIPTION_EPOCH_NOT_COMMITTED: &str = "LDB-6022";
+/// Requested subscription checkpoint is older than retained history.
+pub const SUBSCRIPTION_REPLAY_PRUNED: &str = "LDB-6023";
+/// Authoritative subscription manifest failed validation.
+pub const SUBSCRIPTION_MANIFEST_CORRUPT: &str = "LDB-6024";
+/// A committed subscription segment is unavailable.
+pub const SUBSCRIPTION_SEGMENT_MISSING: &str = "LDB-6025";
+/// A committed subscription segment failed integrity validation.
+pub const SUBSCRIPTION_SEGMENT_CORRUPT: &str = "LDB-6026";
+/// Subscription output schema differs from its durable certificate.
+pub const SUBSCRIPTION_SCHEMA_MISMATCH: &str = "LDB-6027";
+/// A committed partition sequence has a gap.
+pub const SUBSCRIPTION_SEQUENCE_GAP: &str = "LDB-6028";
+/// One frame identity names conflicting immutable content.
+pub const SUBSCRIPTION_CONFLICTING_DUPLICATE: &str = "LDB-6029";
+/// An output writer no longer owns its certified partition.
+pub const SUBSCRIPTION_STALE_WRITER: &str = "LDB-6030";
+/// Assignment authority changed during a subscription operation.
+pub const SUBSCRIPTION_ASSIGNMENT_CHANGED: &str = "LDB-6031";
+/// The committed subscription backend is unavailable.
+pub const SUBSCRIPTION_BACKEND_UNAVAILABLE: &str = "LDB-6032";
+/// A bounded subscriber queue was overrun.
+pub const SUBSCRIPTION_LAGGED: &str = "LDB-6033";
+/// A subscription resume token is malformed or fails authentication.
+pub const SUBSCRIPTION_RESUME_TOKEN_INVALID: &str = "LDB-6034";
+/// A subscription resume token has expired.
+pub const SUBSCRIPTION_RESUME_TOKEN_EXPIRED: &str = "LDB-6035";
+/// Required committed history disappeared outside the retention contract.
+pub const SUBSCRIPTION_RETENTION_LOST: &str = "LDB-6036";
+/// Subscription wire or segment protocol is unsupported.
+pub const SUBSCRIPTION_PROTOCOL_UNSUPPORTED: &str = "LDB-6037";
 
 // ── DataFusion / Arrow Interop (LDB-7xxx) ──
 

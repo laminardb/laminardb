@@ -1549,6 +1549,11 @@ impl CheckpointCoordinator {
         })
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn bound_deployment_id(&self) -> Result<&str, DbError> {
+        self.expected_deployment_id()
+    }
+
     fn checkpoint_artifact_inventory(
         &self,
         attempt: CheckpointAttempt,

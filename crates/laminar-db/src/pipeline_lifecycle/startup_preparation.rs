@@ -37,6 +37,9 @@ impl LaminarDB {
             )
         };
 
+        #[cfg(feature = "cluster")]
+        let mut stream_regs = stream_regs;
+
         for (name, reg) in &source_regs {
             tracing::debug!(source = %name, connector_type = ?reg.connector_type, "Registered source");
         }
@@ -96,6 +99,23 @@ impl LaminarDB {
             )
             .await?;
 
+        #[cfg(feature = "cluster")]
+        if startup_runtime == RuntimeMode::Cluster {
+            self.bind_subscription_output_certificates(
+                &mut stream_regs,
+                pipeline_identity.as_ref(),
+            )
+            .await?;
+            let certified_streams = stream_regs
+                .values()
+                .filter(|stream| stream.subscription_certificate.is_some())
+                .count();
+            tracing::debug!(
+                certified_streams,
+                "Bound cluster subscription output distributions"
+            );
+        }
+
         if has_external || !stream_regs.is_empty() {
             tracing::info!(
                 sources = source_regs.len(),
@@ -131,6 +151,80 @@ impl LaminarDB {
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
+    async fn bind_subscription_output_certificates(
+        &self,
+        stream_regs: &mut HashMap<String, crate::connector_manager::StreamRegistration>,
+        pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,
+    ) -> Result<(), DbError> {
+        use laminar_core::checkpoint::ChangelogMode;
+
+        let pipeline_identity = pipeline_identity.cloned().ok_or_else(|| {
+            DbError::Checkpoint("cluster subscription output has no bound pipeline identity".into())
+        })?;
+        let deployment_id = {
+            let coordinator = self.coordinator.lock().await;
+            let coordinator = coordinator.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(
+                    "cluster subscription output requires checkpoint coordination".into(),
+                )
+            })?;
+            coordinator.bound_deployment_id()?.to_owned()
+        };
+        let deployment_id = uuid::Uuid::parse_str(&deployment_id).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "cluster subscription deployment identity is invalid: {error}"
+            ))
+        })?;
+
+        let mut names = stream_regs.keys().cloned().collect::<Vec<_>>();
+        names.sort_unstable();
+        for name in names {
+            let registration = stream_regs.get_mut(&name).ok_or_else(|| {
+                DbError::InvalidOperation(format!(
+                    "stream registration '{name}' disappeared during subscription certificate binding"
+                ))
+            })?;
+            let Some(output) = registration.subscription_output.as_ref() else {
+                continue;
+            };
+            let schema =
+                crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &registration.query_sql)
+                    .await
+                    .ok_or_else(|| {
+                        DbError::InvalidOperation(format!(
+                    "cluster subscription output schema for stream '{name}' could not be resolved"
+                ))
+                    })?;
+            let schema = if output.changelog_mode() == ChangelogMode::WeightedRetractInsert {
+                let mut fields = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect::<Vec<_>>();
+                fields.push(arrow_schema::Field::new(
+                    laminar_core::changelog::WEIGHT_COLUMN,
+                    arrow_schema::DataType::Int64,
+                    false,
+                ));
+                arrow_schema::Schema::new(fields)
+            } else {
+                schema.as_ref().clone()
+            };
+            let schema_fingerprint =
+                crate::pipeline_identity::subscription_schema_fingerprint(&schema)?;
+            registration.subscription_certificate = Some(output.bind(
+                deployment_id,
+                registration.catalog_generation,
+                &name,
+                schema_fingerprint,
+                pipeline_identity.clone(),
+                self.checkpoint_key_groups(),
+            )?);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn revalidate_persisted_cluster_query_shapes(
         &self,
         stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
@@ -146,6 +240,7 @@ impl LaminarDB {
                 join_config: stream.join_config.clone(),
                 has_analytic: stream.has_analytic,
                 has_frame: stream.has_frame,
+                subscription_output: stream.subscription_output.clone(),
             };
             self.validate_interval_join_schema(&stream.name, &stream.query_sql, &plan)
                 .await?;

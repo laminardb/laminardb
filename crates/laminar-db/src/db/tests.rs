@@ -9488,6 +9488,9 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             has_analytic: false,
             has_frame: false,
             incremental: false,
+            subscription_output: None,
+            catalog_generation: 1,
+            subscription_certificate: None,
         },
     )]);
     let error = db
@@ -9506,6 +9509,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         )]),
         has_analytic: false,
         has_frame: false,
+        subscription_output: None,
     };
     let error = db
         .validate_cluster_query_shape(
@@ -10675,6 +10679,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
             &CatalogManifest::new(vec![CatalogManifestEntry {
                 canonical_name: "secured".into(),
                 kind: CatalogObjectKind::Source,
+                catalog_generation: 1,
                 ddl: DDL.into(),
             }])
             .unwrap(),
@@ -10765,6 +10770,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
             &CatalogManifest::new(vec![CatalogManifestEntry {
                 canonical_name: "unstable".into(),
                 kind: CatalogObjectKind::Source,
+                catalog_generation: 1,
                 ddl: DDL.into(),
             }])
             .unwrap(),
@@ -11023,6 +11029,7 @@ async fn cluster_manifest_invalid_entry_fails_before_any_replay() {
         CatalogManifestEntry {
             canonical_name: name.to_string(),
             kind,
+            catalog_generation: 1,
             ddl: ddl.to_string(),
         }
     }

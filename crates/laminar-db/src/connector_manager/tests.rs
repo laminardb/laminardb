@@ -43,6 +43,9 @@ fn test_register_stream() {
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        catalog_generation: 1,
+        subscription_certificate: None,
     });
     assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
 }
@@ -207,6 +210,9 @@ fn test_unregister_sink_and_stream() {
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        catalog_generation: 1,
+        subscription_certificate: None,
     });
     assert!(mgr.unregister_sink("s1"));
     assert!(!mgr.unregister_sink("s1"));

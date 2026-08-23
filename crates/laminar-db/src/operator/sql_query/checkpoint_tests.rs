@@ -36,6 +36,10 @@ fn sql_capability_classification_is_shape_aware_and_fail_closed() {
         keyed.managed_state,
         Some(ManagedStateContract::SqlAggregateV1)
     );
+    assert_eq!(
+        keyed.subscription_output,
+        Some(crate::operator::capability::SubscriptionOutputDistribution::VnodePartitioned)
+    );
 
     let window_keyed = classify(
         "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), SUM(value) FROM events \

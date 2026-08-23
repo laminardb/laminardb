@@ -608,7 +608,7 @@ impl LaminarDB {
                 .emit_clause
                 .as_ref()
                 .is_some_and(|emit| matches!(emit, laminar_sql::parser::EmitClause::Changes));
-            match crate::aggregate_state::IncrementalAggState::try_from_sql(
+            let aggregate = match crate::aggregate_state::IncrementalAggState::try_from_sql(
                 &self.ctx,
                 query_sql,
                 emit_changelog,
@@ -616,7 +616,7 @@ impl LaminarDB {
             )
             .await
             {
-                Ok(Some(_)) => {}
+                Ok(Some(aggregate)) => aggregate,
                 Ok(None) => {
                     return Err(reject(
                         "aggregate cannot be constructed on the exact incremental execution path",
@@ -627,7 +627,19 @@ impl LaminarDB {
                         "aggregate incremental execution path could not be constructed: {error}"
                     )));
                 }
+            };
+            let certified = plan.subscription_output.as_ref().is_some_and(|output| {
+                output.matches_aggregate_grouping(aggregate.num_group_cols())
+            });
+            if !certified {
+                return Err(reject(
+                    "aggregate final output has no matching planner-owned subscription distribution certificate",
+                ));
             }
+        } else if plan.subscription_output.is_some() {
+            return Err(reject(
+                "non-aggregate plan carried an invalid subscription distribution certificate",
+            ));
         }
         Ok(has_aggregate)
     }

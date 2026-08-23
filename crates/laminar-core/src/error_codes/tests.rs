@@ -48,5 +48,7 @@ fn error_codes_are_stable_strings() {
     assert_eq!(SOURCE_PRIMARY_KEY_REQUIRED, "LDB-5038");
     assert_eq!(SOURCE_MUTATION_NOT_ADMITTED, "LDB-5039");
     assert_eq!(CHECKPOINT_FAILED, "LDB-6001");
+    assert_eq!(SUBSCRIPTION_PLAN_UNSUPPORTED, "LDB-6020");
+    assert_eq!(SUBSCRIPTION_PROTOCOL_UNSUPPORTED, "LDB-6037");
     assert_eq!(INTERNAL, "LDB-8001");
 }

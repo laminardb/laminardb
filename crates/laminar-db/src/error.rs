@@ -73,6 +73,9 @@ pub enum DbError {
         latest_committed: Option<u64>,
     },
 
+    /// Structured committed cluster-subscription failure.
+    Subscription(#[from] crate::subscription::ClusterSubscriptionError),
+
     /// SQL parse error (from streaming parser)
     SqlParse(#[from] laminar_sql::parser::ParseError),
 
@@ -228,6 +231,7 @@ impl DbError {
             | Self::SubscriptionReplayPruned { .. }
             | Self::SubscriptionEpochNotCommitted { .. }
             | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
+            Self::Subscription(error) => error.code(),
             Self::Shutdown => error_codes::SHUTDOWN,
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
@@ -361,10 +365,9 @@ impl std::fmt::Display for DbError {
                     self.code()
                 ),
             },
+            Self::Subscription(error) => write!(f, "[{}] {error}", self.code()),
             Self::SqlParse(e) => write!(f, "SQL parse error: {e}"),
-            Self::Shutdown => {
-                write!(f, "[{}] Database is shut down", self.code())
-            }
+            Self::Shutdown => write!(f, "[{}] Database is shut down", self.code()),
             Self::Checkpoint(msg) => {
                 write!(f, "[{}] Checkpoint error: {msg}", self.code())
             }

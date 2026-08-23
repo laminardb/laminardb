@@ -820,7 +820,6 @@ pub(crate) struct AggregateWorkingSetSnapshot {
 
 impl IncrementalAggState {
     /// Number of leading GROUP BY columns; used by the shuffle path for hashing.
-    #[cfg(feature = "cluster")]
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols

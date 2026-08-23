@@ -786,7 +786,7 @@ fn is_stream_window_marker(name: &str) -> bool {
 /// The parser analysis is exact for direct aggregate and single-source projection/filter shapes.
 /// Complex structure, unknown functions, analytics, and unrecognized grouping remain local-only;
 /// the descriptor must never guess "stateless".
-fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapability {
+pub(crate) fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapability {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return OperatorCapability::unclassified_sql_query();
     };

@@ -167,6 +167,7 @@ pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
+pub use subscription::ClusterSubscriptionError;
 
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]

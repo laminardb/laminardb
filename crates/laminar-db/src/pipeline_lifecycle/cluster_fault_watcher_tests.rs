@@ -673,6 +673,7 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
                 CatalogManifestEntry {
                     canonical_name: "unsafe_input".into(),
                     kind: CatalogObjectKind::Source,
+                    catalog_generation: 1,
                     ddl: "CREATE SOURCE unsafe_input (id BIGINT) FROM \
                           \"rejecting-splittable-test\""
                         .into(),
@@ -680,6 +681,7 @@ async fn splittable_source_without_assignment_hook_fails_before_start() {
                 CatalogManifestEntry {
                     canonical_name: "unsafe_output".into(),
                     kind: CatalogObjectKind::Stream,
+                    catalog_generation: 1,
                     ddl: "CREATE STREAM unsafe_output AS SELECT id FROM unsafe_input".into(),
                 },
             ])
@@ -715,6 +717,7 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
                 CatalogManifestEntry {
                     canonical_name: "failing_input".into(),
                     kind: CatalogObjectKind::Source,
+                    catalog_generation: 1,
                     ddl: "CREATE SOURCE failing_input (id BIGINT) FROM \
                           \"failing-start-cluster-test\""
                         .into(),
@@ -722,6 +725,7 @@ async fn cluster_source_start_failure_does_not_leave_graph_ready_vnode_state() {
                 CatalogManifestEntry {
                     canonical_name: "failing_output".into(),
                     kind: CatalogObjectKind::Stream,
+                    catalog_generation: 1,
                     ddl: "CREATE STREAM failing_output AS SELECT id FROM failing_input".into(),
                 },
             ])
@@ -755,11 +759,13 @@ async fn cluster_compute_panic_before_ready_releases_the_startup_rotation_fence(
                 CatalogManifestEntry {
                     canonical_name: "idle_input".into(),
                     kind: CatalogObjectKind::Source,
+                    catalog_generation: 1,
                     ddl: "CREATE SOURCE idle_input (id BIGINT) FROM \"idle-cluster-test\"".into(),
                 },
                 CatalogManifestEntry {
                     canonical_name: "idle_output".into(),
                     kind: CatalogObjectKind::Stream,
+                    catalog_generation: 1,
                     ddl: "CREATE STREAM idle_output AS SELECT id FROM idle_input".into(),
                 },
             ])
@@ -799,11 +805,13 @@ async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
                 CatalogManifestEntry {
                     canonical_name: "fenced".into(),
                     kind: CatalogObjectKind::Source,
+                    catalog_generation: 1,
                     ddl: "CREATE SOURCE fenced (id BIGINT)".into(),
                 },
                 CatalogManifestEntry {
                     canonical_name: "broken".into(),
                     kind: CatalogObjectKind::Stream,
+                    catalog_generation: 1,
                     ddl: "CREATE STREAM broken AS SELECT id FROM missing_source".into(),
                 },
             ])

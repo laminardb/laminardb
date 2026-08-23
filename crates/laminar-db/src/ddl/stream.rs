@@ -71,6 +71,31 @@ pub(crate) struct PlannedStreamingQuery {
     pub(crate) join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     pub(crate) has_analytic: bool,
     pub(crate) has_frame: bool,
+    pub(crate) subscription_output:
+        Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+}
+
+impl PlannedStreamingQuery {
+    pub(super) fn candidate_registration(
+        &self,
+        name: &str,
+        query_sql: &str,
+    ) -> crate::connector_manager::StreamRegistration {
+        crate::connector_manager::StreamRegistration {
+            name: name.to_owned(),
+            query_sql: query_sql.to_owned(),
+            emit_clause: self.emit_clause.clone(),
+            window_config: self.window_config.clone(),
+            order_config: self.order_config.clone(),
+            join_config: self.join_config.clone(),
+            has_analytic: self.has_analytic,
+            has_frame: self.has_frame,
+            incremental: false,
+            subscription_output: self.subscription_output.clone(),
+            catalog_generation: 1,
+            subscription_certificate: None,
+        }
+    }
 }
 
 pub(crate) async fn validate_managed_aggregate_admission(
@@ -242,6 +267,7 @@ impl LaminarDB {
             join_config: plan_joins,
             has_analytic: plan_has_analytic,
             has_frame: plan_has_frame,
+            subscription_output: plan_subscription_output,
         } = planned;
         let query_sql = query_sql.to_string();
 
@@ -285,6 +311,9 @@ impl LaminarDB {
                 has_analytic: plan_has_analytic,
                 has_frame: plan_has_frame,
                 incremental: false,
+                subscription_output: plan_subscription_output,
+                catalog_generation: 1,
+                subscription_certificate: None,
             });
             // Local replay identity participates in the same cancellation guard as
             // graph/catalog admission. Once the coordinator CAS is Applied, caller
@@ -425,6 +454,12 @@ impl LaminarDB {
                 "planner did not produce a streaming query for '{name}'"
             )));
         };
+        let subscription_output = crate::subscription::distribution::plan(
+            query_sql,
+            plan.emit_clause.as_ref(),
+            &self.ctx,
+            self.checkpoint_key_groups(),
+        )?;
         Ok(PlannedStreamingQuery {
             emit_clause: plan.emit_clause,
             window_config: plan.window_config,
@@ -432,6 +467,7 @@ impl LaminarDB {
             join_config: plan.join_config,
             has_analytic: plan.analytic_config.is_some(),
             has_frame: plan.frame_config.is_some(),
+            subscription_output,
         })
     }
 }

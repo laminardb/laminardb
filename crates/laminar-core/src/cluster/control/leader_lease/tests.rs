@@ -3144,6 +3144,7 @@ fn catalog(name: &str) -> CatalogManifest {
     CatalogManifest::new(vec![super::super::CatalogManifestEntry {
         canonical_name: name.to_owned(),
         kind: crate::catalog::CatalogObjectKind::Source,
+        catalog_generation: 1,
         ddl: format!("CREATE SOURCE {name} (id BIGINT)"),
     }])
     .unwrap()
@@ -6462,6 +6463,7 @@ async fn renewals_copy_only_the_bounded_catalog_reference() {
     let manifest = CatalogManifest::new(vec![super::super::CatalogManifestEntry {
         canonical_name: "events".into(),
         kind: crate::catalog::CatalogObjectKind::Source,
+        catalog_generation: 1,
         ddl: format!(
             "CREATE SOURCE events FROM GENERATOR ('description' = '{}')",
             "x".repeat(100_000)

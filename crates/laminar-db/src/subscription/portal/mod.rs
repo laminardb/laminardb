@@ -9,6 +9,19 @@ use futures::FutureExt;
 
 use super::registry::{ChargedUpdate, MvUpdate, SubscriptionRead, SubscriptionReader};
 
+#[derive(Debug)]
+enum PortalReader {
+    Local(SubscriptionReader),
+}
+
+impl PortalReader {
+    async fn next(&mut self) -> SubscriptionRead {
+        match self {
+            Self::Local(reader) => reader.next().await,
+        }
+    }
+}
+
 /// Keeps the process-wide subscription charge alive with an emitted batch.
 #[doc(hidden)]
 #[derive(Clone)]
@@ -61,7 +74,7 @@ pub enum PortalFrame {
 pub struct SubscriptionPortal {
     name: String,
     schema: SchemaRef,
-    reader: Option<SubscriptionReader>,
+    reader: Option<PortalReader>,
     closed: bool,
     filter: Option<Arc<dyn PhysicalExpr>>,
 }
@@ -93,7 +106,7 @@ impl SubscriptionPortal {
         Self {
             name: name.into(),
             schema,
-            reader: Some(reader),
+            reader: Some(PortalReader::Local(reader)),
             closed: false,
             filter,
         }

@@ -142,6 +142,9 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        catalog_generation: 1,
+        subscription_certificate: None,
     };
     let temporal = stream(Some(vec![
         laminar_sql::translator::JoinOperatorConfig::Temporal(

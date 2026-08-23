@@ -2663,36 +2663,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    fn catalog_manifest_inventory(
-        &self,
-    ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
-        let ordered = self.connector_manager.lock().ordered_ddl();
-        let namespace = self.catalog_namespace.lock();
-        if ordered.len() != namespace.len() {
-            return Err(DbError::Pipeline(format!(
-                "typed catalog has {} objects but the durable DDL inventory has {}",
-                namespace.len(),
-                ordered.len()
-            )));
-        }
-        ordered
-            .into_iter()
-            .map(|(canonical_name, ddl)| {
-                let kind = namespace.get(&canonical_name).copied().ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "DDL inventory entry '{canonical_name}' has no typed catalog owner"
-                    ))
-                })?;
-                Ok(laminar_core::cluster::control::CatalogManifestEntry {
-                    canonical_name,
-                    kind,
-                    ddl,
-                })
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "cluster")]
     fn exact_bootstrap_noop(
         &self,
         sql: &str,
@@ -2882,7 +2852,7 @@ impl LaminarDB {
             tracing::info!(name = %entry.canonical_name, "replayed catalog DDL from manifest");
         }
 
-        let local_inventory = self.catalog_manifest_inventory()?;
+        let local_inventory = self.reconcile_catalog_manifest_inventory(&manifest)?;
         if local_inventory.as_slice() != manifest.entries.as_slice() {
             return Err(DbError::Pipeline(format!(
                 "[{}] local catalog DDL inventory does not match the ordered catalog manifest \
@@ -4843,20 +4813,17 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            let requested = parsed
-                .iter()
-                .map(|(ddl, _, canonical_name, kind)| {
-                    laminar_core::cluster::control::CatalogManifestEntry {
-                        canonical_name: canonical_name.clone(),
-                        kind: *kind,
-                        ddl: ddl.clone(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            if requested.as_slice() != manifest.entries.as_slice() {
+            let configured_matches = parsed.iter().zip(&manifest.entries).all(
+                |((ddl, _, canonical_name, kind), entry)| {
+                    ddl == &entry.ddl
+                        && canonical_name == &entry.canonical_name
+                        && kind == &entry.kind
+                },
+            );
+            if parsed.len() != manifest.entries.len() || !configured_matches {
                 return Err(DbError::Pipeline(format!(
                     "configured cluster catalog must exactly match the complete ordered sealed inventory (configured entries: {}, sealed entries: {})",
-                    requested.len(),
+                    parsed.len(),
                     manifest.entries.len()
                 )));
             }
