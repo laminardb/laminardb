@@ -448,6 +448,50 @@ fn sum_pre_agg_batch(names: &[&str], values: &[f64]) -> RecordBatch {
     .unwrap()
 }
 
+#[tokio::test]
+async fn new_aggregate_state_is_retained_for_grouped_batches() {
+    let sql = "SELECT name, SUM(value) AS total FROM events GROUP BY name";
+    let (_, mut state) = setup_agg_state(sql).await;
+    state
+        .process_batch(&sum_pre_agg_batch(&["a"], &[3.0]), 10)
+        .unwrap();
+
+    let output = state.emit().expect("new grouped state must emit");
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    let totals = output[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(totals.value(0), 3.0);
+}
+
+#[tokio::test]
+async fn new_aggregate_state_is_retained_for_global_batches() {
+    let (_, mut state) = setup_agg_state("SELECT SUM(value) AS total FROM events").await;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "__agg_input_0",
+            DataType::Float64,
+            true,
+        )])),
+        vec![Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0]))],
+    )
+    .unwrap();
+    state.process_batch(&batch, 10).unwrap();
+
+    let output = state.emit().expect("new global state must emit");
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 1);
+    let totals = output[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    assert_eq!(totals.value(0), 3.0);
+}
+
 fn capture_all_vnodes(
     state: &mut IncrementalAggState,
 ) -> Result<Vec<(u32, AggStateCheckpoint)>, DbError> {

@@ -1722,13 +1722,9 @@ impl IncrementalAggState {
                 entry.last_updated_ms = watermark_ms;
                 entry.refresh_accumulator_usage();
 
-                let usage = AggregateVnodeState::group_usage(&owned_key, &entry);
                 let emit_key = emit_changelog.then(|| owned_key.clone());
                 let vnode_state = self.vnode_states.get_or_insert(vnode);
-                let previous_spare = vnode_state.collection_spare_usage();
-                debug_assert!(vnode_state.groups.insert(owned_key, entry).is_none());
-                vnode_state.add_usage(usage);
-                vnode_state.reconcile_collection_spare_usage(previous_spare);
+                vnode_state.insert_new_group(owned_key, entry);
                 if let Some(emit_key) = emit_key {
                     vnode_state.insert_emit_dirty_key(emit_key);
                 }
@@ -1815,15 +1811,8 @@ impl IncrementalAggState {
             entry.last_updated_ms = watermark_ms;
             entry.refresh_accumulator_usage();
 
-            let usage = AggregateVnodeState::group_usage(&empty_key, &entry);
             let vnode_state = self.vnode_states.get_or_insert(0);
-            let previous_spare = vnode_state.collection_spare_usage();
-            debug_assert!(vnode_state
-                .groups
-                .insert(empty_key.clone(), entry)
-                .is_none());
-            vnode_state.add_usage(usage);
-            vnode_state.reconcile_collection_spare_usage(previous_spare);
+            vnode_state.insert_new_group(empty_key.clone(), entry);
             if self.emit_changelog {
                 vnode_state.insert_emit_dirty_key(empty_key);
             }

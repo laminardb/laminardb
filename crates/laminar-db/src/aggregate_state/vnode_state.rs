@@ -116,6 +116,15 @@ impl AggregateVnodeState {
         self.usage = self.usage.saturating_add(usage);
     }
 
+    pub(super) fn insert_new_group(&mut self, key: arrow::row::OwnedRow, entry: GroupEntry) {
+        let previous_spare = self.collection_spare_usage();
+        let usage = Self::group_usage(&key, &entry);
+        let previous = self.groups.insert(key, entry);
+        debug_assert!(previous.is_none());
+        self.add_usage(usage);
+        self.reconcile_collection_spare_usage(previous_spare);
+    }
+
     pub(super) fn reconcile_accumulator_usage(&mut self, previous: usize, current: usize) {
         let usage = |bytes| AggregateStateUsage::from_parts(0, 0, 0, 0, bytes);
         self.usage = self
