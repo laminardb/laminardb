@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>LaminarDB Live Markout Lab</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="lab-shell">
+      <header class="hero">
+        <div class="brand-row">
+          <div class="brand"><span class="brand-mark">L</span> LAMINARDB <em>LIVE MARKOUT LAB</em></div>
+          <div class="run-state"><span id="connection-dot"></span><span id="run-status">CONNECTING TO MARKET</span></div>
+        </div>
+        <div class="truth-strip" aria-label="Demo truthfulness labels">
+          <span>LIVE BINANCE DATA</span>
+          <span>SIMULATED ORDERS</span>
+          <span>NO MONEY AT RISK</span>
+          <span>ENGINE-CALCULATED RESULTS</span>
+        </div>
+        <div class="hero-copy">
+          <p class="eyebrow">A 30-SECOND BITCOIN EXPERIMENT</p>
+          <h1>Would your fill still look good after the market moves?</h1>
+          <p>Choose a side using the real BTC/USDT market. LaminarDB will follow your simulated fill and reveal what happened next.</p>
+        </div>
+      </header>
+
+      <section class="play-grid" aria-label="Live market and simulated order controls">
+        <article class="panel market-card">
+          <div class="panel-heading">
+            <div><p class="panel-kicker">BTC / USDT · BINANCE</p><h2>Live market now</h2></div>
+            <span id="phase-pill" class="status-pill waiting">CONNECTING</span>
+          </div>
+          <div class="live-price" id="market-mid">—</div>
+          <p class="price-caption">live midpoint between the best buyer and seller</p>
+          <div class="quote-row">
+            <div><span>Best buyer offers</span><strong id="market-bid">—</strong><small>BID</small></div>
+            <div><span>Best seller asks</span><strong id="market-ask">—</strong><small>ASK</small></div>
+          </div>
+          <div class="market-meta"><span>Gap <b id="market-spread">—</b></span><span>Exchange time <b id="event-time">—</b></span></div>
+        </article>
+
+        <article class="panel action-card">
+          <div class="panel-heading">
+            <div><p class="panel-kicker">YOUR TURN</p><h2>Make a simulated fill</h2></div>
+            <span class="safe-label">NO REAL ORDER</span>
+          </div>
+          <p class="action-explainer">Pick a side. We use the live touch price shown by the engine—you cannot type or change the price.</p>
+          <label class="quantity-picker">Amount
+            <select id="quantity-control">
+              <option value="0.0005">0.0005 BTC</option>
+              <option value="0.001" selected>0.001 BTC</option>
+              <option value="0.005">0.005 BTC</option>
+              <option value="0.01">0.01 BTC</option>
+            </select>
+          </label>
+          <div class="order-buttons">
+            <button type="button" class="buy-button" data-side="BUY" disabled>
+              <span>SIMULATE BUY</span><strong id="buy-button-price">waiting for market</strong>
+            </button>
+            <button type="button" class="sell-button" data-side="SELL" disabled>
+              <span>SIMULATE SELL</span><strong id="sell-button-price">waiting for market</strong>
+            </button>
+          </div>
+          <p id="order-message" class="order-message" aria-live="polite">Connecting to the live market before accepting a choice…</p>
+        </article>
+      </section>
+
+      <section class="panel fill-story" aria-label="Selected simulated fill outcome">
+        <div class="panel-heading story-heading">
+          <div>
+            <p class="panel-kicker">YOUR LATEST FILL</p>
+            <h2>Watch the answer arrive one moment at a time</h2>
+            <p class="panel-explainer">A result stays pending until the real market reaches that future time.</p>
+          </div>
+          <span id="selected-status" class="status-pill waiting">WAITING FOR YOUR CHOICE</span>
+        </div>
+        <div id="selected-empty" class="story-empty">
+          <span class="empty-icon">↗</span>
+          <strong>Choose BUY or SELL above</strong>
+          <p>Your fill will appear here immediately. Its 1s, 5s, 15s, and 30s outcomes will arrive progressively from LaminarDB.</p>
+        </div>
+        <div id="selected-content" class="story-content" hidden>
+          <div class="fill-summary">
+            <div><span>Your action</span><strong id="selected-side">—</strong></div>
+            <div><span>Simulated fill</span><strong id="selected-fill">—</strong></div>
+            <div><span>Amount</span><strong id="selected-quantity">—</strong></div>
+            <div><span>Exchange time</span><strong id="selected-time">—</strong></div>
+          </div>
+          <div id="horizon-journey" class="horizon-journey" aria-label="Progressive fill horizons"></div>
+          <div class="outcome-band">
+            <div>
+              <span id="selected-outcome-label">CURRENT OUTCOME</span>
+              <strong id="selected-outcome">pending</strong>
+              <small>net hypothetical PnL</small>
+            </div>
+            <div>
+              <span>MARKET MIDPOINT THEN</span>
+              <strong id="selected-future">pending</strong>
+              <small id="selected-horizon-label">waiting for a future quote</small>
+            </div>
+            <p id="selected-explanation">LaminarDB is waiting for the next eligible market moment.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="analysis-grid">
+        <article class="panel chart-panel">
+          <div class="panel-heading">
+            <div><p class="panel-kicker">HOW YOUR FILLS AGED</p><h2>Helpful or harmful after the fill?</h2></div>
+            <span class="chart-key"><i></i>YOUR SIMULATED FILLS</span>
+          </div>
+          <svg id="markout-chart" viewBox="0 0 720 210" role="img" aria-label="Your weighted net markout curve in basis points">
+            <g class="chart-grid">
+              <line x1="52" y1="24" x2="696" y2="24"></line>
+              <line x1="52" y1="76" x2="696" y2="76"></line>
+              <line x1="52" y1="128" x2="696" y2="128"></line>
+              <line x1="52" y1="180" x2="696" y2="180"></line>
+            </g>
+            <line id="zero-line" class="zero-line" x1="52" y1="102" x2="696" y2="102"></line>
+            <g id="chart-series"></g>
+            <g class="axis-labels">
+              <text x="52" y="204">FILL</text><text x="213" y="204">1s</text>
+              <text x="374" y="204">5s</text><text x="535" y="204">15s</text>
+              <text x="696" y="204" text-anchor="end">30s</text>
+              <text x="8" y="20">BPS</text>
+            </g>
+          </svg>
+          <p class="chart-help"><span>Above zero helped</span><b>·</b><span class="hurt">Below zero hurt</span><b>·</b>1 basis point = 0.01%</p>
+        </article>
+
+        <aside class="panel score-panel">
+          <div class="panel-heading"><div><p class="panel-kicker">YOUR SCORECARD</p><h2>What the engine knows so far</h2></div></div>
+          <div class="score-grid">
+            <div><span>Earned at the fill</span><strong id="kpi-spread">pending</strong><small>spread capture</small></div>
+            <div><span>Result after 5s</span><strong id="kpi-five">pending</strong><small>weighted markout</small></div>
+            <div><span>30s total</span><strong id="kpi-pnl">pending</strong><small>hypothetical PnL</small></div>
+            <div><span>Value filled</span><strong id="kpi-notional">pending</strong><small>notional</small></div>
+            <div><span>Turned against you</span><strong id="kpi-adverse">pending</strong><small>at 5 seconds</small></div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="panel recent-panel">
+        <div class="panel-heading compact">
+          <div><p class="panel-kicker">YOUR RECENT CHOICES</p><h2>Every fill, every future checkpoint</h2></div>
+          <span class="micro-label">SELECT A ROW TO FOLLOW IT</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Fill</th><th>Side</th><th>Amount</th><th>Fill price</th><th>Now</th><th>1s</th><th>5s</th><th>15s</th><th>30s</th></tr></thead>
+            <tbody id="fill-rows"><tr class="empty-row"><td colspan="9">Your simulated fills will appear here.</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+
+      <footer>
+        <div class="engine-proof"><span>✓</span><strong>Real market in. Engine-calculated outcomes out.</strong><small>Prices come from Binance. Fills are simulated and never sent to an exchange.</small></div>
+        <details class="how-it-works secondary-details">
+          <summary>For the curious: see how LaminarDB produced the answer</summary>
+          <div class="technical-layer">
+            <p>LaminarDB ingests each live quote, binds your simulated fill to event time, then waits for five future market moments before calculating the result.</p>
+            <div class="lineage" aria-label="Data lineage">
+              <span>Live Binance quotes</span><b>→</b><span>Your simulated fill</span><b>→</b><span>Five event-time probes</span><b>→</b><span>Your result</span>
+            </div>
+            <details class="sql-reveal">
+              <summary>Reveal the exact SQL being executed</summary>
+              <pre id="pipeline-sql">Loading pipeline.sql…</pre>
+            </details>
+          </div>
+        </details>
+        <p class="disclaimer">Live public market data · simulated touch fills, not queue-accurate · hypothetical analysis, not financial advice or realised PnL</p>
+      </footer>
+    </main>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,38 @@
+[workspace]
+
+[package]
+name = "laminardb-markout-lab"
+version = "0.30.0"
+edition = "2021"
+rust-version = "1.95"
+publish = false
+description = "Interactive live-market LaminarDB markout demonstration"
+
+[lib]
+name = "markout_lab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "markout-lab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+arrow = "=58.4.0"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4.6", features = ["derive"] }
+futures = "0.3"
+laminar-connectors = { path = "../../../crates/laminar-connectors", default-features = false }
+laminar-db = { path = "../../../crates/laminar-db", default-features = false }
+laminar-derive = { path = "../../../crates/laminar-derive" }
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.52", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2.0"
+url = "2.5"

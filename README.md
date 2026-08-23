@@ -546,6 +546,7 @@ examples/
   demo/                Market data TUI demo with Ratatui
   binance-ws/          Live Binance WebSocket streaming SQL demo
   microstructure/      Market microstructure analysis demo
+  demos/markout_lab/   Interactive live-Bitcoin markout lab
   claude-code-aiops/   OpenTelemetry ingest + streaming SQL dashboard
   server-demo/         Standalone server walkthrough
 ```

@@ -1,5 +1,6 @@
 # Build artifacts (20-30GB+)
 target/
+**/target/
 
 # Version control
 .git/
@@ -31,8 +32,13 @@ nul
 Thumbs.db
 .DS_Store
 
-# Examples (not needed in server image)
-examples/
+# Examples (only the standalone Markout Lab is needed by its image)
+examples/*
+!examples/demos/
+examples/demos/*
+!examples/demos/markout_lab/
+!examples/demos/markout_lab/**
+examples/demos/markout_lab/target/
 
 # Logs
 *.log
