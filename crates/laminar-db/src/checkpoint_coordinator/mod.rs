@@ -7,6 +7,8 @@ mod follower_completion;
 #[cfg(feature = "cluster")]
 mod follower_prepare;
 pub(crate) mod sink_epoch_admission;
+#[cfg(feature = "cluster")]
+mod subscription_output;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -35,6 +37,8 @@ use laminar_core::checkpoint::{
 use laminar_core::checkpoint_decision::{
     CheckpointArtifactInventory, CheckpointArtifactInventoryUpdateResult,
 };
+#[cfg(feature = "cluster")]
+use laminar_core::cluster::control::{BarrierAnnouncement, Phase, QuorumOutcome};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -346,6 +350,9 @@ pub struct CheckpointRequest {
     pub source_names: Vec<String>,
     pub channel_progress: Vec<ChannelProgress>,
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+    #[cfg(feature = "cluster")]
+    pub(crate) subscription_output:
+        Option<Arc<crate::subscription::cluster::PreparedNodeSubscriptionOutput>>,
 }
 
 #[derive(Debug, Clone)]
@@ -835,18 +842,34 @@ async fn load_index_manifests(
 struct LiveChunkInventory {
     references: BTreeSet<StateChunkId>,
     pinned: BTreeSet<StateChunkId>,
+    subscription_segments: BTreeSet<String>,
 }
 
 fn live_chunk_inventory(manifests: &[CheckpointManifest]) -> LiveChunkInventory {
     let mut references = BTreeSet::new();
     let mut pinned = BTreeSet::new();
+    let mut subscription_segments = BTreeSet::new();
     for manifest in manifests {
         pinned.insert(manifest.node_data.chunk);
         for reference in &manifest.referenced_chunks {
             references.insert(reference.chunk);
         }
+        if let Some(output) = &manifest.subscription_output {
+            for stream in &output.streams {
+                subscription_segments.extend(
+                    stream
+                        .segments
+                        .iter()
+                        .map(|segment| segment.object_key.clone()),
+                );
+            }
+        }
     }
-    LiveChunkInventory { references, pinned }
+    LiveChunkInventory {
+        references,
+        pinned,
+        subscription_segments,
+    }
 }
 
 async fn delete_retired_data(
@@ -869,6 +892,22 @@ async fn delete_retired_data(
         .filter(|chunk| !live.pinned.contains(chunk) && !live.references.contains(chunk));
     let results = futures::stream::iter(deletions)
         .map(|chunk| async move { store.delete_node_data(chunk).await })
+        .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    for result in results {
+        result.map_err(DbError::from)?;
+    }
+    let subscription_candidates = manifests
+        .iter()
+        .filter_map(|manifest| manifest.subscription_output.as_ref())
+        .flat_map(|output| &output.streams)
+        .flat_map(|stream| &stream.segments)
+        .map(|segment| segment.object_key.clone())
+        .collect::<BTreeSet<_>>();
+    let results = futures::stream::iter(subscription_candidates)
+        .filter(|object_key| std::future::ready(!live.subscription_segments.contains(object_key)))
+        .map(|object_key| async move { store.delete_subscription_segment(&object_key).await })
         .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
@@ -1109,21 +1148,14 @@ async fn begin_cluster_cleanup(
 }
 
 #[cfg(feature = "cluster")]
-async fn run_cluster_gc_request(
+async fn run_cluster_gc_protocol(
     store: Arc<dyn CheckpointStore>,
     request: &GcRequest,
     authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
     proof: LeaderProof,
+    requested: Option<CommittedCheckpointRef>,
 ) -> Result<(), DbError> {
     use laminar_core::cluster::control::ClusterArtifactCleanupPhase;
-
-    let requested = request
-        .requested
-        .as_ref()
-        .map(CommittedCheckpointIndex::encode_and_reference)
-        .transpose()
-        .map_err(DbError::Checkpoint)?
-        .map(|(_, reference)| reference);
     let mut cursor = authority
         .cluster_artifact_cleanup()
         .await
@@ -1230,6 +1262,51 @@ async fn run_cluster_gc_request(
             }
         }
     }
+}
+
+#[cfg(feature = "cluster")]
+async fn run_cluster_gc_request(
+    store: Arc<dyn CheckpointStore>,
+    request: &GcRequest,
+    authority: Arc<laminar_core::cluster::control::LeaderLeaseStore>,
+    proof: LeaderProof,
+) -> Result<(), DbError> {
+    let requested = subscription_output::cluster_subscription_retention_reference(
+        store.as_ref(),
+        request.decision_store.as_ref(),
+        authority.as_ref(),
+        request.requested.as_ref(),
+    )
+    .await?;
+    run_cluster_gc_protocol(
+        Arc::clone(&store),
+        request,
+        authority,
+        proof,
+        requested.clone(),
+    )
+    .await?;
+    let (Some(latest), Some(horizon)) = (request.requested.as_ref(), requested.as_ref()) else {
+        return Ok(());
+    };
+    let grace_ms =
+        i64::try_from(std::time::Duration::from_secs(60 * 60).as_millis()).unwrap_or(i64::MAX);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| DbError::Checkpoint(format!("read orphan cleanup clock: {error}")))?
+        .as_millis();
+    let grace_before_ms = i64::try_from(now_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(grace_ms);
+    let _ = subscription_output::cleanup_subscription_orphans(
+        store.as_ref(),
+        request.decision_store.as_ref(),
+        latest,
+        horizon,
+        grace_before_ms,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn run_gc_request(
@@ -1344,6 +1421,9 @@ mod outcome_tests {
 
 #[cfg(test)]
 mod sparse_capture_tests;
+
+#[cfg(all(test, feature = "cluster"))]
+mod subscription_output_tests;
 
 #[cfg(all(test, feature = "cluster"))]
 mod handoff_tests;
@@ -3493,24 +3573,16 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    async fn pack_checkpoint(
+    fn canonicalize_checkpoint_request(
         &self,
-        attempt: CheckpointAttempt,
-        mut request: CheckpointRequest,
-        sink_payloads: BTreeMap<String, Option<Vec<u8>>>,
-        deadline: tokio::time::Instant,
-    ) -> Result<PackedCheckpoint, DbError> {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(DbError::Checkpoint(
-                "checkpoint packing exceeded its end-to-end deadline".into(),
-            ));
-        }
-        self.validate_request(&request)?;
+        request: &mut CheckpointRequest,
+    ) -> Result<(), DbError> {
+        self.validate_request(request)?;
         request
             .state_frames
             .sort_unstable_by(|left, right| left.key.cmp(&right.key));
         self.validate_capture_roster(&request.state_frames)?;
-        self.complete_sparse_vnode_captures(&mut request)?;
+        self.complete_sparse_vnode_captures(request)?;
         for channel in &mut request.channel_progress {
             channel.participant_id = self.store.participant_id();
         }
@@ -3535,7 +3607,31 @@ impl CheckpointCoordinator {
                 "channel progress contains duplicate channel identities".into(),
             ));
         }
+        Ok(())
+    }
 
+    async fn pack_checkpoint(
+        &self,
+        attempt: CheckpointAttempt,
+        mut request: CheckpointRequest,
+        sink_payloads: BTreeMap<String, Option<Vec<u8>>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<PackedCheckpoint, DbError> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DbError::Checkpoint(
+                "checkpoint packing exceeded its end-to-end deadline".into(),
+            ));
+        }
+        self.canonicalize_checkpoint_request(&mut request)?;
+        #[cfg(feature = "cluster")]
+        let subscription_output = self
+            .prepare_subscription_output_until(
+                attempt,
+                request.assignment_fence.as_ref(),
+                request.subscription_output.take(),
+                deadline,
+            )
+            .await?;
         let expected_sinks = self.committable_sink_names()?;
         if !sink_payloads
             .keys()
@@ -3756,6 +3852,10 @@ impl CheckpointCoordinator {
                 })
             })
             .collect::<Result<Vec<_>, DbError>>()?;
+        #[cfg(feature = "cluster")]
+        {
+            manifest.subscription_output = subscription_output;
+        }
         let errors = manifest.validate(self.store.key_group_count());
         if !errors.is_empty() {
             return Err(DbError::Checkpoint(format!(
@@ -4371,6 +4471,67 @@ impl CheckpointCoordinator {
         Ok(index)
     }
 
+    async fn build_validated_committed_index_until(
+        &self,
+        attempt: CheckpointAttempt,
+        scope: CheckpointScope,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        predecessor: Option<CommittedCheckpointRef>,
+        predecessor_source_watermarks: &BTreeMap<String, i64>,
+        manifests: &[(CheckpointManifest, Bytes)],
+        quorum_watermark: Option<CheckpointWatermark>,
+        deadline: tokio::time::Instant,
+    ) -> Result<CommittedCheckpointIndex, DbError> {
+        let index = self.build_committed_index(
+            attempt,
+            scope,
+            assignment_fence.clone(),
+            predecessor.clone(),
+            predecessor_source_watermarks,
+            manifests,
+            quorum_watermark,
+        )?;
+        #[cfg(feature = "cluster")]
+        self.validate_subscription_continuity_until(
+            attempt,
+            assignment_fence.as_ref(),
+            predecessor.as_ref(),
+            manifests,
+            deadline,
+        )
+        .await?;
+        #[cfg(not(feature = "cluster"))]
+        let _ = deadline;
+        Ok(index)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn validate_captured_quorum(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        participants: Vec<QuorumPeer>,
+        proof: &LeaderProof,
+    ) -> Result<(), DbError> {
+        let mut expected = fence
+            .participant_ids()
+            .into_iter()
+            .filter(|participant| *participant != self.store.participant_id())
+            .collect::<Vec<_>>();
+        let mut actual = participants
+            .into_iter()
+            .map(|participant| participant.0)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        if actual != expected || !controller.proof_is_live(proof) {
+            return Err(DbError::Checkpoint(
+                "checkpoint quorum does not match its assignment or leader proof".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn commit_external_sinks_until(
         &self,
         attempt: CheckpointAttempt,
@@ -4784,7 +4945,6 @@ impl CheckpointCoordinator {
                 // or allowing notification I/O to hang.
                 #[cfg(feature = "cluster")]
                 if let Some(controller) = self.cluster_controller.as_ref() {
-                    use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
                     let notification_deadline =
                         tokio::time::Instant::now() + self.config.cleanup_timeout;
                     publish_terminal_hint_until(
@@ -4841,10 +5001,13 @@ impl CheckpointCoordinator {
         sink_epoch_publication: SinkEpochPublication,
     ) -> Result<CheckpointResult, DbError> {
         require_canonical_attempt(attempt, "checkpoint admission")?;
-        let flags = request.flags;
-        let (assignment_fence, terminal_handoff) = (
+        let (flags, assignment_fence, terminal_handoff) = (
+            request.flags,
             request.assignment_fence.clone(),
-            sink_epoch_admission::is_terminal_handoff(flags, request.handoff_replay_pending),
+            sink_epoch_admission::is_terminal_handoff(
+                request.flags,
+                request.handoff_replay_pending,
+            ),
         );
         #[cfg(feature = "cluster")]
         let validation_proof = match &quorum {
@@ -4886,8 +5049,7 @@ impl CheckpointCoordinator {
                 )
                 .await);
         }
-        let request_validation = self.validate_request(&request);
-        if let Err(error) = request_validation {
+        if let Err(error) = self.validate_request(&request) {
             return Ok(self
                 .fail_before_commit(
                     attempt,
@@ -4934,26 +5096,14 @@ impl CheckpointCoordinator {
                         leader_proof,
                     } => (leader_proof, participants, cluster_watermark),
                 };
-                let mut expected = fence
-                    .participant_ids()
-                    .into_iter()
-                    .filter(|participant| *participant != self.store.participant_id())
-                    .collect::<Vec<_>>();
-                let mut actual = participants
-                    .into_iter()
-                    .map(|participant| participant.0)
-                    .collect::<Vec<_>>();
-                expected.sort_unstable();
-                actual.sort_unstable();
-                if actual != expected || !controller.proof_is_live(&proof) {
+                if let Err(error) =
+                    self.validate_captured_quorum(&controller, fence, participants, &proof)
+                {
                     return Ok(self
                         .fail_before_commit(
                             attempt,
                             started,
-                            DbError::Checkpoint(
-                                "checkpoint quorum does not match its assignment or leader proof"
-                                    .into(),
-                            ),
+                            error,
                             flags,
                             assignment_fence,
                             Some(proof),
@@ -5098,15 +5248,19 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
-        let index = match self.build_committed_index(
-            attempt,
-            scope,
-            assignment_fence.clone(),
-            predecessor.clone(),
-            &predecessor_source_watermarks,
-            &manifests,
-            quorum_watermark,
-        ) {
+        let index = match self
+            .build_validated_committed_index_until(
+                attempt,
+                scope,
+                assignment_fence.clone(),
+                predecessor.clone(),
+                &predecessor_source_watermarks,
+                &manifests,
+                quorum_watermark,
+                deadline,
+            )
+            .await
+        {
             Ok(index) => index,
             Err(error) => {
                 return Ok(self
@@ -5193,10 +5347,6 @@ impl CheckpointCoordinator {
                     &index.source_watermarks,
                 )
                 .map_err(DbError::Checkpoint)?;
-        }
-        #[cfg(feature = "cluster")]
-        if let Some(controller) = self.cluster_controller.as_ref() {
-            use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
             // The durable Commit is already immutable. Its cluster hint is best-effort and must
             // not delay sink continuation or the terminal caller reply without bound.
             let notification_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
@@ -5401,8 +5551,6 @@ impl CheckpointCoordinator {
         ),
         String,
     > {
-        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, QuorumOutcome};
-
         let PrepareQuorum {
             attempt,
             local_watermark,

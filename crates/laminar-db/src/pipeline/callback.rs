@@ -782,19 +782,19 @@ pub trait PipelineCallback: Send + 'static {
     /// # Errors
     ///
     /// Returns an error if the subscription cut cannot be reserved atomically.
-    fn reserve_subscription_cut(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }
 
     /// Discard an unresolved subscription cut after checkpoint failure.
-    fn abort_subscription_cut(&self, _attempt: CheckpointAttempt) {}
+    fn abort_subscription_cut(&mut self, _attempt: CheckpointAttempt) {}
 
     /// Resolve the exact cut for external SUBSCRIBE consumers after durable commit.
     ///
     /// # Errors
     ///
     /// Returns an error if the committed cut cannot be published atomically.
-    fn publish_barrier(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }
 

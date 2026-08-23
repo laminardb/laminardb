@@ -13,24 +13,29 @@ use crate::checkpoint::checkpoint_manifest::{
     checkpoint_descriptor_sha256, ByteRange, CheckpointManifest, NodeDataObject,
     PreparedSinkDescriptor, StateChunkId,
 };
-use crate::checkpoint::{canonical_json_bytes, canonical_json_sha256};
+use crate::checkpoint::{canonical_json_bytes, OutputSegmentRef};
 use crate::checkpoint_decision::CheckpointArtifactInventory;
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
 
+mod artifact_identity;
 mod conditional_probe;
+mod subscription_segments;
 mod validation;
 
+pub use artifact_identity::checkpoint_artifact_identity_sha256;
 pub use conditional_probe::{
     probe_object_store_conditional_create, probe_object_store_conditional_update,
 };
+pub use subscription_segments::SubscriptionOrphanCleanup;
+pub use validation::validate_max_checkpoint_node_data_bytes;
 use validation::{
-    checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, missing_node_data, sha256,
-    validate_abort_seal, validate_abort_seal_request, validate_node_data_layout,
+    checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, missing_node_data,
+    normalize_prefix, sha256, validate_abort_seal, validate_abort_seal_request,
+    validate_node_data_layout,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ABORT_SEAL_BYTES: u64 = MAX_MANIFEST_BYTES + 64 * 1024;
-const CHECKPOINT_ARTIFACT_IDENTITY_VERSION: u32 = 1;
 const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION: u32 = 1;
 
 /// Default maximum size of one participant's checkpoint data object.
@@ -53,27 +58,6 @@ pub enum CheckpointStoreError {
     NotFound(u64),
 }
 
-/// Validate the configured per-node checkpoint byte budget.
-///
-/// # Errors
-/// Returns an error for zero or unrepresentable limits.
-pub fn validate_max_checkpoint_node_data_bytes(limit: u64) -> Result<(), CheckpointStoreError> {
-    if limit == 0 {
-        return Err(CheckpointStoreError::Invalid(
-            "checkpoint node-data limit must be greater than zero".into(),
-        ));
-    }
-    // Rust allocations are limited to `isize::MAX` bytes even when `usize`
-    // can represent a larger value. This budget ultimately bounds owned
-    // checkpoint buffers, so reject limits that no single buffer can address.
-    if limit > isize::MAX as u64 {
-        return Err(CheckpointStoreError::Invalid(format!(
-            "checkpoint node-data limit {limit} exceeds this process address space"
-        )));
-    }
-    Ok(())
-}
-
 /// Exact canonical bytes persisted for a checkpoint manifest.
 ///
 /// # Errors
@@ -82,13 +66,6 @@ pub fn checkpoint_manifest_bytes(
     manifest: &CheckpointManifest,
 ) -> Result<Vec<u8>, serde_json::Error> {
     canonical_json_bytes(manifest)
-}
-
-#[derive(serde::Serialize)]
-struct CheckpointArtifactIdentityPayload<'a> {
-    version: u32,
-    inventory: &'a CheckpointArtifactInventory,
-    chunk: StateChunkId,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -103,45 +80,6 @@ struct CheckpointArtifactAbortSeal {
 enum ManifestAbortState {
     Sealed(Option<(CheckpointManifest, Bytes)>),
     Manifest(CheckpointManifest, Bytes),
-}
-
-/// SHA-256 binding one active artifact inventory to one exact participant object namespace.
-///
-/// # Errors
-/// Returns an error when the inventory or object identity is not canonical.
-pub fn checkpoint_artifact_identity_sha256(
-    inventory: &CheckpointArtifactInventory,
-    chunk: StateChunkId,
-) -> Result<String, CheckpointStoreError> {
-    inventory.validate().map_err(|error| {
-        CheckpointStoreError::Invalid(format!("checkpoint artifact inventory: {error}"))
-    })?;
-    if chunk.participant_id == 0 || chunk.checkpoint_id != inventory.attempt.checkpoint_id {
-        return Err(CheckpointStoreError::Invalid(
-            "checkpoint artifact chunk does not match its active inventory".into(),
-        ));
-    }
-    match inventory.assignment_fence.as_ref() {
-        Some(fence) if !fence.contains(chunk.participant_id) => {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "checkpoint artifact participant {} is outside its assignment fence",
-                chunk.participant_id
-            )));
-        }
-        None if chunk.participant_id != LOCAL_NODE_ID.0 => {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "local checkpoint artifact participant must be {}",
-                LOCAL_NODE_ID.0
-            )));
-        }
-        Some(_) | None => {}
-    }
-    canonical_json_sha256(&CheckpointArtifactIdentityPayload {
-        version: CHECKPOINT_ARTIFACT_IDENTITY_VERSION,
-        inventory,
-        chunk,
-    })
-    .map_err(CheckpointStoreError::Serde)
 }
 
 /// Immutable checkpoint storage contract.
@@ -265,6 +203,35 @@ pub trait CheckpointStore: Send + Sync {
         }
         Ok(Some(bytes))
     }
+
+    /// Create an immutable subscription segment, accepting an identical retry only.
+    async fn save_subscription_segment(
+        &self,
+        segment: &OutputSegmentRef,
+        payload: Bytes,
+    ) -> Result<(), CheckpointStoreError>;
+
+    /// Load and verify an exact subscription segment without consulting object listing.
+    async fn load_subscription_segment(
+        &self,
+        segment: &OutputSegmentRef,
+    ) -> Result<Option<Bytes>, CheckpointStoreError>;
+
+    /// Delete an explicitly unreachable subscription segment.
+    async fn delete_subscription_segment(
+        &self,
+        object_key: &str,
+    ) -> Result<(), CheckpointStoreError>;
+
+    /// Delete grace-expired segment objects not present in an authoritative reachable set.
+    /// Object listing supplies candidates only; `reachable` and `through_checkpoint_id` are the
+    /// caller's committed-state authority.
+    async fn delete_subscription_orphans(
+        &self,
+        reachable: &std::collections::BTreeSet<String>,
+        through_checkpoint_id: u64,
+        grace_before_ms: i64,
+    ) -> Result<SubscriptionOrphanCleanup, CheckpointStoreError>;
 }
 
 /// Checkpoint store backed by any [`ObjectStore`] implementation.
@@ -905,14 +872,42 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     async fn delete_node_data(&self, chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
         self.delete_exact(&self.node_data_path(chunk)).await
     }
-}
 
-fn normalize_prefix(prefix: &str) -> String {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        String::new()
-    } else {
-        format!("{prefix}/")
+    async fn save_subscription_segment(
+        &self,
+        segment: &OutputSegmentRef,
+        payload: Bytes,
+    ) -> Result<(), CheckpointStoreError> {
+        subscription_segments::save(self, segment, payload).await
+    }
+
+    async fn load_subscription_segment(
+        &self,
+        segment: &OutputSegmentRef,
+    ) -> Result<Option<Bytes>, CheckpointStoreError> {
+        subscription_segments::load(self, segment).await
+    }
+
+    async fn delete_subscription_segment(
+        &self,
+        object_key: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        subscription_segments::delete(self, object_key).await
+    }
+
+    async fn delete_subscription_orphans(
+        &self,
+        reachable: &std::collections::BTreeSet<String>,
+        through_checkpoint_id: u64,
+        grace_before_ms: i64,
+    ) -> Result<SubscriptionOrphanCleanup, CheckpointStoreError> {
+        subscription_segments::delete_orphans(
+            self,
+            reachable,
+            through_checkpoint_id,
+            grace_before_ms,
+        )
+        .await
     }
 }
 

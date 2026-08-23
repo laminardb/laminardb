@@ -1283,6 +1283,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_leader_proofs:
         FxHashMap<CheckpointAttempt, laminar_core::cluster::control::LeaderProof>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_subscription_output:
+        crate::subscription::cluster::ClusterSubscriptionOutputState,
     pub(crate) named_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx:
         crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
@@ -3624,7 +3627,6 @@ impl ConnectorPipelineCallback {
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
-        let reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.require_process_authority("follower post-fence state capture") {
             drop(checkpoint_rotation_guard);
             return self
@@ -3635,6 +3637,7 @@ impl ConnectorPipelineCallback {
         // Capture the complete local node image after shuffle alignment so follower entry paths
         // cannot omit channel replay or non-keyed operator state.
         let (mut request, operator_state) = match self.build_follower_checkpoint_request_until(
+            attempt,
             assignment_fence,
             ann.flags,
             attempt_deadline,
@@ -3645,7 +3648,7 @@ impl ConnectorPipelineCallback {
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
-        request.reassignment_portable = reassignment_portable;
+        request.reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
             let error =
                 format!("follower assignment changed during mutable state capture: {error}");
@@ -3860,9 +3863,8 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        let reassignment_portable = checkpoint_rotation_guard.is_some();
-
         let (mut request, operator_state) = match self.build_follower_checkpoint_request_until(
+            attempt,
             assignment_fence,
             ann.flags,
             attempt_deadline,
@@ -3873,7 +3875,7 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        request.reassignment_portable = reassignment_portable;
+        request.reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
             let error = format!(
                 "deferred follower assignment changed during mutable state capture: {error}"
@@ -3974,6 +3976,7 @@ impl ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
     fn build_follower_checkpoint_request_until(
         &mut self,
+        attempt: CheckpointAttempt,
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         flags: u64,
         deadline: tokio::time::Instant,
@@ -4001,7 +4004,7 @@ impl ConnectorPipelineCallback {
             );
         }
         let operator_state = self.capture_operator_state_until(deadline)?;
-        let mut request = self.build_checkpoint_request()?;
+        let mut request = self.build_checkpoint_request(attempt)?;
         (request.flags, request.handoff_replay_pending) = (flags, handoff_replay_pending);
         request.assignment_fence = Some(assignment_fence.clone());
         Ok((request, operator_state))
@@ -4329,7 +4332,8 @@ impl ConnectorPipelineCallback {
     /// Source offset overrides remain empty here. The immutable source snapshot is already owned
     /// by the durable tail, which materializes it on a blocking worker after the pipeline resumes.
     fn build_checkpoint_request(
-        &self,
+        &mut self,
+        attempt: CheckpointAttempt,
     ) -> Result<crate::checkpoint_coordinator::CheckpointRequest, String> {
         let mut channel_progress = Vec::new();
         if let Some(tracker) = self.tracker.as_ref() {
@@ -4379,6 +4383,18 @@ impl ConnectorPipelineCallback {
                     .cmp(&(&right.source_name, &right.input_channel))
             });
         }
+        #[cfg(feature = "cluster")]
+        let subscription_output = if self.in_cluster() {
+            let frontiers = self
+                .graph
+                .capture_subscription_frontiers()
+                .map_err(|error| error.to_string())?;
+            self.cluster_subscription_output
+                .prepare_checkpoint(attempt, frontiers)
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         Ok(crate::checkpoint_coordinator::CheckpointRequest {
             flags: laminar_core::checkpoint::flags::NONE,
             handoff_replay_pending: false,
@@ -4389,6 +4405,8 @@ impl ConnectorPipelineCallback {
             source_names: self.checkpoint_source_names.clone(),
             channel_progress,
             source_offset_overrides: HashMap::new(),
+            #[cfg(feature = "cluster")]
+            subscription_output,
         })
     }
 
@@ -4923,7 +4941,7 @@ impl ConnectorPipelineCallback {
                 Ok(Ok(results)) => results,
                 Ok(Err(error)) => {
                     #[cfg(feature = "cluster")]
-                    self.graph.abort_prepared_subscription_outputs();
+                    self.abort_prepared_subscription_output_cycle();
                     let mapped = Self::map_checkpoint_drain_error(&error, &self.shutdown_signal);
                     self.record_pipeline_halt(&mapped);
                     if let crate::pipeline::CycleError::Recovery(reason) = &mapped {
@@ -5379,7 +5397,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             Ok(results) => results,
             Err(error) => {
                 #[cfg(feature = "cluster")]
-                self.graph.abort_prepared_subscription_outputs();
+                self.abort_prepared_subscription_output_cycle();
                 let error = Self::map_graph_error(&error, &self.shutdown_signal);
                 self.record_pipeline_halt(&error);
                 return Err(error);
@@ -5391,7 +5409,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         {
             let subscription_outputs = self.graph.take_prepared_subscription_outputs();
             if let Err(error) = self.stage_subscription_outputs(subscription_outputs) {
-                self.graph.abort_prepared_subscription_outputs();
+                self.abort_prepared_subscription_output_cycle();
                 return Err(error);
             }
         }
@@ -5498,12 +5516,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     #[cfg(feature = "cluster")]
     fn commit_subscription_output(&mut self) {
-        self.graph.commit_prepared_subscription_outputs();
+        self.commit_prepared_subscription_output_cycle();
     }
 
     #[cfg(feature = "cluster")]
     fn abort_subscription_output(&mut self) {
-        self.graph.abort_prepared_subscription_outputs();
+        self.abort_prepared_subscription_output_cycle();
     }
 
     fn update_mv_stores(
@@ -6796,7 +6814,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         }
 
-        let mut request = match self.build_checkpoint_request() {
+        let mut request = match self.build_checkpoint_request(attempt) {
             Ok(request) => request,
             Err(error) => {
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
@@ -6996,23 +7014,35 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         false
     }
 
-    fn reserve_subscription_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         if self.in_cluster() {
-            return Ok(());
+            return self
+                .cluster_subscription_output
+                .reserve_checkpoint(attempt)
+                .map_err(|error| error.to_string());
         }
         self.subscription_registry.reserve_cut(attempt)
     }
 
-    fn abort_subscription_cut(&self, attempt: CheckpointAttempt) {
+    fn abort_subscription_cut(&mut self, attempt: CheckpointAttempt) {
         if self.in_cluster() {
+            if let Err(error) = self.cluster_subscription_output.abort_checkpoint(attempt) {
+                set_checkpoint_fault(
+                    &self.checkpoint_fault,
+                    format!("abort cluster subscription checkpoint: {error}"),
+                );
+            }
             return;
         }
         self.subscription_registry.abort_cut(attempt);
     }
 
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         if self.in_cluster() {
-            return Ok(());
+            return self
+                .cluster_subscription_output
+                .commit_checkpoint(attempt)
+                .map_err(|error| error.to_string());
         }
         self.subscription_registry.commit_cut(attempt)
     }

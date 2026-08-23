@@ -27,6 +27,8 @@ mod compile;
 mod concrete;
 mod emission;
 mod keys;
+#[cfg(feature = "cluster")]
+mod output_sequence;
 mod scalar_ipc;
 mod vnode_state;
 pub(crate) use checkpoints::AggStateArchiveRestoreProfile;

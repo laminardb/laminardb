@@ -143,6 +143,7 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
         has_frame: false,
         incremental: false,
         subscription_output: None,
+        subscription_retention_bytes: 0,
         catalog_generation: 1,
         subscription_certificate: None,
     };

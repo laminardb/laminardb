@@ -238,6 +238,7 @@ impl LaminarDB {
                 incremental,
                 // Cluster materialized-view subscriptions remain fail-closed.
                 subscription_output: None,
+                subscription_retention_bytes: 0,
                 catalog_generation: 1,
                 subscription_certificate: None,
             });

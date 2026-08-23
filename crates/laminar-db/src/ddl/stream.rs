@@ -92,6 +92,7 @@ impl PlannedStreamingQuery {
             has_frame: self.has_frame,
             incremental: false,
             subscription_output: self.subscription_output.clone(),
+            subscription_retention_bytes: 0,
             catalog_generation: 1,
             subscription_certificate: None,
         }
@@ -312,6 +313,7 @@ impl LaminarDB {
                 has_frame: plan_has_frame,
                 incremental: false,
                 subscription_output: plan_subscription_output,
+                subscription_retention_bytes: retention_bytes.unwrap_or(0),
                 catalog_generation: 1,
                 subscription_certificate: None,
             });

@@ -46,6 +46,8 @@ pub(crate) struct StreamRegistration {
     pub incremental: bool,
     /// Planner-owned stable output distribution for a potentially subscribable stream.
     pub subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+    /// Durable output-log byte cap for checkpoint replay; zero admits tail only.
+    pub subscription_retention_bytes: u64,
     /// Durable object incarnation from the authoritative catalog manifest.
     pub catalog_generation: u64,
     /// Fully bound runtime certificate; populated before cluster graph construction.

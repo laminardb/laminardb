@@ -218,6 +218,7 @@ impl LaminarDB {
                 registration.catalog_generation,
                 &name,
                 schema_fingerprint,
+                registration.subscription_retention_bytes,
                 pipeline_identity.clone(),
                 self.checkpoint_key_groups(),
             )?);

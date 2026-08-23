@@ -8,12 +8,13 @@ use std::num::{NonZeroU32, NonZeroU64};
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::assignment::CheckpointAssignmentFence;
+use crate::checkpoint::NodeSubscriptionManifest;
 use crate::state::{
     KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID, PARTITIONING_ABI_VERSION,
 };
 
 /// Current checkpoint manifest format. Every other version is rejected.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 9;
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 10;
 
 /// Canonical pipeline-identity payload version.
 pub const PIPELINE_IDENTITY_VERSION: u16 = 7;
@@ -234,6 +235,9 @@ pub struct CheckpointManifest {
     pub prepared_sinks: Vec<PreparedSinkDescriptor>,
     /// Canonically ordered older objects retained by `state_frames`.
     pub referenced_chunks: Vec<ReferencedStateChunk>,
+    /// Participant-local subscription output ranges and immutable segment references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_output: Option<NodeSubscriptionManifest>,
 }
 
 /// Errors found during manifest validation.
@@ -298,6 +302,7 @@ impl CheckpointManifest {
             state_frames: Vec::new(),
             prepared_sinks: Vec::new(),
             referenced_chunks: Vec::new(),
+            subscription_output: None,
         }
     }
 
@@ -307,7 +312,7 @@ impl CheckpointManifest {
         self.node_data.chunk.participant_id = participant_id;
     }
 
-    /// Validate the exact v9 recovery contract.
+    /// Validate the exact v10 recovery contract.
     #[must_use]
     pub fn validate(
         &self,
@@ -342,51 +347,7 @@ impl CheckpointManifest {
         if !valid_deployment {
             error("deployment_id must be a canonical non-nil UUID".into());
         }
-        if self.vnode_count != expected_key_group_count.get() {
-            error(format!(
-                "vnode_count mismatch: checkpoint has {}, runtime expects {expected_key_group_count}",
-                self.vnode_count
-            ));
-        }
-        if self.participant_id == 0 {
-            error("participant_id must be nonzero".into());
-        }
-        if self.owned_vnodes.is_empty() {
-            error("owned_vnodes must not be empty".into());
-        } else if !self.owned_vnodes.windows(2).all(|pair| pair[0] < pair[1]) {
-            error("owned_vnodes must be strictly ordered and unique".into());
-        }
-        if self
-            .owned_vnodes
-            .iter()
-            .any(|vnode| *vnode >= self.vnode_count)
-        {
-            error("owned_vnodes contains a vnode outside the manifest domain".into());
-        }
-        if let Some(fence) = &self.assignment_fence {
-            if fence.vnode_count != u32::from(self.vnode_count)
-                || fence.partitioning_abi_version != self.partitioning_abi_version
-                || !fence.contains(self.participant_id)
-            {
-                error(
-                    "assignment_fence does not cover this manifest topology and participant".into(),
-                );
-            }
-            if !self.reassignment_portable {
-                error(
-                    "a cluster manifest must be proven portable across vnode reassignment".into(),
-                );
-            }
-        } else {
-            let owns_complete_domain = self.owned_vnodes.len() == usize::from(self.vnode_count)
-                && self.owned_vnodes.iter().copied().eq(0..self.vnode_count);
-            if self.participant_id != LOCAL_NODE_ID.0 || !owns_complete_domain {
-                error("a local manifest must use LOCAL_NODE_ID and own every vnode".into());
-            }
-            if self.reassignment_portable {
-                error("a local manifest cannot claim vnode reassignment portability".into());
-            }
-        }
+        validate_topology(self, expected_key_group_count, &mut error);
         validate_sorted_unique("source_names", &self.source_names, &mut error);
         validate_sorted_unique("sink_names", &self.sink_names, &mut error);
         if !self.channel_progress.windows(2).all(|pair| {
@@ -664,6 +625,94 @@ impl CheckpointManifest {
 
         errors
     }
+}
+
+fn validate_topology(
+    manifest: &CheckpointManifest,
+    expected_key_group_count: KeyGroupCount,
+    error: &mut impl FnMut(String),
+) {
+    if manifest.vnode_count != expected_key_group_count.get() {
+        error(format!(
+            "vnode_count mismatch: checkpoint has {}, runtime expects {expected_key_group_count}",
+            manifest.vnode_count
+        ));
+    }
+    if manifest.participant_id == 0 {
+        error("participant_id must be nonzero".into());
+    }
+    if manifest.owned_vnodes.is_empty() {
+        error("owned_vnodes must not be empty".into());
+    } else if !manifest
+        .owned_vnodes
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
+    {
+        error("owned_vnodes must be strictly ordered and unique".into());
+    }
+    if manifest
+        .owned_vnodes
+        .iter()
+        .any(|vnode| *vnode >= manifest.vnode_count)
+    {
+        error("owned_vnodes contains a vnode outside the manifest domain".into());
+    }
+    match &manifest.assignment_fence {
+        Some(fence) => validate_cluster_topology(manifest, fence, error),
+        None => validate_local_topology(manifest, error),
+    }
+    if let Some(message) = subscription_output_validation_error(manifest) {
+        error(message);
+    }
+}
+
+fn validate_cluster_topology(
+    manifest: &CheckpointManifest,
+    fence: &CheckpointAssignmentFence,
+    error: &mut impl FnMut(String),
+) {
+    if fence.vnode_count != u32::from(manifest.vnode_count)
+        || fence.partitioning_abi_version != manifest.partitioning_abi_version
+        || !fence.contains(manifest.participant_id)
+    {
+        error("assignment_fence does not cover this manifest topology and participant".into());
+    }
+    if !manifest.reassignment_portable {
+        error("a cluster manifest must be proven portable across vnode reassignment".into());
+    }
+}
+
+fn validate_local_topology(manifest: &CheckpointManifest, error: &mut impl FnMut(String)) {
+    let owns_complete_domain = manifest.owned_vnodes.len() == usize::from(manifest.vnode_count)
+        && manifest
+            .owned_vnodes
+            .iter()
+            .copied()
+            .eq(0..manifest.vnode_count);
+    if manifest.participant_id != LOCAL_NODE_ID.0 || !owns_complete_domain {
+        error("a local manifest must use LOCAL_NODE_ID and own every vnode".into());
+    }
+    if manifest.reassignment_portable {
+        error("a local manifest cannot claim vnode reassignment portability".into());
+    }
+}
+
+fn subscription_output_validation_error(manifest: &CheckpointManifest) -> Option<String> {
+    let output = manifest.subscription_output.as_ref()?;
+    let Some(fence) = manifest.assignment_fence.as_ref() else {
+        return Some("a local manifest cannot carry cluster subscription output".into());
+    };
+    if output.epoch != manifest.epoch
+        || output.checkpoint_id != manifest.checkpoint_id
+        || output.participant_id != manifest.participant_id
+        || output.assignment_certificate != *fence
+    {
+        return Some("subscription output manifest belongs to a different participant cut".into());
+    }
+    output
+        .validate(&manifest.owned_vnodes)
+        .err()
+        .map(|error| format!("subscription output manifest is invalid: {error}"))
 }
 
 /// Connector-owned offset map stored at the exact checkpoint cut.

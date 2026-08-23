@@ -77,7 +77,9 @@ impl OutputDistribution {
         Ok(())
     }
 
-    pub(crate) fn contains(&self, partition: OutputPartitionId) -> bool {
+    /// Whether `partition` belongs to this certified output domain.
+    #[must_use]
+    pub fn contains(&self, partition: OutputPartitionId) -> bool {
         match self {
             Self::VnodePartitioned { vnode_count, .. } => partition.get() < *vnode_count,
             Self::Singleton {
@@ -121,6 +123,8 @@ pub struct OutputDistributionCertificate {
     pub schema_fingerprint: SubscriptionDigest,
     /// Changelog representation emitted by the final operator.
     pub changelog_mode: ChangelogMode,
+    /// Maximum committed output bytes retained for epoch replay; zero admits tail only.
+    pub history_retention_bytes: u64,
     /// Canonical query fingerprint.
     pub query_fingerprint: SubscriptionDigest,
     /// Complete pipeline/state ABI identity.
@@ -214,6 +218,7 @@ mod tests {
             },
             schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
             changelog_mode: ChangelogMode::WeightedRetractInsert,
+            history_retention_bytes: 0,
             query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
             pipeline_identity: PipelineIdentity::empty(),
         }

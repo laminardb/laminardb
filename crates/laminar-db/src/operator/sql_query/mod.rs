@@ -56,8 +56,11 @@ use crate::sql_analysis::{
 const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
 const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
 
+mod apply_failure;
 #[cfg(feature = "cluster")]
 mod subscription_output;
+
+use apply_failure::stateful_apply_outcome_unknown;
 
 /// Whether Arrow concatenation is representation-stable for this local aggregate input type.
 ///
@@ -924,19 +927,6 @@ pub(crate) struct SqlQueryOperator {
     prepared_vnode_transition: Option<PreparedSqlVnodeTransition>,
     #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<SqlVnodeTransitionCleanup>,
-}
-
-/// Classify a failure from a step that may already have changed operator state.
-///
-/// Ordinary errors are not safe to isolate or retry once mutation may have begun. Existing
-/// recovery and halt dispositions retain their stronger classification.
-fn stateful_apply_outcome_unknown(op_name: &str, phase: &str, error: DbError) -> DbError {
-    if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
-        return error;
-    }
-    DbError::StatefulOperatorPartialApply(format!(
-        "aggregate '{op_name}' {phase} failed after state application began; the apply outcome is unknown: {error}"
-    ))
 }
 
 impl SqlQueryOperator {
@@ -3001,6 +2991,13 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
     ) -> Option<crate::subscription::PreparedSubscriptionOutput> {
         self.take_prepared_subscription_output_frames()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn certified_subscription_frontiers(
+        &self,
+    ) -> Result<Option<crate::subscription::CertifiedSubscriptionFrontiers>, DbError> {
+        self.capture_certified_subscription_frontiers()
     }
 
     #[cfg(feature = "cluster")]

@@ -508,6 +508,8 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         checkpoint_leader_proofs: FxHashMap::default(),
         subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+        #[cfg(feature = "cluster")]
+        cluster_subscription_output: Default::default(),
         named_stream_names: rustc_hash::FxHashSet::default(),
         checkpoint_complete_tx,
         checkpoint_tail_runtime: tokio::runtime::Handle::current(),
@@ -3203,6 +3205,7 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
     // deferred source-barrier capture.
     let (mut request, operator_state) = callback
         .build_follower_checkpoint_request_until(
+            laminar_core::checkpoint::CheckpointAttempt::canonical(17),
             &assignment_fence,
             laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -3248,6 +3251,7 @@ async fn follower_capture_request_rejects_an_expired_deadline() {
 
     let error = callback
         .build_follower_checkpoint_request_until(
+            laminar_core::checkpoint::CheckpointAttempt::canonical(18),
             &assignment_fence,
             laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() - Duration::from_millis(1),
@@ -3376,6 +3380,7 @@ fn cluster_callback_fixture(
             pending_follower_checkpoint: None,
             checkpoint_leader_proofs: FxHashMap::default(),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+            cluster_subscription_output: Default::default(),
             named_stream_names: rustc_hash::FxHashSet::default(),
             checkpoint_complete_tx,
             checkpoint_tail_runtime: tokio::runtime::Handle::current(),
@@ -4531,7 +4536,9 @@ async fn empty_idle_source_gaining_a_channel_activates_at_the_pinned_committed_c
     callback.watermark_states.insert("orders".into(), state);
     crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
 
-    let request = callback.build_checkpoint_request().unwrap();
+    let request = callback
+        .build_checkpoint_request(CheckpointAttempt::canonical(1))
+        .unwrap();
     assert_eq!(request.channel_progress.len(), 1);
     let marker = &request.channel_progress[0];
     assert_eq!(marker.source_name, "orders");
@@ -4587,7 +4594,9 @@ async fn local_empty_partition_inventory_emits_its_logical_watermark_marker() {
     tracker.mark_idle(0);
     callback.tracker = Some(tracker);
 
-    let request = callback.build_checkpoint_request().unwrap();
+    let request = callback
+        .build_checkpoint_request(CheckpointAttempt::canonical(1))
+        .unwrap();
     assert_eq!(request.channel_progress.len(), 1);
     let marker = &request.channel_progress[0];
     assert_eq!(marker.source_name, "orders");

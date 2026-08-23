@@ -13,6 +13,12 @@ pub const MAX_OUTPUT_SEGMENTS_PER_MANIFEST: usize = 65_536;
 /// Hard canonical encoded size bound for one stream checkpoint manifest.
 pub const MAX_SUBSCRIPTION_MANIFEST_BYTES: usize = 8 * 1024 * 1024;
 
+/// Hard encoded-object bound for one immutable Arrow output segment.
+pub const MAX_OUTPUT_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard frame-count bound for one immutable Arrow output segment.
+pub const MAX_OUTPUT_FRAMES_PER_SEGMENT: u64 = 1_024;
+
 const MAX_OBJECT_KEY_BYTES: usize = 2_048;
 
 /// First partition sequence not covered by a committed checkpoint.
@@ -56,7 +62,7 @@ pub struct OutputSegmentRef {
 }
 
 impl OutputSegmentRef {
-    fn validate(
+    pub(crate) fn validate(
         &self,
         certificate: &OutputDistributionCertificate,
     ) -> Result<(), SubscriptionContractError> {
@@ -92,8 +98,10 @@ impl OutputSegmentRef {
             .ok_or(SubscriptionContractError::InvalidSegmentRange)?;
         if range == 0
             || range != self.frame_count
+            || self.frame_count > MAX_OUTPUT_FRAMES_PER_SEGMENT
             || self.row_count == 0
             || self.encoded_length == 0
+            || self.encoded_length > u64::try_from(MAX_OUTPUT_SEGMENT_BYTES).unwrap_or(u64::MAX)
         {
             return Err(SubscriptionContractError::InvalidSegmentRange);
         }
@@ -424,6 +432,36 @@ pub enum SubscriptionContractError {
     /// Manifest body does not match its content digest.
     #[error("subscription manifest digest mismatch")]
     ManifestDigest,
+    /// Participant-local stream inventory is not sorted and unique.
+    #[error("subscription node streams must be strictly sorted and unique")]
+    NonCanonicalNodeStreams,
+    /// Participant-local partition ranges are not sorted and unique.
+    #[error("subscription node partition ranges must be strictly sorted and unique")]
+    NonCanonicalPartitionRanges,
+    /// A participant claimed an output partition it does not own.
+    #[error("subscription partition {partition} was published by the wrong owner")]
+    PartitionOwnerMismatch {
+        /// Partition claimed by the wrong participant.
+        partition: u16,
+    },
+    /// Participant identity is missing from its assignment certificate.
+    #[error("subscription node participant binding is invalid")]
+    NodeParticipant,
+    /// Participant manifest body does not match its content digest.
+    #[error("subscription node manifest digest mismatch")]
+    NodeManifestDigest,
+    /// A committed partition interval is discontinuous.
+    #[error(
+        "subscription partition {partition} sequence gap: expected {expected}, found {actual}"
+    )]
+    SequenceGap {
+        /// Partition containing the gap.
+        partition: u16,
+        /// Required next sequence.
+        expected: u64,
+        /// Observed next sequence.
+        actual: u64,
+    },
 }
 
 #[cfg(test)]
@@ -449,6 +487,7 @@ mod tests {
             },
             schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
             changelog_mode: super::super::ChangelogMode::WeightedRetractInsert,
+            history_retention_bytes: 0,
             query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
             pipeline_identity: PipelineIdentity::empty(),
         }
@@ -551,6 +590,60 @@ mod tests {
         assert_eq!(
             manifest.validate(),
             Err(SubscriptionContractError::ManifestDigest)
+        );
+    }
+
+    #[test]
+    fn segment_reference_rejects_allocation_sized_counts_and_lengths() {
+        let certificate = certificate();
+        let mut segment = OutputSegmentRef {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            object_key: "subscription-output/deployment/stream/generation/0/segment.arrow".into(),
+            stream_generation: certificate.stream_generation,
+            partition: OutputPartitionId::new(0),
+            first_sequence: PartitionSequence::FIRST,
+            exclusive_end_sequence: PartitionSequence::new(MAX_OUTPUT_FRAMES_PER_SEGMENT + 1),
+            frame_count: MAX_OUTPUT_FRAMES_PER_SEGMENT + 1,
+            row_count: 1,
+            encoded_length: 1,
+            schema_fingerprint: certificate.schema_fingerprint,
+            payload_digest: SubscriptionDigest::from_bytes([5; 32]),
+        };
+        assert_eq!(
+            segment.validate(&certificate),
+            Err(SubscriptionContractError::InvalidSegmentRange)
+        );
+
+        segment.exclusive_end_sequence = PartitionSequence::new(1);
+        segment.frame_count = 1;
+        segment.encoded_length = u64::try_from(MAX_OUTPUT_SEGMENT_BYTES).unwrap() + 1;
+        assert_eq!(
+            segment.validate(&certificate),
+            Err(SubscriptionContractError::InvalidSegmentRange)
+        );
+    }
+
+    #[test]
+    fn overlapping_segment_ranges_are_rejected() {
+        let mut manifest = manifest();
+        manifest.frontiers[0].through_sequence = PartitionSequence::new(3);
+        let segment = |first, end, marker| OutputSegmentRef {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            object_key: format!("subscription-output/test/{marker}.arrow"),
+            stream_generation: manifest.stream_generation,
+            partition: OutputPartitionId::new(0),
+            first_sequence: PartitionSequence::new(first),
+            exclusive_end_sequence: PartitionSequence::new(end),
+            frame_count: end - first,
+            row_count: 1,
+            encoded_length: 1,
+            schema_fingerprint: manifest.schema_fingerprint,
+            payload_digest: SubscriptionDigest::from_bytes([5; 32]),
+        };
+        manifest.segments = vec![segment(0, 2, "first"), segment(1, 3, "second")];
+        assert_eq!(
+            manifest.validate(),
+            Err(SubscriptionContractError::OverlappingSegments)
         );
     }
 }

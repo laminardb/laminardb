@@ -8,9 +8,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
-    channel_progress_frontiers_by_source, classify_channel_progress, ChannelProgress,
-    CheckpointAssignmentFence, CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
-    SINGLETON_WATERMARK_CHANNEL,
+    channel_progress_frontiers_by_source, classify_channel_progress,
+    merge_node_subscription_manifests, ChannelProgress, CheckpointAssignmentFence,
+    CheckpointManifest, ConnectorCheckpoint, PipelineIdentity, SINGLETON_WATERMARK_CHANNEL,
 };
 use crate::state::{KeyGroupCount, LOCAL_NODE_ID};
 
@@ -546,6 +546,24 @@ impl CommittedCheckpointIndex {
                 return Err(
                     "committed manifest vnode owners do not match the assignment fence".into(),
                 );
+            }
+            let subscription_manifests = manifests
+                .iter()
+                .filter_map(|(manifest, _)| manifest.subscription_output.as_ref())
+                .collect::<Vec<_>>();
+            if !subscription_manifests.is_empty() {
+                if subscription_manifests.len() != manifests.len() {
+                    return Err(
+                        "participant manifests do not agree on subscription output presence".into(),
+                    );
+                }
+                merge_node_subscription_manifests(
+                    self.epoch,
+                    self.checkpoint_id,
+                    fence,
+                    &subscription_manifests,
+                )
+                .map_err(|error| format!("committed subscription output is invalid: {error}"))?;
             }
         }
         Ok(())

@@ -37,6 +37,8 @@ use laminar_sql::translator::{
 
 mod catalog_context;
 #[cfg(feature = "cluster")]
+mod execution_poison;
+#[cfg(feature = "cluster")]
 mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
@@ -380,6 +382,14 @@ pub(crate) trait GraphOperator: Send {
         None
     }
 
+    /// Capture participant-owned partition frontiers for a certified final operator.
+    #[cfg(feature = "cluster")]
+    fn certified_subscription_frontiers(
+        &self,
+    ) -> Result<Option<crate::subscription::CertifiedSubscriptionFrontiers>, DbError> {
+        Ok(None)
+    }
+
     /// Publish bookkeeping for the output transferred by the current graph cycle.
     #[cfg(feature = "cluster")]
     fn commit_prepared_subscription_output(&mut self) {}
@@ -618,27 +628,6 @@ const GRAPH_EXECUTION_POISON_REASON: &str =
      terminally after input admission, or a vnode lifecycle callback returned an indeterminate \
      outcome; recovery from the last committed checkpoint is required";
 
-/// In cluster mode, assignment adoption may trust the installed-state binding only while this
-/// graph generation remains usable. Clear that success marker before publishing poison so an
-/// observer that sees the poison can never retain authority derived from indeterminate state.
-#[cfg(feature = "cluster")]
-fn publish_cluster_execution_poison(
-    poisoned: &AtomicBool,
-    installed_vnode_state: Option<&crate::vnode_transition_staging::InstalledVnodeStateHandle>,
-    pending_vnode_transition: Option<(
-        &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
-        &Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
-    )>,
-) {
-    if let Some(installed_vnode_state) = installed_vnode_state {
-        installed_vnode_state.lock().take();
-    }
-    if let Some((handle, expected)) = pending_vnode_transition {
-        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(handle, expected);
-    }
-    poisoned.store(true, Ordering::Release);
-}
-
 /// A graph cycle may hold operator mutation and graph-owned input in different futures. Unwind or
 /// cancellation before the explicit result boundary permanently fences this graph generation;
 /// post-admission terminal results are fenced where they are classified.
@@ -668,7 +657,7 @@ impl Drop for GraphExecutionAttemptGuard {
     fn drop(&mut self) {
         if self.armed {
             #[cfg(feature = "cluster")]
-            publish_cluster_execution_poison(
+            execution_poison::publish_cluster_execution_poison(
                 &self.poisoned,
                 self.installed_vnode_state.as_ref(),
                 None,
@@ -3627,7 +3616,7 @@ impl OperatorGraph {
         if self.installed_vnode_state.is_none() && pending.is_none() {
             return;
         }
-        publish_cluster_execution_poison(
+        execution_poison::publish_cluster_execution_poison(
             &self.execution_poisoned,
             self.installed_vnode_state.as_ref(),
             pending.as_ref().map(|(handle, pending)| (handle, pending)),

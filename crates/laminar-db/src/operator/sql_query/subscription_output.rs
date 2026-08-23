@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use laminar_core::checkpoint::{ChangelogMode, OutputDistribution, OutputDistributionCertificate};
+use laminar_core::checkpoint::{
+    ChangelogMode, OutputDistribution, OutputDistributionCertificate, OutputPartitionId,
+};
 use laminar_core::state::VnodeAssignmentSnapshot;
 
 use super::{ClusterShuffleConfig, QueryState, SqlQueryOperator};
 use crate::aggregate_state::IncrementalAggState;
 use crate::error::DbError;
 use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
-use crate::subscription::PreparedSubscriptionOutput;
+use crate::subscription::{CertifiedSubscriptionFrontiers, PreparedSubscriptionOutput};
 
 impl SqlQueryOperator {
     pub(crate) fn attach_subscription_certificate(
@@ -90,6 +92,35 @@ impl SqlQueryOperator {
     ) -> Result<(ClusterShuffleConfig, VnodeAssignmentSnapshot, Arc<[u64]>), DbError> {
         self.require_no_prepared_subscription_output("capture a checkpoint")?;
         self.active_cluster_scope()
+    }
+
+    pub(super) fn capture_certified_subscription_frontiers(
+        &self,
+    ) -> Result<Option<CertifiedSubscriptionFrontiers>, DbError> {
+        let Some(certificate) = self.subscription_certificate.as_ref() else {
+            return Ok(None);
+        };
+        let QueryState::Agg(aggregate) = &self.state else {
+            return Err(DbError::Checkpoint(format!(
+                "certified subscription aggregate '{}' is not initialized",
+                self.op_name
+            )));
+        };
+        let (config, assignment, _) = self.subscription_checkpoint_scope()?;
+        let vnodes = assignment
+            .owners()
+            .iter()
+            .enumerate()
+            .filter_map(|(vnode, owner)| {
+                let vnode = u32::try_from(vnode).ok()?;
+                let partition = u16::try_from(vnode).ok().map(OutputPartitionId::new)?;
+                (*owner == config.self_id && certificate.distribution.contains(partition))
+                    .then_some(vnode)
+            });
+        Ok(Some(CertifiedSubscriptionFrontiers {
+            certificate: Arc::clone(certificate),
+            frontiers: aggregate.output_frontiers(vnodes)?,
+        }))
     }
 
     pub(super) fn require_vnode_state_boundary(&self, context: &str) -> Result<(), DbError> {

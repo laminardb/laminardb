@@ -3,6 +3,7 @@
 mod distribution;
 mod identity;
 mod manifest;
+mod node_manifest;
 
 pub use distribution::{
     ChangelogMode, OutputDistribution, OutputDistributionCertificate,
@@ -14,5 +15,10 @@ pub use identity::{
 };
 pub use manifest::{
     OutputSegmentRef, PartitionFrontier, SubscriptionCheckpointManifest, SubscriptionContractError,
-    MAX_OUTPUT_SEGMENTS_PER_MANIFEST, MAX_SUBSCRIPTION_MANIFEST_BYTES,
+    MAX_OUTPUT_FRAMES_PER_SEGMENT, MAX_OUTPUT_SEGMENTS_PER_MANIFEST, MAX_OUTPUT_SEGMENT_BYTES,
+    MAX_SUBSCRIPTION_MANIFEST_BYTES,
+};
+pub use node_manifest::{
+    merge_node_subscription_manifests, MergedSubscriptionCheckpoint, NodePartitionRange,
+    NodeSubscriptionManifest, NodeSubscriptionStreamManifest,
 };

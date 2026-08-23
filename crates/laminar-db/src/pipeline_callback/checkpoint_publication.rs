@@ -16,14 +16,14 @@ impl ConnectorPipelineCallback {
         {
             let subscription_outputs = self.graph.take_prepared_subscription_outputs();
             if let Err(error) = self.stage_subscription_outputs(subscription_outputs) {
-                self.graph.abort_prepared_subscription_outputs();
+                self.abort_prepared_subscription_output_cycle();
                 return Err(error);
             }
         }
         let (any_failed, _) = self.graph.take_cycle_failures();
         if any_failed {
             #[cfg(feature = "cluster")]
-            self.graph.abort_prepared_subscription_outputs();
+            self.abort_prepared_subscription_output_cycle();
             let reason =
                 "checkpoint graph drain encountered a partial operator-domain failure".to_string();
             set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
@@ -37,7 +37,7 @@ impl ConnectorPipelineCallback {
         self.require_checkpoint_output_authority("materialized-view")?;
         if let Err(error) = <Self as PipelineCallback>::update_mv_stores(self, results) {
             #[cfg(feature = "cluster")]
-            self.graph.abort_prepared_subscription_outputs();
+            self.abort_prepared_subscription_output_cycle();
             let reason = format!(
                 "checkpoint graph drain could not publish materialized-view output: {error}"
             );
@@ -49,7 +49,7 @@ impl ConnectorPipelineCallback {
         self.require_checkpoint_output_authority("stream")?;
         if let Err(error) = <Self as PipelineCallback>::push_to_streams(self, results) {
             #[cfg(feature = "cluster")]
-            self.graph.abort_prepared_subscription_outputs();
+            self.abort_prepared_subscription_output_cycle();
             let reason = format!("checkpoint graph drain could not publish stream output: {error}");
             set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
             return Err(CycleError::Recovery(reason));
@@ -61,7 +61,7 @@ impl ConnectorPipelineCallback {
             <Self as PipelineCallback>::write_to_sinks(self, results, Some(deadline)).await
         {
             #[cfg(feature = "cluster")]
-            self.graph.abort_prepared_subscription_outputs();
+            self.abort_prepared_subscription_output_cycle();
             if let CycleError::Recovery(reason) = &error {
                 set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
             }
@@ -71,7 +71,7 @@ impl ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         {
             self.require_checkpoint_output_authority("continuation")?;
-            self.graph.commit_prepared_subscription_outputs();
+            self.commit_prepared_subscription_output_cycle();
         }
         Ok(())
     }
@@ -81,7 +81,7 @@ impl ConnectorPipelineCallback {
         if let Err(error) =
             self.require_process_authority(&format!("checkpoint {output} publication"))
         {
-            self.graph.abort_prepared_subscription_outputs();
+            self.abort_prepared_subscription_output_cycle();
             return Err(error);
         }
         Ok(())
@@ -92,36 +92,74 @@ impl ConnectorPipelineCallback {
         &mut self,
         outputs: Vec<crate::subscription::PreparedSubscriptionOutput>,
     ) -> Result<(), CycleError> {
-        for output in outputs {
-            let generation = output.certificate.stream_generation;
-            let mut previous: Option<laminar_core::checkpoint::OutputFrameId> = None;
-            for frame in output.frames {
-                if frame.id.stream_generation != generation || frame.batch.num_rows() == 0 {
-                    let reason = format!(
-                        "certified subscription output for '{}' has inconsistent frame metadata",
-                        output.certificate.stream_id
-                    );
-                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                    return Err(CycleError::Recovery(reason));
-                }
-                if let Some(previous_id) = previous {
-                    let ordered = frame.id.partition > previous_id.partition
-                        || (frame.id.partition == previous_id.partition
-                            && previous_id.sequence.checked_next().ok() == Some(frame.id.sequence));
-                    if !ordered {
-                        let reason = format!(
-                            "certified subscription output for '{}' is not partition-canonical",
-                            output.certificate.stream_id
-                        );
-                        set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                        return Err(CycleError::Recovery(reason));
-                    }
-                }
-                previous = Some(frame.id);
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        let authority = self.subscription_writer_authority(&outputs)?;
+        self.cluster_subscription_output
+            .stage_cycle(outputs, authority)
+            .map_err(|error| {
+                let reason = format!("stage cluster subscription output: {error}");
+                set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+                CycleError::Recovery(reason)
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn subscription_writer_authority(
+        &mut self,
+        outputs: &[crate::subscription::PreparedSubscriptionOutput],
+    ) -> Result<crate::subscription::cluster::OutputWriterAuthority, CycleError> {
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            CycleError::Recovery("cluster subscription output has no controller".into())
+        })?;
+        let registry = self.vnode_registry.as_ref().ok_or_else(|| {
+            CycleError::Recovery("cluster subscription output has no vnode registry".into())
+        })?;
+        let process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| CycleError::Recovery(format!("stale subscription writer: {error}")))?;
+        let assignment_version = registry.assignment_version();
+        let assignment = controller
+            .checkpoint_assignment_fence(assignment_version)
+            .ok_or_else(|| {
+                CycleError::Recovery(format!(
+                    "stale subscription writer: assignment {assignment_version} is not certified"
+                ))
+            })?;
+        if assignment.participant_incarnation(process.participant.node_id)
+            != Some(process.participant.boot_incarnation)
+        {
+            return Err(CycleError::Recovery(
+                "stale subscription writer: process incarnation is not assignment-certified".into(),
+            ));
+        }
+        for frame in outputs.iter().flat_map(|output| &output.frames) {
+            if registry.owner(u32::from(frame.id.partition.get())).0 != process.participant.node_id
+            {
+                return Err(CycleError::Recovery(format!(
+                    "stale subscription writer does not own output partition {}",
+                    frame.id.partition.get()
+                )));
             }
         }
-        // Phase 1 keeps external cluster subscriptions disabled. Phase 2 replaces this validated
-        // handoff with the bounded checkpoint-committable writer owned by this callback.
-        Ok(())
+        Ok(crate::subscription::cluster::OutputWriterAuthority {
+            participant: process.participant,
+            process_term: process.process_term,
+            assignment_version,
+            assignment_digest: assignment.digest(),
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn commit_prepared_subscription_output_cycle(&mut self) {
+        self.cluster_subscription_output.commit_cycle();
+        self.graph.commit_prepared_subscription_outputs();
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn abort_prepared_subscription_output_cycle(&mut self) {
+        self.cluster_subscription_output.abort_cycle();
+        self.graph.abort_prepared_subscription_outputs();
     }
 }

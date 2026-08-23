@@ -57,11 +57,13 @@ pub use committed_checkpoint::{
     COMMITTED_CHECKPOINT_INDEX_VERSION, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
 };
 pub use subscription::{
-    ChangelogMode, OutputDistribution, OutputDistributionCertificate, OutputFrameId,
-    OutputPartitionId, OutputSegmentRef, PartitionFrontier, PartitionSequence, StreamGeneration,
+    merge_node_subscription_manifests, ChangelogMode, MergedSubscriptionCheckpoint,
+    NodePartitionRange, NodeSubscriptionManifest, NodeSubscriptionStreamManifest,
+    OutputDistribution, OutputDistributionCertificate, OutputFrameId, OutputPartitionId,
+    OutputSegmentRef, PartitionFrontier, PartitionSequence, StreamGeneration,
     SubscriptionCheckpointManifest, SubscriptionContractError, SubscriptionDigest,
-    SubscriptionProtocolVersion, OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
-    SUBSCRIPTION_PROTOCOL_VERSION,
+    SubscriptionProtocolVersion, MAX_OUTPUT_FRAMES_PER_SEGMENT, MAX_OUTPUT_SEGMENT_BYTES,
+    OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION, SUBSCRIPTION_PROTOCOL_VERSION,
 };
 
 /// Reserved input-channel identity for one logical watermark per source and participant.

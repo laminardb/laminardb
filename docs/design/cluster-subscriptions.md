@@ -253,8 +253,8 @@ validated before allocating from encoded lengths.
 Provider-neutral paths are deterministic and do not contain credentials:
 
 ```text
-subscription-output/v1/<deployment>/<stream-id>/<generation>/<partition>/
-  <first>-<end>-<payload-sha256>.arrow
+subscription-output/<deployment>/<stream-id>/<generation>/<partition>/
+  checkpoint=<checkpoint-id>/<first>-<end>-<payload-sha256>.arrow
 ```
 
 Create-once collision handling loads and validates the existing object. Exact metadata and digest

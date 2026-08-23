@@ -52,6 +52,19 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
+    pub(crate) fn subscription_certificates(
+        &self,
+    ) -> Vec<Arc<laminar_core::checkpoint::OutputDistributionCertificate>> {
+        let mut certificates = self
+            .subscription_certificates
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        certificates.sort_unstable_by(|left, right| left.stream_id.cmp(&right.stream_id));
+        certificates
+    }
+
+    #[cfg(feature = "cluster")]
     pub(super) fn attach_sql_query_cluster_context(
         &self,
         name: &str,

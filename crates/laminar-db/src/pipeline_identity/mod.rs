@@ -68,6 +68,7 @@ struct CanonicalStream {
     temporal_join_idle_history_retention_ms: Option<i64>,
     incremental: bool,
     subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+    subscription_retention_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -307,6 +308,7 @@ fn canonical_streams(
                 temporal_join_idle_history_retention_ms,
                 incremental: reg.incremental,
                 subscription_output: reg.subscription_output.clone(),
+                subscription_retention_bytes: reg.subscription_retention_bytes,
             })
         })
         .collect::<Result<_, DbError>>()?;

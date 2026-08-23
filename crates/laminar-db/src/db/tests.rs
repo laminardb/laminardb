@@ -9489,6 +9489,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             has_frame: false,
             incremental: false,
             subscription_output: None,
+            subscription_retention_bytes: 0,
             catalog_generation: 1,
             subscription_certificate: None,
         },

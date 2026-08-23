@@ -1167,7 +1167,7 @@ impl PipelineCallback for MockCallback {
         self.watermark
     }
 
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         if let Some(error) = self.publish_barrier_error.lock().take() {
             return Err(error);
         }
@@ -1177,14 +1177,14 @@ impl PipelineCallback for MockCallback {
         Ok(())
     }
 
-    fn reserve_subscription_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         self.reserved_subscription_cuts.lock().push(attempt);
         #[cfg(feature = "cluster")]
         self.fence_process_authority_at(ProcessAuthorityFencePoint::SubscriptionCut);
         Ok(())
     }
 
-    fn abort_subscription_cut(&self, attempt: CheckpointAttempt) {
+    fn abort_subscription_cut(&mut self, attempt: CheckpointAttempt) {
         self.aborted_subscription_cuts.lock().push(attempt);
     }
 
@@ -10461,7 +10461,7 @@ impl PipelineCallback for BackpressuredCallback {
     fn current_watermark(&self) -> i64 {
         self.inner.current_watermark()
     }
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         self.inner.publish_barrier(attempt)
     }
     async fn service_checkpoint_control(

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use laminar_core::checkpoint::{OutputDistributionCertificate, OutputFrameId};
+use laminar_core::checkpoint::{OutputDistributionCertificate, OutputFrameId, PartitionFrontier};
 
 /// One Arrow batch whose logical subscription partition is preserved outside the user schema.
 #[derive(Clone)]
@@ -16,4 +16,10 @@ pub(crate) struct PartitionedOutputBatch {
 pub(crate) struct PreparedSubscriptionOutput {
     pub(crate) certificate: Arc<OutputDistributionCertificate>,
     pub(crate) frames: Vec<PartitionedOutputBatch>,
+}
+
+/// Exact participant-owned output frontier sampled at a checkpoint cut.
+pub(crate) struct CertifiedSubscriptionFrontiers {
+    pub(crate) certificate: Arc<OutputDistributionCertificate>,
+    pub(crate) frontiers: Vec<PartitionFrontier>,
 }

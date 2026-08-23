@@ -33,6 +33,7 @@ impl PlannedSubscriptionOutput {
         catalog_generation: u64,
         stream_name: &str,
         schema_fingerprint: SubscriptionDigest,
+        history_retention_bytes: u64,
         pipeline_identity: PipelineIdentity,
         key_group_count: KeyGroupCount,
     ) -> Result<OutputDistributionCertificate, DbError> {
@@ -52,6 +53,7 @@ impl PlannedSubscriptionOutput {
             distribution: self.distribution.clone(),
             schema_fingerprint,
             changelog_mode: self.changelog_mode,
+            history_retention_bytes,
             query_fingerprint: self.query_fingerprint,
             pipeline_identity,
         };
