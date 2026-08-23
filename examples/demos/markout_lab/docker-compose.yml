@@ -1,0 +1,7 @@
+services:
+  markout-lab:
+    build:
+      context: ../../..
+      dockerfile: examples/demos/markout_lab/Dockerfile
+    ports:
+      - "8088:8088"
