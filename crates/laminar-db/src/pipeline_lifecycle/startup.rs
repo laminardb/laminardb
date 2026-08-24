@@ -255,7 +255,10 @@ impl LaminarDB {
     /// A startup owner outlives callers that time out while awaiting it. Terminalization therefore
     /// belongs here, before the sticky attempt result is published, rather than in a recovery
     /// monitor that may already have dropped its receiver.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "cluster"),
+        allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub(super) async fn terminalize_start_attempt_if_needed(
         &self,
         authority: PipelineLifecycleAuthority,

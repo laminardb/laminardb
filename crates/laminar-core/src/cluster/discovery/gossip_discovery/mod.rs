@@ -683,7 +683,7 @@ impl Discovery for GossipDiscovery {
     }
 
     // INVARIANT: discovery operations stay poll-driven for timeout and select cancellation.
-    #[allow(clippy::unused_async)]
+    #[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
     async fn peers(&self) -> Result<Vec<NodeInfo>, DiscoveryError> {
         if !self.started {
             return Err(DiscoveryError::NotStarted);

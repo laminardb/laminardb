@@ -4,9 +4,7 @@
 mod checkpoint_publication;
 mod checkpoint_tail;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use datafusion::physical_expr::PhysicalExpr;
@@ -5303,6 +5301,9 @@ impl ConnectorPipelineCallback {
     }
 }
 
+// COMPAT: local builds preserve the cluster trait shape without awaiting cluster control work.
+#[cfg_attr(not(feature = "cluster"), allow(unknown_lints))]
+#[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn prepare_source_intake(&mut self) -> Result<(), String> {
         Ok(())

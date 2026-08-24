@@ -596,7 +596,12 @@ async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
             .unwrap();
-        assert!(weights.values().chunks_exact(2).all(|pair| pair == [-1, 1]));
+        assert!(weights
+            .values()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| pair == &[-1, 1]));
     }
     state.commit_partitioned_emit(update);
 }

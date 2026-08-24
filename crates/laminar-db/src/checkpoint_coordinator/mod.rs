@@ -4480,7 +4480,10 @@ impl CheckpointCoordinator {
     }
 
     // COMPAT: cluster builds await shared-store continuity validation; keep one caller shape.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async))]
+    #[cfg_attr(
+        not(feature = "cluster"),
+        allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     async fn build_validated_committed_index_until(
         &self,
         attempt: CheckpointAttempt,
