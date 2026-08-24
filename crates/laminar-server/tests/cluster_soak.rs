@@ -5049,14 +5049,14 @@ fn expected_cluster_subscription_aggregate(
 ) -> BTreeMap<u64, (u64, u64)> {
     let sampler = ZipfSampler::new(key_count, zipf_milli);
     let mut expected = BTreeMap::<u64, (u64, u64)>::new();
-    for (left_id, right_id) in &produced.expected_pairs {
-        let key = sampler.sample(*left_id);
+    for id in 0..produced.count {
+        let key = sampler.sample(id);
         let entry = expected.entry(key).or_insert((0, 0));
         entry.0 = entry
             .0
             .checked_add(1)
-            .expect("join aggregate count overflow");
-        entry.1 = entry.1.max(*right_id);
+            .expect("subscription aggregate count overflow");
+        entry.1 = entry.1.max(id);
     }
     expected
 }
@@ -10105,12 +10105,15 @@ GROUP BY join_key
 
 #[cfg(feature = "kafka")]
 fn cluster_subscription_workload_config() -> &'static str {
+    // WHY: keep this gate proportional to input volume so it certifies the subscription data
+    // plane independently from the high-amplification interval-join soak running beside it.
     r#"
 [[pipeline]]
 name = "soak_subscription_aggregate"
 sql = """
-SELECT join_key, COUNT(*) AS match_count, MAX(right_id) AS max_right_id
-FROM soak_join
+SELECT join_key, COUNT(*) AS match_count, MAX(id) AS max_right_id
+FROM join_left
+WHERE join_key >= 0
 GROUP BY join_key
 WITH ('retain_history' = '256mb')
 """
@@ -17125,9 +17128,11 @@ fn cluster_subscription_input_oracle_is_independent_and_bounded_by_key_count() {
     let expected = expected_cluster_subscription_aggregate(&produced, 4, 0);
     assert!(!expected.is_empty());
     assert!(expected.len() <= 4);
-    assert_eq!(expected.values().map(|(count, _)| count).sum::<u64>(), 4);
+    assert_eq!(expected.values().map(|(count, _)| count).sum::<u64>(), 3);
     let workload = cluster_subscription_workload_config();
     assert!(workload.contains("name = \"soak_subscription_aggregate\""));
+    assert!(workload.contains("FROM join_left"));
+    assert!(workload.contains("WHERE join_key >= 0"));
     assert!(workload.contains("WITH ('retain_history' = '256mb')"));
 }
 

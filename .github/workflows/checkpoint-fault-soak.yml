@@ -147,8 +147,13 @@ jobs:
             topology: cluster-subscription
             discovery: gossip
             emulator: "0"
-            checkpoint_ms: "250"
-            rps: "400"
+            # This job certifies committed replay and recovery, not the quadratic interval-join
+            # throughput profile covered by the adjacent ALO job. Sixty-four Zipf keys still span
+            # many stable vnodes while keeping every retained output cut within the bounded writer.
+            checkpoint_ms: "500"
+            rps: "100"
+            keys: "64"
+            min_live_state_bytes: "0"
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
@@ -257,7 +262,7 @@ jobs:
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE: ${{ matrix.visibility_slo_mode }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
-          LAMINAR_SOAK_JOIN_KEYS: "65536"
+          LAMINAR_SOAK_JOIN_KEYS: ${{ matrix.keys || '65536' }}
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: ${{ matrix.rps }}
           # Hosted-runner timing is non-certifying; use the wider 10/50ms envelope.
@@ -265,7 +270,7 @@ jobs:
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
-          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
+          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: ${{ matrix.min_live_state_bytes || '8388608' }}
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}/checkpoints
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
