@@ -92,6 +92,28 @@ fn capture(
     }]
 }
 
+fn partition_burst(
+    certificate: &Arc<OutputDistributionCertificate>,
+    sequence: u64,
+    partitions: u16,
+    batch: &RecordBatch,
+) -> PreparedSubscriptionOutput {
+    let frames = (0..partitions)
+        .map(|partition| PartitionedOutputBatch {
+            id: OutputFrameId {
+                stream_generation: certificate.stream_generation,
+                partition: OutputPartitionId::new(partition),
+                sequence: PartitionSequence::new(sequence),
+            },
+            batch: batch.clone(),
+        })
+        .collect();
+    PreparedSubscriptionOutput {
+        certificate: Arc::clone(certificate),
+        frames,
+    }
+}
+
 #[test]
 fn cycle_abort_does_not_suppress_the_same_frame() {
     let sample = batch(vec![1]);
@@ -223,4 +245,38 @@ fn checkpoint_abort_restores_pre_cut_frames_before_post_cut_output() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+#[test]
+fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
+    const MIB: usize = 1024 * 1024;
+    const PARTITIONS: u16 = 48;
+    let shared = batch(vec![7; 3 * MIB / size_of::<i64>()]);
+    let mut certificate = (*certificate(shared.schema().as_ref())).clone();
+    certificate.distribution = OutputDistribution::VnodePartitioned {
+        key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        partition_abi: PARTITIONING_ABI_VERSION,
+        vnode_count: PARTITIONS,
+    };
+    let certificate = Arc::new(certificate);
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+
+    state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 0, PARTITIONS, &shared)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    assert!(state.retained_bytes() > 128 * MIB);
+    assert!(state.retained_bytes() < 256 * MIB);
+
+    let error = state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 1, PARTITIONS, &shared)],
+            authority(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("total pending output"));
 }

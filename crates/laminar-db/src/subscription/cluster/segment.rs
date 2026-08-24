@@ -96,7 +96,7 @@ pub(crate) fn encode_output_segment(
         .first()
         .ok_or_else(|| DbError::Checkpoint("subscription segment has no frames".into()))?
         .schema();
-    let ipc = laminar_core::serialization::serialize_batches_stream_bounded(
+    let ipc = laminar_core::serialization::serialize_batches_stream_lz4_bounded(
         schema.as_ref(),
         frames,
         MAX_OUTPUT_SEGMENT_BYTES - MAX_SEGMENT_HEADER_BYTES - SEGMENT_PREFIX_BYTES,

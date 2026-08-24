@@ -16,8 +16,9 @@ use crate::subscription::{
 
 const MAX_OUTPUT_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PENDING_PARTITION_BYTES: usize = 32 * 1024 * 1024;
-const MAX_PENDING_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+// INVARIANT: one hot stream may consume the process budget, but never exceed it.
+const MAX_PENDING_STREAM_BYTES: usize = MAX_PENDING_OUTPUT_BYTES;
 const MAX_PENDING_OUTPUT_FRAMES: usize = 65_536;
 
 #[derive(Debug, Clone)]

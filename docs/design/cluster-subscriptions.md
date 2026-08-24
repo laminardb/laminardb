@@ -294,10 +294,12 @@ the certificate vnode domain. A frontier is the first sequence not covered by th
 For a predecessor cut, new segment ranges must begin exactly at its frontier and end at the new
 frontier. Empty ranges keep the frontier unchanged.
 
-Segments use bounded Arrow IPC and a self-validating envelope containing protocol version,
-deployment, stream identity/generation, partition, first and exclusive-end sequence, frame and row
-counts, schema fingerprint, encoded length, payload digest, and checkpoint attempt. Metadata is
-validated before allocating from encoded lengths.
+Segments use bounded LZ4-compressed Arrow IPC and a self-validating envelope containing protocol
+version, deployment, stream identity/generation, partition, first and exclusive-end sequence,
+frame and row counts, schema fingerprint, encoded length, payload digest, and checkpoint attempt.
+Arrow records the compression mode in the IPC stream, so the same bounded decoder accepts both
+compressed and uncompressed payloads. Metadata is validated before allocating from encoded
+lengths.
 
 Provider-neutral paths are deterministic and do not contain credentials:
 
@@ -377,6 +379,12 @@ partition, partitions per stream, segments and manifest bytes per checkpoint, co
 retry deadline, gateway read concurrency, decoded frame bytes, manifest-cache entries, and
 connection queue bytes. Limits reuse checkpoint timeout, vnode count, subscription retention bytes,
 and existing Arrow IPC bounds where those already express the same resource.
+
+The compute owner accepts at most 4 MiB per frame, 32 MiB per partition, 256 MiB per stream, 256
+MiB across all pending streams, and 65,536 pending frames. Allowing one stream to consume the total
+budget supports full-partition aggregate snapshots without increasing the process-wide ceiling.
+Durable segments remain capped at 16 MiB and 1,024 frames; node and cluster subscription manifests
+remain capped at 8 MiB and 65,536 segment references.
 
 The compute task never waits for a subscriber. Writer-capacity exhaustion returns a recovery error
 and closes intake; output is never dropped. A slow gateway consumer is disconnected with
