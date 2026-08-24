@@ -4,7 +4,7 @@ use std::sync::Arc;
 use futures::{StreamExt, TryStreamExt};
 use laminar_core::checkpoint::{
     merge_node_subscription_manifests, CheckpointAssignmentFence, CheckpointAttempt,
-    CheckpointManifest, CommittedCheckpointIndex, CommittedCheckpointRef,
+    CheckpointManifest, CommittedCheckpointIndex, CommittedCheckpointRef, LeaderProof,
     MergedSubscriptionCheckpoint, NodeSubscriptionManifest, NodeSubscriptionStreamManifest,
     OutputSegmentRef, StreamGeneration, SubscriptionContractError, SubscriptionDigest,
     SubscriptionProtocolVersion, MAX_OUTPUT_FRAMES_PER_SEGMENT, MAX_OUTPUT_SEGMENT_BYTES,
@@ -23,8 +23,104 @@ const TARGET_OUTPUT_SEGMENT_BYTES: usize = MAX_OUTPUT_SEGMENT_BYTES / 2;
 const MAX_RETAINED_SUBSCRIPTION_INTERVALS: usize = 256;
 const MAX_RETAINED_SUBSCRIPTION_SEGMENTS: usize = 262_144;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SubscriptionCommitStats {
+    pub(super) frames: u64,
+    pub(super) rows: u64,
+    pub(super) bytes: u64,
+    pub(super) segments: u64,
+    pub(super) partitions: u64,
+}
+
 impl CheckpointCoordinator {
+    pub(super) fn record_cluster_subscription_error(&self, error: &DbError) {
+        let Some(metrics) = self.prom.as_ref() else {
+            return;
+        };
+        let metrics = &metrics.cluster_subscription;
+        match error {
+            DbError::Subscription(ClusterSubscriptionError::ManifestCorrupt { .. }) => {
+                metrics.manifest_failures_total.inc();
+                metrics.integrity_failures_total.inc();
+            }
+            DbError::Subscription(ClusterSubscriptionError::PartitionSequenceGap { .. }) => {
+                metrics.sequence_gaps_total.inc();
+                metrics.integrity_failures_total.inc();
+            }
+            DbError::Subscription(ClusterSubscriptionError::StaleOutputWriter) => {
+                metrics.stale_writer_rejections_total.inc();
+            }
+            DbError::Subscription(
+                ClusterSubscriptionError::SegmentMissing { .. }
+                | ClusterSubscriptionError::SegmentCorrupt { .. }
+                | ClusterSubscriptionError::SchemaMismatch
+                | ClusterSubscriptionError::ConflictingDuplicateSequence,
+            ) => metrics.integrity_failures_total.inc(),
+            _ => {}
+        }
+    }
+
+    pub(super) fn record_subscription_commit(
+        &self,
+        stats: Option<SubscriptionCommitStats>,
+        visibility: std::time::Duration,
+        attempt: CheckpointAttempt,
+    ) {
+        let Some(stats) = stats else {
+            return;
+        };
+        if let Some(metrics) = self.prom.as_ref() {
+            let metrics = &metrics.cluster_subscription;
+            metrics.frames_committed_total.inc_by(stats.frames);
+            metrics.rows_committed_total.inc_by(stats.rows);
+            metrics.bytes_committed_total.inc_by(stats.bytes);
+            metrics
+                .commit_visibility_seconds
+                .observe(visibility.as_secs_f64());
+        }
+        tracing::info!(
+            epoch = attempt.epoch,
+            checkpoint_id = attempt.checkpoint_id,
+            partitions = stats.partitions,
+            segments = stats.segments,
+            frames = stats.frames,
+            rows = stats.rows,
+            bytes = stats.bytes,
+            "published committed cluster subscription output"
+        );
+    }
+
     pub(super) async fn prepare_subscription_output_until(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment: Option<&CheckpointAssignmentFence>,
+        prepared: Option<Arc<PreparedNodeSubscriptionOutput>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<NodeSubscriptionManifest>, DbError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .prepare_subscription_output_inner(attempt, assignment, prepared, deadline)
+            .await;
+        if let Some(metrics) = self.prom.as_ref() {
+            metrics
+                .cluster_subscription
+                .checkpoint_prepare_seconds
+                .observe(started.elapsed().as_secs_f64());
+            match &result {
+                Err(DbError::Subscription(ClusterSubscriptionError::StaleOutputWriter)) => metrics
+                    .cluster_subscription
+                    .stale_writer_rejections_total
+                    .inc(),
+                Err(DbError::Subscription(ClusterSubscriptionError::PartitionSequenceGap {
+                    ..
+                })) => metrics.cluster_subscription.sequence_gaps_total.inc(),
+                _ => {}
+            }
+        }
+        result
+    }
+
+    async fn prepare_subscription_output_inner(
         &self,
         attempt: CheckpointAttempt,
         assignment: Option<&CheckpointAssignmentFence>,
@@ -66,30 +162,56 @@ impl CheckpointCoordinator {
                 &owned_vnodes,
             )
         });
-        let (manifest, segments) = tokio::time::timeout_at(deadline, encoding)
+        let encoded = tokio::time::timeout_at(deadline, encoding)
             .await
             .map_err(|_| {
                 DbError::Checkpoint("subscription segment encoding exceeded its deadline".into())
-            })?
-            .map_err(|error| {
-                DbError::Checkpoint(format!("subscription segment encoder failed: {error}"))
-            })??;
+            })
+            .and_then(|result| {
+                result.map_err(|error| {
+                    DbError::Checkpoint(format!("subscription segment encoder failed: {error}"))
+                })
+            });
+        let encoded = encoded.inspect_err(|_| {
+            if let Some(metrics) = self.prom.as_ref() {
+                metrics.cluster_subscription.manifest_failures_total.inc();
+            }
+        })?;
+        let (manifest, segments) = encoded.inspect_err(|_| {
+            if let Some(metrics) = self.prom.as_ref() {
+                metrics.cluster_subscription.manifest_failures_total.inc();
+            }
+        })?;
 
+        let metrics = self.prom.clone();
         futures::stream::iter(segments)
-            .map(|segment| async move {
-                tokio::time::timeout_at(
-                    deadline,
-                    self.store
-                        .save_subscription_segment(&segment.reference, segment.bytes),
-                )
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "subscription segment '{}' upload timed out",
-                        segment.reference.object_key
-                    ))
-                })?
-                .map_err(DbError::from)
+            .map(|segment| {
+                let metrics = metrics.clone();
+                async move {
+                    let result = match tokio::time::timeout_at(
+                        deadline,
+                        self.store
+                            .save_subscription_segment(&segment.reference, segment.bytes),
+                    )
+                    .await
+                    {
+                        Ok(result) => result.map_err(DbError::from),
+                        Err(_) => Err(DbError::Checkpoint(format!(
+                            "subscription segment '{}' upload timed out",
+                            segment.reference.object_key
+                        ))),
+                    };
+                    if let Some(metrics) = metrics.as_ref() {
+                        match &result {
+                            Ok(()) => metrics.cluster_subscription.segments_written_total.inc(),
+                            Err(_) => metrics
+                                .cluster_subscription
+                                .segment_write_failures_total
+                                .inc(),
+                        }
+                    }
+                    result
+                }
             })
             .buffer_unordered(MAX_SUBSCRIPTION_UPLOAD_CONCURRENCY)
             .try_collect::<Vec<_>>()
@@ -169,6 +291,7 @@ pub(super) async fn cluster_subscription_retention_reference(
     store: &dyn laminar_core::checkpoint::CheckpointStore,
     decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
     authority: &laminar_core::cluster::control::LeaderLeaseStore,
+    proof: &LeaderProof,
     latest: Option<&CommittedCheckpointIndex>,
 ) -> Result<Option<CommittedCheckpointRef>, DbError> {
     let Some(latest) = latest else {
@@ -182,6 +305,30 @@ pub(super) async fn cluster_subscription_retention_reference(
     let horizon =
         cluster_subscription_retention_horizon(store, decisions, latest, artifact_floor_epoch)
             .await?;
+    let selected_epoch = authority
+        .reserve_subscription_cleanup_floor(proof, horizon.epoch)
+        .await
+        .map_err(|error| {
+            DbError::Checkpoint(format!("reserve subscription cleanup floor: {error}"))
+        })?;
+    let horizon = if selected_epoch == horizon.epoch {
+        horizon
+    } else {
+        let (_, selected) = authority
+            .cluster_outcome_with_committed_checkpoint(selected_epoch)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!("load replay-pinned cleanup horizon: {error}"))
+            })?
+            .ok_or_else(|| {
+                DbError::Checkpoint(
+                    "replay-pinned cleanup horizon is not a committed cluster epoch".into(),
+                )
+            })?;
+        selected.ok_or_else(|| {
+            DbError::Checkpoint("replay-pinned cleanup horizon has no checkpoint index".into())
+        })?
+    };
     horizon
         .encode_and_reference()
         .map(|(_, reference)| Some(reference))
@@ -194,46 +341,95 @@ pub(super) async fn cleanup_subscription_orphans(
     latest: &CommittedCheckpointIndex,
     horizon: &CommittedCheckpointRef,
     grace_before_ms: i64,
-) -> Result<laminar_core::checkpoint::checkpoint_store::SubscriptionOrphanCleanup, DbError> {
-    let reachable = retained_subscription_segment_keys(store, decisions, latest, horizon).await?;
-    store
-        .delete_subscription_orphans(&reachable, latest.checkpoint_id, grace_before_ms)
+) -> Result<SubscriptionOutputCleanup, DbError> {
+    let retained = retained_subscription_segments(store, decisions, latest, horizon).await?;
+    let orphan = store
+        .delete_subscription_orphans(&retained.keys, latest.checkpoint_id, grace_before_ms)
         .await
-        .map_err(DbError::from)
+        .map_err(DbError::from)?;
+    Ok(SubscriptionOutputCleanup {
+        retained_bytes: retained.bytes,
+        orphan,
+    })
 }
 
-async fn retained_subscription_segment_keys(
+pub(super) struct SubscriptionOutputCleanup {
+    pub(super) retained_bytes: u64,
+    pub(super) orphan: laminar_core::checkpoint::checkpoint_store::SubscriptionOrphanCleanup,
+}
+
+pub(super) fn record_subscription_cleanup(
+    metrics: Option<&crate::engine_metrics::EngineMetrics>,
+    cleanup: Option<&SubscriptionOutputCleanup>,
+) {
+    let retained_bytes = cleanup.map_or(0, |cleanup| cleanup.retained_bytes);
+    let orphan_bytes = cleanup.map_or(0, |cleanup| cleanup.orphan.bytes_remaining);
+    if let Some(metrics) = metrics {
+        metrics
+            .cluster_subscription
+            .retained_bytes
+            .set(i64::try_from(retained_bytes).unwrap_or(i64::MAX));
+        metrics
+            .cluster_subscription
+            .orphan_bytes
+            .set(i64::try_from(orphan_bytes).unwrap_or(i64::MAX));
+    }
+    let Some(cleanup) = cleanup else {
+        return;
+    };
+    tracing::info!(
+        retained_bytes,
+        orphan_objects_scanned = cleanup.orphan.objects_scanned,
+        orphan_objects_deleted = cleanup.orphan.objects_deleted,
+        orphan_bytes_deleted = cleanup.orphan.bytes_deleted,
+        orphan_bytes_remaining = orphan_bytes,
+        "completed cluster subscription output cleanup"
+    );
+}
+
+struct RetainedSubscriptionSegments {
+    keys: std::collections::BTreeSet<String>,
+    bytes: u64,
+}
+
+async fn retained_subscription_segments(
     store: &dyn laminar_core::checkpoint::CheckpointStore,
     decisions: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
     latest: &CommittedCheckpointIndex,
     horizon: &CommittedCheckpointRef,
-) -> Result<std::collections::BTreeSet<String>, DbError> {
+) -> Result<RetainedSubscriptionSegments, DbError> {
     let mut current = latest.clone();
-    let mut reachable = std::collections::BTreeSet::new();
+    let mut retained = RetainedSubscriptionSegments {
+        keys: std::collections::BTreeSet::new(),
+        bytes: 0,
+    };
     for _ in 0..MAX_RETAINED_SUBSCRIPTION_INTERVALS {
         let manifests = super::load_index_manifests(store, &current).await?;
-        for object_key in manifests
+        for (object_key, encoded_length) in manifests
             .iter()
             .filter_map(|manifest| manifest.subscription_output.as_ref())
             .flat_map(|output| &output.streams)
             .flat_map(|stream| &stream.segments)
-            .map(|segment| &segment.object_key)
+            .map(|segment| (&segment.object_key, segment.encoded_length))
         {
-            if !reachable.insert(object_key.clone()) {
+            if !retained.keys.insert(object_key.clone()) {
                 return Err(ClusterSubscriptionError::ManifestCorrupt {
                     reason: "one segment object is referenced by multiple retained checkpoints"
                         .into(),
                 }
                 .into());
             }
-            if reachable.len() > MAX_RETAINED_SUBSCRIPTION_SEGMENTS {
+            retained.bytes = retained.bytes.checked_add(encoded_length).ok_or_else(|| {
+                DbError::Checkpoint("retained subscription byte count overflow".into())
+            })?;
+            if retained.keys.len() > MAX_RETAINED_SUBSCRIPTION_SEGMENTS {
                 return Err(DbError::Checkpoint(format!(
                     "retained subscription segment roster exceeds {MAX_RETAINED_SUBSCRIPTION_SEGMENTS} objects"
                 )));
             }
         }
         if current.epoch == horizon.epoch && current.checkpoint_id == horizon.checkpoint_id {
-            return Ok(reachable);
+            return Ok(retained);
         }
         let predecessor = current.predecessor.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
@@ -314,14 +510,19 @@ pub(super) async fn cluster_subscription_retention_horizon(
                     "subscription retention predecessor is invalid: {error}"
                 ))
             })?;
-        horizon = predecessor.clone();
         let manifests = super::load_index_manifests(store, &predecessor).await?;
         let outputs = merged_subscription_manifests(
             CheckpointAttempt::new(predecessor.epoch, predecessor.checkpoint_id),
             predecessor.assignment_fence.as_ref(),
             manifests.iter(),
         )?;
-        add_retained_output_bytes(&mut retained_bytes, &outputs, &certificates)?;
+        let mut candidate_bytes = retained_bytes.clone();
+        add_retained_output_bytes(&mut candidate_bytes, &outputs, &certificates)?;
+        if !retention_caps_fit(&candidate_bytes, &caps) {
+            break;
+        }
+        retained_bytes = candidate_bytes;
+        horizon = predecessor.clone();
         current = predecessor;
     }
     Ok(horizon)
@@ -428,6 +629,28 @@ fn merged_subscription_outputs(
         assignment,
         manifests.iter().map(|(manifest, _)| manifest),
     )
+}
+
+pub(super) fn subscription_commit_stats(
+    manifests: &[(CheckpointManifest, bytes::Bytes)],
+) -> SubscriptionCommitStats {
+    let mut stats = SubscriptionCommitStats::default();
+    for stream in manifests
+        .iter()
+        .filter_map(|(manifest, _)| manifest.subscription_output.as_ref())
+        .flat_map(|output| &output.streams)
+    {
+        stats.partitions = stats
+            .partitions
+            .saturating_add(u64::try_from(stream.ranges.len()).unwrap_or(u64::MAX));
+        for segment in &stream.segments {
+            stats.frames = stats.frames.saturating_add(segment.frame_count);
+            stats.rows = stats.rows.saturating_add(segment.row_count);
+            stats.bytes = stats.bytes.saturating_add(segment.encoded_length);
+            stats.segments = stats.segments.saturating_add(1);
+        }
+    }
+    stats
 }
 
 pub(super) fn encode_node_subscription_output(

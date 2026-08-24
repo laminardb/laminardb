@@ -161,7 +161,8 @@ pub use error::DbError;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, MaterializedViewInfo, PipelineEdge, PipelineNode,
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
-    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionFrame, UntypedSourceHandle,
+    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionEnvelope,
+    TypedSubscriptionFrame, UntypedSourceHandle,
 };
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};

@@ -32,6 +32,34 @@ fn prepare_callback_collections(
     }
 }
 
+#[cfg(feature = "cluster")]
+fn prepare_subscription_output(
+    runtime_mode: RuntimeMode,
+    graph: &crate::operator_graph::OperatorGraph,
+    controller: Option<&Arc<laminar_core::cluster::control::ClusterController>>,
+) -> Result<crate::subscription::cluster::ClusterSubscriptionOutputState, DbError> {
+    let certificates = graph.subscription_certificates();
+    if runtime_mode != RuntimeMode::Cluster || certificates.is_empty() {
+        return crate::subscription::cluster::ClusterSubscriptionOutputState::new(
+            certificates,
+            None,
+        );
+    }
+    let controller = controller.ok_or_else(|| {
+        DbError::Pipeline(
+            "cluster subscription output cannot bind process authority without a controller".into(),
+        )
+    })?;
+    let process = controller
+        .try_live_local_process_authority_identity()
+        .map_err(|error| {
+            DbError::Pipeline(format!(
+                "cluster subscription output cannot bind process authority: {error}"
+            ))
+        })?;
+    crate::subscription::cluster::ClusterSubscriptionOutputState::new(certificates, Some(process))
+}
+
 impl LaminarDB {
     pub(super) async fn prepare_pipeline_runtime(
         &self,
@@ -157,9 +185,7 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         let cluster_subscription_output =
-            crate::subscription::cluster::ClusterSubscriptionOutputState::new(
-                graph.subscription_certificates(),
-            )?;
+            prepare_subscription_output(runtime_mode, &graph, callback_controller.as_ref())?;
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_entries,

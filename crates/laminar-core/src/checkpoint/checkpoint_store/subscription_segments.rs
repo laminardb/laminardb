@@ -20,6 +20,8 @@ pub struct SubscriptionOrphanCleanup {
     pub objects_deleted: u64,
     /// Encoded bytes represented by deleted object metadata.
     pub bytes_deleted: u64,
+    /// Unreachable bytes retained because their orphan grace period has not elapsed.
+    pub bytes_remaining: u64,
 }
 
 pub(super) async fn save(
@@ -110,10 +112,19 @@ pub(super) async fn delete_orphans(
             )
         })?;
         let checkpoint_id = checkpoint_id_from_canonical_key(object_key)?;
-        if checkpoint_id > through_checkpoint_id
-            || reachable.contains(object_key)
-            || entry.last_modified.timestamp_millis() > grace_before_ms
-        {
+        if checkpoint_id > through_checkpoint_id || reachable.contains(object_key) {
+            continue;
+        }
+        if entry.last_modified.timestamp_millis() > grace_before_ms {
+            report.bytes_remaining =
+                report
+                    .bytes_remaining
+                    .checked_add(entry.size)
+                    .ok_or_else(|| {
+                        CheckpointStoreError::Invalid(
+                            "subscription orphan byte count overflow".into(),
+                        )
+                    })?;
             continue;
         }
         store.delete_exact(&entry.location).await?;

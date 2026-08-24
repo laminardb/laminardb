@@ -178,6 +178,21 @@ impl LaminarDB {
         let (planned, temporal_output_schema) = self
             .validate_stream_admission("stream", name, query, emit_clause, query_sql)
             .await?;
+        if self.is_cluster_runtime()
+            && retention_bytes.is_some()
+            && !planned.subscription_output.as_ref().is_some_and(
+                crate::subscription::distribution::PlannedSubscriptionOutput::is_vnode_partitioned,
+            )
+        {
+            return Err(
+                crate::subscription::ClusterSubscriptionError::UnsupportedPlan {
+                    reason:
+                        "durable cluster history requires a non-windowed managed keyed aggregate"
+                            .into(),
+                }
+                .into(),
+            );
+        }
         self.register_and_admit_stream(
             sql,
             &name_str,

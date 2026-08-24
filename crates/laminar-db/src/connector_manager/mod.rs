@@ -292,6 +292,36 @@ impl ConnectorManager {
         Ok(())
     }
 
+    /// Publish the runtime-bound subscription certificates after complete startup binding.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_stream_subscription_certificates(
+        &mut self,
+        bound: &HashMap<String, StreamRegistration>,
+    ) -> Result<(), DbError> {
+        if self.streams.len() != bound.len() {
+            return Err(DbError::InvalidOperation(
+                "stream registrations changed while binding subscription certificates".into(),
+            ));
+        }
+        for (name, candidate) in bound {
+            let registered = self.streams.get(name).ok_or_else(|| {
+                DbError::InvalidOperation(format!(
+                    "stream registration '{name}' disappeared during subscription binding"
+                ))
+            })?;
+            if registered.catalog_generation != candidate.catalog_generation
+                || registered.query_sql != candidate.query_sql
+                || registered.subscription_output != candidate.subscription_output
+            {
+                return Err(DbError::InvalidOperation(format!(
+                    "stream registration '{name}' changed during subscription binding"
+                )));
+            }
+        }
+        self.streams.clone_from(bound);
+        Ok(())
+    }
+
     /// Returns `true` if it existed.
     pub fn unregister_source(&mut self, name: &str) -> bool {
         self.remove_ddl(name);

@@ -96,7 +96,8 @@ fn capture(
 fn cycle_abort_does_not_suppress_the_same_frame() {
     let sample = batch(vec![1]);
     let certificate = certificate(sample.schema().as_ref());
-    let mut state = ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)]).unwrap();
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
 
     state
         .stage_cycle(vec![output(&certificate, 0, vec![1])], authority())
@@ -128,7 +129,8 @@ fn cycle_abort_does_not_suppress_the_same_frame() {
 fn duplicate_frame_is_idempotent_only_when_the_batch_matches() {
     let sample = batch(vec![1]);
     let certificate = certificate(sample.schema().as_ref());
-    let mut state = ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)]).unwrap();
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
     state
         .stage_cycle(vec![output(&certificate, 0, vec![1])], authority())
         .unwrap();
@@ -167,7 +169,8 @@ fn duplicate_frame_is_idempotent_only_when_the_batch_matches() {
 fn sequence_gap_is_rejected_without_mutating_pending_state() {
     let sample = batch(vec![1]);
     let certificate = certificate(sample.schema().as_ref());
-    let mut state = ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)]).unwrap();
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
     state
         .stage_cycle(vec![output(&certificate, 0, vec![1])], authority())
         .unwrap();
@@ -187,7 +190,8 @@ fn sequence_gap_is_rejected_without_mutating_pending_state() {
 fn checkpoint_abort_restores_pre_cut_frames_before_post_cut_output() {
     let sample = batch(vec![1]);
     let certificate = certificate(sample.schema().as_ref());
-    let mut state = ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)]).unwrap();
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
     state
         .stage_cycle(vec![output(&certificate, 0, vec![1])], authority())
         .unwrap();

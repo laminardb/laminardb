@@ -96,17 +96,21 @@ impl ConnectorPipelineCallback {
             return Ok(());
         }
         let authority = self.subscription_writer_authority(&outputs)?;
-        self.cluster_subscription_output
+        let result = self
+            .cluster_subscription_output
             .stage_cycle(outputs, authority)
             .map_err(|error| {
+                self.record_subscription_output_error(&error);
                 let reason = format!("stage cluster subscription output: {error}");
                 set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
                 CycleError::Recovery(reason)
-            })
+            });
+        self.record_subscription_pending_bytes();
+        result
     }
 
     #[cfg(feature = "cluster")]
-    fn subscription_writer_authority(
+    pub(super) fn subscription_writer_authority(
         &mut self,
         outputs: &[crate::subscription::PreparedSubscriptionOutput],
     ) -> Result<crate::subscription::cluster::OutputWriterAuthority, CycleError> {
@@ -116,29 +120,42 @@ impl ConnectorPipelineCallback {
         let registry = self.vnode_registry.as_ref().ok_or_else(|| {
             CycleError::Recovery("cluster subscription output has no vnode registry".into())
         })?;
+        let expected_process = self
+            .cluster_subscription_output
+            .bound_process()
+            .ok_or_else(|| {
+                self.stale_subscription_writer(
+                    "cluster subscription output has no bound process generation",
+                )
+            })?;
         let process = controller
             .try_live_local_process_authority_identity()
-            .map_err(|error| CycleError::Recovery(format!("stale subscription writer: {error}")))?;
+            .map_err(|error| self.stale_subscription_writer(error.clone()))?;
+        if process != expected_process {
+            return Err(self.stale_subscription_writer(format!(
+                "process authority changed from {expected_process:?} to {process:?}"
+            )));
+        }
         let assignment_version = registry.assignment_version();
         let assignment = controller
             .checkpoint_assignment_fence(assignment_version)
             .ok_or_else(|| {
-                CycleError::Recovery(format!(
-                    "stale subscription writer: assignment {assignment_version} is not certified"
+                self.stale_subscription_writer(format!(
+                    "assignment {assignment_version} is not certified"
                 ))
             })?;
         if assignment.participant_incarnation(process.participant.node_id)
             != Some(process.participant.boot_incarnation)
         {
-            return Err(CycleError::Recovery(
-                "stale subscription writer: process incarnation is not assignment-certified".into(),
-            ));
+            return Err(
+                self.stale_subscription_writer("process incarnation is not assignment-certified")
+            );
         }
         for frame in outputs.iter().flat_map(|output| &output.frames) {
             if registry.owner(u32::from(frame.id.partition.get())).0 != process.participant.node_id
             {
-                return Err(CycleError::Recovery(format!(
-                    "stale subscription writer does not own output partition {}",
+                return Err(self.stale_subscription_writer(format!(
+                    "process does not own output partition {}",
                     frame.id.partition.get()
                 )));
             }
@@ -161,5 +178,40 @@ impl ConnectorPipelineCallback {
     pub(super) fn abort_prepared_subscription_output_cycle(&mut self) {
         self.cluster_subscription_output.abort_cycle();
         self.graph.abort_prepared_subscription_outputs();
+        self.record_subscription_pending_bytes();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn stale_subscription_writer(&self, reason: impl std::fmt::Display) -> CycleError {
+        self.prom
+            .cluster_subscription
+            .stale_writer_rejections_total
+            .inc();
+        tracing::warn!(reason = %reason, "rejected stale cluster subscription writer");
+        CycleError::Recovery(format!("stale subscription writer: {reason}"))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn record_subscription_output_error(&self, error: &crate::error::DbError) {
+        match error {
+            crate::error::DbError::Subscription(
+                crate::subscription::ClusterSubscriptionError::PartitionSequenceGap { .. },
+            ) => self.prom.cluster_subscription.sequence_gaps_total.inc(),
+            crate::error::DbError::Subscription(
+                crate::subscription::ClusterSubscriptionError::StaleOutputWriter,
+            ) => self
+                .prom
+                .cluster_subscription
+                .stale_writer_rejections_total
+                .inc(),
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) fn record_subscription_pending_bytes(&self) {
+        self.prom.cluster_subscription.pending_bytes.set(
+            i64::try_from(self.cluster_subscription_output.retained_bytes()).unwrap_or(i64::MAX),
+        );
     }
 }

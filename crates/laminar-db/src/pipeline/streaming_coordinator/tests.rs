@@ -818,7 +818,7 @@ impl Drop for MockCallback {
 }
 
 // The test double mirrors the async production contract without performing asynchronous I/O.
-#[allow(clippy::unused_async_trait_impl)]
+#[allow(clippy::unused_async)]
 impl PipelineCallback for MockCallback {
     fn pin_source_frontiers_for_new_cycle(&mut self) -> Result<(), String> {
         self.source_frontier_pin_cycles

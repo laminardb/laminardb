@@ -11,6 +11,7 @@ use laminar_connectors::connector::{
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_connectors::registry::ConnectorRegistry;
+use laminar_core::state::{NodeId, VnodeRegistry};
 
 /// Connector name shared by temporal runtime tests.
 pub(crate) const CONNECTOR_NAME: &str = "temporal-positioned-test";
@@ -117,6 +118,14 @@ struct TemporalTestSource {
     cursor: usize,
     ready: tokio::sync::watch::Receiver<usize>,
     start_cursors: Arc<parking_lot::Mutex<std::collections::HashMap<Vec<u8>, usize>>>,
+    vnode_assignment: Option<TemporalTestVnodeAssignment>,
+}
+
+struct TemporalTestVnodeAssignment {
+    source_identity: Vec<u8>,
+    registry: Arc<VnodeRegistry>,
+    self_id: NodeId,
+    version: std::num::NonZeroU64,
 }
 
 impl TemporalTestSource {
@@ -131,7 +140,35 @@ impl TemporalTestSource {
             cursor: 0,
             ready,
             start_cursors,
+            vnode_assignment: None,
         }
+    }
+
+    fn owns_input_channel(&self) -> bool {
+        self.vnode_assignment.as_ref().is_none_or(|assignment| {
+            let vnode = assignment.registry.vnode_for_key(&self.source_identity);
+            assignment.registry.owner(vnode) == assignment.self_id
+        })
+    }
+
+    fn input_channels(&self) -> Vec<Vec<u8>> {
+        if self.owns_input_channel() {
+            vec![self.source_identity.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn captured_checkpoint(&self) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("cursor", self.cursor.to_string());
+        checkpoint
+            .set_input_channels(self.input_channels())
+            .expect("the temporal test source identity is non-empty");
+        if let Some(assignment) = self.vnode_assignment.as_ref() {
+            checkpoint.bind_assignment_version(assignment.version);
+        }
+        checkpoint
     }
 
     fn batch(&self) -> Result<Option<SourceBatch>, ConnectorError> {
@@ -204,11 +241,18 @@ impl SourceConnector for TemporalTestSource {
             .unwrap_or(CONNECTOR_NAME)
             .as_bytes()
             .to_vec();
+        if let Some(assignment) = self.vnode_assignment.as_ref() {
+            if assignment.source_identity != self.source_identity {
+                return Err(ConnectorError::ConfigurationError(
+                    "temporal test source assignment has the wrong catalog identity".into(),
+                ));
+            }
+        }
         self.cursor = match position {
             SourcePosition::Initial => 0,
             SourcePosition::Resume { checkpoint, .. } => {
-                if checkpoint.input_channels() != Some(std::slice::from_ref(&self.source_identity))
-                {
+                let expected_channels = self.input_channels();
+                if checkpoint.input_channels() != Some(expected_channels.as_slice()) {
                     return Err(ConnectorError::ConfigurationError(
                         "temporal test checkpoint has the wrong input-channel inventory".into(),
                     ));
@@ -234,6 +278,9 @@ impl SourceConnector for TemporalTestSource {
         &mut self,
         _max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        if !self.owns_input_channel() {
+            return Ok(None);
+        }
         if *self.ready.borrow() <= self.cursor {
             return Ok(None);
         }
@@ -241,6 +288,9 @@ impl SourceConnector for TemporalTestSource {
             return Ok(None);
         };
         self.cursor += 1;
+        if self.vnode_assignment.is_some() {
+            return Ok(Some(batch.with_checkpoint(self.captured_checkpoint())));
+        }
         Ok(Some(batch))
     }
 
@@ -249,12 +299,46 @@ impl SourceConnector for TemporalTestSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut checkpoint = SourceCheckpoint::new();
-        checkpoint.set_offset("cursor", self.cursor.to_string());
-        checkpoint
-            .set_input_channels(vec![self.source_identity.clone()])
-            .expect("the temporal test source identity is non-empty");
-        checkpoint
+        self.captured_checkpoint()
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        if !self.checkpoint_ready()? {
+            return Ok(None);
+        }
+        Ok(Some(self.captured_checkpoint()))
+    }
+
+    fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
+        Ok(self.vnode_assignment.as_ref().is_none_or(|assignment| {
+            assignment.registry.assignment_version() == assignment.version.get()
+        }))
+    }
+
+    fn set_vnode_assignment(
+        &mut self,
+        source_identity: &str,
+        registry: Arc<VnodeRegistry>,
+        self_id: NodeId,
+    ) -> Result<(), ConnectorError> {
+        if source_identity.is_empty() || self_id.is_unassigned() {
+            return Err(ConnectorError::ConfigurationError(
+                "temporal test vnode assignment requires a source and node identity".into(),
+            ));
+        }
+        let version =
+            std::num::NonZeroU64::new(registry.assignment_version()).ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "temporal test vnode assignment is not yet published".into(),
+                )
+            })?;
+        self.vnode_assignment = Some(TemporalTestVnodeAssignment {
+            source_identity: source_identity.as_bytes().to_vec(),
+            registry,
+            self_id,
+            version,
+        });
+        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

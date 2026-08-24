@@ -226,11 +226,12 @@ mod tests {
     async fn recovery_rejects_corrupt_referenced_segment() {
         let (objects, store, manifest) = fixture().await;
         let segment = &manifest.subscription_output.as_ref().unwrap().streams[0].segments[0];
+        let encoded_length = usize::try_from(segment.encoded_length).unwrap();
         let path = Path::from(format!("recovery-output/{}", segment.object_key));
         objects
             .put(
                 &path,
-                PutPayload::from_bytes(Bytes::from(vec![0; segment.encoded_length as usize])),
+                PutPayload::from_bytes(Bytes::from(vec![0; encoded_length])),
             )
             .await
             .unwrap();

@@ -24,9 +24,9 @@ use super::cluster_evidence::{
 };
 use super::json_encoding::batches_to_json_string;
 use super::ws::{
-    next_ws_data_frame, try_acquire_ws_slot, ws_error_json, ws_gap_json, ws_progress_json,
-    WsBatchFrameState, WsFrameBuildError, WsPongDeadline, MAX_WS_CONTROL_FIELD_BYTES,
-    MAX_WS_FRAME_BYTES,
+    next_ws_data_frame, next_ws_data_frame_with_metadata, try_acquire_ws_slot, ws_error_json,
+    ws_gap_json, ws_progress_json, ws_progress_json_with_metadata, WsBatchFrameState,
+    WsFrameBuildError, WsPongDeadline, MAX_WS_CONTROL_FIELD_BYTES, MAX_WS_FRAME_BYTES,
 };
 use super::*;
 use crate::reload::ReloadGuard;
@@ -1722,6 +1722,66 @@ fn test_ws_terminal_frames_expose_error_and_gap_details() {
     assert_eq!(progress["log_sequence"], "8");
     assert_eq!(progress["through_log_sequence"], "6");
     assert_eq!(progress["sequence"], "10");
+    assert!(progress.get("stream_generation").is_none());
+}
+
+#[test]
+fn ws_cluster_frames_add_partition_metadata_without_changing_row_data() {
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use laminar_core::checkpoint::{
+        OutputPartitionId, PartitionSequence, StreamGeneration, SubscriptionDigest,
+    };
+
+    let generation = StreamGeneration::from_digest(SubscriptionDigest::from_bytes([7; 32]));
+    let data_metadata = laminar_db::subscription::ClusterSubscriptionFrameMetadata::Data {
+        stream_generation: generation,
+        partition: OutputPartitionId::new(3),
+        partition_sequence: PartitionSequence::new(9),
+        committed_epoch: 12,
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![42]))],
+    )
+    .unwrap();
+    let frame = next_ws_data_frame_with_metadata(
+        "positions",
+        &batch,
+        &mut WsBatchFrameState::default(),
+        0,
+        0,
+        Some(&data_metadata),
+    )
+    .unwrap()
+    .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(frame["data"], serde_json::json!([{ "value": "42" }]));
+    assert_eq!(frame["stream_generation"], generation.to_string());
+    assert_eq!(frame["partition"], "3");
+    assert_eq!(frame["partition_sequence"], "9");
+    assert_eq!(frame["committed_epoch"], "12");
+
+    let progress_metadata = laminar_db::subscription::ClusterSubscriptionFrameMetadata::Progress {
+        stream_generation: generation,
+        epoch: 12,
+        checkpoint_id: 12,
+    };
+    let progress: serde_json::Value = serde_json::from_str(&ws_progress_json_with_metadata(
+        "positions",
+        12,
+        12,
+        3,
+        3,
+        4,
+        Some(&progress_metadata),
+    ))
+    .unwrap();
+    assert_eq!(progress["stream_generation"], generation.to_string());
 }
 
 #[test]
@@ -3310,6 +3370,34 @@ async fn test_cluster_nodes_404_when_not_cluster() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_status_reports_bounded_subscription_output_health() {
+    let state = test_state();
+    state.current_config.write().server.mode = crate::config::ServerMode::Cluster;
+    let response = build_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let output = json["subscription_output"].as_object().unwrap();
+    assert_eq!(output["active_readers"], 0);
+    assert_eq!(output["pending_bytes"], 0);
+    assert_eq!(output["integrity_failures"], 0);
+    assert!(!output.contains_key("stream"));
+    assert!(!output.contains_key("partition"));
 }
 
 #[tokio::test]

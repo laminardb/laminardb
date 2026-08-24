@@ -1,6 +1,11 @@
 //! Durable, append-only leader fencing.
 
 mod artifact_admission;
+mod subscription_replay;
+
+pub use subscription_replay::{
+    SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};

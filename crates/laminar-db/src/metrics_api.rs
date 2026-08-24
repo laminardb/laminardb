@@ -56,6 +56,29 @@ impl LaminarDB {
         self.engine_metrics.lock().clone()
     }
 
+    /// Read process-local committed subscription output-log health without storage I/O.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn cluster_subscription_output_health(
+        &self,
+    ) -> Option<crate::metrics::ClusterSubscriptionOutputHealth> {
+        let metrics = self.engine_metrics.lock();
+        let metrics = &metrics.as_ref()?.cluster_subscription;
+        Some(crate::metrics::ClusterSubscriptionOutputHealth {
+            active_readers: nonnegative_gauge(metrics.active_readers.get()),
+            pending_bytes: nonnegative_gauge(metrics.pending_bytes.get()),
+            retained_bytes: nonnegative_gauge(metrics.retained_bytes.get()),
+            orphan_bytes: nonnegative_gauge(metrics.orphan_bytes.get()),
+            open_failures: metrics.open_failures_total.get(),
+            segment_write_failures: metrics.segment_write_failures_total.get(),
+            manifest_failures: metrics.manifest_failures_total.get(),
+            integrity_failures: metrics.integrity_failures_total.get(),
+            stale_writer_rejections: metrics.stale_writer_rejections_total.get(),
+            sequence_gaps: metrics.sequence_gaps_total.get(),
+            lag_disconnects: metrics.gateway_lag_disconnects_total.get(),
+        })
+    }
+
     /// Read one bounded, process-bound page of local cluster checkpoint barrier timings.
     ///
     /// This is an in-memory diagnostic read. It performs no checkpoint, state-backend, network,
@@ -322,6 +345,11 @@ impl LaminarDB {
     }
 }
 
+#[cfg(feature = "cluster")]
+fn nonnegative_gauge(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +485,24 @@ mod tests {
 
         DbState::Created.store(&db.state);
         assert!(error.contains("Created"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_subscription_health_is_aggregated_without_identity_labels() {
+        let db = LaminarDB::open().unwrap();
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        metrics.cluster_subscription.active_readers.set(2);
+        metrics.cluster_subscription.pending_bytes.set(128);
+        metrics.cluster_subscription.integrity_failures_total.inc();
+        db.set_engine_metrics(metrics);
+
+        let health = db.cluster_subscription_output_health().unwrap();
+        assert_eq!(health.active_readers, 2);
+        assert_eq!(health.pending_bytes, 128);
+        assert_eq!(health.integrity_failures, 1);
+        assert_eq!(health.retained_bytes, 0);
     }
 
     #[cfg(feature = "cluster")]

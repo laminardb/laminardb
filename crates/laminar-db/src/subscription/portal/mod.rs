@@ -6,32 +6,101 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::physical_expr::PhysicalExpr;
 use futures::FutureExt;
+use laminar_core::checkpoint::{OutputPartitionId, PartitionSequence, StreamGeneration};
 
+#[cfg(feature = "cluster")]
+use super::cluster::{ClusterReaderFrame, ClusterReaderRead, ClusterSubscriptionReader};
 use super::registry::{ChargedUpdate, MvUpdate, SubscriptionRead, SubscriptionReader};
 
 #[derive(Debug)]
 enum PortalReader {
     Local(SubscriptionReader),
+    #[cfg(feature = "cluster")]
+    Cluster(ClusterSubscriptionReader),
 }
 
 impl PortalReader {
-    async fn next(&mut self) -> SubscriptionRead {
+    async fn next(&mut self) -> PortalRead {
         match self {
-            Self::Local(reader) => reader.next().await,
+            Self::Local(reader) => PortalRead::Local(reader.next().await),
+            #[cfg(feature = "cluster")]
+            Self::Cluster(reader) => PortalRead::Cluster(reader.next().await),
         }
     }
+
+    fn try_next(&mut self) -> Option<PortalRead> {
+        match self {
+            Self::Local(reader) => reader.next().now_or_never().map(PortalRead::Local),
+            #[cfg(feature = "cluster")]
+            Self::Cluster(reader) => reader.try_next().map(PortalRead::Cluster),
+        }
+    }
+}
+
+enum PortalRead {
+    Local(SubscriptionRead),
+    #[cfg(feature = "cluster")]
+    Cluster(ClusterReaderRead),
 }
 
 /// Keeps the process-wide subscription charge alive with an emitted batch.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct SubscriptionFrameLease {
-    _owner: ChargedUpdate,
+    _local_owner: Option<ChargedUpdate>,
+    #[cfg(feature = "cluster")]
+    _cluster_owner: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl std::fmt::Debug for SubscriptionFrameLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SubscriptionFrameLease")
+    }
+}
+
+/// Optional durable identity carried alongside a compatibility [`PortalFrame`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterSubscriptionFrameMetadata {
+    /// Partition-local identity of one committed data frame.
+    Data {
+        /// Durable stream incarnation.
+        stream_generation: StreamGeneration,
+        /// Stable vnode output partition.
+        partition: OutputPartitionId,
+        /// Monotonic sequence within this generation and partition.
+        partition_sequence: PartitionSequence,
+        /// Whole-cluster checkpoint that first exposed this frame.
+        committed_epoch: u64,
+    },
+    /// Whole-cluster committed progress after every partition interval was delivered.
+    Progress {
+        /// Durable stream incarnation.
+        stream_generation: StreamGeneration,
+        /// Committed checkpoint epoch.
+        epoch: u64,
+        /// Committed checkpoint identifier.
+        checkpoint_id: u64,
+    },
+}
+
+/// Backward-compatible frame plus optional cluster delivery metadata.
+#[derive(Debug, Clone)]
+pub struct SubscriptionEnvelope {
+    /// Existing local/standalone-compatible frame.
+    pub frame: PortalFrame,
+    /// Present only for committed cluster frames.
+    pub cluster: Option<ClusterSubscriptionFrameMetadata>,
+    /// Stable terminal error code when `frame` is [`PortalFrame::Error`].
+    pub error_code: Option<&'static str>,
+}
+
+impl SubscriptionEnvelope {
+    fn local(frame: PortalFrame) -> Self {
+        Self {
+            frame,
+            cluster: None,
+            error_code: None,
+        }
     }
 }
 
@@ -42,7 +111,8 @@ pub enum PortalFrame {
     Batch {
         /// Arrow rows in the shared-log entry.
         batch: RecordBatch,
-        /// Physical sequence within this in-memory object incarnation; not a durable resume token.
+        /// Portal-local delivery sequence. In cluster mode this is neither durable nor global;
+        /// use [`ClusterSubscriptionFrameMetadata::Data`] for partition identity.
         sequence: u64,
         /// Internal process-memory ownership token.
         #[doc(hidden)]
@@ -50,13 +120,14 @@ pub enum PortalFrame {
     },
     /// Progress frontier for a durably committed checkpoint.
     Barrier {
-        /// Physical sequence of this progress entry within the current object incarnation.
+        /// Portal-local delivery sequence; not a cluster-wide ordering position.
         sequence: u64,
         /// Engine checkpoint epoch.
         epoch: u64,
         /// Engine checkpoint id.
         checkpoint_id: u64,
-        /// Every shared-log entry with sequence below this value is covered by the cut.
+        /// Local-log cut, or the gateway-local delivery cut in cluster mode. The durable cluster
+        /// position is the checkpoint's partition-frontier vector, addressed by `epoch`.
         through_sequence: u64,
     },
     /// Consumer fell behind by exactly `skipped` shared-log entries. This is
@@ -112,6 +183,22 @@ impl SubscriptionPortal {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn open_cluster(
+        name: impl Into<String>,
+        schema: SchemaRef,
+        reader: ClusterSubscriptionReader,
+        filter: Option<Arc<dyn PhysicalExpr>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            reader: Some(PortalReader::Cluster(reader)),
+            closed: false,
+            filter,
+        }
+    }
+
     /// Schema of the subscribed object.
     #[must_use]
     pub fn schema(&self) -> SchemaRef {
@@ -120,6 +207,11 @@ impl SubscriptionPortal {
 
     /// Next frame, or `None` after a terminal frame or explicit close.
     pub async fn next_frame(&mut self) -> Option<PortalFrame> {
+        self.next_envelope().await.map(|envelope| envelope.frame)
+    }
+
+    /// Next frame with optional partition/checkpoint metadata for cluster-aware clients.
+    pub async fn next_envelope(&mut self) -> Option<SubscriptionEnvelope> {
         if self.closed {
             return None;
         }
@@ -134,19 +226,32 @@ impl SubscriptionPortal {
 
     /// Return the next immediately available frame without waiting.
     pub fn try_next_frame(&mut self) -> Option<PortalFrame> {
+        self.try_next_envelope().map(|envelope| envelope.frame)
+    }
+
+    /// Return the next immediately available cluster-aware envelope without waiting.
+    pub fn try_next_envelope(&mut self) -> Option<SubscriptionEnvelope> {
         if self.closed {
             return None;
         }
 
         loop {
-            let read = self.reader.as_mut()?.next().now_or_never()?;
+            let read = self.reader.as_mut()?.try_next()?;
             if let Some(frame) = self.process_read(read) {
                 return Some(frame);
             }
         }
     }
 
-    fn process_read(&mut self, read: SubscriptionRead) -> Option<PortalFrame> {
+    fn process_read(&mut self, read: PortalRead) -> Option<SubscriptionEnvelope> {
+        match read {
+            PortalRead::Local(read) => self.process_local_read(read),
+            #[cfg(feature = "cluster")]
+            PortalRead::Cluster(read) => self.process_cluster_read(read),
+        }
+    }
+
+    fn process_local_read(&mut self, read: SubscriptionRead) -> Option<SubscriptionEnvelope> {
         let frame = match read {
             SubscriptionRead::Update { sequence, update } => translate(sequence, update),
             SubscriptionRead::Lagged(skipped) => {
@@ -156,7 +261,7 @@ impl SubscriptionPortal {
                     "subscription cursor was evicted; closing"
                 );
                 self.close();
-                return Some(PortalFrame::Lagged(skipped));
+                return Some(SubscriptionEnvelope::local(PortalFrame::Lagged(skipped)));
             }
             SubscriptionRead::Terminal(message) => {
                 tracing::warn!(
@@ -165,9 +270,88 @@ impl SubscriptionPortal {
                     "subscription log terminated; closing"
                 );
                 self.close();
-                return Some(PortalFrame::Error { message });
+                return Some(SubscriptionEnvelope::local(PortalFrame::Error { message }));
             }
         };
+
+        self.process_envelope(SubscriptionEnvelope::local(frame))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn process_cluster_read(&mut self, read: ClusterReaderRead) -> Option<SubscriptionEnvelope> {
+        let envelope = match read {
+            ClusterReaderRead::Frame(ClusterReaderFrame::Batch {
+                batch,
+                delivery_sequence,
+                stream_generation,
+                partition,
+                partition_sequence,
+                committed_epoch,
+                permit,
+            }) => SubscriptionEnvelope {
+                frame: PortalFrame::Batch {
+                    batch,
+                    sequence: delivery_sequence,
+                    lease: SubscriptionFrameLease {
+                        _local_owner: None,
+                        _cluster_owner: Some(permit),
+                    },
+                },
+                cluster: Some(ClusterSubscriptionFrameMetadata::Data {
+                    stream_generation,
+                    partition,
+                    partition_sequence,
+                    committed_epoch,
+                }),
+                error_code: None,
+            },
+            ClusterReaderRead::Frame(ClusterReaderFrame::Progress {
+                delivery_sequence,
+                through_sequence,
+                stream_generation,
+                epoch,
+                checkpoint_id,
+            }) => SubscriptionEnvelope {
+                frame: PortalFrame::Barrier {
+                    sequence: delivery_sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence,
+                },
+                cluster: Some(ClusterSubscriptionFrameMetadata::Progress {
+                    stream_generation,
+                    epoch,
+                    checkpoint_id,
+                }),
+                error_code: None,
+            },
+            ClusterReaderRead::Terminal(error) => {
+                let code = error.code();
+                tracing::warn!(
+                    subscription = %self.name,
+                    code,
+                    error = %error,
+                    "committed cluster subscription terminated"
+                );
+                self.close();
+                return Some(SubscriptionEnvelope {
+                    frame: PortalFrame::Error {
+                        message: format!("[{code}] {error}"),
+                    },
+                    cluster: None,
+                    error_code: Some(code),
+                });
+            }
+        };
+        self.process_envelope(envelope)
+    }
+
+    fn process_envelope(&mut self, envelope: SubscriptionEnvelope) -> Option<SubscriptionEnvelope> {
+        let SubscriptionEnvelope {
+            frame,
+            cluster,
+            error_code,
+        } = envelope;
 
         let PortalFrame::Batch {
             batch,
@@ -178,20 +362,32 @@ impl SubscriptionPortal {
             if matches!(&frame, PortalFrame::Error { .. }) {
                 self.close();
             }
-            return Some(frame);
+            return Some(SubscriptionEnvelope {
+                frame,
+                cluster,
+                error_code,
+            });
         };
         let Some(filter) = self.filter.as_ref() else {
-            return Some(PortalFrame::Batch {
-                batch,
-                sequence,
-                lease,
+            return Some(SubscriptionEnvelope {
+                frame: PortalFrame::Batch {
+                    batch,
+                    sequence,
+                    lease,
+                },
+                cluster,
+                error_code,
             });
         };
         match crate::filter_compile::apply(&batch, filter.as_ref()) {
-            Ok(Some(filtered)) => Some(PortalFrame::Batch {
-                batch: filtered,
-                sequence,
-                lease,
+            Ok(Some(filtered)) => Some(SubscriptionEnvelope {
+                frame: PortalFrame::Batch {
+                    batch: filtered,
+                    sequence,
+                    lease,
+                },
+                cluster,
+                error_code,
             }),
             Ok(None) => None,
             Err(error) => {
@@ -202,7 +398,11 @@ impl SubscriptionPortal {
                 );
                 let message = error.to_string();
                 self.close();
-                Some(PortalFrame::Error { message })
+                Some(SubscriptionEnvelope {
+                    frame: PortalFrame::Error { message },
+                    cluster: None,
+                    error_code: None,
+                })
             }
         }
     }
@@ -233,7 +433,11 @@ fn translate(sequence: u64, update: ChargedUpdate) -> PortalFrame {
             PortalFrame::Batch {
                 batch,
                 sequence,
-                lease: SubscriptionFrameLease { _owner: update },
+                lease: SubscriptionFrameLease {
+                    _local_owner: Some(update),
+                    #[cfg(feature = "cluster")]
+                    _cluster_owner: None,
+                },
             }
         }
         MvUpdate::Barrier {

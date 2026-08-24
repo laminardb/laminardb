@@ -800,7 +800,7 @@ impl Discovery for StaticDiscovery {
     }
 
     // INVARIANT: discovery operations stay poll-driven for timeout and select cancellation.
-    #[allow(clippy::unused_async_trait_impl)]
+    #[allow(clippy::unused_async)]
     async fn peers(&self) -> Result<Vec<NodeInfo>, DiscoveryError> {
         if !self.started {
             return Err(DiscoveryError::NotStarted);
@@ -809,7 +809,7 @@ impl Discovery for StaticDiscovery {
     }
 
     // INVARIANT: announcement mutation starts only when the returned future is polled.
-    #[allow(clippy::unused_async_trait_impl)]
+    #[allow(clippy::unused_async)]
     async fn announce(&self, info: NodeInfo) -> Result<(), DiscoveryError> {
         if !self.started {
             return Err(DiscoveryError::NotStarted);

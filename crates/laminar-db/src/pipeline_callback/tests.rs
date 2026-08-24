@@ -3324,6 +3324,12 @@ fn cluster_callback_fixture(
     let pipeline_watermark = Arc::new(std::sync::atomic::AtomicI64::new(
         startup_watermark.unwrap_or(i64::MIN),
     ));
+    let cluster_subscription_output =
+        crate::subscription::cluster::ClusterSubscriptionOutputState::new(
+            Vec::new(),
+            controller.try_live_local_process_authority_identity().ok(),
+        )
+        .unwrap();
 
     ClusterCallbackFixture {
         callback: ConnectorPipelineCallback {
@@ -3380,7 +3386,7 @@ fn cluster_callback_fixture(
             pending_follower_checkpoint: None,
             checkpoint_leader_proofs: FxHashMap::default(),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
-            cluster_subscription_output: Default::default(),
+            cluster_subscription_output,
             named_stream_names: rustc_hash::FxHashSet::default(),
             checkpoint_complete_tx,
             checkpoint_tail_runtime: tokio::runtime::Handle::current(),
@@ -3393,6 +3399,52 @@ fn cluster_callback_fixture(
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         },
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn subscription_writer_rejects_callback_process_identity_mismatch() {
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::VnodeRegistry;
+
+    let kv = Arc::new(InMemoryKv::new(NodeId(1)));
+    let control_kv: Arc<dyn ClusterKv> = kv;
+    let leader = authoritative_local_leader(control_kv).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(vec![NodeId(1)].into(), leader.fence.assignment_version);
+    let mut fixture = cluster_callback_fixture(registry, Arc::clone(&leader.controller), None);
+
+    let initial = fixture.callback.subscription_writer_authority(&[]);
+    assert!(initial.is_ok(), "{initial:?}");
+    let mut foreign_process = fixture
+        .callback
+        .cluster_subscription_output
+        .bound_process()
+        .unwrap();
+    foreign_process.process_term = foreign_process.process_term.checked_add(1).unwrap();
+    fixture
+        .callback
+        .cluster_subscription_output
+        .replace_bound_process_for_test(foreign_process);
+
+    let error = fixture
+        .callback
+        .subscription_writer_authority(&[])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("process authority changed"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture
+            .callback
+            .prom
+            .cluster_subscription
+            .stale_writer_rejections_total
+            .get(),
+        1
+    );
 }
 
 #[cfg(feature = "cluster")]

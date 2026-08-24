@@ -16,6 +16,9 @@ pub use error::ClusterSubscriptionError;
 pub(crate) use frame::{
     CertifiedSubscriptionFrontiers, PartitionedOutputBatch, PreparedSubscriptionOutput,
 };
-pub use portal::{PortalFrame, SubscriptionFrameLease, SubscriptionPortal};
+pub use portal::{
+    ClusterSubscriptionFrameMetadata, PortalFrame, SubscriptionEnvelope, SubscriptionFrameLease,
+    SubscriptionPortal,
+};
 pub use registry::SubscribeStart;
 pub(crate) use registry::{SubscriptionOpenError, SubscriptionRegistry};

@@ -70,6 +70,13 @@ impl PlannedSubscriptionOutput {
         &self.distribution
     }
 
+    pub(crate) const fn is_vnode_partitioned(&self) -> bool {
+        matches!(
+            self.distribution,
+            OutputDistribution::VnodePartitioned { .. }
+        )
+    }
+
     pub(crate) fn matches_aggregate_grouping(&self, group_columns: usize) -> bool {
         match &self.distribution {
             OutputDistribution::VnodePartitioned { .. } => group_columns != 0,

@@ -773,6 +773,8 @@ struct GcRequest {
     requested: Option<CommittedCheckpointIndex>,
     decision_store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     authority: GcAuthority,
+    #[cfg(feature = "cluster")]
+    metrics: Option<Arc<crate::engine_metrics::EngineMetrics>>,
 }
 
 async fn load_index_manifests(
@@ -1275,6 +1277,7 @@ async fn run_cluster_gc_request(
         store.as_ref(),
         request.decision_store.as_ref(),
         authority.as_ref(),
+        &proof,
         request.requested.as_ref(),
     )
     .await?;
@@ -1287,6 +1290,7 @@ async fn run_cluster_gc_request(
     )
     .await?;
     let (Some(latest), Some(horizon)) = (request.requested.as_ref(), requested.as_ref()) else {
+        subscription_output::record_subscription_cleanup(request.metrics.as_deref(), None);
         return Ok(());
     };
     let grace_ms =
@@ -1298,7 +1302,7 @@ async fn run_cluster_gc_request(
     let grace_before_ms = i64::try_from(now_ms)
         .unwrap_or(i64::MAX)
         .saturating_sub(grace_ms);
-    let _ = subscription_output::cleanup_subscription_orphans(
+    let cleanup = subscription_output::cleanup_subscription_orphans(
         store.as_ref(),
         request.decision_store.as_ref(),
         latest,
@@ -1306,6 +1310,7 @@ async fn run_cluster_gc_request(
         grace_before_ms,
     )
     .await?;
+    subscription_output::record_subscription_cleanup(request.metrics.as_deref(), Some(&cleanup));
     Ok(())
 }
 
@@ -2026,6 +2031,8 @@ impl CheckpointCoordinator {
                 requested: Some(current),
                 decision_store: Arc::clone(decision_store),
                 authority,
+                #[cfg(feature = "cluster")]
+                metrics: self.prom.clone(),
             }))
             .is_err()
         {
@@ -2069,6 +2076,7 @@ impl CheckpointCoordinator {
                     proof,
                     controller: Arc::downgrade(controller),
                 },
+                metrics: self.prom.clone(),
             }))
             .map_err(|_| DbError::Checkpoint("checkpoint retention worker is unavailable".into()))
     }
@@ -4471,6 +4479,8 @@ impl CheckpointCoordinator {
         Ok(index)
     }
 
+    // COMPAT: cluster builds await shared-store continuity validation; keep one caller shape.
+    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async))]
     async fn build_validated_committed_index_until(
         &self,
         attempt: CheckpointAttempt,
@@ -4492,14 +4502,21 @@ impl CheckpointCoordinator {
             quorum_watermark,
         )?;
         #[cfg(feature = "cluster")]
-        self.validate_subscription_continuity_until(
-            attempt,
-            assignment_fence.as_ref(),
-            predecessor.as_ref(),
-            manifests,
-            deadline,
-        )
-        .await?;
+        let subscription_validation = self
+            .validate_subscription_continuity_until(
+                attempt,
+                assignment_fence.as_ref(),
+                predecessor.as_ref(),
+                manifests,
+                deadline,
+            )
+            .await;
+        #[cfg(feature = "cluster")]
+        if let Err(error) = &subscription_validation {
+            self.record_cluster_subscription_error(error);
+        }
+        #[cfg(feature = "cluster")]
+        subscription_validation?;
         #[cfg(not(feature = "cluster"))]
         let _ = deadline;
         Ok(index)
@@ -5277,6 +5294,9 @@ impl CheckpointCoordinator {
                     .await);
             }
         };
+        #[cfg(feature = "cluster")]
+        let subscription_commit_stats = (scope == CheckpointScope::Cluster)
+            .then(|| subscription_output::subscription_commit_stats(&manifests));
         #[cfg(all(debug_assertions, feature = "cluster"))]
         checkpoint_kill_gate(
             "leader",
@@ -5305,6 +5325,8 @@ impl CheckpointCoordinator {
         };
 
         self.phase = CheckpointPhase::Deciding;
+        #[cfg(feature = "cluster")]
+        let commit_visibility_started = Instant::now();
         let outcome = self
             .record_outcome_until(
                 attempt,
@@ -5323,6 +5345,12 @@ impl CheckpointCoordinator {
                 CheckpointFailureDisposition::RequiresRecovery,
             ));
         }
+        #[cfg(feature = "cluster")]
+        self.record_subscription_commit(
+            subscription_commit_stats,
+            commit_visibility_started.elapsed(),
+            attempt,
+        );
 
         let predecessor_checkpoint_id = index
             .predecessor

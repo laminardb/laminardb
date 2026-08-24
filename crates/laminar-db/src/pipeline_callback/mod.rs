@@ -4335,6 +4335,8 @@ impl ConnectorPipelineCallback {
         &mut self,
         attempt: CheckpointAttempt,
     ) -> Result<crate::checkpoint_coordinator::CheckpointRequest, String> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = attempt;
         let mut channel_progress = Vec::new();
         if let Some(tracker) = self.tracker.as_ref() {
             channel_progress.reserve(tracker.num_sources());
@@ -5423,7 +5425,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn complete_pending_vnode_transition(
         &mut self,
     ) -> Result<bool, crate::pipeline::CycleError> {
@@ -6598,7 +6599,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     /// Service follower announcements observed from the cluster leader.
     /// All local checkpoint admission is owned exclusively by `StreamingCoordinator`.
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn service_checkpoint_control(
         &mut self,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
@@ -7015,6 +7015,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
             return self
                 .cluster_subscription_output
@@ -7025,6 +7026,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn abort_subscription_cut(&mut self, attempt: CheckpointAttempt) {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
             if let Err(error) = self.cluster_subscription_output.abort_checkpoint(attempt) {
                 set_checkpoint_fault(
@@ -7032,17 +7034,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     format!("abort cluster subscription checkpoint: {error}"),
                 );
             }
+            self.record_subscription_pending_bytes();
             return;
         }
         self.subscription_registry.abort_cut(attempt);
     }
 
     fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
-            return self
+            let result = self
                 .cluster_subscription_output
                 .commit_checkpoint(attempt)
                 .map_err(|error| error.to_string());
+            self.record_subscription_pending_bytes();
+            return result;
         }
         self.subscription_registry.commit_cut(attempt)
     }
@@ -7077,7 +7083,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn cancel_source_barrier_attempt(
         &mut self,
         attempt: CheckpointAttempt,

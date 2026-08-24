@@ -5,11 +5,220 @@ use prometheus::{
     IntGaugeVec, Opts, Registry,
 };
 
+/// Bounded-cardinality metrics for committed cluster subscriptions.
+#[cfg(feature = "cluster")]
+pub struct ClusterSubscriptionMetrics {
+    /// Readers currently attached to this gateway process.
+    pub active_readers: IntGauge,
+    /// Cluster subscription open attempts handled by this process.
+    pub open_total: IntCounter,
+    /// Failed cluster subscription open attempts.
+    pub open_failures_total: IntCounter,
+    /// Output frames made visible by authoritative checkpoint Commit outcomes.
+    pub frames_committed_total: IntCounter,
+    /// Output rows made visible by authoritative checkpoint Commit outcomes.
+    pub rows_committed_total: IntCounter,
+    /// Encoded segment bytes made visible by authoritative checkpoint Commit outcomes.
+    pub bytes_committed_total: IntCounter,
+    /// Immutable output segments written by this process.
+    pub segments_written_total: IntCounter,
+    /// Immutable output segment writes that failed.
+    pub segment_write_failures_total: IntCounter,
+    /// Manifest construction, loading, or validation failures.
+    pub manifest_failures_total: IntCounter,
+    /// Committed manifest or segment integrity failures.
+    pub integrity_failures_total: IntCounter,
+    /// Fenced output writer attempts rejected by this process.
+    pub stale_writer_rejections_total: IntCounter,
+    /// Partition continuity failures detected by writers or readers.
+    pub sequence_gaps_total: IntCounter,
+    /// Encoded bytes read during committed replay.
+    pub replay_bytes_total: IntCounter,
+    /// Frames read during committed replay.
+    pub replay_frames_total: IntCounter,
+    /// Replay opens rejected because their epoch was pruned.
+    pub replay_pruned_total: IntCounter,
+    /// Readers disconnected after exhausting bounded gateway lag allowance.
+    pub gateway_lag_disconnects_total: IntCounter,
+    /// In-memory output bytes awaiting checkpoint disposition on this process.
+    pub pending_bytes: IntGauge,
+    /// Bytes reachable from the retained committed output-log suffix.
+    pub retained_bytes: IntGauge,
+    /// Grace-held unreachable output bytes found by the latest orphan scan.
+    pub orphan_bytes: IntGauge,
+    /// Subscription output encoding and upload duration during checkpoint preparation.
+    pub checkpoint_prepare_seconds: Histogram,
+    /// Authoritative Commit publication duration before local visibility.
+    pub commit_visibility_seconds: Histogram,
+    /// Gateway committed-index refresh duration.
+    pub gateway_manifest_refresh_seconds: Histogram,
+}
+
+#[cfg(feature = "cluster")]
+impl ClusterSubscriptionMetrics {
+    fn new(registry: &Registry) -> Self {
+        Self {
+            active_readers: register_int_gauge(
+                registry,
+                "cluster_subscription_active_readers",
+                "Committed cluster subscription readers attached to this process",
+            ),
+            open_total: register_int_counter(
+                registry,
+                "cluster_subscription_open_total",
+                "Committed cluster subscription open attempts",
+            ),
+            open_failures_total: register_int_counter(
+                registry,
+                "cluster_subscription_open_failures_total",
+                "Failed committed cluster subscription open attempts",
+            ),
+            frames_committed_total: register_int_counter(
+                registry,
+                "cluster_subscription_frames_committed_total",
+                "Output frames made visible by authoritative checkpoint commits",
+            ),
+            rows_committed_total: register_int_counter(
+                registry,
+                "cluster_subscription_rows_committed_total",
+                "Output rows made visible by authoritative checkpoint commits",
+            ),
+            bytes_committed_total: register_int_counter(
+                registry,
+                "cluster_subscription_bytes_committed_total",
+                "Encoded output bytes made visible by authoritative checkpoint commits",
+            ),
+            segments_written_total: register_int_counter(
+                registry,
+                "cluster_subscription_segments_written_total",
+                "Immutable committed-output segments written by this process",
+            ),
+            segment_write_failures_total: register_int_counter(
+                registry,
+                "cluster_subscription_segment_write_failures_total",
+                "Immutable committed-output segment writes that failed",
+            ),
+            manifest_failures_total: register_int_counter(
+                registry,
+                "cluster_subscription_manifest_failures_total",
+                "Committed-output manifest construction, loading, or validation failures",
+            ),
+            integrity_failures_total: register_int_counter(
+                registry,
+                "cluster_subscription_integrity_failures_total",
+                "Committed-output manifest or segment integrity failures",
+            ),
+            stale_writer_rejections_total: register_int_counter(
+                registry,
+                "cluster_subscription_stale_writer_rejections_total",
+                "Fenced committed-output writer attempts rejected by this process",
+            ),
+            sequence_gaps_total: register_int_counter(
+                registry,
+                "cluster_subscription_sequence_gaps_total",
+                "Partition sequence continuity failures detected by writers or readers",
+            ),
+            replay_bytes_total: register_int_counter(
+                registry,
+                "cluster_subscription_replay_bytes_total",
+                "Encoded bytes read during committed subscription replay",
+            ),
+            replay_frames_total: register_int_counter(
+                registry,
+                "cluster_subscription_replay_frames_total",
+                "Frames read during committed subscription replay",
+            ),
+            replay_pruned_total: register_int_counter(
+                registry,
+                "cluster_subscription_replay_pruned_total",
+                "Replay opens rejected because their epoch was pruned",
+            ),
+            gateway_lag_disconnects_total: register_int_counter(
+                registry,
+                "cluster_subscription_gateway_lag_disconnects_total",
+                "Readers disconnected after exhausting bounded gateway lag allowance",
+            ),
+            pending_bytes: register_int_gauge(
+                registry,
+                "cluster_subscription_pending_bytes",
+                "In-memory committed-output bytes awaiting checkpoint disposition",
+            ),
+            retained_bytes: register_int_gauge(
+                registry,
+                "cluster_subscription_retained_bytes",
+                "Bytes reachable from the retained committed output-log suffix",
+            ),
+            orphan_bytes: register_int_gauge(
+                registry,
+                "cluster_subscription_orphan_bytes",
+                "Grace-held unreachable output bytes found by the latest orphan scan",
+            ),
+            checkpoint_prepare_seconds: register_subscription_histogram(
+                registry,
+                "cluster_subscription_checkpoint_prepare_seconds",
+                "Subscription output encoding and upload duration during checkpoint preparation",
+            ),
+            commit_visibility_seconds: register_subscription_histogram(
+                registry,
+                "cluster_subscription_commit_visibility_seconds",
+                "Authoritative checkpoint Commit publication duration before local visibility",
+            ),
+            gateway_manifest_refresh_seconds: register_subscription_histogram(
+                registry,
+                "cluster_subscription_gateway_manifest_refresh_seconds",
+                "Gateway committed-index refresh duration",
+            ),
+        }
+    }
+}
+
+fn register_int_counter(registry: &Registry, name: &str, help: &str) -> IntCounter {
+    let metric = IntCounter::new(name, help).unwrap();
+    registry.register(Box::new(metric.clone())).unwrap();
+    metric
+}
+
+fn register_event_counters(registry: &Registry) -> (IntCounter, IntCounter) {
+    (
+        register_int_counter(
+            registry,
+            "events_ingested_total",
+            "Events ingested from sources",
+        ),
+        register_int_counter(
+            registry,
+            "events_emitted_total",
+            "Events emitted to streams",
+        ),
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn register_int_gauge(registry: &Registry, name: &str, help: &str) -> IntGauge {
+    let metric = IntGauge::new(name, help).unwrap();
+    registry.register(Box::new(metric.clone())).unwrap();
+    metric
+}
+
+#[cfg(feature = "cluster")]
+fn register_subscription_histogram(registry: &Registry, name: &str, help: &str) -> Histogram {
+    let metric = Histogram::with_opts(
+        HistogramOpts::new(name, help)
+            .buckets(prometheus::exponential_buckets(0.001, 2.0, 18).unwrap()),
+    )
+    .unwrap();
+    registry.register(Box::new(metric.clone())).unwrap();
+    metric
+}
+
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
 ///
 /// Constructed once at startup, `Arc`-shared into `PipelineCallback`,
 /// `CheckpointCoordinator`, and `OperatorGraph`.
 pub struct EngineMetrics {
+    /// Committed cluster-subscription metrics without per-stream or per-reader labels.
+    #[cfg(feature = "cluster")]
+    pub cluster_subscription: ClusterSubscriptionMetrics,
     /// Events ingested from sources.
     pub events_ingested: IntCounter,
     /// Events emitted to streams.
@@ -149,17 +358,13 @@ impl EngineMetrics {
             }};
         }
 
+        let (events_ingested, events_emitted) = register_event_counters(registry);
+
         Self {
-            events_ingested: reg!(IntCounter::new(
-                "events_ingested_total",
-                "Events ingested from sources"
-            )
-            .unwrap()),
-            events_emitted: reg!(IntCounter::new(
-                "events_emitted_total",
-                "Events emitted to streams"
-            )
-            .unwrap()),
+            #[cfg(feature = "cluster")]
+            cluster_subscription: ClusterSubscriptionMetrics::new(registry),
+            events_ingested,
+            events_emitted,
             events_dropped: reg!(IntCounter::new("events_dropped_total", "Events dropped").unwrap()),
             cycles: reg!(IntCounter::new(
                 "cycles_total",
@@ -473,6 +678,48 @@ impl EngineMetrics {
                 "Cross-node shuffle delivery-loss incidents (fences the epoch, forces replay)"
             )
             .unwrap()),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cluster_subscription_metric_family_has_the_release_names() {
+        let registry = Registry::new();
+        let _metrics = EngineMetrics::new(&registry);
+        let names = registry
+            .gather()
+            .into_iter()
+            .map(|family| family.name().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "cluster_subscription_active_readers",
+            "cluster_subscription_open_total",
+            "cluster_subscription_open_failures_total",
+            "cluster_subscription_frames_committed_total",
+            "cluster_subscription_rows_committed_total",
+            "cluster_subscription_bytes_committed_total",
+            "cluster_subscription_segments_written_total",
+            "cluster_subscription_segment_write_failures_total",
+            "cluster_subscription_manifest_failures_total",
+            "cluster_subscription_integrity_failures_total",
+            "cluster_subscription_stale_writer_rejections_total",
+            "cluster_subscription_sequence_gaps_total",
+            "cluster_subscription_replay_bytes_total",
+            "cluster_subscription_replay_frames_total",
+            "cluster_subscription_replay_pruned_total",
+            "cluster_subscription_gateway_lag_disconnects_total",
+            "cluster_subscription_pending_bytes",
+            "cluster_subscription_retained_bytes",
+            "cluster_subscription_orphan_bytes",
+            "cluster_subscription_checkpoint_prepare_seconds",
+            "cluster_subscription_commit_visibility_seconds",
+            "cluster_subscription_gateway_manifest_refresh_seconds",
+        ] {
+            assert!(names.contains(expected), "missing metric {expected}");
         }
     }
 }

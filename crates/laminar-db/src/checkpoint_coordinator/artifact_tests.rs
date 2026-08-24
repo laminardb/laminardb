@@ -457,6 +457,8 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             requested: Some(latest.take().unwrap()),
             decision_store: Arc::clone(&decisions),
             authority: GcAuthority::Local,
+            #[cfg(feature = "cluster")]
+            metrics: None,
         },
     )
     .await
@@ -588,6 +590,8 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             requested: Some(index),
             decision_store: decisions,
             authority: GcAuthority::Local,
+            #[cfg(feature = "cluster")]
+            metrics: None,
         },
     )
     .await

@@ -479,7 +479,15 @@ async fn orphan_cleanup_uses_committed_reachability_and_attempt_bounds() {
     }
 
     let reachable = std::collections::BTreeSet::from([retained.object_key.clone()]);
-    let grace_before_ms = chrono::Utc::now().timestamp_millis().saturating_add(1_000);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let grace_report = store
+        .delete_subscription_orphans(&reachable, 1, now_ms.saturating_sub(1_000))
+        .await
+        .unwrap();
+    assert_eq!(grace_report.objects_deleted, 0);
+    assert_eq!(grace_report.bytes_remaining, orphan.encoded_length);
+
+    let grace_before_ms = now_ms.saturating_add(1_000);
     let report = store
         .delete_subscription_orphans(&reachable, 1, grace_before_ms)
         .await
@@ -487,6 +495,7 @@ async fn orphan_cleanup_uses_committed_reachability_and_attempt_bounds() {
     assert_eq!(report.objects_scanned, 3);
     assert_eq!(report.objects_deleted, 1);
     assert_eq!(report.bytes_deleted, orphan.encoded_length);
+    assert_eq!(report.bytes_remaining, 0);
     assert!(store
         .load_subscription_segment(&orphan)
         .await

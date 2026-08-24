@@ -91,7 +91,8 @@ fn prepared_output(
         crate::pipeline_identity::subscription_schema_fingerprint(&schema).unwrap();
     let certificate = Arc::new(certificate);
     let participant = assignment.participants[0];
-    let mut state = ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)]).unwrap();
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
     state
         .stage_cycle(
             vec![PreparedSubscriptionOutput {
@@ -256,7 +257,7 @@ async fn byte_cap_selects_the_oldest_replayable_checkpoint_boundary() {
     )
     .await
     .unwrap();
-    assert_eq!(horizon.epoch, 2);
+    assert_eq!(horizon.epoch, 3);
 }
 
 #[tokio::test]
@@ -327,6 +328,9 @@ async fn immutable_upload_ack_loss_retries_and_uncommitted_object_is_collectable
         .unwrap();
     coordinator.bind_deployment_id(DEPLOYMENT.into()).unwrap();
     coordinator.set_vnode_set(vec![0]);
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    coordinator.set_metrics(Arc::clone(&metrics));
     let assignment = assignment();
     let prepared = prepared_output(&assignment, assignment.assignment_version);
     let attempt = laminar_core::checkpoint::CheckpointAttempt::canonical(1);
@@ -340,11 +344,26 @@ async fn immutable_upload_ack_loss_retries_and_uncommitted_object_is_collectable
         )
         .await
         .is_err());
+    assert_eq!(
+        metrics
+            .cluster_subscription
+            .segment_write_failures_total
+            .get(),
+        1
+    );
     let manifest = coordinator
         .prepare_subscription_output_until(attempt, Some(&assignment), Some(prepared), deadline)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(metrics.cluster_subscription.segments_written_total.get(), 1);
+    assert_eq!(
+        metrics
+            .cluster_subscription
+            .checkpoint_prepare_seconds
+            .get_sample_count(),
+        2
+    );
     let segment = manifest.streams[0].segments[0].clone();
 
     let fresh_objects: Arc<dyn object_store::ObjectStore> = flaky.clone();

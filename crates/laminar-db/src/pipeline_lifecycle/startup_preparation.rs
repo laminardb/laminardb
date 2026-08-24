@@ -106,6 +106,9 @@ impl LaminarDB {
                 pipeline_identity.as_ref(),
             )
             .await?;
+            self.connector_manager
+                .lock()
+                .install_stream_subscription_certificates(&stream_regs)?;
             let certified_streams = stream_regs
                 .values()
                 .filter(|stream| stream.subscription_certificate.is_some())
@@ -159,6 +162,12 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::ChangelogMode;
 
+        if !stream_regs
+            .values()
+            .any(|registration| registration.subscription_output.is_some())
+        {
+            return Ok(());
+        }
         let pipeline_identity = pipeline_identity.cloned().ok_or_else(|| {
             DbError::Checkpoint("cluster subscription output has no bound pipeline identity".into())
         })?;

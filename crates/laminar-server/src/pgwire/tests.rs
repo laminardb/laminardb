@@ -58,6 +58,9 @@ fn subscription_progress_row_uses_ordered_envelope_columns() {
     assert_eq!(fields[4].name(), SUBSCRIPTION_LOG_SEQUENCE_COLUMN);
     assert_eq!(fields[5].name(), SUBSCRIPTION_ROW_INDEX_COLUMN);
     assert_eq!(fields[6].name(), SUBSCRIPTION_THROUGH_SEQUENCE_COLUMN);
+    assert!(fields
+        .iter()
+        .all(|field| !field.name().contains("partition")));
     encode_subscription_progress_row(&fields, 1, 8, 7, 99, 6).unwrap();
 }
 
@@ -132,6 +135,28 @@ fn subscription_open_errors_keep_distinct_sqlstates() {
         (
             laminar_db::DbError::Pipeline("subscriber cap".into()),
             "53300",
+        ),
+        (
+            laminar_db::DbError::Subscription(
+                laminar_db::subscription::ClusterSubscriptionError::UnsupportedPlan {
+                    reason: "stateless".into(),
+                },
+            ),
+            "0A000",
+        ),
+        (
+            laminar_db::DbError::Subscription(
+                laminar_db::subscription::ClusterSubscriptionError::EpochNotCommitted {
+                    requested: 7,
+                },
+            ),
+            "22023",
+        ),
+        (
+            laminar_db::DbError::Subscription(
+                laminar_db::subscription::ClusterSubscriptionError::BackendUnavailable,
+            ),
+            "58000",
         ),
     ] {
         let PgWireError::UserError(info) = subscription_open_error("s", error) else {

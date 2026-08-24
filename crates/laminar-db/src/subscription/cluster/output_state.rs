@@ -6,6 +6,7 @@ use laminar_core::checkpoint::{
     CheckpointAttempt, NodePartitionRange, OutputDistributionCertificate, OutputFrameId,
     OutputPartitionId, PartitionSequence, StreamGeneration,
 };
+use laminar_core::cluster::control::LocalProcessAuthorityIdentity;
 
 use super::OutputWriterAuthority;
 use crate::error::DbError;
@@ -74,6 +75,7 @@ struct CycleAppend {
 /// Single-owner bounded state between aggregate emission and checkpoint persistence.
 pub(crate) struct ClusterSubscriptionOutputState {
     certificates: BTreeMap<String, Arc<OutputDistributionCertificate>>,
+    bound_process: Option<LocalProcessAuthorityIdentity>,
     open: OutputBuffer,
     staged_cycle: Option<CycleAppend>,
     reserved_attempt: Option<CheckpointAttempt>,
@@ -82,13 +84,14 @@ pub(crate) struct ClusterSubscriptionOutputState {
 
 impl Default for ClusterSubscriptionOutputState {
     fn default() -> Self {
-        Self::new(Vec::new()).expect("an empty subscription certificate roster is canonical")
+        Self::new(Vec::new(), None).expect("an empty subscription certificate roster is canonical")
     }
 }
 
 impl ClusterSubscriptionOutputState {
     pub(crate) fn new(
         certificates: Vec<Arc<OutputDistributionCertificate>>,
+        bound_process: Option<LocalProcessAuthorityIdentity>,
     ) -> Result<Self, DbError> {
         let mut registered = BTreeMap::new();
         for certificate in certificates {
@@ -103,6 +106,7 @@ impl ClusterSubscriptionOutputState {
         }
         Ok(Self {
             certificates: registered,
+            bound_process,
             open: OutputBuffer::default(),
             staged_cycle: None,
             reserved_attempt: None,
@@ -112,6 +116,18 @@ impl ClusterSubscriptionOutputState {
 
     pub(crate) fn enabled(&self) -> bool {
         !self.certificates.is_empty()
+    }
+
+    pub(crate) fn bound_process(&self) -> Option<LocalProcessAuthorityIdentity> {
+        self.bound_process
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_bound_process_for_test(
+        &mut self,
+        process: LocalProcessAuthorityIdentity,
+    ) {
+        self.bound_process = Some(process);
     }
 
     pub(crate) fn stage_cycle(
@@ -691,7 +707,7 @@ impl ClusterSubscriptionOutputState {
             })
     }
 
-    fn retained_bytes(&self) -> usize {
+    pub(crate) fn retained_bytes(&self) -> usize {
         self.open.retained_bytes.saturating_add(
             self.prepared
                 .as_ref()

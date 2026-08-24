@@ -61,7 +61,7 @@ fn canonical_identity_digest_changes_with_root_execution_config() {
         ))
         .unwrap(),
     );
-    assert_eq!(STATE_ABI_VERSION, 5);
+    assert_eq!(STATE_ABI_VERSION, 6);
     let prior_state_abi = Sha256::digest(
         serde_json::to_vec(&payload(
             STATE_ABI_VERSION - 1,

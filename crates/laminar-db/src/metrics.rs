@@ -93,6 +93,34 @@ pub struct StreamMetrics {
     pub sql: Option<String>,
 }
 
+/// Process-local, bounded-cardinality health snapshot for committed cluster subscriptions.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClusterSubscriptionOutputHealth {
+    /// Readers currently attached to this gateway.
+    pub active_readers: u64,
+    /// In-memory output bytes awaiting checkpoint disposition.
+    pub pending_bytes: u64,
+    /// Bytes reachable from retained committed history.
+    pub retained_bytes: u64,
+    /// Grace-held unreachable bytes found by the latest orphan scan.
+    pub orphan_bytes: u64,
+    /// Failed opens since this process started.
+    pub open_failures: u64,
+    /// Segment write failures since this process started.
+    pub segment_write_failures: u64,
+    /// Manifest failures since this process started.
+    pub manifest_failures: u64,
+    /// Integrity failures since this process started.
+    pub integrity_failures: u64,
+    /// Stale writer rejections since this process started.
+    pub stale_writer_rejections: u64,
+    /// Partition sequence gaps since this process started.
+    pub sequence_gaps: u64,
+    /// Bounded-lag gateway disconnects since this process started.
+    pub lag_disconnects: u64,
+}
+
 const BACKPRESSURE_THRESHOLD: f64 = 0.8;
 
 #[must_use]

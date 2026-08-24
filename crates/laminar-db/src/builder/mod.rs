@@ -460,7 +460,7 @@ impl LaminarDbBuilder {
     ///
     /// Returns `DbError` if database creation fails.
     // COMPAT: `build` remains async as part of the public API even when construction has no I/O.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    #[allow(clippy::unused_async)]
     pub async fn build(mut self) -> Result<Arc<LaminarDB>, DbError> {
         let has_checkpoint_data_dir = self
             .config
