@@ -317,11 +317,33 @@ SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
 DESCRIBE [EXTENDED] table_name
 EXPLAIN ANALYZE SELECT ...
-SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- live tail of a stream
+SUBSCRIBE <stream> [WHERE …] [AS OF EPOCH n]      -- committed tail or epoch replay
 DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
 
-`retain_history` keeps a bounded suffix of committed epochs in memory. Resume only from a progress marker the client durably recorded: WebSocket emits `type=progress` frames, while pgwire emits `__laminar_kind=progress` rows with epoch and checkpoint ID. `SUBSCRIBE … AS OF EPOCH n` then starts strictly after that committed cut or fails visibly if it is unavailable.
+Embedded and single-node subscriptions retain their existing local delivery semantics. In cluster
+mode, `SUBSCRIBE` is admitted only for named, non-windowed managed keyed aggregates with a
+planner-certified vnode distribution and an initialized durable output backend. Any server node
+can serve the complete subscription from shared checkpoint storage. Stateless streams, raw join
+output, windowed aggregates, materialized views, and uncertified aggregate plans remain
+fail-closed.
+
+The cluster default is committed delivery with durable replay and partition-local ordering. A bare
+`SUBSCRIBE <stream>` attaches at the current committed tail and receives only output exposed by
+later whole-cluster checkpoint commits. Each vnode is one logical output partition with a strict,
+contiguous sequence; gateways merge partitions fairly but define no cross-partition arrival,
+event-time, SQL-sort, or total order. A `WHERE` predicate may omit an entire committed frame, so a
+filtered client can observe non-adjacent optional partition-sequence metadata without losing a row
+that matched its predicate.
+
+`retain_history` keeps a byte-bounded suffix of committed epochs: locally in the existing registry,
+and durably as verified immutable segments in the cluster checkpoint store. WebSocket emits
+`type=progress` frames, while pgwire emits `__laminar_kind=progress` rows with epoch and checkpoint
+ID, only after the complete cluster checkpoint commits. `SUBSCRIBE … AS OF EPOCH n` begins at each
+partition's exclusive frontier from that committed epoch, or fails visibly when the epoch is not
+committed, has been pruned, belongs to another stream generation, or has corrupt history. This is
+checkpoint-granular replay, not a durable named-consumer cursor; reconnecting after consuming only
+part of an interval may replay that interval.
 
 The managed non-windowed aggregate path used after a bounded join supports non-`DISTINCT` `COUNT`,
 `SUM`, `AVG`, `MIN`, and `MAX` in local and cluster mode. Local SQL has additional DataFusion and
@@ -431,9 +453,9 @@ Enable the listener by setting `pgwire_bind` in `laminardb.toml`. Auth is trust 
 
 | Statement | Behavior |
 |-----------|----------|
-| `SUBSCRIBE <stream>` | Stream rows as they're committed |
-| `SUBSCRIBE … WHERE <expr>` | Server-side filter, schema-aware |
-| `SUBSCRIBE … AS OF EPOCH n` | Replay from epoch `n` (stream must be `WITH ('retain_history' = '…')`) |
+| `SUBSCRIBE <stream>` | Attach at the current tail; cluster rows become visible only after a whole-cluster checkpoint commit |
+| `SUBSCRIBE … WHERE <expr>` | Schema-aware server-side filtering; supported for certified cluster keyed aggregates |
+| `SUBSCRIBE … AS OF EPOCH n` | Replay strictly after committed epoch `n` while its durable history is retained |
 | `DECLARE c CURSOR FOR SUBSCRIBE …` + `FETCH n FROM c` | Cursored consumption for `\set FETCH_COUNT n` clients |
 | `SELECT version()` / `SELECT 1` / transaction control | The handful of meta-commands clients issue at startup |
 

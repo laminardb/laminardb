@@ -1,12 +1,13 @@
 # Cluster subscriptions over a partitioned committed output log
 
-- **Status:** implementation contract for the initial production release
-- **Date:** 2026-08-23
+- **Status:** implemented initial-release contract; production enablement remains release-gated by
+  the validation in this document
+- **Date:** 2026-08-24
 - **Runtime scope:** cluster runtime; local embedded and standalone subscription behaviour is
   compatibility-frozen
 - **Default contract:** `delivery=committed`, `ordering=partition`, `replay=durable`
 
-## Current implementation and failure mode
+## Pre-change implementation and failure mode
 
 Local subscriptions use one process-memory `SubscriptionRegistry` log per named object. The log is
 byte bounded, assigns a process-local scalar sequence, retains an optional byte-bounded suffix, and
@@ -14,9 +15,10 @@ publishes a barrier only after a local checkpoint commits. `SubscriptionPortal` 
 that shared log and applies a compiled physical `WHERE` expression before returning `PortalFrame`
 values.
 
-Cluster runtime deliberately disables `open_subscription()` before schema lookup, filter
+Before this work, cluster runtime deliberately disabled `open_subscription()` before schema lookup, filter
 compilation, reader attachment, or external I/O. The checkpoint callback also skips subscription
-cut reservation, abort, publication, and invalidation in cluster mode. This is correct today:
+cut reservation, abort, publication, and invalidation in cluster mode. That guard was necessary
+because:
 
 - aggregate state is vnode-partitioned, but `IncrementalAggState::emit_changelog_delta()` combines
   all locally resident vnodes into one anonymous Arrow batch;
@@ -30,7 +32,7 @@ cut reservation, abort, publication, and invalidation in cluster mode. This is c
 Removing the cluster guard without replacing all five properties would permit partial results,
 gaps, stale-owner publication, and false progress.
 
-### Relevant current call graph
+### Relevant pre-change call graph
 
 ```text
 SQL / API open
@@ -90,6 +92,50 @@ recovery / reassignment
     -> publish_prepared_vnode_transition behind rotation fence
 ```
 
+### Implemented call graph
+
+```text
+SQL / API open
+  LaminarDB::open_subscription under topology_ddl_lock.read
+    -> schema resolution and physical WHERE compilation
+    -> local runtime: SubscriptionRegistry reader (unchanged)
+    -> cluster runtime: open_cluster_subscription
+       -> exact OutputDistributionCertificate admission
+       -> ClusterSubscriptionReader::open
+          -> authoritative committed-index lookup
+          -> optional replay-pin acquisition for AS OF EPOCH
+          -> bounded gateway task
+             -> exact participant-manifest and partition-roster validation
+             -> bounded concurrent immutable-segment reads and digest validation
+             -> fair partition-frame merge
+          -> SubscriptionPortal::cluster
+             -> existing WHERE filter
+             -> PortalFrame plus optional cluster frame metadata
+
+record path
+  managed aggregate emits canonical PartitionedOutputBatch values per vnode
+    -> append transaction validates assignment/process/pipeline/generation authority
+    -> bounded ClusterSubscriptionOutputState assigns partition-local sequences
+    -> append receipt commits staged last_emitted/dirty-key bookkeeping
+
+checkpoint
+  existing checkpoint attempt captures aggregate state and subscription sequence state
+    -> seal bounded per-partition segments
+    -> background checkpoint worker encodes and conditionally creates immutable objects
+    -> participant manifest binds owned partition ranges and segment references
+    -> CommittedCheckpointIndex validates the complete canonical cross-node roster
+    -> one authoritative commit outcome exposes state and output together
+    -> aborted attempts expose neither output nor progress
+
+recovery / reassignment
+  exact committed index and participant manifests
+    -> verify every required output segment before source intake resumes
+    -> restore next_sequence from each committed exclusive frontier
+  vnode transition
+    -> transfer aggregate state, emission bookkeeping, and partition sequence state
+    -> assignment/process/pipeline fencing rejects the former owner
+```
+
 ## Target semantics
 
 The initial release supports named, non-windowed, planner-certified managed aggregate streams:
@@ -112,7 +158,10 @@ epoch `n` and disconnects part-way through the next interval can receive that in
 
 Delivery order is strict within each output partition. Interleaving among partitions is fair but
 has no semantic order. Arrival order is not a cluster-wide total order, event-time order, or SQL
-sort order.
+sort order. The durable log itself has contiguous partition sequences. The existing `WHERE` filter
+runs after verified log consumption and may suppress every row in a frame; consequently, optional
+metadata on frames visible to a filtered client can contain intentional sequence holes. Such holes
+represent predicate filtering, not skipped matching rows, and are not resume positions.
 
 ## Identities and output-distribution certificate
 
@@ -383,7 +432,7 @@ bounded byte/error totals without credentials or per-stream high-cardinality det
 
 | Plan shape | Initial cluster subscription status | Reason |
 |---|---|---|
-| Named non-windowed managed keyed aggregate | supported after all release gates | stable vnode-owned final output |
+| Named non-windowed managed keyed aggregate | supported | stable vnode-owned final output |
 | Existing global aggregate | internally representable as vnode zero; externally gated | singleton-specific release coverage pending |
 | Stateless projection/filter | fail-closed | stable output partition identity is not propagated |
 | Raw join output | fail-closed | no certified final output distribution |
@@ -399,30 +448,31 @@ Admission is evaluated before segment, object-store, connector, or gateway I/O.
 
 ### Phase 0: contracts, admission, and compatibility
 
-Add strong persisted identities, canonical manifest validation, structured errors, and explicit
-output-distribution certificates. Generalize the portal/read abstraction without changing local
-behaviour. Cluster subscription remains externally disabled. Gate: every eligible aggregate has an
-exact certificate or is rejected, protocol/version tests pass, and no cluster backend is reachable.
+Strong persisted identities, canonical manifest validation, structured errors, and explicit
+output-distribution certificates are implemented. The portal/read abstraction supports local and
+cluster readers without changing local behaviour. Phase 0 kept cluster subscription externally
+disabled until every eligible aggregate had an exact certificate or failed admission.
 
 ### Phase 1: vnode-preserving aggregate output
 
-Emit deterministic per-vnode changelog batches, add vnode-owned sequence state, checkpoint and
-transfer it, and make output/bookkeeping publication transactional. Cluster subscription remains
-disabled. Gate: partition identity, deterministic ordering/splitting, continuation, stale-owner,
-failure, and local-regression tests plus before/after hot-path benchmarks pass.
+Managed aggregates emit deterministic per-vnode changelog batches with vnode-owned sequence state.
+Sequence state is checkpointed and transferred, and output/bookkeeping publication is
+transactional. Phase 1 kept cluster subscription disabled through partition, continuation,
+stale-owner, failure, local-regression, and hot-path benchmark gates.
 
 ### Phase 2: checkpointed durable output log
 
-Add bounded immutable segment encoding/upload, participant and global manifests, restore, retention,
-orphan cleanup, and crash/integrity injection. Cluster subscription remains disabled. Gate: every
-crash point yields only the previous or next complete cut; corruption and resource exhaustion fail
-closed.
+Bounded immutable segment encoding/upload, participant and global manifests, restore, retention,
+orphan cleanup, and crash/integrity validation are implemented. Phase 2 kept cluster subscription
+disabled until crash points exposed only the previous or next complete cut and corruption/resource
+exhaustion failed closed.
 
 ### Phase 3: multi-active committed gateways
 
-Add backend selection, fair bounded replay/follow readers, WebSocket/pgwire/typed metadata support,
-metrics/status, and three-node recovery/lag/retention coverage. Relax the blanket guard only after
-all Phase 3 tests and the real MinIO-backed subscription soak pass for the exact admitted scope.
+Backend selection, fair bounded replay/follow readers, WebSocket/pgwire/typed metadata support,
+metrics/status, replay pins, and three-node recovery/lag/retention coverage are implemented. The
+production release gate requires the real MinIO-backed subscription soak and the repository-wide
+validation workflow to pass for the exact admitted scope.
 
 ## Later phases (not enabled here)
 
@@ -457,8 +507,9 @@ route the data plane through the current shared-store leader.
 
 ## Unresolved later-phase work
 
-- replicated online topology DDL and a durable per-object recreation generation;
-- authenticated resume-token key rotation and cross-version migration policy;
+- replicated online topology DDL; the sealed catalog already persists object generations, and any
+  future replacement protocol must atomically advance them;
+- authenticated resume-token issuance, key rotation, and cross-version migration policy;
 - durable named-reader acknowledgement and retention pin expiry;
 - certified partition propagation for stateless and join outputs;
 - snapshot-plus-changelog materialized-view protocol;
