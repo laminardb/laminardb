@@ -140,6 +140,18 @@ jobs:
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
+          - label: Cluster ALO committed subscriptions (gossip)
+            test: three_node_alo_cluster_subscription_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster-subscription
+            discovery: gossip
+            emulator: "0"
+            checkpoint_ms: "250"
+            rps: "400"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
           - label: Cluster ALO stateful joins (static)
             test: three_node_alo_join_kill9_soak
             features: cluster,aws,kafka
