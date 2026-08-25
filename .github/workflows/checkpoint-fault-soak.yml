@@ -265,7 +265,8 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: ${{ matrix.keys || '65536' }}
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: ${{ matrix.rps }}
-          # Hosted-runner timing is non-certifying; use the wider 10/50ms envelope.
+          # Hosted-runner timing remains visible but is not production performance evidence.
+          LAMINAR_SOAK_HOT_SLO_MODE: observe
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"
@@ -370,7 +371,8 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: "400"
-          # Use the wider 10/50ms envelope on non-certifying hosted runners.
+          # Hosted-runner timing remains visible but is not production performance evidence.
+          LAMINAR_SOAK_HOT_SLO_MODE: observe
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"

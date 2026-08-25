@@ -59,6 +59,8 @@
 //! - `LAMINAR_SOAK_JOIN_KEYS` / `LAMINAR_SOAK_ZIPF_MILLI`  key count and Zipf exponent × 1000
 //! - `LAMINAR_SOAK_MIN_LIVE_STATE_BYTES`  optional retained-state high-water gate
 //! - `LAMINAR_SOAK_HOT_P50_MS` / `_P95_MS` / `_P99_MS`  hot-cycle latency gates
+//! - `LAMINAR_SOAK_HOT_SLO_MODE`  `certify` (default) enforces hot-cycle latency limits;
+//!   `observe` records the same evidence without treating shared-runner timing as certification
 //! - `LAMINAR_SOAK_HOT_MIN_CYCLES`  minimum latency sample count
 //! - `LAMINAR_SOAK_KEY_GROUPS`  stable cluster key-group count (default 64)
 //! - `LAMINAR_SOAK_FAULT_INJECT_ROLE`  trigger one fatal cycle fault after steady state on the
@@ -155,6 +157,8 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const SOAK_CHECKPOINT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_CHECKPOINT_SLO_MODE";
+#[cfg(feature = "kafka")]
+const SOAK_HOT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_HOT_SLO_MODE";
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 const SOAK_EO_VISIBILITY_SLO_MODE_ENV: &str = "LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE";
 #[cfg(feature = "kafka")]
@@ -5344,6 +5348,46 @@ fn wait_for_offset_advance(
 }
 
 #[cfg(feature = "kafka")]
+fn wait_for_minimum_offset_rate(
+    nodes: &mut [Node],
+    producer: &mut ProducerGuard,
+    start_at: Instant,
+    start_offsets: &[i64],
+    deadline_offsets: &[i64],
+    minimum_rps: f64,
+    window: Duration,
+    label: &str,
+    mut current_offsets: impl FnMut() -> Option<Vec<i64>>,
+) -> (Instant, Vec<i64>) {
+    let mut observed = None;
+    wait_for(
+        &format!("{label}: post-window output to sustain at least {minimum_rps:.1} rps"),
+        window,
+        || {
+            assert_running_nodes(nodes);
+            producer.assert_running();
+            let Some(current) = current_offsets() else {
+                return false;
+            };
+            match all_partition_offsets_advanced(deadline_offsets, &current) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => panic!("{label}: invalid Kafka offset frontier: {error}"),
+            }
+            let observed_at = Instant::now();
+            let emitted = monotonic_offset_delta(label, start_offsets, &current);
+            let elapsed = observed_at.duration_since(start_at).as_secs_f64();
+            if emitted as f64 / elapsed < minimum_rps {
+                return false;
+            }
+            observed = Some((observed_at, current));
+            true
+        },
+    );
+    observed.expect("offset-rate wait completed without an observed frontier")
+}
+
+#[cfg(feature = "kafka")]
 fn assert_active_load_throughput(
     nodes: &mut [Node],
     producer: &mut ProducerGuard,
@@ -5479,10 +5523,13 @@ fn assert_active_load_throughput(
     for ((label, output, emitted_start_at, output_start), deadline_offsets) in
         output_starts.into_iter().zip(output_at_deadline)
     {
-        let (emitted_end_at, output_end) = wait_for_offset_advance(
+        let (emitted_end_at, output_end) = wait_for_minimum_offset_rate(
             nodes,
             producer,
+            emitted_start_at,
+            &output_start,
             &deadline_offsets,
+            minimum_pair_rps,
             recovery_ceiling,
             &format!("active-load {label} output endpoint"),
             || output.high_watermarks(),
@@ -9809,8 +9856,18 @@ fn temporal_join_source_config(
     ]
     .into_iter()
     .map(|(name, topic, group_suffix, format, primary_key)| {
-        let primary_key = if primary_key {
-            "primary_key = [\"join_key\"]\n"
+        let temporal_load = name.starts_with("temporal_load_");
+        let primary_key = match (primary_key, temporal_load) {
+            (true, true) => "primary_key = [\"join_key\", \"source_partition\"]\n",
+            (true, false) => "primary_key = [\"join_key\"]\n",
+            (false, _) => "",
+        };
+        let source_partition = if temporal_load {
+            r#"[[source.schema]]
+name = "source_partition"
+type = "BIGINT"
+nullable = false
+"#
         } else {
             ""
         };
@@ -9834,7 +9891,7 @@ nullable = false
 name = "join_key"
 type = "BIGINT"
 nullable = false
-[[source.schema]]
+{source_partition}[[source.schema]]
 name = "temporal_time"
 type = "TIMESTAMP"
 nullable = false
@@ -10083,6 +10140,7 @@ FROM temporal_load_left l
 LEFT JOIN temporal_load_right
 FOR SYSTEM_TIME AS OF l.temporal_time AS r
   ON l.join_key = r.join_key
+ AND l.source_partition = r.source_partition
 WHERE l.join_key >= 0
 """
 
@@ -10895,7 +10953,30 @@ fn assert_live_join_state_bytes(
 }
 
 #[cfg(feature = "kafka")]
-fn assert_hot_path_latency(nodes: &[Node], label: &str) {
+fn enforce_or_report_hot_path_slo(
+    mode: SloMode,
+    label: &str,
+    node_id: usize,
+    quantile: &str,
+    observed_ms: f64,
+    limit_ms: u64,
+    diagnostic: &str,
+) {
+    if observed_ms <= limit_ms as f64 {
+        return;
+    }
+    match mode {
+        SloMode::Certify => panic!(
+            "{label}: node{node_id} hot-path {quantile} bucket upper bound {observed_ms:.3}ms exceeds {limit_ms}ms; {diagnostic}"
+        ),
+        SloMode::Observe => eprintln!(
+            "soak: PROFILE {label} node{node_id} hot-path {quantile} bucket upper bound {observed_ms:.3}ms exceeded the non-certifying {limit_ms}ms SLO boundary; {diagnostic}"
+        ),
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn assert_hot_path_latency(nodes: &[Node], label: &str, slo_mode: SloMode) {
     let minimum = env_u64("LAMINAR_SOAK_HOT_MIN_CYCLES", DEFAULT_HOT_PATH_MIN_CYCLES);
     let p50_limit_ms = env_u64("LAMINAR_SOAK_HOT_P50_MS", DEFAULT_HOT_PATH_P50_MS);
     let p95_limit_ms = env_u64("LAMINAR_SOAK_HOT_P95_MS", DEFAULT_HOT_PATH_P95_MS);
@@ -10936,18 +11017,21 @@ fn assert_hot_path_latency(nodes: &[Node], label: &str) {
         let p50_ms = latency.p50_upper_seconds * 1_000.0;
         let p95_ms = latency.p95_upper_seconds * 1_000.0;
         let p99_ms = latency.p99_upper_seconds * 1_000.0;
-        assert!(
-            p50_ms <= p50_limit_ms as f64,
-            "{label}: node{node_id} hot-path p50 bucket upper bound {p50_ms:.3}ms exceeds {p50_limit_ms}ms; {diagnostic}",
-        );
-        assert!(
-            p95_ms <= p95_limit_ms as f64,
-            "{label}: node{node_id} hot-path p95 bucket upper bound {p95_ms:.3}ms exceeds {p95_limit_ms}ms; {diagnostic}",
-        );
-        assert!(
-            p99_ms <= p99_limit_ms as f64,
-            "{label}: node{node_id} hot-path p99 bucket upper bound {p99_ms:.3}ms exceeds {p99_limit_ms}ms; {diagnostic}",
-        );
+        for (quantile, observed_ms, limit_ms) in [
+            ("p50", p50_ms, p50_limit_ms),
+            ("p95", p95_ms, p95_limit_ms),
+            ("p99", p99_ms, p99_limit_ms),
+        ] {
+            enforce_or_report_hot_path_slo(
+                slo_mode,
+                label,
+                node_id,
+                quantile,
+                observed_ms,
+                limit_ms,
+                &diagnostic,
+            );
+        }
     }
 }
 
@@ -11568,6 +11652,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
     let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let hot_path_slo_mode = SloMode::from_environment(SOAK_HOT_SLO_MODE_ENV)
+        .unwrap_or_else(|error| panic!("invalid hot-path SLO mode: {error}"));
     let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     let kills = env_u64("LAMINAR_SOAK_SINGLE_KILLS", 1);
     if delivery == JoinDelivery::AtLeastOnce {
@@ -11790,9 +11876,10 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let join_keys = env_u64("LAMINAR_SOAK_JOIN_KEYS", DEFAULT_JOIN_KEYS);
     let zipf_milli = env_u64("LAMINAR_SOAK_ZIPF_MILLI", DEFAULT_ZIPF_MILLI);
     eprintln!(
-        "soak: PROFILE mode=single delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
+        "soak: PROFILE mode=single delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
         delivery.label(),
         checkpoint_slo_mode.label(),
+        hot_path_slo_mode.label(),
     );
     let temporal_recovery_seed = produce_temporal_pre_fault_input(
         &brokers,
@@ -12463,6 +12550,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     assert_hot_path_latency(
         &nodes,
         &format!("single-node {delivery_label} stateful workload"),
+        hot_path_slo_mode,
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -12518,6 +12606,8 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
     let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let hot_path_slo_mode = SloMode::from_environment(SOAK_HOT_SLO_MODE_ENV)
+        .unwrap_or_else(|error| panic!("invalid hot-path SLO mode: {error}"));
     let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     assert!(
         interval_ms >= 100,
@@ -12697,9 +12787,10 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     let join_keys = env_u64("LAMINAR_SOAK_JOIN_KEYS", DEFAULT_JOIN_KEYS);
     let zipf_milli = env_u64("LAMINAR_SOAK_ZIPF_MILLI", DEFAULT_ZIPF_MILLI);
     eprintln!(
-        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
+        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
         delivery.label(),
         checkpoint_slo_mode.label(),
+        hot_path_slo_mode.label(),
     );
     let temporal_recovery_seed = produce_temporal_pre_fault_input(
         &brokers,
@@ -13753,6 +13844,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     assert_hot_path_latency(
         &nodes,
         &format!("three-node {delivery_label} stateful workload"),
+        hot_path_slo_mode,
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -14635,12 +14727,12 @@ fn produce_join_inputs(
             let temporal_time_ms = event_time_base
                 .checked_add(load_offset_ms)
                 .expect("temporal timestamp overflow");
-            let payload = format!(
-                r#"{{"id":{n},"join_key":{join_key},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
-            );
-            let key = join_key.to_string();
             let partition =
                 i32::try_from(n % partition_count).expect("round-robin partition fits i32");
+            let payload = format!(
+                r#"{{"id":{n},"join_key":{join_key},"source_partition":{partition},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
+            );
+            let key = join_key.to_string();
             let left_delivery = producer
                 .send_result(
                     FutureRecord::to(left_topic)
@@ -14710,7 +14802,7 @@ fn produce_join_inputs(
                 let join_key = -i64::from(partitions) - i64::from(partition) - 1;
                 let key = join_key.to_string();
                 let payload = format!(
-                    r#"{{"id":{id},"join_key":{join_key},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
+                    r#"{{"id":{id},"join_key":{join_key},"source_partition":{partition},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
                 );
                 let delivery = producer
                     .send_result(
@@ -14759,6 +14851,40 @@ fn temporal_load_clock_tracks_pacing_without_losing_strict_order() {
 
     let unsupported = std::panic::catch_unwind(|| temporal_load_offset_ms(1, 1_001));
     assert!(unsupported.is_err());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn temporal_load_primary_key_is_stable_within_each_kafka_partition() {
+    let sources = temporal_join_source_config(
+        "broker",
+        "canary-left",
+        "canary-right",
+        "load-left",
+        "load-right",
+        "group",
+    );
+    assert!(sources.contains(
+        "name = \"temporal_load_right\"\nconnector = \"kafka\"\nformat = \"json\"\nprimary_key = [\"join_key\", \"source_partition\"]"
+    ));
+    assert_eq!(sources.matches("name = \"source_partition\"").count(), 2);
+
+    let workload = kafka_join_workload_config(
+        "broker",
+        "left",
+        "right",
+        "temporal-left",
+        "temporal-right",
+        "group",
+        "matrix-left",
+        "matrix-right",
+        "matrix-group",
+        "",
+        "",
+        "",
+    );
+    assert!(workload
+        .contains("ON l.join_key = r.join_key\n AND l.source_partition = r.source_partition"));
 }
 
 #[test]
@@ -16382,6 +16508,7 @@ fn test_checkpoint_latency_snapshot(
 fn slo_mode_is_explicit_and_fail_closed() {
     for environment in [
         SOAK_CHECKPOINT_SLO_MODE_ENV,
+        SOAK_HOT_SLO_MODE_ENV,
         #[cfg(feature = "delta-lake-s3")]
         SOAK_EO_VISIBILITY_SLO_MODE_ENV,
     ] {
@@ -16400,6 +16527,35 @@ fn slo_mode_is_explicit_and_fail_closed() {
             assert!(error.contains("'certify' or 'observe'"), "{error}");
         }
     }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn observed_hot_path_slo_miss_remains_non_certifying() {
+    enforce_or_report_hot_path_slo(
+        SloMode::Observe,
+        "test workload",
+        0,
+        "p99",
+        51.0,
+        50,
+        "diagnostic",
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+#[should_panic(expected = "hot-path p99 bucket upper bound 51.000ms exceeds 50ms")]
+fn certified_hot_path_slo_miss_fails_closed() {
+    enforce_or_report_hot_path_slo(
+        SloMode::Certify,
+        "test workload",
+        0,
+        "p99",
+        51.0,
+        50,
+        "diagnostic",
+    );
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
