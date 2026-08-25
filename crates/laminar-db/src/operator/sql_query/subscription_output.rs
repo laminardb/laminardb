@@ -157,7 +157,11 @@ impl SqlQueryOperator {
                 ));
             };
             let prepared = aggregate.prepare_partitioned_emit(stream_generation)?;
-            let batches = prepared.result_batches();
+            let batches = super::coalesce_aggregate_batches(
+                &self.op_name,
+                prepared.result_batches(),
+                super::AggregateBatchCoalescing::PublishedOutput,
+            )?;
             self.prepared_aggregate_emission = Some(prepared);
             Ok(batches)
         })())

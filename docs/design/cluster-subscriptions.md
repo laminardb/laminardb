@@ -217,7 +217,9 @@ aggregation and no leader data-plane hop is introduced.
 Aggregate emission produces a sidecar `PartitionedOutputBatch`. Ordinary graph edges and external
 sinks continue to consume the unchanged Arrow batch; the subscription output sink alone consumes
 the sidecar partition and generation metadata. User schemas never receive reserved sequence
-columns.
+columns. Ordinary graph delivery may coalesce adjacent compatible vnode batches within the
+existing bounded Arrow batch limits. This does not coalesce subscription frames, erase their vnode
+identity, or imply an order between partitions.
 
 Dirty keys are ordered by canonical encoded group-key bytes within each vnode. For one key, a
 retraction precedes its replacement insertion. Deterministic frame splitting uses the ordered key

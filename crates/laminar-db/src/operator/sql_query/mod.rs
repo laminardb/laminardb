@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
@@ -51,175 +50,15 @@ use crate::sql_analysis::{
     extract_projection_filter, projection_sql_preserving_weight, single_source_table,
 };
 
-// Keep batches created by local aggregate coalescing small enough to bound both accumulator work
-// and the temporary old-plus-new Arrow buffers held while concatenating one group.
-const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
-const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
-
 mod apply_failure;
+mod batch_coalescing;
 #[cfg(feature = "cluster")]
 mod subscription_output;
 
 use apply_failure::stateful_apply_outcome_unknown;
-
-/// Whether Arrow concatenation is representation-stable for this local aggregate input type.
-///
-/// Dictionary and nested encodings can make independently valid batches fail only when their
-/// value spaces or offsets are merged. Preserve their original apply boundaries unless a
-/// type-specific coalescing proof is added.
-fn certifies_local_aggregate_concat_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Null
-            | DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Duration(_)
-            | DataType::Interval(_)
-            | DataType::Binary
-            | DataType::FixedSizeBinary(_)
-            | DataType::LargeBinary
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-    )
-}
-
-/// Coalesce already-projected local aggregate input without changing row or schema order.
-///
-/// The input is consumed so concatenation overlaps new Arrow buffers with only the current group.
-/// Existing oversized batches are preserved: these limits constrain only batches created here.
-fn coalesce_local_aggregate_batches(
-    op_name: &str,
-    batches: Vec<RecordBatch>,
-) -> Result<Vec<RecordBatch>, DbError> {
-    fn flush_group(
-        op_name: &str,
-        group: &mut Vec<RecordBatch>,
-        output: &mut Vec<RecordBatch>,
-    ) -> Result<(), DbError> {
-        match group.len() {
-            0 => Ok(()),
-            1 => {
-                output.push(
-                    group
-                        .pop()
-                        .expect("single aggregate coalescing group batch"),
-                );
-                Ok(())
-            }
-            _ => {
-                let schema = group[0].schema();
-                let combined = arrow::compute::concat_batches(&schema, group.as_slice())
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "aggregate '{op_name}' local input concat failed before state application: {error}"
-                        ))
-                    })?;
-                let logical_bytes = laminar_core::shuffle::logical_batch_bytes(&combined)
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "aggregate '{op_name}' local input size accounting failed before state application: {error}"
-                        ))
-                    })?;
-                if combined.num_rows() > LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
-                    || logical_bytes > LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES
-                {
-                    return Err(DbError::Pipeline(format!(
-                        "aggregate '{op_name}' coalesced local input exceeded its target before state application: {} rows/{logical_bytes} bytes (limits: {} rows/{} bytes)",
-                        combined.num_rows(),
-                        LOCAL_AGG_COALESCE_MAX_BATCH_ROWS,
-                        LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES,
-                    )));
-                }
-                group.clear();
-                output.push(combined);
-                Ok(())
-            }
-        }
-    }
-
-    // Retraction validity is checked at each weighted batch boundary. For example, [-1] then
-    // [+1] must reject the invalid prefix rather than being merged into a valid-looking zero.
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
-            .is_ok()
-    }) {
-        return Ok(batches);
-    }
-
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| !certifies_local_aggregate_concat_type(field.data_type()))
-    }) {
-        return Ok(batches);
-    }
-
-    let mut output = Vec::new();
-    let mut group = Vec::new();
-    let mut group_rows = 0usize;
-    let mut group_bytes = 0usize;
-
-    for batch in batches.into_iter().filter(|batch| batch.num_rows() != 0) {
-        let batch_rows = batch.num_rows();
-        let batch_bytes =
-            laminar_core::shuffle::logical_batch_bytes(&batch).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "aggregate '{op_name}' local input size accounting failed before state application: {error}"
-                ))
-            })?;
-        let independently_coalescible = batch.num_rows() <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
-            && batch_bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES;
-        if !independently_coalescible {
-            flush_group(op_name, &mut group, &mut output)?;
-            group_rows = 0;
-            group_bytes = 0;
-            output.push(batch);
-            continue;
-        }
-
-        let same_schema = group
-            .first()
-            .is_none_or(|first: &RecordBatch| first.schema().as_ref() == batch.schema().as_ref());
-        let next_rows = group_rows.checked_add(batch.num_rows());
-        let next_bytes = group_bytes.checked_add(batch_bytes);
-        let fits = same_schema
-            && next_rows.is_some_and(|rows| rows <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS)
-            && next_bytes.is_some_and(|bytes| bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES);
-        if !fits {
-            flush_group(op_name, &mut group, &mut output)?;
-            group_rows = 0;
-            group_bytes = 0;
-        }
-        group.push(batch);
-        group_rows += batch_rows;
-        group_bytes += batch_bytes;
-    }
-    flush_group(op_name, &mut group, &mut output)?;
-    Ok(output)
-}
+use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
+#[cfg(test)]
+use batch_coalescing::{LOCAL_AGG_COALESCE_MAX_BATCH_ROWS, LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES};
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -1371,7 +1210,7 @@ impl SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         match &self.state {
             QueryState::Agg(aggregate) if aggregate.certifies_local_input_coalescing() => {
-                coalesce_local_aggregate_batches(&self.op_name, batches)
+                coalesce_aggregate_batches(&self.op_name, batches, AggregateBatchCoalescing::Input)
             }
             QueryState::Agg(_) => Ok(batches),
             _ => Err(DbError::Pipeline(

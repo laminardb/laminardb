@@ -2,7 +2,7 @@ use super::*;
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{ManagedVnodeRestore, ManagedVnodeTransitionMode};
 use arrow::array::{DictionaryArray, Int64Array, Int8Array, StringArray};
-use arrow::datatypes::{Field, Int8Type, Schema};
+use arrow::datatypes::{DataType, Field, Int8Type, Schema};
 
 #[test]
 fn sql_capability_classification_is_shape_aware_and_fail_closed() {
@@ -603,7 +603,8 @@ fn local_aggregate_coalescing_preserves_dictionary_batch_boundaries() {
         })
         .collect::<Vec<_>>();
 
-    let preserved = coalesce_local_aggregate_batches("dictionary", batches).unwrap();
+    let preserved =
+        coalesce_aggregate_batches("dictionary", batches, AggregateBatchCoalescing::Input).unwrap();
     assert_eq!(preserved.len(), 130);
     for (index, batch) in preserved.iter().enumerate() {
         let dictionary = batch
@@ -618,6 +619,58 @@ fn local_aggregate_coalescing_preserves_dictionary_batch_boundaries() {
             .unwrap();
         assert_eq!(values.value(0), format!("dictionary-{index}"));
     }
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn published_aggregate_output_coalesces_weighted_batches_without_reordering() {
+    let weight = laminar_core::changelog::WEIGHT_COLUMN;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new(weight, DataType::Int64, false),
+    ]));
+    let batch = |key, value, row_weight| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(Int64Array::from(vec![value])),
+                Arc::new(Int64Array::from(vec![row_weight])),
+            ],
+        )
+        .unwrap()
+    };
+    let coalesced = coalesce_aggregate_batches(
+        "published",
+        vec![batch("a", 1, -1), batch("a", 2, 1), batch("b", 3, 1)],
+        AggregateBatchCoalescing::PublishedOutput,
+    )
+    .unwrap();
+
+    assert_eq!(coalesced.len(), 1);
+    let output = &coalesced[0];
+    let keys = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let values = output
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let weights = output
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        keys.iter().map(Option::unwrap).collect::<Vec<_>>(),
+        ["a", "a", "b"]
+    );
+    assert_eq!(values.values(), &[1, 2, 3]);
+    assert_eq!(weights.values(), &[-1, 1, 1]);
 }
 
 #[tokio::test]
