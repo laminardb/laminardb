@@ -18,7 +18,7 @@ fn decode_fixed_hex<const N: usize>(hex: &str) -> Result<[u8; N], String> {
         ));
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
         let low = hex_nibble(pair[1])
@@ -42,7 +42,7 @@ fn decode_variable_hex(hex: &str) -> Result<Vec<u8>, String> {
     decoded
         .try_reserve_exact(byte_len)
         .map_err(|_| "could not allocate canonical group-key bytes".to_owned())?;
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
         let low = hex_nibble(pair[1])
