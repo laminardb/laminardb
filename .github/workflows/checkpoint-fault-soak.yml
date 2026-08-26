@@ -99,7 +99,9 @@ jobs:
   join-validity:
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Covers a cold feature-specific build plus the bounded soak. Correctness deadlines are
+    # enforced inside the harness and remain independent of hosted-runner compile variance.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
