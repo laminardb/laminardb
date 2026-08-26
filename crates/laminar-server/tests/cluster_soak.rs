@@ -173,7 +173,6 @@ const CHECKPOINT_STATE_CAPTURE_SLO_SECONDS: f64 = 0.064;
 const MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const CHECKPOINT_OBSERVATION_COLLECTION_CAP: Duration = Duration::from_secs(20 * 60);
-#[cfg(feature = "kafka")]
 const SINGLE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "kafka")]
 const CLUSTER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);

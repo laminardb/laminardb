@@ -180,8 +180,8 @@ jobs:
             emulator: "1"
             checkpoint_ms: "10000"
             # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner MinIO
-            # saturation. The harness still enforces the 8 MiB retained-state floor.
-            rps: "100"
+            # saturation while leaving headroom above the 8 MiB retained-state floor.
+            rps: "120"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -194,7 +194,7 @@ jobs:
             emulator: "1"
             checkpoint_ms: "10000"
             # Match the gossip workload so discovery is the only intended variant.
-            rps: "100"
+            rps: "120"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
