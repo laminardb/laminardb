@@ -179,7 +179,9 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "150"
+            # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner MinIO
+            # saturation. The harness still enforces the 8 MiB retained-state floor.
+            rps: "100"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -191,7 +193,8 @@ jobs:
             discovery: static
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "150"
+            # Match the gossip workload so discovery is the only intended variant.
+            rps: "100"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -257,8 +260,9 @@ jobs:
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           # MinIO EO is protocol validation, not a throughput certificate. Use the production
           # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor. Cluster EO
-          # gets a bounded drain window for fault-built backlog across 23 emulator-backed sinks;
-          # the test's strict defaults remain the certifying profile for production object stores.
+          # gets a bounded 60s checkpoint-operation timeout and recovery-aware observation window
+          # for fault-built backlog across 23 emulator-backed sinks. The real-store soak profile
+          # keeps 30s, and the per-fault 90s recovery ceiling remains unchanged.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}

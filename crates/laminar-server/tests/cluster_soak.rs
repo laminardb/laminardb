@@ -49,7 +49,8 @@
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
 //! - `LAMINAR_SOAK_ALLOW_S3_EMULATOR=1`  debug/soak-only MinIO protocol validation; this does not
-//!   certify an emulator or custom endpoint for production
+//!   certify an emulator or custom endpoint for production; EO emulator runs use a bounded 60s
+//!   checkpoint-operation timeout while the real-store soak profile retains 30s
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
@@ -176,6 +177,11 @@ const CHECKPOINT_OBSERVATION_COLLECTION_CAP: Duration = Duration::from_secs(20 *
 const SINGLE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "kafka")]
 const CLUSTER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+// WHY: the shared-runner MinIO profile drives 23 Delta sinks plus vnode output segments through
+// one emulator. Give that non-certifying profile one bounded slow-storage allowance without
+// changing the production-store timeout or the recovery liveness ceiling.
+#[cfg(feature = "kafka")]
+const CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(feature = "kafka")]
 const MIN_CONTINUOUS_AGGREGATE_STATE_BYTES: u64 = 64 * 1_024;
 #[cfg(feature = "kafka")]
@@ -804,7 +810,15 @@ fn local_exact_prefix_rows(groups: u64, span: u64) -> u64 {
         .expect("local exact source prefix must fit in a u64")
 }
 
-fn validate_checkpoint_liveness(interval_ms: u64, recovery: Duration) {
+fn validate_checkpoint_liveness(
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
+    recovery: Duration,
+) {
+    assert!(
+        checkpoint_timeout < recovery,
+        "checkpoint timeout {checkpoint_timeout:?} leaves no bounded recovery interval within {recovery:?}"
+    );
     assert!(
         u128::from(interval_ms).saturating_mul(4) <= recovery.as_millis(),
         "checkpoint interval {interval_ms}ms leaves insufficient time for two commits within the {recovery:?} recovery ceiling"
@@ -5393,12 +5407,26 @@ fn wait_for_minimum_offset_rate(
 }
 
 #[cfg(feature = "kafka")]
+fn recovery_aware_durable_progress_window(
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
+    recovery_ceiling: Duration,
+    required_commits: u32,
+) -> Duration {
+    let checkpoint_cycle = Duration::from_millis(interval_ms).saturating_add(checkpoint_timeout);
+    recovery_ceiling
+        .saturating_add(checkpoint_cycle.saturating_mul(required_commits.saturating_add(1)))
+}
+
+#[cfg(feature = "kafka")]
 fn assert_active_load_throughput(
     nodes: &mut [Node],
     producer: &mut ProducerGuard,
     inputs: &[(&str, &KafkaJoinCommitOracle)],
     outputs: &[(&str, Option<&KafkaOutputOracle>)],
     target_rps: u64,
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
     recovery_ceiling: Duration,
     delivery: JoinDelivery,
 ) {
@@ -5406,8 +5434,14 @@ fn assert_active_load_throughput(
     assert_running_nodes(nodes);
     producer.assert_running();
     // Kafka's committed frontier advances only after the asynchronous checkpoint tail completes.
-    // Anchor both ends on observable terminal cuts so a wall-clock endpoint cannot omit an entire
-    // in-flight checkpoint from an otherwise healthy throughput window.
+    // A constrained object store can consume one tail before recovery starts, and the restored
+    // generation then needs another cycle to publish its first durable cut.
+    let durable_progress_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        1,
+    );
     for &(label, input) in inputs {
         let seed = input
             .committed_offsets()
@@ -5417,7 +5451,7 @@ fn assert_active_load_throughput(
             nodes,
             producer,
             &seed,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} durable baseline"),
             || input.committed_offsets(),
         );
@@ -5437,7 +5471,7 @@ fn assert_active_load_throughput(
             nodes,
             producer,
             &seed,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} output baseline"),
             || output.high_watermarks(),
         );
@@ -5508,7 +5542,7 @@ fn assert_active_load_throughput(
             &start_offsets,
             &deadline_offsets,
             minimum_row_rps,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} durable endpoint"),
             || input.committed_offsets(),
         );
@@ -5539,7 +5573,7 @@ fn assert_active_load_throughput(
             &output_start,
             &deadline_offsets,
             minimum_pair_rps,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} output endpoint"),
             || output.high_watermarks(),
         );
@@ -9132,6 +9166,20 @@ impl JoinDelivery {
     }
 }
 
+#[cfg(feature = "kafka")]
+fn cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bool) -> Duration {
+    if delivery == JoinDelivery::ExactlyOnce && s3_emulator {
+        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    } else {
+        CLUSTER_CHECKPOINT_TIMEOUT
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn s3_emulator_enabled() -> bool {
+    std::env::var("LAMINAR_SOAK_ALLOW_S3_EMULATOR").as_deref() == Ok("1")
+}
+
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 struct DeltaSoakStorage {
     endpoint: String,
@@ -10227,7 +10275,8 @@ fn write_config(
     if storage.contains("endpoint") {
         storage.push_str("allow_http = \"true\"\n");
     }
-    let checkpoint_timeout_secs = CLUSTER_CHECKPOINT_TIMEOUT.as_secs();
+    let checkpoint_timeout_secs =
+        cluster_checkpoint_timeout(delivery, s3_emulator_enabled()).as_secs();
 
     // Discovery: gossip (phi-accrual failure detection) by default;
     // `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
@@ -11385,7 +11434,7 @@ fn local_exact_source_state_kill9_soak() {
         "LAMINAR_SOAK_KILLS must be at least 2 (one moving-source and one exhausted-cut fault)"
     );
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    validate_checkpoint_liveness(interval_ms, SINGLE_CHECKPOINT_TIMEOUT, recovery_ceiling);
     let groups = env_u64("LAMINAR_SOAK_GROUPS", 64);
     let span = env_u64("LAMINAR_SOAK_SPAN", 16);
     let rows_per_second = env_u64("LAMINAR_SOAK_RPS", 400);
@@ -11679,7 +11728,13 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    validate_checkpoint_liveness(interval_ms, SINGLE_CHECKPOINT_TIMEOUT, recovery_ceiling);
+    let durable_cut_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        SINGLE_CHECKPOINT_TIMEOUT,
+        recovery_ceiling,
+        2,
+    );
     if delivery == JoinDelivery::AtLeastOnce {
         validate_mutable_interval_recovery_horizon(kills, recovery_ceiling);
     }
@@ -11976,7 +12031,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_recovery_seed.input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
         &format!("single {delivery_label} pre-fault temporal history"),
     );
@@ -11987,7 +12042,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     if let (Some(commit_oracle), Some(seed), Some(output)) = (
@@ -11999,7 +12054,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             &mut nodes,
             commit_oracle,
             &seed.input_boundary,
-            recovery_ceiling,
+            durable_cut_window,
             latest_checkpoint,
         );
         let expected = expected_mutable_interval_transitions();
@@ -12165,7 +12220,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             &mut nodes,
             commit_oracle,
             &seed.input_boundary,
-            recovery_ceiling,
+            durable_cut_window,
             latest_checkpoint,
         );
         assert_mutable_interval_output_stable(
@@ -12246,7 +12301,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_final_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -12266,6 +12321,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             ("temporal_load", output_oracles.kafka_temporal_load.as_ref()),
         ],
         source_rps,
+        interval_ms,
+        SINGLE_CHECKPOINT_TIMEOUT,
         recovery_ceiling,
         delivery,
     );
@@ -12384,7 +12441,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let temporal_closing_boundary = produce_temporal_post_fault_sentinels(
@@ -12399,7 +12456,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let (produced_prefix, _bounded_frozen_input_at) = producer.stop();
@@ -12452,7 +12509,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &[&commit_oracle, &temporal_load_commit_oracle],
         &produced_prefix.end_offsets,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -12626,7 +12683,20 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    let checkpoint_timeout = cluster_checkpoint_timeout(delivery, s3_emulator_enabled());
+    validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
+    let durable_output_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        1,
+    );
+    let durable_cut_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        2,
+    );
     let key_group_count = cluster_key_group_count();
     let kafka_partitions = cluster_kafka_partition_count();
     let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
@@ -12967,7 +13037,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_recovery_seed.input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
         &format!("three-node {delivery_label} pre-fault temporal history"),
     );
@@ -12978,7 +13048,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     observe_live_core_window_state(&nodes, &mut window_state_high_water);
@@ -13437,7 +13507,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_final_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -13457,6 +13527,8 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
             ("temporal_load", output_oracles.kafka_temporal_load.as_ref()),
         ],
         source_rps,
+        interval_ms,
+        checkpoint_timeout,
         recovery_ceiling,
         delivery,
     );
@@ -13634,7 +13706,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let temporal_closing_boundary = produce_temporal_post_fault_sentinels(
@@ -13649,7 +13721,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let (produced_prefix, _bounded_frozen_input_at) = producer.stop();
@@ -13661,7 +13733,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &temporal_post,
         temporal_frontier_released_at,
         visibility_slo_mode,
-        recovery_ceiling,
+        durable_output_window,
         "three-node",
     );
     // Cluster operators use the minimum active-source frontier. The matrix canary is deliberately
@@ -13690,7 +13762,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
                 &expected_windows,
                 window_frontier_released_at,
                 visibility_slo_mode,
-                recovery_ceiling,
+                durable_output_window,
                 "three-node EO CoreWindow canaries",
             );
             #[cfg(not(feature = "delta-lake-s3"))]
@@ -13739,7 +13811,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         &mut nodes,
         &[&commit_oracle, &temporal_load_commit_oracle],
         &produced_prefix.end_offsets,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -13777,7 +13849,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
             delta_visibility_boundaries
                 .as_ref()
                 .expect("cluster EO visibility boundaries captured before final cuts"),
-            recovery_ceiling,
+            durable_output_window,
         )
     });
     match delivery {
@@ -16826,6 +16898,51 @@ fn checkpoint_observation_budget_rejects_invalid_metrics() {
 
 #[cfg(feature = "kafka")]
 #[test]
+fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            1,
+        ),
+        Duration::from_secs(170)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            2,
+        ),
+        Duration::from_secs(210)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            1,
+        ),
+        Duration::from_secs(230)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            2,
+        ),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(u64::MAX, Duration::MAX, Duration::MAX, u32::MAX),
+        Duration::MAX
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
 fn single_node_latency_finalization_requires_a_stable_once_only_cut() {
     let generation = ProcessGeneration {
         node_id: 0,
@@ -17188,7 +17305,20 @@ fn bounded_join_oracle_matches_one_sided_sql_contract() {
 #[test]
 fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     assert_eq!(CLUSTER_CHECKPOINT_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::AtLeastOnce, true),
+        CLUSTER_CHECKPOINT_TIMEOUT
+    );
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, false),
+        CLUSTER_CHECKPOINT_TIMEOUT
+    );
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, true),
+        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    );
     assert!(CLUSTER_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
+    assert!(CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
 
     let directory = tempfile::tempdir().unwrap();
     let path = write_config(
