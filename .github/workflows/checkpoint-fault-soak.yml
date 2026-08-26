@@ -138,7 +138,10 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
-            rps: "400"
+            # Three Laminar nodes share a two-core hosted runner with Redpanda and MinIO. Keep
+            # enough headroom for the strict Kafka visibility gate while the 8 MiB state floor
+            # continues to enforce a substantial retained-state workload.
+            rps: "250"
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
@@ -167,7 +170,8 @@ jobs:
             discovery: static
             emulator: "0"
             checkpoint_ms: "250"
-            rps: "400"
+            # Match gossip so discovery remains the only intended variant.
+            rps: "250"
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
@@ -265,6 +269,7 @@ jobs:
           # keeps 30s, and the per-fault 90s recovery ceiling remains unchanged.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
+          LAMINAR_SOAK_ALO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE: ${{ matrix.visibility_slo_mode }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
