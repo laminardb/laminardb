@@ -1983,6 +1983,42 @@ async fn recovery_quorum_requires_the_exact_round_and_target() {
 }
 
 #[tokio::test]
+async fn restore_quorum_accepts_an_intentionally_suspended_assignment_certificate() {
+    let (controller, _members_tx, kv) = controller(Vec::new()).await;
+    report_test_fault(&controller).await;
+    let exact_round = round_for_current_faults(&controller, 7, &[1]).await;
+    activate_start(&controller, &kv, &exact_round, 4).await;
+    let start = start(exact_round, 4);
+    controller.announce_recovered(&start).await.unwrap();
+    controller.publish_checkpoint_assignment_fence(None);
+
+    let outcome = wait_restored_quorum(&controller, &start, Duration::from_secs(1)).await;
+
+    assert_eq!(outcome, RecoveryQuorum::Reached);
+}
+
+#[tokio::test]
+async fn restore_quorum_rejects_a_divergent_published_assignment() {
+    let (controller, _members_tx, kv) = controller(Vec::new()).await;
+    report_test_fault(&controller).await;
+    let exact_round = round_for_current_faults(&controller, 7, &[1]).await;
+    activate_start(&controller, &kv, &exact_round, 4).await;
+    let start = start(exact_round.clone(), 4);
+    controller.announce_recovered(&start).await.unwrap();
+    let divergent = CheckpointAssignmentFence::from_owner_map(
+        exact_round.assignment_fence.assignment_version + 1,
+        &[1],
+        exact_round.assignment_fence.participants.clone(),
+    )
+    .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(divergent));
+
+    let outcome = wait_restored_quorum(&controller, &start, Duration::from_secs(1)).await;
+
+    assert_eq!(outcome, RecoveryQuorum::ParticipantsChanged);
+}
+
+#[tokio::test]
 async fn newer_recovery_ack_supersedes_instead_of_satisfying_old_quorum() {
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     report_test_fault(&controller).await;

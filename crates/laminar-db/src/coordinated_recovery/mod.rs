@@ -4124,16 +4124,24 @@ async fn wait_restored_quorum_until(
 ) -> RecoveryQuorum {
     let round = &start.round;
     loop {
-        if !controller.is_leader()
-            || controller
-                .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
-                .as_ref()
-                != Some(&round.assignment_fence)
-            || !matches!(
-                controller.recovery_incarnations_match(round).await,
-                Ok(true)
-            )
-        {
+        if !controller.is_leader() {
+            return RecoveryQuorum::ParticipantsChanged;
+        }
+        let local_assignment_is_exact = controller
+            .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+            .as_ref()
+            == Some(&round.assignment_fence);
+        let published_assignment = controller.checkpoint_assignment_watch();
+        // An ownerless process may intentionally suspend the local certificate after the frozen
+        // owners have acknowledged Start. Release repeats the durable audit and reinstalls the
+        // exact certificate before intake opens. A present mismatch still changes the roster.
+        if !local_assignment_is_exact && published_assignment.borrow().is_some() {
+            return RecoveryQuorum::ParticipantsChanged;
+        }
+        if !matches!(
+            controller.recovery_incarnations_match(round).await,
+            Ok(true)
+        ) {
             return RecoveryQuorum::ParticipantsChanged;
         }
         match controller.observe_recover_control().await {
