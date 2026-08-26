@@ -27,9 +27,11 @@ use crate::subscription::{ClusterSubscriptionError, SubscribeStart};
 pub(super) const MANIFEST_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub(super) const GATEWAY_IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const GATEWAY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_GATEWAY_QUEUE_FRAMES: usize = 64;
+pub(super) const MAX_GATEWAY_QUEUE_FRAMES: usize = 64;
 pub(super) const MAX_GATEWAY_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_GATEWAY_SEGMENT_READS: usize = 4;
+// One decoded segment may be draining while the next reads remain in flight.
+pub(super) const MAX_GATEWAY_RETAINED_SEGMENTS: usize = MAX_GATEWAY_SEGMENT_READS + 1;
 pub(super) const MAX_GATEWAY_CATCHUP_CHECKPOINTS: usize = 256;
 
 /// One verified frame returned to the backend-neutral portal.
@@ -124,6 +126,39 @@ impl ClusterSubscriptionReader {
                 Some(ClusterReaderRead::Terminal(take_terminal(&self.terminal)))
             }
         }
+    }
+
+    #[cfg(feature = "benchmark-internals")]
+    pub(super) fn queued_frames(&self) -> usize {
+        self.receiver.len()
+    }
+
+    #[cfg(feature = "benchmark-internals")]
+    #[allow(clippy::used_underscore_binding)] // benchmark teardown awaits the dormant handle
+    pub(super) async fn close_for_benchmark(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self._task).await;
+    }
+
+    #[cfg(feature = "benchmark-internals")]
+    #[allow(clippy::used_underscore_binding)] // benchmark capture freezes the dormant handle
+    pub(super) async fn capture_queue_for_benchmark(mut self) -> (usize, usize, usize) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        let _ = (&mut self._task).await;
+        let queued_slots = self.receiver.len();
+        let mut batch_frames = 0;
+        let mut arrow_bytes = 0;
+        while let Ok(frame) = self.receiver.try_recv() {
+            if let ClusterReaderFrame::Batch { batch, .. } = frame {
+                batch_frames += 1;
+                arrow_bytes += batch.get_array_memory_size();
+            }
+        }
+        (queued_slots, batch_frames, arrow_bytes)
     }
 }
 

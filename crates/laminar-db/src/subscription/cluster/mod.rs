@@ -6,6 +6,9 @@ mod output_state;
 mod reader;
 mod segment;
 
+#[cfg(feature = "benchmark-internals")]
+pub(crate) mod benchmark;
+
 #[cfg(test)]
 mod tests;
 
