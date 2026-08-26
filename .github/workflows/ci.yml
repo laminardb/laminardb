@@ -135,7 +135,9 @@ jobs:
       # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,files,parquet-lookup"
+        # Windows hosted runners have less scheduling and linking headroom. Two
+        # concurrent test processes keep async runtime workers responsive.
+        run: cargo nextest run --workspace --test-threads=2 --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,files,parquet-lookup"
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests

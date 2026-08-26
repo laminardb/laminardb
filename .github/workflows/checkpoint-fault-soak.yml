@@ -376,7 +376,9 @@ jobs:
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
-          LAMINAR_SOAK_RPS: "400"
+          # Keep the 250 ms checkpoint/recovery stress while leaving hosted-runner
+          # headroom for durable aggregate output; 250 rps still exceeds the 8 MiB floor.
+          LAMINAR_SOAK_RPS: "250"
           # Hosted-runner timing remains visible but is not production performance evidence.
           LAMINAR_SOAK_HOT_SLO_MODE: observe
           LAMINAR_SOAK_HOT_P50_MS: "10"

@@ -48,25 +48,16 @@ async fn read_mv(db: &LaminarDB, mv: &str) -> Vec<(i64, i64, i64)> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    tokio::task::yield_now().await;
     let mut sub = q.subscribe_raw().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
+        .await
+        .expect("materialized-view query did not produce its snapshot within 30 seconds")
+        .expect("materialized-view query disconnected before producing its snapshot");
     let mut rows = Vec::new();
+    rows.extend(rows_of(&first));
     for _ in 0..1024 {
         match sub.poll() {
-            Some(b) => {
-                let col = |i: usize| {
-                    b.column(i)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .unwrap()
-                        .clone()
-                };
-                let (ks, totals, cnts) = (col(0), col(1), col(2));
-                for r in 0..b.num_rows() {
-                    rows.push((ks.value(r), totals.value(r), cnts.value(r)));
-                }
-            }
+            Some(batch) => rows.extend(rows_of(&batch)),
             None => break,
         }
     }
@@ -80,26 +71,16 @@ async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
     let ExecuteResult::Query(mut q) = result else {
         panic!("expected Query result");
     };
-    tokio::task::yield_now().await;
     let mut sub = q.subscribe_raw().unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(30), sub.recv_async())
+        .await
+        .expect("query did not produce its snapshot within 30 seconds")
+        .expect("query disconnected before producing its snapshot");
     let mut rows = Vec::new();
+    append_i64_rows(&first, ncols, &mut rows);
     for _ in 0..4096 {
         match sub.poll() {
-            Some(b) => {
-                for r in 0..b.num_rows() {
-                    let row: Vec<i64> = (0..ncols)
-                        .map(|c| {
-                            b.column(c)
-                                .as_any()
-                                .downcast_ref::<Int64Array>()
-                                .unwrap()
-                                .value(r)
-                        })
-                        .collect();
-                    rows.push(row);
-                }
-            }
+            Some(batch) => append_i64_rows(&batch, ncols, &mut rows),
             None => break,
         }
     }
@@ -107,15 +88,26 @@ async fn read_query(db: &LaminarDB, sql: &str, ncols: usize) -> Vec<Vec<i64>> {
     rows
 }
 
+fn append_i64_rows(batch: &RecordBatch, ncols: usize, rows: &mut Vec<Vec<i64>>) {
+    for row in 0..batch.num_rows() {
+        rows.push(
+            (0..ncols)
+                .map(|column| {
+                    batch
+                        .column(column)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(row)
+                })
+                .collect(),
+        );
+    }
+}
+
 /// Parse a plain `agg` batch (`k, total, cnt`) into sorted `(k, total, cnt)` rows.
 fn rows_of(b: &RecordBatch) -> Vec<(i64, i64, i64)> {
-    let col = |i: usize| {
-        b.column(i)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .clone()
-    };
+    let col = |i: usize| b.column(i).as_any().downcast_ref::<Int64Array>().unwrap();
     let (ks, totals, cnts) = (col(0), col(1), col(2));
     let mut rows: Vec<(i64, i64, i64)> = (0..b.num_rows())
         .map(|r| (ks.value(r), totals.value(r), cnts.value(r)))
