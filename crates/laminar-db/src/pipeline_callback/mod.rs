@@ -1,6 +1,7 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
+mod backpressure;
 mod checkpoint_publication;
 mod checkpoint_tail;
 
@@ -6993,11 +6994,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn is_backpressured(&self) -> bool {
-        let bp = self.graph.input_buf_pressure() > 0.8;
-        if bp {
-            self.prom.cycles_backpressured.inc();
-        }
-        bp
+        self.graph_backpressured()
+    }
+
+    fn external_commit_backpressured(&self) -> bool {
+        self.output_commit_backpressured()
     }
 
     fn intake_paused(&self) -> bool {

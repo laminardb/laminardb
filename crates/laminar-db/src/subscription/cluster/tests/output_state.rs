@@ -92,6 +92,22 @@ fn capture(
     }]
 }
 
+fn capture_partitions(
+    certificate: &Arc<OutputDistributionCertificate>,
+    partitions: u16,
+    through_sequence: u64,
+) -> Vec<CertifiedSubscriptionFrontiers> {
+    vec![CertifiedSubscriptionFrontiers {
+        certificate: Arc::clone(certificate),
+        frontiers: (0..partitions)
+            .map(|partition| PartitionFrontier {
+                partition: OutputPartitionId::new(partition),
+                through_sequence: PartitionSequence::new(through_sequence),
+            })
+            .collect(),
+    }]
+}
+
 fn partition_burst(
     certificate: &Arc<OutputDistributionCertificate>,
     sequence: u64,
@@ -111,6 +127,27 @@ fn partition_burst(
     PreparedSubscriptionOutput {
         certificate: Arc::clone(certificate),
         frames,
+    }
+}
+
+fn sequential_partition_frames(
+    certificate: &Arc<OutputDistributionCertificate>,
+    first_sequence: u64,
+    frame_count: u64,
+    batch: &RecordBatch,
+) -> PreparedSubscriptionOutput {
+    PreparedSubscriptionOutput {
+        certificate: Arc::clone(certificate),
+        frames: (first_sequence..first_sequence + frame_count)
+            .map(|sequence| PartitionedOutputBatch {
+                id: OutputFrameId {
+                    stream_generation: certificate.stream_generation,
+                    partition: OutputPartitionId::new(0),
+                    sequence: PartitionSequence::new(sequence),
+                },
+                batch: batch.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -279,4 +316,79 @@ fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("total pending output"));
+}
+
+#[test]
+fn prepared_cut_applies_backpressure_until_commit_releases_it() {
+    const MIB: usize = 1024 * 1024;
+    const PARTITIONS: u16 = 48;
+    let pre_cut = batch(vec![7; 3 * MIB / size_of::<i64>()]);
+    let post_cut = batch(vec![8; 2 * MIB / size_of::<i64>()]);
+    let mut certificate = (*certificate(pre_cut.schema().as_ref())).clone();
+    certificate.distribution = OutputDistribution::VnodePartitioned {
+        key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        partition_abi: PARTITIONING_ABI_VERSION,
+        vnode_count: PARTITIONS,
+    };
+    let certificate = Arc::new(certificate);
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+
+    state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 0, PARTITIONS, &pre_cut)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    let attempt = CheckpointAttempt::canonical(1);
+    state.reserve_checkpoint(attempt).unwrap();
+    state
+        .prepare_checkpoint(attempt, capture_partitions(&certificate, PARTITIONS, 1))
+        .unwrap();
+    assert!(!state.commit_backpressured());
+
+    state
+        .stage_cycle(
+            vec![partition_burst(&certificate, 1, PARTITIONS, &post_cut)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    assert!(state.commit_backpressured());
+
+    state.commit_checkpoint(attempt).unwrap();
+    assert!(!state.commit_backpressured());
+    assert!(state.retained_bytes() < 128 * MIB);
+}
+
+#[test]
+fn prepared_and_open_bytes_share_the_partition_bound() {
+    const MIB: usize = 1024 * 1024;
+    let shared = batch(vec![7; 3 * MIB / size_of::<i64>()]);
+    let certificate = certificate(shared.schema().as_ref());
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+
+    state
+        .stage_cycle(
+            vec![sequential_partition_frames(&certificate, 0, 8, &shared)],
+            authority(),
+        )
+        .unwrap();
+    state.commit_cycle();
+    let attempt = CheckpointAttempt::canonical(1);
+    state.reserve_checkpoint(attempt).unwrap();
+    state
+        .prepare_checkpoint(attempt, capture(&certificate, 8))
+        .unwrap();
+    assert!(state.commit_backpressured());
+
+    let error = state
+        .stage_cycle(
+            vec![sequential_partition_frames(&certificate, 8, 3, &shared)],
+            authority(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("pending partition output"));
 }

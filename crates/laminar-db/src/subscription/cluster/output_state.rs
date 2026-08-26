@@ -8,18 +8,16 @@ use laminar_core::checkpoint::{
 };
 use laminar_core::cluster::control::LocalProcessAuthorityIdentity;
 
+use super::output_admission::{
+    at_commit_high_water, resource_error, validate_partition_cut, CyclePlan,
+    MAX_OUTPUT_FRAME_BYTES, MAX_PENDING_OUTPUT_BYTES, MAX_PENDING_OUTPUT_FRAMES,
+    MAX_PENDING_PARTITION_BYTES, MAX_PENDING_STREAM_BYTES,
+};
 use super::OutputWriterAuthority;
 use crate::error::DbError;
 use crate::subscription::{
     CertifiedSubscriptionFrontiers, ClusterSubscriptionError, PreparedSubscriptionOutput,
 };
-
-const MAX_OUTPUT_FRAME_BYTES: usize = 4 * 1024 * 1024;
-const MAX_PENDING_PARTITION_BYTES: usize = 32 * 1024 * 1024;
-const MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
-// INVARIANT: one hot stream may consume the process budget, but never exceed it.
-const MAX_PENDING_STREAM_BYTES: usize = MAX_PENDING_OUTPUT_BYTES;
-const MAX_PENDING_OUTPUT_FRAMES: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BufferedSubscriptionFrame {
@@ -33,12 +31,14 @@ pub(crate) struct BufferedSubscriptionFrame {
 pub(crate) struct PreparedPartitionSubscriptionOutput {
     pub(crate) range: NodePartitionRange,
     pub(crate) frames: Vec<BufferedSubscriptionFrame>,
+    retained_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedStreamSubscriptionOutput {
     pub(crate) certificate: Arc<OutputDistributionCertificate>,
     pub(crate) partitions: Vec<PreparedPartitionSubscriptionOutput>,
+    retained_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -50,8 +50,8 @@ pub(crate) struct PreparedNodeSubscriptionOutput {
 }
 
 #[derive(Default)]
-struct PartitionBuffer {
-    frames: Vec<BufferedSubscriptionFrame>,
+pub(super) struct PartitionBuffer {
+    pub(super) frames: Vec<BufferedSubscriptionFrame>,
     retained_bytes: usize,
 }
 
@@ -81,6 +81,7 @@ pub(crate) struct ClusterSubscriptionOutputState {
     staged_cycle: Option<CycleAppend>,
     reserved_attempt: Option<CheckpointAttempt>,
     prepared: Option<Arc<PreparedNodeSubscriptionOutput>>,
+    commit_backpressured: bool,
 }
 
 impl Default for ClusterSubscriptionOutputState {
@@ -112,6 +113,7 @@ impl ClusterSubscriptionOutputState {
             staged_cycle: None,
             reserved_attempt: None,
             prepared: None,
+            commit_backpressured: false,
         })
     }
 
@@ -192,6 +194,7 @@ impl ClusterSubscriptionOutputState {
                 })
                 .collect(),
         });
+        self.update_commit_backpressure_after_cycle(&plan);
         Ok(())
     }
 
@@ -312,16 +315,8 @@ impl ClusterSubscriptionOutputState {
             .ok_or_else(|| resource_error("pending output frames", MAX_PENDING_OUTPUT_FRAMES))?;
         let _ = (retained, frames);
         for ((generation, partition), addition) in &plan.partitions {
-            let (partition_bytes, stream_bytes) =
-                self.open.streams.get(generation).map_or((0, 0), |stream| {
-                    (
-                        stream
-                            .partitions
-                            .get(partition)
-                            .map_or(0, |partition| partition.retained_bytes),
-                        stream.retained_bytes,
-                    )
-                });
+            let partition_bytes = self.partition_retained_bytes(*generation, *partition);
+            let stream_bytes = self.stream_retained_bytes(*generation);
             if partition_bytes.saturating_add(addition.retained_bytes) > MAX_PENDING_PARTITION_BYTES
             {
                 return Err(resource_error(
@@ -406,6 +401,7 @@ impl ClusterSubscriptionOutputState {
             self.open.retained_bytes = self.open.retained_bytes.saturating_sub(bytes);
             self.open.frame_count = self.open.frame_count.saturating_sub(count);
         }
+        self.recompute_commit_backpressure();
     }
 
     pub(crate) fn reserve_checkpoint(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
@@ -448,6 +444,7 @@ impl ClusterSubscriptionOutputState {
         self.validate_frontier_captures(&captures)?;
         let prepared = Arc::new(self.take_prepared_checkpoint(attempt, captures));
         self.prepared = Some(Arc::clone(&prepared));
+        self.recompute_commit_backpressure();
         Ok(Some(prepared))
     }
 
@@ -529,10 +526,13 @@ impl ClusterSubscriptionOutputState {
             let mut buffered = open.streams.remove(&capture.certificate.stream_generation);
             let mut partitions = Vec::with_capacity(capture.frontiers.len());
             for frontier in capture.frontiers {
-                let frames = buffered
+                let partition = buffered
                     .as_mut()
-                    .and_then(|stream| stream.partitions.remove(&frontier.partition))
-                    .map_or_else(Vec::new, |partition| partition.frames);
+                    .and_then(|stream| stream.partitions.remove(&frontier.partition));
+                let retained_bytes = partition
+                    .as_ref()
+                    .map_or(0, |partition| partition.retained_bytes);
+                let frames = partition.map_or_else(Vec::new, |partition| partition.frames);
                 let first_sequence = frames
                     .first()
                     .map_or(frontier.through_sequence, |frame| frame.id.sequence);
@@ -543,11 +543,17 @@ impl ClusterSubscriptionOutputState {
                         through_sequence: frontier.through_sequence,
                     },
                     frames,
+                    retained_bytes,
                 });
             }
+            let retained_bytes = partitions
+                .iter()
+                .map(|partition| partition.retained_bytes)
+                .sum();
             streams.push(PreparedStreamSubscriptionOutput {
                 certificate: capture.certificate,
                 partitions,
+                retained_bytes,
             });
             debug_assert!(buffered.is_none_or(|stream| stream.partitions.is_empty()));
         }
@@ -574,6 +580,7 @@ impl ClusterSubscriptionOutputState {
             ));
         }
         self.reserved_attempt = None;
+        self.commit_backpressured = false;
         Ok(())
     }
 
@@ -594,7 +601,9 @@ impl ClusterSubscriptionOutputState {
                 "subscription output checkpoint abort identity mismatch".into(),
             ));
         }
-        self.restore_prepared(prepared)
+        let result = self.restore_prepared(prepared);
+        self.commit_backpressured = false;
+        result
     }
 
     fn restore_prepared(
@@ -716,6 +725,10 @@ impl ClusterSubscriptionOutputState {
         )
     }
 
+    pub(crate) fn commit_backpressured(&self) -> bool {
+        self.commit_backpressured
+    }
+
     fn frame_count(&self) -> usize {
         self.open.frame_count.saturating_add(
             self.prepared
@@ -723,90 +736,85 @@ impl ClusterSubscriptionOutputState {
                 .map_or(0, |prepared| prepared.frame_count),
         )
     }
-}
 
-#[derive(Default)]
-struct CyclePlan {
-    partitions: BTreeMap<(StreamGeneration, OutputPartitionId), PlanCount>,
-    streams: BTreeMap<StreamGeneration, PlanCount>,
-    retained_bytes: usize,
-    frame_count: usize,
-}
-
-#[derive(Default)]
-struct PlanCount {
-    retained_bytes: usize,
-    frame_count: usize,
-}
-
-impl CyclePlan {
-    fn add(
-        &mut self,
-        key: (StreamGeneration, OutputPartitionId),
-        retained_bytes: usize,
-    ) -> Result<(), DbError> {
-        add_plan_count(self.partitions.entry(key).or_default(), retained_bytes)?;
-        add_plan_count(self.streams.entry(key.0).or_default(), retained_bytes)?;
-        self.retained_bytes = self
-            .retained_bytes
-            .checked_add(retained_bytes)
-            .ok_or_else(|| DbError::Checkpoint("subscription output byte count overflow".into()))?;
-        self.frame_count = self.frame_count.checked_add(1).ok_or_else(|| {
-            DbError::Checkpoint("subscription output frame count overflow".into())
-        })?;
-        Ok(())
-    }
-}
-
-fn add_plan_count(count: &mut PlanCount, retained_bytes: usize) -> Result<(), DbError> {
-    count.retained_bytes = count
-        .retained_bytes
-        .checked_add(retained_bytes)
-        .ok_or_else(|| DbError::Checkpoint("subscription output byte count overflow".into()))?;
-    count.frame_count = count
-        .frame_count
-        .checked_add(1)
-        .ok_or_else(|| DbError::Checkpoint("subscription output frame count overflow".into()))?;
-    Ok(())
-}
-
-fn validate_partition_cut(
-    partition_id: OutputPartitionId,
-    partition: &PartitionBuffer,
-    frontier: PartitionSequence,
-) -> Result<(), DbError> {
-    let Some(first) = partition.frames.first() else {
-        return Ok(());
-    };
-    let mut expected = first.id.sequence;
-    for frame in &partition.frames {
-        if frame.id.partition != partition_id {
-            return Err(ClusterSubscriptionError::ManifestCorrupt {
-                reason: "buffered frame belongs to a different output partition".into(),
-            }
-            .into());
+    fn update_commit_backpressure_after_cycle(&mut self, plan: &CyclePlan) {
+        if self.prepared.is_none() || self.commit_backpressured {
+            return;
         }
-        if frame.id.sequence != expected {
-            return Err(ClusterSubscriptionError::PartitionSequenceGap {
-                partition: partition_id,
-                expected,
-                actual: frame.id.sequence,
-            }
-            .into());
+        if at_commit_high_water(self.retained_bytes(), MAX_PENDING_OUTPUT_BYTES)
+            || at_commit_high_water(self.frame_count(), MAX_PENDING_OUTPUT_FRAMES)
+            || plan.streams.keys().any(|generation| {
+                at_commit_high_water(
+                    self.stream_retained_bytes(*generation),
+                    MAX_PENDING_STREAM_BYTES,
+                )
+            })
+            || plan.partitions.keys().any(|(generation, partition)| {
+                at_commit_high_water(
+                    self.partition_retained_bytes(*generation, *partition),
+                    MAX_PENDING_PARTITION_BYTES,
+                )
+            })
+        {
+            self.commit_backpressured = true;
         }
-        expected = expected.checked_next().map_err(|error| {
-            DbError::Checkpoint(format!("advance subscription sequence: {error}"))
-        })?;
     }
-    if expected != frontier {
-        return Err(ClusterSubscriptionError::PartitionSequenceGap {
-            partition: partition_id,
-            expected: frontier,
-            actual: expected,
-        }
-        .into());
+
+    fn recompute_commit_backpressure(&mut self) {
+        let Some(prepared) = self.prepared.as_ref() else {
+            self.commit_backpressured = false;
+            return;
+        };
+        self.commit_backpressured =
+            at_commit_high_water(self.retained_bytes(), MAX_PENDING_OUTPUT_BYTES)
+                || at_commit_high_water(self.frame_count(), MAX_PENDING_OUTPUT_FRAMES)
+                || prepared.streams.iter().any(|stream| {
+                    at_commit_high_water(
+                        self.stream_retained_bytes(stream.certificate.stream_generation),
+                        MAX_PENDING_STREAM_BYTES,
+                    ) || stream.partitions.iter().any(|partition| {
+                        at_commit_high_water(
+                            self.partition_retained_bytes(
+                                stream.certificate.stream_generation,
+                                partition.range.partition,
+                            ),
+                            MAX_PENDING_PARTITION_BYTES,
+                        )
+                    })
+                });
     }
-    Ok(())
+
+    fn stream_retained_bytes(&self, generation: StreamGeneration) -> usize {
+        self.open
+            .streams
+            .get(&generation)
+            .map_or(0, |stream| stream.retained_bytes)
+            .saturating_add(
+                self.prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared_stream(prepared, generation))
+                    .map_or(0, |stream| stream.retained_bytes),
+            )
+    }
+
+    fn partition_retained_bytes(
+        &self,
+        generation: StreamGeneration,
+        partition: OutputPartitionId,
+    ) -> usize {
+        self.open
+            .streams
+            .get(&generation)
+            .and_then(|stream| stream.partitions.get(&partition))
+            .map_or(0, |partition| partition.retained_bytes)
+            .saturating_add(
+                self.prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared_stream(prepared, generation))
+                    .and_then(|stream| prepared_partition(stream, partition))
+                    .map_or(0, |partition| partition.retained_bytes),
+            )
+    }
 }
 
 fn prepared_stream(
@@ -828,10 +836,4 @@ fn prepared_partition(
         .binary_search_by_key(&partition, |partition| partition.range.partition)
         .ok()
         .map(|index| &stream.partitions[index])
-}
-
-fn resource_error(resource: &str, limit: usize) -> DbError {
-    DbError::Checkpoint(format!(
-        "cluster subscription {resource} reached its bounded {limit}-byte/count limit"
-    ))
 }

@@ -545,6 +545,72 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
     assert_eq!(written_rows.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+    let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
+    let attempt = CheckpointAttempt::new(7, 7);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    )
+    .with_checkpoint_complete_rx(completion_rx);
+    source_tx
+        .send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(42),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+        })
+        .await
+        .unwrap();
+
+    let callback = MockCallback::new();
+    callback
+        .external_commit_backpressure
+        .store(true, Ordering::Release);
+    let written_rows = Arc::clone(&callback.written_rows);
+    let published = Arc::clone(&callback.published_barriers);
+    let observed_rows = Arc::clone(&written_rows);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            observed_rows.load(Ordering::Acquire),
+            0,
+            "source input ran before the durable output cut resolved"
+        );
+        completion_tx
+            .send(CheckpointCompletion::new(
+                attempt,
+                FxHashMap::default(),
+                false,
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_rows.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source input did not resume after checkpoint completion");
+        shutdown.notify_one();
+    });
+
+    let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+        .await
+        .expect("coordinator did not settle external commit backpressure");
+    release.await.unwrap();
+    drop(source_tx);
+    assert!(matches!(exit, ExitReason::Shutdown));
+    assert_eq!(written_rows.load(Ordering::Acquire), 1);
+    assert_eq!(published.lock().as_slice(), &[(7, 7)]);
+}
+
 fn assignment_fence(
     version: u64,
     participants: &[u64],
@@ -687,6 +753,7 @@ struct MockCallback {
     barrier_control_installed: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     intake_pause_call_audit: Arc<AtomicU64>,
+    external_commit_backpressure: Arc<AtomicBool>,
     handoff_replay_pending: bool,
     pending_vnode_transition: bool,
     vnode_transition_completions: Arc<AtomicU64>,
@@ -781,6 +848,7 @@ impl MockCallback {
             barrier_control_installed: Arc::new(AtomicBool::new(false)),
             intake_gate: Arc::new(AtomicBool::new(false)),
             intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
+            external_commit_backpressure: Arc::new(AtomicBool::new(false)),
             handoff_replay_pending: false,
             pending_vnode_transition: false,
             vnode_transition_completions: Arc::new(AtomicU64::new(0)),
@@ -935,6 +1003,10 @@ impl PipelineCallback for MockCallback {
     fn intake_paused(&self) -> bool {
         self.intake_pause_call_audit.fetch_add(1, Ordering::Relaxed);
         self.intake_gate.load(Ordering::Acquire)
+    }
+
+    fn external_commit_backpressured(&self) -> bool {
+        self.external_commit_backpressure.load(Ordering::Acquire)
     }
 
     fn fault_on_cycle_error(&self) -> bool {
@@ -1174,6 +1246,8 @@ impl PipelineCallback for MockCallback {
         self.published_barriers
             .lock()
             .push((attempt.epoch, attempt.checkpoint_id));
+        self.external_commit_backpressure
+            .store(false, Ordering::Release);
         Ok(())
     }
 

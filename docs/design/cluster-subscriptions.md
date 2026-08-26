@@ -388,11 +388,15 @@ budget supports full-partition aggregate snapshots without increasing the proces
 Durable segments remain capped at 16 MiB and 1,024 frames; node and cluster subscription manifests
 remain capped at 8 MiB and 65,536 segment references.
 
-The compute task never waits for a subscriber. Writer-capacity exhaustion returns a recovery error
-and closes intake; output is never dropped. A slow gateway consumer is disconnected with
-`SubscriberLagged`, retaining its last whole-checkpoint progress boundary for explicit epoch replay.
-Object-store delay is bounded by the checkpoint deadline. Retry queues and orphan cleanup are
-bounded by exact retained-index traversal and a grace period.
+The compute task never waits for a subscriber. While an exact cut is prepared, reaching 75% of any
+pending byte or frame bound pauses source and deferred-input admission. Checkpoint completion,
+failure, control, shutdown, and public-request deadlines remain live; commit releases the prepared
+cut and resumes intake, while abort restores it ahead of post-cut output. This high-water gate leaves
+headroom for a normal already-admitted cycle. A single oversized cycle or capacity exhaustion still
+fails closed into recovery, and output is never dropped. A slow gateway consumer is disconnected
+with `SubscriberLagged`, retaining its last whole-checkpoint progress boundary for explicit epoch
+replay. Object-store delay is bounded by the checkpoint deadline. Retry queues and orphan cleanup
+are bounded by exact retained-index traversal and a grace period.
 
 Retention keeps a bounded suffix of committed checkpoint indexes and every segment reachable from
 them. It preserves the latest cut and active supported replay pins. GC follows index predecessor

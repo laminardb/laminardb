@@ -135,6 +135,11 @@ const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
 #[cfg(feature = "kafka")]
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
 #[cfg(feature = "kafka")]
+// WHY: Hosted runners can pause one of the 96 continuously active Kafka partitions for longer
+// than five seconds. Keep that partition in the watermark minimum while quiet canaries still
+// become idle well within the 90-second recovery window.
+const SOAK_SOURCE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "kafka")]
 // This latency-certification profile deliberately favors prompt delivery over producer-side
 // request aggregation. The Kafka connector's production default remains 5 ms.
 const SOAK_KAFKA_SINK_LINGER_MS: u64 = 0;
@@ -10243,7 +10248,7 @@ delivery = "{delivery}"
 key_groups = {key_groups}
 console_token = "{SOAK_CONSOLE_TOKEN}"
 temporal_join_idle_history_retention = "5m"
-source_idle_timeout = "5s"
+source_idle_timeout = "{source_idle_timeout_secs}s"
 event_time_max_future_skew = "{event_time_max_future_skew_ms}ms"
 [discovery]
 strategy = "{discovery}"
@@ -10266,6 +10271,7 @@ timeout = "{checkpoint_timeout_secs}s"
         seeds = seeds.join(", "),
         url = checkpoint_url,
         delivery = delivery.server_value(),
+        source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
         event_time_max_future_skew_ms = SOAK_EVENT_MAX_FUTURE_SKEW_MS,
         workload = kafka_join_workload_config(
             brokers,
@@ -10333,7 +10339,7 @@ bind = "127.0.0.1:{SINGLE_JOIN_PORT}"
 delivery = "{delivery}"
 console_token = "{SOAK_CONSOLE_TOKEN}"
 temporal_join_idle_history_retention = "5m"
-source_idle_timeout = "5s"
+source_idle_timeout = "{source_idle_timeout_secs}s"
 event_time_max_future_skew = "{event_time_max_future_skew_ms}ms"
 
 [checkpoint]
@@ -10344,6 +10350,7 @@ timeout = "30s"
 {workload}
 "#,
         delivery = delivery.server_value(),
+        source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
         event_time_max_future_skew_ms = SOAK_EVENT_MAX_FUTURE_SKEW_MS,
         workload = kafka_join_workload_config(
             brokers,

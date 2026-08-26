@@ -760,6 +760,14 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// `true` while an asynchronous commit retains enough bounded output that another compute
+    /// cycle risks exhausting its writer budget. The coordinator keeps checkpoint completion and
+    /// control traffic live but stops admitting source and deferred-input work until the exact
+    /// commit resolves.
+    fn external_commit_backpressured(&self) -> bool {
+        false
+    }
+
     /// `true` while the runtime must not fold source or shuffle input into operator state.
     /// Cluster startup and coordinated recovery use this stronger fence; ordinary backpressure
     /// only pauses source polling.
