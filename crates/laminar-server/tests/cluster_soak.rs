@@ -5361,7 +5361,7 @@ fn wait_for_minimum_offset_rate(
 ) -> (Instant, Vec<i64>) {
     let mut observed = None;
     wait_for(
-        &format!("{label}: post-window output to sustain at least {minimum_rps:.1} rps"),
+        &format!("{label}: post-window frontier to sustain at least {minimum_rps:.1} rps"),
         window,
         || {
             assert_running_nodes(nodes);
@@ -5495,10 +5495,14 @@ fn assert_active_load_throughput(
     {
         all_partition_offsets_advanced(&start_offsets, &deadline_offsets)
             .unwrap_or_else(|error| panic!("active-load {label} durable deadline: {error}"));
-        let (ended_at, end_offsets) = wait_for_offset_advance(
+        let minimum_row_rps = minimum_pair_rps * 2.0;
+        let (ended_at, end_offsets) = wait_for_minimum_offset_rate(
             nodes,
             producer,
+            started_at,
+            &start_offsets,
             &deadline_offsets,
+            minimum_row_rps,
             recovery_ceiling,
             &format!("active-load {label} durable endpoint"),
             || input.committed_offsets(),
