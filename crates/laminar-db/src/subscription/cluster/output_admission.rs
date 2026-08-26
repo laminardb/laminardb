@@ -15,6 +15,8 @@ pub(super) const MAX_PENDING_OUTPUT_FRAMES: usize = 65_536;
 
 const COMMIT_BACKPRESSURE_NUMERATOR: usize = 3;
 const COMMIT_BACKPRESSURE_DENOMINATOR: usize = 4;
+const CHECKPOINT_REQUEST_NUMERATOR: usize = 1;
+const CHECKPOINT_REQUEST_DENOMINATOR: usize = 2;
 
 #[derive(Default)]
 pub(super) struct CyclePlan {
@@ -22,6 +24,7 @@ pub(super) struct CyclePlan {
     pub(super) streams: BTreeMap<StreamGeneration, PlanCount>,
     pub(super) retained_bytes: usize,
     pub(super) frame_count: usize,
+    pub(super) reaches_high_water: bool,
 }
 
 #[derive(Default)]
@@ -63,6 +66,10 @@ fn add_plan_count(count: &mut PlanCount, retained_bytes: usize) -> Result<(), Db
 
 pub(super) fn at_commit_high_water(retained: usize, limit: usize) -> bool {
     retained >= limit / COMMIT_BACKPRESSURE_DENOMINATOR * COMMIT_BACKPRESSURE_NUMERATOR
+}
+
+pub(super) fn at_checkpoint_high_water(retained: usize, limit: usize) -> bool {
+    retained >= limit / CHECKPOINT_REQUEST_DENOMINATOR * CHECKPOINT_REQUEST_NUMERATOR
 }
 
 pub(super) fn validate_partition_cut(

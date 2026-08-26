@@ -2,6 +2,7 @@
 
 mod manifest;
 mod output_admission;
+mod output_pressure;
 mod output_state;
 mod reader;
 mod segment;

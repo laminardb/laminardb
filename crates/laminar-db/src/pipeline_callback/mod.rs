@@ -6997,8 +6997,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.graph_backpressured()
     }
 
-    fn external_commit_backpressured(&self) -> bool {
-        self.output_commit_backpressured()
+    fn external_output_pressure(&self) -> crate::pipeline::callback::ExternalOutputPressure {
+        self.output_pressure()
     }
 
     fn intake_paused(&self) -> bool {

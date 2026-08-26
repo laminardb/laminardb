@@ -753,6 +753,7 @@ struct MockCallback {
     barrier_control_installed: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     intake_pause_call_audit: Arc<AtomicU64>,
+    external_checkpoint_pressure: Arc<AtomicBool>,
     external_commit_backpressure: Arc<AtomicBool>,
     handoff_replay_pending: bool,
     pending_vnode_transition: bool,
@@ -848,6 +849,7 @@ impl MockCallback {
             barrier_control_installed: Arc::new(AtomicBool::new(false)),
             intake_gate: Arc::new(AtomicBool::new(false)),
             intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
+            external_checkpoint_pressure: Arc::new(AtomicBool::new(false)),
             external_commit_backpressure: Arc::new(AtomicBool::new(false)),
             handoff_replay_pending: false,
             pending_vnode_transition: false,
@@ -1005,8 +1007,16 @@ impl PipelineCallback for MockCallback {
         self.intake_gate.load(Ordering::Acquire)
     }
 
-    fn external_commit_backpressured(&self) -> bool {
-        self.external_commit_backpressure.load(Ordering::Acquire)
+    fn external_output_pressure(&self) -> crate::pipeline::callback::ExternalOutputPressure {
+        use crate::pipeline::callback::ExternalOutputPressure;
+
+        if self.external_commit_backpressure.load(Ordering::Acquire) {
+            ExternalOutputPressure::CommitBackpressured
+        } else if self.external_checkpoint_pressure.load(Ordering::Acquire) {
+            ExternalOutputPressure::CheckpointDue
+        } else {
+            ExternalOutputPressure::Normal
+        }
     }
 
     fn fault_on_cycle_error(&self) -> bool {
@@ -3034,6 +3044,32 @@ fn checkpoint_admission_serializes_every_durable_tail() {
         .checkpoint_in_flight
         .store(1, std::sync::atomic::Ordering::Release);
     assert!(!coordinator.checkpoint_capacity_available());
+}
+
+#[tokio::test]
+async fn pending_output_accelerates_only_a_configured_periodic_checkpoint() {
+    let mut periodic = admission_coordinator(Vec::new());
+    periodic.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::from_secs(60));
+    periodic.last_checkpoint = Instant::now();
+    let mut callback = MockCallback::new();
+    callback
+        .external_checkpoint_pressure
+        .store(true, Ordering::Release);
+
+    let admission = periodic
+        .checkpoint_admission(&mut callback)
+        .await
+        .expect("pending output must accelerate the configured periodic cut");
+    assert!(!admission.manual);
+
+    for schedule in [CheckpointSchedule::Manual, CheckpointSchedule::Disabled] {
+        let mut coordinator = admission_coordinator(Vec::new());
+        coordinator.config.checkpoint_schedule = schedule;
+        assert!(coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none());
+    }
 }
 
 #[tokio::test]

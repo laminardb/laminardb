@@ -1,4 +1,5 @@
 use super::ConnectorPipelineCallback;
+use crate::pipeline::callback::ExternalOutputPressure;
 
 impl ConnectorPipelineCallback {
     pub(super) fn graph_backpressured(&self) -> bool {
@@ -9,11 +10,11 @@ impl ConnectorPipelineCallback {
         backpressured
     }
 
-    pub(super) fn output_commit_backpressured(&self) -> bool {
+    pub(super) fn output_pressure(&self) -> ExternalOutputPressure {
         #[cfg(feature = "cluster")]
         if self.in_cluster() {
-            return self.cluster_subscription_output.commit_backpressured();
+            return self.cluster_subscription_output.output_pressure();
         }
-        false
+        ExternalOutputPressure::Normal
     }
 }

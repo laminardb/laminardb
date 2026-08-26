@@ -308,6 +308,8 @@ fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
     state.commit_cycle();
     assert!(state.retained_bytes() > 128 * MIB);
     assert!(state.retained_bytes() < 256 * MIB);
+    assert!(state.output_pressure().checkpoint_due());
+    assert!(!state.output_pressure().commit_backpressured());
 
     let error = state
         .stage_cycle(
@@ -341,12 +343,14 @@ fn prepared_cut_applies_backpressure_until_commit_releases_it() {
         )
         .unwrap();
     state.commit_cycle();
+    assert!(state.output_pressure().checkpoint_due());
     let attempt = CheckpointAttempt::canonical(1);
     state.reserve_checkpoint(attempt).unwrap();
     state
         .prepare_checkpoint(attempt, capture_partitions(&certificate, PARTITIONS, 1))
         .unwrap();
-    assert!(!state.commit_backpressured());
+    assert!(!state.output_pressure().checkpoint_due());
+    assert!(!state.output_pressure().commit_backpressured());
 
     state
         .stage_cycle(
@@ -355,10 +359,12 @@ fn prepared_cut_applies_backpressure_until_commit_releases_it() {
         )
         .unwrap();
     state.commit_cycle();
-    assert!(state.commit_backpressured());
+    assert!(!state.output_pressure().checkpoint_due());
+    assert!(state.output_pressure().commit_backpressured());
 
     state.commit_checkpoint(attempt).unwrap();
-    assert!(!state.commit_backpressured());
+    assert!(!state.output_pressure().checkpoint_due());
+    assert!(!state.output_pressure().commit_backpressured());
     assert!(state.retained_bytes() < 128 * MIB);
 }
 
@@ -377,12 +383,13 @@ fn prepared_and_open_bytes_share_the_partition_bound() {
         )
         .unwrap();
     state.commit_cycle();
+    assert!(state.output_pressure().checkpoint_due());
     let attempt = CheckpointAttempt::canonical(1);
     state.reserve_checkpoint(attempt).unwrap();
     state
         .prepare_checkpoint(attempt, capture(&certificate, 8))
         .unwrap();
-    assert!(state.commit_backpressured());
+    assert!(state.output_pressure().commit_backpressured());
 
     let error = state
         .stage_cycle(
@@ -391,4 +398,8 @@ fn prepared_and_open_bytes_share_the_partition_bound() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("pending partition output"));
+
+    state.abort_checkpoint(attempt).unwrap();
+    assert!(state.output_pressure().checkpoint_due());
+    assert!(!state.output_pressure().commit_backpressured());
 }

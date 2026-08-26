@@ -31,6 +31,7 @@ pub(super) const MAX_GATEWAY_QUEUE_FRAMES: usize = 64;
 pub(super) const MAX_GATEWAY_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_GATEWAY_SEGMENT_READS: usize = 4;
 // One decoded segment may be draining while the next reads remain in flight.
+#[cfg(feature = "benchmark-internals")]
 pub(super) const MAX_GATEWAY_RETAINED_SEGMENTS: usize = MAX_GATEWAY_SEGMENT_READS + 1;
 pub(super) const MAX_GATEWAY_CATCHUP_CHECKPOINTS: usize = 256;
 

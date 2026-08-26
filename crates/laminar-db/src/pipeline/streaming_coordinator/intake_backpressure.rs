@@ -9,9 +9,14 @@ impl CoordinatorGates {
         if intake_paused || replay_pending {
             let _ = callback.is_recovering();
         }
+        #[cfg(feature = "cluster")]
+        let external_commit_backpressured =
+            callback.external_output_pressure().commit_backpressured();
+        #[cfg(not(feature = "cluster"))]
+        let external_commit_backpressured = false;
         Self {
             intake_paused,
-            external_commit_backpressured: callback.external_commit_backpressured(),
+            external_commit_backpressured,
         }
     }
 

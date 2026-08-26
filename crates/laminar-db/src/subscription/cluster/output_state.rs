@@ -9,12 +9,13 @@ use laminar_core::checkpoint::{
 use laminar_core::cluster::control::LocalProcessAuthorityIdentity;
 
 use super::output_admission::{
-    at_commit_high_water, resource_error, validate_partition_cut, CyclePlan,
-    MAX_OUTPUT_FRAME_BYTES, MAX_PENDING_OUTPUT_BYTES, MAX_PENDING_OUTPUT_FRAMES,
-    MAX_PENDING_PARTITION_BYTES, MAX_PENDING_STREAM_BYTES,
+    resource_error, validate_partition_cut, CyclePlan, MAX_OUTPUT_FRAME_BYTES,
+    MAX_PENDING_OUTPUT_BYTES, MAX_PENDING_OUTPUT_FRAMES, MAX_PENDING_PARTITION_BYTES,
+    MAX_PENDING_STREAM_BYTES,
 };
 use super::OutputWriterAuthority;
 use crate::error::DbError;
+use crate::pipeline::callback::ExternalOutputPressure;
 use crate::subscription::{
     CertifiedSubscriptionFrontiers, ClusterSubscriptionError, PreparedSubscriptionOutput,
 };
@@ -80,8 +81,8 @@ pub(crate) struct ClusterSubscriptionOutputState {
     open: OutputBuffer,
     staged_cycle: Option<CycleAppend>,
     reserved_attempt: Option<CheckpointAttempt>,
-    prepared: Option<Arc<PreparedNodeSubscriptionOutput>>,
-    commit_backpressured: bool,
+    pub(super) prepared: Option<Arc<PreparedNodeSubscriptionOutput>>,
+    pub(super) output_pressure: ExternalOutputPressure,
 }
 
 impl Default for ClusterSubscriptionOutputState {
@@ -113,7 +114,7 @@ impl ClusterSubscriptionOutputState {
             staged_cycle: None,
             reserved_attempt: None,
             prepared: None,
-            commit_backpressured: false,
+            output_pressure: ExternalOutputPressure::Normal,
         })
     }
 
@@ -194,7 +195,7 @@ impl ClusterSubscriptionOutputState {
                 })
                 .collect(),
         });
-        self.update_commit_backpressure_after_cycle(&plan);
+        self.update_output_pressure_after_cycle(&plan);
         Ok(())
     }
 
@@ -270,7 +271,7 @@ impl ClusterSubscriptionOutputState {
                 })?;
             }
         }
-        self.validate_cycle_bounds(&plan)?;
+        self.validate_cycle_bounds(&mut plan)?;
         Ok(plan)
     }
 
@@ -302,7 +303,7 @@ impl ClusterSubscriptionOutputState {
         Ok(())
     }
 
-    fn validate_cycle_bounds(&self, plan: &CyclePlan) -> Result<(), DbError> {
+    fn validate_cycle_bounds(&self, plan: &mut CyclePlan) -> Result<(), DbError> {
         let retained = self
             .retained_bytes()
             .checked_add(plan.retained_bytes)
@@ -313,12 +314,14 @@ impl ClusterSubscriptionOutputState {
             .checked_add(plan.frame_count)
             .filter(|frames| *frames <= MAX_PENDING_OUTPUT_FRAMES)
             .ok_or_else(|| resource_error("pending output frames", MAX_PENDING_OUTPUT_FRAMES))?;
-        let _ = (retained, frames);
+        let (_, at_high_water) = self.pressure_target();
+        let mut reaches_high_water = at_high_water(retained, MAX_PENDING_OUTPUT_BYTES)
+            || at_high_water(frames, MAX_PENDING_OUTPUT_FRAMES);
         for ((generation, partition), addition) in &plan.partitions {
             let partition_bytes = self.partition_retained_bytes(*generation, *partition);
             let stream_bytes = self.stream_retained_bytes(*generation);
-            if partition_bytes.saturating_add(addition.retained_bytes) > MAX_PENDING_PARTITION_BYTES
-            {
+            let partition_bytes = partition_bytes.saturating_add(addition.retained_bytes);
+            if partition_bytes > MAX_PENDING_PARTITION_BYTES {
                 return Err(resource_error(
                     "pending partition output",
                     MAX_PENDING_PARTITION_BYTES,
@@ -328,13 +331,17 @@ impl ClusterSubscriptionOutputState {
                 .streams
                 .get(generation)
                 .map_or(0, |stream| stream.retained_bytes);
-            if stream_bytes.saturating_add(stream_addition) > MAX_PENDING_STREAM_BYTES {
+            let stream_bytes = stream_bytes.saturating_add(stream_addition);
+            if stream_bytes > MAX_PENDING_STREAM_BYTES {
                 return Err(resource_error(
                     "pending stream output",
                     MAX_PENDING_STREAM_BYTES,
                 ));
             }
+            reaches_high_water |= at_high_water(partition_bytes, MAX_PENDING_PARTITION_BYTES)
+                || at_high_water(stream_bytes, MAX_PENDING_STREAM_BYTES);
         }
+        plan.reaches_high_water = reaches_high_water;
         Ok(())
     }
 
@@ -401,7 +408,7 @@ impl ClusterSubscriptionOutputState {
             self.open.retained_bytes = self.open.retained_bytes.saturating_sub(bytes);
             self.open.frame_count = self.open.frame_count.saturating_sub(count);
         }
-        self.recompute_commit_backpressure();
+        self.recompute_output_pressure();
     }
 
     pub(crate) fn reserve_checkpoint(&mut self, attempt: CheckpointAttempt) -> Result<(), DbError> {
@@ -444,7 +451,7 @@ impl ClusterSubscriptionOutputState {
         self.validate_frontier_captures(&captures)?;
         let prepared = Arc::new(self.take_prepared_checkpoint(attempt, captures));
         self.prepared = Some(Arc::clone(&prepared));
-        self.recompute_commit_backpressure();
+        self.recompute_output_pressure();
         Ok(Some(prepared))
     }
 
@@ -580,7 +587,7 @@ impl ClusterSubscriptionOutputState {
             ));
         }
         self.reserved_attempt = None;
-        self.commit_backpressured = false;
+        self.recompute_output_pressure();
         Ok(())
     }
 
@@ -602,7 +609,7 @@ impl ClusterSubscriptionOutputState {
             ));
         }
         let result = self.restore_prepared(prepared);
-        self.commit_backpressured = false;
+        self.recompute_output_pressure();
         result
     }
 
@@ -725,11 +732,11 @@ impl ClusterSubscriptionOutputState {
         )
     }
 
-    pub(crate) fn commit_backpressured(&self) -> bool {
-        self.commit_backpressured
+    pub(crate) fn output_pressure(&self) -> ExternalOutputPressure {
+        self.output_pressure
     }
 
-    fn frame_count(&self) -> usize {
+    pub(super) fn frame_count(&self) -> usize {
         self.open.frame_count.saturating_add(
             self.prepared
                 .as_ref()
@@ -737,54 +744,45 @@ impl ClusterSubscriptionOutputState {
         )
     }
 
-    fn update_commit_backpressure_after_cycle(&mut self, plan: &CyclePlan) {
-        if self.prepared.is_none() || self.commit_backpressured {
-            return;
+    pub(super) fn all_output_reaches_high_water(
+        &self,
+        at_high_water: fn(usize, usize) -> bool,
+    ) -> bool {
+        if at_high_water(self.retained_bytes(), MAX_PENDING_OUTPUT_BYTES)
+            || at_high_water(self.frame_count(), MAX_PENDING_OUTPUT_FRAMES)
+        {
+            return true;
         }
-        if at_commit_high_water(self.retained_bytes(), MAX_PENDING_OUTPUT_BYTES)
-            || at_commit_high_water(self.frame_count(), MAX_PENDING_OUTPUT_FRAMES)
-            || plan.streams.keys().any(|generation| {
-                at_commit_high_water(
-                    self.stream_retained_bytes(*generation),
-                    MAX_PENDING_STREAM_BYTES,
-                )
-            })
-            || plan.partitions.keys().any(|(generation, partition)| {
-                at_commit_high_water(
+        if self.open.streams.iter().any(|(generation, stream)| {
+            at_high_water(
+                self.stream_retained_bytes(*generation),
+                MAX_PENDING_STREAM_BYTES,
+            ) || stream.partitions.keys().any(|partition| {
+                at_high_water(
                     self.partition_retained_bytes(*generation, *partition),
                     MAX_PENDING_PARTITION_BYTES,
                 )
             })
-        {
-            self.commit_backpressured = true;
+        }) {
+            return true;
         }
+        self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.streams.iter().any(|stream| {
+                let generation = stream.certificate.stream_generation;
+                at_high_water(
+                    self.stream_retained_bytes(generation),
+                    MAX_PENDING_STREAM_BYTES,
+                ) || stream.partitions.iter().any(|partition| {
+                    at_high_water(
+                        self.partition_retained_bytes(generation, partition.range.partition),
+                        MAX_PENDING_PARTITION_BYTES,
+                    )
+                })
+            })
+        })
     }
 
-    fn recompute_commit_backpressure(&mut self) {
-        let Some(prepared) = self.prepared.as_ref() else {
-            self.commit_backpressured = false;
-            return;
-        };
-        self.commit_backpressured =
-            at_commit_high_water(self.retained_bytes(), MAX_PENDING_OUTPUT_BYTES)
-                || at_commit_high_water(self.frame_count(), MAX_PENDING_OUTPUT_FRAMES)
-                || prepared.streams.iter().any(|stream| {
-                    at_commit_high_water(
-                        self.stream_retained_bytes(stream.certificate.stream_generation),
-                        MAX_PENDING_STREAM_BYTES,
-                    ) || stream.partitions.iter().any(|partition| {
-                        at_commit_high_water(
-                            self.partition_retained_bytes(
-                                stream.certificate.stream_generation,
-                                partition.range.partition,
-                            ),
-                            MAX_PENDING_PARTITION_BYTES,
-                        )
-                    })
-                });
-    }
-
-    fn stream_retained_bytes(&self, generation: StreamGeneration) -> usize {
+    pub(super) fn stream_retained_bytes(&self, generation: StreamGeneration) -> usize {
         self.open
             .streams
             .get(&generation)
@@ -797,7 +795,7 @@ impl ClusterSubscriptionOutputState {
             )
     }
 
-    fn partition_retained_bytes(
+    pub(super) fn partition_retained_bytes(
         &self,
         generation: StreamGeneration,
         partition: OutputPartitionId,
