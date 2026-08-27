@@ -637,6 +637,79 @@ async fn coordinator_with_store(
     (coordinator, decisions, deployment_id)
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn committed_index_binds_sorted_participants_predecessor_and_assignment_fence() {
+    let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
+    let deployment_id = uuid::Uuid::from_u128(1).to_string();
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        9,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: uuid::Uuid::from_u128(2),
+            },
+        ],
+    )
+    .unwrap();
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "index-bindings")
+        .with_key_group_count(key_groups)
+        .with_participant_id(1);
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id(deployment_id.clone())
+        .unwrap();
+
+    let manifests = [(1, 0), (2, 1)]
+        .into_iter()
+        .map(|(participant_id, vnode)| {
+            let (manifest, _) =
+                cluster_manifest(2, participant_id, vnode, &deployment_id, &fence, key_groups);
+            let encoded = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+            (manifest, encoded)
+        })
+        .collect::<Vec<_>>();
+    let predecessor = CommittedCheckpointRef {
+        epoch: 1,
+        checkpoint_id: 1,
+        sha256: checkpoint_sha256(b"predecessor"),
+        len: 1,
+    };
+
+    let index = coordinator
+        .build_committed_index(
+            CheckpointAttempt::canonical(2),
+            CheckpointScope::Cluster,
+            Some(fence.clone()),
+            Some(predecessor.clone()),
+            &BTreeMap::new(),
+            &manifests,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        index
+            .participants
+            .iter()
+            .map(|participant| participant.participant_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(index.predecessor, Some(predecessor));
+    assert_eq!(index.assignment_fence, Some(fence));
+    index.validate().unwrap();
+}
+
 #[tokio::test]
 async fn initial_committed_index_derives_an_empty_inventory_source_cut_from_its_marker() {
     let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -879,6 +952,11 @@ async fn recovery_aborts_and_seals_unresolved_candidate_index() {
 
     let (mut restarted, _, _) = coordinator_with_store(objects).await;
     assert_eq!(restarted.recover().await.unwrap().unwrap().epoch(), 1);
+    assert_eq!(
+        restarted.allocator.peek_epoch(),
+        2,
+        "recovery must restore the allocator to the committed successor epoch"
+    );
     assert!(decisions
         .load_committed_checkpoint(&candidate)
         .await
