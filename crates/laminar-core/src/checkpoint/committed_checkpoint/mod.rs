@@ -549,12 +549,27 @@ impl CommittedCheckpointIndex {
             }
             let subscription_manifests = manifests
                 .iter()
-                .filter_map(|(manifest, _)| manifest.subscription_output.as_ref())
+                .filter_map(|(manifest, _)| {
+                    manifest
+                        .subscription_output
+                        .as_ref()
+                        .map(|output| (output, manifest.owned_vnodes.as_slice()))
+                })
                 .collect::<Vec<_>>();
             if !subscription_manifests.is_empty() {
                 if subscription_manifests.len() != manifests.len() {
                     return Err(
                         "participant manifests do not agree on subscription output presence".into(),
+                    );
+                }
+                if subscription_manifests.iter().any(|(manifest, _)| {
+                    manifest.streams.iter().any(|stream| {
+                        stream.distribution_certificate.pipeline_identity != self.pipeline_identity
+                    })
+                }) {
+                    return Err(
+                        "subscription output pipeline identity differs from the committed index"
+                            .into(),
                     );
                 }
                 merge_node_subscription_manifests(

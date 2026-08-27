@@ -47,7 +47,7 @@ pub(super) async fn acquire_replay_pin(
         SubscriptionReplayPinAcquire::Pruned { .. } => {
             Err(ClusterSubscriptionError::ReplayPruned { requested }.into())
         }
-        SubscriptionReplayPinAcquire::Capacity => {
+        SubscriptionReplayPinAcquire::Capacity | SubscriptionReplayPinAcquire::Contended => {
             Err(ClusterSubscriptionError::BackendUnavailable.into())
         }
     }

@@ -622,6 +622,7 @@ async fn legacy_recoverable_fault_authority_and_release_bytes_remain_canonical()
     let record = store.load_record().await.unwrap().unwrap();
     let encoded_record = encode_authority_record(&record).unwrap();
     assert!(!String::from_utf8_lossy(&encoded_record).contains("disposition"));
+    assert!(!String::from_utf8_lossy(&encoded_record).contains("subscription_cleanup_commit"));
     let decoded_record: LeaderAuthorityRecord = serde_json::from_slice(&encoded_record).unwrap();
     assert_eq!(
         encode_authority_record(&decoded_record).unwrap(),

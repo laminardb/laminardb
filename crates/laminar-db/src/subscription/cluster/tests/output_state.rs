@@ -285,6 +285,21 @@ fn checkpoint_abort_restores_pre_cut_frames_before_post_cut_output() {
 }
 
 #[test]
+fn overlapping_checkpoint_reservation_preserves_the_active_attempt() {
+    let sample = batch(vec![1]);
+    let certificate = certificate(sample.schema().as_ref());
+    let mut state =
+        ClusterSubscriptionOutputState::new(vec![Arc::clone(&certificate)], None).unwrap();
+    let first_attempt = CheckpointAttempt::canonical(1);
+    let second_attempt = CheckpointAttempt::canonical(2);
+
+    state.reserve_checkpoint(first_attempt).unwrap();
+    assert!(state.reserve_checkpoint(second_attempt).is_err());
+    state.abort_checkpoint(first_attempt).unwrap();
+    state.reserve_checkpoint(second_attempt).unwrap();
+}
+
+#[test]
 fn one_stream_can_use_but_not_exceed_the_process_pending_budget() {
     const MIB: usize = 1024 * 1024;
     const PARTITIONS: u16 = 48;

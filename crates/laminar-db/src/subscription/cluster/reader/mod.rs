@@ -93,13 +93,16 @@ impl ClusterSubscriptionReader {
             GATEWAY_IO_TIMEOUT,
             GatewayCursor::open(&authority, &store, &certificate, start),
         )
-        .await
-        .map_err(|_| ClusterSubscriptionError::BackendUnavailable)?;
+        .await;
         let cursor = match cursor {
-            Ok(cursor) => cursor,
-            Err(error) => {
+            Ok(Ok(cursor)) => cursor,
+            Ok(Err(error)) => {
                 release_replay_pin(&authority, replay_pin.as_ref()).await;
                 return Err(error);
+            }
+            Err(_) => {
+                release_replay_pin(&authority, replay_pin.as_ref()).await;
+                return Err(ClusterSubscriptionError::BackendUnavailable.into());
             }
         };
         Ok(spawn_reader(

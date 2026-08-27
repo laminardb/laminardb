@@ -3470,6 +3470,36 @@ fn test_remove_query() {
         None,
         true,
     );
+    #[cfg(feature = "cluster")]
+    {
+        use laminar_core::checkpoint::{
+            ChangelogMode, OutputDistribution, OutputDistributionCertificate, OutputPartitionId,
+            PipelineIdentity, StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+            OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+        };
+
+        graph.subscription_certificates.insert(
+            "q1".into(),
+            Arc::new(OutputDistributionCertificate {
+                version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+                protocol_version: SubscriptionProtocolVersion::CURRENT,
+                stream_id: "q1".into(),
+                catalog_generation: 1,
+                stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes(
+                    [1; 32],
+                )),
+                final_operator_id: "stream:q1".into(),
+                distribution: OutputDistribution::Singleton {
+                    partition: OutputPartitionId::new(0),
+                },
+                schema_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+                changelog_mode: ChangelogMode::FullPartitionSnapshot,
+                history_retention_bytes: 0,
+                query_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+                pipeline_identity: PipelineIdentity::empty(),
+            }),
+        );
+    }
     assert!(graph.output_map.contains_key("q1"));
     let original_node = graph.output_map["q1"];
     prom.operator_process_duration
@@ -3481,6 +3511,11 @@ fn test_remove_query() {
     graph.ensure_live_provider("q1", &test_schema());
     graph.remove_query("q1");
     assert!(!graph.output_map.contains_key("q1"));
+    #[cfg(feature = "cluster")]
+    {
+        assert!(!graph.subscription_certificates.contains_key("q1"));
+        assert!(graph.capture_subscription_frontiers().unwrap().is_empty());
+    }
     assert!(graph.nodes[1].removed); // node 0 = source, node 1 = q1
     assert!(!graph.changelog_tables.contains("q1"));
     assert!(!graph.live_handles.contains_key("q1"));

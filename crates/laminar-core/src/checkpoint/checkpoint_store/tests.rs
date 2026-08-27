@@ -402,10 +402,11 @@ async fn subscription_segment_create_is_idempotent_but_conflicts_fail_closed() {
         .unwrap();
     assert_eq!(
         store.load_subscription_segment(&segment).await.unwrap(),
-        Some(payload)
+        Some(payload.clone())
     );
 
-    let conflicting_payload = Bytes::from_static(b"conflicting immutable segment");
+    let conflicting_payload = Bytes::from_static(b"conflicting immutable segment!");
+    assert_eq!(conflicting_payload.len(), payload.len());
     let conflicting = subscription_segment(&conflicting_payload, object_key);
     assert!(matches!(
         store

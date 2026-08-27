@@ -283,6 +283,7 @@ struct MergedStream {
 }
 
 /// Merge one complete participant roster into canonical whole-cluster subscription cuts.
+/// Each manifest is paired with the exact owned-vnode roster from its enclosing checkpoint.
 ///
 /// # Errors
 /// Returns an error for a missing participant manifest, certificate disagreement, duplicate or
@@ -291,24 +292,26 @@ pub fn merge_node_subscription_manifests(
     epoch: u64,
     checkpoint_id: u64,
     assignment_certificate: &CheckpointAssignmentFence,
-    manifests: &[&NodeSubscriptionManifest],
+    manifests: &[(&NodeSubscriptionManifest, &[u16])],
 ) -> Result<Vec<MergedSubscriptionCheckpoint>, SubscriptionContractError> {
     let expected_participants = assignment_certificate.participant_ids();
     let actual_participants = manifests
         .iter()
-        .map(|manifest| manifest.participant_id)
+        .map(|(manifest, _)| manifest.participant_id)
         .collect::<Vec<_>>();
     if actual_participants != expected_participants {
         return Err(SubscriptionContractError::NodeParticipant);
     }
+    validate_node_ownership(assignment_certificate, manifests)?;
     let mut streams = BTreeMap::<String, MergedStream>::new();
-    for node in manifests {
+    for (node, owned_vnodes) in manifests {
         if node.epoch != epoch
             || node.checkpoint_id != checkpoint_id
             || node.assignment_certificate != *assignment_certificate
         {
             return Err(SubscriptionContractError::AssignmentCertificate);
         }
+        node.validate(owned_vnodes)?;
         for stream in &node.streams {
             let stream_id = stream.distribution_certificate.stream_id.clone();
             let merged = streams.entry(stream_id).or_insert_with(|| MergedStream {
@@ -364,6 +367,36 @@ pub fn merge_node_subscription_manifests(
         });
     }
     Ok(merged_checkpoints)
+}
+
+fn validate_node_ownership(
+    assignment_certificate: &CheckpointAssignmentFence,
+    manifests: &[(&NodeSubscriptionManifest, &[u16])],
+) -> Result<(), SubscriptionContractError> {
+    let vnode_count = usize::try_from(assignment_certificate.vnode_count)
+        .map_err(|_| SubscriptionContractError::AssignmentCertificate)?;
+    let mut owners = vec![None; vnode_count];
+    for (manifest, owned_vnodes) in manifests {
+        if owned_vnodes.is_empty() || !owned_vnodes.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(SubscriptionContractError::AssignmentCertificate);
+        }
+        for vnode in *owned_vnodes {
+            let owner = owners
+                .get_mut(usize::from(*vnode))
+                .ok_or(SubscriptionContractError::AssignmentCertificate)?;
+            if owner.replace(manifest.participant_id).is_some() {
+                return Err(SubscriptionContractError::AssignmentCertificate);
+            }
+        }
+    }
+    if owners.iter().any(Option::is_none) {
+        return Err(SubscriptionContractError::AssignmentCertificate);
+    }
+    let owner_map = owners.into_iter().flatten().collect::<Vec<_>>();
+    if !assignment_certificate.matches_owner_map(&owner_map) {
+        return Err(SubscriptionContractError::AssignmentCertificate);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -469,8 +502,13 @@ mod tests {
     fn participant_ranges_merge_into_one_exact_frontier_vector() {
         let first = node(1, &[0, 2], 0, 0);
         let second = node(2, &[1, 3], 0, 0);
-        let merged =
-            merge_node_subscription_manifests(10, 10, &assignment(), &[&first, &second]).unwrap();
+        let merged = merge_node_subscription_manifests(
+            10,
+            10,
+            &assignment(),
+            &[(&first, &[0, 2]), (&second, &[1, 3])],
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(
             merged[0]
@@ -487,7 +525,7 @@ mod tests {
     fn missing_participant_and_wrong_owner_fail_closed() {
         let first = node(1, &[0, 2], 0, 0);
         assert_eq!(
-            merge_node_subscription_manifests(10, 10, &assignment(), &[&first]),
+            merge_node_subscription_manifests(10, 10, &assignment(), &[(&first, &[0, 2])]),
             Err(SubscriptionContractError::NodeParticipant)
         );
 
@@ -508,7 +546,10 @@ mod tests {
             10,
             10,
             &assignment(),
-            &[&predecessor_first, &predecessor_second],
+            &[
+                (&predecessor_first, &[0, 2]),
+                (&predecessor_second, &[1, 3]),
+            ],
         )
         .unwrap()
         .remove(0);
@@ -519,7 +560,7 @@ mod tests {
             10,
             10,
             &assignment(),
-            &[&current_first, &current_second],
+            &[(&current_first, &[0, 2]), (&current_second, &[1, 3])],
         )
         .unwrap()
         .remove(0);
@@ -556,6 +597,37 @@ mod tests {
                 expected: 1,
                 actual: 2,
             })
+        );
+    }
+
+    #[test]
+    fn merge_revalidates_node_digest_segments_and_assignment_ownership() {
+        let mut unvalidated = node(1, &[0, 2], 0, 0);
+        unvalidated.streams[0].ranges[0].through_sequence = PartitionSequence::new(1);
+        let second = node(2, &[1, 3], 0, 0);
+        assert_eq!(
+            merge_node_subscription_manifests(
+                10,
+                10,
+                &assignment(),
+                &[(&unvalidated, &[0, 2]), (&second, &[1, 3])],
+            ),
+            Err(SubscriptionContractError::SequenceGap {
+                partition: 0,
+                expected: 1,
+                actual: 0,
+            })
+        );
+
+        let first = node(1, &[0, 2], 0, 0);
+        assert_eq!(
+            merge_node_subscription_manifests(
+                10,
+                10,
+                &assignment(),
+                &[(&first, &[0, 1]), (&second, &[2, 3])],
+            ),
+            Err(SubscriptionContractError::AssignmentCertificate)
         );
     }
 }

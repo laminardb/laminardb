@@ -580,6 +580,7 @@ async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional
         frame_signature(&retried_frames)
     );
     state.commit_partitioned_emit(retried);
+    assert!(state.cached_usage_matches_structural_recompute());
 
     state
         .process_batch(&sum_pre_agg_batch(&["a", "b"], &[2.0, 3.0]), 20)
@@ -588,6 +589,7 @@ async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional
         .prepare_partitioned_emit(subscription_generation(1))
         .unwrap();
     let update_frames = take_partition_frames(&mut update);
+    assert!(!update_frames.is_empty());
     for frame in &update_frames {
         assert_eq!(frame.id.sequence.get(), 1);
         let weights = frame
@@ -604,6 +606,7 @@ async fn partitioned_changelog_is_canonical_and_sequence_commit_is_transactional
             .all(|pair| pair == &[-1, 1]));
     }
     state.commit_partitioned_emit(update);
+    assert!(state.cached_usage_matches_structural_recompute());
 }
 
 #[cfg(feature = "cluster")]
@@ -635,6 +638,7 @@ async fn partition_sequence_checkpoint_restore_and_global_singleton_continue_exa
         .prepare_partitioned_emit(subscription_generation(2))
         .unwrap();
     let continued_frames = take_partition_frames(&mut continuation);
+    assert!(!continued_frames.is_empty());
     for frame in &continued_frames {
         let previous = first_frames
             .iter()
@@ -665,6 +669,24 @@ async fn partition_sequence_checkpoint_restore_and_global_singleton_continue_exa
     assert_eq!(frames[0].id.partition.get(), 0);
     assert_eq!(frames[0].id.sequence.get(), 0);
     global.commit_partitioned_emit(global_output);
+
+    let checkpoints = capture_all_vnodes(&mut global).unwrap();
+    let (_, mut restored_global) =
+        setup_agg_state_for_key_groups("SELECT SUM(value) AS total FROM events", true, key_groups)
+            .await;
+    for (vnode, checkpoint) in checkpoints {
+        restored_global
+            .restore_vnode(vnode, u32::from(key_groups.get()), checkpoint)
+            .unwrap();
+    }
+    restored_global.process_batch(&batch, 20).unwrap();
+    let mut continuation = restored_global
+        .prepare_partitioned_emit(subscription_generation(3))
+        .unwrap();
+    let frames = take_partition_frames(&mut continuation);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].id.partition.get(), 0);
+    assert_eq!(frames[0].id.sequence.get(), 1);
 }
 
 #[cfg(feature = "cluster")]
@@ -745,8 +767,9 @@ async fn sequence_overflow_and_later_vnode_failure_restore_every_dirty_set() {
 async fn partitioned_deletion_only_and_empty_cycles_preserve_sequence() {
     let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
     let mut state = setup_weighted_count_state(key_groups).await;
+    let deleted_key = "deleted-key".repeat(512);
     state
-        .process_batch(&weighted_count_pre_agg_batch(&["gone"], &[1]), 10)
+        .process_batch(&weighted_count_pre_agg_batch(&[&deleted_key], &[1]), 10)
         .unwrap();
     let initial = state
         .prepare_partitioned_emit(subscription_generation(6))
@@ -754,11 +777,12 @@ async fn partitioned_deletion_only_and_empty_cycles_preserve_sequence() {
     state.commit_partitioned_emit(initial);
 
     state
-        .process_batch(&weighted_count_pre_agg_batch(&["gone"], &[-1]), 20)
+        .process_batch(&weighted_count_pre_agg_batch(&[&deleted_key], &[-1]), 20)
         .unwrap();
     let mut deletion = state
         .prepare_partitioned_emit(subscription_generation(6))
         .unwrap();
+    assert!(deletion.retained_bookkeeping_bytes() > deleted_key.len());
     let frames = take_partition_frames(&mut deletion);
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].id.sequence.get(), 1);

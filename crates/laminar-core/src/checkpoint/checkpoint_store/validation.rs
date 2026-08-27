@@ -11,6 +11,11 @@ use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, StateChunkId};
 use crate::state::KeyGroupCount;
 
+pub(super) enum ManifestAbortState {
+    Sealed(Option<(CheckpointManifest, Bytes)>),
+    Manifest(CheckpointManifest, Bytes),
+}
+
 pub(super) fn normalize_prefix(prefix: &str) -> String {
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {

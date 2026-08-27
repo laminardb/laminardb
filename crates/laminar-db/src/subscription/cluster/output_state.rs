@@ -415,14 +415,12 @@ impl ClusterSubscriptionOutputState {
         if !self.enabled() {
             return Ok(());
         }
-        if !attempt.is_canonical()
-            || self.reserved_attempt.replace(attempt).is_some()
-            || self.prepared.is_some()
-        {
+        if !attempt.is_canonical() || self.reserved_attempt.is_some() || self.prepared.is_some() {
             return Err(DbError::Checkpoint(
                 "subscription output checkpoint reservation overlaps another attempt".into(),
             ));
         }
+        self.reserved_attempt = Some(attempt);
         Ok(())
     }
 
@@ -714,13 +712,13 @@ impl ClusterSubscriptionOutputState {
             .streams
             .get(&id.stream_generation)
             .and_then(|stream| stream.partitions.get(&id.partition))
-            .and_then(|partition| partition.frames.iter().find(|frame| frame.id == id))
+            .and_then(|partition| frame_at_id(&partition.frames, id))
             .or_else(|| {
                 self.prepared
                     .as_ref()
                     .and_then(|prepared| prepared_stream(prepared, id.stream_generation))
                     .and_then(|stream| prepared_partition(stream, id.partition))
-                    .and_then(|partition| partition.frames.iter().find(|frame| frame.id == id))
+                    .and_then(|partition| frame_at_id(&partition.frames, id))
             })
     }
 
@@ -813,6 +811,14 @@ impl ClusterSubscriptionOutputState {
                     .map_or(0, |partition| partition.retained_bytes),
             )
     }
+}
+
+type BufferedFrames = [BufferedSubscriptionFrame];
+
+fn frame_at_id(frames: &BufferedFrames, id: OutputFrameId) -> Option<&BufferedSubscriptionFrame> {
+    let first = frames.first()?.id.sequence.get();
+    let offset = usize::try_from(id.sequence.get().checked_sub(first)?).ok()?;
+    frames.get(offset).filter(|frame| frame.id == id)
 }
 
 fn prepared_stream(

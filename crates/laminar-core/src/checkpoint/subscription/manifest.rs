@@ -69,6 +69,7 @@ impl OutputSegmentRef {
         self.protocol_version.validate()?;
         if self.object_key.is_empty()
             || self.object_key.len() > MAX_OBJECT_KEY_BYTES
+            || !self.object_key.starts_with("subscription-output/")
             || self.object_key.starts_with('/')
             || self.object_key.contains('\\')
             || self
@@ -150,6 +151,7 @@ impl SubscriptionCheckpointManifest {
     /// # Errors
     /// Returns the first malformed, mismatched, discontinuous, or oversized field.
     pub fn validate(&self) -> Result<(), SubscriptionContractError> {
+        ensure_encoded_size_within_limit(self)?;
         self.protocol_version.validate()?;
         if self.epoch == 0 || self.checkpoint_id != self.epoch {
             return Err(SubscriptionContractError::CheckpointAttempt);
@@ -202,12 +204,55 @@ impl SubscriptionCheckpointManifest {
             frontiers: &self.frontiers,
             segments: &self.segments,
         };
+        ensure_encoded_size_within_limit(&body)?;
         let encoded = canonical_json_bytes(&body)
             .map_err(|error| SubscriptionContractError::Encode(error.to_string()))?;
         Ok(SubscriptionDigest::for_bytes(
             b"laminardb-subscription-checkpoint-manifest-v1",
             &encoded,
         ))
+    }
+}
+
+struct EncodedSizeWriter {
+    written: usize,
+    overflow_at: Option<usize>,
+}
+
+impl std::io::Write for EncodedSizeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next = self.written.saturating_add(bytes.len());
+        if next > MAX_SUBSCRIPTION_MANIFEST_BYTES {
+            self.overflow_at = Some(next);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "subscription manifest exceeds its encoded-size bound",
+            ));
+        }
+        self.written = next;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn ensure_encoded_size_within_limit<T: Serialize>(
+    value: &T,
+) -> Result<(), SubscriptionContractError> {
+    let mut writer = EncodedSizeWriter {
+        written: 0,
+        overflow_at: None,
+    };
+    let result = serde_json::to_writer(&mut writer, value);
+    match (result, writer.overflow_at) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(actual)) => Err(SubscriptionContractError::ManifestTooLarge {
+            actual,
+            limit: MAX_SUBSCRIPTION_MANIFEST_BYTES,
+        }),
+        (Err(error), None) => Err(SubscriptionContractError::Encode(error.to_string())),
     }
 }
 
@@ -621,6 +666,56 @@ mod tests {
             segment.validate(&certificate),
             Err(SubscriptionContractError::InvalidSegmentRange)
         );
+    }
+
+    #[test]
+    fn segment_reference_requires_the_storage_namespace() {
+        let certificate = certificate();
+        let segment = OutputSegmentRef {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            object_key: "other/deployment/stream/generation/0/segment.arrow".into(),
+            stream_generation: certificate.stream_generation,
+            partition: OutputPartitionId::new(0),
+            first_sequence: PartitionSequence::FIRST,
+            exclusive_end_sequence: PartitionSequence::new(1),
+            frame_count: 1,
+            row_count: 1,
+            encoded_length: 1,
+            schema_fingerprint: certificate.schema_fingerprint,
+            payload_digest: SubscriptionDigest::from_bytes([5; 32]),
+        };
+
+        assert_eq!(
+            segment.validate(&certificate),
+            Err(SubscriptionContractError::NonCanonicalObjectKey)
+        );
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_before_digest_encoding() {
+        let mut manifest = manifest();
+        let segment = OutputSegmentRef {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            object_key: format!(
+                "subscription-output/{}",
+                "x".repeat(MAX_OBJECT_KEY_BYTES - "subscription-output/".len())
+            ),
+            stream_generation: manifest.stream_generation,
+            partition: OutputPartitionId::new(0),
+            first_sequence: PartitionSequence::FIRST,
+            exclusive_end_sequence: PartitionSequence::new(1),
+            frame_count: 1,
+            row_count: 1,
+            encoded_length: 1,
+            schema_fingerprint: manifest.schema_fingerprint,
+            payload_digest: SubscriptionDigest::from_bytes([5; 32]),
+        };
+        manifest.segments = vec![segment; 4_096];
+
+        assert!(matches!(
+            manifest.computed_digest(),
+            Err(SubscriptionContractError::ManifestTooLarge { .. })
+        ));
     }
 
     #[test]

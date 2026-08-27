@@ -545,6 +545,7 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
     assert_eq!(written_rows.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -743,6 +744,10 @@ struct MockCallback {
     publish_barrier_error: Arc<Mutex<Option<String>>>,
     publication_error: Arc<Mutex<Option<String>>>,
     sink_publication_error: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "cluster")]
+    subscription_output_commits: Arc<AtomicU64>,
+    #[cfg(feature = "cluster")]
+    subscription_output_aborts: Arc<AtomicU64>,
     written_rows: Arc<AtomicU64>,
     published_barriers_observed_at_close: Arc<AtomicU64>,
     invalidated_subscriptions: Arc<Mutex<Vec<String>>>,
@@ -839,6 +844,10 @@ impl MockCallback {
             publish_barrier_error: Arc::new(Mutex::new(None)),
             publication_error: Arc::new(Mutex::new(None)),
             sink_publication_error: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            subscription_output_commits: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "cluster")]
+            subscription_output_aborts: Arc::new(AtomicU64::new(0)),
             written_rows: Arc::new(AtomicU64::new(0)),
             published_barriers_observed_at_close: Arc::new(AtomicU64::new(0)),
             invalidated_subscriptions: Arc::new(Mutex::new(Vec::new())),
@@ -1180,6 +1189,19 @@ impl PipelineCallback for MockCallback {
             None => Ok(()),
         }
     }
+
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {
+        self.subscription_output_commits
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {
+        self.subscription_output_aborts
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     async fn write_to_sinks(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -3046,6 +3068,7 @@ fn checkpoint_admission_serializes_every_durable_tail() {
     assert!(!coordinator.checkpoint_capacity_available());
 }
 
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn pending_output_accelerates_only_a_configured_periodic_checkpoint() {
     let mut periodic = admission_coordinator(Vec::new());
@@ -9205,6 +9228,33 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
         Some("3")
     );
     assert_eq!(callback.written_rows.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cursor_settlement_failure_aborts_before_subscription_output_commit() {
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.pending_offsets.push(None);
+    let mut callback = MockCallback::new();
+    let commits = Arc::clone(&callback.subscription_output_commits);
+    let aborts = Arc::clone(&callback.subscription_output_aborts);
+
+    let error = coordinator
+        .publish_cycle_outputs(&mut callback, &CycleOutcome::clean(FxHashMap::default()))
+        .await
+        .expect_err("cursor roster divergence must fail publication");
+
+    assert!(error.to_string().contains("cursor slot counts diverged"));
+    assert_eq!(commits.load(Ordering::SeqCst), 0);
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

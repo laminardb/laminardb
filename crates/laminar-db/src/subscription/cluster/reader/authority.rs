@@ -118,10 +118,13 @@ pub(super) async fn next_committed_indexes(
     authority: &LeaderLeaseStore,
     cursor: &GatewayCursor,
 ) -> Result<Vec<CommittedCheckpointIndex>, DbError> {
-    let Some(latest) = authority
-        .highest_cluster_committed_outcome()
-        .await
-        .map_err(map_authority_error)?
+    let Some(latest) = tokio::time::timeout(
+        GATEWAY_IO_TIMEOUT,
+        authority.highest_cluster_committed_outcome(),
+    )
+    .await
+    .map_err(|_| ClusterSubscriptionError::BackendUnavailable)?
+    .map_err(map_authority_error)?
     else {
         return Ok(Vec::new());
     };

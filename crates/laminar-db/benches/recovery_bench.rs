@@ -270,7 +270,10 @@ fn bench_partition_sequence_assignment(c: &mut Criterion) {
 
 fn subscription_manifest_fixture(
     vnode_count: u16,
-) -> (CheckpointAssignmentFence, Vec<NodeSubscriptionManifest>) {
+) -> (
+    CheckpointAssignmentFence,
+    Vec<(NodeSubscriptionManifest, Vec<u16>)>,
+) {
     const PARTICIPANT_COUNT: u64 = 3;
     let participants = (1..=PARTICIPANT_COUNT)
         .map(|node_id| CheckpointParticipant {
@@ -330,7 +333,7 @@ fn subscription_manifest_fixture(
                 manifest_digest: SubscriptionDigest::from_bytes([0; 32]),
             };
             manifest.seal(&owned_vnodes).unwrap();
-            manifest
+            (manifest, owned_vnodes)
         })
         .collect();
     (assignment, manifests)
@@ -341,7 +344,10 @@ fn bench_subscription_manifest_construction(c: &mut Criterion) {
     group.sample_size(20);
     for vnode_count in [64_u16, 1_024] {
         let (assignment, manifests) = subscription_manifest_fixture(vnode_count);
-        let manifests = manifests.iter().collect::<Vec<_>>();
+        let manifests = manifests
+            .iter()
+            .map(|(manifest, owned_vnodes)| (manifest, owned_vnodes.as_slice()))
+            .collect::<Vec<_>>();
         group.throughput(Throughput::Elements(u64::from(vnode_count)));
         group.bench_function(BenchmarkId::from_parameter(vnode_count), |bencher| {
             bencher.iter(|| {

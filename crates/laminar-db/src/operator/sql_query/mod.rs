@@ -692,7 +692,7 @@ pub(crate) fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> Operat
         laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref());
     let has_grouping = match &select.group_by {
         GroupByExpr::Expressions(expressions, _) => !expressions.is_empty(),
-        GroupByExpr::All(_) => true,
+        GroupByExpr::All(_) => return OperatorCapability::uncertified_keyed_sql_aggregate(),
     };
     if !is_direct_single_source_shape(query, select) {
         return OperatorCapability::unclassified_sql_query();
@@ -2222,6 +2222,9 @@ impl SqlQueryOperator {
             .any(|batch| batch.num_rows() != 0);
         let mut output = Vec::new();
         let mut drained_remote = false;
+        if self.prepared_aggregate_emission.is_some() {
+            return Ok(output);
+        }
         if self.queued_remote_events != 0 {
             if has_input {
                 return Err(DbError::InvalidOperation(format!(
@@ -2231,9 +2234,6 @@ impl SqlQueryOperator {
             }
             output.extend(self.drain_remote_event(&assignment, &config)?);
             drained_remote = true;
-        }
-        if drained_remote && self.prepared_aggregate_emission.is_some() {
-            return Ok(output);
         }
         let completion = self.finish_pending_cluster_input().map_err(|error| {
             if drained_remote {
@@ -3216,11 +3216,14 @@ impl GraphOperator for SqlQueryOperator {
         self.pending_cluster_input.is_none()
             && self.queued_remote_events == 0
             && self.last_broadcast == self.local_frontier
+            && self.prepared_aggregate_emission.is_none()
     }
 
     #[cfg(feature = "cluster")]
     fn checkpoint_drain_pending(&self) -> bool {
-        self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier
+        self.pending_cluster_input.is_some()
+            || self.last_broadcast != self.local_frontier
+            || self.prepared_aggregate_emission.is_some()
     }
 
     #[cfg(feature = "cluster")]

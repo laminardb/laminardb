@@ -5,7 +5,7 @@ use std::sync::Arc;
 use laminar_core::checkpoint::{
     checkpoint_manifest_bytes, merge_node_subscription_manifests, CheckpointAttempt,
     CheckpointManifest, CheckpointParticipant, CheckpointStore, CheckpointStoreError,
-    CommittedCheckpointIndex, CommittedCheckpointRef, NodePartitionRange,
+    CommittedCheckpointIndex, CommittedCheckpointRef, NodePartitionRange, NodeSubscriptionManifest,
     OutputDistributionCertificate, OutputSegmentRef, SubscriptionCheckpointManifest,
 };
 use laminar_core::state::KeyGroupCount;
@@ -13,6 +13,8 @@ use laminar_core::state::KeyGroupCount;
 use super::OutputSegmentBinding;
 use crate::error::DbError;
 use crate::subscription::ClusterSubscriptionError;
+
+type NodeOutputRoster<'a> = Vec<(&'a NodeSubscriptionManifest, &'a [u16])>;
 
 /// Segment reference paired with the participant authority omitted from the public manifest.
 #[derive(Clone)]
@@ -123,21 +125,13 @@ fn select_stream_cut(
     manifests: &[CheckpointManifest],
     certificate: &OutputDistributionCertificate,
 ) -> Result<Option<LoadedStreamCut>, DbError> {
+    let Some(node_outputs) = unanimous_node_outputs(manifests)? else {
+        return Ok(None);
+    };
     let assignment = index
         .assignment_fence
         .as_ref()
         .ok_or_else(|| manifest_error("cluster checkpoint has no assignment certificate"))?;
-    let node_outputs = manifests
-        .iter()
-        .map(|manifest| {
-            manifest.subscription_output.as_ref().ok_or_else(|| {
-                manifest_error(format!(
-                    "participant {} omitted subscription output",
-                    manifest.participant_id
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let merged = merge_node_subscription_manifests(
         index.epoch,
         index.checkpoint_id,
@@ -167,6 +161,29 @@ fn select_stream_cut(
         ranges: selected.ranges,
         segments,
     }))
+}
+
+fn unanimous_node_outputs(
+    manifests: &[CheckpointManifest],
+) -> Result<Option<NodeOutputRoster<'_>>, DbError> {
+    let node_outputs = manifests
+        .iter()
+        .filter_map(|manifest| {
+            manifest
+                .subscription_output
+                .as_ref()
+                .map(|output| (output, manifest.owned_vnodes.as_slice()))
+        })
+        .collect::<Vec<_>>();
+    if node_outputs.is_empty() {
+        return Ok(None);
+    }
+    if node_outputs.len() != manifests.len() {
+        return Err(manifest_error(
+            "participant manifests disagree on subscription output presence",
+        ));
+    }
+    Ok(Some(node_outputs))
 }
 
 fn validate_certificate(
@@ -252,4 +269,58 @@ fn manifest_error(reason: impl Into<String>) -> DbError {
         reason: reason.into(),
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use laminar_core::checkpoint::{
+        CheckpointAssignmentFence, NodeSubscriptionManifest, SubscriptionDigest,
+        SubscriptionProtocolVersion,
+    };
+
+    use super::*;
+
+    fn manifest(participant_id: u64) -> CheckpointManifest {
+        let key_groups = KeyGroupCount::try_from(1_u16).unwrap();
+        let mut manifest = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
+        manifest.bind_participant(participant_id);
+        manifest
+    }
+
+    #[test]
+    fn unanimous_absence_is_an_optional_checkpoint_cut() {
+        let manifests = [manifest(1), manifest(2)];
+        assert!(unanimous_node_outputs(&manifests).unwrap().is_none());
+    }
+
+    #[test]
+    fn partial_subscription_output_presence_fails_closed() {
+        let assignment = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1],
+            vec![CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            }],
+        )
+        .unwrap();
+        let mut present = manifest(1);
+        present.subscription_output = Some(NodeSubscriptionManifest {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            epoch: 1,
+            checkpoint_id: 1,
+            participant_id: 1,
+            assignment_certificate: assignment,
+            streams: Vec::new(),
+            manifest_digest: SubscriptionDigest::from_bytes([0; 32]),
+        });
+        let absent = manifest(2);
+
+        let error = unanimous_node_outputs(&[present, absent]).unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::Subscription(ClusterSubscriptionError::ManifestCorrupt { reason })
+                if reason.contains("disagree")
+        ));
+    }
 }

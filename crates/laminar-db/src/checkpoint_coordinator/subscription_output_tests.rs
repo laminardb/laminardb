@@ -19,7 +19,7 @@ use laminar_core::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 use object_store::memory::InMemory;
 
 use super::subscription_output::{
-    cluster_subscription_retention_horizon, encode_node_subscription_output,
+    cluster_subscription_retention_horizon, encode_node_subscription_output, retention_caps,
 };
 use super::{delete_retired_data, live_chunk_inventory};
 use crate::error::DbError;
@@ -286,6 +286,25 @@ async fn zero_history_cap_keeps_only_the_current_tail_boundary() {
     .await
     .unwrap();
     assert_eq!(horizon.epoch, 4);
+}
+
+#[test]
+fn mixed_retention_roster_preserves_the_zero_cap() {
+    let tail_only = certificate(0);
+    let tail_generation = tail_only.stream_generation;
+    let mut retained = certificate(100);
+    retained.stream_id = "retained_positions".into();
+    retained.stream_generation =
+        StreamGeneration::from_digest(SubscriptionDigest::from_bytes([9; 32]));
+    let certificates = BTreeMap::from([
+        (tail_generation, tail_only),
+        (retained.stream_generation, retained),
+    ]);
+
+    let caps = retention_caps(&certificates);
+
+    assert_eq!(caps.get(&tail_generation), Some(&0));
+    assert_eq!(caps.len(), 2);
 }
 
 #[test]

@@ -167,6 +167,12 @@ struct PendingGraphPassOperator {
     entered: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+#[cfg(feature = "cluster")]
+struct PendingPreparedGraphPassOperator {
+    prepared: Arc<std::sync::atomic::AtomicBool>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
@@ -182,6 +188,42 @@ impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
             let _ = entered.send(());
         }
         std::future::pending().await
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for PendingPreparedGraphPassOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.prepared
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::future::pending().await
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        true
+    }
+
+    fn abort_prepared_subscription_output(&mut self) {
+        if self
+            .prepared
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
@@ -1772,6 +1814,55 @@ async fn handoff_graph_drain_deadline_bounds_rotation_fence_wait() {
         .as_deref()
         .is_some_and(|reason| reason.contains("absolute attempt deadline")));
     drop(held_writer);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn checkpoint_graph_timeout_aborts_prepared_subscription_output() {
+    use laminar_core::checkpoint::{
+        ChangelogMode, OutputDistribution, OutputDistributionCertificate, OutputPartitionId,
+        PipelineIdentity, StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+    };
+
+    let mut callback = empty_callback_fixture();
+    let certificate = Arc::new(OutputDistributionCertificate {
+        version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+        protocol_version: SubscriptionProtocolVersion::CURRENT,
+        stream_id: "pending-output".into(),
+        catalog_generation: 1,
+        stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes([1; 32])),
+        final_operator_id: "stream:pending-output".into(),
+        distribution: OutputDistribution::Singleton {
+            partition: OutputPartitionId::new(0),
+        },
+        schema_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        changelog_mode: ChangelogMode::FullPartitionSnapshot,
+        history_retention_bytes: 0,
+        query_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+        pipeline_identity: PipelineIdentity::empty(),
+    });
+    callback.graph.set_subscription_certificates(
+        std::iter::once(("pending-output".to_string(), certificate)).collect(),
+    );
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    callback.graph.push_test_node(
+        "pending-output",
+        Box::new(PendingPreparedGraphPassOperator {
+            prepared: Arc::clone(&prepared),
+            aborted: Arc::clone(&aborted),
+        }),
+    );
+
+    let error = callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect_err("the absolute graph deadline must cancel a pending pass");
+
+    assert!(error.to_string().contains("absolute attempt deadline"));
+    assert!(!prepared.load(std::sync::atomic::Ordering::Acquire));
+    assert!(aborted.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[cfg(feature = "cluster")]

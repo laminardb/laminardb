@@ -84,6 +84,9 @@ impl PreparedAggregateEmission {
                 .deletions
                 .capacity()
                 .saturating_mul(std::mem::size_of::<arrow::row::OwnedRow>());
+            let deletion_payload_bytes = commit.deletions.iter().fold(0usize, |bytes, key| {
+                bytes.saturating_add(key.as_ref().len())
+            });
             let scalar_bytes = commit
                 .insertions
                 .iter()
@@ -100,6 +103,7 @@ impl PreparedAggregateEmission {
             total
                 .saturating_add(insert_roster)
                 .saturating_add(delete_roster)
+                .saturating_add(deletion_payload_bytes)
                 .saturating_add(scalar_bytes)
         })
     }
@@ -346,9 +350,12 @@ impl IncrementalAggState {
                 .iter()
                 .filter(|change| change.commit_insert)
                 .count();
-            self.vnode_states
+            let state = self
+                .vnode_states
                 .get_mut(vnode)
-                .expect("evaluated aggregate vnode must remain resident")
+                .expect("evaluated aggregate vnode must remain resident");
+            let previous_spare = state.collection_spare_usage();
+            state
                 .last_emitted
                 .try_reserve(insert_count)
                 .map_err(|error| {
@@ -356,6 +363,7 @@ impl IncrementalAggState {
                         "aggregate vnode {vnode} changelog commit reservation failed: {error}"
                     ))
                 })?;
+            state.reconcile_collection_spare_usage(previous_spare);
             let partition = OutputPartitionId::new(u16::try_from(vnode).map_err(|_| {
                 DbError::Pipeline(format!(
                     "aggregate vnode {vnode} is not a valid output partition"

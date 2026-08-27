@@ -7,6 +7,14 @@ use super::{set_checkpoint_fault, ConnectorPipelineCallback};
 use crate::pipeline::{CycleError, PipelineCallback};
 
 impl ConnectorPipelineCallback {
+    pub(super) fn checkpoint_drain_timeout(&mut self) -> CycleError {
+        #[cfg(feature = "cluster")]
+        self.abort_prepared_subscription_output_cycle();
+        let reason = "checkpoint graph drain exceeded its absolute attempt deadline".to_string();
+        set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+        CycleError::Recovery(reason)
+    }
+
     pub(super) async fn publish_checkpoint_drain_results(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,

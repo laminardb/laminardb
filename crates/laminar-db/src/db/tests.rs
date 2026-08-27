@@ -6660,7 +6660,7 @@ async fn cluster_keyed_aggregate_commits_and_replays_through_the_gateway() {
         .unwrap();
     assert!(committed.success, "output checkpoint failed: {committed:?}");
 
-    let frames = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let mut frames = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut batches = Vec::new();
         loop {
             match tail.next_envelope().await {
@@ -6690,15 +6690,6 @@ async fn cluster_keyed_aggregate_commits_and_replays_through_the_gateway() {
     assert!(frames
         .iter()
         .all(|(_, _, epoch, _)| *epoch == committed.epoch));
-    let mut sequences = std::collections::BTreeMap::<_, Vec<_>>::new();
-    for (partition, sequence, _, _) in &frames {
-        sequences.entry(*partition).or_default().push(*sequence);
-    }
-    for partition_sequences in sequences.values() {
-        for pair in partition_sequences.windows(2) {
-            assert_eq!(pair[1].get(), pair[0].get() + 1);
-        }
-    }
     let filtered_batches = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut batches = Vec::new();
         loop {
@@ -6732,6 +6723,68 @@ async fn cluster_keyed_aggregate_commits_and_replays_through_the_gateway() {
         .unwrap();
     assert_eq!(filtered_total.value(0), 10);
 
+    source_control.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while metrics.events_ingested.get() < initial_ingested.saturating_add(2) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cluster pipeline did not consume the second aggregate input");
+    let second_committed = db
+        .checkpoint_with_timeout(std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(
+        second_committed.success,
+        "second output checkpoint failed: {second_committed:?}"
+    );
+    let second_frames = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
+        loop {
+            match tail.next_envelope().await {
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    cluster:
+                        Some(crate::subscription::ClusterSubscriptionFrameMetadata::Data {
+                            partition,
+                            partition_sequence,
+                            committed_epoch,
+                            ..
+                        }),
+                    ..
+                }) => batches.push((partition, partition_sequence, committed_epoch, batch)),
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
+                    ..
+                }) if epoch == second_committed.epoch => return batches,
+                Some(_) => {}
+                None => panic!("cluster gateway terminated before second committed progress"),
+            }
+        }
+    })
+    .await
+    .expect("cluster gateway did not expose the second committed aggregate cut");
+    assert!(!second_frames.is_empty());
+    assert!(second_frames
+        .iter()
+        .all(|(_, _, epoch, _)| *epoch == second_committed.epoch));
+    frames.extend(second_frames);
+
+    let mut sequences = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (partition, sequence, _, _) in &frames {
+        sequences.entry(*partition).or_default().push(*sequence);
+    }
+    assert!(
+        sequences.values().any(|partition| partition.len() >= 2),
+        "the fixture must emit adjacent sequences for one partition"
+    );
+    for partition_sequences in sequences.values() {
+        for pair in partition_sequences.windows(2) {
+            assert_eq!(pair[1].get(), pair[0].get() + 1);
+        }
+    }
+
     let mut replay = db
         .open_subscription(
             "positions",
@@ -6740,23 +6793,39 @@ async fn cluster_keyed_aggregate_commits_and_replays_through_the_gateway() {
         )
         .await
         .unwrap();
-    let replayed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let replay_batches = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
         loop {
             match replay.next_envelope().await {
                 Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    ..
+                }) => batches.push(batch),
+                Some(crate::subscription::SubscriptionEnvelope {
                     frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
                     ..
-                }) if epoch == committed.epoch => break,
+                }) if epoch == second_committed.epoch => return batches,
                 Some(_) => {}
                 None => panic!("cluster replay terminated before committed progress"),
             }
         }
     })
-    .await;
-    assert!(
-        replayed.is_ok(),
-        "AS OF EPOCH replay did not reach the committed cut"
-    );
+    .await
+    .expect("AS OF EPOCH replay did not reach the committed cut");
+    assert!(!replay_batches.is_empty());
+    let replay_totals = replay_batches
+        .iter()
+        .flat_map(|batch| {
+            let totals = batch
+                .column(batch.schema().index_of("total").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            totals.values().iter().copied().collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(replay_totals.contains(&10));
+    assert!(replay_totals.contains(&21));
     db.shutdown().await.unwrap();
 }
 

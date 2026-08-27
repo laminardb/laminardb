@@ -41,6 +41,18 @@ fn sql_capability_classification_is_shape_aware_and_fail_closed() {
         Some(crate::operator::capability::SubscriptionOutputDistribution::VnodePartitioned)
     );
 
+    let group_by_all = classify("SELECT key, SUM(value) AS total FROM events GROUP BY ALL");
+    assert_eq!(group_by_all.state_class, OperatorStateClass::VnodeKeyed);
+    assert_eq!(
+        group_by_all.cluster_status,
+        ClusterExecutionStatus::DdlGuarded
+    );
+    assert_eq!(
+        group_by_all.managed_state,
+        Some(ManagedStateContract::SqlAggregateV1)
+    );
+    assert_eq!(group_by_all.subscription_output, None);
+
     let window_keyed = classify(
         "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), SUM(value) FROM events \
              GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
@@ -1280,6 +1292,104 @@ async fn pending_send_drains_remote_sum_before_publishing_local_cut() {
     assert_eq!(operator.queued_remote_events, 0);
     assert_eq!(operator.local_frontier, frontier);
     assert_eq!(operator.effective_frontier, frontier);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn pending_certified_emission_defers_the_next_remote_event() {
+    use laminar_core::checkpoint::{
+        ChangelogMode, OutputDistribution, OutputDistributionCertificate, PipelineIdentity,
+        StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+    };
+
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    operator
+        .attach_subscription_certificate(Arc::new(OutputDistributionCertificate {
+            version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            stream_id: "sum".into(),
+            catalog_generation: 1,
+            stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes(
+                [1; 32],
+            )),
+            final_operator_id: "stream:sum".into(),
+            distribution: OutputDistribution::VnodePartitioned {
+                key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+                partition_abi: laminar_core::state::PARTITIONING_ABI_VERSION,
+                vnode_count: 8,
+            },
+            schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+            changelog_mode: ChangelogMode::FullPartitionSnapshot,
+            history_retention_bytes: 0,
+            query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
+            pipeline_identity: PipelineIdentity::empty(),
+        }))
+        .unwrap();
+
+    let (key, first) = projected_batch_for_vnode(&operator, 0, 10);
+    let second = projected_batch_for_key(&operator, &key, 20);
+    let assignment = scope.registry.assignment_version();
+    let recovery = scope.receiver.recovery_gen();
+    for batch in [first, second] {
+        operator
+            .stage_checkpointed_shuffle(
+                "sum",
+                crate::operator::RetainedBatch::restored_channel(
+                    batch,
+                    2,
+                    assignment,
+                    recovery,
+                    Arc::from([0_u32]),
+                ),
+                i64::MIN,
+            )
+            .unwrap();
+    }
+
+    let first_output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert!(!first_output.is_empty());
+    assert_eq!(operator.queued_remote_events, 1);
+    assert!(operator.checkpoint_drain_pending());
+    let before_wait = match &operator.state {
+        QueryState::Agg(aggregate) => aggregate.working_set_snapshot_for_test(),
+        _ => panic!("sum query must retain aggregate state"),
+    };
+
+    let waiting = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert!(waiting.is_empty());
+    assert_eq!(operator.queued_remote_events, 1);
+    assert!(!operator.wants_input());
+    let after_wait = match &operator.state {
+        QueryState::Agg(aggregate) => aggregate.working_set_snapshot_for_test(),
+        _ => panic!("sum query must retain aggregate state"),
+    };
+    assert_eq!(after_wait, before_wait);
+
+    operator.publish_prepared_subscription_output();
+    let second_output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    assert!(!second_output.is_empty());
+    assert_eq!(operator.queued_remote_events, 0);
 }
 
 #[cfg(feature = "cluster")]

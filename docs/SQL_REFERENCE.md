@@ -362,7 +362,7 @@ cluster admission path rejects unsupported state before connector I/O.
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
 
 ```sql
-SUBSCRIBE <name> [WHERE <predicate>] [AS OF EPOCH <n>]
+SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 ```
 
 - `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.

@@ -31,7 +31,7 @@ pub use validation::validate_max_checkpoint_node_data_bytes;
 use validation::{
     checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, missing_node_data,
     normalize_prefix, sha256, validate_abort_seal, validate_abort_seal_request,
-    validate_node_data_layout,
+    validate_node_data_layout, ManifestAbortState,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -75,11 +75,6 @@ struct CheckpointArtifactAbortSeal {
     artifact_identity_sha256: String,
     chunk: StateChunkId,
     original_manifest: Option<CheckpointManifest>,
-}
-
-enum ManifestAbortState {
-    Sealed(Option<(CheckpointManifest, Bytes)>),
-    Manifest(CheckpointManifest, Bytes),
 }
 
 /// Immutable checkpoint storage contract.
@@ -207,31 +202,39 @@ pub trait CheckpointStore: Send + Sync {
     /// Create an immutable subscription segment, accepting an identical retry only.
     async fn save_subscription_segment(
         &self,
-        segment: &OutputSegmentRef,
-        payload: Bytes,
-    ) -> Result<(), CheckpointStoreError>;
+        _segment: &OutputSegmentRef,
+        _payload: Bytes,
+    ) -> Result<(), CheckpointStoreError> {
+        Err(subscription_segments::unsupported_store_error())
+    }
 
     /// Load and verify an exact subscription segment without consulting object listing.
     async fn load_subscription_segment(
         &self,
-        segment: &OutputSegmentRef,
-    ) -> Result<Option<Bytes>, CheckpointStoreError>;
+        _segment: &OutputSegmentRef,
+    ) -> Result<Option<Bytes>, CheckpointStoreError> {
+        Err(subscription_segments::unsupported_store_error())
+    }
 
     /// Delete an explicitly unreachable subscription segment.
     async fn delete_subscription_segment(
         &self,
-        object_key: &str,
-    ) -> Result<(), CheckpointStoreError>;
+        _object_key: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        Err(subscription_segments::unsupported_store_error())
+    }
 
     /// Delete grace-expired segment objects not present in an authoritative reachable set.
     /// Object listing supplies candidates only; `reachable` and `through_checkpoint_id` are the
     /// caller's committed-state authority.
     async fn delete_subscription_orphans(
         &self,
-        reachable: &std::collections::BTreeSet<String>,
-        through_checkpoint_id: u64,
-        grace_before_ms: i64,
-    ) -> Result<SubscriptionOrphanCleanup, CheckpointStoreError>;
+        _reachable: &std::collections::BTreeSet<String>,
+        _through_checkpoint_id: u64,
+        _grace_before_ms: i64,
+    ) -> Result<SubscriptionOrphanCleanup, CheckpointStoreError> {
+        Err(subscription_segments::unsupported_store_error())
+    }
 }
 
 /// Checkpoint store backed by any [`ObjectStore`] implementation.

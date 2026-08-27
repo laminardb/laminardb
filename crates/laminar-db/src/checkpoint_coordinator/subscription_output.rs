@@ -473,13 +473,7 @@ pub(super) async fn cluster_subscription_retention_horizon(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let caps = certificates
-        .iter()
-        .filter_map(|(generation, certificate)| {
-            (certificate.history_retention_bytes != 0)
-                .then_some((*generation, certificate.history_retention_bytes))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let caps = retention_caps(&certificates);
     if caps.is_empty() {
         return Ok(latest.clone());
     }
@@ -536,7 +530,12 @@ fn merged_subscription_manifests<'a>(
     let manifests = manifests.into_iter().collect::<Vec<_>>();
     let nodes = manifests
         .iter()
-        .filter_map(|manifest| manifest.subscription_output.as_ref())
+        .filter_map(|manifest| {
+            manifest
+                .subscription_output
+                .as_ref()
+                .map(|output| (output, manifest.owned_vnodes.as_slice()))
+        })
         .collect::<Vec<_>>();
     if nodes.is_empty() {
         return Ok(Vec::new());
@@ -617,6 +616,18 @@ fn retention_caps_fit(
 ) -> bool {
     caps.iter()
         .all(|(generation, cap)| retained.get(generation).copied().unwrap_or(0) <= *cap)
+}
+
+pub(super) fn retention_caps(
+    certificates: &BTreeMap<
+        StreamGeneration,
+        laminar_core::checkpoint::OutputDistributionCertificate,
+    >,
+) -> BTreeMap<StreamGeneration, u64> {
+    certificates
+        .iter()
+        .map(|(generation, certificate)| (*generation, certificate.history_retention_bytes))
+        .collect()
 }
 
 fn merged_subscription_outputs(

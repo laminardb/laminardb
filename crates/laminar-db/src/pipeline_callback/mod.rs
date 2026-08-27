@@ -4950,12 +4950,7 @@ impl ConnectorPipelineCallback {
                     }
                     return Err(mapped);
                 }
-                Err(_) => {
-                    let error =
-                        "checkpoint graph drain exceeded its absolute attempt deadline".to_string();
-                    set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                    return Err(crate::pipeline::CycleError::Recovery(error));
-                }
+                Err(_) => return Err(self.checkpoint_drain_timeout()),
             };
             self.publish_checkpoint_drain_results(&results, deadline)
                 .await?;

@@ -24,6 +24,12 @@ pub struct SubscriptionOrphanCleanup {
     pub bytes_remaining: u64,
 }
 
+pub(super) fn unsupported_store_error() -> CheckpointStoreError {
+    CheckpointStoreError::Invalid(
+        "checkpoint store does not support durable subscription segments".into(),
+    )
+}
+
 pub(super) async fn save(
     store: &ObjectStoreCheckpointStore,
     segment: &OutputSegmentRef,

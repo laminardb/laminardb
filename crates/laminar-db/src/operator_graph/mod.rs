@@ -2793,6 +2793,8 @@ impl OperatorGraph {
         }
 
         self.output_map.remove(name);
+        #[cfg(feature = "cluster")]
+        self.subscription_certificates.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         self.intermediate_schemas.remove(name);

@@ -1027,6 +1027,9 @@ struct LeaderAuthorityRecord {
     outcome_floor: Option<AuthorityOutcomeFloor>,
     /// Exact leader-fenced artifact cleanup position, preserved across leadership terms.
     artifact_cleanup: Option<ClusterArtifactCleanupCursor>,
+    /// Latest replay-retention floor linearized through this authority sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subscription_cleanup_commit: Option<subscription_replay::SubscriptionCleanupCommit>,
     /// Exact unresolved checkpoint attempt whose artifacts require a terminal decision or cleanup.
     active_checkpoint_artifacts: Option<CheckpointArtifactInventory>,
     /// Leader term that admitted `active_checkpoint_artifacts` before any artifact write.
@@ -1240,6 +1243,7 @@ impl LeaderAuthorityRecord {
             commit_head: None,
             outcome_floor: None,
             artifact_cleanup: None,
+            subscription_cleanup_commit: None,
             active_checkpoint_artifacts: None,
             active_checkpoint_artifact_leader_proof: None,
             assignment_decision: None,
@@ -1265,6 +1269,7 @@ impl LeaderAuthorityRecord {
             commit_head: self.commit_head,
             outcome_floor: self.outcome_floor.clone(),
             artifact_cleanup: self.artifact_cleanup.clone(),
+            subscription_cleanup_commit: self.subscription_cleanup_commit.clone(),
             active_checkpoint_artifacts: self.active_checkpoint_artifacts.clone(),
             active_checkpoint_artifact_leader_proof: self
                 .active_checkpoint_artifact_leader_proof
@@ -1300,12 +1305,9 @@ impl LeaderAuthorityRecord {
         {
             link.validate()?;
         }
-        if let Some(floor) = &self.outcome_floor {
-            floor.validate()?;
-        }
-        if let Some(floor) = &self.assignment_decision_floor {
-            floor.validate()?;
-        }
+        self.subscription_cleanup_commit
+            .iter()
+            .try_for_each(subscription_replay::SubscriptionCleanupCommit::validate)?;
         self.validate_recovery_fault_inventory()?;
         self.validate_checkpoint_outcome_chain()?;
         self.validate_outcome_floor()?;
@@ -1494,6 +1496,7 @@ impl LeaderAuthorityRecord {
 
     fn validate_outcome_floor(&self) -> Result<(), LeaseError> {
         if let Some(floor) = self.outcome_floor.as_ref() {
+            floor.validate()?;
             if floor
                 .terminal_anchor_link
                 .is_some_and(|link| link.sequence >= self.lease.seq)
@@ -1684,6 +1687,7 @@ impl LeaderAuthorityRecord {
 
     fn validate_assignment_decision_floor(&self) -> Result<(), LeaseError> {
         if let Some(floor) = self.assignment_decision_floor.as_ref() {
+            floor.validate()?;
             if floor
                 .terminal_anchor_link
                 .is_some_and(|link| link.sequence >= self.lease.seq)

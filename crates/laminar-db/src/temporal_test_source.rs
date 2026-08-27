@@ -125,7 +125,19 @@ struct TemporalTestVnodeAssignment {
     source_identity: Vec<u8>,
     registry: Arc<VnodeRegistry>,
     self_id: NodeId,
-    version: std::num::NonZeroU64,
+}
+
+impl TemporalTestVnodeAssignment {
+    fn published_ownership(&self) -> Option<(std::num::NonZeroU64, bool)> {
+        let vnode = self.registry.vnode_for_key(&self.source_identity) as usize;
+        let publication = self.registry.read_assignment();
+        let version = std::num::NonZeroU64::new(publication.version())?;
+        let owner = publication.owners().get(vnode).copied()?;
+        if owner.is_unassigned() {
+            return None;
+        }
+        Some((version, owner == self.self_id))
+    }
 }
 
 impl TemporalTestSource {
@@ -146,8 +158,9 @@ impl TemporalTestSource {
 
     fn owns_input_channel(&self) -> bool {
         self.vnode_assignment.as_ref().is_none_or(|assignment| {
-            let vnode = assignment.registry.vnode_for_key(&self.source_identity);
-            assignment.registry.owner(vnode) == assignment.self_id
+            assignment
+                .published_ownership()
+                .is_some_and(|(_, owns)| owns)
         })
     }
 
@@ -160,13 +173,23 @@ impl TemporalTestSource {
     }
 
     fn captured_checkpoint(&self) -> SourceCheckpoint {
+        let assignment_publication = self
+            .vnode_assignment
+            .as_ref()
+            .and_then(TemporalTestVnodeAssignment::published_ownership);
+        let owns_input_channel =
+            self.vnode_assignment.is_none() || assignment_publication.is_some_and(|(_, owns)| owns);
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset("cursor", self.cursor.to_string());
         checkpoint
-            .set_input_channels(self.input_channels())
+            .set_input_channels(if owns_input_channel {
+                vec![self.source_identity.clone()]
+            } else {
+                Vec::new()
+            })
             .expect("the temporal test source identity is non-empty");
-        if let Some(assignment) = self.vnode_assignment.as_ref() {
-            checkpoint.bind_assignment_version(assignment.version);
+        if let Some((version, _)) = assignment_publication {
+            checkpoint.bind_assignment_version(version);
         }
         checkpoint
     }
@@ -310,9 +333,10 @@ impl SourceConnector for TemporalTestSource {
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
-        Ok(self.vnode_assignment.as_ref().is_none_or(|assignment| {
-            assignment.registry.assignment_version() == assignment.version.get()
-        }))
+        Ok(self
+            .vnode_assignment
+            .as_ref()
+            .is_none_or(|assignment| assignment.published_ownership().is_some()))
     }
 
     fn set_vnode_assignment(
@@ -326,22 +350,62 @@ impl SourceConnector for TemporalTestSource {
                 "temporal test vnode assignment requires a source and node identity".into(),
             ));
         }
-        let version =
-            std::num::NonZeroU64::new(registry.assignment_version()).ok_or_else(|| {
-                ConnectorError::ConfigurationError(
-                    "temporal test vnode assignment is not yet published".into(),
-                )
-            })?;
         self.vnode_assignment = Some(TemporalTestVnodeAssignment {
             source_identity: source_identity.as_bytes().to_vec(),
             registry,
             self_id,
-            version,
         });
         Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source() -> TemporalTestSource {
+        let (_, ready) = tokio::sync::watch::channel(0);
+        TemporalTestSource::new(
+            ready,
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        )
+    }
+
+    #[test]
+    fn assignment_bootstrap_waits_for_a_nonzero_assigned_publication() {
+        let node = NodeId(1);
+        let registry = Arc::new(VnodeRegistry::new_unassigned(8));
+        let mut source = source();
+        source
+            .set_vnode_assignment("trades", Arc::clone(&registry), node)
+            .unwrap();
+        assert!(!source.checkpoint_ready().unwrap());
+
+        registry.set_assignment_and_version(vec![NodeId::UNASSIGNED; 8].into(), 1);
+        assert!(!source.checkpoint_ready().unwrap());
+
+        let mapped_vnode = registry.vnode_for_key(b"trades") as usize;
+        let mut owners = vec![NodeId::UNASSIGNED; 8];
+        let other_vnode = (mapped_vnode + 1) % owners.len();
+        owners[other_vnode] = node;
+        registry.set_assignment_and_version(owners.clone().into(), 2);
+        assert!(!source.checkpoint_ready().unwrap());
+
+        owners[mapped_vnode] = node;
+        registry.set_assignment_and_version(owners.into(), 3);
+        assert!(source.checkpoint_ready().unwrap());
+        assert_eq!(
+            source
+                .try_checkpoint()
+                .unwrap()
+                .unwrap()
+                .assignment_version()
+                .map(std::num::NonZeroU64::get),
+            Some(3)
+        );
     }
 }

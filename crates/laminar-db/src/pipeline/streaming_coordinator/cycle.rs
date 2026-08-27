@@ -357,9 +357,16 @@ impl StreamingCoordinator {
             self.discard_pending_offsets();
             return Err(error);
         }
+        if let Err(error) =
+            self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)
+        {
+            #[cfg(feature = "cluster")]
+            callback.abort_subscription_output();
+            self.discard_pending_offsets();
+            return Err(error);
+        }
         #[cfg(feature = "cluster")]
         callback.commit_subscription_output();
-        self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)?;
         self.replay_pending = outcome.any_deferred;
         Ok(CyclePublicationDurations {
             output_store_ns,

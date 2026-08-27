@@ -59,6 +59,8 @@ pub enum SubscriptionReplayPinAcquire {
     },
     /// The fixed shared pin roster is full after expired leases were removed.
     Capacity,
+    /// A leader-fenced cleanup floor is being committed; the caller may retry.
+    Contended,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +95,64 @@ impl ReplayPinSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PendingCleanupFloor {
+    id: Uuid,
+    leader_proof: LeaderProof,
+    selected_epoch: u64,
+}
+
+impl PendingCleanupFloor {
+    fn validate(&self) -> Result<(), LeaseError> {
+        if self.id.is_nil() || !self.leader_proof.is_canonical() || self.selected_epoch == 0 {
+            return Err(LeaseError::Invalid(
+                "pending subscription cleanup floor is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn committed(&self) -> SubscriptionCleanupCommit {
+        SubscriptionCleanupCommit {
+            id: self.id,
+            leader_proof: self.leader_proof.clone(),
+            selected_epoch: self.selected_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubscriptionCleanupCommit {
+    id: Uuid,
+    leader_proof: LeaderProof,
+    selected_epoch: u64,
+}
+
+impl SubscriptionCleanupCommit {
+    pub(super) fn validate(&self) -> Result<(), LeaseError> {
+        if self.id.is_nil() || !self.leader_proof.is_canonical() || self.selected_epoch == 0 {
+            return Err(LeaseError::Invalid(
+                "subscription cleanup commit is not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches(&self, pending: &PendingCleanupFloor) -> bool {
+        self.id == pending.id
+            && self.leader_proof == pending.leader_proof
+            && self.selected_epoch == pending.selected_epoch
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplayPinRegistry {
     version: u16,
     revision: u64,
     artifact_before_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_cleanup: Option<PendingCleanupFloor>,
     pins: Vec<ReplayPinSlot>,
 }
 
@@ -106,6 +162,7 @@ impl ReplayPinRegistry {
             version: REGISTRY_VERSION,
             revision: 0,
             artifact_before_epoch: 0,
+            pending_cleanup: None,
             pins: Vec::new(),
         }
     }
@@ -119,6 +176,20 @@ impl ReplayPinRegistry {
             return Err(LeaseError::Invalid(
                 "subscription replay pin registry is not canonical".into(),
             ));
+        }
+        if let Some(pending) = &self.pending_cleanup {
+            pending.validate()?;
+            if pending.selected_epoch <= self.artifact_before_epoch
+                || self
+                    .pins
+                    .iter()
+                    .any(|pin| pin.epoch < pending.selected_epoch)
+            {
+                return Err(LeaseError::Invalid(
+                    "pending subscription cleanup floor crosses committed state or a replay pin"
+                        .into(),
+                ));
+            }
         }
         for pin in &self.pins {
             pin.validate()?;
@@ -164,6 +235,11 @@ impl<T> RegistryMutation<T> {
     }
 }
 
+enum CleanupFloorPreparation {
+    Committed(u64),
+    Pending(PendingCleanupFloor),
+}
+
 impl LeaderLeaseStore {
     /// Acquire one bounded durable replay pin before loading an historical checkpoint.
     ///
@@ -193,6 +269,15 @@ impl LeaderLeaseStore {
                     SubscriptionReplayPinAcquire::Pruned {
                         artifact_before_epoch: registry.artifact_before_epoch,
                     },
+                ));
+            }
+            if registry
+                .pending_cleanup
+                .as_ref()
+                .is_some_and(|pending| epoch < pending.selected_epoch)
+            {
+                return Ok(RegistryMutation::unchanged(
+                    SubscriptionReplayPinAcquire::Contended,
                 ));
             }
             if registry.pins.iter().any(|slot| slot.matches(&pin)) {
@@ -288,21 +373,150 @@ impl LeaderLeaseStore {
             )
             .into());
         }
+        let preparation = self
+            .prepare_subscription_cleanup_floor(proof, requested_epoch)
+            .await?;
+        let pending = match preparation {
+            CleanupFloorPreparation::Committed(floor) => return Ok(floor),
+            CleanupFloorPreparation::Pending(pending) => pending,
+        };
+        if let Err(error) = self
+            .commit_subscription_cleanup_floor(proof, &pending)
+            .await
+        {
+            // A pending slot is not a cleanup authority. Reconciliation removes it if this proof
+            // lost the authority CAS, while preserving it if the marker became durable.
+            let _ = self
+                .mutate_subscription_replay_registry(|_, _| Ok(RegistryMutation::unchanged(())))
+                .await;
+            return Err(error);
+        }
+        self.mutate_subscription_replay_registry(|registry, _| {
+            if registry.artifact_before_epoch < pending.selected_epoch {
+                return Err(LeaseError::Invalid(
+                    "committed subscription cleanup marker was not applied to its registry".into(),
+                ));
+            }
+            Ok(RegistryMutation::unchanged(registry.artifact_before_epoch))
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn prepare_subscription_cleanup_floor(
+        &self,
+        proof: &LeaderProof,
+        requested_epoch: u64,
+    ) -> Result<CleanupFloorPreparation, ClusterCheckpointAuthorityError> {
         self.require_subscription_cleanup_leader(proof).await?;
-        let floor = self
-            .mutate_subscription_replay_registry(|registry, _| {
+        let proof = proof.clone();
+        self.mutate_subscription_replay_registry(|registry, _| {
+            if let Some(pending) = &registry.pending_cleanup {
+                if pending.leader_proof != proof {
+                    return Err(LeaseError::Fenced(
+                        "another leader term owns the pending subscription cleanup floor".into(),
+                    ));
+                }
+                return Ok(RegistryMutation::unchanged(
+                    CleanupFloorPreparation::Pending(pending.clone()),
+                ));
+            }
+            if registry.artifact_before_epoch >= requested_epoch {
+                return Ok(RegistryMutation::unchanged(
+                    CleanupFloorPreparation::Committed(registry.artifact_before_epoch),
+                ));
+            }
+            let pending = {
                 let pinned = registry.pins.iter().map(|pin| pin.epoch).min();
                 let selected = pinned.map_or(requested_epoch, |epoch| requested_epoch.min(epoch));
                 let selected = registry.artifact_before_epoch.max(selected);
                 if selected == registry.artifact_before_epoch {
-                    return Ok(RegistryMutation::unchanged(selected));
+                    return Ok(RegistryMutation::unchanged(
+                        CleanupFloorPreparation::Committed(selected),
+                    ));
                 }
-                registry.artifact_before_epoch = selected;
-                Ok(RegistryMutation::changed(selected))
-            })
-            .await?;
-        self.require_subscription_cleanup_leader(proof).await?;
-        Ok(floor)
+                PendingCleanupFloor {
+                    id: Uuid::new_v4(),
+                    leader_proof: proof.clone(),
+                    selected_epoch: selected,
+                }
+            };
+            pending.validate()?;
+            registry.pending_cleanup = Some(pending.clone());
+            Ok(RegistryMutation::changed(CleanupFloorPreparation::Pending(
+                pending,
+            )))
+        })
+        .await
+        .map_err(|error| match error {
+            LeaseError::Fenced(_) => ClusterCheckpointAuthorityError::Fenced,
+            error => error.into(),
+        })
+    }
+
+    async fn commit_subscription_cleanup_floor(
+        &self,
+        proof: &LeaderProof,
+        pending: &PendingCleanupFloor,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        pending.validate()?;
+        if pending.leader_proof != *proof {
+            return Err(ClusterCheckpointAuthorityError::Fenced);
+        }
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let published = self
+                .load_published_authority_head()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
+            if current
+                .subscription_cleanup_commit
+                .as_ref()
+                .is_some_and(|commit| commit.matches(pending))
+            {
+                return Ok(());
+            }
+            if !current.lease.matches_proof(proof) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            let registry = read_registry(self.store.as_ref()).await?;
+            if registry.registry.pending_cleanup.as_ref() != Some(pending) {
+                return Err(ClusterCheckpointAuthorityError::Fenced);
+            }
+            let mut lease = current.lease.clone();
+            lease.seq = lease
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
+            let mut next = current.preserve_with_lease(lease);
+            next.subscription_cleanup_commit = Some(pending.committed());
+            next.validate()?;
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
+                super::AuthorityCreateOutcome::Created
+                | super::AuthorityCreateOutcome::ExistingIdentical => return Ok(()),
+                super::AuthorityCreateOutcome::Contended(winner)
+                    if winner
+                        .subscription_cleanup_commit
+                        .as_ref()
+                        .is_some_and(|commit| commit.matches(pending)) =>
+                {
+                    return Ok(());
+                }
+                super::AuthorityCreateOutcome::Contended(winner)
+                    if !winner.lease.matches_proof(proof) =>
+                {
+                    return Err(ClusterCheckpointAuthorityError::Fenced);
+                }
+                super::AuthorityCreateOutcome::Contended(_) => tokio::task::yield_now().await,
+            }
+        }
+        Err(LeaseError::Io(format!(
+            "subscription cleanup authority update exceeded {MAX_CAS_ATTEMPTS} attempts"
+        ))
+        .into())
     }
 
     async fn require_subscription_cleanup_leader(
@@ -326,6 +540,9 @@ impl LeaderLeaseStore {
         let mut last_error = None;
         for _ in 0..MAX_CAS_ATTEMPTS {
             let mut versioned = read_registry(self.store.as_ref()).await?;
+            let reconciled = self
+                .reconcile_subscription_cleanup(&mut versioned.registry)
+                .await?;
             let now_ms = now_millis();
             if now_ms == i64::MAX {
                 return Err(LeaseError::Invalid(
@@ -334,7 +551,7 @@ impl LeaderLeaseStore {
             }
             let pruned = versioned.registry.prune_expired(now_ms);
             let result = mutation(&mut versioned.registry, now_ms)?;
-            if !pruned && !result.changed {
+            if !reconciled && !pruned && !result.changed {
                 return Ok(result.value);
             }
             versioned.registry.revision = versioned
@@ -361,6 +578,34 @@ impl LeaderLeaseStore {
             "subscription replay pin update exceeded {MAX_CAS_ATTEMPTS} attempts: {}",
             last_error.map_or_else(|| "unknown conflict".into(), |error| error.to_string())
         )))
+    }
+
+    async fn reconcile_subscription_cleanup(
+        &self,
+        registry: &mut ReplayPinRegistry,
+    ) -> Result<bool, LeaseError> {
+        let Some(pending) = registry.pending_cleanup.clone() else {
+            return Ok(false);
+        };
+        let current = self.load_record().await?.ok_or_else(|| {
+            LeaseError::Invalid(
+                "pending subscription cleanup floor lost the leader authority head".into(),
+            )
+        })?;
+        if current
+            .subscription_cleanup_commit
+            .as_ref()
+            .is_some_and(|commit| commit.matches(&pending))
+        {
+            registry.artifact_before_epoch = pending.selected_epoch;
+            registry.pending_cleanup = None;
+            return Ok(true);
+        }
+        if current.lease.matches_proof(&pending.leader_proof) {
+            return Ok(false);
+        }
+        registry.pending_cleanup = None;
+        Ok(true)
     }
 }
 
@@ -453,20 +698,46 @@ mod tests {
     use crate::checkpoint::SubscriptionDigest;
     use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
     use crate::cluster::discovery::NodeId;
+    use std::time::Instant;
 
     fn generation(byte: u8) -> StreamGeneration {
         StreamGeneration::from_digest(SubscriptionDigest::from_bytes([byte; 32]))
+    }
+
+    fn owner(node: u64) -> LeaderLeaseOwner {
+        LeaderLeaseOwner {
+            node: NodeId(node),
+            boot: Uuid::from_u128(u128::from(node)),
+            process_term: 1,
+        }
+    }
+
+    async fn takeover(
+        authority: &LeaderLeaseStore,
+        lease: &super::super::LeaderLease,
+        successor: &LeaderLeaseOwner,
+    ) -> super::super::LeaderLease {
+        let observation = super::super::LeaderLeaseObservation {
+            lease: lease.clone(),
+            started: Instant::now()
+                .checked_sub(Duration::from_millis(2))
+                .unwrap(),
+        };
+        let LeaseOutcome::Acquired(takeover) = authority
+            .try_takeover(successor, &observation, 2)
+            .await
+            .unwrap()
+        else {
+            panic!("elapsed rival observation must permit takeover");
+        };
+        takeover
     }
 
     #[tokio::test]
     async fn active_pin_serializes_with_cleanup_floor() {
         let authority =
             LeaderLeaseStore::new(Arc::new(object_store::memory::InMemory::new()), 30_000);
-        let owner = LeaderLeaseOwner {
-            node: NodeId(1),
-            boot: Uuid::from_u128(1),
-            process_term: 1,
-        };
+        let owner = owner(1);
         let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("empty authority must grant the leader term");
@@ -533,5 +804,94 @@ mod tests {
             registry.registry.pins.iter().map(|pin| pin.epoch).min(),
             Some(4)
         );
+    }
+
+    #[test]
+    fn legacy_registry_without_a_pending_floor_round_trips_canonically() {
+        let legacy = Bytes::from_static(
+            br#"{"version":1,"revision":1,"artifact_before_epoch":0,"pins":[]}"#,
+        );
+        let registry: ReplayPinRegistry = serde_json::from_slice(&legacy).unwrap();
+        assert!(registry.pending_cleanup.is_none());
+        assert_eq!(encode_registry(&registry).unwrap(), legacy);
+    }
+
+    #[tokio::test]
+    async fn takeover_before_cleanup_marker_discards_the_uncommitted_floor() {
+        let authority = LeaderLeaseStore::new(Arc::new(object_store::memory::InMemory::new()), 1);
+        let incumbent = owner(1);
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must grant the leader term");
+        };
+        let CleanupFloorPreparation::Pending(pending) = authority
+            .prepare_subscription_cleanup_floor(&lease.proof(), 9)
+            .await
+            .unwrap()
+        else {
+            panic!("a new cleanup floor must prepare a pending slot");
+        };
+
+        let successor = owner(2);
+        takeover(&authority, &lease, &successor).await;
+        assert!(matches!(
+            authority
+                .commit_subscription_cleanup_floor(&lease.proof(), &pending)
+                .await,
+            Err(ClusterCheckpointAuthorityError::Fenced)
+        ));
+        assert!(matches!(
+            authority
+                .acquire_subscription_replay_pin(generation(2), 8)
+                .await
+                .unwrap(),
+            SubscriptionReplayPinAcquire::Acquired(_)
+        ));
+        let registry = read_registry(authority.store.as_ref()).await.unwrap();
+        assert_eq!(registry.registry.artifact_before_epoch, 0);
+        assert!(registry.registry.pending_cleanup.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_cleanup_marker_survives_takeover_and_is_helped_to_completion() {
+        let authority = LeaderLeaseStore::new(Arc::new(object_store::memory::InMemory::new()), 1);
+        let incumbent = owner(1);
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must grant the leader term");
+        };
+        let CleanupFloorPreparation::Pending(pending) = authority
+            .prepare_subscription_cleanup_floor(&lease.proof(), 9)
+            .await
+            .unwrap()
+        else {
+            panic!("a new cleanup floor must prepare a pending slot");
+        };
+        assert_eq!(
+            authority
+                .acquire_subscription_replay_pin(generation(2), 8)
+                .await
+                .unwrap(),
+            SubscriptionReplayPinAcquire::Contended
+        );
+        authority
+            .commit_subscription_cleanup_floor(&lease.proof(), &pending)
+            .await
+            .unwrap();
+
+        let successor = owner(2);
+        takeover(&authority, &lease, &successor).await;
+        assert!(matches!(
+            authority
+                .acquire_subscription_replay_pin(generation(3), 8)
+                .await
+                .unwrap(),
+            SubscriptionReplayPinAcquire::Pruned {
+                artifact_before_epoch: 9
+            }
+        ));
+        let registry = read_registry(authority.store.as_ref()).await.unwrap();
+        assert_eq!(registry.registry.artifact_before_epoch, 9);
+        assert!(registry.registry.pending_cleanup.is_none());
     }
 }

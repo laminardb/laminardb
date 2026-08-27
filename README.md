@@ -317,7 +317,7 @@ SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
 DESCRIBE [EXTENDED] table_name
 EXPLAIN ANALYZE SELECT ...
-SUBSCRIBE <stream> [WHERE …] [AS OF EPOCH n]      -- committed tail or epoch replay
+SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- committed tail or epoch replay
 DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
 

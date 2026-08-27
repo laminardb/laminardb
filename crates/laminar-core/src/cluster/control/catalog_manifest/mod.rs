@@ -65,7 +65,10 @@ pub struct CatalogManifestEntry {
     /// Exact namespace owner.
     pub kind: CatalogObjectKind,
     /// Durable catalog-object incarnation. The initial sealed inventory uses generation one.
-    #[serde(default = "initial_catalog_generation")]
+    #[serde(
+        default = "initial_catalog_generation",
+        skip_serializing_if = "is_initial_catalog_generation"
+    )]
     pub catalog_generation: u64,
     /// Exact DDL text replayed on every node.
     pub ddl: String,
@@ -73,6 +76,10 @@ pub struct CatalogManifestEntry {
 
 const fn initial_catalog_generation() -> u64 {
     1
+}
+
+const fn is_initial_catalog_generation(generation: &u64) -> bool {
+    *generation == initial_catalog_generation()
 }
 
 /// The complete ordered catalog sealed for one cluster control namespace.

@@ -274,6 +274,15 @@ impl OperatorCapability {
         .with_subscription_output(SubscriptionOutputDistribution::VnodePartitioned)
     }
 
+    /// Existing keyed aggregate execution without a certifiable subscription key expression.
+    pub(crate) const fn uncertified_keyed_sql_aggregate() -> Self {
+        Self::ddl_guarded(
+            OperatorImplementation::SqlQuery,
+            OperatorStateClass::VnodeKeyed,
+        )
+        .with_managed_state(ManagedStateContract::SqlAggregateV1)
+    }
+
     /// Descriptor for a keyed SQL aggregate with event-time window state.
     pub(crate) const fn windowed_keyed_sql_aggregate() -> Self {
         Self::rejected(
