@@ -9,7 +9,7 @@ pub mod jsonb_tags;
 use arrow::buffer::Buffer;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
-use arrow_ipc::writer::StreamWriter;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use arrow_schema::{ArrowError, Schema};
 
 /// A growable byte writer that rejects payloads and retained capacities above a fixed limit.
@@ -203,21 +203,48 @@ pub fn serialize_batches_stream_bounded<'a, I>(
 where
     I: IntoIterator<Item = &'a RecordBatch>,
 {
-    serialize_batches_stream_bounded_with_capacity(schema, batches, max_bytes, 0)
+    serialize_batches_stream_bounded_with_options(
+        schema,
+        batches,
+        max_bytes,
+        0,
+        IpcWriteOptions::default(),
+    )
 }
 
-fn serialize_batches_stream_bounded_with_capacity<'a, I>(
+/// Serializes batches as one LZ4-compressed Arrow IPC stream without allowing the output writer
+/// to allocate beyond `max_bytes`.
+///
+/// # Errors
+///
+/// Returns [`arrow_schema::ArrowError`] if compression or encoding fails, or if the encoded stream
+/// crosses the byte bound.
+pub fn serialize_batches_stream_lz4_bounded<'a, I>(
+    schema: &Schema,
+    batches: I,
+    max_bytes: usize,
+) -> Result<Vec<u8>, arrow_schema::ArrowError>
+where
+    I: IntoIterator<Item = &'a RecordBatch>,
+{
+    let options = IpcWriteOptions::default()
+        .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))?;
+    serialize_batches_stream_bounded_with_options(schema, batches, max_bytes, 0, options)
+}
+
+fn serialize_batches_stream_bounded_with_options<'a, I>(
     schema: &Schema,
     batches: I,
     max_bytes: usize,
     initial_capacity: usize,
+    options: IpcWriteOptions,
 ) -> Result<Vec<u8>, arrow_schema::ArrowError>
 where
     I: IntoIterator<Item = &'a RecordBatch>,
 {
     let mut bounded = BoundedBytesWriter::with_capacity(max_bytes, initial_capacity);
     {
-        let mut writer = StreamWriter::try_new(&mut bounded, schema)?;
+        let mut writer = StreamWriter::try_new_with_options(&mut bounded, schema, options)?;
         for batch in batches {
             writer.write(batch)?;
         }
@@ -233,11 +260,12 @@ pub(crate) fn serialize_batch_stream_bounded(
     max_bytes: usize,
     initial_capacity: usize,
 ) -> Result<Vec<u8>, arrow_schema::ArrowError> {
-    serialize_batches_stream_bounded_with_capacity(
+    serialize_batches_stream_bounded_with_options(
         batch.schema().as_ref(),
         std::iter::once(batch),
         max_bytes,
         initial_capacity,
+        IpcWriteOptions::default(),
     )
 }
 

@@ -11,6 +11,9 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use laminar_db::subscription::{
+    ClusterSubscriptionFrameMetadata, PortalFrame, SubscriptionEnvelope,
+};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -83,6 +86,7 @@ pub(super) fn ws_gap_json(name: &str, skipped: u64, sequence: u64) -> String {
     out
 }
 
+#[cfg(test)]
 pub(super) fn ws_progress_json(
     name: &str,
     epoch: u64,
@@ -91,7 +95,28 @@ pub(super) fn ws_progress_json(
     through_sequence: u64,
     sequence: u64,
 ) -> String {
-    let out = serde_json::json!({
+    ws_progress_json_with_metadata(
+        name,
+        epoch,
+        checkpoint_id,
+        log_sequence,
+        through_sequence,
+        sequence,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // the compatibility progress envelope has six stable fields
+pub(super) fn ws_progress_json_with_metadata(
+    name: &str,
+    epoch: u64,
+    checkpoint_id: u64,
+    log_sequence: u64,
+    through_sequence: u64,
+    sequence: u64,
+    cluster: Option<&ClusterSubscriptionFrameMetadata>,
+) -> String {
+    let mut out = serde_json::json!({
         "type": "progress",
         "subscription_id": name,
         "epoch": epoch.to_string(),
@@ -99,8 +124,14 @@ pub(super) fn ws_progress_json(
         "log_sequence": log_sequence.to_string(),
         "through_log_sequence": through_sequence.to_string(),
         "sequence": sequence.to_string(),
-    })
-    .to_string();
+    });
+    if let Some(ClusterSubscriptionFrameMetadata::Progress {
+        stream_generation, ..
+    }) = cluster
+    {
+        out["stream_generation"] = serde_json::Value::String(stream_generation.to_string());
+    }
+    let out = out.to_string();
     debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
     out
 }
@@ -149,26 +180,68 @@ fn decimal_digits_usize(value: usize) -> usize {
     }
 }
 
-fn ws_data_suffix_len(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> usize {
+fn ws_data_suffix_len(
+    sequence: u64,
+    log_sequence: u64,
+    offset: usize,
+    rows: usize,
+    cluster_fields: &str,
+) -> usize {
     WS_DATA_SUFFIX_FIXED_BYTES
         + decimal_digits_u64(sequence)
         + decimal_digits_u64(log_sequence)
         + decimal_digits_usize(offset)
         + decimal_digits_usize(rows)
+        + cluster_fields.len()
 }
 
-fn ws_data_suffix(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> String {
+fn ws_data_suffix(
+    sequence: u64,
+    log_sequence: u64,
+    offset: usize,
+    rows: usize,
+    cluster_fields: &str,
+) -> String {
     format!(
-        "],\"sequence\":\"{sequence}\",\"log_sequence\":\"{log_sequence}\",\"row_offset\":\"{offset}\",\"row_count\":\"{rows}\"}}"
+        "],\"sequence\":\"{sequence}\",\"log_sequence\":\"{log_sequence}\",\"row_offset\":\"{offset}\",\"row_count\":\"{rows}\"{cluster_fields}}}"
     )
 }
 
+fn ws_cluster_data_fields(cluster: Option<&ClusterSubscriptionFrameMetadata>) -> String {
+    let Some(ClusterSubscriptionFrameMetadata::Data {
+        stream_generation,
+        partition,
+        partition_sequence,
+        committed_epoch,
+    }) = cluster
+    else {
+        return String::new();
+    };
+    format!(
+        ",\"stream_generation\":\"{stream_generation}\",\"partition\":\"{}\",\"partition_sequence\":\"{}\",\"committed_epoch\":\"{committed_epoch}\"",
+        partition.get(),
+        partition_sequence.get(),
+    )
+}
+
+#[cfg(test)]
 pub(super) fn next_ws_data_frame(
     name: &str,
     batch: &arrow_array::RecordBatch,
     state: &mut WsBatchFrameState,
     sequence: u64,
     log_sequence: u64,
+) -> Result<Option<String>, WsFrameBuildError> {
+    next_ws_data_frame_with_metadata(name, batch, state, sequence, log_sequence, None)
+}
+
+pub(super) fn next_ws_data_frame_with_metadata(
+    name: &str,
+    batch: &arrow_array::RecordBatch,
+    state: &mut WsBatchFrameState,
+    sequence: u64,
+    log_sequence: u64,
+    cluster: Option<&ClusterSubscriptionFrameMetadata>,
 ) -> Result<Option<String>, WsFrameBuildError> {
     if state.offset >= batch.num_rows() {
         debug_assert!(state.pending_row.is_none());
@@ -178,11 +251,15 @@ pub(super) fn next_ws_data_frame(
     let subid = serde_json::to_string(name)
         .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
     let prefix = format!("{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":[");
+    let cluster_fields = ws_cluster_data_fields(cluster);
     let frame_offset = state.offset;
-    if prefix
-        .len()
-        .saturating_add(ws_data_suffix_len(sequence, log_sequence, frame_offset, 1))
-        >= MAX_WS_FRAME_BYTES
+    if prefix.len().saturating_add(ws_data_suffix_len(
+        sequence,
+        log_sequence,
+        frame_offset,
+        1,
+        &cluster_fields,
+    )) >= MAX_WS_FRAME_BYTES
     {
         return Err(WsFrameBuildError::TooLarge);
     }
@@ -220,6 +297,7 @@ pub(super) fn next_ws_data_frame(
                 log_sequence,
                 frame_offset,
                 candidate_rows,
+                &cluster_fields,
             ));
 
         if candidate_len > MAX_WS_FRAME_BYTES {
@@ -239,7 +317,9 @@ pub(super) fn next_ws_data_frame(
     }
 
     debug_assert!(rows > 0);
-    bytes.extend_from_slice(ws_data_suffix(sequence, log_sequence, frame_offset, rows).as_bytes());
+    bytes.extend_from_slice(
+        ws_data_suffix(sequence, log_sequence, frame_offset, rows, &cluster_fields).as_bytes(),
+    );
     debug_assert!(bytes.len() <= MAX_WS_FRAME_BYTES);
     let frame = String::from_utf8(bytes)
         .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
@@ -267,11 +347,19 @@ async fn forward_portal_batch(
     name: &str,
     batch: &arrow_array::RecordBatch,
     log_sequence: u64,
+    cluster: Option<&ClusterSubscriptionFrameMetadata>,
     state: &AppState,
 ) -> bool {
     let mut frame_state = WsBatchFrameState::default();
     while frame_state.offset < batch.num_rows() {
-        let out = match next_ws_data_frame(name, batch, &mut frame_state, *seq, log_sequence) {
+        let out = match next_ws_data_frame_with_metadata(
+            name,
+            batch,
+            &mut frame_state,
+            *seq,
+            log_sequence,
+            cluster,
+        ) {
             Ok(Some(frame)) => frame,
             Ok(None) => break,
             Err(WsFrameBuildError::TooLarge) => {
@@ -382,6 +470,27 @@ pub(super) async fn ws_upgrade(
         Err(error @ laminar_db::DbError::SubscriptionEpochNotCommitted { .. }) => {
             return error_response(StatusCode::CONFLICT, error.to_string()).into_response();
         }
+        Err(laminar_db::DbError::Subscription(error)) => {
+            let status = match &error {
+                laminar_db::subscription::ClusterSubscriptionError::UnsupportedPlan { .. } => {
+                    StatusCode::BAD_REQUEST
+                }
+                laminar_db::subscription::ClusterSubscriptionError::GenerationMismatch
+                | laminar_db::subscription::ClusterSubscriptionError::EpochNotCommitted {
+                    ..
+                } => StatusCode::CONFLICT,
+                laminar_db::subscription::ClusterSubscriptionError::ReplayPruned { .. }
+                | laminar_db::subscription::ClusterSubscriptionError::ResumeTokenExpired
+                | laminar_db::subscription::ClusterSubscriptionError::RetentionLost => {
+                    StatusCode::GONE
+                }
+                laminar_db::subscription::ClusterSubscriptionError::BackendUnavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            return error_response(status, format!("[{}] {error}", error.code())).into_response();
+        }
         Err(error) => {
             warn!(stream = %name, error = %error, "failed to open WebSocket subscription");
             return error_response(
@@ -422,74 +531,15 @@ async fn ws_client(
         tokio::select! {
             biased;
             () = state.wait_for_serving_fence() => break,
-            frame = portal.next_frame() => {
-                match frame {
-                    Some(laminar_db::subscription::PortalFrame::Batch {
-                        batch,
-                        sequence: log_sequence,
-                        lease: _lease,
-                    }) => {
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-                        if !forward_portal_batch(
-                            &mut socket,
-                            &mut seq,
-                            &name,
-                            &batch,
-                            log_sequence,
-                            &state,
-                        ).await {
-                            break 'subscription;
-                        }
-                    }
-                    Some(laminar_db::subscription::PortalFrame::Barrier {
-                        sequence: log_sequence,
-                        epoch,
-                        checkpoint_id,
-                        through_sequence,
-                    }) => {
-                        let out = ws_progress_json(
-                            &name,
-                            epoch,
-                            checkpoint_id,
-                            log_sequence,
-                            through_sequence,
-                            seq,
-                        );
-                        if !ws_send(
-                            &mut socket,
-                            Message::Text(out.into()),
-                            &state,
-                        ).await {
-                            break;
-                        }
-                        let Some(next) = seq.checked_add(1) else {
-                            break;
-                        };
-                        seq = next;
-                    }
-                    Some(laminar_db::subscription::PortalFrame::Lagged(n)) => {
-                        warn!(stream = %name, skipped = n, "WS client fell behind, disconnecting");
-                        let out = ws_gap_json(&name, n, seq);
-                        let _ = ws_send(
-                            &mut socket,
-                            Message::Text(out.into()),
-                            &state,
-                        ).await;
-                        break;
-                    }
-                    Some(laminar_db::subscription::PortalFrame::Error { message }) => {
-                        warn!(stream = %name, error = %message, "WS subscription failed, disconnecting");
-                        let out = ws_error_json(&name, "subscription_failed", &message, seq);
-                        let _ = ws_send(
-                            &mut socket,
-                            Message::Text(out.into()),
-                            &state,
-                        ).await;
-                        break;
-                    }
-                    None => break, // disconnected
+            frame = portal.next_envelope() => {
+                if forward_portal_envelope(
+                    &mut socket,
+                    &mut seq,
+                    &name,
+                    frame,
+                    &state,
+                ).await == WsFrameOutcome::Disconnect {
+                    break 'subscription;
                 }
             }
             _ = heartbeat.tick() => {
@@ -520,5 +570,107 @@ async fn ws_client(
     }
     if state.serving_rejection().is_none() {
         let _ = ws_send(&mut socket, Message::Close(None), &state).await;
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WsFrameOutcome {
+    Continue,
+    Disconnect,
+}
+
+async fn forward_portal_envelope(
+    socket: &mut WebSocket,
+    sequence: &mut u64,
+    name: &str,
+    envelope: Option<SubscriptionEnvelope>,
+    state: &AppState,
+) -> WsFrameOutcome {
+    let Some(envelope) = envelope else {
+        return WsFrameOutcome::Disconnect;
+    };
+    match envelope {
+        SubscriptionEnvelope {
+            frame:
+                PortalFrame::Batch {
+                    batch,
+                    sequence: log_sequence,
+                    lease: _lease,
+                },
+            cluster,
+            ..
+        } => {
+            if batch.num_rows() == 0 {
+                return WsFrameOutcome::Continue;
+            }
+            if forward_portal_batch(
+                socket,
+                sequence,
+                name,
+                &batch,
+                log_sequence,
+                cluster.as_ref(),
+                state,
+            )
+            .await
+            {
+                WsFrameOutcome::Continue
+            } else {
+                WsFrameOutcome::Disconnect
+            }
+        }
+        SubscriptionEnvelope {
+            frame:
+                PortalFrame::Barrier {
+                    sequence: log_sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence,
+                },
+            cluster,
+            ..
+        } => {
+            let out = ws_progress_json_with_metadata(
+                name,
+                epoch,
+                checkpoint_id,
+                log_sequence,
+                through_sequence,
+                *sequence,
+                cluster.as_ref(),
+            );
+            if !ws_send(socket, Message::Text(out.into()), state).await {
+                return WsFrameOutcome::Disconnect;
+            }
+            let Some(next) = sequence.checked_add(1) else {
+                return WsFrameOutcome::Disconnect;
+            };
+            *sequence = next;
+            WsFrameOutcome::Continue
+        }
+        SubscriptionEnvelope {
+            frame: PortalFrame::Lagged(skipped),
+            ..
+        } => {
+            warn!(stream = %name, skipped, "WS client fell behind, disconnecting");
+            let out = ws_gap_json(name, skipped, *sequence);
+            let _ = ws_send(socket, Message::Text(out.into()), state).await;
+            WsFrameOutcome::Disconnect
+        }
+        SubscriptionEnvelope {
+            frame: PortalFrame::Error { message },
+            error_code,
+            ..
+        } => {
+            warn!(stream = %name, error = %message, "WS subscription failed, disconnecting");
+            let out = ws_error_json(
+                name,
+                error_code.unwrap_or("subscription_failed"),
+                &message,
+                *sequence,
+            );
+            let _ = ws_send(socket, Message::Text(out.into()), state).await;
+            WsFrameOutcome::Disconnect
+        }
     }
 }

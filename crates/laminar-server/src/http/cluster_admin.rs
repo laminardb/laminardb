@@ -40,13 +40,50 @@ pub(super) async fn cluster_status(State(state): State<Arc<AppState>>) -> impl I
         mode: &'static str,
         node_id: String,
         pipeline_state: &'static str,
+        #[cfg(feature = "cluster")]
+        subscription_output: Option<SubscriptionOutputHealthResponse>,
     }
+
+    #[cfg(feature = "cluster")]
+    #[derive(Serialize)]
+    struct SubscriptionOutputHealthResponse {
+        active_readers: u64,
+        pending_bytes: u64,
+        retained_bytes: u64,
+        orphan_bytes: u64,
+        open_failures: u64,
+        segment_write_failures: u64,
+        manifest_failures: u64,
+        integrity_failures: u64,
+        stale_writer_rejections: u64,
+        sequence_gaps: u64,
+        lag_disconnects: u64,
+    }
+
+    #[cfg(feature = "cluster")]
+    let subscription_output = state.db.cluster_subscription_output_health().map(|health| {
+        SubscriptionOutputHealthResponse {
+            active_readers: health.active_readers,
+            pending_bytes: health.pending_bytes,
+            retained_bytes: health.retained_bytes,
+            orphan_bytes: health.orphan_bytes,
+            open_failures: health.open_failures,
+            segment_write_failures: health.segment_write_failures,
+            manifest_failures: health.manifest_failures,
+            integrity_failures: health.integrity_failures,
+            stale_writer_rejections: health.stale_writer_rejections,
+            sequence_gaps: health.sequence_gaps,
+            lag_disconnects: health.lag_disconnects,
+        }
+    });
 
     let pipeline_state = state.db.pipeline_state();
     Json(ClusterStatusResponse {
         mode: "cluster",
         node_id,
         pipeline_state,
+        #[cfg(feature = "cluster")]
+        subscription_output,
     })
     .into_response()
 }

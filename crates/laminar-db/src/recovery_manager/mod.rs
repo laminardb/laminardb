@@ -1,4 +1,4 @@
-//! Exact-cut recovery from committed v9 checkpoint manifests.
+//! Exact-cut recovery from committed v10 checkpoint manifests.
 #![allow(clippy::disallowed_types)] // bounded recovery metadata
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +17,8 @@ use laminar_core::state::NodeId;
 use crate::error::DbError;
 
 mod frame_selection;
+#[cfg(feature = "cluster")]
+mod subscription_output;
 
 use frame_selection::{
     select_local_state_frames, select_reassigned_state_frames, select_same_assignment_frames,
@@ -269,6 +271,9 @@ impl<'a> RecoveryManager<'a> {
         manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
 
         self.validate_manifests(committed, &manifests)?;
+        #[cfg(feature = "cluster")]
+        subscription_output::validate_committed_subscription_segments(self.store, &manifests)
+            .await?;
         let selection = self.select_state_frames(committed, &manifests, cluster_target.as_ref())?;
         let state_frames = load_verified_state_frames(self.store, selection.plans).await?;
 

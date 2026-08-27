@@ -43,6 +43,10 @@ fn reg(name: &str, sql: &str, windowed: bool) -> StreamRegistration {
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        subscription_retention_bytes: 0,
+        catalog_generation: 1,
+        subscription_certificate: None,
     }
 }
 

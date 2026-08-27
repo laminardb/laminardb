@@ -43,6 +43,8 @@ files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
 cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
+# Non-default visibility for Criterion targets that exercise private cluster data-plane paths.
+benchmark-internals = ["cluster"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
@@ -169,6 +171,11 @@ harness = false
 [[bench]]
 name = "hot_path_micro"
 harness = false
+
+[[bench]]
+name = "cluster_subscription_bench"
+harness = false
+required-features = ["benchmark-internals"]
 
 [[test]]
 name = "kafka_docker_scenarios"

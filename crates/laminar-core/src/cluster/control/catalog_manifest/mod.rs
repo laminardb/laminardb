@@ -40,6 +40,12 @@ fn validate_entries(entries: &[CatalogManifestEntry]) -> Result<(), CatalogManif
                 entry.canonical_name
             )));
         }
+        if entry.catalog_generation == 0 {
+            return Err(CatalogManifestError::Invalid(format!(
+                "catalog manifest entry '{}' has a zero object generation",
+                entry.canonical_name
+            )));
+        }
         if !names.insert(entry.canonical_name.as_str()) {
             return Err(CatalogManifestError::Invalid(format!(
                 "catalog manifest repeats canonical name '{}'",
@@ -58,8 +64,22 @@ pub struct CatalogManifestEntry {
     pub canonical_name: String,
     /// Exact namespace owner.
     pub kind: CatalogObjectKind,
+    /// Durable catalog-object incarnation. The initial sealed inventory uses generation one.
+    #[serde(
+        default = "initial_catalog_generation",
+        skip_serializing_if = "is_initial_catalog_generation"
+    )]
+    pub catalog_generation: u64,
     /// Exact DDL text replayed on every node.
     pub ddl: String,
+}
+
+const fn initial_catalog_generation() -> u64 {
+    1
+}
+
+const fn is_initial_catalog_generation(generation: &u64) -> bool {
+    *generation == initial_catalog_generation()
 }
 
 /// The complete ordered catalog sealed for one cluster control namespace.

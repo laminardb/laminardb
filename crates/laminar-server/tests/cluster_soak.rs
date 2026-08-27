@@ -49,7 +49,8 @@
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
 //! - `LAMINAR_SOAK_ALLOW_S3_EMULATOR=1`  debug/soak-only MinIO protocol validation; this does not
-//!   certify an emulator or custom endpoint for production
+//!   certify an emulator or custom endpoint for production; EO emulator runs use a bounded 60s
+//!   checkpoint-operation timeout while the real-store soak profile retains 30s
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
@@ -59,6 +60,8 @@
 //! - `LAMINAR_SOAK_JOIN_KEYS` / `LAMINAR_SOAK_ZIPF_MILLI`  key count and Zipf exponent × 1000
 //! - `LAMINAR_SOAK_MIN_LIVE_STATE_BYTES`  optional retained-state high-water gate
 //! - `LAMINAR_SOAK_HOT_P50_MS` / `_P95_MS` / `_P99_MS`  hot-cycle latency gates
+//! - `LAMINAR_SOAK_HOT_SLO_MODE`  `certify` (default) enforces hot-cycle latency limits;
+//!   `observe` records the same evidence without treating shared-runner timing as certification
 //! - `LAMINAR_SOAK_HOT_MIN_CYCLES`  minimum latency sample count
 //! - `LAMINAR_SOAK_KEY_GROUPS`  stable cluster key-group count (default 64)
 //! - `LAMINAR_SOAK_FAULT_INJECT_ROLE`  trigger one fatal cycle fault after steady state on the
@@ -133,6 +136,11 @@ const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
 #[cfg(feature = "kafka")]
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
 #[cfg(feature = "kafka")]
+// WHY: Hosted runners can pause one of the 96 continuously active Kafka partitions for longer
+// than five seconds. Keep that partition in the watermark minimum while quiet canaries still
+// become idle well within the 90-second recovery window.
+const SOAK_SOURCE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "kafka")]
 // This latency-certification profile deliberately favors prompt delivery over producer-side
 // request aggregation. The Kafka connector's production default remains 5 ms.
 const SOAK_KAFKA_SINK_LINGER_MS: u64 = 0;
@@ -155,6 +163,8 @@ const CHECKPOINT_PIPELINE_STALL_SLO_NS: u64 = 1_024_000_000;
 const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const SOAK_CHECKPOINT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_CHECKPOINT_SLO_MODE";
+#[cfg(feature = "kafka")]
+const SOAK_HOT_SLO_MODE_ENV: &str = "LAMINAR_SOAK_HOT_SLO_MODE";
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 const SOAK_EO_VISIBILITY_SLO_MODE_ENV: &str = "LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE";
 #[cfg(feature = "kafka")]
@@ -163,10 +173,14 @@ const CHECKPOINT_STATE_CAPTURE_SLO_SECONDS: f64 = 0.064;
 const MIN_CHECKPOINT_STATE_CAPTURE_OBSERVATIONS: u64 = 100;
 #[cfg(feature = "kafka")]
 const CHECKPOINT_OBSERVATION_COLLECTION_CAP: Duration = Duration::from_secs(20 * 60);
-#[cfg(feature = "kafka")]
 const SINGLE_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "kafka")]
 const CLUSTER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
+// WHY: the shared-runner MinIO profile drives 23 Delta sinks plus vnode output segments through
+// one emulator. Give that non-certifying profile one bounded slow-storage allowance without
+// changing the production-store timeout or the recovery liveness ceiling.
+#[cfg(feature = "kafka")]
+const CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(feature = "kafka")]
 const MIN_CONTINUOUS_AGGREGATE_STATE_BYTES: u64 = 64 * 1_024;
 #[cfg(feature = "kafka")]
@@ -795,7 +809,15 @@ fn local_exact_prefix_rows(groups: u64, span: u64) -> u64 {
         .expect("local exact source prefix must fit in a u64")
 }
 
-fn validate_checkpoint_liveness(interval_ms: u64, recovery: Duration) {
+fn validate_checkpoint_liveness(
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
+    recovery: Duration,
+) {
+    assert!(
+        checkpoint_timeout < recovery,
+        "checkpoint timeout {checkpoint_timeout:?} leaves no bounded recovery interval within {recovery:?}"
+    );
     assert!(
         u128::from(interval_ms).saturating_mul(4) <= recovery.as_millis(),
         "checkpoint interval {interval_ms}ms leaves insufficient time for two commits within the {recovery:?} recovery ceiling"
@@ -4523,6 +4545,578 @@ impl Drop for ProducerGuard {
 }
 
 #[cfg(feature = "kafka")]
+const CLUSTER_SUBSCRIPTION_SOAK_STREAM: &str = "soak_subscription_aggregate";
+#[cfg(feature = "kafka")]
+const SUBSCRIPTION_PROGRESS_PER_GATEWAY: u64 = 2;
+#[cfg(feature = "kafka")]
+const MAX_SUBSCRIPTION_CHUNKS_PER_INTERVAL: usize = 65_536;
+
+#[cfg(feature = "kafka")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SubscriptionLogicalFrame {
+    partition: u16,
+    sequence: u64,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SubscriptionChunkId {
+    frame: SubscriptionLogicalFrame,
+    row_offset: usize,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Clone, Default)]
+struct ClusterSubscriptionObservation {
+    stream_generation: Option<String>,
+    expected_sequences: BTreeMap<u16, u64>,
+    frame_next_offsets: BTreeMap<SubscriptionLogicalFrame, usize>,
+    chunk_digests: BTreeMap<SubscriptionChunkId, [u8; 32]>,
+    aggregate: BTreeMap<u64, (u64, u64)>,
+    observed_partitions: BTreeSet<u16>,
+    used_gateways: BTreeSet<usize>,
+    pending_epoch: Option<u64>,
+    last_progress_epoch: u64,
+    progress_events: u64,
+    reconnects: u64,
+    last_connection_error: Option<String>,
+}
+
+#[cfg(feature = "kafka")]
+impl ClusterSubscriptionObservation {
+    fn observe_data(&mut self, frame: &serde_json::Value) -> Result<(), String> {
+        let generation = subscription_string_field(frame, "stream_generation")?;
+        self.observe_generation(generation)?;
+        let partition = u16::try_from(subscription_u64_field(frame, "partition")?)
+            .map_err(|_| "subscription partition exceeds u16".to_string())?;
+        let sequence = subscription_u64_field(frame, "partition_sequence")?;
+        let committed_epoch = subscription_u64_field(frame, "committed_epoch")?;
+        if committed_epoch == 0 {
+            return Err("subscription data carried epoch zero".to_string());
+        }
+        match self.pending_epoch {
+            Some(expected) if expected != committed_epoch => {
+                return Err(format!(
+                    "subscription data crossed epochs without progress: {expected}->{committed_epoch}"
+                ));
+            }
+            None => self.pending_epoch = Some(committed_epoch),
+            Some(_) => {}
+        }
+        let row_offset = usize::try_from(subscription_u64_field(frame, "row_offset")?)
+            .map_err(|_| "subscription row offset exceeds usize".to_string())?;
+        let row_count = usize::try_from(subscription_u64_field(frame, "row_count")?)
+            .map_err(|_| "subscription row count exceeds usize".to_string())?;
+        let data = frame
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "subscription data frame omitted its row array".to_string())?;
+        if data.is_empty() || data.len() != row_count {
+            return Err("subscription data frame row count is inconsistent".to_string());
+        }
+        let logical = SubscriptionLogicalFrame {
+            partition,
+            sequence,
+        };
+        let chunk = SubscriptionChunkId {
+            frame: logical,
+            row_offset,
+        };
+        let digest: [u8; 32] = Sha256::digest(
+            serde_json::to_vec(data)
+                .map_err(|error| format!("encode subscription rows for digest: {error}"))?,
+        )
+        .into();
+        if let Some(existing) = self.chunk_digests.get(&chunk) {
+            if existing != &digest {
+                return Err(format!(
+                    "conflicting duplicate subscription frame partition={partition} sequence={sequence} row_offset={row_offset}"
+                ));
+            }
+            return Ok(());
+        }
+        if self.chunk_digests.len() == MAX_SUBSCRIPTION_CHUNKS_PER_INTERVAL {
+            return Err("subscription replay interval exceeded the bounded chunk oracle".into());
+        }
+        self.begin_or_continue_frame(logical, row_offset, row_count)?;
+        self.chunk_digests.insert(chunk, digest);
+        self.observed_partitions.insert(partition);
+        for row in data {
+            let key = subscription_u64_field(row, "join_key")?;
+            let count = subscription_u64_field(row, "match_count")?;
+            let max_right_id = subscription_u64_field(row, "max_right_id")?;
+            self.aggregate.insert(key, (count, max_right_id));
+        }
+        Ok(())
+    }
+
+    fn begin_or_continue_frame(
+        &mut self,
+        frame: SubscriptionLogicalFrame,
+        row_offset: usize,
+        row_count: usize,
+    ) -> Result<(), String> {
+        if let Some(next_offset) = self.frame_next_offsets.get_mut(&frame) {
+            if row_offset != *next_offset {
+                return Err(format!(
+                    "subscription frame chunk gap partition={} sequence={}: expected row offset {}, got {row_offset}",
+                    frame.partition, frame.sequence, *next_offset
+                ));
+            }
+            *next_offset = next_offset
+                .checked_add(row_count)
+                .ok_or_else(|| "subscription row offset overflow".to_string())?;
+            return Ok(());
+        }
+        let expected = self
+            .expected_sequences
+            .entry(frame.partition)
+            .or_insert(frame.sequence);
+        if frame.sequence != *expected {
+            return Err(format!(
+                "subscription partition sequence gap for {}: expected {}, got {}",
+                frame.partition, *expected, frame.sequence
+            ));
+        }
+        if row_offset != 0 {
+            return Err(format!(
+                "subscription logical frame began at row offset {row_offset}"
+            ));
+        }
+        *expected = expected
+            .checked_add(1)
+            .ok_or_else(|| "subscription partition sequence overflow".to_string())?;
+        self.frame_next_offsets.insert(frame, row_count);
+        Ok(())
+    }
+
+    fn observe_progress(
+        &mut self,
+        frame: &serde_json::Value,
+        progress_path: &Path,
+    ) -> Result<(), String> {
+        let generation = subscription_string_field(frame, "stream_generation")?;
+        self.observe_generation(generation)?;
+        let epoch = subscription_u64_field(frame, "epoch")?;
+        let checkpoint_id = subscription_u64_field(frame, "checkpoint_id")?;
+        if epoch == 0 || checkpoint_id != epoch || epoch <= self.last_progress_epoch {
+            return Err(format!(
+                "subscription progress is not a strictly advancing canonical checkpoint: epoch={epoch}, checkpoint_id={checkpoint_id}, previous={}",
+                self.last_progress_epoch
+            ));
+        }
+        if self.pending_epoch.is_some_and(|pending| pending != epoch) {
+            return Err(format!(
+                "subscription progress epoch {epoch} differs from pending data epoch {:?}",
+                self.pending_epoch
+            ));
+        }
+        persist_subscription_progress(progress_path, epoch)?;
+        self.last_progress_epoch = epoch;
+        self.progress_events = self
+            .progress_events
+            .checked_add(1)
+            .ok_or_else(|| "subscription progress count overflow".to_string())?;
+        self.pending_epoch = None;
+        self.frame_next_offsets.clear();
+        self.chunk_digests.clear();
+        Ok(())
+    }
+
+    fn observe_generation(&mut self, generation: &str) -> Result<(), String> {
+        if generation.is_empty() || generation.len() > 128 {
+            return Err("subscription stream generation is not canonical".to_string());
+        }
+        match self.stream_generation.as_deref() {
+            Some(expected) if expected != generation => Err(format!(
+                "subscription stream generation changed from {expected} to {generation}"
+            )),
+            None => {
+                self.stream_generation = Some(generation.to_owned());
+                Ok(())
+            }
+            Some(_) => Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
+struct ClusterSubscriptionObserver {
+    stop: Arc<AtomicBool>,
+    attached: Arc<AtomicBool>,
+    observation: Arc<parking_lot::Mutex<ClusterSubscriptionObservation>>,
+    handle: Option<JoinHandle<Result<(), String>>>,
+}
+
+#[cfg(feature = "kafka")]
+impl ClusterSubscriptionObserver {
+    fn spawn(progress_path: PathBuf) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let attached = Arc::new(AtomicBool::new(false));
+        let observation = Arc::new(parking_lot::Mutex::new(
+            ClusterSubscriptionObservation::default(),
+        ));
+        let task_stop = Arc::clone(&stop);
+        let task_attached = Arc::clone(&attached);
+        let task_observation = Arc::clone(&observation);
+        let handle = std::thread::Builder::new()
+            .name("cluster-subscription-soak-reader".into())
+            .spawn(move || {
+                run_cluster_subscription_observer(
+                    &progress_path,
+                    &task_stop,
+                    &task_attached,
+                    &task_observation,
+                )
+            })
+            .expect("spawn cluster subscription observer");
+        Self {
+            stop,
+            attached,
+            observation,
+            handle: Some(handle),
+        }
+    }
+
+    fn wait_until_attached(&mut self, window: Duration) {
+        wait_for("cluster subscription gateway attachment", window, || {
+            self.assert_running();
+            self.attached.load(Ordering::Acquire)
+        });
+    }
+
+    fn wait_until_progress(&mut self, epoch: u64, window: Duration) {
+        wait_for("cluster subscription committed progress", window, || {
+            self.assert_running();
+            self.observation.lock().last_progress_epoch >= epoch
+        });
+    }
+
+    fn assert_running(&mut self) {
+        if !self
+            .handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            return;
+        }
+        let result = self
+            .handle
+            .take()
+            .expect("subscription observer handle")
+            .join();
+        match result {
+            Ok(Ok(())) => panic!("cluster subscription observer stopped before the soak"),
+            Ok(Err(error)) => panic!("cluster subscription observer failed: {error}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn stop(mut self) -> ClusterSubscriptionObservation {
+        self.stop.store(true, Ordering::Release);
+        let result = self
+            .handle
+            .take()
+            .expect("subscription observer was already stopped")
+            .join();
+        match result {
+            Ok(Ok(())) => self.observation.lock().clone(),
+            Ok(Err(error)) => panic!("cluster subscription observer failed: {error}"),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl Drop for ClusterSubscriptionObserver {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn run_cluster_subscription_observer(
+    progress_path: &Path,
+    stop: &AtomicBool,
+    attached: &AtomicBool,
+    observation: &parking_lot::Mutex<ClusterSubscriptionObservation>,
+) -> Result<(), String> {
+    let mut gateway_cursor = 0usize;
+    let mut connected_once = false;
+    while !stop.load(Ordering::Acquire) {
+        let gateway = gateway_cursor % NODES;
+        gateway_cursor = gateway_cursor
+            .checked_add(1)
+            .ok_or_else(|| "subscription gateway cursor overflow".to_string())?;
+        let resume_epoch = load_subscription_progress(progress_path)?;
+        let Some(mut socket) = connect_cluster_subscription_gateway(gateway, resume_epoch)? else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        {
+            let mut state = observation.lock();
+            state.used_gateways.insert(gateway);
+            state.last_connection_error = None;
+            if connected_once {
+                state.reconnects = state
+                    .reconnects
+                    .checked_add(1)
+                    .ok_or_else(|| "subscription reconnect count overflow".to_string())?;
+            }
+        }
+        connected_once = true;
+        attached.store(true, Ordering::Release);
+        match consume_cluster_subscription_gateway(&mut socket, progress_path, stop, observation) {
+            Ok(()) => {}
+            Err(error) if subscription_connection_error_is_retryable(&error) => {
+                observation.lock().last_connection_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kafka")]
+fn connect_cluster_subscription_gateway(
+    gateway: usize,
+    resume_epoch: Option<u64>,
+) -> Result<Option<tungstenite::WebSocket<TcpStream>>, String> {
+    let port = BASE_PORT
+        .checked_add(u16::try_from(gateway).map_err(|_| "gateway index exceeds u16")?)
+        .ok_or_else(|| "gateway port overflow".to_string())?;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let stream = match TcpStream::connect_timeout(&address, Duration::from_secs(2)) {
+        Ok(stream) => stream,
+        Err(_) => return Ok(None),
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set subscription socket read timeout: {error}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| format!("set subscription socket write timeout: {error}"))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| format!("set subscription socket nodelay: {error}"))?;
+    let replay = resume_epoch.map_or_else(String::new, |epoch| format!("&as_of_epoch={epoch}"));
+    let request = format!(
+        "ws://127.0.0.1:{port}/ws/{CLUSTER_SUBSCRIPTION_SOAK_STREAM}?token={SOAK_CONSOLE_TOKEN}{replay}"
+    );
+    match tungstenite::client(request, stream) {
+        Ok((socket, response)) if response.status().as_u16() == 101 => Ok(Some(socket)),
+        Ok((_, response)) => Err(format!(
+            "retryable subscription handshake status {}",
+            response.status()
+        )),
+        Err(tungstenite::HandshakeError::Interrupted(_)) => Ok(None),
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response)))
+            if response.status().is_server_error() =>
+        {
+            Ok(None)
+        }
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+            Err(format!(
+                "subscription handshake failed with HTTP {}",
+                response.status()
+            ))
+        }
+        Err(tungstenite::HandshakeError::Failure(error))
+            if subscription_websocket_error_is_retryable(&error) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(format!("subscription handshake failed: {error}")),
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn consume_cluster_subscription_gateway(
+    socket: &mut tungstenite::WebSocket<TcpStream>,
+    progress_path: &Path,
+    stop: &AtomicBool,
+    observation: &parking_lot::Mutex<ClusterSubscriptionObservation>,
+) -> Result<(), String> {
+    let mut progress_on_connection = 0u64;
+    while !stop.load(Ordering::Acquire) {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                let frame: serde_json::Value = serde_json::from_str(text.as_ref())
+                    .map_err(|error| format!("invalid subscription JSON frame: {error}"))?;
+                match frame.get("type").and_then(serde_json::Value::as_str) {
+                    Some("data") => observation.lock().observe_data(&frame)?,
+                    Some("progress") => {
+                        observation.lock().observe_progress(&frame, progress_path)?;
+                        progress_on_connection =
+                            progress_on_connection.checked_add(1).ok_or_else(|| {
+                                "subscription connection progress overflow".to_string()
+                            })?;
+                        if progress_on_connection == SUBSCRIPTION_PROGRESS_PER_GATEWAY {
+                            return Ok(());
+                        }
+                    }
+                    Some("error" | "gap") => {
+                        return Err(format!("subscription gateway reported {frame}"));
+                    }
+                    Some(kind) => return Err(format!("unknown subscription frame type {kind:?}")),
+                    None => return Err("subscription frame omitted its type".to_string()),
+                }
+            }
+            Ok(tungstenite::Message::Ping(payload)) => {
+                socket
+                    .send(tungstenite::Message::Pong(payload))
+                    .map_err(|error| format!("retryable subscription pong failed: {error}"))?;
+            }
+            Ok(tungstenite::Message::Pong(_)) => {}
+            Ok(tungstenite::Message::Close(_)) => {
+                return Err("retryable subscription gateway closed".to_string());
+            }
+            Ok(tungstenite::Message::Binary(_)) => {
+                return Err("subscription gateway emitted a binary frame".to_string());
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) if subscription_websocket_error_is_retryable(&error) => {
+                return Err("retryable subscription transport closed".to_string());
+            }
+            Err(error) => return Err(format!("subscription WebSocket failed: {error}")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kafka")]
+fn subscription_connection_error_is_retryable(error: &str) -> bool {
+    error.starts_with("retryable subscription")
+}
+
+#[cfg(feature = "kafka")]
+fn subscription_websocket_error_is_retryable(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(_)
+            | tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::AlreadyClosed
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+            )
+    )
+}
+
+#[cfg(feature = "kafka")]
+fn subscription_string_field<'a>(
+    value: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("subscription frame omitted string field {field:?}"))
+}
+
+#[cfg(feature = "kafka")]
+fn subscription_u64_field(value: &serde_json::Value, field: &str) -> Result<u64, String> {
+    value
+        .get(field)
+        .and_then(json_u64)
+        .ok_or_else(|| format!("subscription frame omitted non-negative field {field:?}"))
+}
+
+#[cfg(feature = "kafka")]
+fn persist_subscription_progress(path: &Path, epoch: u64) -> Result<(), String> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open subscription progress journal: {error}"))?;
+    writeln!(file, "{epoch}")
+        .map_err(|error| format!("append subscription progress journal: {error}"))?;
+    file.sync_data()
+        .map_err(|error| format!("sync subscription progress journal: {error}"))
+}
+
+#[cfg(feature = "kafka")]
+fn load_subscription_progress(path: &Path) -> Result<Option<u64>, String> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read subscription progress journal: {error}")),
+    };
+    if contents.len() > 1024 * 1024 {
+        return Err("subscription progress journal exceeded 1 MiB".to_string());
+    }
+    contents
+        .lines()
+        .next_back()
+        .map(|epoch| {
+            epoch
+                .parse::<u64>()
+                .map_err(|error| format!("parse subscription progress epoch: {error}"))
+        })
+        .transpose()
+}
+
+#[cfg(feature = "kafka")]
+fn expected_cluster_subscription_aggregate(
+    produced: &ProducedPrefix,
+    key_count: u64,
+    zipf_milli: u64,
+) -> BTreeMap<u64, (u64, u64)> {
+    let sampler = ZipfSampler::new(key_count, zipf_milli);
+    let mut expected = BTreeMap::<u64, (u64, u64)>::new();
+    for id in 0..produced.count {
+        let key = sampler.sample(id);
+        let entry = expected.entry(key).or_insert((0, 0));
+        entry.0 = entry
+            .0
+            .checked_add(1)
+            .expect("subscription aggregate count overflow");
+        entry.1 = entry.1.max(id);
+    }
+    expected
+}
+
+#[cfg(feature = "kafka")]
+fn assert_cluster_subscription_observation(
+    observation: &ClusterSubscriptionObservation,
+    produced: &ProducedPrefix,
+    key_count: u64,
+    zipf_milli: u64,
+) {
+    let expected = expected_cluster_subscription_aggregate(produced, key_count, zipf_milli);
+    assert_eq!(
+        observation.aggregate, expected,
+        "committed cluster subscription aggregate differs from the independent input oracle"
+    );
+    assert_eq!(
+        observation.used_gateways,
+        BTreeSet::from([0, 1, 2]),
+        "subscription observer did not successfully attach through every gateway"
+    );
+    assert!(
+        observation.reconnects >= 2,
+        "subscription observer did not exercise cross-gateway replay"
+    );
+    assert!(
+        observation.observed_partitions.len() >= NODES.saturating_mul(2),
+        "subscription output did not span enough vnode partitions: {:?}",
+        observation.observed_partitions
+    );
+    assert!(
+        observation.last_connection_error.is_none(),
+        "subscription observer ended with a connection failure: {:?}",
+        observation.last_connection_error
+    );
+}
+
+#[cfg(feature = "kafka")]
 struct KafkaCommitOracle {
     consumer: rdkafka::consumer::BaseConsumer,
     topic: String,
@@ -4772,12 +5366,66 @@ fn wait_for_offset_advance(
 }
 
 #[cfg(feature = "kafka")]
+fn wait_for_minimum_offset_rate(
+    nodes: &mut [Node],
+    producer: &mut ProducerGuard,
+    start_at: Instant,
+    start_offsets: &[i64],
+    deadline_offsets: &[i64],
+    minimum_rps: f64,
+    window: Duration,
+    label: &str,
+    mut current_offsets: impl FnMut() -> Option<Vec<i64>>,
+) -> (Instant, Vec<i64>) {
+    let mut observed = None;
+    wait_for(
+        &format!("{label}: post-window frontier to sustain at least {minimum_rps:.1} rps"),
+        window,
+        || {
+            assert_running_nodes(nodes);
+            producer.assert_running();
+            let Some(current) = current_offsets() else {
+                return false;
+            };
+            match all_partition_offsets_advanced(deadline_offsets, &current) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(error) => panic!("{label}: invalid Kafka offset frontier: {error}"),
+            }
+            let observed_at = Instant::now();
+            let emitted = monotonic_offset_delta(label, start_offsets, &current);
+            let elapsed = observed_at.duration_since(start_at).as_secs_f64();
+            if emitted as f64 / elapsed < minimum_rps {
+                return false;
+            }
+            observed = Some((observed_at, current));
+            true
+        },
+    );
+    observed.expect("offset-rate wait completed without an observed frontier")
+}
+
+#[cfg(feature = "kafka")]
+fn recovery_aware_durable_progress_window(
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
+    recovery_ceiling: Duration,
+    required_commits: u32,
+) -> Duration {
+    let checkpoint_cycle = Duration::from_millis(interval_ms).saturating_add(checkpoint_timeout);
+    recovery_ceiling
+        .saturating_add(checkpoint_cycle.saturating_mul(required_commits.saturating_add(1)))
+}
+
+#[cfg(feature = "kafka")]
 fn assert_active_load_throughput(
     nodes: &mut [Node],
     producer: &mut ProducerGuard,
     inputs: &[(&str, &KafkaJoinCommitOracle)],
     outputs: &[(&str, Option<&KafkaOutputOracle>)],
     target_rps: u64,
+    interval_ms: u64,
+    checkpoint_timeout: Duration,
     recovery_ceiling: Duration,
     delivery: JoinDelivery,
 ) {
@@ -4785,8 +5433,14 @@ fn assert_active_load_throughput(
     assert_running_nodes(nodes);
     producer.assert_running();
     // Kafka's committed frontier advances only after the asynchronous checkpoint tail completes.
-    // Anchor both ends on observable terminal cuts so a wall-clock endpoint cannot omit an entire
-    // in-flight checkpoint from an otherwise healthy throughput window.
+    // A constrained object store can consume one tail before recovery starts, and the restored
+    // generation then needs another cycle to publish its first durable cut.
+    let durable_progress_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        1,
+    );
     for &(label, input) in inputs {
         let seed = input
             .committed_offsets()
@@ -4796,7 +5450,7 @@ fn assert_active_load_throughput(
             nodes,
             producer,
             &seed,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} durable baseline"),
             || input.committed_offsets(),
         );
@@ -4816,7 +5470,7 @@ fn assert_active_load_throughput(
             nodes,
             producer,
             &seed,
-            recovery_ceiling,
+            durable_progress_window,
             &format!("active-load {label} output baseline"),
             || output.high_watermarks(),
         );
@@ -4879,11 +5533,15 @@ fn assert_active_load_throughput(
     {
         all_partition_offsets_advanced(&start_offsets, &deadline_offsets)
             .unwrap_or_else(|error| panic!("active-load {label} durable deadline: {error}"));
-        let (ended_at, end_offsets) = wait_for_offset_advance(
+        let minimum_row_rps = minimum_pair_rps * 2.0;
+        let (ended_at, end_offsets) = wait_for_minimum_offset_rate(
             nodes,
             producer,
+            started_at,
+            &start_offsets,
             &deadline_offsets,
-            recovery_ceiling,
+            minimum_row_rps,
+            durable_progress_window,
             &format!("active-load {label} durable endpoint"),
             || input.committed_offsets(),
         );
@@ -4907,11 +5565,14 @@ fn assert_active_load_throughput(
     for ((label, output, emitted_start_at, output_start), deadline_offsets) in
         output_starts.into_iter().zip(output_at_deadline)
     {
-        let (emitted_end_at, output_end) = wait_for_offset_advance(
+        let (emitted_end_at, output_end) = wait_for_minimum_offset_rate(
             nodes,
             producer,
+            emitted_start_at,
+            &output_start,
             &deadline_offsets,
-            recovery_ceiling,
+            minimum_pair_rps,
+            durable_progress_window,
             &format!("active-load {label} output endpoint"),
             || output.high_watermarks(),
         );
@@ -8504,6 +9165,20 @@ impl JoinDelivery {
     }
 }
 
+#[cfg(feature = "kafka")]
+fn cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bool) -> Duration {
+    if delivery == JoinDelivery::ExactlyOnce && s3_emulator {
+        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    } else {
+        CLUSTER_CHECKPOINT_TIMEOUT
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn s3_emulator_enabled() -> bool {
+    std::env::var("LAMINAR_SOAK_ALLOW_S3_EMULATOR").as_deref() == Ok("1")
+}
+
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 struct DeltaSoakStorage {
     endpoint: String,
@@ -9237,8 +9912,18 @@ fn temporal_join_source_config(
     ]
     .into_iter()
     .map(|(name, topic, group_suffix, format, primary_key)| {
-        let primary_key = if primary_key {
-            "primary_key = [\"join_key\"]\n"
+        let temporal_load = name.starts_with("temporal_load_");
+        let primary_key = match (primary_key, temporal_load) {
+            (true, true) => "primary_key = [\"join_key\", \"source_partition\"]\n",
+            (true, false) => "primary_key = [\"join_key\"]\n",
+            (false, _) => "",
+        };
+        let source_partition = if temporal_load {
+            r#"[[source.schema]]
+name = "source_partition"
+type = "BIGINT"
+nullable = false
+"#
         } else {
             ""
         };
@@ -9262,7 +9947,7 @@ nullable = false
 name = "join_key"
 type = "BIGINT"
 nullable = false
-[[source.schema]]
+{source_partition}[[source.schema]]
 name = "temporal_time"
 type = "TIMESTAMP"
 nullable = false
@@ -9511,6 +10196,7 @@ FROM temporal_load_left l
 LEFT JOIN temporal_load_right
 FOR SYSTEM_TIME AS OF l.temporal_time AS r
   ON l.join_key = r.join_key
+ AND l.source_partition = r.source_partition
 WHERE l.join_key >= 0
 """
 
@@ -9532,6 +10218,23 @@ GROUP BY join_key
 }
 
 #[cfg(feature = "kafka")]
+fn cluster_subscription_workload_config() -> &'static str {
+    // WHY: keep this gate proportional to input volume so it certifies the subscription data
+    // plane independently from the high-amplification interval-join soak running beside it.
+    r#"
+[[pipeline]]
+name = "soak_subscription_aggregate"
+sql = """
+SELECT join_key, COUNT(*) AS match_count, MAX(id) AS max_right_id
+FROM join_left
+WHERE join_key >= 0
+GROUP BY join_key
+WITH ('retain_history' = '256mb')
+"""
+"#
+}
+
+#[cfg(feature = "kafka")]
 fn write_config(
     dir: &Path,
     id: usize,
@@ -9550,6 +10253,7 @@ fn write_config(
     delivery: JoinDelivery,
     sink: &str,
     matrix_sinks: &str,
+    extra_workload: &str,
 ) -> PathBuf {
     let http = BASE_PORT + id as u16;
     let gossip = BASE_PORT + 100 + id as u16;
@@ -9570,7 +10274,8 @@ fn write_config(
     if storage.contains("endpoint") {
         storage.push_str("allow_http = \"true\"\n");
     }
-    let checkpoint_timeout_secs = CLUSTER_CHECKPOINT_TIMEOUT.as_secs();
+    let checkpoint_timeout_secs =
+        cluster_checkpoint_timeout(delivery, s3_emulator_enabled()).as_secs();
 
     // Discovery: gossip (phi-accrual failure detection) by default;
     // `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
@@ -9591,7 +10296,7 @@ delivery = "{delivery}"
 key_groups = {key_groups}
 console_token = "{SOAK_CONSOLE_TOKEN}"
 temporal_join_idle_history_retention = "5m"
-source_idle_timeout = "5s"
+source_idle_timeout = "{source_idle_timeout_secs}s"
 event_time_max_future_skew = "{event_time_max_future_skew_ms}ms"
 [discovery]
 strategy = "{discovery}"
@@ -9614,6 +10319,7 @@ timeout = "{checkpoint_timeout_secs}s"
         seeds = seeds.join(", "),
         url = checkpoint_url,
         delivery = delivery.server_value(),
+        source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
         event_time_max_future_skew_ms = SOAK_EVENT_MAX_FUTURE_SKEW_MS,
         workload = kafka_join_workload_config(
             brokers,
@@ -9627,7 +10333,7 @@ timeout = "{checkpoint_timeout_secs}s"
             matrix_consumer_group,
             sink,
             matrix_sinks,
-            "",
+            extra_workload,
         ),
     );
 
@@ -9681,7 +10387,7 @@ bind = "127.0.0.1:{SINGLE_JOIN_PORT}"
 delivery = "{delivery}"
 console_token = "{SOAK_CONSOLE_TOKEN}"
 temporal_join_idle_history_retention = "5m"
-source_idle_timeout = "5s"
+source_idle_timeout = "{source_idle_timeout_secs}s"
 event_time_max_future_skew = "{event_time_max_future_skew_ms}ms"
 
 [checkpoint]
@@ -9692,6 +10398,7 @@ timeout = "30s"
 {workload}
 "#,
         delivery = delivery.server_value(),
+        source_idle_timeout_secs = SOAK_SOURCE_IDLE_TIMEOUT.as_secs(),
         event_time_max_future_skew_ms = SOAK_EVENT_MAX_FUTURE_SKEW_MS,
         workload = kafka_join_workload_config(
             brokers,
@@ -10305,7 +11012,30 @@ fn assert_live_join_state_bytes(
 }
 
 #[cfg(feature = "kafka")]
-fn assert_hot_path_latency(nodes: &[Node], label: &str) {
+fn enforce_or_report_hot_path_slo(
+    mode: SloMode,
+    label: &str,
+    node_id: usize,
+    quantile: &str,
+    observed_ms: f64,
+    limit_ms: u64,
+    diagnostic: &str,
+) {
+    if observed_ms <= limit_ms as f64 {
+        return;
+    }
+    match mode {
+        SloMode::Certify => panic!(
+            "{label}: node{node_id} hot-path {quantile} bucket upper bound {observed_ms:.3}ms exceeds {limit_ms}ms; {diagnostic}"
+        ),
+        SloMode::Observe => eprintln!(
+            "soak: PROFILE {label} node{node_id} hot-path {quantile} bucket upper bound {observed_ms:.3}ms exceeded the non-certifying {limit_ms}ms SLO boundary; {diagnostic}"
+        ),
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn assert_hot_path_latency(nodes: &[Node], label: &str, slo_mode: SloMode) {
     let minimum = env_u64("LAMINAR_SOAK_HOT_MIN_CYCLES", DEFAULT_HOT_PATH_MIN_CYCLES);
     let p50_limit_ms = env_u64("LAMINAR_SOAK_HOT_P50_MS", DEFAULT_HOT_PATH_P50_MS);
     let p95_limit_ms = env_u64("LAMINAR_SOAK_HOT_P95_MS", DEFAULT_HOT_PATH_P95_MS);
@@ -10346,18 +11076,21 @@ fn assert_hot_path_latency(nodes: &[Node], label: &str) {
         let p50_ms = latency.p50_upper_seconds * 1_000.0;
         let p95_ms = latency.p95_upper_seconds * 1_000.0;
         let p99_ms = latency.p99_upper_seconds * 1_000.0;
-        assert!(
-            p50_ms <= p50_limit_ms as f64,
-            "{label}: node{node_id} hot-path p50 bucket upper bound {p50_ms:.3}ms exceeds {p50_limit_ms}ms; {diagnostic}",
-        );
-        assert!(
-            p95_ms <= p95_limit_ms as f64,
-            "{label}: node{node_id} hot-path p95 bucket upper bound {p95_ms:.3}ms exceeds {p95_limit_ms}ms; {diagnostic}",
-        );
-        assert!(
-            p99_ms <= p99_limit_ms as f64,
-            "{label}: node{node_id} hot-path p99 bucket upper bound {p99_ms:.3}ms exceeds {p99_limit_ms}ms; {diagnostic}",
-        );
+        for (quantile, observed_ms, limit_ms) in [
+            ("p50", p50_ms, p50_limit_ms),
+            ("p95", p95_ms, p95_limit_ms),
+            ("p99", p99_ms, p99_limit_ms),
+        ] {
+            enforce_or_report_hot_path_slo(
+                slo_mode,
+                label,
+                node_id,
+                quantile,
+                observed_ms,
+                limit_ms,
+                &diagnostic,
+            );
+        }
     }
 }
 
@@ -10700,7 +11433,7 @@ fn local_exact_source_state_kill9_soak() {
         "LAMINAR_SOAK_KILLS must be at least 2 (one moving-source and one exhausted-cut fault)"
     );
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    validate_checkpoint_liveness(interval_ms, SINGLE_CHECKPOINT_TIMEOUT, recovery_ceiling);
     let groups = env_u64("LAMINAR_SOAK_GROUPS", 64);
     let span = env_u64("LAMINAR_SOAK_SPAN", 16);
     let rows_per_second = env_u64("LAMINAR_SOAK_RPS", 400);
@@ -10978,6 +11711,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
     let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let hot_path_slo_mode = SloMode::from_environment(SOAK_HOT_SLO_MODE_ENV)
+        .unwrap_or_else(|error| panic!("invalid hot-path SLO mode: {error}"));
     let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     let kills = env_u64("LAMINAR_SOAK_SINGLE_KILLS", 1);
     if delivery == JoinDelivery::AtLeastOnce {
@@ -10992,7 +11727,13 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    validate_checkpoint_liveness(interval_ms, SINGLE_CHECKPOINT_TIMEOUT, recovery_ceiling);
+    let durable_cut_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        SINGLE_CHECKPOINT_TIMEOUT,
+        recovery_ceiling,
+        2,
+    );
     if delivery == JoinDelivery::AtLeastOnce {
         validate_mutable_interval_recovery_horizon(kills, recovery_ceiling);
     }
@@ -11200,9 +11941,10 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     let join_keys = env_u64("LAMINAR_SOAK_JOIN_KEYS", DEFAULT_JOIN_KEYS);
     let zipf_milli = env_u64("LAMINAR_SOAK_ZIPF_MILLI", DEFAULT_ZIPF_MILLI);
     eprintln!(
-        "soak: PROFILE mode=single delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
+        "soak: PROFILE mode=single delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
         delivery.label(),
         checkpoint_slo_mode.label(),
+        hot_path_slo_mode.label(),
     );
     let temporal_recovery_seed = produce_temporal_pre_fault_input(
         &brokers,
@@ -11288,7 +12030,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_recovery_seed.input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
         &format!("single {delivery_label} pre-fault temporal history"),
     );
@@ -11299,7 +12041,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     if let (Some(commit_oracle), Some(seed), Some(output)) = (
@@ -11311,7 +12053,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             &mut nodes,
             commit_oracle,
             &seed.input_boundary,
-            recovery_ceiling,
+            durable_cut_window,
             latest_checkpoint,
         );
         let expected = expected_mutable_interval_transitions();
@@ -11477,7 +12219,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             &mut nodes,
             commit_oracle,
             &seed.input_boundary,
-            recovery_ceiling,
+            durable_cut_window,
             latest_checkpoint,
         );
         assert_mutable_interval_output_stable(
@@ -11558,7 +12300,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_final_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -11578,6 +12320,8 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
             ("temporal_load", output_oracles.kafka_temporal_load.as_ref()),
         ],
         source_rps,
+        interval_ms,
+        SINGLE_CHECKPOINT_TIMEOUT,
         recovery_ceiling,
         delivery,
     );
@@ -11696,7 +12440,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let temporal_closing_boundary = produce_temporal_post_fault_sentinels(
@@ -11711,7 +12455,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let (produced_prefix, _bounded_frozen_input_at) = producer.stop();
@@ -11764,7 +12508,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &[&commit_oracle, &temporal_load_commit_oracle],
         &produced_prefix.end_offsets,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -11873,6 +12617,7 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
     assert_hot_path_latency(
         &nodes,
         &format!("single-node {delivery_label} stateful workload"),
+        hot_path_slo_mode,
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -11897,18 +12642,25 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce);
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false);
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
+#[cfg(feature = "kafka")]
+fn three_node_alo_cluster_subscription_kill9_soak() {
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, true);
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3; run with --ignored"]
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn three_node_eo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce);
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, false);
 }
 
 #[cfg(feature = "kafka")]
-fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
+fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: bool) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
@@ -11921,6 +12673,8 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let minimum_live_state_bytes = env_u64("LAMINAR_SOAK_MIN_LIVE_STATE_BYTES", 0);
     let checkpoint_slo_mode = SloMode::from_environment(SOAK_CHECKPOINT_SLO_MODE_ENV)
         .unwrap_or_else(|error| panic!("invalid checkpoint SLO mode: {error}"));
+    let hot_path_slo_mode = SloMode::from_environment(SOAK_HOT_SLO_MODE_ENV)
+        .unwrap_or_else(|error| panic!("invalid hot-path SLO mode: {error}"));
     let visibility_slo_mode = resolve_visibility_slo_mode(delivery);
     assert!(
         interval_ms >= 100,
@@ -11928,7 +12682,20 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    validate_checkpoint_liveness(interval_ms, recovery_ceiling);
+    let checkpoint_timeout = cluster_checkpoint_timeout(delivery, s3_emulator_enabled());
+    validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
+    let durable_output_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        1,
+    );
+    let durable_cut_window = recovery_aware_durable_progress_window(
+        interval_ms,
+        checkpoint_timeout,
+        recovery_ceiling,
+        2,
+    );
     let key_group_count = cluster_key_group_count();
     let kafka_partitions = cluster_kafka_partition_count();
     let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
@@ -12100,9 +12867,10 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let join_keys = env_u64("LAMINAR_SOAK_JOIN_KEYS", DEFAULT_JOIN_KEYS);
     let zipf_milli = env_u64("LAMINAR_SOAK_ZIPF_MILLI", DEFAULT_ZIPF_MILLI);
     eprintln!(
-        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
+        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
         delivery.label(),
         checkpoint_slo_mode.label(),
+        hot_path_slo_mode.label(),
     );
     let temporal_recovery_seed = produce_temporal_pre_fault_input(
         &brokers,
@@ -12126,6 +12894,9 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir(&log_dir).expect("create exclusive cluster soak log directory");
     eprintln!("soak: node logs in {}", log_dir.display());
+    let subscription_workload = subscription_soak
+        .then(cluster_subscription_workload_config)
+        .unwrap_or_default();
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
@@ -12149,6 +12920,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                 delivery,
                 &sink_config,
                 &matrix_sink_config,
+                subscription_workload,
             ),
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
@@ -12253,11 +13025,18 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         Instant::now() + Duration::from_secs(10),
         "stable startup",
     );
+    let mut subscription_observer = subscription_soak.then(|| {
+        let mut observer = ClusterSubscriptionObserver::spawn(
+            dir.path().join("cluster-subscription-progress.log"),
+        );
+        observer.wait_until_attached(Duration::from_secs(30));
+        observer
+    });
     latest_checkpoint = assert_temporal_idle_checkpoint(
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_recovery_seed.input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
         &format!("three-node {delivery_label} pre-fault temporal history"),
     );
@@ -12268,7 +13047,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     observe_live_core_window_state(&nodes, &mut window_state_high_water);
@@ -12727,7 +13506,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &matrix_commit_oracle,
         &matrix_final_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
@@ -12747,6 +13526,8 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             ("temporal_load", output_oracles.kafka_temporal_load.as_ref()),
         ],
         source_rps,
+        interval_ms,
+        checkpoint_timeout,
         recovery_ceiling,
         delivery,
     );
@@ -12924,7 +13705,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let temporal_closing_boundary = produce_temporal_post_fault_sentinels(
@@ -12939,7 +13720,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &temporal_commit_oracle,
         &temporal_input_boundary,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     let (produced_prefix, _bounded_frozen_input_at) = producer.stop();
@@ -12951,7 +13732,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &temporal_post,
         temporal_frontier_released_at,
         visibility_slo_mode,
-        recovery_ceiling,
+        durable_output_window,
         "three-node",
     );
     // Cluster operators use the minimum active-source frontier. The matrix canary is deliberately
@@ -12980,7 +13761,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
                 &expected_windows,
                 window_frontier_released_at,
                 visibility_slo_mode,
-                recovery_ceiling,
+                durable_output_window,
                 "three-node EO CoreWindow canaries",
             );
             #[cfg(not(feature = "delta-lake-s3"))]
@@ -13029,13 +13810,29 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
         &mut nodes,
         &[&commit_oracle, &temporal_load_commit_oracle],
         &produced_prefix.end_offsets,
-        recovery_ceiling,
+        durable_cut_window,
         latest_checkpoint,
     );
     eprintln!(
         "soak: frozen bounded and temporal input prefix is durable through checkpoint {} epoch {}",
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
+    if let Some(mut observer) = subscription_observer.take() {
+        observer.wait_until_progress(latest_checkpoint.epoch, recovery_ceiling);
+        let observation = observer.stop();
+        assert_cluster_subscription_observation(
+            &observation,
+            &produced_prefix,
+            join_keys,
+            zipf_milli,
+        );
+        eprintln!(
+            "soak: committed subscription replay verified through epoch {} across gateways {:?} and {} vnode partitions",
+            observation.last_progress_epoch,
+            observation.used_gateways,
+            observation.observed_partitions.len(),
+        );
+    }
     #[cfg(feature = "delta-lake-s3")]
     let completed_delta_outputs = (delivery == JoinDelivery::ExactlyOnce).then(|| {
         let outputs = delta_join_exact_outputs(
@@ -13051,7 +13848,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
             delta_visibility_boundaries
                 .as_ref()
                 .expect("cluster EO visibility boundaries captured before final cuts"),
-            recovery_ceiling,
+            durable_output_window,
         )
     });
     match delivery {
@@ -13129,6 +13926,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery) {
     assert_hot_path_latency(
         &nodes,
         &format!("three-node {delivery_label} stateful workload"),
+        hot_path_slo_mode,
     );
     assert_live_join_state_bytes(
         live_state_high_water,
@@ -14011,12 +14809,12 @@ fn produce_join_inputs(
             let temporal_time_ms = event_time_base
                 .checked_add(load_offset_ms)
                 .expect("temporal timestamp overflow");
-            let payload = format!(
-                r#"{{"id":{n},"join_key":{join_key},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
-            );
-            let key = join_key.to_string();
             let partition =
                 i32::try_from(n % partition_count).expect("round-robin partition fits i32");
+            let payload = format!(
+                r#"{{"id":{n},"join_key":{join_key},"source_partition":{partition},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
+            );
+            let key = join_key.to_string();
             let left_delivery = producer
                 .send_result(
                     FutureRecord::to(left_topic)
@@ -14086,7 +14884,7 @@ fn produce_join_inputs(
                 let join_key = -i64::from(partitions) - i64::from(partition) - 1;
                 let key = join_key.to_string();
                 let payload = format!(
-                    r#"{{"id":{id},"join_key":{join_key},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
+                    r#"{{"id":{id},"join_key":{join_key},"source_partition":{partition},"event_time":{event_time_ms},"temporal_time":{temporal_time_ms}}}"#
                 );
                 let delivery = producer
                     .send_result(
@@ -14135,6 +14933,40 @@ fn temporal_load_clock_tracks_pacing_without_losing_strict_order() {
 
     let unsupported = std::panic::catch_unwind(|| temporal_load_offset_ms(1, 1_001));
     assert!(unsupported.is_err());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn temporal_load_primary_key_is_stable_within_each_kafka_partition() {
+    let sources = temporal_join_source_config(
+        "broker",
+        "canary-left",
+        "canary-right",
+        "load-left",
+        "load-right",
+        "group",
+    );
+    assert!(sources.contains(
+        "name = \"temporal_load_right\"\nconnector = \"kafka\"\nformat = \"json\"\nprimary_key = [\"join_key\", \"source_partition\"]"
+    ));
+    assert_eq!(sources.matches("name = \"source_partition\"").count(), 2);
+
+    let workload = kafka_join_workload_config(
+        "broker",
+        "left",
+        "right",
+        "temporal-left",
+        "temporal-right",
+        "group",
+        "matrix-left",
+        "matrix-right",
+        "matrix-group",
+        "",
+        "",
+        "",
+    );
+    assert!(workload
+        .contains("ON l.join_key = r.join_key\n AND l.source_partition = r.source_partition"));
 }
 
 #[test]
@@ -15758,6 +16590,7 @@ fn test_checkpoint_latency_snapshot(
 fn slo_mode_is_explicit_and_fail_closed() {
     for environment in [
         SOAK_CHECKPOINT_SLO_MODE_ENV,
+        SOAK_HOT_SLO_MODE_ENV,
         #[cfg(feature = "delta-lake-s3")]
         SOAK_EO_VISIBILITY_SLO_MODE_ENV,
     ] {
@@ -15776,6 +16609,35 @@ fn slo_mode_is_explicit_and_fail_closed() {
             assert!(error.contains("'certify' or 'observe'"), "{error}");
         }
     }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn observed_hot_path_slo_miss_remains_non_certifying() {
+    enforce_or_report_hot_path_slo(
+        SloMode::Observe,
+        "test workload",
+        0,
+        "p99",
+        51.0,
+        50,
+        "diagnostic",
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+#[should_panic(expected = "hot-path p99 bucket upper bound 51.000ms exceeds 50ms")]
+fn certified_hot_path_slo_miss_fails_closed() {
+    enforce_or_report_hot_path_slo(
+        SloMode::Certify,
+        "test workload",
+        0,
+        "p99",
+        51.0,
+        50,
+        "diagnostic",
+    );
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -16031,6 +16893,51 @@ fn checkpoint_observation_budget_rejects_invalid_metrics() {
     )
     .unwrap_err()
     .contains("recovery ceiling does not fit"));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            1,
+        ),
+        Duration::from_secs(170)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            2,
+        ),
+        Duration::from_secs(210)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            1,
+        ),
+        Duration::from_secs(230)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(
+            10_000,
+            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            Duration::from_secs(90),
+            2,
+        ),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        recovery_aware_durable_progress_window(u64::MAX, Duration::MAX, Duration::MAX, u32::MAX),
+        Duration::MAX
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -16397,7 +17304,20 @@ fn bounded_join_oracle_matches_one_sided_sql_contract() {
 #[test]
 fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     assert_eq!(CLUSTER_CHECKPOINT_TIMEOUT, Duration::from_secs(30));
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::AtLeastOnce, true),
+        CLUSTER_CHECKPOINT_TIMEOUT
+    );
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, false),
+        CLUSTER_CHECKPOINT_TIMEOUT
+    );
+    assert_eq!(
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, true),
+        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    );
     assert!(CLUSTER_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
+    assert!(CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
 
     let directory = tempfile::tempdir().unwrap();
     let path = write_config(
@@ -16418,6 +17338,7 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         JoinDelivery::AtLeastOnce,
         "",
         "",
+        "",
     );
     let config = std::fs::read_to_string(path).unwrap();
     let (_, checkpoint_and_later) = config.split_once("[checkpoint]").unwrap();
@@ -16425,6 +17346,99 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         .split_once("[checkpoint.storage]")
         .unwrap();
     assert!(checkpoint.contains("timeout = \"30s\""), "{checkpoint}");
+}
+
+#[cfg(feature = "kafka")]
+fn subscription_data_fixture(
+    partition: u16,
+    sequence: u64,
+    epoch: u64,
+    key: u64,
+    count: u64,
+    max_right_id: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "data",
+        "stream_generation": "0101010101010101010101010101010101010101010101010101010101010101",
+        "partition": partition.to_string(),
+        "partition_sequence": sequence.to_string(),
+        "committed_epoch": epoch.to_string(),
+        "row_offset": "0",
+        "row_count": "1",
+        "data": [{
+            "join_key": key,
+            "match_count": count,
+            "max_right_id": max_right_id,
+        }],
+    })
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn cluster_subscription_oracle_checks_duplicates_gaps_and_progress() {
+    let directory = tempfile::tempdir().unwrap();
+    let journal = directory.path().join("progress.log");
+    let mut observation = ClusterSubscriptionObservation::default();
+    let first = subscription_data_fixture(3, 40, 7, 11, 2, 9);
+    observation.observe_data(&first).unwrap();
+    observation
+        .observe_data(&subscription_data_fixture(1, 12, 7, 22, 4, 17))
+        .unwrap();
+    observation
+        .observe_data(&subscription_data_fixture(3, 41, 7, 11, 3, 19))
+        .unwrap();
+    observation
+        .observe_data(&first)
+        .expect("an exact duplicate chunk is idempotent");
+    let conflict = subscription_data_fixture(3, 40, 7, 11, 99, 9);
+    assert!(observation.observe_data(&conflict).is_err());
+
+    observation
+        .observe_progress(
+            &serde_json::json!({
+                "type": "progress",
+                "stream_generation": "0101010101010101010101010101010101010101010101010101010101010101",
+                "epoch": "7",
+                "checkpoint_id": "7",
+            }),
+            &journal,
+        )
+        .unwrap();
+    assert_eq!(load_subscription_progress(&journal).unwrap(), Some(7));
+    assert!(observation
+        .observe_data(&subscription_data_fixture(3, 43, 8, 11, 4, 29))
+        .is_err());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn cluster_subscription_input_oracle_is_independent_and_bounded_by_key_count() {
+    let produced = ProducedPrefix {
+        count: 3,
+        end_offsets: vec![3, 3],
+        expected_pairs: BTreeSet::from([(0, 0), (0, 1), (1, 1), (2, 2)]),
+        expected_temporal_pairs: BTreeSet::new(),
+        elapsed: Duration::from_secs(1),
+        broker_acked_at: Instant::now(),
+    };
+    let expected = expected_cluster_subscription_aggregate(&produced, 4, 0);
+    assert!(!expected.is_empty());
+    assert!(expected.len() <= 4);
+    assert_eq!(expected.values().map(|(count, _)| count).sum::<u64>(), 3);
+    let workload = cluster_subscription_workload_config();
+    assert!(workload.contains("name = \"soak_subscription_aggregate\""));
+    assert!(workload.contains("FROM join_left"));
+    assert!(workload.contains("WHERE join_key >= 0"));
+    assert!(workload.contains("WITH ('retain_history' = '256mb')"));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn cluster_subscription_observer_retries_gateway_reset_without_close_handshake() {
+    let reset = tungstenite::Error::Protocol(
+        tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+    );
+    assert!(subscription_websocket_error_is_retryable(&reset));
 }
 
 #[cfg(feature = "kafka")]

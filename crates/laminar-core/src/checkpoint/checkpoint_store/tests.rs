@@ -5,7 +5,10 @@ use crate::checkpoint::checkpoint_manifest::{
     checkpoint_sha256, PreparedSinkDescriptor, ReferencedStateChunk, StateFrameKey,
     PREPARED_SINK_DESCRIPTOR_VERSION,
 };
-use crate::checkpoint::StateFrame;
+use crate::checkpoint::{
+    OutputPartitionId, OutputSegmentRef, PartitionSequence, StateFrame, StreamGeneration,
+    SubscriptionDigest, SubscriptionProtocolVersion,
+};
 
 fn manifest_with_payload(payload: &[u8]) -> CheckpointManifest {
     let one = KeyGroupCount::try_from(1_u16).unwrap();
@@ -360,5 +363,152 @@ async fn in_memory_store_passes_conditional_put_probe() {
     probe_object_store_conditional_update(&backing, "test", Duration::from_secs(1))
         .await
         .unwrap();
+}
+
+fn subscription_segment(payload: &[u8], object_key: &str) -> OutputSegmentRef {
+    OutputSegmentRef {
+        protocol_version: SubscriptionProtocolVersion::CURRENT,
+        object_key: object_key.into(),
+        stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes([1; 32])),
+        partition: OutputPartitionId::new(0),
+        first_sequence: PartitionSequence::FIRST,
+        exclusive_end_sequence: PartitionSequence::new(1),
+        frame_count: 1,
+        row_count: 1,
+        encoded_length: payload.len() as u64,
+        schema_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        payload_digest: SubscriptionDigest::for_bytes(
+            b"laminardb-subscription-segment-v1",
+            payload,
+        ),
+    }
+}
+
+#[tokio::test]
+async fn subscription_segment_create_is_idempotent_but_conflicts_fail_closed() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let object_key = "subscription-output/deployment/stream/generation/0/0-1-digest.arrow";
+    let payload = Bytes::from_static(b"immutable subscription segment");
+    let segment = subscription_segment(&payload, object_key);
+
+    store
+        .save_subscription_segment(&segment, payload.clone())
+        .await
+        .unwrap();
+    store
+        .save_subscription_segment(&segment, payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_subscription_segment(&segment).await.unwrap(),
+        Some(payload.clone())
+    );
+
+    let conflicting_payload = Bytes::from_static(b"conflicting immutable segment!");
+    assert_eq!(conflicting_payload.len(), payload.len());
+    let conflicting = subscription_segment(&conflicting_payload, object_key);
+    assert!(matches!(
+        store
+            .save_subscription_segment(&conflicting, conflicting_payload)
+            .await,
+        Err(CheckpointStoreError::Invalid(_))
+    ));
+}
+
+#[tokio::test]
+async fn subscription_segment_delete_uses_an_explicit_validated_key() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let payload = Bytes::from_static(b"retired subscription segment");
+    let segment = subscription_segment(
+        &payload,
+        "subscription-output/deployment/stream/generation/0/1-2-digest.arrow",
+    );
+    store
+        .save_subscription_segment(&segment, payload)
+        .await
+        .unwrap();
+    store
+        .delete_subscription_segment(&segment.object_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_subscription_segment(&segment).await.unwrap(),
+        None
+    );
+    assert!(store
+        .delete_subscription_segment("../escape")
+        .await
+        .is_err());
+}
+
+fn canonical_subscription_key(checkpoint_id: u64, segment: &OutputSegmentRef) -> String {
+    let deployment = uuid::Uuid::from_u128(1);
+    let stream_key = SubscriptionDigest::from_bytes([3; 32]);
+    format!(
+        "subscription-output/{deployment}/{stream_key}/{}/0/checkpoint={checkpoint_id:020}/{:020}-{:020}-{}.arrow",
+        segment.stream_generation,
+        segment.first_sequence.get(),
+        segment.exclusive_end_sequence.get(),
+        segment.payload_digest,
+    )
+}
+
+#[tokio::test]
+async fn orphan_cleanup_uses_committed_reachability_and_attempt_bounds() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let orphan_payload = Bytes::from_static(b"orphan");
+    let retained_payload = Bytes::from_static(b"retained");
+    let newer_payload = Bytes::from_static(b"newer");
+    let mut orphan = subscription_segment(&orphan_payload, "subscription-output/placeholder");
+    orphan.object_key = canonical_subscription_key(1, &orphan);
+    let mut retained = subscription_segment(&retained_payload, "subscription-output/placeholder");
+    retained.object_key = canonical_subscription_key(1, &retained);
+    let mut newer = subscription_segment(&newer_payload, "subscription-output/placeholder");
+    newer.object_key = canonical_subscription_key(2, &newer);
+    for (segment, payload) in [
+        (&orphan, orphan_payload.clone()),
+        (&retained, retained_payload.clone()),
+        (&newer, newer_payload.clone()),
+    ] {
+        store
+            .save_subscription_segment(segment, payload)
+            .await
+            .unwrap();
+    }
+
+    let reachable = std::collections::BTreeSet::from([retained.object_key.clone()]);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let grace_report = store
+        .delete_subscription_orphans(&reachable, 1, now_ms.saturating_sub(1_000))
+        .await
+        .unwrap();
+    assert_eq!(grace_report.objects_deleted, 0);
+    assert_eq!(grace_report.bytes_remaining, orphan.encoded_length);
+
+    let grace_before_ms = now_ms.saturating_add(1_000);
+    let report = store
+        .delete_subscription_orphans(&reachable, 1, grace_before_ms)
+        .await
+        .unwrap();
+    assert_eq!(report.objects_scanned, 3);
+    assert_eq!(report.objects_deleted, 1);
+    assert_eq!(report.bytes_deleted, orphan.encoded_length);
+    assert_eq!(report.bytes_remaining, 0);
+    assert!(store
+        .load_subscription_segment(&orphan)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.load_subscription_segment(&retained).await.unwrap(),
+        Some(retained_payload)
+    );
+    assert_eq!(
+        store.load_subscription_segment(&newer).await.unwrap(),
+        Some(newer_payload)
+    );
 }
 use std::time::Duration;

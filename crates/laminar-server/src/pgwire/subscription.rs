@@ -14,7 +14,7 @@ use pgwire::api::Type;
 use pgwire::error::{PgWireError, PgWireResult};
 
 use laminar_db::subscription::{
-    PortalFrame, SubscribeStart, SubscriptionFrameLease, SubscriptionPortal,
+    PortalFrame, SubscribeStart, SubscriptionEnvelope, SubscriptionFrameLease, SubscriptionPortal,
 };
 use laminar_db::LaminarDB;
 
@@ -54,6 +54,18 @@ pub(super) fn subscription_open_error(name: &str, error: laminar_db::DbError) ->
         | laminar_db::DbError::SubscriptionReplayPruned { .. }
         | laminar_db::DbError::SubscriptionEpochNotCommitted { .. } => "22023",
         laminar_db::DbError::Pipeline(_) => "53300",
+        laminar_db::DbError::Subscription(error) => match error {
+            laminar_db::subscription::ClusterSubscriptionError::UnsupportedPlan { .. } => "0A000",
+            laminar_db::subscription::ClusterSubscriptionError::GenerationMismatch
+            | laminar_db::subscription::ClusterSubscriptionError::EpochNotCommitted { .. }
+            | laminar_db::subscription::ClusterSubscriptionError::ReplayPruned { .. }
+            | laminar_db::subscription::ClusterSubscriptionError::ResumeTokenInvalid
+            | laminar_db::subscription::ClusterSubscriptionError::ResumeTokenExpired
+            | laminar_db::subscription::ClusterSubscriptionError::RetentionLost => "22023",
+            laminar_db::subscription::ClusterSubscriptionError::SubscriberLagged => "54000",
+            laminar_db::subscription::ClusterSubscriptionError::BackendUnavailable => "58000",
+            _ => "XX000",
+        },
         laminar_db::DbError::Sql(_)
         | laminar_db::DbError::SqlParse(_)
         | laminar_db::DbError::DataFusion(_)
@@ -105,21 +117,32 @@ pub(super) fn subscription_query_response(
                 }
                 s.batch = None;
             }
-            match s.portal.next_frame().await {
+            match s.portal.next_envelope().await {
                 None => return None,
-                Some(PortalFrame::Batch {
-                    batch,
-                    sequence,
-                    lease,
+                Some(SubscriptionEnvelope {
+                    frame:
+                        PortalFrame::Batch {
+                            batch,
+                            sequence,
+                            lease,
+                        },
+                    ..
                 }) if batch.num_rows() > 0 => {
                     s.batch = Some(BatchCursor::new(batch, sequence, lease));
                 }
-                Some(PortalFrame::Batch { .. }) => {}
-                Some(PortalFrame::Barrier {
-                    sequence,
-                    epoch,
-                    checkpoint_id,
-                    through_sequence,
+                Some(SubscriptionEnvelope {
+                    frame: PortalFrame::Batch { .. },
+                    ..
+                }) => {}
+                Some(SubscriptionEnvelope {
+                    frame:
+                        PortalFrame::Barrier {
+                            sequence,
+                            epoch,
+                            checkpoint_id,
+                            through_sequence,
+                        },
+                    ..
                 }) => {
                     let row = encode_subscription_progress_row(
                         &s.fields,
@@ -134,7 +157,10 @@ pub(super) fn subscription_query_response(
                     }
                     return Some((row, s));
                 }
-                Some(PortalFrame::Lagged(n)) => {
+                Some(SubscriptionEnvelope {
+                    frame: PortalFrame::Lagged(n),
+                    ..
+                }) => {
                     let err = user_error(
                         "54000",
                         format!("subscription lagged: skipped {n} messages, terminating"),
@@ -142,7 +168,10 @@ pub(super) fn subscription_query_response(
                     s.failed = true;
                     return Some((Err(err), s));
                 }
-                Some(PortalFrame::Error { message }) => {
+                Some(SubscriptionEnvelope {
+                    frame: PortalFrame::Error { message },
+                    ..
+                }) => {
                     let err = user_error("XX000", format!("subscription failed: {message}"));
                     s.failed = true;
                     return Some((Err(err), s));

@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_INCREMENTAL: 0
+      # Coverage instrumentation grows the same large async recovery test frames exercised by CI.
+      RUST_MIN_STACK: 4194304
     steps:
       - uses: actions/checkout@v6
       # The --all-features build under -C instrument-coverage (run 3x in this

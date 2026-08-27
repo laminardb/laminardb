@@ -11,10 +11,11 @@ use std::sync::Arc;
 use futures::stream;
 use pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::PgWireResult;
+use pgwire::messages::data::DataRow;
 use sqlparser::ast::{CloseCursor, FetchDirection, Value as AstValue};
 use tokio::sync::Mutex as TokioMutex;
 
-use laminar_db::subscription::{PortalFrame, SubscriptionPortal};
+use laminar_db::subscription::{PortalFrame, SubscriptionEnvelope, SubscriptionPortal};
 use laminar_db::LaminarDB;
 
 use super::dispatch::user_error;
@@ -39,6 +40,12 @@ struct CursorInner {
 struct CursorState {
     portal: SubscriptionPortal,
     batch: Option<BatchCursor>,
+}
+
+struct FetchState {
+    cursor: ActiveCursor,
+    fields: Arc<Vec<FieldInfo>>,
+    remaining: u64,
 }
 
 #[derive(Clone)]
@@ -205,116 +212,124 @@ pub(super) fn fetch_response(cursor: ActiveCursor, target: FetchTarget) -> Respo
     let fields = Arc::new(subscription_field_infos(&cursor.schema, None));
     let data_columns = cursor.schema.fields().len();
     let FetchTarget::Count(remaining) = target;
-
-    struct State {
-        cursor: ActiveCursor,
-        fields: Arc<Vec<FieldInfo>>,
-        remaining: u64,
-    }
-
-    let init = State {
+    let init = FetchState {
         cursor,
         fields: Arc::clone(&fields),
         remaining,
     };
+    let row_stream = stream::unfold(init, move |state| next_fetch_row(state, data_columns));
+    Response::Query(QueryResponse::new(fields, row_stream))
+}
 
-    let row_stream = stream::unfold(init, move |mut s| async move {
-        loop {
-            if s.remaining == 0 {
+async fn next_fetch_row(
+    mut state: FetchState,
+    data_columns: usize,
+) -> Option<(PgWireResult<DataRow>, FetchState)> {
+    loop {
+        if state.remaining == 0 || state.cursor.inner.exhausted.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut cursor_state = state.cursor.inner.state.lock().await;
+        if let Some(batch) = cursor_state.batch.as_mut() {
+            if let Some(row) = batch.next_row(&state.fields) {
+                let failed = row.is_err();
+                if failed || batch.is_exhausted() {
+                    cursor_state.batch = None;
+                }
+                if failed {
+                    state.cursor.inner.exhausted.store(true, Ordering::Release);
+                }
+                drop(cursor_state);
+                if !failed {
+                    state.remaining = state.remaining.saturating_sub(1);
+                }
+                return Some((row, state));
+            }
+            cursor_state.batch = None;
+        }
+
+        let next = match tokio::time::timeout(
+            SUBSCRIPTION_FETCH_WAIT,
+            cursor_state.portal.next_envelope(),
+        )
+        .await
+        {
+            Ok(next) => next,
+            Err(_) => return None,
+        };
+        match next {
+            None => {
+                drop(cursor_state);
+                state.cursor.inner.exhausted.store(true, Ordering::Release);
                 return None;
             }
-            if s.cursor.inner.exhausted.load(Ordering::Acquire) {
-                return None;
+            Some(SubscriptionEnvelope {
+                frame:
+                    PortalFrame::Batch {
+                        batch,
+                        sequence,
+                        lease,
+                    },
+                ..
+            }) if batch.num_rows() > 0 => {
+                cursor_state.batch = Some(BatchCursor::new(batch, sequence, lease));
             }
-
-            let mut cursor_state = s.cursor.inner.state.lock().await;
-            if let Some(batch) = cursor_state.batch.as_mut() {
-                if let Some(row) = batch.next_row(&s.fields) {
-                    let failed = row.is_err();
-                    if failed || batch.is_exhausted() {
-                        cursor_state.batch = None;
-                    }
-                    if failed {
-                        s.cursor.inner.exhausted.store(true, Ordering::Release);
-                    }
-                    drop(cursor_state);
-                    if !failed {
-                        s.remaining = s.remaining.saturating_sub(1);
-                    }
-                    return Some((row, s));
-                }
-                cursor_state.batch = None;
-            }
-
-            let next = match tokio::time::timeout(
-                SUBSCRIPTION_FETCH_WAIT,
-                cursor_state.portal.next_frame(),
-            )
-            .await
-            {
-                Ok(next) => next,
-                Err(_) => {
-                    drop(cursor_state);
-                    return None;
-                }
-            };
-            match next {
-                None => {
-                    drop(cursor_state);
-                    s.cursor.inner.exhausted.store(true, Ordering::Release);
-                    return None;
-                }
-                Some(PortalFrame::Batch {
-                    batch,
-                    sequence,
-                    lease,
-                }) if batch.num_rows() > 0 => {
-                    cursor_state.batch = Some(BatchCursor::new(batch, sequence, lease));
-                }
-                Some(PortalFrame::Batch { .. }) => {}
-                Some(PortalFrame::Barrier {
-                    sequence,
-                    epoch,
-                    checkpoint_id,
-                    through_sequence,
-                }) => {
-                    let row = encode_subscription_progress_row(
-                        &s.fields,
-                        data_columns,
+            Some(SubscriptionEnvelope {
+                frame: PortalFrame::Batch { .. },
+                ..
+            }) => {}
+            Some(SubscriptionEnvelope {
+                frame:
+                    PortalFrame::Barrier {
                         sequence,
                         epoch,
                         checkpoint_id,
                         through_sequence,
-                    );
-                    let failed = row.is_err();
-                    drop(cursor_state);
-                    if failed {
-                        s.cursor.inner.exhausted.store(true, Ordering::Release);
-                    } else {
-                        s.remaining = s.remaining.saturating_sub(1);
-                    }
-                    return Some((row, s));
+                    },
+                ..
+            }) => {
+                let row = encode_subscription_progress_row(
+                    &state.fields,
+                    data_columns,
+                    sequence,
+                    epoch,
+                    checkpoint_id,
+                    through_sequence,
+                );
+                let failed = row.is_err();
+                drop(cursor_state);
+                if failed {
+                    state.cursor.inner.exhausted.store(true, Ordering::Release);
+                } else {
+                    state.remaining = state.remaining.saturating_sub(1);
                 }
-                Some(PortalFrame::Lagged(n)) => {
-                    drop(cursor_state);
-                    s.cursor.inner.exhausted.store(true, Ordering::Release);
-                    let err = user_error(
-                        "54000",
-                        format!("subscription lagged: skipped {n} messages, terminating cursor"),
-                    );
-                    return Some((Err(err), s));
-                }
-                Some(PortalFrame::Error { message }) => {
-                    drop(cursor_state);
-                    s.cursor.inner.exhausted.store(true, Ordering::Release);
-                    let err = user_error(
-                        "XX000",
-                        format!("subscription failed: {message}; terminating cursor"),
-                    );
-                    return Some((Err(err), s));
-                }
+                return Some((row, state));
+            }
+            Some(SubscriptionEnvelope {
+                frame: PortalFrame::Lagged(skipped),
+                ..
+            }) => {
+                drop(cursor_state);
+                state.cursor.inner.exhausted.store(true, Ordering::Release);
+                let error = user_error(
+                    "54000",
+                    format!("subscription lagged: skipped {skipped} messages, terminating cursor"),
+                );
+                return Some((Err(error), state));
+            }
+            Some(SubscriptionEnvelope {
+                frame: PortalFrame::Error { message },
+                ..
+            }) => {
+                drop(cursor_state);
+                state.cursor.inner.exhausted.store(true, Ordering::Release);
+                let error = user_error(
+                    "XX000",
+                    format!("subscription failed: {message}; terminating cursor"),
+                );
+                return Some((Err(error), state));
             }
         }
-    });
-    Response::Query(QueryResponse::new(fields, row_stream))
+    }
 }

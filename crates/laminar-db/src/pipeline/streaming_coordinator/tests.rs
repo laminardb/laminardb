@@ -545,6 +545,73 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
     assert_eq!(written_rows.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+    let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
+    let attempt = CheckpointAttempt::new(7, 7);
+    let coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::clone(&shutdown),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    )
+    .with_checkpoint_complete_rx(completion_rx);
+    source_tx
+        .send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(42),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+        })
+        .await
+        .unwrap();
+
+    let callback = MockCallback::new();
+    callback
+        .external_commit_backpressure
+        .store(true, Ordering::Release);
+    let written_rows = Arc::clone(&callback.written_rows);
+    let published = Arc::clone(&callback.published_barriers);
+    let observed_rows = Arc::clone(&written_rows);
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            observed_rows.load(Ordering::Acquire),
+            0,
+            "source input ran before the durable output cut resolved"
+        );
+        completion_tx
+            .send(CheckpointCompletion::new(
+                attempt,
+                FxHashMap::default(),
+                false,
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observed_rows.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source input did not resume after checkpoint completion");
+        shutdown.notify_one();
+    });
+
+    let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+        .await
+        .expect("coordinator did not settle external commit backpressure");
+    release.await.unwrap();
+    drop(source_tx);
+    assert!(matches!(exit, ExitReason::Shutdown));
+    assert_eq!(written_rows.load(Ordering::Acquire), 1);
+    assert_eq!(published.lock().as_slice(), &[(7, 7)]);
+}
+
 fn assignment_fence(
     version: u64,
     participants: &[u64],
@@ -677,6 +744,10 @@ struct MockCallback {
     publish_barrier_error: Arc<Mutex<Option<String>>>,
     publication_error: Arc<Mutex<Option<String>>>,
     sink_publication_error: Arc<Mutex<Option<String>>>,
+    #[cfg(feature = "cluster")]
+    subscription_output_commits: Arc<AtomicU64>,
+    #[cfg(feature = "cluster")]
+    subscription_output_aborts: Arc<AtomicU64>,
     written_rows: Arc<AtomicU64>,
     published_barriers_observed_at_close: Arc<AtomicU64>,
     invalidated_subscriptions: Arc<Mutex<Vec<String>>>,
@@ -687,6 +758,8 @@ struct MockCallback {
     barrier_control_installed: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     intake_pause_call_audit: Arc<AtomicU64>,
+    external_checkpoint_pressure: Arc<AtomicBool>,
+    external_commit_backpressure: Arc<AtomicBool>,
     handoff_replay_pending: bool,
     pending_vnode_transition: bool,
     vnode_transition_completions: Arc<AtomicU64>,
@@ -771,6 +844,10 @@ impl MockCallback {
             publish_barrier_error: Arc::new(Mutex::new(None)),
             publication_error: Arc::new(Mutex::new(None)),
             sink_publication_error: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            subscription_output_commits: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "cluster")]
+            subscription_output_aborts: Arc::new(AtomicU64::new(0)),
             written_rows: Arc::new(AtomicU64::new(0)),
             published_barriers_observed_at_close: Arc::new(AtomicU64::new(0)),
             invalidated_subscriptions: Arc::new(Mutex::new(Vec::new())),
@@ -781,6 +858,8 @@ impl MockCallback {
             barrier_control_installed: Arc::new(AtomicBool::new(false)),
             intake_gate: Arc::new(AtomicBool::new(false)),
             intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
+            external_checkpoint_pressure: Arc::new(AtomicBool::new(false)),
+            external_commit_backpressure: Arc::new(AtomicBool::new(false)),
             handoff_replay_pending: false,
             pending_vnode_transition: false,
             vnode_transition_completions: Arc::new(AtomicU64::new(0)),
@@ -818,7 +897,7 @@ impl Drop for MockCallback {
 }
 
 // The test double mirrors the async production contract without performing asynchronous I/O.
-#[allow(clippy::unused_async_trait_impl)]
+#[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
 impl PipelineCallback for MockCallback {
     fn pin_source_frontiers_for_new_cycle(&mut self) -> Result<(), String> {
         self.source_frontier_pin_cycles
@@ -935,6 +1014,18 @@ impl PipelineCallback for MockCallback {
     fn intake_paused(&self) -> bool {
         self.intake_pause_call_audit.fetch_add(1, Ordering::Relaxed);
         self.intake_gate.load(Ordering::Acquire)
+    }
+
+    fn external_output_pressure(&self) -> crate::pipeline::callback::ExternalOutputPressure {
+        use crate::pipeline::callback::ExternalOutputPressure;
+
+        if self.external_commit_backpressure.load(Ordering::Acquire) {
+            ExternalOutputPressure::CommitBackpressured
+        } else if self.external_checkpoint_pressure.load(Ordering::Acquire) {
+            ExternalOutputPressure::CheckpointDue
+        } else {
+            ExternalOutputPressure::Normal
+        }
     }
 
     fn fault_on_cycle_error(&self) -> bool {
@@ -1098,6 +1189,19 @@ impl PipelineCallback for MockCallback {
             None => Ok(()),
         }
     }
+
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {
+        self.subscription_output_commits
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {
+        self.subscription_output_aborts
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
     async fn write_to_sinks(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -1167,24 +1271,26 @@ impl PipelineCallback for MockCallback {
         self.watermark
     }
 
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         if let Some(error) = self.publish_barrier_error.lock().take() {
             return Err(error);
         }
         self.published_barriers
             .lock()
             .push((attempt.epoch, attempt.checkpoint_id));
+        self.external_commit_backpressure
+            .store(false, Ordering::Release);
         Ok(())
     }
 
-    fn reserve_subscription_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         self.reserved_subscription_cuts.lock().push(attempt);
         #[cfg(feature = "cluster")]
         self.fence_process_authority_at(ProcessAuthorityFencePoint::SubscriptionCut);
         Ok(())
     }
 
-    fn abort_subscription_cut(&self, attempt: CheckpointAttempt) {
+    fn abort_subscription_cut(&mut self, attempt: CheckpointAttempt) {
         self.aborted_subscription_cuts.lock().push(attempt);
     }
 
@@ -2960,6 +3066,33 @@ fn checkpoint_admission_serializes_every_durable_tail() {
         .checkpoint_in_flight
         .store(1, std::sync::atomic::Ordering::Release);
     assert!(!coordinator.checkpoint_capacity_available());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn pending_output_accelerates_only_a_configured_periodic_checkpoint() {
+    let mut periodic = admission_coordinator(Vec::new());
+    periodic.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::from_secs(60));
+    periodic.last_checkpoint = Instant::now();
+    let mut callback = MockCallback::new();
+    callback
+        .external_checkpoint_pressure
+        .store(true, Ordering::Release);
+
+    let admission = periodic
+        .checkpoint_admission(&mut callback)
+        .await
+        .expect("pending output must accelerate the configured periodic cut");
+    assert!(!admission.manual);
+
+    for schedule in [CheckpointSchedule::Manual, CheckpointSchedule::Disabled] {
+        let mut coordinator = admission_coordinator(Vec::new());
+        coordinator.config.checkpoint_schedule = schedule;
+        assert!(coordinator
+            .checkpoint_admission(&mut callback)
+            .await
+            .is_none());
+    }
 }
 
 #[tokio::test]
@@ -9097,6 +9230,33 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
     assert_eq!(callback.written_rows.load(Ordering::SeqCst), 0);
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cursor_settlement_failure_aborts_before_subscription_output_commit() {
+    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.pending_offsets.push(None);
+    let mut callback = MockCallback::new();
+    let commits = Arc::clone(&callback.subscription_output_commits);
+    let aborts = Arc::clone(&callback.subscription_output_aborts);
+
+    let error = coordinator
+        .publish_cycle_outputs(&mut callback, &CycleOutcome::clean(FxHashMap::default()))
+        .await
+        .expect_err("cursor roster divergence must fail publication");
+
+    assert!(error.to_string().contains("cursor slot counts diverged"));
+    assert_eq!(commits.load(Ordering::SeqCst), 0);
+    assert_eq!(aborts.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn fatal_cycle_error_faults_at_least_once_before_publication() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -10461,7 +10621,7 @@ impl PipelineCallback for BackpressuredCallback {
     fn current_watermark(&self) -> i64 {
         self.inner.current_watermark()
     }
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
         self.inner.publish_barrier(attempt)
     }
     async fn service_checkpoint_control(

@@ -13,10 +13,11 @@ use std::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::DataType;
 use async_trait::async_trait;
 use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
+#[cfg(feature = "cluster")]
+use laminar_core::checkpoint::OutputDistributionCertificate;
 #[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
 use laminar_core::state::KeyGroupCount;
@@ -32,12 +33,10 @@ use crate::aggregate_state::{
 #[cfg(feature = "cluster")]
 use crate::aggregate_state::{
     AggStateRestorePreflight, OwnedAggVnodeRestore, PreparedAggVnodeTransition,
-    RetiredAggVnodeTransition,
+    PreparedAggregateEmission, RetiredAggVnodeTransition,
 };
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-#[cfg(feature = "cluster")]
-use crate::operator::capability::{ManagedStateContract, OperatorStateClass};
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator_graph::{
@@ -51,169 +50,15 @@ use crate::sql_analysis::{
     extract_projection_filter, projection_sql_preserving_weight, single_source_table,
 };
 
-// Keep batches created by local aggregate coalescing small enough to bound both accumulator work
-// and the temporary old-plus-new Arrow buffers held while concatenating one group.
-const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;
-const LOCAL_AGG_COALESCE_MAX_BATCH_ROWS: usize = 1_024;
+mod apply_failure;
+mod batch_coalescing;
+#[cfg(feature = "cluster")]
+mod subscription_output;
 
-/// Whether Arrow concatenation is representation-stable for this local aggregate input type.
-///
-/// Dictionary and nested encodings can make independently valid batches fail only when their
-/// value spaces or offsets are merged. Preserve their original apply boundaries unless a
-/// type-specific coalescing proof is added.
-fn certifies_local_aggregate_concat_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Null
-            | DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Timestamp(_, _)
-            | DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Duration(_)
-            | DataType::Interval(_)
-            | DataType::Binary
-            | DataType::FixedSizeBinary(_)
-            | DataType::LargeBinary
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Decimal32(_, _)
-            | DataType::Decimal64(_, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Decimal256(_, _)
-    )
-}
-
-/// Coalesce already-projected local aggregate input without changing row or schema order.
-///
-/// The input is consumed so concatenation overlaps new Arrow buffers with only the current group.
-/// Existing oversized batches are preserved: these limits constrain only batches created here.
-fn coalesce_local_aggregate_batches(
-    op_name: &str,
-    batches: Vec<RecordBatch>,
-) -> Result<Vec<RecordBatch>, DbError> {
-    fn flush_group(
-        op_name: &str,
-        group: &mut Vec<RecordBatch>,
-        output: &mut Vec<RecordBatch>,
-    ) -> Result<(), DbError> {
-        match group.len() {
-            0 => Ok(()),
-            1 => {
-                output.push(
-                    group
-                        .pop()
-                        .expect("single aggregate coalescing group batch"),
-                );
-                Ok(())
-            }
-            _ => {
-                let schema = group[0].schema();
-                let combined = arrow::compute::concat_batches(&schema, group.as_slice())
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "aggregate '{op_name}' local input concat failed before state application: {error}"
-                        ))
-                    })?;
-                let logical_bytes = laminar_core::shuffle::logical_batch_bytes(&combined)
-                    .map_err(|error| {
-                        DbError::Pipeline(format!(
-                            "aggregate '{op_name}' local input size accounting failed before state application: {error}"
-                        ))
-                    })?;
-                if combined.num_rows() > LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
-                    || logical_bytes > LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES
-                {
-                    return Err(DbError::Pipeline(format!(
-                        "aggregate '{op_name}' coalesced local input exceeded its target before state application: {} rows/{logical_bytes} bytes (limits: {} rows/{} bytes)",
-                        combined.num_rows(),
-                        LOCAL_AGG_COALESCE_MAX_BATCH_ROWS,
-                        LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES,
-                    )));
-                }
-                group.clear();
-                output.push(combined);
-                Ok(())
-            }
-        }
-    }
-
-    // Retraction validity is checked at each weighted batch boundary. For example, [-1] then
-    // [+1] must reject the invalid prefix rather than being merged into a valid-looking zero.
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .index_of(laminar_core::changelog::WEIGHT_COLUMN)
-            .is_ok()
-    }) {
-        return Ok(batches);
-    }
-
-    if batches.iter().any(|batch| {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|field| !certifies_local_aggregate_concat_type(field.data_type()))
-    }) {
-        return Ok(batches);
-    }
-
-    let mut output = Vec::new();
-    let mut group = Vec::new();
-    let mut group_rows = 0usize;
-    let mut group_bytes = 0usize;
-
-    for batch in batches.into_iter().filter(|batch| batch.num_rows() != 0) {
-        let batch_rows = batch.num_rows();
-        let batch_bytes =
-            laminar_core::shuffle::logical_batch_bytes(&batch).map_err(|error| {
-                DbError::Pipeline(format!(
-                    "aggregate '{op_name}' local input size accounting failed before state application: {error}"
-                ))
-            })?;
-        let independently_coalescible = batch.num_rows() <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS
-            && batch_bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES;
-        if !independently_coalescible {
-            flush_group(op_name, &mut group, &mut output)?;
-            group_rows = 0;
-            group_bytes = 0;
-            output.push(batch);
-            continue;
-        }
-
-        let same_schema = group
-            .first()
-            .is_none_or(|first: &RecordBatch| first.schema().as_ref() == batch.schema().as_ref());
-        let next_rows = group_rows.checked_add(batch.num_rows());
-        let next_bytes = group_bytes.checked_add(batch_bytes);
-        let fits = same_schema
-            && next_rows.is_some_and(|rows| rows <= LOCAL_AGG_COALESCE_MAX_BATCH_ROWS)
-            && next_bytes.is_some_and(|bytes| bytes <= LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES);
-        if !fits {
-            flush_group(op_name, &mut group, &mut output)?;
-            group_rows = 0;
-            group_bytes = 0;
-        }
-        group.push(batch);
-        group_rows += batch_rows;
-        group_bytes += batch_bytes;
-    }
-    flush_group(op_name, &mut group, &mut output)?;
-    Ok(output)
-}
+use apply_failure::stateful_apply_outcome_unknown;
+use batch_coalescing::{coalesce_aggregate_batches, AggregateBatchCoalescing};
+#[cfg(test)]
+use batch_coalescing::{LOCAL_AGG_COALESCE_MAX_BATCH_ROWS, LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES};
 
 // Resolved on first `process()` call by introspecting the SQL.
 enum QueryState {
@@ -786,7 +631,7 @@ fn is_stream_window_marker(name: &str) -> bool {
 /// The parser analysis is exact for direct aggregate and single-source projection/filter shapes.
 /// Complex structure, unknown functions, analytics, and unrecognized grouping remain local-only;
 /// the descriptor must never guess "stateless".
-fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapability {
+pub(crate) fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapability {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return OperatorCapability::unclassified_sql_query();
     };
@@ -847,7 +692,7 @@ fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapabilit
         laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref());
     let has_grouping = match &select.group_by {
         GroupByExpr::Expressions(expressions, _) => !expressions.is_empty(),
-        GroupByExpr::All(_) => true,
+        GroupByExpr::All(_) => return OperatorCapability::uncertified_keyed_sql_aggregate(),
     };
     if !is_direct_single_source_shape(query, select) {
         return OperatorCapability::unclassified_sql_query();
@@ -892,6 +737,10 @@ pub(crate) struct SqlQueryOperator {
     #[cfg(feature = "cluster")]
     cluster_assignment_digest: Option<[u8; 32]>,
     #[cfg(feature = "cluster")]
+    subscription_certificate: Option<Arc<OutputDistributionCertificate>>,
+    #[cfg(feature = "cluster")]
+    prepared_aggregate_emission: Option<PreparedAggregateEmission>,
+    #[cfg(feature = "cluster")]
     cluster_peers: Arc<[u64]>,
     #[cfg(feature = "cluster")]
     peer_channels: BTreeMap<u64, AggPeerChannel>,
@@ -917,19 +766,6 @@ pub(crate) struct SqlQueryOperator {
     prepared_vnode_transition: Option<PreparedSqlVnodeTransition>,
     #[cfg(feature = "cluster")]
     vnode_transition_cleanup: Option<SqlVnodeTransitionCleanup>,
-}
-
-/// Classify a failure from a step that may already have changed operator state.
-///
-/// Ordinary errors are not safe to isolate or retry once mutation may have begun. Existing
-/// recovery and halt dispositions retain their stronger classification.
-fn stateful_apply_outcome_unknown(op_name: &str, phase: &str, error: DbError) -> DbError {
-    if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
-        return error;
-    }
-    DbError::StatefulOperatorPartialApply(format!(
-        "aggregate '{op_name}' {phase} failed after state application began; the apply outcome is unknown: {error}"
-    ))
 }
 
 impl SqlQueryOperator {
@@ -980,6 +816,10 @@ impl SqlQueryOperator {
             cluster_assignment: None,
             #[cfg(feature = "cluster")]
             cluster_assignment_digest: None,
+            #[cfg(feature = "cluster")]
+            subscription_certificate: None,
+            #[cfg(feature = "cluster")]
+            prepared_aggregate_emission: None,
             #[cfg(feature = "cluster")]
             cluster_peers: Arc::from([]),
             #[cfg(feature = "cluster")]
@@ -1142,24 +982,7 @@ impl SqlQueryOperator {
                 )));
             }
             #[cfg(feature = "cluster")]
-            if self.cluster_shuffle.is_some() {
-                let expected_state_class = if agg_state.num_group_cols() == 0 {
-                    OperatorStateClass::GlobalSingleton
-                } else {
-                    OperatorStateClass::VnodeKeyed
-                };
-                if self.capability.managed_state != Some(ManagedStateContract::SqlAggregateV1)
-                    || self.capability.state_class != expected_state_class
-                {
-                    return Err(DbError::Pipeline(format!(
-                        "[{}] query '{}': initialized aggregate state does not match its immutable cluster capability ({:?}, {:?})",
-                        laminar_core::error_codes::CLUSTER_STATE_LIFECYCLE_UNSUPPORTED,
-                        self.op_name,
-                        self.capability.state_class,
-                        self.capability.managed_state
-                    )));
-                }
-            }
+            self.validate_cluster_aggregate(&agg_state)?;
             self.log_execution_path(agg_state.compiled_projection().is_some());
             self.state = QueryState::Agg(Box::new(agg_state));
             return Ok(());
@@ -1387,7 +1210,7 @@ impl SqlQueryOperator {
     ) -> Result<Vec<RecordBatch>, DbError> {
         match &self.state {
             QueryState::Agg(aggregate) if aggregate.certifies_local_input_coalescing() => {
-                coalesce_local_aggregate_batches(&self.op_name, batches)
+                coalesce_aggregate_batches(&self.op_name, batches, AggregateBatchCoalescing::Input)
             }
             QueryState::Agg(_) => Ok(batches),
             _ => Err(DbError::Pipeline(
@@ -2399,6 +2222,9 @@ impl SqlQueryOperator {
             .any(|batch| batch.num_rows() != 0);
         let mut output = Vec::new();
         let mut drained_remote = false;
+        if self.prepared_aggregate_emission.is_some() {
+            return Ok(output);
+        }
         if self.queued_remote_events != 0 {
             if has_input {
                 return Err(DbError::InvalidOperation(format!(
@@ -2507,7 +2333,7 @@ impl SqlQueryOperator {
         &self,
         max_capture_bytes: u64,
     ) -> Result<AggCheckpointCapture, DbError> {
-        let (config, assignment, peers) = self.active_cluster_scope()?;
+        let (config, assignment, peers) = self.subscription_checkpoint_scope()?;
         if self.cluster_assignment_digest != Some(self.owner_map_digest(&assignment)) {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' checkpoint assignment digest is inconsistent",
@@ -2753,6 +2579,11 @@ impl SqlQueryOperator {
     }
 
     fn emit_agg_output(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "cluster")]
+        if let Some(output) = self.prepare_certified_subscription_output() {
+            return output;
+        }
+
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: emit_agg_output on non-agg".into(),
@@ -2804,7 +2635,7 @@ impl GraphOperator for SqlQueryOperator {
 
         #[cfg(feature = "cluster")]
         let (prepared_bytes, retired_bytes) = {
-            let staged = self
+            let staged_transition = self
                 .prepared_vnode_transition
                 .as_ref()
                 .map_or(0, |prepared| {
@@ -2813,6 +2644,8 @@ impl GraphOperator for SqlQueryOperator {
                         .accounted_state_bytes()
                         .saturating_add(prepared.topology.accounted_state_bytes())
                 });
+            let staged =
+                staged_transition.saturating_add(self.prepared_subscription_output_bytes());
             match self.vnode_transition_cleanup.as_ref() {
                 Some(SqlVnodeTransitionCleanup::Aborted(prepared)) => (
                     staged
@@ -2990,6 +2823,30 @@ impl GraphOperator for SqlQueryOperator {
             .map(|frontier| frontier.watermark.unwrap_or(i64::MIN))
             .collect::<Vec<_>>();
         self.process(inputs, &watermarks).await
+    }
+
+    #[cfg(feature = "cluster")]
+    fn take_prepared_subscription_output(
+        &mut self,
+    ) -> Option<crate::subscription::PreparedSubscriptionOutput> {
+        self.take_prepared_subscription_output_frames()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn certified_subscription_frontiers(
+        &self,
+    ) -> Result<Option<crate::subscription::CertifiedSubscriptionFrontiers>, DbError> {
+        self.capture_certified_subscription_frontiers()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_prepared_subscription_output(&mut self) {
+        self.publish_prepared_subscription_output();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_prepared_subscription_output(&mut self) {
+        self.discard_prepared_subscription_output();
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -3359,11 +3216,14 @@ impl GraphOperator for SqlQueryOperator {
         self.pending_cluster_input.is_none()
             && self.queued_remote_events == 0
             && self.last_broadcast == self.local_frontier
+            && self.prepared_aggregate_emission.is_none()
     }
 
     #[cfg(feature = "cluster")]
     fn checkpoint_drain_pending(&self) -> bool {
-        self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier
+        self.pending_cluster_input.is_some()
+            || self.last_broadcast != self.local_frontier
+            || self.prepared_aggregate_emission.is_some()
     }
 
     #[cfg(feature = "cluster")]
@@ -3504,12 +3364,7 @@ impl GraphOperator for SqlQueryOperator {
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
         #[cfg(feature = "cluster")]
-        if self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' cannot capture vnodes across pending shuffle work",
-                self.op_name
-            )));
-        }
+        self.require_vnode_state_boundary("capture vnode state")?;
         self.invalidate_local_aggregate_output_cache();
         let QueryState::Agg(aggregate) = &mut self.state else {
             return Ok(None);
@@ -3551,12 +3406,7 @@ impl GraphOperator for SqlQueryOperator {
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, state: &[u8]) -> Result<(), DbError> {
         #[cfg(feature = "cluster")]
-        if self.pending_cluster_input.is_some() || self.last_broadcast != self.local_frontier {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' cannot restore vnode {vnode} across pending shuffle work",
-                self.op_name
-            )));
-        }
+        self.require_vnode_state_boundary("restore vnode state")?;
         self.invalidate_local_aggregate_output_cache();
         let restore_bytes = state
             .len()
@@ -3646,7 +3496,7 @@ impl GraphOperator for SqlQueryOperator {
         &mut self,
         transition: ManagedVnodeTransition<'_>,
     ) -> Result<(), DbError> {
-        self.invalidate_local_aggregate_output_cache();
+        self.begin_subscription_vnode_transition()?;
         if self.prepared_vnode_transition.is_some() || self.vnode_transition_cleanup.is_some() {
             return Err(DbError::Checkpoint(format!(
                 "aggregate '{}' already owns vnode transition state",

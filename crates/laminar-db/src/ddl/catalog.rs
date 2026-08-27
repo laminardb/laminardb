@@ -72,6 +72,48 @@ pub(super) fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
 }
 
 impl LaminarDB {
+    #[cfg(feature = "cluster")]
+    pub(crate) fn catalog_manifest_inventory(
+        &self,
+    ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
+        let ordered = self.connector_manager.lock().ordered_ddl();
+        let namespace = self.catalog_namespace.lock();
+        if ordered.len() != namespace.len() {
+            return Err(DbError::Pipeline(format!(
+                "typed catalog has {} objects but the durable DDL inventory has {}",
+                namespace.len(),
+                ordered.len()
+            )));
+        }
+        ordered
+            .into_iter()
+            .map(|(canonical_name, ddl, catalog_generation)| {
+                let kind = namespace.get(&canonical_name).copied().ok_or_else(|| {
+                    DbError::Pipeline(format!(
+                        "DDL inventory entry '{canonical_name}' has no typed catalog owner"
+                    ))
+                })?;
+                Ok(laminar_core::cluster::control::CatalogManifestEntry {
+                    canonical_name,
+                    kind,
+                    catalog_generation,
+                    ddl,
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn reconcile_catalog_manifest_inventory(
+        &self,
+        manifest: &laminar_core::cluster::control::CatalogManifest,
+    ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
+        self.connector_manager
+            .lock()
+            .apply_stream_catalog_generations(&manifest.entries)?;
+        self.catalog_manifest_inventory()
+    }
+
     fn catalog_object_is_present(
         &self,
         name: &str,

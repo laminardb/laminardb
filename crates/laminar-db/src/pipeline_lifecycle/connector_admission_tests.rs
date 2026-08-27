@@ -1166,6 +1166,10 @@ async fn append_only_derived_interval_inputs_skip_mutation_admission() {
             has_analytic: false,
             has_frame: false,
             incremental: false,
+            subscription_output: None,
+            subscription_retention_bytes: 0,
+            catalog_generation: 1,
+            subscription_certificate: None,
         },
     )]);
 
@@ -1442,6 +1446,10 @@ async fn persisted_mutable_enrich_rejects_on_demand_lookup_provenance() {
             has_analytic: false,
             has_frame: false,
             incremental: false,
+            subscription_output: None,
+            subscription_retention_bytes: 0,
+            catalog_generation: 1,
+            subscription_certificate: None,
         });
 
     let error = db.start().await.unwrap_err();
@@ -1748,6 +1756,10 @@ fn temporal_stream_registration(name: &str) -> crate::connector_manager::StreamR
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        subscription_retention_bytes: 0,
+        catalog_generation: 1,
+        subscription_certificate: None,
     }
 }
 
@@ -1786,6 +1798,10 @@ fn temporal_mutation_routes_cannot_share_the_source_with_other_consumers() {
             has_analytic: false,
             has_frame: false,
             incremental: false,
+            subscription_output: None,
+            subscription_retention_bytes: 0,
+            catalog_generation: 1,
+            subscription_certificate: None,
         },
     );
     assert!(!has_only_temporal_right_consumers(
@@ -2452,6 +2468,10 @@ async fn source_preplanning_failure_retains_captured_generation_fence() {
                 has_analytic: false,
                 has_frame: false,
                 incremental: false,
+                subscription_output: None,
+                subscription_retention_bytes: 0,
+                catalog_generation: 1,
+                subscription_certificate: None,
             },
         );
         resolve_stream_output_schemas(&context, &streams, &Default::default(), &Default::default())

@@ -237,6 +237,10 @@ impl From<crate::DbError> for ApiError {
             DbError::Sql(e) => Self::sql_parse(e.to_string()),
             DbError::SqlParse(e) => Self::sql_parse(e.to_string()),
             DbError::Streaming(e) => Self::ingestion(e.to_string()),
+            DbError::Subscription(error) => Self::Subscription {
+                code: codes::SUBSCRIPTION_FAILED,
+                message: format!("[{}] {error}", error.code()),
+            },
             DbError::Shutdown => Self::shutdown(),
             DbError::InvalidOperation(msg) => Self::Query {
                 code: codes::QUERY_FAILED,
@@ -293,6 +297,20 @@ mod tests {
         let api_err: ApiError = db_err.into();
         assert_eq!(api_err.code(), codes::TABLE_NOT_FOUND);
         assert!(api_err.message().contains("foo"));
+    }
+
+    #[test]
+    fn structured_cluster_subscription_error_remains_a_subscription_error() {
+        let db_error = crate::DbError::Subscription(
+            crate::subscription::ClusterSubscriptionError::ReplayPruned { requested: 7 },
+        );
+        let api_error: ApiError = db_error.into();
+
+        assert!(matches!(&api_error, ApiError::Subscription { .. }));
+        assert_eq!(api_error.code(), codes::SUBSCRIPTION_FAILED);
+        assert!(api_error
+            .message()
+            .contains(laminar_core::error_codes::SUBSCRIPTION_REPLAY_PRUNED));
     }
 
     #[test]

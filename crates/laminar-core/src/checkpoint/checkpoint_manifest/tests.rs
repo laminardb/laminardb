@@ -92,7 +92,7 @@ fn all_idle_channels_have_no_watermark() {
 }
 
 #[test]
-fn v9_round_trip_carries_portability_channels_ranges_sinks_and_prior_chunk_refs() {
+fn v10_round_trip_carries_portability_channels_ranges_sinks_and_prior_chunk_refs() {
     let mut manifest = valid_manifest(9);
     manifest.source_offsets.insert(
         "source".into(),

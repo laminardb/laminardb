@@ -167,6 +167,12 @@ struct PendingGraphPassOperator {
     entered: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+#[cfg(feature = "cluster")]
+struct PendingPreparedGraphPassOperator {
+    prepared: Arc<std::sync::atomic::AtomicBool>,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
@@ -182,6 +188,42 @@ impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
             let _ = entered.send(());
         }
         std::future::pending().await
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for PendingPreparedGraphPassOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.prepared
+            .store(true, std::sync::atomic::Ordering::Release);
+        std::future::pending().await
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        true
+    }
+
+    fn abort_prepared_subscription_output(&mut self) {
+        if self
+            .prepared
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.aborted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
@@ -508,6 +550,8 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         checkpoint_leader_proofs: FxHashMap::default(),
         subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+        #[cfg(feature = "cluster")]
+        cluster_subscription_output: Default::default(),
         named_stream_names: rustc_hash::FxHashSet::default(),
         checkpoint_complete_tx,
         checkpoint_tail_runtime: tokio::runtime::Handle::current(),
@@ -1770,6 +1814,55 @@ async fn handoff_graph_drain_deadline_bounds_rotation_fence_wait() {
         .as_deref()
         .is_some_and(|reason| reason.contains("absolute attempt deadline")));
     drop(held_writer);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn checkpoint_graph_timeout_aborts_prepared_subscription_output() {
+    use laminar_core::checkpoint::{
+        ChangelogMode, OutputDistribution, OutputDistributionCertificate, OutputPartitionId,
+        PipelineIdentity, StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+    };
+
+    let mut callback = empty_callback_fixture();
+    let certificate = Arc::new(OutputDistributionCertificate {
+        version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+        protocol_version: SubscriptionProtocolVersion::CURRENT,
+        stream_id: "pending-output".into(),
+        catalog_generation: 1,
+        stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes([1; 32])),
+        final_operator_id: "stream:pending-output".into(),
+        distribution: OutputDistribution::Singleton {
+            partition: OutputPartitionId::new(0),
+        },
+        schema_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+        changelog_mode: ChangelogMode::FullPartitionSnapshot,
+        history_retention_bytes: 0,
+        query_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+        pipeline_identity: PipelineIdentity::empty(),
+    });
+    callback.graph.set_subscription_certificates(
+        std::iter::once(("pending-output".to_string(), certificate)).collect(),
+    );
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    callback.graph.push_test_node(
+        "pending-output",
+        Box::new(PendingPreparedGraphPassOperator {
+            prepared: Arc::clone(&prepared),
+            aborted: Arc::clone(&aborted),
+        }),
+    );
+
+    let error = callback
+        .drain_checkpoint_edges_until_inner(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .expect_err("the absolute graph deadline must cancel a pending pass");
+
+    assert!(error.to_string().contains("absolute attempt deadline"));
+    assert!(!prepared.load(std::sync::atomic::Ordering::Acquire));
+    assert!(aborted.load(std::sync::atomic::Ordering::Acquire));
 }
 
 #[cfg(feature = "cluster")]
@@ -3203,6 +3296,7 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
     // deferred source-barrier capture.
     let (mut request, operator_state) = callback
         .build_follower_checkpoint_request_until(
+            laminar_core::checkpoint::CheckpointAttempt::canonical(17),
             &assignment_fence,
             laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -3248,6 +3342,7 @@ async fn follower_capture_request_rejects_an_expired_deadline() {
 
     let error = callback
         .build_follower_checkpoint_request_until(
+            laminar_core::checkpoint::CheckpointAttempt::canonical(18),
             &assignment_fence,
             laminar_core::checkpoint::flags::NONE,
             tokio::time::Instant::now() - Duration::from_millis(1),
@@ -3320,6 +3415,12 @@ fn cluster_callback_fixture(
     let pipeline_watermark = Arc::new(std::sync::atomic::AtomicI64::new(
         startup_watermark.unwrap_or(i64::MIN),
     ));
+    let cluster_subscription_output =
+        crate::subscription::cluster::ClusterSubscriptionOutputState::new(
+            Vec::new(),
+            controller.try_live_local_process_authority_identity().ok(),
+        )
+        .unwrap();
 
     ClusterCallbackFixture {
         callback: ConnectorPipelineCallback {
@@ -3376,6 +3477,7 @@ fn cluster_callback_fixture(
             pending_follower_checkpoint: None,
             checkpoint_leader_proofs: FxHashMap::default(),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+            cluster_subscription_output,
             named_stream_names: rustc_hash::FxHashSet::default(),
             checkpoint_complete_tx,
             checkpoint_tail_runtime: tokio::runtime::Handle::current(),
@@ -3388,6 +3490,52 @@ fn cluster_callback_fixture(
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         },
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn subscription_writer_rejects_callback_process_identity_mismatch() {
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::VnodeRegistry;
+
+    let kv = Arc::new(InMemoryKv::new(NodeId(1)));
+    let control_kv: Arc<dyn ClusterKv> = kv;
+    let leader = authoritative_local_leader(control_kv).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(vec![NodeId(1)].into(), leader.fence.assignment_version);
+    let mut fixture = cluster_callback_fixture(registry, Arc::clone(&leader.controller), None);
+
+    let initial = fixture.callback.subscription_writer_authority(&[]);
+    assert!(initial.is_ok(), "{initial:?}");
+    let mut foreign_process = fixture
+        .callback
+        .cluster_subscription_output
+        .bound_process()
+        .unwrap();
+    foreign_process.process_term = foreign_process.process_term.checked_add(1).unwrap();
+    fixture
+        .callback
+        .cluster_subscription_output
+        .replace_bound_process_for_test(foreign_process);
+
+    let error = fixture
+        .callback
+        .subscription_writer_authority(&[])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("process authority changed"),
+        "{error}"
+    );
+    assert_eq!(
+        fixture
+            .callback
+            .prom
+            .cluster_subscription
+            .stale_writer_rejections_total
+            .get(),
+        1
+    );
 }
 
 #[cfg(feature = "cluster")]
@@ -4531,7 +4679,9 @@ async fn empty_idle_source_gaining_a_channel_activates_at_the_pinned_committed_c
     callback.watermark_states.insert("orders".into(), state);
     crate::pipeline::PipelineCallback::pin_source_frontiers_for_new_cycle(&mut callback).unwrap();
 
-    let request = callback.build_checkpoint_request().unwrap();
+    let request = callback
+        .build_checkpoint_request(CheckpointAttempt::canonical(1))
+        .unwrap();
     assert_eq!(request.channel_progress.len(), 1);
     let marker = &request.channel_progress[0];
     assert_eq!(marker.source_name, "orders");
@@ -4587,7 +4737,9 @@ async fn local_empty_partition_inventory_emits_its_logical_watermark_marker() {
     tracker.mark_idle(0);
     callback.tracker = Some(tracker);
 
-    let request = callback.build_checkpoint_request().unwrap();
+    let request = callback
+        .build_checkpoint_request(CheckpointAttempt::canonical(1))
+        .unwrap();
     assert_eq!(request.channel_progress.len(), 1);
     let marker = &request.channel_progress[0];
     assert_eq!(marker.source_name, "orders");

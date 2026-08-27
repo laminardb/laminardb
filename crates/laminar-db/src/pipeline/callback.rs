@@ -20,6 +20,30 @@ use rustc_hash::{FxHashMap, FxHashSet};
 const CHECKPOINT_CONTROL_DIRECT_FALLBACK: Duration = Duration::from_millis(250);
 const CHECKPOINT_CONTROL_POLL_FALLBACK: Duration = Duration::from_millis(25);
 
+/// Bounded-output pressure reported to the pipeline coordinator.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalOutputPressure {
+    /// No checkpoint or intake intervention is required.
+    Normal,
+    /// Accelerate the next configured periodic checkpoint without pausing compute.
+    CheckpointDue,
+    /// Stop compute intake while a prepared checkpoint cut completes.
+    CommitBackpressured,
+}
+
+impl ExternalOutputPressure {
+    #[cfg(any(feature = "cluster", test))]
+    pub(crate) const fn checkpoint_due(self) -> bool {
+        matches!(self, Self::CheckpointDue)
+    }
+
+    #[cfg(any(feature = "cluster", test))]
+    pub(crate) const fn commit_backpressured(self) -> bool {
+        matches!(self, Self::CommitBackpressured)
+    }
+}
+
 /// Push wake plus bounded KV fallback for clustered checkpoint control.
 #[cfg(feature = "cluster")]
 #[doc(hidden)]
@@ -522,6 +546,14 @@ pub trait PipelineCallback: Send + 'static {
         Ok(())
     }
 
+    /// Publish aggregate output bookkeeping after every cycle consumer accepted the output.
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {}
+
+    /// Restore retryable aggregate bookkeeping after cycle publication fails.
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {}
+
     /// Update materialized view stores with cycle results.
     ///
     /// # Errors
@@ -752,6 +784,13 @@ pub trait PipelineCallback: Send + 'static {
         false
     }
 
+    /// Pressure from bounded checkpoint-committable output. A due checkpoint accelerates the next
+    /// periodic cut without stopping compute. Commit backpressure keeps checkpoint completion and
+    /// control traffic live but stops source and deferred-input work until the prepared cut resolves.
+    fn external_output_pressure(&self) -> ExternalOutputPressure {
+        ExternalOutputPressure::Normal
+    }
+
     /// `true` while the runtime must not fold source or shuffle input into operator state.
     /// Cluster startup and coordinated recovery use this stronger fence; ordinary backpressure
     /// only pauses source polling.
@@ -774,19 +813,19 @@ pub trait PipelineCallback: Send + 'static {
     /// # Errors
     ///
     /// Returns an error if the subscription cut cannot be reserved atomically.
-    fn reserve_subscription_cut(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }
 
     /// Discard an unresolved subscription cut after checkpoint failure.
-    fn abort_subscription_cut(&self, _attempt: CheckpointAttempt) {}
+    fn abort_subscription_cut(&mut self, _attempt: CheckpointAttempt) {}
 
     /// Resolve the exact cut for external SUBSCRIBE consumers after durable commit.
     ///
     /// # Errors
     ///
     /// Returns an error if the committed cut cannot be published atomically.
-    fn publish_barrier(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }
 

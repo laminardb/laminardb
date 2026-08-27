@@ -109,3 +109,27 @@ fn bounded_batch_stream_round_trips_multiple_batches_and_fails_at_the_bound() {
         serialize_batches_stream_bounded(schema.as_ref(), inputs.iter(), 1).unwrap_err();
     assert!(tiny_error.to_string().contains("configured bound"));
 }
+
+#[test]
+fn bounded_lz4_stream_is_deterministic_compact_and_round_trips() {
+    let input = batch(&vec![7; 16_384]);
+    let schema = input.schema();
+    let plain = serialize_batches_stream_bounded(schema.as_ref(), [&input], usize::MAX).unwrap();
+    let compressed =
+        serialize_batches_stream_lz4_bounded(schema.as_ref(), [&input], usize::MAX).unwrap();
+    let repeated =
+        serialize_batches_stream_lz4_bounded(schema.as_ref(), [&input], usize::MAX).unwrap();
+
+    assert_eq!(compressed, repeated);
+    assert!(compressed.len() < plain.len() / 4);
+    let decoded = StreamReader::try_new(std::io::Cursor::new(&compressed), None)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(decoded, [input]);
+
+    let error =
+        serialize_batches_stream_lz4_bounded(schema.as_ref(), decoded.iter(), compressed.len() - 1)
+            .unwrap_err();
+    assert!(error.to_string().contains("configured bound"));
+}

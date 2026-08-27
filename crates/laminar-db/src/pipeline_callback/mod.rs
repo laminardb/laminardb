@@ -1,11 +1,11 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
+mod backpressure;
+mod checkpoint_publication;
 mod checkpoint_tail;
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use datafusion::physical_expr::PhysicalExpr;
@@ -1282,6 +1282,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_leader_proofs:
         FxHashMap<CheckpointAttempt, laminar_core::cluster::control::LeaderProof>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_subscription_output:
+        crate::subscription::cluster::ClusterSubscriptionOutputState,
     pub(crate) named_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx:
         crossfire::MAsyncTx<crossfire::mpsc::Array<CheckpointCompletion>>,
@@ -3623,7 +3626,6 @@ impl ConnectorPipelineCallback {
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
-        let reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.require_process_authority("follower post-fence state capture") {
             drop(checkpoint_rotation_guard);
             return self
@@ -3634,6 +3636,7 @@ impl ConnectorPipelineCallback {
         // Capture the complete local node image after shuffle alignment so follower entry paths
         // cannot omit channel replay or non-keyed operator state.
         let (mut request, operator_state) = match self.build_follower_checkpoint_request_until(
+            attempt,
             assignment_fence,
             ann.flags,
             attempt_deadline,
@@ -3644,7 +3647,7 @@ impl ConnectorPipelineCallback {
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
-        request.reassignment_portable = reassignment_portable;
+        request.reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
             let error =
                 format!("follower assignment changed during mutable state capture: {error}");
@@ -3859,9 +3862,8 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        let reassignment_portable = checkpoint_rotation_guard.is_some();
-
         let (mut request, operator_state) = match self.build_follower_checkpoint_request_until(
+            attempt,
             assignment_fence,
             ann.flags,
             attempt_deadline,
@@ -3872,7 +3874,7 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
-        request.reassignment_portable = reassignment_portable;
+        request.reassignment_portable = checkpoint_rotation_guard.is_some();
         if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
             let error = format!(
                 "deferred follower assignment changed during mutable state capture: {error}"
@@ -3973,6 +3975,7 @@ impl ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
     fn build_follower_checkpoint_request_until(
         &mut self,
+        attempt: CheckpointAttempt,
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         flags: u64,
         deadline: tokio::time::Instant,
@@ -4000,7 +4003,7 @@ impl ConnectorPipelineCallback {
             );
         }
         let operator_state = self.capture_operator_state_until(deadline)?;
-        let mut request = self.build_checkpoint_request()?;
+        let mut request = self.build_checkpoint_request(attempt)?;
         (request.flags, request.handoff_replay_pending) = (flags, handoff_replay_pending);
         request.assignment_fence = Some(assignment_fence.clone());
         Ok((request, operator_state))
@@ -4328,8 +4331,11 @@ impl ConnectorPipelineCallback {
     /// Source offset overrides remain empty here. The immutable source snapshot is already owned
     /// by the durable tail, which materializes it on a blocking worker after the pipeline resumes.
     fn build_checkpoint_request(
-        &self,
+        &mut self,
+        attempt: CheckpointAttempt,
     ) -> Result<crate::checkpoint_coordinator::CheckpointRequest, String> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = attempt;
         let mut channel_progress = Vec::new();
         if let Some(tracker) = self.tracker.as_ref() {
             channel_progress.reserve(tracker.num_sources());
@@ -4378,6 +4384,18 @@ impl ConnectorPipelineCallback {
                     .cmp(&(&right.source_name, &right.input_channel))
             });
         }
+        #[cfg(feature = "cluster")]
+        let subscription_output = if self.in_cluster() {
+            let frontiers = self
+                .graph
+                .capture_subscription_frontiers()
+                .map_err(|error| error.to_string())?;
+            self.cluster_subscription_output
+                .prepare_checkpoint(attempt, frontiers)
+                .map_err(|error| error.to_string())?
+        } else {
+            None
+        };
         Ok(crate::checkpoint_coordinator::CheckpointRequest {
             flags: laminar_core::checkpoint::flags::NONE,
             handoff_replay_pending: false,
@@ -4388,6 +4406,8 @@ impl ConnectorPipelineCallback {
             source_names: self.checkpoint_source_names.clone(),
             channel_progress,
             source_offset_overrides: HashMap::new(),
+            #[cfg(feature = "cluster")]
+            subscription_output,
         })
     }
 
@@ -4921,6 +4941,8 @@ impl ConnectorPipelineCallback {
             {
                 Ok(Ok(results)) => results,
                 Ok(Err(error)) => {
+                    #[cfg(feature = "cluster")]
+                    self.abort_prepared_subscription_output_cycle();
                     let mapped = Self::map_checkpoint_drain_error(&error, &self.shutdown_signal);
                     self.record_pipeline_halt(&mapped);
                     if let crate::pipeline::CycleError::Recovery(reason) = &mapped {
@@ -4928,62 +4950,10 @@ impl ConnectorPipelineCallback {
                     }
                     return Err(mapped);
                 }
-                Err(_) => {
-                    let error =
-                        "checkpoint graph drain exceeded its absolute attempt deadline".to_string();
-                    set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                    return Err(crate::pipeline::CycleError::Recovery(error));
-                }
+                Err(_) => return Err(self.checkpoint_drain_timeout()),
             };
-            let (any_failed, _) = self.graph.take_cycle_failures();
-            if any_failed {
-                let error = "checkpoint graph drain encountered a partial operator-domain failure"
-                    .to_string();
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            // Consume this drain pass's normal-cycle deferral report. Checkpoint quiescence
-            // deliberately permits barrier-aligned shuffle replay: it is captured in operator
-            // channel state and blocks vnode handoff, not an ordinary checkpoint snapshot.
-            let _ = self.graph.take_cycle_deferrals();
-
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint materialized-view publication")?;
-            if let Err(error) =
-                <Self as crate::pipeline::PipelineCallback>::update_mv_stores(self, &results)
-            {
-                let error = format!(
-                    "checkpoint graph drain could not publish materialized-view output: {error}"
-                );
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint stream publication")?;
-            if let Err(error) =
-                <Self as crate::pipeline::PipelineCallback>::push_to_streams(self, &results)
-            {
-                let error =
-                    format!("checkpoint graph drain could not publish stream output: {error}");
-                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                return Err(crate::pipeline::CycleError::Recovery(error));
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint sink publication")?;
-            if let Err(error) = <Self as crate::pipeline::PipelineCallback>::write_to_sinks(
-                self,
-                &results,
-                Some(deadline),
-            )
-            .await
-            {
-                if let crate::pipeline::CycleError::Recovery(reason) = &error {
-                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                }
-                return Err(error);
-            }
-            #[cfg(feature = "cluster")]
-            self.require_process_authority("checkpoint graph drain continuation")?;
+            self.publish_checkpoint_drain_results(&results, deadline)
+                .await?;
             // Checkpoint drains run while the pipeline is paused and belong to whole-attempt
             // checkpoint-duration accounting. Mixing them into the normal processing-cycle
             // histogram makes that hot-path signal report checkpoint latency instead.
@@ -5327,6 +5297,9 @@ impl ConnectorPipelineCallback {
     }
 }
 
+// COMPAT: local builds preserve the cluster trait shape without awaiting cluster control work.
+#[cfg_attr(not(feature = "cluster"), allow(unknown_lints))]
+#[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn prepare_source_intake(&mut self) -> Result<(), String> {
         Ok(())
@@ -5422,6 +5395,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         {
             Ok(results) => results,
             Err(error) => {
+                #[cfg(feature = "cluster")]
+                self.abort_prepared_subscription_output_cycle();
                 let error = Self::map_graph_error(&error, &self.shutdown_signal);
                 self.record_pipeline_halt(&error);
                 return Err(error);
@@ -5429,6 +5404,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         };
         let (any_failed, failed_sources) = self.graph.take_cycle_failures();
         let (any_deferred, deferred_sources) = self.graph.take_cycle_deferrals();
+        #[cfg(feature = "cluster")]
+        {
+            let subscription_outputs = self.graph.take_prepared_subscription_outputs();
+            if let Err(error) = self.stage_subscription_outputs(subscription_outputs) {
+                self.abort_prepared_subscription_output_cycle();
+                return Err(error);
+            }
+        }
         Ok(crate::pipeline::CycleOutcome {
             results,
             any_failed,
@@ -5439,7 +5422,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn complete_pending_vnode_transition(
         &mut self,
     ) -> Result<bool, crate::pipeline::CycleError> {
@@ -5528,6 +5510,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn commit_subscription_output(&mut self) {
+        self.commit_prepared_subscription_output_cycle();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_subscription_output(&mut self) {
+        self.abort_prepared_subscription_output_cycle();
     }
 
     fn update_mv_stores(
@@ -6604,7 +6596,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     /// Service follower announcements observed from the cluster leader.
     /// All local checkpoint admission is owned exclusively by `StreamingCoordinator`.
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn service_checkpoint_control(
         &mut self,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
@@ -6820,7 +6811,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         }
 
-        let mut request = match self.build_checkpoint_request() {
+        let mut request = match self.build_checkpoint_request(attempt) {
             Ok(request) => request,
             Err(error) => {
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
@@ -6998,11 +6989,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn is_backpressured(&self) -> bool {
-        let bp = self.graph.input_buf_pressure() > 0.8;
-        if bp {
-            self.prom.cycles_backpressured.inc();
-        }
-        bp
+        self.graph_backpressured()
+    }
+
+    fn external_output_pressure(&self) -> crate::pipeline::callback::ExternalOutputPressure {
+        self.output_pressure()
     }
 
     fn intake_paused(&self) -> bool {
@@ -7020,23 +7011,41 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         false
     }
 
-    fn reserve_subscription_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn reserve_subscription_cut(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
-            return Ok(());
+            return self
+                .cluster_subscription_output
+                .reserve_checkpoint(attempt)
+                .map_err(|error| error.to_string());
         }
         self.subscription_registry.reserve_cut(attempt)
     }
 
-    fn abort_subscription_cut(&self, attempt: CheckpointAttempt) {
+    fn abort_subscription_cut(&mut self, attempt: CheckpointAttempt) {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
+            if let Err(error) = self.cluster_subscription_output.abort_checkpoint(attempt) {
+                set_checkpoint_fault(
+                    &self.checkpoint_fault,
+                    format!("abort cluster subscription checkpoint: {error}"),
+                );
+            }
+            self.record_subscription_pending_bytes();
             return;
         }
         self.subscription_registry.abort_cut(attempt);
     }
 
-    fn publish_barrier(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+    fn publish_barrier(&mut self, attempt: CheckpointAttempt) -> Result<(), String> {
+        #[cfg(feature = "cluster")]
         if self.in_cluster() {
-            return Ok(());
+            let result = self
+                .cluster_subscription_output
+                .commit_checkpoint(attempt)
+                .map_err(|error| error.to_string());
+            self.record_subscription_pending_bytes();
+            return result;
         }
         self.subscription_registry.commit_cut(attempt)
     }
@@ -7071,7 +7080,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     // COMPAT: cluster builds await here; keep the no-cluster trait signature identical.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_async_trait_impl))]
     async fn cancel_source_barrier_attempt(
         &mut self,
         attempt: CheckpointAttempt,

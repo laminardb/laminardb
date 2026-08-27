@@ -11,8 +11,8 @@ use rustc_hash::FxHashSet;
 use authority::{FinalOwnerExitAuthoritySnapshot, VnodeTransitionAuthoritySnapshot};
 
 use super::{
-    publish_cluster_execution_poison, ManagedVnodeRestore, ManagedVnodeTransition,
-    ManagedVnodeTransitionMode, ManagedWholeRestore, OperatorGraph,
+    execution_poison::publish_cluster_execution_poison, ManagedVnodeRestore,
+    ManagedVnodeTransition, ManagedVnodeTransitionMode, ManagedWholeRestore, OperatorGraph,
 };
 use crate::error::DbError;
 use crate::operator::capability::ManagedStateContract;

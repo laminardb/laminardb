@@ -1,5 +1,11 @@
 use super::*;
-use crate::checkpoint::{checkpoint_manifest_bytes, checkpoint_sha256, CheckpointParticipant};
+use crate::checkpoint::{
+    checkpoint_manifest_bytes, checkpoint_sha256, ChangelogMode, CheckpointParticipant,
+    NodePartitionRange, NodeSubscriptionManifest, NodeSubscriptionStreamManifest,
+    OutputDistribution, OutputDistributionCertificate, OutputPartitionId, PartitionSequence,
+    StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+    OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION, PIPELINE_IDENTITY_VERSION,
+};
 
 fn digest(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
@@ -466,4 +472,58 @@ fn participant_source_and_sink_inventories_must_match() {
     let encoded = bind_manifests(&mut index, &manifests);
     let error = validate_manifests(&index, &manifests, &encoded).unwrap_err();
     assert!(error.contains("sink topology"));
+}
+
+#[test]
+fn subscription_certificates_must_bind_the_committed_pipeline_identity() {
+    let (mut index, mut manifests) = cluster_cut();
+    let certificate_pipeline_identity = PipelineIdentity {
+        canonical_version: PIPELINE_IDENTITY_VERSION,
+        sha256: digest(9),
+    };
+    let fence = index.assignment_fence.clone().unwrap();
+    let certificate = OutputDistributionCertificate {
+        version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+        protocol_version: SubscriptionProtocolVersion::CURRENT,
+        stream_id: "positions".into(),
+        catalog_generation: 1,
+        stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes([1; 32])),
+        final_operator_id: "stream:positions".into(),
+        distribution: OutputDistribution::VnodePartitioned {
+            key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+            partition_abi: crate::state::PARTITIONING_ABI_VERSION,
+            vnode_count: 2,
+        },
+        schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+        changelog_mode: ChangelogMode::WeightedRetractInsert,
+        history_retention_bytes: 0,
+        query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
+        pipeline_identity: certificate_pipeline_identity,
+    };
+    for manifest in &mut manifests {
+        let partition = OutputPartitionId::new(manifest.owned_vnodes[0]);
+        let mut output = NodeSubscriptionManifest {
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            epoch: index.epoch,
+            checkpoint_id: index.checkpoint_id,
+            participant_id: manifest.participant_id,
+            assignment_certificate: fence.clone(),
+            streams: vec![NodeSubscriptionStreamManifest {
+                distribution_certificate: certificate.clone(),
+                ranges: vec![NodePartitionRange {
+                    partition,
+                    first_sequence: PartitionSequence::FIRST,
+                    through_sequence: PartitionSequence::FIRST,
+                }],
+                segments: Vec::new(),
+            }],
+            manifest_digest: SubscriptionDigest::from_bytes([0; 32]),
+        };
+        output.seal(&manifest.owned_vnodes).unwrap();
+        manifest.subscription_output = Some(output);
+    }
+    let encoded = bind_manifests(&mut index, &manifests);
+
+    let error = validate_manifests(&index, &manifests, &encoded).unwrap_err();
+    assert!(error.contains("pipeline identity differs from the committed index"));
 }

@@ -362,39 +362,59 @@ cluster admission path rejects unsupported state before connector I/O.
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
 
 ```sql
-SUBSCRIBE <name> [WHERE <predicate>] [AS OF EPOCH <n>]
+SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
 ```
 
 - `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
-- The query stays open until the client disconnects; rows arrive as they're produced upstream.
-- `SUBSCRIBE` is currently supported in embedded and single-node runtimes. Cluster runtimes reject it until delivery is globally sequenced and checkpoint-aligned.
+- The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
+- Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.
+- Every cluster server is a gateway over the same shared committed history; clients do not need to locate current vnode owners.
+- Cluster ordering is strict and contiguous within each vnode output partition. Fair gateway merging defines no order between partitions and does not imply arrival, event-time, SQL-sort, or global total order.
+- Partition sequences describe committed source-log frames. A `WHERE` predicate can remove every row from a frame, so optional frame metadata observed by a filtered client can have non-adjacent partition sequences without indicating that a matching row was skipped.
 
 #### Reconnect without gaps: `RETAIN HISTORY` + `AS OF EPOCH`
 
-Create the stream with a bounded history ring:
+Create the stream with bounded history:
 
 ```sql
-CREATE STREAM trades AS SELECT * FROM raw_trades
+CREATE STREAM positions AS
+  SELECT account_id, SUM(pnl) AS total_pnl
+  FROM raw_trades
+  GROUP BY account_id
   WITH ('retain_history' = '64mb');
 ```
 
-`RETAIN HISTORY` is currently rejected in cluster runtimes for the same ordering reason.
+Local runtimes keep the suffix in their existing byte-bounded registry. For the supported cluster
+aggregate scope, history is a byte-bounded suffix of verified immutable Arrow segments referenced
+by authoritative committed checkpoint indexes in shared object storage. Object listing is never
+commit authority.
 
-The server keeps a bounded suffix of committed epochs in memory. WebSocket consumers receive ordered `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds `__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` columns; progress is a row in the same ordered result stream. Durably record the marker only after all preceding data is durable, then resume strictly after it:
+WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds
+`__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` control columns without changing
+the user data schema. Cluster progress is emitted only after the complete participant roster and
+partition-frontier vector commit. Durably record a marker after processing its preceding data, then
+resume from the exclusive frontier of that checkpoint:
 
 ```sql
-SUBSCRIBE trades AS OF EPOCH 42;
+SUBSCRIBE positions AS OF EPOCH 42;
 ```
 
-If epoch `42` was not committed or is no longer retained, the server returns an error instead of silently skipping rows.
+If epoch `42` was not committed, was pruned, belongs to another generation of the named stream, or
+references missing/corrupt history, the server returns a structured terminal error rather than
+skipping rows. `AS OF EPOCH` is checkpoint-granular durable replay, not acknowledgement storage for
+a named consumer. A disconnect after processing part of the next checkpoint interval can therefore
+cause that interval to be delivered again.
+
+A bare `SUBSCRIBE positions` attaches at the current committed tail: rows committed before attachment
+are excluded, and rows exposed by later committed checkpoints are delivered.
 
 #### Cursored consumption: `DECLARE` / `FETCH` / `CLOSE`
 
 For libpq clients that drive flow control via `\set FETCH_COUNT n` (psql, JDBC with `setFetchSize`):
 
 ```sql
-DECLARE c CURSOR FOR SUBSCRIBE trades WHERE symbol = 'AAPL';
+DECLARE c CURSOR FOR SUBSCRIBE positions WHERE total_pnl > 0;
 FETCH FORWARD 100 FROM c;
 FETCH FORWARD 100 FROM c;
 CLOSE c;

@@ -44,6 +44,15 @@ pub(crate) struct StreamRegistration {
     /// Marks this MV to emit a dirty-only changelog into a keyed `Upsert` store. Decided at DDL
     /// time (`incremental_emit` flag + terminal non-windowed agg); drives operator + store mode.
     pub incremental: bool,
+    /// Planner-owned stable output distribution for a potentially subscribable stream.
+    pub subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+    /// Durable output-log byte cap for checkpoint replay; zero admits tail only.
+    pub subscription_retention_bytes: u64,
+    /// Durable object incarnation from the authoritative catalog manifest.
+    pub catalog_generation: u64,
+    /// Fully bound runtime certificate; populated before cluster graph construction.
+    #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+    pub subscription_certificate: Option<laminar_core::checkpoint::OutputDistributionCertificate>,
 }
 
 #[derive(Debug, Clone)]
@@ -235,13 +244,17 @@ impl ConnectorManager {
 
     /// Returns stored DDL in creation order for catalog manifest replay.
     #[cfg(feature = "cluster")]
-    pub fn ordered_ddl(&self) -> Vec<(String, String)> {
+    pub fn ordered_ddl(&self) -> Vec<(String, String, u64)> {
         self.ddl_order
             .iter()
             .filter_map(|name| {
-                self.ddl_store
-                    .get(name)
-                    .map(|ddl| (name.clone(), ddl.clone()))
+                self.ddl_store.get(name).map(|ddl| {
+                    let generation = self
+                        .streams
+                        .get(name)
+                        .map_or(1, |stream| stream.catalog_generation);
+                    (name.clone(), ddl.clone(), generation)
+                })
             })
             .collect()
     }
@@ -256,6 +269,57 @@ impl ConnectorManager {
 
     pub fn register_stream(&mut self, reg: StreamRegistration) {
         self.streams.insert(reg.name.clone(), reg);
+    }
+
+    /// Apply authoritative stream generations after complete manifest replay.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn apply_stream_catalog_generations(
+        &mut self,
+        entries: &[laminar_core::cluster::control::CatalogManifestEntry],
+    ) -> Result<(), DbError> {
+        for entry in entries {
+            if entry.kind != laminar_core::catalog::CatalogObjectKind::Stream {
+                continue;
+            }
+            let stream = self.streams.get_mut(&entry.canonical_name).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "catalog manifest stream '{}' was not registered during replay",
+                    entry.canonical_name
+                ))
+            })?;
+            stream.catalog_generation = entry.catalog_generation;
+        }
+        Ok(())
+    }
+
+    /// Publish the runtime-bound subscription certificates after complete startup binding.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_stream_subscription_certificates(
+        &mut self,
+        bound: &HashMap<String, StreamRegistration>,
+    ) -> Result<(), DbError> {
+        if self.streams.len() != bound.len() {
+            return Err(DbError::InvalidOperation(
+                "stream registrations changed while binding subscription certificates".into(),
+            ));
+        }
+        for (name, candidate) in bound {
+            let registered = self.streams.get(name).ok_or_else(|| {
+                DbError::InvalidOperation(format!(
+                    "stream registration '{name}' disappeared during subscription binding"
+                ))
+            })?;
+            if registered.catalog_generation != candidate.catalog_generation
+                || registered.query_sql != candidate.query_sql
+                || registered.subscription_output != candidate.subscription_output
+            {
+                return Err(DbError::InvalidOperation(format!(
+                    "stream registration '{name}' changed during subscription binding"
+                )));
+            }
+        }
+        self.streams.clone_from(bound);
+        Ok(())
     }
 
     /// Returns `true` if it existed.

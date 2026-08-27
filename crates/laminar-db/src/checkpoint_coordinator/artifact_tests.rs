@@ -16,46 +16,48 @@ use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
 
 #[cfg(feature = "cluster")]
-struct ManifestCommitThenIoStore {
-    inner: Arc<dyn object_store::ObjectStore>,
-    fail_manifest_create: std::sync::atomic::AtomicBool,
-    block_get: std::sync::atomic::AtomicBool,
+pub(super) struct CreateCommitThenIoStore {
+    pub(super) inner: Arc<dyn object_store::ObjectStore>,
+    pub(super) lose_create_ack: std::sync::atomic::AtomicBool,
+    pub(super) create_suffix: &'static str,
+    pub(super) block_get: std::sync::atomic::AtomicBool,
+    pub(super) deny_list: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "cluster")]
-impl std::fmt::Debug for ManifestCommitThenIoStore {
+impl std::fmt::Debug for CreateCommitThenIoStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("ManifestCommitThenIoStore")
+            .debug_struct("CreateCommitThenIoStore")
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(feature = "cluster")]
-impl std::fmt::Display for ManifestCommitThenIoStore {
+impl std::fmt::Display for CreateCommitThenIoStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ManifestCommitThenIoStore")
+        formatter.write_str("CreateCommitThenIoStore")
     }
 }
 
 #[cfg(feature = "cluster")]
 #[async_trait::async_trait]
-impl object_store::ObjectStore for ManifestCommitThenIoStore {
+impl object_store::ObjectStore for CreateCommitThenIoStore {
     async fn put_opts(
         &self,
         location: &object_store::path::Path,
         payload: object_store::PutPayload,
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        let lose_ack = location.to_string().ends_with("/manifest.json")
+        let lose_ack = location.to_string().ends_with(self.create_suffix)
             && matches!(&options.mode, object_store::PutMode::Create)
             && self
-                .fail_manifest_create
+                .lose_create_ack
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
         let result = self.inner.put_opts(location, payload, options).await?;
         if lose_ack {
             return Err(object_store::Error::Generic {
-                store: "ManifestCommitThenIoStore",
+                store: "CreateCommitThenIoStore",
                 source: Box::new(std::io::Error::other(
                     "injected manifest acknowledgement loss after create",
                 )),
@@ -97,6 +99,14 @@ impl object_store::ObjectStore for ManifestCommitThenIoStore {
         &self,
         prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        if self.deny_list.load(std::sync::atomic::Ordering::Acquire) {
+            return Box::pin(futures::stream::once(async {
+                Err(object_store::Error::Generic {
+                    store: "CreateCommitThenIoStore",
+                    source: Box::new(std::io::Error::other("object listing is forbidden")),
+                })
+            }));
+        }
         self.inner.list(prefix)
     }
 
@@ -447,6 +457,8 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             requested: Some(latest.take().unwrap()),
             decision_store: Arc::clone(&decisions),
             authority: GcAuthority::Local,
+            #[cfg(feature = "cluster")]
+            metrics: None,
         },
     )
     .await
@@ -578,6 +590,8 @@ async fn retention_reclaims_last_referenced_chunk_and_keeps_latest_cut() {
             requested: Some(index),
             decision_store: decisions,
             authority: GcAuthority::Local,
+            #[cfg(feature = "cluster")]
+            metrics: None,
         },
     )
     .await
@@ -963,10 +977,12 @@ async fn commit_winner_prevents_prepared_artifact_sealing() {
 #[tokio::test(start_paused = true)]
 async fn follower_assignment_authority_validation_is_bounded_by_attempt_deadline() {
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let blocked = Arc::new(ManifestCommitThenIoStore {
+    let blocked = Arc::new(CreateCommitThenIoStore {
         inner,
-        fail_manifest_create: std::sync::atomic::AtomicBool::new(false),
+        lose_create_ack: std::sync::atomic::AtomicBool::new(false),
+        create_suffix: "/manifest.json",
         block_get: std::sync::atomic::AtomicBool::new(false),
+        deny_list: std::sync::atomic::AtomicBool::new(false),
     });
     let authority_objects: Arc<dyn object_store::ObjectStore> = blocked.clone();
     let authority = Arc::new(LeaderLeaseStore::new(authority_objects, 1_000));
@@ -1309,10 +1325,12 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
     };
 
     let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let flaky = Arc::new(ManifestCommitThenIoStore {
+    let flaky = Arc::new(CreateCommitThenIoStore {
         inner: Arc::clone(&objects),
-        fail_manifest_create: std::sync::atomic::AtomicBool::new(false),
+        lose_create_ack: std::sync::atomic::AtomicBool::new(false),
+        create_suffix: "/manifest.json",
         block_get: std::sync::atomic::AtomicBool::new(false),
+        deny_list: std::sync::atomic::AtomicBool::new(false),
     });
     let checkpoint_objects: Arc<dyn object_store::ObjectStore> = flaky.clone();
     let decisions = Arc::new(CheckpointDecisionStore::new(Arc::clone(&objects)));
@@ -1445,7 +1463,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         .unwrap();
 
     flaky
-        .fail_manifest_create
+        .lose_create_ack
         .store(true, std::sync::atomic::Ordering::Release);
     let outcome = coordinator
         .follower_prepare_acked_until(

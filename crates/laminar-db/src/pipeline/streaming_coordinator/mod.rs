@@ -67,6 +67,7 @@ mod construction;
 mod cycle;
 mod drain_ownership;
 mod execution;
+mod intake_backpressure;
 mod shutdown;
 mod source_actor;
 mod source_drain;
@@ -458,6 +459,7 @@ struct CoordinatorWake {
 #[derive(Default)]
 struct CoordinatorGates {
     intake_paused: bool,
+    external_commit_backpressured: bool,
 }
 
 enum CoordinatorWaitAction {

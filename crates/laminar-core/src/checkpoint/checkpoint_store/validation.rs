@@ -4,12 +4,44 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    validate_max_checkpoint_node_data_bytes, CheckpointArtifactAbortSeal, CheckpointStoreError,
-    CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION, MAX_ABORT_SEAL_BYTES,
+    CheckpointArtifactAbortSeal, CheckpointStoreError, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
+    MAX_ABORT_SEAL_BYTES,
 };
 use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, StateChunkId};
 use crate::state::KeyGroupCount;
+
+pub(super) enum ManifestAbortState {
+    Sealed(Option<(CheckpointManifest, Bytes)>),
+    Manifest(CheckpointManifest, Bytes),
+}
+
+pub(super) fn normalize_prefix(prefix: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+/// Validate the configured per-node checkpoint byte budget.
+///
+/// # Errors
+/// Returns an error for zero or unrepresentable limits.
+pub fn validate_max_checkpoint_node_data_bytes(limit: u64) -> Result<(), CheckpointStoreError> {
+    if limit == 0 {
+        return Err(CheckpointStoreError::Invalid(
+            "checkpoint node-data limit must be greater than zero".into(),
+        ));
+    }
+    if limit > isize::MAX as u64 {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint node-data limit {limit} exceeds this process address space"
+        )));
+    }
+    Ok(())
+}
 
 pub(super) fn validate_abort_seal_request(
     chunk: StateChunkId,

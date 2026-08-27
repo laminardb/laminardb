@@ -21,11 +21,11 @@ use laminar_db::LaminarDB;
 /// Schema: id (Int64), region (Utf8), price (Float64), quantity (Int64), ts (Int64)
 fn bench_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("region", DataType::Utf8, false),
-        Field::new("price", DataType::Float64, false),
-        Field::new("quantity", DataType::Int64, false),
-        Field::new("ts", DataType::Int64, false),
+        Field::new("id", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("price", DataType::Float64, true),
+        Field::new("quantity", DataType::Int64, true),
+        Field::new("ts", DataType::Int64, true),
     ]))
 }
 

@@ -129,20 +129,29 @@ pub enum TypedSubscriptionFrame<T> {
     Rows {
         /// Deserialized rows in the shared-log entry.
         rows: Vec<T>,
-        /// Physical sequence within this in-memory object incarnation; not a durable resume token.
+        /// Portal-local delivery sequence; not a durable or cluster-wide resume position.
         sequence: u64,
     },
     /// Durable progress frontier for this checkpoint.
     Barrier {
-        /// Physical sequence of this progress entry within the current object incarnation.
+        /// Portal-local delivery sequence; not a cluster-wide ordering position.
         sequence: u64,
         /// Engine checkpoint epoch.
         epoch: u64,
         /// Engine checkpoint identifier.
         checkpoint_id: u64,
-        /// Every logical entry below this sequence is covered by the cut.
+        /// Local-log cut, or a gateway-local compatibility cut in cluster mode.
         through_sequence: u64,
     },
+}
+
+/// Typed compatibility frame plus optional durable cluster partition metadata.
+#[derive(Debug)]
+pub struct TypedSubscriptionEnvelope<T> {
+    /// Existing typed rows or checkpoint progress.
+    pub frame: TypedSubscriptionFrame<T>,
+    /// Present for committed cluster data and progress frames.
+    pub cluster: Option<crate::subscription::ClusterSubscriptionFrameMetadata>,
 }
 
 /// Terminal failure from a named subscription.
@@ -189,11 +198,23 @@ impl<T: FromBatch> TypedSubscription<T> {
     pub async fn next_frame(
         &mut self,
     ) -> Result<Option<TypedSubscriptionFrame<T>>, SubscriptionError> {
-        self.portal
-            .next_frame()
-            .await
-            .map(convert_typed_frame)
-            .transpose()
+        Ok(self.next_envelope().await?.map(|envelope| envelope.frame))
+    }
+
+    /// Wait for the next frame with optional durable cluster partition metadata.
+    ///
+    /// # Errors
+    /// Returns a terminal error if delivery has a gap or the object fails.
+    pub async fn next_envelope(
+        &mut self,
+    ) -> Result<Option<TypedSubscriptionEnvelope<T>>, SubscriptionError> {
+        let Some(envelope) = self.portal.next_envelope().await else {
+            return Ok(None);
+        };
+        Ok(Some(TypedSubscriptionEnvelope {
+            frame: convert_typed_frame(envelope.frame)?,
+            cluster: envelope.cluster,
+        }))
     }
 
     /// Return the next immediately available data or checkpoint frame.
@@ -203,10 +224,23 @@ impl<T: FromBatch> TypedSubscription<T> {
     pub fn try_next_frame(
         &mut self,
     ) -> Result<Option<TypedSubscriptionFrame<T>>, SubscriptionError> {
-        self.portal
-            .try_next_frame()
-            .map(convert_typed_frame)
-            .transpose()
+        Ok(self.try_next_envelope()?.map(|envelope| envelope.frame))
+    }
+
+    /// Return the next immediately available frame and optional cluster metadata.
+    ///
+    /// # Errors
+    /// Returns a terminal error if delivery has a gap or the object fails.
+    pub fn try_next_envelope(
+        &mut self,
+    ) -> Result<Option<TypedSubscriptionEnvelope<T>>, SubscriptionError> {
+        let Some(envelope) = self.portal.try_next_envelope() else {
+            return Ok(None);
+        };
+        Ok(Some(TypedSubscriptionEnvelope {
+            frame: convert_typed_frame(envelope.frame)?,
+            cluster: envelope.cluster,
+        }))
     }
 
     /// Return the next immediately available row batch, skipping checkpoint markers.

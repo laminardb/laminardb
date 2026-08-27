@@ -35,6 +35,11 @@ use laminar_sql::translator::{
     OrderOperatorConfig, TemporalJoinTranslatorConfig, WindowOperatorConfig,
 };
 
+mod catalog_context;
+#[cfg(feature = "cluster")]
+mod execution_poison;
+#[cfg(feature = "cluster")]
+mod subscription_output;
 #[cfg(feature = "cluster")]
 mod vnode_transition;
 
@@ -369,6 +374,30 @@ pub(crate) trait GraphOperator: Send {
         self.process(inputs, &watermarks).await
     }
 
+    /// Transfer partition-aware frames while retaining their unpublished bookkeeping changes.
+    #[cfg(feature = "cluster")]
+    fn take_prepared_subscription_output(
+        &mut self,
+    ) -> Option<crate::subscription::PreparedSubscriptionOutput> {
+        None
+    }
+
+    /// Capture participant-owned partition frontiers for a certified final operator.
+    #[cfg(feature = "cluster")]
+    fn certified_subscription_frontiers(
+        &self,
+    ) -> Result<Option<crate::subscription::CertifiedSubscriptionFrontiers>, DbError> {
+        Ok(None)
+    }
+
+    /// Publish bookkeeping for the output transferred by the current graph cycle.
+    #[cfg(feature = "cluster")]
+    fn commit_prepared_subscription_output(&mut self) {}
+
+    /// Discard unpublished bookkeeping and restore retryable dirty-key ownership.
+    #[cfg(feature = "cluster")]
+    fn abort_prepared_subscription_output(&mut self) {}
+
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
 
     fn checkpoint_capture(
@@ -599,27 +628,6 @@ const GRAPH_EXECUTION_POISON_REASON: &str =
      terminally after input admission, or a vnode lifecycle callback returned an indeterminate \
      outcome; recovery from the last committed checkpoint is required";
 
-/// In cluster mode, assignment adoption may trust the installed-state binding only while this
-/// graph generation remains usable. Clear that success marker before publishing poison so an
-/// observer that sees the poison can never retain authority derived from indeterminate state.
-#[cfg(feature = "cluster")]
-fn publish_cluster_execution_poison(
-    poisoned: &AtomicBool,
-    installed_vnode_state: Option<&crate::vnode_transition_staging::InstalledVnodeStateHandle>,
-    pending_vnode_transition: Option<(
-        &crate::vnode_transition_staging::PendingVnodeTransitionHandle,
-        &Arc<crate::vnode_transition_staging::PendingVnodeTransition>,
-    )>,
-) {
-    if let Some(installed_vnode_state) = installed_vnode_state {
-        installed_vnode_state.lock().take();
-    }
-    if let Some((handle, expected)) = pending_vnode_transition {
-        crate::vnode_transition_staging::retire_exact_pending_vnode_transition(handle, expected);
-    }
-    poisoned.store(true, Ordering::Release);
-}
-
 /// A graph cycle may hold operator mutation and graph-owned input in different futures. Unwind or
 /// cancellation before the explicit result boundary permanently fences this graph generation;
 /// post-admission terminal results are fenced where they are classified.
@@ -649,7 +657,7 @@ impl Drop for GraphExecutionAttemptGuard {
     fn drop(&mut self) {
         if self.armed {
             #[cfg(feature = "cluster")]
-            publish_cluster_execution_poison(
+            execution_poison::publish_cluster_execution_poison(
                 &self.poisoned,
                 self.installed_vnode_state.as_ref(),
                 None,
@@ -663,7 +671,7 @@ impl Drop for GraphExecutionAttemptGuard {
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 /// Logical ABI for independently checksummed operator and vnode frames.
-pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 5;
+pub(crate) const STATE_FRAME_ABI_VERSION: u32 = 6;
 
 #[derive(Debug)]
 pub(crate) struct CapturedWholeState {
@@ -1072,6 +1080,9 @@ pub(crate) struct OperatorGraph {
     // Logical pipeline/state ABI bound into every managed vnode transition.
     #[cfg(feature = "cluster")]
     pipeline_identity: Option<laminar_core::checkpoint::PipelineIdentity>,
+    #[cfg(feature = "cluster")]
+    subscription_certificates:
+        FxHashMap<String, Arc<laminar_core::checkpoint::OutputDistributionCertificate>>,
     // One immutable assignment transition, consumed only after complete lifecycle success.
     #[cfg(feature = "cluster")]
     pending_vnode_transition: Option<crate::vnode_transition_staging::PendingVnodeTransitionHandle>,
@@ -1133,6 +1144,8 @@ impl OperatorGraph {
             #[cfg(feature = "cluster")]
             pipeline_identity: None,
             #[cfg(feature = "cluster")]
+            subscription_certificates: FxHashMap::default(),
+            #[cfg(feature = "cluster")]
             pending_vnode_transition: None,
             #[cfg(feature = "cluster")]
             installed_vnode_state: None,
@@ -1158,31 +1171,6 @@ impl OperatorGraph {
             whole_restore_open: true,
             execution_poisoned: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// Register the static reference/dimension table names (valid right sides of a changelog
-    /// enrich join).
-    pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
-        self.reference_tables = tables;
-    }
-
-    /// Seed changelog producers before operators are built so admission is build-order independent.
-    pub fn set_changelog_tables(&mut self, tables: FxHashSet<String>) {
-        self.changelog_tables = tables;
-    }
-
-    /// Install the complete startup-certified mutable interval topology before graph construction.
-    pub(crate) fn set_ordered_interval_joins(
-        &mut self,
-        joins: FxHashMap<String, [crate::operator::interval_join_input::BoundedJoinInputMode; 2]>,
-    ) {
-        if !self.nodes.is_empty() {
-            self.build_errors.push(DbError::Config(
-                "ordered interval topology must be installed before graph operators".into(),
-            ));
-            return;
-        }
-        self.ordered_interval_joins = joins;
     }
 
     /// Install the AI subsystem and main runtime handle for inference workers.
@@ -2745,10 +2733,7 @@ impl OperatorGraph {
         #[cfg(feature = "cluster")]
         let mut op = op;
         #[cfg(feature = "cluster")]
-        if let Some(ref cfg) = self.cluster_shuffle {
-            debug_assert_eq!(cfg.registry.vnode_count(), u32::from(self.key_group_count));
-            op.attach_cluster_shuffle(cfg.clone());
-        }
+        self.attach_sql_query_cluster_context(name, &mut op)?;
         Ok(Box::new(op))
     }
 
@@ -2808,6 +2793,8 @@ impl OperatorGraph {
         }
 
         self.output_map.remove(name);
+        #[cfg(feature = "cluster")]
+        self.subscription_certificates.remove(name);
         self.changelog_tables.remove(name);
         self.live_handles.remove(name);
         self.intermediate_schemas.remove(name);
@@ -3631,7 +3618,7 @@ impl OperatorGraph {
         if self.installed_vnode_state.is_none() && pending.is_none() {
             return;
         }
-        publish_cluster_execution_poison(
+        execution_poison::publish_cluster_execution_poison(
             &self.execution_poisoned,
             self.installed_vnode_state.as_ref(),
             pending.as_ref().map(|(handle, pending)| (handle, pending)),

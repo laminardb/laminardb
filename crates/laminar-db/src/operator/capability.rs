@@ -55,6 +55,18 @@ pub(crate) enum ClusterExecutionStatus {
     InternalOnly,
 }
 
+/// Planner-known output ownership usable by the committed subscription sink.
+///
+/// This is only the physical shape. Durable stream, schema, query, and pipeline bindings are added
+/// by `subscription::distribution` before it becomes an `OutputDistributionCertificate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubscriptionOutputDistribution {
+    /// Final grouping keys map through the stable vnode partition ABI.
+    VnodePartitioned,
+    /// Existing global aggregate executes on the singleton vnode.
+    Singleton,
+}
+
 /// Concrete production implementations of [`crate::operator_graph::GraphOperator`].
 ///
 /// Keep one variant per concrete implementation. The exhaustive match in
@@ -85,6 +97,7 @@ pub(crate) struct OperatorCapability {
     pub(crate) state_class: OperatorStateClass,
     pub(crate) cluster_status: ClusterExecutionStatus,
     pub(crate) managed_state: Option<ManagedStateContract>,
+    pub(crate) subscription_output: Option<SubscriptionOutputDistribution>,
 }
 
 impl OperatorCapability {
@@ -97,6 +110,7 @@ impl OperatorCapability {
             state_class,
             cluster_status: ClusterExecutionStatus::DdlGuarded,
             managed_state: None,
+            subscription_output: None,
         }
     }
 
@@ -110,6 +124,7 @@ impl OperatorCapability {
             state_class,
             cluster_status: ClusterExecutionStatus::Rejected { reason },
             managed_state: None,
+            subscription_output: None,
         }
     }
 
@@ -122,11 +137,20 @@ impl OperatorCapability {
             state_class,
             cluster_status: ClusterExecutionStatus::InternalOnly,
             managed_state: None,
+            subscription_output: None,
         }
     }
 
     const fn with_managed_state(mut self, contract: ManagedStateContract) -> Self {
         self.managed_state = Some(contract);
+        self
+    }
+
+    const fn with_subscription_output(
+        mut self,
+        distribution: SubscriptionOutputDistribution,
+    ) -> Self {
+        self.subscription_output = Some(distribution);
         self
     }
 
@@ -210,6 +234,7 @@ impl OperatorCapability {
             OperatorStateClass::GlobalSingleton,
         )
         .with_managed_state(ManagedStateContract::SqlAggregateV1)
+        .with_subscription_output(SubscriptionOutputDistribution::Singleton)
     }
 
     /// Managed vnode state for TUMBLE, HOP, and SESSION aggregates.
@@ -241,6 +266,16 @@ impl OperatorCapability {
 
     /// Descriptor for the DDL-guarded, vnode-managed grouped-aggregate path.
     pub(crate) const fn keyed_sql_aggregate() -> Self {
+        Self::ddl_guarded(
+            OperatorImplementation::SqlQuery,
+            OperatorStateClass::VnodeKeyed,
+        )
+        .with_managed_state(ManagedStateContract::SqlAggregateV1)
+        .with_subscription_output(SubscriptionOutputDistribution::VnodePartitioned)
+    }
+
+    /// Existing keyed aggregate execution without a certifiable subscription key expression.
+    pub(crate) const fn uncertified_keyed_sql_aggregate() -> Self {
         Self::ddl_guarded(
             OperatorImplementation::SqlQuery,
             OperatorStateClass::VnodeKeyed,
@@ -372,6 +407,7 @@ mod tests {
                     state_class,
                     cluster_status,
                     managed_state: None,
+                    subscription_output: None,
                 }
             );
         }
@@ -391,6 +427,7 @@ mod tests {
                 state_class: State::VnodeKeyed,
                 cluster_status: DdlGuarded,
                 managed_state: Some(ManagedStateContract::CoreWindowV1),
+                subscription_output: None,
             }
         );
         assert_eq!(
@@ -400,6 +437,7 @@ mod tests {
                 state_class: State::VnodeKeyed,
                 cluster_status: DdlGuarded,
                 managed_state: Some(ManagedStateContract::BoundedIntervalJoinV3),
+                subscription_output: None,
             }
         );
     }

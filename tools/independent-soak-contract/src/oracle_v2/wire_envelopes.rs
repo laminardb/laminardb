@@ -7,7 +7,7 @@ pub(super) fn decode_wire_hex(hex: &str, maximum_bytes: usize) -> Result<Vec<u8>
         return Err(());
     }
     let mut decoded = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.as_bytes().chunks_exact(2) {
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
         let high = hex_nibble(pair[0]).ok_or(())?;
         let low = hex_nibble(pair[1]).ok_or(())?;
         decoded.push((high << 4) | low);

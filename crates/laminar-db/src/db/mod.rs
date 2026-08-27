@@ -3,6 +3,8 @@
 
 #[cfg(feature = "cluster")]
 mod assignment_authority;
+#[cfg(feature = "cluster")]
+mod cluster_subscription;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -641,20 +643,35 @@ fn catalog_create_identity(
 
 #[cfg(feature = "cluster")]
 fn validate_cluster_catalog_create(
+    db: &LaminarDB,
     sql: &str,
     statement: &StreamingStatement,
 ) -> Result<(String, CatalogObjectKind, &'static str), DbError> {
-    if matches!(
-        statement,
-        StreamingStatement::CreateStream {
-            retention_bytes: Some(_),
-            ..
-        }
-    ) {
-        return Err(DbError::Unsupported(
-            "CREATE STREAM RETAIN HISTORY is not supported in cluster runtime until replay is globally ordered and checkpoint-aligned"
+    if let StreamingStatement::CreateStream {
+        query_sql,
+        emit_clause,
+        retention_bytes: Some(_),
+        ..
+    } = statement
+    {
+        let output = crate::subscription::distribution::plan(
+            query_sql,
+            emit_clause.as_ref(),
+            &db.ctx,
+            db.checkpoint_key_groups(),
+        )?;
+        if !output.as_ref().is_some_and(
+            crate::subscription::distribution::PlannedSubscriptionOutput::is_vnode_partitioned,
+        ) {
+            return Err(
+                crate::subscription::ClusterSubscriptionError::UnsupportedPlan {
+                    reason:
+                        "durable cluster history requires a non-windowed managed keyed aggregate"
+                            .into(),
+                }
                 .into(),
-        ));
+            );
+        }
     }
     if catalog_ddl_contains_comment(sql)? {
         return Err(DbError::InvalidOperation(
@@ -2663,36 +2680,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    fn catalog_manifest_inventory(
-        &self,
-    ) -> Result<Vec<laminar_core::cluster::control::CatalogManifestEntry>, DbError> {
-        let ordered = self.connector_manager.lock().ordered_ddl();
-        let namespace = self.catalog_namespace.lock();
-        if ordered.len() != namespace.len() {
-            return Err(DbError::Pipeline(format!(
-                "typed catalog has {} objects but the durable DDL inventory has {}",
-                namespace.len(),
-                ordered.len()
-            )));
-        }
-        ordered
-            .into_iter()
-            .map(|(canonical_name, ddl)| {
-                let kind = namespace.get(&canonical_name).copied().ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "DDL inventory entry '{canonical_name}' has no typed catalog owner"
-                    ))
-                })?;
-                Ok(laminar_core::cluster::control::CatalogManifestEntry {
-                    canonical_name,
-                    kind,
-                    ddl,
-                })
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "cluster")]
     fn exact_bootstrap_noop(
         &self,
         sql: &str,
@@ -2882,7 +2869,7 @@ impl LaminarDB {
             tracing::info!(name = %entry.canonical_name, "replayed catalog DDL from manifest");
         }
 
-        let local_inventory = self.catalog_manifest_inventory()?;
+        let local_inventory = self.reconcile_catalog_manifest_inventory(&manifest)?;
         if local_inventory.as_slice() != manifest.entries.as_slice() {
             return Err(DbError::Pipeline(format!(
                 "[{}] local catalog DDL inventory does not match the ordered catalog manifest \
@@ -4818,7 +4805,7 @@ impl LaminarDB {
                         "cluster bootstrap entries must contain exactly one SQL statement".into(),
                     )
                 })?;
-                let (name, kind, _) = validate_cluster_catalog_create(stmt_sql, &statement)?;
+                let (name, kind, _) = validate_cluster_catalog_create(self, stmt_sql, &statement)?;
                 parsed.push((stmt_sql.to_owned(), statement, name, kind));
             }
         }
@@ -4843,20 +4830,17 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
-            let requested = parsed
-                .iter()
-                .map(|(ddl, _, canonical_name, kind)| {
-                    laminar_core::cluster::control::CatalogManifestEntry {
-                        canonical_name: canonical_name.clone(),
-                        kind: *kind,
-                        ddl: ddl.clone(),
-                    }
-                })
-                .collect::<Vec<_>>();
-            if requested.as_slice() != manifest.entries.as_slice() {
+            let configured_matches = parsed.iter().zip(&manifest.entries).all(
+                |((ddl, _, canonical_name, kind), entry)| {
+                    ddl == &entry.ddl
+                        && canonical_name == &entry.canonical_name
+                        && kind == &entry.kind
+                },
+            );
+            if parsed.len() != manifest.entries.len() || !configured_matches {
                 return Err(DbError::Pipeline(format!(
                     "configured cluster catalog must exactly match the complete ordered sealed inventory (configured entries: {}, sealed entries: {})",
-                    requested.len(),
+                    parsed.len(),
                     manifest.entries.len()
                 )));
             }
@@ -5009,27 +4993,12 @@ impl LaminarDB {
         sql: &str,
         statement: &StreamingStatement,
     ) -> Result<ExecuteResult, DbError> {
-        if self.is_cluster_runtime()
-            && matches!(
-                statement,
-                StreamingStatement::CreateStream {
-                    retention_bytes: Some(_),
-                    ..
-                }
-            )
-        {
-            return Err(DbError::Unsupported(
-                "CREATE STREAM RETAIN HISTORY is not supported in cluster runtime until replay is globally ordered and checkpoint-aligned"
-                    .into(),
-            ));
-        }
-
         #[cfg(feature = "cluster")]
         if is_topology_ddl(statement) && !catalog_manifest_replay_active() {
             let store_configured = self.catalog_manifest_store.lock().is_some();
             let cluster_runtime = self.is_cluster_runtime();
             if store_configured || cluster_runtime {
-                validate_cluster_catalog_create(sql, statement)?;
+                validate_cluster_catalog_create(self, sql, statement)?;
                 if !store_configured {
                     return Err(DbError::Pipeline(
                         "cluster topology DDL requires a catalog manifest store".into(),
@@ -5415,16 +5384,6 @@ impl LaminarDB {
         Ok(crate::handle::TypedSubscription::new(portal))
     }
 
-    fn ensure_subscription_runtime_supported(&self) -> Result<(), DbError> {
-        if self.is_cluster_runtime() {
-            return Err(DbError::Unsupported(
-                "SUBSCRIBE is not supported in cluster runtime until delivery is sequenced and checkpoint-aligned"
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// Schema a `SUBSCRIBE` against `name` would emit.
     /// A stream is visible here only after its physical output schema has been
     /// resolved. Bare sources and unresolved streams are not subscribable.
@@ -5443,18 +5402,15 @@ impl LaminarDB {
     /// SOURCE is not subscribable (surfaced as `StreamNotFound`).
     ///
     /// # Errors
-    /// `Unsupported` in cluster runtime; `StreamNotFound` for unknown `name`;
-    /// `Pipeline` for subscriber-cap
-    /// or filter-compile failures; `InvalidOperation` when `AsOfEpoch(n)`
-    /// is not committed or is no longer retained.
+    /// `StreamNotFound` for unknown `name`; `Subscription` for unsupported cluster plans or
+    /// durable replay failures; `Pipeline` for subscriber-cap or filter-compile failures;
+    /// `InvalidOperation` when a local `AsOfEpoch(n)` is not committed or retained.
     pub async fn open_subscription(
         &self,
         name: &str,
         filter_sql: Option<&str>,
         start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
-        self.ensure_subscription_runtime_supported()?;
-
         // Serialize schema resolution, filter compilation, and cursor attachment
         // with topology DDL. Otherwise DROP/recreate can leave a portal attached
         // to an orphaned log with the previous object's schema.
@@ -5471,6 +5427,13 @@ impl LaminarDB {
             None => None,
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
+
+        #[cfg(feature = "cluster")]
+        if self.is_cluster_runtime() {
+            return self
+                .open_cluster_subscription(name, schema, filter, start)
+                .await;
+        }
 
         let reader =
             self.subscription_registry

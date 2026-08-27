@@ -13,7 +13,7 @@ pub enum ArrowSubscriptionFrame {
     Batch {
         /// Arrow rows in the shared-log entry.
         batch: RecordBatch,
-        /// Physical sequence within this in-memory object incarnation; not a durable resume token.
+        /// Portal-local delivery sequence; neither durable nor cluster-global.
         sequence: u64,
         /// Internal process-memory ownership token.
         #[doc(hidden)]
@@ -21,13 +21,16 @@ pub enum ArrowSubscriptionFrame {
     },
     /// Durable progress frontier for this checkpoint.
     Barrier {
-        /// Physical sequence of this progress entry within the current object incarnation.
+        /// Portal-local delivery sequence; neither durable nor cluster-global.
         sequence: u64,
         /// Engine checkpoint epoch.
         epoch: u64,
         /// Engine checkpoint identifier.
         checkpoint_id: u64,
-        /// Every logical entry below this sequence is covered by the cut.
+        /// Local-log cut, or a gateway-local cut in cluster mode.
+        ///
+        /// Durable cluster replay is addressed by `epoch`, whose committed manifest contains the
+        /// partition-frontier vector.
         through_sequence: u64,
     },
 }

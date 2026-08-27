@@ -302,11 +302,14 @@ impl StreamingCoordinator {
     ) -> Result<CyclePublicationDurations, CycleError> {
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("materialized-view publication") {
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(error);
         }
         let output_store_started = Instant::now();
         if let Err(error) = callback.update_mv_stores(&outcome.results) {
+            #[cfg(feature = "cluster")]
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(CycleError::Recovery(format!(
                 "materialized-view publication failed: {error}"
@@ -314,10 +317,13 @@ impl StreamingCoordinator {
         }
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("stream publication") {
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(error);
         }
         if let Err(error) = callback.push_to_streams(&outcome.results) {
+            #[cfg(feature = "cluster")]
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(CycleError::Recovery(format!(
                 "stream publication failed: {error}"
@@ -328,11 +334,14 @@ impl StreamingCoordinator {
 
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("sink publication") {
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(error);
         }
         let sink_enqueue_started = Instant::now();
         if let Err(error) = callback.write_to_sinks(&outcome.results, None).await {
+            #[cfg(feature = "cluster")]
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(error);
         }
@@ -344,10 +353,20 @@ impl StreamingCoordinator {
         // FIFO-fences every sink before persisting it.
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("source cursor advancement") {
+            callback.abort_subscription_output();
             self.discard_pending_offsets();
             return Err(error);
         }
-        self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)?;
+        if let Err(error) =
+            self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources)
+        {
+            #[cfg(feature = "cluster")]
+            callback.abort_subscription_output();
+            self.discard_pending_offsets();
+            return Err(error);
+        }
+        #[cfg(feature = "cluster")]
+        callback.commit_subscription_output();
         self.replay_pending = outcome.any_deferred;
         Ok(CyclePublicationDurations {
             output_store_ns,

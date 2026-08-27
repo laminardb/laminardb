@@ -45,6 +45,7 @@ pub use leader_lease::{
     LeaderCandidacy, LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation,
     LeaderLeaseOwner, LeaderLeaseStore, LeaseError, LeaseOutcome,
     RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
+    SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
 };
 pub use lease_deadline::LeaseDeadline;
 pub use namespace_proof::{

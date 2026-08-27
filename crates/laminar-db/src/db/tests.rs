@@ -213,7 +213,6 @@ async fn cluster_controller_identity_is_fixed_for_the_graph_generation() {
         .build()
         .await
         .unwrap();
-
     db.set_cluster_controller(Arc::clone(&installed)).unwrap();
     let error = db
         .set_cluster_controller(replacement)
@@ -6335,7 +6334,7 @@ async fn test_catalog_authority_with_ttl(
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn cluster_subscription_rejects_before_lookup_and_replay_state() {
+async fn cluster_subscription_missing_name_fails_before_filter_or_backend_access() {
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
 
@@ -6361,12 +6360,15 @@ async fn cluster_subscription_rejects_before_lookup_and_replay_state() {
         .build()
         .await
         .unwrap();
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&metrics));
 
     let raw_error = db
         .subscribe::<UnusedRow>("missing")
         .await
-        .expect_err("direct stream subscriptions must not expose a local cluster shard");
-    assert!(matches!(raw_error, DbError::Unsupported(_)));
+        .expect_err("an unknown cluster stream must not open a gateway");
+    assert!(matches!(raw_error, DbError::StreamNotFound(name) if name == "missing"));
 
     for start in [
         crate::subscription::SubscribeStart::Tail,
@@ -6375,13 +6377,38 @@ async fn cluster_subscription_rejects_before_lookup_and_replay_state() {
         let error = db
             .open_subscription("missing", Some("not valid SQL ("), start)
             .await
-            .expect_err("cluster SUBSCRIBE must fail before lookup, filter, or replay work");
+            .expect_err("cluster SUBSCRIBE must fail before filter or replay work");
         assert!(
-            matches!(&error, DbError::Unsupported(_)),
+            matches!(&error, DbError::StreamNotFound(name) if name == "missing"),
             "unexpected cluster SUBSCRIBE error: {error}"
         );
         assert!(!db.subscription_registry.contains_name("missing"));
     }
+
+    let uncertified_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+        "id",
+        arrow_schema::DataType::Int64,
+        false,
+    )]));
+    db.stream_schemas
+        .write()
+        .insert("uncertified".into(), uncertified_schema);
+    let error = db
+        .open_subscription(
+            "uncertified",
+            None,
+            crate::subscription::SubscribeStart::Tail,
+        )
+        .await
+        .expect_err("an uncertified cluster stream must fail before backend access");
+    assert!(matches!(
+        error,
+        DbError::Subscription(
+            crate::subscription::ClusterSubscriptionError::UnsupportedPlan { .. }
+        )
+    ));
+    assert_eq!(metrics.cluster_subscription.open_total.get(), 1);
+    assert_eq!(metrics.cluster_subscription.open_failures_total.get(), 1);
 }
 
 #[cfg(feature = "cluster")]
@@ -6409,7 +6436,12 @@ async fn cluster_retain_history_bootstrap_rejects_without_catalog_mutation() {
         .await
         .expect_err("cluster RETAIN HISTORY must reject the complete bootstrap batch");
     assert!(
-        matches!(&error, DbError::Unsupported(_)),
+        matches!(
+            &error,
+            DbError::Subscription(
+                crate::subscription::ClusterSubscriptionError::UnsupportedPlan { .. }
+            )
+        ),
         "unexpected cluster RETAIN HISTORY error: {error}"
     );
 
@@ -6428,6 +6460,373 @@ async fn cluster_retain_history_bootstrap_rejects_without_catalog_mutation() {
         .contains_key("unapplied_stream"));
     assert!(!db.subscription_registry.contains_name("unapplied_stream"));
     assert!(manifest_store.load().await.unwrap().is_none());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_keyed_aggregate_history_is_certified_before_catalog_seal() {
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use object_store::ObjectStore;
+
+    let node = NodeId(1);
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority(object_store).await;
+    let process_incarnation = authority.controller.recovery_incarnation();
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(node.0, "127.0.0.1:0".parse().unwrap(), process_incarnation)
+            .await
+            .unwrap(),
+    );
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&authority.controller))
+        .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+        .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+        .shuffle_sender(Arc::new(ShuffleSender::new(node.0, process_incarnation)))
+        .shuffle_receiver(receiver)
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, node)))
+        .build()
+        .await
+        .unwrap();
+
+    db.execute_cluster_bootstrap_batch(&[
+        "CREATE SOURCE trades (account_id BIGINT, pnl BIGINT)".into(),
+        "CREATE STREAM positions AS SELECT account_id, SUM(pnl) AS pnl FROM trades GROUP BY account_id WITH ('retain_history' = '4mb')".into(),
+    ])
+    .await
+    .unwrap();
+
+    {
+        let manager = db.connector_manager.lock();
+        let registration = &manager.streams()["positions"];
+        assert_eq!(registration.subscription_retention_bytes, 4 * 1024 * 1024);
+        assert!(registration.subscription_output.as_ref().is_some_and(
+            crate::subscription::distribution::PlannedSubscriptionOutput::is_vnode_partitioned
+        ));
+    }
+    assert!(authority.manifest_store.load().await.unwrap().is_some());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_keyed_aggregate_commits_and_replays_through_the_gateway() {
+    use laminar_core::checkpoint::CheckpointParticipant;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, AssignmentSnapshotStore, ProcessLeaseAuthority, ProcessLeaseOutcome,
+    };
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{NodeId, VnodeRegistry};
+    use object_store::ObjectStore;
+
+    let node = NodeId(1);
+    let source_control = crate::temporal_test_source::TemporalTestSourceControl::new();
+    let registration_control = source_control.clone();
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = test_catalog_authority_with_ttl(object_store, 60_000).await;
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(
+            Arc::clone(&authority.checkpoint_store),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap(),
+    );
+    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+        .store_for(node)
+        .try_acquire(authority.controller.recovery_incarnation(), 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty test authority must grant the local process lease");
+    };
+    authority
+        .controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+    authority.controller.install_local_leader_proof_provider();
+    authority
+        .controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
+    authority
+        .controller
+        .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
+        .await
+        .unwrap();
+    let assignment_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(
+        &authority.checkpoint_store,
+    )));
+    let assignment = AssignmentSnapshot::empty()
+        .next_for_participants(
+            (0..8).map(|vnode| (vnode, node)).collect(),
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: authority.controller.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+    assignment_store.save_if_absent(&assignment).await.unwrap();
+    authority
+        .controller
+        .publish_checkpoint_assignment_fence(Some(assignment.assignment_fence().unwrap()));
+    let process_incarnation = authority.controller.recovery_incarnation();
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(node.0, "127.0.0.1:0".parse().unwrap(), process_incarnation)
+            .await
+            .unwrap(),
+    );
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&authority.controller))
+        .cluster_checkpoint_object_store(Arc::clone(&authority.checkpoint_store))
+        .catalog_manifest_store(Arc::clone(&authority.manifest_store))
+        .shuffle_sender(Arc::new(ShuffleSender::new(node.0, process_incarnation)))
+        .shuffle_receiver(receiver)
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(8, node)))
+        .assignment_snapshot_store(assignment_store)
+        .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: Some(3_600_000),
+            ..Default::default()
+        })
+        .delivery_guarantee(laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce)
+        .register_connector(move |registry| {
+            crate::temporal_test_source::register(registry, &registration_control)
+        })
+        .build()
+        .await
+        .unwrap();
+    db.execute_cluster_bootstrap_batch(&[
+        "CREATE SOURCE trades (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL) FROM \"temporal-positioned-test\" ('mode' = 'append')".into(),
+        "CREATE STREAM positions AS SELECT id AS account_id, SUM(value) AS total FROM trades GROUP BY id WITH ('retain_history' = '4mb')".into(),
+    ])
+    .await
+    .unwrap();
+    authority.controller.set_active(true);
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&metrics));
+    db.fence_cluster_startup();
+    db.prepare_cluster_startup_recovery_generation(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let disposition = db
+        .finish_cluster_startup(tokio::time::Instant::now() + std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(disposition, ClusterStartupDisposition::Serving);
+    assert!(db.connector_manager.lock().streams()["positions"]
+        .subscription_certificate
+        .is_some());
+
+    let initial = db
+        .checkpoint_with_timeout(std::time::Duration::from_secs(15))
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "initial cluster checkpoint failed: {error}; state={}; fault={:?}; intake_fenced={}",
+                db.pipeline_state(),
+                db.last_fault(),
+                db.cluster_intake_fenced(),
+            )
+        });
+    assert!(initial.success, "initial checkpoint failed: {initial:?}");
+    let mut tail = db
+        .open_subscription("positions", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap();
+    let mut filtered_tail = db
+        .open_subscription(
+            "positions",
+            Some("total = 10"),
+            crate::subscription::SubscribeStart::Tail,
+        )
+        .await
+        .unwrap();
+
+    let initial_ingested = metrics.events_ingested.get();
+    source_control.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while metrics.events_ingested.get() < initial_ingested.saturating_add(1) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cluster pipeline did not consume the aggregate input");
+    let committed = db
+        .checkpoint_with_timeout(std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(committed.success, "output checkpoint failed: {committed:?}");
+
+    let mut frames = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
+        loop {
+            match tail.next_envelope().await {
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    cluster:
+                        Some(crate::subscription::ClusterSubscriptionFrameMetadata::Data {
+                            partition,
+                            partition_sequence,
+                            committed_epoch,
+                            ..
+                        }),
+                    ..
+                }) => batches.push((partition, partition_sequence, committed_epoch, batch)),
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
+                    ..
+                }) if epoch == committed.epoch => return batches,
+                Some(_) => {}
+                None => panic!("cluster gateway terminated before committed progress"),
+            }
+        }
+    })
+    .await
+    .expect("cluster gateway did not expose the committed aggregate cut");
+    assert!(!frames.is_empty());
+    assert!(frames
+        .iter()
+        .all(|(_, _, epoch, _)| *epoch == committed.epoch));
+    let filtered_batches = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
+        loop {
+            match filtered_tail.next_envelope().await {
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    ..
+                }) => batches.push(batch),
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
+                    ..
+                }) if epoch == committed.epoch => return batches,
+                Some(_) => {}
+                None => panic!("filtered cluster gateway terminated before committed progress"),
+            }
+        }
+    })
+    .await
+    .expect("filtered cluster gateway did not expose committed progress");
+    assert_eq!(
+        filtered_batches
+            .iter()
+            .map(arrow::array::RecordBatch::num_rows)
+            .sum::<usize>(),
+        1
+    );
+    let filtered_total = filtered_batches[0]
+        .column(filtered_batches[0].schema().index_of("total").unwrap())
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(filtered_total.value(0), 10);
+
+    source_control.release();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while metrics.events_ingested.get() < initial_ingested.saturating_add(2) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cluster pipeline did not consume the second aggregate input");
+    let second_committed = db
+        .checkpoint_with_timeout(std::time::Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(
+        second_committed.success,
+        "second output checkpoint failed: {second_committed:?}"
+    );
+    let second_frames = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
+        loop {
+            match tail.next_envelope().await {
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    cluster:
+                        Some(crate::subscription::ClusterSubscriptionFrameMetadata::Data {
+                            partition,
+                            partition_sequence,
+                            committed_epoch,
+                            ..
+                        }),
+                    ..
+                }) => batches.push((partition, partition_sequence, committed_epoch, batch)),
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
+                    ..
+                }) if epoch == second_committed.epoch => return batches,
+                Some(_) => {}
+                None => panic!("cluster gateway terminated before second committed progress"),
+            }
+        }
+    })
+    .await
+    .expect("cluster gateway did not expose the second committed aggregate cut");
+    assert!(!second_frames.is_empty());
+    assert!(second_frames
+        .iter()
+        .all(|(_, _, epoch, _)| *epoch == second_committed.epoch));
+    frames.extend(second_frames);
+
+    let mut sequences = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for (partition, sequence, _, _) in &frames {
+        sequences.entry(*partition).or_default().push(*sequence);
+    }
+    assert!(
+        sequences.values().any(|partition| partition.len() >= 2),
+        "the fixture must emit adjacent sequences for one partition"
+    );
+    for partition_sequences in sequences.values() {
+        for pair in partition_sequences.windows(2) {
+            assert_eq!(pair[1].get(), pair[0].get() + 1);
+        }
+    }
+
+    let mut replay = db
+        .open_subscription(
+            "positions",
+            None,
+            crate::subscription::SubscribeStart::AsOfEpoch(initial.epoch),
+        )
+        .await
+        .unwrap();
+    let replay_batches = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut batches = Vec::new();
+        loop {
+            match replay.next_envelope().await {
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Batch { batch, .. },
+                    ..
+                }) => batches.push(batch),
+                Some(crate::subscription::SubscriptionEnvelope {
+                    frame: crate::subscription::PortalFrame::Barrier { epoch, .. },
+                    ..
+                }) if epoch == second_committed.epoch => return batches,
+                Some(_) => {}
+                None => panic!("cluster replay terminated before committed progress"),
+            }
+        }
+    })
+    .await
+    .expect("AS OF EPOCH replay did not reach the committed cut");
+    assert!(!replay_batches.is_empty());
+    let replay_totals = replay_batches
+        .iter()
+        .flat_map(|batch| {
+            let totals = batch
+                .column(batch.schema().index_of("total").unwrap())
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            totals.values().iter().copied().collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert!(replay_totals.contains(&10));
+    assert!(replay_totals.contains(&21));
+    db.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "cluster")]
@@ -9488,6 +9887,10 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             has_analytic: false,
             has_frame: false,
             incremental: false,
+            subscription_output: None,
+            subscription_retention_bytes: 0,
+            catalog_generation: 1,
+            subscription_certificate: None,
         },
     )]);
     let error = db
@@ -9506,6 +9909,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         )]),
         has_analytic: false,
         has_frame: false,
+        subscription_output: None,
     };
     let error = db
         .validate_cluster_query_shape(
@@ -10675,6 +11079,7 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
             &CatalogManifest::new(vec![CatalogManifestEntry {
                 canonical_name: "secured".into(),
                 kind: CatalogObjectKind::Source,
+                catalog_generation: 1,
                 ddl: DDL.into(),
             }])
             .unwrap(),
@@ -10765,6 +11170,7 @@ async fn manifest_replay_rejects_connector_schema_rediscovery_before_factory_use
             &CatalogManifest::new(vec![CatalogManifestEntry {
                 canonical_name: "unstable".into(),
                 kind: CatalogObjectKind::Source,
+                catalog_generation: 1,
                 ddl: DDL.into(),
             }])
             .unwrap(),
@@ -11023,6 +11429,7 @@ async fn cluster_manifest_invalid_entry_fails_before_any_replay() {
         CatalogManifestEntry {
             canonical_name: name.to_string(),
             kind,
+            catalog_generation: 1,
             ddl: ddl.to_string(),
         }
     }

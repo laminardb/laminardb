@@ -37,17 +37,7 @@ impl LaminarDB {
         };
         stream_regs.insert(
             name.to_string(),
-            crate::connector_manager::StreamRegistration {
-                name: name.to_string(),
-                query_sql: query_sql.to_string(),
-                emit_clause: plan.emit_clause.clone(),
-                window_config: plan.window_config.clone(),
-                order_config: plan.order_config.clone(),
-                join_config: plan.join_config.clone(),
-                has_analytic: plan.has_analytic,
-                has_frame: plan.has_frame,
-                incremental: false,
-            },
+            plan.candidate_registration(name, query_sql),
         );
         self.validate_persisted_temporal_source_contracts(
             &source_regs,
@@ -142,17 +132,7 @@ impl LaminarDB {
         };
         stream_regs.insert(
             name.to_string(),
-            crate::connector_manager::StreamRegistration {
-                name: name.to_string(),
-                query_sql: query_sql.to_string(),
-                emit_clause: plan.emit_clause.clone(),
-                window_config: plan.window_config.clone(),
-                order_config: plan.order_config.clone(),
-                join_config: plan.join_config.clone(),
-                has_analytic: plan.has_analytic,
-                has_frame: plan.has_frame,
-                incremental: false,
-            },
+            plan.candidate_registration(name, query_sql),
         );
         let temporal_source_roles = self.validate_persisted_temporal_source_contracts(
             &source_regs,

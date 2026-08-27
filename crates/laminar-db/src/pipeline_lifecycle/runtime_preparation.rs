@@ -3,6 +3,63 @@ use super::{
     PreparedPipelineRuntime, RuntimeMode, TrackedSourceRegistration,
 };
 
+struct CallbackCollections {
+    source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>>,
+    source_frontiers_buf: rustc_hash::FxHashMap<Arc<str>, crate::operator_graph::InputFrontier>,
+    named_stream_names: rustc_hash::FxHashSet<Arc<str>>,
+}
+
+fn prepare_callback_collections(
+    source_ids: &rustc_hash::FxHashMap<String, usize>,
+    stream_entries: &[Arc<crate::catalog::StreamEntry>],
+) -> CallbackCollections {
+    let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
+        .iter()
+        .map(|(name, &source_id)| (source_id, Arc::<str>::from(name.as_str())))
+        .collect();
+    let source_frontiers_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
+        source_name_arcs.len(),
+        rustc_hash::FxBuildHasher,
+    );
+    let named_stream_names = stream_entries
+        .iter()
+        .map(|entry| Arc::from(entry.name.as_str()))
+        .collect();
+    CallbackCollections {
+        source_name_arcs,
+        source_frontiers_buf,
+        named_stream_names,
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn prepare_subscription_output(
+    runtime_mode: RuntimeMode,
+    graph: &crate::operator_graph::OperatorGraph,
+    controller: Option<&Arc<laminar_core::cluster::control::ClusterController>>,
+) -> Result<crate::subscription::cluster::ClusterSubscriptionOutputState, DbError> {
+    let certificates = graph.subscription_certificates();
+    if runtime_mode != RuntimeMode::Cluster || certificates.is_empty() {
+        return crate::subscription::cluster::ClusterSubscriptionOutputState::new(
+            certificates,
+            None,
+        );
+    }
+    let controller = controller.ok_or_else(|| {
+        DbError::Pipeline(
+            "cluster subscription output cannot bind process authority without a controller".into(),
+        )
+    })?;
+    let process = controller
+        .try_live_local_process_authority_identity()
+        .map_err(|error| {
+            DbError::Pipeline(format!(
+                "cluster subscription output cannot bind process authority: {error}"
+            ))
+        })?;
+    crate::subscription::cluster::ClusterSubscriptionOutputState::new(certificates, Some(process))
+}
+
 impl LaminarDB {
     pub(super) async fn prepare_pipeline_runtime(
         &self,
@@ -41,14 +98,11 @@ impl LaminarDB {
             .iter()
             .filter(|(_, _, filter_sql, _, _, _)| filter_sql.is_some())
             .count();
-        let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
-            .iter()
-            .map(|(name, &source_id)| (source_id, Arc::<str>::from(name.as_str())))
-            .collect();
-        let source_frontiers_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
-            source_name_arcs.len(),
-            rustc_hash::FxBuildHasher,
-        );
+        let CallbackCollections {
+            source_name_arcs,
+            source_frontiers_buf,
+            named_stream_names,
+        } = prepare_callback_collections(&source_ids, &stream_entries);
         let prom = self
             .engine_metrics
             .lock()
@@ -111,10 +165,6 @@ impl LaminarDB {
         #[cfg(not(feature = "cluster"))]
         let _ = quorum_timeout;
 
-        let named_stream_names = stream_entries
-            .iter()
-            .map(|entry| Arc::from(entry.name.as_str()))
-            .collect();
         #[cfg(feature = "cluster")]
         let source_process_authority = (runtime_mode == RuntimeMode::Cluster)
             .then(|| callback_controller.clone())
@@ -133,6 +183,9 @@ impl LaminarDB {
                 )
             });
 
+        #[cfg(feature = "cluster")]
+        let cluster_subscription_output =
+            prepare_subscription_output(runtime_mode, &graph, callback_controller.as_ref())?;
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_entries,
@@ -193,6 +246,8 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             checkpoint_leader_proofs: rustc_hash::FxHashMap::default(),
             subscription_registry: Arc::clone(&self.subscription_registry),
+            #[cfg(feature = "cluster")]
+            cluster_subscription_output,
             named_stream_names,
             checkpoint_complete_tx,
             checkpoint_tail_runtime: self.control_runtime.handle()?,

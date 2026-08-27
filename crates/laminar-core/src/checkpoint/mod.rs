@@ -27,6 +27,9 @@ pub mod object_store_builder;
 /// Canonical global index selected by a committed checkpoint.
 pub mod committed_checkpoint;
 
+/// Durable identities and canonical metadata for committed subscription output.
+pub mod subscription;
+
 pub use assignment::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, MAX_CHECKPOINT_PARTICIPANTS,
@@ -52,6 +55,15 @@ pub use committed_checkpoint::{
     canonical_json_bytes, canonical_json_sha256, CheckpointScope, CheckpointWatermark,
     CommittedCheckpointIndex, CommittedCheckpointRef, CommittedParticipantRef,
     COMMITTED_CHECKPOINT_INDEX_VERSION, MAX_COMMITTED_CHECKPOINT_INDEX_BYTES,
+};
+pub use subscription::{
+    merge_node_subscription_manifests, ChangelogMode, MergedSubscriptionCheckpoint,
+    NodePartitionRange, NodeSubscriptionManifest, NodeSubscriptionStreamManifest,
+    OutputDistribution, OutputDistributionCertificate, OutputFrameId, OutputPartitionId,
+    OutputSegmentRef, PartitionFrontier, PartitionSequence, StreamGeneration,
+    SubscriptionCheckpointManifest, SubscriptionContractError, SubscriptionDigest,
+    SubscriptionProtocolVersion, MAX_OUTPUT_FRAMES_PER_SEGMENT, MAX_OUTPUT_SEGMENT_BYTES,
+    OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION, SUBSCRIPTION_PROTOCOL_VERSION,
 };
 
 /// Reserved input-channel identity for one logical watermark per source and participant.

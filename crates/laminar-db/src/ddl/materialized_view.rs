@@ -182,6 +182,7 @@ impl LaminarDB {
             join_config: plan_joins,
             has_analytic: plan_has_analytic,
             has_frame: plan_has_frame,
+            subscription_output: _,
         } = planned;
         let query_sql = query_sql.to_string();
         // A chained MV over an incremental MV must net the changelog — a non-windowed aggregate or
@@ -235,6 +236,11 @@ impl LaminarDB {
                 has_analytic: plan_has_analytic,
                 has_frame: plan_has_frame,
                 incremental,
+                // Cluster materialized-view subscriptions remain fail-closed.
+                subscription_output: None,
+                subscription_retention_bytes: 0,
+                catalog_generation: 1,
+                subscription_certificate: None,
             });
             mgr.store_ddl(name_str, sql);
         }

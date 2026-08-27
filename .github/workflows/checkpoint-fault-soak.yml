@@ -99,7 +99,9 @@ jobs:
   join-validity:
     name: ${{ matrix.label }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Covers a cold feature-specific build plus the bounded soak. Correctness deadlines are
+    # enforced inside the harness and remain independent of hosted-runner compile variance.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -136,7 +138,27 @@ jobs:
             discovery: gossip
             emulator: "0"
             checkpoint_ms: "250"
-            rps: "400"
+            # Three Laminar nodes share a two-core hosted runner with Redpanda and MinIO. Keep
+            # enough headroom for the strict Kafka visibility gate while the 8 MiB state floor
+            # continues to enforce a substantial retained-state workload.
+            rps: "250"
+            visibility_ms: "10000"
+            slo_mode: observe
+            visibility_slo_mode: certify
+          - label: Cluster ALO committed subscriptions (gossip)
+            test: three_node_alo_cluster_subscription_kill9_soak
+            features: cluster,aws,kafka
+            delivery: alo
+            topology: cluster-subscription
+            discovery: gossip
+            emulator: "0"
+            # This job certifies committed replay and recovery, not the quadratic interval-join
+            # throughput profile covered by the adjacent ALO job. Sixty-four Zipf keys still span
+            # many stable vnodes while keeping every retained output cut within the bounded writer.
+            checkpoint_ms: "500"
+            rps: "100"
+            keys: "64"
+            min_live_state_bytes: "0"
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
@@ -148,7 +170,8 @@ jobs:
             discovery: static
             emulator: "0"
             checkpoint_ms: "250"
-            rps: "400"
+            # Match gossip so discovery remains the only intended variant.
+            rps: "250"
             visibility_ms: "10000"
             slo_mode: observe
             visibility_slo_mode: certify
@@ -160,7 +183,9 @@ jobs:
             discovery: gossip
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "150"
+            # Keep 23 Delta sinks plus partitioned subscription output below hosted-runner MinIO
+            # saturation while leaving headroom above the 8 MiB retained-state floor.
+            rps: "120"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -172,7 +197,8 @@ jobs:
             discovery: static
             emulator: "1"
             checkpoint_ms: "10000"
-            rps: "150"
+            # Match the gossip workload so discovery is the only intended variant.
+            rps: "120"
             visibility_ms: "120000"
             slo_mode: observe
             visibility_slo_mode: observe
@@ -238,22 +264,25 @@ jobs:
           LAMINAR_SOAK_SECONDS: ${{ github.event.inputs.seconds || '120' }}
           # MinIO EO is protocol validation, not a throughput certificate. Use the production
           # 10s checkpoint cadence and a load that still exceeds the 8 MiB state floor. Cluster EO
-          # gets a bounded drain window for fault-built backlog across 23 emulator-backed sinks;
-          # the test's strict defaults remain the certifying profile for production object stores.
+          # gets a bounded 60s checkpoint-operation timeout and recovery-aware observation window
+          # for fault-built backlog across 23 emulator-backed sinks. The real-store soak profile
+          # keeps 30s, and the per-fault 90s recovery ceiling remains unchanged.
           LAMINAR_SOAK_INTERVAL_MS: ${{ matrix.checkpoint_ms }}
           LAMINAR_SOAK_CHECKPOINT_SLO_MODE: ${{ matrix.slo_mode }}
+          LAMINAR_SOAK_ALO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_EO_VISIBILITY_MS: ${{ matrix.visibility_ms }}
           LAMINAR_SOAK_EO_VISIBILITY_SLO_MODE: ${{ matrix.visibility_slo_mode }}
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
-          LAMINAR_SOAK_JOIN_KEYS: "65536"
+          LAMINAR_SOAK_JOIN_KEYS: ${{ matrix.keys || '65536' }}
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_RPS: ${{ matrix.rps }}
-          # Hosted-runner timing is non-certifying; use the wider 10/50ms envelope.
+          # Hosted-runner timing remains visible but is not production performance evidence.
+          LAMINAR_SOAK_HOT_SLO_MODE: observe
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"
           LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ github.event.inputs.recovery_ms || '90000' }}
-          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
+          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: ${{ matrix.min_live_state_bytes || '8388608' }}
           LAMINAR_SOAK_DISCOVERY: ${{ matrix.discovery }}
           LAMINAR_SOAK_CHECKPOINT_URL: s3://laminardb-soak/${{ github.run_id }}/${{ matrix.topology }}-${{ matrix.delivery }}-${{ matrix.discovery }}/checkpoints
           LAMINAR_SOAK_S3_ENDPOINT: http://127.0.0.1:19000
@@ -352,8 +381,11 @@ jobs:
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
-          LAMINAR_SOAK_RPS: "400"
-          # Use the wider 10/50ms envelope on non-certifying hosted runners.
+          # Keep the 250 ms checkpoint/recovery stress while leaving hosted-runner
+          # headroom for durable aggregate output; 250 rps still exceeds the 8 MiB floor.
+          LAMINAR_SOAK_RPS: "250"
+          # Hosted-runner timing remains visible but is not production performance evidence.
+          LAMINAR_SOAK_HOT_SLO_MODE: observe
           LAMINAR_SOAK_HOT_P50_MS: "10"
           LAMINAR_SOAK_HOT_P95_MS: "50"
           LAMINAR_SOAK_HOT_P99_MS: "50"

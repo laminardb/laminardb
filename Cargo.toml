@@ -76,7 +76,7 @@ arrow-avro = "=58.4.0"
 arrow-schema = "=58.4.0"
 arrow-cast = "=58.4.0"
 arrow-csv = "=58.4.0"
-arrow-ipc = "=58.4.0"
+arrow-ipc = { version = "=58.4.0", features = ["lz4"] }
 arrow-json = "=58.4.0"
 arrow-row = "=58.4.0"
 arrow-select = "=58.4.0"

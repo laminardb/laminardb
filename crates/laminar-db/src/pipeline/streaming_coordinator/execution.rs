@@ -40,15 +40,12 @@ impl StreamingCoordinator {
             ));
             return CoordinatorWait::stop();
         }
-        let intake_paused = callback.intake_paused();
-        if intake_paused || self.replay_pending {
-            let _ = callback.is_recovering();
-        }
+        let gates = CoordinatorGates::capture(callback, self.replay_pending);
         let replay_ready = self.replay_pending
-            && !intake_paused
+            && gates.compute_admitted()
             && (self.manual_handoff_required || callback.has_runnable_deferred_input());
         let parked_ready =
-            !self.replay_pending && !intake_paused && self.parked_source_msg.is_some();
+            !self.replay_pending && gates.compute_admitted() && self.parked_source_msg.is_some();
         let mut retrying_replay = false;
         let mut checkpoint_control_due = false;
 
@@ -124,7 +121,8 @@ impl StreamingCoordinator {
             },
             () = std::future::ready(()), if parked_ready => self.parked_source_msg.take(),
             msg = self.rx.recv(),
-                if state.source_channel_expected && !intake_paused =>
+                if state.source_channel_expected
+                    && gates.compute_admitted() =>
             {
                 if let Ok(message) = msg {
                     if !state.batch_window.is_zero() {
@@ -152,7 +150,7 @@ impl StreamingCoordinator {
                     Some(wake) => wake.notified().await,
                     None => std::future::pending().await,
                 }
-            } => None,
+            }, if !gates.external_commit_backpressured => None,
             authority_lost = wait_coordinator_delay(
                 IDLE_TIMEOUT,
                 #[cfg(feature = "cluster")]
@@ -171,7 +169,7 @@ impl StreamingCoordinator {
             message,
             retrying_replay,
             checkpoint_control_due,
-            gates: CoordinatorGates { intake_paused },
+            gates,
         })
     }
 
@@ -409,57 +407,34 @@ impl StreamingCoordinator {
                 message: msg,
                 retrying_replay,
                 checkpoint_control_due,
-                gates: CoordinatorGates { intake_paused },
+                gates,
             } = wait.wake;
             // Recheck after the await: recovery may have closed the gate after this loop removed
             // a message from the source FIFO. Keep that message ahead of later FIFO entries so a
             // transient close/reopen cannot silently lose it. A fenced shutdown still discards
             // all open-epoch data below, where recovery owns the rewind.
-            let intake_blocked = intake_paused || callback.intake_paused();
+            let intake_blocked = gates.intake_paused || callback.intake_paused();
             self.observe_intake_gate_for_checkpoint_cadence(&mut state, intake_blocked);
             if intake_blocked {
-                if let Some(message) = msg {
-                    if self.parked_source_msg.is_some() {
-                        state.fault = Some(
-                            "source intake gate race exceeded its single parked-message slot"
-                                .into(),
-                        );
-                        break;
-                    }
-                    self.parked_source_msg = Some(message);
-                }
-                // Do not hide public admission deadlines behind assignment-transition control.
-                // Retain the second pass below because requests can arrive while that await runs.
-                self.drain_manual_requests();
-                self.prune_manual_requests();
-                #[cfg(feature = "cluster")]
-                if let Err(error) =
-                    self.require_process_authority("fenced vnode transition completion")
+                if !self
+                    .service_paused_intake(&mut callback, &mut state, msg)
+                    .await
                 {
-                    state.fault = Some(error.to_string());
                     break;
                 }
-                match callback.complete_pending_vnode_transition().await {
-                    Ok(_) => {}
-                    Err(CycleError::Halt(reason)) => {
-                        tracing::warn!(%reason, "[LDB-3022] fenced vnode transition halted");
-                        state.halt(reason);
-                        break;
-                    }
-                    Err(CycleError::Recovery(reason) | CycleError::Fatal(reason)) => {
-                        state.fault = Some(format!(
-                            "fenced vnode transition completion failed: {reason}"
-                        ));
-                        break;
-                    }
+                continue;
+            }
+            if gates.external_commit_backpressured {
+                if !self
+                    .service_external_commit_backpressure(
+                        &mut callback,
+                        &mut state,
+                        checkpoint_control_due,
+                    )
+                    .await
+                {
+                    break;
                 }
-                // A generic intake fence also blocks the mixed source FIFO that carries both
-                // predecessor batches and checkpoint barriers. Never reserve or inject a forced
-                // checkpoint here: its barrier could be stranded behind data the coordinator is
-                // deliberately forbidden to consume. Keep only pre-reservation caller lifecycle
-                // live so deadlines are observed and the drain can take its durable Abort path.
-                self.drain_manual_requests();
-                self.prune_manual_requests();
                 continue;
             }
 

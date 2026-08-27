@@ -23,6 +23,7 @@ fn entry(name: &str) -> CatalogManifestEntry {
     CatalogManifestEntry {
         canonical_name: name.to_string(),
         kind: CatalogObjectKind::Source,
+        catalog_generation: 1,
         ddl: format!("CREATE SOURCE {name} (k BIGINT)"),
     }
 }
@@ -83,6 +84,52 @@ fn duplicate_or_noncanonical_entries_are_rejected() {
 }
 
 #[test]
+fn object_generation_is_durable_nonzero_and_backward_decodable() {
+    let mut zero = entry("events");
+    zero.catalog_generation = 0;
+    assert!(matches!(
+        CatalogManifest::new(vec![zero]),
+        Err(CatalogManifestError::Invalid(_))
+    ));
+
+    let first = CatalogManifest::new(vec![entry("events")]).unwrap();
+    let mut recreated_entry = entry("events");
+    recreated_entry.catalog_generation = 2;
+    let recreated = CatalogManifest::new(vec![recreated_entry]).unwrap();
+    assert_ne!(
+        first.encode_and_reference().unwrap().1,
+        recreated.encode_and_reference().unwrap().1
+    );
+
+    let legacy = br#"{"entries":[{"canonical_name":"events","kind":"source","ddl":"CREATE SOURCE events (k BIGINT)"}]}"#;
+    let decoded: CatalogManifest = serde_json::from_slice(legacy).unwrap();
+    assert_eq!(decoded.entries[0].catalog_generation, 1);
+    decoded.validate().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_generation_one_manifest_loads_through_the_sealed_blob_path() {
+    let (store, backing, proof) = store().await;
+    let legacy = Bytes::from_static(
+        br#"{"entries":[{"canonical_name":"events","kind":"source","ddl":"CREATE SOURCE events (k BIGINT)"}]}"#,
+    );
+    let manifest: CatalogManifest = serde_json::from_slice(&legacy).unwrap();
+
+    store.seal(&manifest, &proof).await.unwrap();
+    let (_, reference) = manifest.encode_and_reference().unwrap();
+    let stored = backing
+        .get(&reference.object_path())
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    assert_eq!(stored, legacy);
+    assert_eq!(store.load().await.unwrap(), Some(manifest));
+}
+
+#[test]
 fn manifest_bounds_are_enforced_before_durable_writes() {
     let too_many = (0..=MAX_CATALOG_MANIFEST_ENTRIES)
         .map(|index| entry(&format!("source_{index}")))
@@ -95,6 +142,7 @@ fn manifest_bounds_are_enforced_before_durable_writes() {
     let oversized = CatalogManifest::new(vec![CatalogManifestEntry {
         canonical_name: "events".into(),
         kind: CatalogObjectKind::Source,
+        catalog_generation: 1,
         ddl: "x".repeat(MAX_CATALOG_MANIFEST_BYTES),
     }]);
     assert!(matches!(oversized, Err(CatalogManifestError::Invalid(_))));

@@ -58,6 +58,7 @@ struct CanonicalSource {
 #[derive(Serialize)]
 struct CanonicalStream {
     name: String,
+    catalog_generation: u64,
     query_sql: String,
     emit_clause: String,
     window_config: String,
@@ -66,6 +67,8 @@ struct CanonicalStream {
     #[serde(skip_serializing_if = "Option::is_none")]
     temporal_join_idle_history_retention_ms: Option<i64>,
     incremental: bool,
+    subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
+    subscription_retention_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -296,6 +299,7 @@ fn canonical_streams(
                 .transpose()?;
             Ok(CanonicalStream {
                 name: reg.name.clone(),
+                catalog_generation: reg.catalog_generation,
                 query_sql: canonical_sql(&reg.query_sql),
                 emit_clause: format!("{:?}", reg.emit_clause),
                 window_config: format!("{:?}", reg.window_config),
@@ -303,6 +307,8 @@ fn canonical_streams(
                 join_config: format!("{:?}", reg.join_config),
                 temporal_join_idle_history_retention_ms,
                 incremental: reg.incremental,
+                subscription_output: reg.subscription_output.clone(),
+                subscription_retention_bytes: reg.subscription_retention_bytes,
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -452,11 +458,26 @@ fn canonical_field(field: &Field) -> CanonicalField {
     }
 }
 
-fn canonical_sql(sql: &str) -> String {
+pub(crate) fn canonical_sql(sql: &str) -> String {
     sql.replace("\r\n", "\n")
         .replace('\r', "\n")
         .trim_end()
         .to_string()
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn subscription_schema_fingerprint(
+    schema: &Schema,
+) -> Result<laminar_core::checkpoint::SubscriptionDigest, DbError> {
+    let encoded = serde_json::to_vec(&canonical_schema(schema)).map_err(|error| {
+        DbError::Checkpoint(format!(
+            "subscription output schema fingerprint encode: {error}"
+        ))
+    })?;
+    Ok(laminar_core::checkpoint::SubscriptionDigest::for_bytes(
+        b"laminardb-subscription-schema-v1",
+        &encoded,
+    ))
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {

@@ -62,12 +62,18 @@ impl StreamingCoordinator {
             return None;
         }
 
+        #[cfg(feature = "cluster")]
+        let output_checkpoint_due = callback.external_output_pressure().checkpoint_due();
+        #[cfg(not(feature = "cluster"))]
+        let output_checkpoint_due = false;
         let interval = leader
             && self
                 .config
                 .checkpoint_schedule
                 .periodic_interval()
-                .is_some_and(|value| self.last_checkpoint.elapsed() >= value);
+                .is_some_and(|value| {
+                    output_checkpoint_due || self.last_checkpoint.elapsed() >= value
+                });
         let retry_ready = self
             .checkpoint_retry_not_before
             .is_none_or(|deadline| Instant::now() >= deadline);

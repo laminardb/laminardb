@@ -61,7 +61,7 @@ fn canonical_identity_digest_changes_with_root_execution_config() {
         ))
         .unwrap(),
     );
-    assert_eq!(STATE_ABI_VERSION, 5);
+    assert_eq!(STATE_ABI_VERSION, 6);
     let prior_state_abi = Sha256::digest(
         serde_json::to_vec(&payload(
             STATE_ABI_VERSION - 1,
@@ -142,6 +142,10 @@ fn temporal_retention_changes_only_temporal_stream_identity() {
         has_analytic: false,
         has_frame: false,
         incremental: false,
+        subscription_output: None,
+        subscription_retention_bytes: 0,
+        catalog_generation: 1,
+        subscription_certificate: None,
     };
     let temporal = stream(Some(vec![
         laminar_sql::translator::JoinOperatorConfig::Temporal(

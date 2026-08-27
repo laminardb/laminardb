@@ -161,12 +161,21 @@ pub use error::DbError;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, MaterializedViewInfo, PipelineEdge, PipelineNode,
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
-    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionFrame, UntypedSourceHandle,
+    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionEnvelope,
+    TypedSubscriptionFrame, UntypedSourceHandle,
 };
 pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
+pub use subscription::ClusterSubscriptionError;
+
+/// Criterion-only access to the real committed cluster-subscription gateway.
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub use subscription::cluster::benchmark::{
+    ClusterSubscriptionGatewayBenchmark, GatewayReplayObservation, SlowReaderFootprint,
+};
 
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
