@@ -474,7 +474,7 @@ pub(super) async fn cluster_subscription_retention_horizon(
         })
         .collect::<BTreeMap<_, _>>();
     let caps = retention_caps(&certificates);
-    if caps.is_empty() {
+    if caps.values().all(|cap| *cap == 0) {
         return Ok(latest.clone());
     }
 
@@ -614,8 +614,11 @@ fn retention_caps_fit(
     retained: &BTreeMap<StreamGeneration, u64>,
     caps: &BTreeMap<StreamGeneration, u64>,
 ) -> bool {
-    caps.iter()
-        .all(|(generation, cap)| retained.get(generation).copied().unwrap_or(0) <= *cap)
+    caps.iter().all(|(generation, cap)| {
+        // A zero cap disables replay for this stream; it must not collapse another stream's
+        // retained suffix when both outputs share the same committed checkpoint chain.
+        *cap == 0 || retained.get(generation).copied().unwrap_or(0) <= *cap
+    })
 }
 
 pub(super) fn retention_caps(
