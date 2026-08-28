@@ -1,3 +1,5 @@
+#[cfg(feature = "cluster")]
+use super::recovery::recovery_sink_fence;
 use super::retention::{
     delete_retired_data, load_cleanup_target, load_protected_checkpoint, run_gc_request,
     GcAuthority, GcRequest,
