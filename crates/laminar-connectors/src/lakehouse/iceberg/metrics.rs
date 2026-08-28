@@ -9,6 +9,8 @@ pub(super) struct IcebergMetrics {
     pub(super) buffered_rows: IntGauge,
     pub(super) buffered_bytes: IntGauge,
     pub(super) active_partition_writers: IntGauge,
+    pub(super) data_files_written: IntCounter,
+    pub(super) small_files_written: IntCounter,
     pub(super) file_size_bytes: Histogram,
     pub(super) file_rows: Histogram,
     pub(super) pre_commit_duration: Histogram,
@@ -44,6 +46,14 @@ impl IcebergMetrics {
             active_partition_writers: handle.gauge(
                 "iceberg_sink_active_partition_writers",
                 "Open Iceberg partition writers",
+            ),
+            data_files_written: handle.counter(
+                "iceberg_sink_data_files_written_total",
+                "Complete Iceberg data files closed by sink participants",
+            ),
+            small_files_written: handle.counter(
+                "iceberg_sink_small_files_written_total",
+                "Complete Iceberg data files smaller than the configured target size",
             ),
             file_size_bytes: histogram(
                 "iceberg_sink_file_size_bytes",
@@ -108,11 +118,56 @@ impl IcebergMetrics {
     }
 
     #[allow(clippy::cast_precision_loss)] // Prometheus histograms accept f64 observations.
-    pub(super) fn observe_files(&self, files: &[iceberg::spec::DataFile]) {
+    pub(super) fn observe_files(
+        &self,
+        files: &[iceberg::spec::DataFile],
+        target_file_size_bytes: usize,
+    ) {
+        self.data_files_written
+            .inc_by(u64::try_from(files.len()).unwrap_or(u64::MAX));
+        let small_files = files
+            .iter()
+            .filter(|file| {
+                usize::try_from(file.file_size_in_bytes())
+                    .is_ok_and(|bytes| bytes < target_file_size_bytes)
+            })
+            .count();
+        self.small_files_written
+            .inc_by(u64::try_from(small_files).unwrap_or(u64::MAX));
         for file in files {
             self.file_size_bytes
                 .observe(file.file_size_in_bytes() as f64);
             self.file_rows.observe(file.record_count() as f64);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lakehouse::iceberg::epoch_writer::{EpochIdentity, IcebergEpochWriter};
+    use crate::lakehouse::iceberg::test_support::{batch, create_test_table};
+
+    #[tokio::test]
+    async fn completed_files_update_data_and_small_file_counters() {
+        let fixture = create_test_table(false).await;
+        let metrics = IcebergMetrics::new(None);
+        let identity = EpochIdentity {
+            deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
+            sink_id: "metrics".into(),
+            participant_id: 1,
+            epoch: 1,
+        };
+        let mut writer =
+            IcebergEpochWriter::new(&fixture.table, &fixture.config, &identity, metrics.clone())
+                .unwrap();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        assert_eq!(metrics.data_files_written.get(), 1);
+        assert_eq!(metrics.small_files_written.get(), 1);
     }
 }

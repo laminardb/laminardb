@@ -11,6 +11,7 @@ use super::cursor::IcebergSourceCursorV1;
 pub(super) struct AppendSnapshotPlan {
     pub snapshot: SnapshotRef,
     pub added_file_paths: HashSet<String>,
+    pub manifest_count: usize,
 }
 
 pub(super) async fn plan_appends(
@@ -23,13 +24,15 @@ pub(super) async fn plan_appends(
     let mut remaining_files = max_files;
     let mut plans = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let added_file_paths = added_files_for_snapshot(table, &snapshot, remaining_files).await?;
+        let (added_file_paths, manifest_count) =
+            added_files_for_snapshot(table, &snapshot, remaining_files).await?;
         remaining_files = remaining_files
             .checked_sub(added_file_paths.len())
             .ok_or_else(file_limit_error)?;
         plans.push(AppendSnapshotPlan {
             snapshot,
             added_file_paths,
+            manifest_count,
         });
     }
     Ok(plans)
@@ -100,7 +103,7 @@ async fn added_files_for_snapshot(
     table: &Table,
     snapshot: &SnapshotRef,
     max_files: usize,
-) -> Result<HashSet<String>, ConnectorError> {
+) -> Result<(HashSet<String>, usize), ConnectorError> {
     if snapshot.summary().operation != Operation::Append {
         return Err(non_append_error(
             snapshot.snapshot_id(),
@@ -170,7 +173,7 @@ async fn added_files_for_snapshot(
             }
         }
     }
-    Ok(paths)
+    Ok((paths, manifest_list.entries().len()))
 }
 
 fn non_append_error(snapshot_id: i64, operation: &str) -> ConnectorError {
@@ -266,6 +269,7 @@ mod tests {
             plans[1].added_file_paths,
             third_paths.into_iter().collect::<HashSet<_>>()
         );
+        assert!(plans.iter().all(|plan| plan.manifest_count > 0));
         assert!(plans.iter().all(|plan| first_paths
             .iter()
             .all(|path| !plan.added_file_paths.contains(path))));

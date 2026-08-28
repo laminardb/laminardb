@@ -261,6 +261,8 @@ impl IcebergSource {
             .snapshot_for_ref(&self.config.table_ref)
             .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
         self.observe_table_head(head);
+        self.metrics
+            .observe_table(table.metadata(), &self.config.table_ref);
 
         if let Some(cursor) = self.cursor.as_ref() {
             cursor.validate_binding(&self.config, &table)?;
@@ -284,12 +286,14 @@ impl IcebergSource {
             self.metrics
                 .planning_duration
                 .observe(planning_started.elapsed().as_secs_f64());
-            self.metrics.planned_files.inc_by(
-                plans
-                    .iter()
-                    .map(|plan| plan.added_file_paths.len() as u64)
-                    .sum(),
-            );
+            let planned_files = plans.iter().fold(0_u64, |total, plan| {
+                total.saturating_add(u64::try_from(plan.added_file_paths.len()).unwrap_or(u64::MAX))
+            });
+            let planned_manifests = plans.iter().fold(0_u64, |total, plan| {
+                total.saturating_add(u64::try_from(plan.manifest_count).unwrap_or(u64::MAX))
+            });
+            self.metrics.planned_files.inc_by(planned_files);
+            self.metrics.planned_manifests.inc_by(planned_manifests);
             self.set_pending_snapshots(plans.len());
             self.scan = planner::append_task(table.clone(), &self.config, plans)?;
         } else if let Some(snapshot) = Self::selected_snapshot(&table, &self.config)? {
@@ -387,6 +391,8 @@ impl SourceConnector for IcebergSource {
                 .snapshot_for_ref(&self.config.table_ref)
                 .map(|snapshot| (snapshot.snapshot_id(), snapshot.sequence_number()));
             self.observe_table_head(head);
+            self.metrics
+                .observe_table(table.metadata(), &self.config.table_ref);
             self.table = Some(table);
 
             match position {
@@ -456,6 +462,10 @@ impl SourceConnector for IcebergSource {
                             });
                         }
                         ScanOutput::Cursor(cursor) => self.install_cursor(cursor)?,
+                        ScanOutput::ReadMetrics {
+                            files,
+                            storage_bytes,
+                        } => self.metrics.observe_completed_read(files, storage_bytes),
                     }
                     continue;
                 }

@@ -356,7 +356,8 @@ impl IcebergEpochWriter {
             .close()
             .await
             .map_err(|error| iceberg_write_error("close partition writer", &error))?;
-        self.metrics.observe_files(&files);
+        self.metrics
+            .observe_files(&files, self.target_file_size_bytes);
         self.completed.extend(files);
         self.metrics.set_active_writers(self.active.len());
         Ok(())

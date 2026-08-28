@@ -84,3 +84,20 @@ fn contracts_match_typed_read_modes() {
     assert_eq!(append.consistency, SourceConsistency::Replayable);
     assert_eq!(append.input_mode, SourceInputMode::AppendOnly);
 }
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn completed_scan_observes_files_and_storage_bytes() {
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let (table, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("read"))]).await;
+    let mut source = IcebergSource::new(test_source_config(), None);
+    source.table = Some(table);
+    source.start_initial_scan().unwrap();
+
+    while source.poll_batch(1).await.unwrap().is_some() {}
+
+    assert_eq!(source.metrics.read_files.get(), 1);
+    assert!(source.metrics.read_storage_bytes.get() > 0);
+}

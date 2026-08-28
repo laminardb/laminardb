@@ -47,3 +47,17 @@ separate decision and is not implied by local connector support.
 Append snapshot reads, append lineage reads, direct append writes, and coordinated exactly-once
 append writes can evolve independently without overstating row-mutation support. An upstream API
 gap produces a stable `FeatureUnsupported` error rather than weaker delivery semantics.
+
+## Maintenance boundary
+
+The released dependency exposes a snapshot-expiration action, but LaminarDB does not invoke it
+from a connector instance. Safe expiration needs one fenced authority with the complete inventory
+of active source cursors, retained checkpoint recovery points, and unresolved external commits.
+No such cross-pipeline maintenance authority exists today. Connector-local expiration would risk
+removing replay or reconciliation state.
+
+The released API also lacks the transaction actions needed for data-file compaction, delete-file
+rewrites, manifest rewrites, and format-aware orphan cleanup. LaminarDB therefore starts no
+per-connector maintenance loop and never deletes files from a publication whose outcome is
+unknown. These operations remain externally managed until a shared fenced maintenance lifecycle
+and the necessary released Iceberg actions are both available.

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +22,10 @@ pub(super) enum ScanOutput {
         completed_cursor: Option<IcebergSourceCursorV1>,
     },
     Cursor(IcebergSourceCursorV1),
+    ReadMetrics {
+        files: u64,
+        storage_bytes: u64,
+    },
 }
 
 pub(super) struct ScanTask {
@@ -156,29 +161,39 @@ async fn run_plan(
             plan.snapshot_id
         ))
     })?;
-    let stream = match plan.files {
-        ScanFiles::All => tokio::time::timeout(request_timeout, scan.to_arrow())
-            .await
-            .map_err(|_| scan_timeout(request_timeout))?
-            .map_err(|error| scan_error(&error))?,
-        ScanFiles::Added(paths) => {
-            let tasks = tokio::time::timeout(request_timeout, scan.plan_files())
-                .await
-                .map_err(|_| scan_timeout(request_timeout))?
-                .map_err(|error| scan_error(&error))?;
-            let filtered: FileScanTaskStream = Box::pin(
-                tasks.try_filter(move |task| future::ready(paths.contains(task.data_file_path()))),
-            );
-            table
-                .reader_builder()
-                .with_batch_size(8_192)
-                .build()
-                .read(filtered)
-                .map_err(|error| scan_error(&error))?
-                .stream()
-        }
+    let tasks = tokio::time::timeout(request_timeout, scan.plan_files())
+        .await
+        .map_err(|_| scan_timeout(request_timeout))?
+        .map_err(|error| scan_error(&error))?;
+    let tasks = match plan.files {
+        ScanFiles::All => tasks,
+        ScanFiles::Added(paths) => Box::pin(
+            tasks.try_filter(move |task| future::ready(paths.contains(task.data_file_path()))),
+        ),
     };
-    send_stream(stream, plan.cursor, sender, request_timeout).await
+    let read_files = Arc::new(AtomicU64::new(0));
+    let read_file_counter = Arc::clone(&read_files);
+    let counted_tasks: FileScanTaskStream = Box::pin(tasks.map_ok(move |task| {
+        read_file_counter.fetch_add(1, Ordering::Relaxed);
+        task
+    }));
+    let result = table
+        .reader_builder()
+        .with_batch_size(8_192)
+        .with_data_file_concurrency_limit(concurrency)
+        .build()
+        .read(counted_tasks)
+        .map_err(|error| scan_error(&error))?;
+    let scan_metrics = result.metrics().clone();
+    send_stream(result.stream(), plan.cursor, sender, request_timeout).await?;
+    send(
+        sender,
+        ScanOutput::ReadMetrics {
+            files: read_files.load(Ordering::Relaxed),
+            storage_bytes: scan_metrics.bytes_read(),
+        },
+    )
+    .await
 }
 
 async fn send_stream(
