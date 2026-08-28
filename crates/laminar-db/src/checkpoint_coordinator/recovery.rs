@@ -75,11 +75,11 @@ impl CheckpointCoordinator {
             .map_err(|error| DbError::Checkpoint(format!("recovered channel progress: {error}")))
     }
 
+    #[cfg(feature = "cluster")]
     fn recovery_target(
         &self,
         recovery_scope: CheckpointScope,
     ) -> Result<Option<ClusterRecoveryTarget>, DbError> {
-        #[cfg(feature = "cluster")]
         if recovery_scope == CheckpointScope::Cluster {
             let controller = self.cluster_controller.as_ref().ok_or_else(|| {
                 DbError::Checkpoint("cluster recovery has no cluster controller".into())
@@ -98,8 +98,6 @@ impl CheckpointCoordinator {
                 max_graph_payload_bytes: self.recovery_graph_payload_limit,
             }));
         }
-        #[cfg(not(feature = "cluster"))]
-        let _ = recovery_scope;
         Ok(None)
     }
 
@@ -189,6 +187,8 @@ impl CheckpointCoordinator {
         recovered: &RecoveredState,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = outcome;
         #[cfg(feature = "cluster")]
         let continuation_proof = if committed.scope == CheckpointScope::Cluster {
             self.cluster_controller
@@ -285,7 +285,10 @@ impl CheckpointCoordinator {
         let pipeline_identity = self.expected_pipeline_identity()?;
         let deployment_id = self.expected_deployment_id()?.to_owned();
         let recovery_scope = self.recovery_scope();
+        #[cfg(feature = "cluster")]
         let cluster_target = self.recovery_target(recovery_scope)?;
+        #[cfg(not(feature = "cluster"))]
+        let cluster_target = None;
         #[cfg(feature = "cluster")]
         if let Some(target) = cluster_target.as_ref() {
             self.validate_recovery_target_until(&outcome, &committed, target, deadline)

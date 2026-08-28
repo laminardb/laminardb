@@ -460,11 +460,13 @@ impl CheckpointCoordinator {
             )));
         }
         let digested = Self::digest_artifact_until(artifact, deadline).await?;
-        let mut packed = self.assemble_checkpoint(attempt, request, digested)?;
+        let packed = self.assemble_checkpoint(attempt, request, digested)?;
         #[cfg(feature = "cluster")]
-        {
+        let packed = {
+            let mut packed = packed;
             packed.manifest.subscription_output = subscription_output;
-        }
+            packed
+        };
         self.validate_packed_manifest(&packed.manifest)?;
         Ok(packed)
     }

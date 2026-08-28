@@ -1,12 +1,12 @@
-#[cfg(feature = "cluster")]
-use super::QuorumPeer;
 use super::{
     channel_progress_frontiers_by_source, checkpoint_manifest_bytes, classify_channel_progress,
     Arc, BTreeMap, Bytes, ChannelProgress, CheckpointAttempt, CheckpointCoordinator,
     CheckpointManifest, CheckpointScope, CheckpointWatermark, CommittedCheckpointIndex,
     CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint, DbError, Duration,
-    FuturesUnordered, LeaderProof, StreamExt, COMMITTED_CHECKPOINT_INDEX_VERSION,
+    FuturesUnordered, StreamExt, COMMITTED_CHECKPOINT_INDEX_VERSION,
 };
+#[cfg(feature = "cluster")]
+use super::{LeaderProof, QuorumPeer};
 
 const PARTICIPANT_MANIFEST_POLL_INITIAL: Duration = Duration::from_millis(10);
 const PARTICIPANT_MANIFEST_POLL_MAX: Duration = Duration::from_millis(250);
