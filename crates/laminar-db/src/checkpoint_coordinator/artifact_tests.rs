@@ -1,3 +1,4 @@
+#[cfg(feature = "cluster")]
 use std::time::Instant;
 
 #[cfg(feature = "cluster")]

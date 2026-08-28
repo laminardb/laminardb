@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
+#[cfg(feature = "cluster")]
+use laminar_core::checkpoint::CommittedCheckpointRef;
 use laminar_core::checkpoint::{
-    CheckpointAttempt, CheckpointManifest, CheckpointStore, CommittedCheckpointRef,
-    ConnectorCheckpoint, PipelineIdentity,
+    CheckpointAttempt, CheckpointManifest, CheckpointStore, ConnectorCheckpoint, PipelineIdentity,
 };
 use tracing::warn;
 

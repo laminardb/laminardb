@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-use laminar_core::checkpoint::CheckpointAttempt;
 #[cfg(feature = "cluster")]
-use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointWatermark, LeaderProof};
+use laminar_core::checkpoint::{
+    CheckpointAssignmentFence, CheckpointAttempt, CheckpointWatermark, LeaderProof,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CheckpointPhase {
