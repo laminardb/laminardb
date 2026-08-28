@@ -259,6 +259,44 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features files
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
+          # Iceberg catalog and storage isolation
+          cargo check -p laminar-connectors --no-default-features --features iceberg-core
+          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-rest
+          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-glue
+          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-hms
+          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-s3tables
+          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-sql
+          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-s3
+          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-gcs
+          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-azure
+          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-fs
+          cargo check -p laminar-connectors --no-default-features --features iceberg
+          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
+          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
+          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
+
+  iceberg-integration:
+    name: Iceberg REST and S3 integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: iceberg-integration
+      - name: Start Iceberg REST and MinIO
+        run: docker compose -f tests/docker/iceberg-compose.yml up -d --wait
+      - name: Run Iceberg append integration tests
+        run: cargo test -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
+      - name: Capture service logs after failure
+        if: failure()
+        continue-on-error: true
+        run: docker compose -f tests/docker/iceberg-compose.yml logs --no-color
+      - name: Stop Iceberg REST and MinIO
+        if: always()
+        run: docker compose -f tests/docker/iceberg-compose.yml down -v
+
   dependency-generations:
     name: Analytical Dependency Generations
     runs-on: ubuntu-latest
@@ -431,7 +469,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, dependency-generations, msrv, docs, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -442,6 +480,7 @@ jobs:
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
+             [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \

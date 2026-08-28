@@ -133,7 +133,15 @@ fn fs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, Connecto
     Err(missing_storage_feature("fs", "iceberg-storage-fs"))
 }
 
-#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+#[cfg(all(
+    any(test, feature = "iceberg-catalog-rest"),
+    any(
+        not(feature = "iceberg-storage-s3"),
+        not(feature = "iceberg-storage-gcs"),
+        not(feature = "iceberg-storage-azure"),
+        not(feature = "iceberg-storage-fs")
+    )
+))]
 fn missing_storage_feature(storage: &str, feature: &str) -> ConnectorError {
     ConnectorError::FeatureUnsupported(format!(
         "iceberg.storage.{storage}: build with the '{feature}' feature"
