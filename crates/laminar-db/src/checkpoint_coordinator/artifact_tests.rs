@@ -1,3 +1,7 @@
+use super::retention::{
+    delete_retired_data, load_cleanup_target, load_protected_checkpoint, run_gc_request,
+    GcAuthority, GcRequest,
+};
 use super::*;
 use laminar_core::checkpoint::ObjectStoreCheckpointStore;
 #[cfg(feature = "cluster")]

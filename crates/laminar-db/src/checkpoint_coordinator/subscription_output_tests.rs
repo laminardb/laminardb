@@ -18,10 +18,10 @@ use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 use object_store::memory::InMemory;
 
+use super::retention::{delete_retired_data, live_chunk_inventory};
 use super::subscription_output::{
     cluster_subscription_retention_horizon, encode_node_subscription_output, retention_caps,
 };
-use super::{delete_retired_data, live_chunk_inventory};
 use crate::error::DbError;
 use crate::subscription::cluster::{
     ClusterSubscriptionOutputState, OutputWriterAuthority, PreparedNodeSubscriptionOutput,

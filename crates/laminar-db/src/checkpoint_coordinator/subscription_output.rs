@@ -254,7 +254,7 @@ impl CheckpointCoordinator {
                 })?;
                 let predecessor_manifests = tokio::time::timeout_at(
                     deadline,
-                    super::load_index_manifests(self.store.as_ref(), &index),
+                    super::retention::load_index_manifests(self.store.as_ref(), &index),
                 )
                 .await
                 .map_err(|_| {
@@ -404,7 +404,7 @@ async fn retained_subscription_segments(
         bytes: 0,
     };
     for _ in 0..MAX_RETAINED_SUBSCRIPTION_INTERVALS {
-        let manifests = super::load_index_manifests(store, &current).await?;
+        let manifests = super::retention::load_index_manifests(store, &current).await?;
         for (object_key, encoded_length) in manifests
             .iter()
             .filter_map(|manifest| manifest.subscription_output.as_ref())
@@ -458,7 +458,7 @@ pub(super) async fn cluster_subscription_retention_horizon(
     latest: &CommittedCheckpointIndex,
     artifact_floor_epoch: u64,
 ) -> Result<CommittedCheckpointIndex, DbError> {
-    let latest_manifests = super::load_index_manifests(store, latest).await?;
+    let latest_manifests = super::retention::load_index_manifests(store, latest).await?;
     let latest_outputs = merged_subscription_manifests(
         CheckpointAttempt::new(latest.epoch, latest.checkpoint_id),
         latest.assignment_fence.as_ref(),
@@ -504,7 +504,7 @@ pub(super) async fn cluster_subscription_retention_horizon(
                     "subscription retention predecessor is invalid: {error}"
                 ))
             })?;
-        let manifests = super::load_index_manifests(store, &predecessor).await?;
+        let manifests = super::retention::load_index_manifests(store, &predecessor).await?;
         let outputs = merged_subscription_manifests(
             CheckpointAttempt::new(predecessor.epoch, predecessor.checkpoint_id),
             predecessor.assignment_fence.as_ref(),
