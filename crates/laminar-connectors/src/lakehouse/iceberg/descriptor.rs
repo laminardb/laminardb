@@ -91,7 +91,7 @@ impl IcebergCommitDescriptorV1 {
         let files = output
             .data_files
             .iter()
-            .map(file_fingerprint)
+            .map(data_file_fingerprint)
             .collect::<Vec<_>>();
         let record_count = checked_sum(
             output.data_files.iter().map(DataFile::record_count),
@@ -237,7 +237,10 @@ impl IcebergCommitDescriptorV1 {
             ))
         })?;
         data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
-        let observed = data_files.iter().map(file_fingerprint).collect::<Vec<_>>();
+        let observed = data_files
+            .iter()
+            .map(data_file_fingerprint)
+            .collect::<Vec<_>>();
         if observed != self.files {
             return Err(ConnectorError::TransactionError(
                 "Iceberg descriptor data-file fingerprints do not match its envelope".into(),
@@ -492,7 +495,7 @@ fn participant_fingerprint(
     format!("{:x}", hash.finalize())
 }
 
-fn file_fingerprint(file: &DataFile) -> IcebergFileFingerprintV1 {
+pub(super) fn data_file_fingerprint(file: &DataFile) -> IcebergFileFingerprintV1 {
     let mut hash = Sha256::new();
     hash.update(b"laminardb-iceberg-data-file-v1\0");
     hash_len_prefixed(&mut hash, file.file_path().as_bytes());
@@ -622,19 +625,19 @@ mod tests {
             FormatVersion::V2,
         )
         .unwrap();
-        let fingerprints = files.iter().map(file_fingerprint).collect::<Vec<_>>();
+        let fingerprints = files.iter().map(data_file_fingerprint).collect::<Vec<_>>();
         canonicalize_data_files_avro(&generated, &fingerprints).unwrap()
     }
 
     #[test]
     fn file_fingerprint_is_deterministic_and_content_sensitive() {
         assert_eq!(
-            file_fingerprint(&data_file("a")),
-            file_fingerprint(&data_file("a"))
+            data_file_fingerprint(&data_file("a")),
+            data_file_fingerprint(&data_file("a"))
         );
         assert_ne!(
-            file_fingerprint(&data_file("a")),
-            file_fingerprint(&data_file("b"))
+            data_file_fingerprint(&data_file("a")),
+            data_file_fingerprint(&data_file("b"))
         );
     }
 

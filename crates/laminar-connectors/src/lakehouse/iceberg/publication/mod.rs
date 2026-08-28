@@ -1,23 +1,28 @@
 //! Atomic `FastAppend` publication and outcome reconciliation.
 
+mod reconciliation;
+
+pub(super) use reconciliation::read_committed_cursor;
+use reconciliation::reconcile_exact_publication;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
+use iceberg::spec::{DataContentType, DataFile};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 use sha2::{Digest, Sha256};
 
-use crate::connector::{
-    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
-    CoordinatedCommitNamespace,
-};
+use crate::connector::{CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor};
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
-use super::descriptor::{IcebergCommitDescriptorV1, IcebergTableBindingV1};
+use super::descriptor::{
+    data_file_fingerprint, IcebergCommitDescriptorV1, IcebergFileFingerprintV1,
+    IcebergTableBindingV1,
+};
 use super::metrics::IcebergMetrics;
 
 const MAX_AGGREGATE_DATA_FILES: usize = 4_096;
@@ -36,12 +41,83 @@ pub(super) struct UnresolvedIcebergPublication {
     pub(super) external_key: String,
     pub(super) target: CoordinatedCommitCursor,
     pub(super) exact_batch_fingerprint: [u8; 32],
+    pub(super) expected_file_set_fingerprint: String,
 }
 
 impl UnresolvedIcebergPublication {
     pub(super) fn reconciled_by(&self, cursor: Option<CoordinatedCommitCursor>) -> bool {
         cursor == Some(self.target)
     }
+}
+
+pub(super) fn unresolved_publication(
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+) -> Result<UnresolvedIcebergPublication, ConnectorError> {
+    batch.validate_shape().map_err(|error| {
+        ConnectorError::TransactionError(format!(
+            "Iceberg coordinated batch validation failed: {error}"
+        ))
+    })?;
+    let descriptor_limit = config
+        .max_descriptor_bytes
+        .min(crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
+    let file_limit = config
+        .max_files_per_checkpoint
+        .min(MAX_AGGREGATE_DATA_FILES);
+    let mut files = Vec::new();
+    let mut paths = HashSet::new();
+    for entry in &batch.entries {
+        let Some(payload) = &entry.payload else {
+            continue;
+        };
+        if payload.len() > descriptor_limit {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg participant descriptor is {} bytes; configured limit is {descriptor_limit}",
+                payload.len()
+            )));
+        }
+        let descriptor = IcebergCommitDescriptorV1::decode(payload)?;
+        if descriptor.deployment_id != batch.namespace.deployment_id
+            || descriptor.sink_id != batch.namespace.sink_id
+            || descriptor.participant_id != entry.participant_id
+            || descriptor.epoch_id != entry.attempt.epoch
+        {
+            return Err(ConnectorError::TransactionError(
+                "Iceberg descriptor runtime identity does not match its coordinated entry".into(),
+            ));
+        }
+        let projected = files
+            .len()
+            .checked_add(descriptor.files.len())
+            .ok_or_else(|| {
+                ConnectorError::TransactionError("Iceberg aggregate file count overflow".into())
+            })?;
+        if projected > file_limit {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg coordinated publication exceeds the {file_limit}-file checkpoint limit"
+            )));
+        }
+        for file in descriptor.files {
+            if !paths.insert(file.path.clone()) {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Iceberg coordinated descriptors repeat data file '{}'",
+                    file.path
+                )));
+            }
+            files.push(file);
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(UnresolvedIcebergPublication {
+        external_key: batch.namespace.external_key(),
+        target: CoordinatedCommitCursor {
+            checkpoint_id: batch.target.checkpoint_id,
+            fencing_token: batch.fencing_token,
+        },
+        exact_batch_fingerprint: batch.exact_fingerprint(),
+        expected_file_set_fingerprint: file_set_fingerprint(&files),
+    })
 }
 
 #[derive(Debug)]
@@ -81,8 +157,16 @@ pub(super) async fn publish_coordinated(
             &prepared,
             &identity.exact_batch_hex,
             identity.commit_uuid,
+            context.deadline(),
         )
-        .await;
+        .await
+        .map_err(|error| {
+            metrics.unknown_outcomes.inc();
+            ConnectorError::outcome_unknown(
+                format!("existing Iceberg cursor could not be proven exact: {error}"),
+                true,
+            )
+        });
     }
     let started = std::time::Instant::now();
     let result = publish_with_retries(
@@ -179,8 +263,16 @@ async fn publish_with_retries(
                     prepared,
                     &identity.exact_batch_hex,
                     identity.commit_uuid,
+                    context.deadline(),
                 )
-                .await;
+                .await
+                .map_err(|error| {
+                    metrics.unknown_outcomes.inc();
+                    ConnectorError::outcome_unknown(
+                        format!("conflict refresh found an unprovable Iceberg cursor: {error}"),
+                        true,
+                    )
+                });
             }
         }
 
@@ -203,8 +295,18 @@ async fn publish_with_retries(
                     prepared,
                     &identity.exact_batch_hex,
                     identity.commit_uuid,
+                    context.deadline(),
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    metrics.unknown_outcomes.inc();
+                    ConnectorError::outcome_unknown(
+                        format!(
+                            "Iceberg commit returned success but exact publication verification failed: {error}"
+                        ),
+                        true,
+                    )
+                })?;
                 return Ok(());
             }
             Ok(Err(error)) if error.kind() == ErrorKind::CatalogCommitConflicts => {
@@ -252,44 +354,6 @@ async fn publish_with_retries(
     Err(ConnectorError::Internal(
         "Iceberg publication retry loop exited unexpectedly".into(),
     ))
-}
-
-pub(super) async fn read_committed_cursor(
-    catalog: &Arc<dyn Catalog>,
-    config: &IcebergSinkConfig,
-    namespace: &CoordinatedCommitNamespace,
-    deadline: tokio::time::Instant,
-    metrics: &IcebergMetrics,
-    unresolved: Option<&UnresolvedIcebergPublication>,
-) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
-    let started = std::time::Instant::now();
-    let table = load_table_until(catalog, config, deadline, false).await?;
-    #[cfg(test)]
-    super::fault_injection::fail_outcome_unknown_if(
-        super::fault_injection::IcebergFaultPoint::DuringCommittedCursor,
-    )?;
-    let record = cursor_record(&table, &namespace.external_key())?;
-    if let (Some(record), Some(unresolved)) = (&record, unresolved) {
-        let exact_fingerprint = hex(&unresolved.exact_batch_fingerprint);
-        if unresolved.external_key == namespace.external_key()
-            && (record.cursor != unresolved.target || record.batch_fingerprint != exact_fingerprint)
-        {
-            return Err(ConnectorError::outcome_unknown(
-                "Iceberg cursor does not prove the exact unresolved publication fingerprint",
-                true,
-            ));
-        }
-    }
-    let cursor = record.map(|record| record.cursor);
-    metrics
-        .reconciliation_duration
-        .observe(started.elapsed().as_secs_f64());
-    if let Some(cursor) = cursor {
-        metrics
-            .committed_checkpoint
-            .set(i64::try_from(cursor.checkpoint_id).unwrap_or(i64::MAX));
-    }
-    Ok(cursor)
 }
 
 fn prepare_publication(
@@ -369,7 +433,7 @@ fn prepare_publication(
     }
     data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
     let binding = binding.unwrap_or_else(|| IcebergTableBindingV1::from_table(table, config));
-    let file_set_fingerprint = file_set_fingerprint(&data_files);
+    let file_set_fingerprint = data_file_set_fingerprint(&data_files);
     Ok(PreparedPublication {
         binding,
         data_files,
@@ -493,6 +557,7 @@ async fn reconcile_after_unknown(
         prepared,
         exact_batch_fingerprint,
         commit_uuid,
+        deadline,
     )
     .await
     {
@@ -505,130 +570,6 @@ async fn reconcile_after_unknown(
             true,
         )),
     }
-}
-
-async fn reconcile_exact_publication(
-    table: &iceberg::table::Table,
-    batch: &CoordinatedCommitBatch,
-    prepared: &PreparedPublication,
-    exact_batch_fingerprint: &str,
-    commit_uuid: uuid::Uuid,
-) -> Result<(), ConnectorError> {
-    let external_key = batch.namespace.external_key();
-    let record = cursor_record(table, &external_key)?.ok_or_else(|| {
-        ConnectorError::TransactionError("Iceberg coordinated cursor is absent".into())
-    })?;
-    let expected_cursor = CoordinatedCommitCursor {
-        checkpoint_id: batch.target.checkpoint_id,
-        fencing_token: batch.fencing_token,
-    };
-    if record.cursor.checkpoint_id < expected_cursor.checkpoint_id {
-        return Err(ConnectorError::TransactionError(format!(
-            "Iceberg cursor is at checkpoint {}, expected {}",
-            record.cursor.checkpoint_id, expected_cursor.checkpoint_id
-        )));
-    }
-    if record.cursor == expected_cursor
-        && (record.batch_fingerprint != exact_batch_fingerprint
-            || record.file_set_fingerprint != prepared.file_set_fingerprint
-            || record.commit_uuid != commit_uuid.to_string())
-    {
-        return Err(ConnectorError::TransactionError(
-            "Iceberg target checkpoint exists with a different fingerprint or commit UUID".into(),
-        ));
-    }
-    if prepared.data_files.is_empty() {
-        if record.cursor != expected_cursor {
-            return Err(ConnectorError::TransactionError(
-                "superseded empty Iceberg checkpoint cannot be proven from snapshot history".into(),
-            ));
-        }
-        return Ok(());
-    }
-
-    let snapshot = find_exact_snapshot(
-        table,
-        &external_key,
-        expected_cursor,
-        exact_batch_fingerprint,
-        &prepared.file_set_fingerprint,
-        commit_uuid,
-    )?;
-    let observed_paths = added_paths_for_snapshot(table, snapshot).await?;
-    if observed_paths != prepared.expected_paths {
-        return Err(ConnectorError::TransactionError(
-            "Iceberg snapshot summary matched but its exact added data-file set did not".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn find_exact_snapshot<'a>(
-    table: &'a iceberg::table::Table,
-    external_key: &str,
-    cursor: CoordinatedCommitCursor,
-    exact_batch_fingerprint: &str,
-    file_set_fingerprint: &str,
-    commit_uuid: uuid::Uuid,
-) -> Result<&'a iceberg::spec::SnapshotRef, ConnectorError> {
-    table
-        .metadata()
-        .snapshots()
-        .find(|snapshot| {
-            let properties = &snapshot.summary().additional_properties;
-            properties.get(SUMMARY_NAMESPACE).map(String::as_str) == Some(external_key)
-                && properties.get(SUMMARY_CHECKPOINT).map(String::as_str)
-                    == Some(cursor.checkpoint_id.to_string().as_str())
-                && properties.get(SUMMARY_FENCE).map(String::as_str)
-                    == Some(cursor.fencing_token.to_string().as_str())
-                && properties
-                    .get(SUMMARY_BATCH_FINGERPRINT)
-                    .map(String::as_str)
-                    == Some(exact_batch_fingerprint)
-                && properties.get(SUMMARY_FILE_SET).map(String::as_str)
-                    == Some(file_set_fingerprint)
-                && properties.get(SUMMARY_COMMIT_UUID).map(String::as_str)
-                    == Some(commit_uuid.to_string().as_str())
-        })
-        .ok_or_else(|| {
-            ConnectorError::TransactionError(
-                "exact Iceberg snapshot summary is absent from retained history".into(),
-            )
-        })
-}
-
-async fn added_paths_for_snapshot(
-    table: &iceberg::table::Table,
-    snapshot: &iceberg::spec::SnapshotRef,
-) -> Result<HashSet<String>, ConnectorError> {
-    let manifest_list = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .map_err(|error| {
-            ConnectorError::ReadError(format!("read Iceberg publication manifest list: {error}"))
-        })?;
-    let mut paths = HashSet::new();
-    for manifest_file in manifest_list.entries() {
-        if manifest_file.added_snapshot_id != snapshot.snapshot_id() {
-            continue;
-        }
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|error| {
-                ConnectorError::ReadError(format!("read Iceberg publication manifest: {error}"))
-            })?;
-        for entry in manifest.entries() {
-            if entry.snapshot_id() == Some(snapshot.snapshot_id())
-                && entry.status() == ManifestStatus::Added
-                && entry.content_type() == DataContentType::Data
-            {
-                paths.insert(entry.file_path().to_string());
-            }
-        }
-    }
-    Ok(paths)
 }
 
 fn summary_properties(
@@ -659,14 +600,23 @@ fn summary_properties(
     ])
 }
 
-fn file_set_fingerprint(files: &[DataFile]) -> String {
+fn data_file_set_fingerprint(files: &[DataFile]) -> String {
+    let fingerprints = files.iter().map(data_file_fingerprint).collect::<Vec<_>>();
+    file_set_fingerprint(&fingerprints)
+}
+
+fn file_set_fingerprint(files: &[IcebergFileFingerprintV1]) -> String {
     let mut hash = Sha256::new();
     hash.update(b"laminardb-iceberg-file-set-v1\0");
+    let mut files = files.iter().collect::<Vec<_>>();
+    files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     for file in files {
-        hash.update(file.file_path().len().to_be_bytes());
-        hash.update(file.file_path().as_bytes());
-        hash.update(file.record_count().to_be_bytes());
-        hash.update(file.file_size_in_bytes().to_be_bytes());
+        hash.update(file.path.len().to_be_bytes());
+        hash.update(file.path.as_bytes());
+        hash.update(file.metadata_sha256.len().to_be_bytes());
+        hash.update(file.metadata_sha256.as_bytes());
+        hash.update(file.records.to_be_bytes());
+        hash.update(file.bytes.to_be_bytes());
     }
     format!("{:x}", hash.finalize())
 }

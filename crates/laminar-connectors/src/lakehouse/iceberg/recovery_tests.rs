@@ -54,6 +54,14 @@ fn coordinated_sink(fixture: &TestTable, table: iceberg::table::Table) -> Iceber
     let schema =
         Arc::new(iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).unwrap());
     sink.schema = Some(Arc::clone(&schema));
+    sink.alignment_plan = Some(
+        super::schema_alignment::SchemaAlignmentPlan::new(
+            table.metadata().current_schema_id(),
+            Arc::clone(&schema),
+            Arc::clone(&schema),
+        )
+        .unwrap(),
+    );
     sink.iceberg_arrow_schema = Some(schema);
     sink.catalog = Some(Arc::clone(&fixture.catalog));
     sink.table = Some(table);
@@ -206,4 +214,39 @@ async fn unknown_refresh_and_cursor_faults_block_until_exact_reconciliation() {
     let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(table.metadata().snapshots().count(), 1);
     assert_eq!(table_row_count(&table).await, 2);
+}
+
+#[tokio::test]
+async fn failed_post_commit_file_set_verification_retains_the_recovery_fence() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let batch = commit_batch(1, descriptor(&mut sink, &fixture, 1).await);
+    let error = scope(
+        [IcebergFault::first(
+            IcebergFaultPoint::DuringManifestReconciliation,
+        )],
+        sink.commit_aggregated(batch.clone(), commit_context()),
+    )
+    .await
+    .expect_err("failed exact verification after commit must remain ambiguous");
+    assert!(error.is_outcome_unknown());
+    assert!(sink.unresolved_publication.lock().is_some());
+
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 1);
+    assert_eq!(table_row_count(&table).await, 2);
+    assert_eq!(
+        sink.committed_cursor(&namespace()).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 1,
+            fencing_token: 7,
+        })
+    );
+    assert!(sink.unresolved_publication.lock().is_none());
+
+    sink.commit_aggregated(batch, commit_context())
+        .await
+        .unwrap();
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 1);
 }

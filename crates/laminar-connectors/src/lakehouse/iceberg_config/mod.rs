@@ -652,7 +652,7 @@ pub fn validate_sink_schema(
             ))
         })?;
         if field.data_type() != table_field.data_type()
-            && !is_safe_widening(field.data_type(), table_field.data_type())
+            && !is_safe_iceberg_widening(field.data_type(), table_field.data_type())
         {
             return Err(ConnectorError::SchemaMismatch(format!(
                 "field '{}': pipeline type {} incompatible with table type {}",
@@ -665,7 +665,10 @@ pub fn validate_sink_schema(
     Ok(())
 }
 
-fn is_safe_widening(from: &arrow_schema::DataType, to: &arrow_schema::DataType) -> bool {
+pub(crate) fn is_safe_iceberg_widening(
+    from: &arrow_schema::DataType,
+    to: &arrow_schema::DataType,
+) -> bool {
     use arrow_schema::DataType;
     matches!(
         (from, to),

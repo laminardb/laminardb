@@ -15,6 +15,8 @@ mod metrics;
 mod publication;
 #[cfg(all(test, feature = "iceberg-core"))]
 mod recovery_tests;
+#[cfg(feature = "iceberg-core")]
+mod schema_alignment;
 #[cfg(all(test, feature = "iceberg-core"))]
 pub(crate) mod test_support;
 
@@ -45,6 +47,8 @@ use epoch_writer::{EpochIdentity, IcebergEpochWriter};
 use metrics::IcebergMetrics;
 #[cfg(feature = "iceberg-core")]
 use publication::UnresolvedIcebergPublication;
+#[cfg(feature = "iceberg-core")]
+use schema_alignment::SchemaAlignmentPlan;
 
 /// Apache Iceberg append sink.
 pub struct IcebergSink {
@@ -62,6 +66,8 @@ pub struct IcebergSink {
     table: Option<iceberg::table::Table>,
     #[cfg(feature = "iceberg-core")]
     iceberg_arrow_schema: Option<SchemaRef>,
+    #[cfg(feature = "iceberg-core")]
+    alignment_plan: Option<SchemaAlignmentPlan>,
     #[cfg(feature = "iceberg-core")]
     active_epoch: Mutex<Option<IcebergEpochWriter>>,
     #[cfg(feature = "iceberg-core")]
@@ -93,6 +99,8 @@ impl IcebergSink {
             table: None,
             #[cfg(feature = "iceberg-core")]
             iceberg_arrow_schema: None,
+            #[cfg(feature = "iceberg-core")]
+            alignment_plan: None,
             #[cfg(feature = "iceberg-core")]
             active_epoch: Mutex::new(None),
             #[cfg(feature = "iceberg-core")]
@@ -161,54 +169,13 @@ impl IcebergSink {
         &self,
         batch: &RecordBatch,
     ) -> Result<RecordBatch, ConnectorError> {
-        let target_schema =
-            self.iceberg_arrow_schema
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "open Iceberg sink".into(),
-                    actual: "Iceberg Arrow schema is not initialized".into(),
-                })?;
-        let batch_schema = batch.schema();
-        let mut columns = Vec::with_capacity(target_schema.fields().len());
-        for target in target_schema.fields() {
-            let column = match source_field_index(&batch_schema, target) {
-                Some(index) => {
-                    validate_supplied_field_id(&batch_schema.fields()[index], target)?;
-                    let column = batch.column(index);
-                    if column.data_type() == target.data_type() {
-                        Arc::clone(column)
-                    } else {
-                        arrow_cast::cast(column, target.data_type()).map_err(|error| {
-                            ConnectorError::SchemaMismatch(format!(
-                                "align Iceberg field '{}' by field ID: {error}",
-                                target.name()
-                            ))
-                        })?
-                    }
-                }
-                None if target.is_nullable() => {
-                    arrow_array::new_null_array(target.data_type(), batch.num_rows())
-                }
-                None => {
-                    return Err(ConnectorError::SchemaMismatch(format!(
-                        "required Iceberg field '{}' is absent from the input batch",
-                        target.name()
-                    )));
-                }
-            };
-            columns.push(column);
-        }
-        for source in batch_schema.fields() {
-            if source_field(target_schema.fields(), source).is_none() {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "input field '{}' has no Iceberg field-ID binding",
-                    source.name()
-                )));
-            }
-        }
-        RecordBatch::try_new(Arc::clone(target_schema), columns).map_err(|error| {
-            ConnectorError::SchemaMismatch(format!("build Iceberg-aligned batch: {error}"))
-        })
+        self.alignment_plan
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink with a schema alignment plan".into(),
+                actual: "Iceberg schema alignment is not initialized".into(),
+            })?
+            .align(batch)
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -362,12 +329,15 @@ impl SinkConnector for IcebergSink {
                     },
                 )?,
             );
-            if let Some(pipeline_schema) = config.arrow_schema() {
-                super::iceberg_config::validate_sink_schema(&pipeline_schema, &table_schema)?;
-                self.schema = Some(pipeline_schema);
-            } else {
-                self.schema = Some(Arc::clone(&table_schema));
-            }
+            let input_schema = config
+                .arrow_schema()
+                .unwrap_or_else(|| Arc::clone(&table_schema));
+            self.alignment_plan = Some(SchemaAlignmentPlan::new(
+                table.metadata().current_schema_id(),
+                Arc::clone(&input_schema),
+                Arc::clone(&table_schema),
+            )?);
+            self.schema = Some(input_schema);
             self.iceberg_arrow_schema = Some(table_schema);
             self.catalog = Some(catalog);
             self.table = Some(table);
@@ -552,6 +522,7 @@ impl SinkConnector for IcebergSink {
             self.catalog = None;
             self.table = None;
             self.iceberg_arrow_schema = None;
+            self.alignment_plan = None;
             self.metrics.set_buffer(0, 0);
             self.metrics.set_active_writers(0);
         }
@@ -581,14 +552,7 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
                 expected: "open Iceberg sink".into(),
                 actual: "catalog is not initialized".into(),
             })?;
-        let pending = UnresolvedIcebergPublication {
-            external_key: batch.namespace.external_key(),
-            target: crate::connector::CoordinatedCommitCursor {
-                checkpoint_id: batch.target.checkpoint_id,
-                fencing_token: batch.fencing_token,
-            },
-            exact_batch_fingerprint: batch.exact_fingerprint(),
-        };
+        let pending = publication::unresolved_publication(&self.config, &batch)?;
         {
             let mut unresolved = self.unresolved_publication.lock();
             if unresolved
@@ -660,95 +624,6 @@ fn parquet_compression(name: &str) -> parquet::basic::Compression {
             parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
         ),
     }
-}
-
-#[cfg(feature = "iceberg-core")]
-fn validate_supplied_field_id(
-    source: &arrow_schema::Field,
-    target: &arrow_schema::Field,
-) -> Result<(), ConnectorError> {
-    const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    if let (Some(source_id), Some(target_id)) = (
-        source.metadata().get(FIELD_ID),
-        target.metadata().get(FIELD_ID),
-    ) {
-        if source_id != target_id {
-            return Err(ConnectorError::SchemaMismatch(format!(
-                "input field '{}' carries Iceberg field ID {source_id}, expected {target_id}",
-                source.name()
-            )));
-        }
-    }
-    match (source.data_type(), target.data_type()) {
-        (arrow_schema::DataType::Struct(source), arrow_schema::DataType::Struct(target)) => {
-            if source.len() != target.len() {
-                return Err(nested_field_mismatch(target.len(), source.len()));
-            }
-            for target in target {
-                let source = source_field(source, target).ok_or_else(|| {
-                    ConnectorError::SchemaMismatch(format!(
-                        "nested Iceberg field '{}' has no field-ID binding",
-                        target.name()
-                    ))
-                })?;
-                validate_supplied_field_id(source, target)?;
-            }
-        }
-        (arrow_schema::DataType::List(source), arrow_schema::DataType::List(target))
-        | (arrow_schema::DataType::LargeList(source), arrow_schema::DataType::LargeList(target))
-        | (arrow_schema::DataType::ListView(source), arrow_schema::DataType::ListView(target))
-        | (
-            arrow_schema::DataType::LargeListView(source),
-            arrow_schema::DataType::LargeListView(target),
-        )
-        | (arrow_schema::DataType::Map(source, _), arrow_schema::DataType::Map(target, _)) => {
-            validate_supplied_field_id(source, target)?;
-        }
-        (
-            arrow_schema::DataType::FixedSizeList(source, source_size),
-            arrow_schema::DataType::FixedSizeList(target, target_size),
-        ) if source_size == target_size => validate_supplied_field_id(source, target)?,
-        _ => {}
-    }
-    Ok(())
-}
-
-#[cfg(feature = "iceberg-core")]
-fn source_field_index(
-    schema: &arrow_schema::Schema,
-    target: &arrow_schema::Field,
-) -> Option<usize> {
-    let fields = schema.fields();
-    source_field(fields, target).and_then(|source| {
-        fields
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate.as_ref(), source))
-    })
-}
-
-#[cfg(feature = "iceberg-core")]
-fn source_field<'a>(
-    fields: &'a arrow_schema::Fields,
-    target: &arrow_schema::Field,
-) -> Option<&'a arrow_schema::Field> {
-    const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    target
-        .metadata()
-        .get(FIELD_ID)
-        .and_then(|target_id| {
-            fields
-                .iter()
-                .find(|field| field.metadata().get(FIELD_ID) == Some(target_id))
-        })
-        .or_else(|| fields.iter().find(|field| field.name() == target.name()))
-        .map(AsRef::as_ref)
-}
-
-#[cfg(feature = "iceberg-core")]
-fn nested_field_mismatch(expected: usize, actual: usize) -> ConnectorError {
-    ConnectorError::SchemaMismatch(format!(
-        "nested Iceberg field count is {actual}, expected {expected}"
-    ))
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ pub(super) enum IcebergFaultPoint {
     BeforeCatalogCommit,
     AfterCatalogCommit,
     DuringMetadataRefresh,
+    DuringManifestReconciliation,
     DuringCommittedCursor,
 }
 

@@ -193,6 +193,47 @@ fn storage_specific_options_do_not_fall_through_to_s3() {
     ));
 }
 
+#[cfg(all(feature = "iceberg-catalog-rest", feature = "iceberg-storage-fs"))]
+#[tokio::test]
+async fn rest_catalog_loads_server_config_before_using_server_overrides() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .and(query_param("warehouse", "file:///tmp/warehouse"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "defaults": {"prefix": "default-prefix"},
+            "overrides": {"prefix": "server-prefix"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/server-prefix/namespaces"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"namespaces": []})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let catalog = catalog_config(|config| {
+        config.set("catalog.uri", server.uri());
+        config.set("catalog.warehouse", "file:///tmp/warehouse");
+        config.set("catalog.prefix", "client-prefix");
+    });
+    let storage = storage_config(Some("fs"));
+    let catalog = build_catalog(&catalog, &storage).await.unwrap();
+    assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].url.path(), "/v1/config");
+    assert_eq!(requests[1].url.path(), "/v1/server-prefix/namespaces");
+}
+
 fn empty_fixture_table() -> Table {
     let schema = iceberg::spec::Schema::builder()
         .with_fields(vec![])

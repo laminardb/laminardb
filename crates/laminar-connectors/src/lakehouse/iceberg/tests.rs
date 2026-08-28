@@ -113,33 +113,3 @@ async fn unsupported_mutation_modes_reject_before_file_creation() {
 fn schema_helper_remains_available_for_open_tests() {
     assert_eq!(test_schema().fields().len(), 1);
 }
-
-#[cfg(feature = "iceberg-core")]
-#[test]
-fn field_ids_are_authoritative_and_nested_ids_are_validated() {
-    use std::collections::HashMap;
-
-    const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-    let with_id = |name: &str, data_type: DataType, id: &str| {
-        Field::new(name, data_type, true)
-            .with_metadata(HashMap::from([(FIELD_ID.to_string(), id.to_string())]))
-    };
-    let source_schema = Schema::new(vec![with_id("old_name", DataType::Int64, "1")]);
-    let renamed_target = with_id("new_name", DataType::Int64, "1");
-    assert_eq!(source_field_index(&source_schema, &renamed_target), Some(0));
-
-    let source_nested = with_id(
-        "payload",
-        DataType::Struct(vec![Arc::new(with_id("value", DataType::Int64, "3"))].into()),
-        "2",
-    );
-    let target_nested = with_id(
-        "payload",
-        DataType::Struct(vec![Arc::new(with_id("value", DataType::Int64, "4"))].into()),
-        "2",
-    );
-    assert!(validate_supplied_field_id(&source_nested, &target_nested)
-        .unwrap_err()
-        .to_string()
-        .contains("field ID 3, expected 4"));
-}
