@@ -8,7 +8,9 @@ use laminar_core::checkpoint::{
 };
 
 #[cfg(feature = "cluster")]
-use super::{publish_terminal_hint_until, subscription_output};
+use super::attempt_failure::publish_terminal_hint_until;
+#[cfg(feature = "cluster")]
+use super::subscription_output;
 use super::{
     require_canonical_attempt, sink_epoch_admission, CheckpointCoordinator,
     CheckpointFailureDisposition, CheckpointPhase, CheckpointRequest, CheckpointResult, DbError,
@@ -16,6 +18,44 @@ use super::{
 };
 #[cfg(feature = "cluster")]
 use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+
+#[cfg(all(debug_assertions, feature = "cluster"))]
+pub(super) async fn checkpoint_kill_gate(
+    role: &'static str,
+    attempt: CheckpointAttempt,
+    predecessor: Option<(u64, u64)>,
+) {
+    static GATE_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(gate_file) = GATE_FILE
+        .get_or_init(|| std::env::var_os("LAMINAR_CHECKPOINT_KILL_GATE_FILE").map(Into::into))
+        .as_ref()
+    else {
+        return;
+    };
+    if std::fs::read_to_string(gate_file)
+        .ok()
+        .is_none_or(|requested| requested.trim() != role)
+    {
+        return;
+    }
+    let Some((predecessor_id, predecessor_epoch)) = predecessor else {
+        return;
+    };
+
+    let ready_file = gate_file.with_extension("ready");
+    let evidence = format!(
+        "{role} {} {} {predecessor_id} {predecessor_epoch}",
+        attempt.checkpoint_id, attempt.epoch
+    );
+    if std::fs::write(&ready_file, evidence).is_err() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while gate_file.is_file() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let _ = std::fs::remove_file(ready_file);
+}
 
 struct CertifiedQuorum {
     scope: CheckpointScope,
@@ -269,7 +309,7 @@ impl CheckpointCoordinator {
         let subscription_commit_stats = (scope == CheckpointScope::Cluster)
             .then(|| subscription_output::subscription_commit_stats(&prepared.manifests));
         #[cfg(all(debug_assertions, feature = "cluster"))]
-        super::checkpoint_kill_gate(
+        checkpoint_kill_gate(
             "leader",
             attempt,
             predecessor

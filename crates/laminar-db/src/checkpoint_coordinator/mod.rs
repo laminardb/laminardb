@@ -17,7 +17,9 @@ mod follower_prepare;
 mod follower_protocol;
 #[cfg(feature = "cluster")]
 mod handoff;
+mod protocol;
 mod recovery;
+mod request;
 mod retention;
 mod sink_commit;
 pub(crate) mod sink_epoch_admission;
@@ -52,237 +54,17 @@ use laminar_core::checkpoint::{
 use laminar_core::checkpoint_decision::{
     CheckpointArtifactInventory, CheckpointArtifactInventoryUpdateResult,
 };
+pub use protocol::{CheckpointFailureDisposition, CheckpointPhase, CheckpointResult};
+#[cfg(feature = "cluster")]
+pub(crate) use protocol::{FollowerPrepareOutcome, PrepareQuorum, QuorumPeer};
+pub(crate) use protocol::{QuorumStage, SinkEpochPublication};
+pub use request::{CapturedStateFrame, CheckpointConfig, CheckpointRequest};
+pub(crate) use request::{ManagedVnodeOperator, ManagedVnodePlacement};
 use retention::GcRequest;
 use sha2::{Digest, Sha256};
 
 const MAX_RETENTION_IO_CONCURRENCY: usize = 8;
 const REFERENCED_CHUNK_REBASE_THRESHOLD: usize = 64;
-#[cfg(feature = "cluster")]
-async fn publish_terminal_hint_until<F>(deadline: tokio::time::Instant, hint: F)
-where
-    F: std::future::Future<Output = Result<(), String>>,
-{
-    // Terminal hints accelerate observation but do not own the already-immutable durable verdict.
-    let _ = tokio::time::timeout_at(deadline, hint).await;
-}
-
-#[cfg(all(test, feature = "cluster"))]
-#[tokio::test]
-async fn terminal_checkpoint_hint_cannot_outlive_its_cleanup_deadline() {
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        publish_terminal_hint_until(
-            tokio::time::Instant::now(),
-            std::future::pending::<Result<(), String>>(),
-        ),
-    )
-    .await
-    .expect("an unresponsive terminal hint must be released at its private cleanup deadline");
-}
-
-#[cfg(all(debug_assertions, feature = "cluster"))]
-async fn checkpoint_kill_gate(
-    role: &'static str,
-    attempt: CheckpointAttempt,
-    predecessor: Option<(u64, u64)>,
-) {
-    static GATE_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    let Some(gate_file) = GATE_FILE
-        .get_or_init(|| std::env::var_os("LAMINAR_CHECKPOINT_KILL_GATE_FILE").map(Into::into))
-        .as_ref()
-    else {
-        return;
-    };
-    if std::fs::read_to_string(gate_file)
-        .ok()
-        .is_none_or(|requested| requested.trim() != role)
-    {
-        return;
-    }
-    let Some((predecessor_id, predecessor_epoch)) = predecessor else {
-        return;
-    };
-
-    let ready_file = gate_file.with_extension("ready");
-    let evidence = format!(
-        "{role} {} {} {predecessor_id} {predecessor_epoch}",
-        attempt.checkpoint_id, attempt.epoch
-    );
-    if std::fs::write(&ready_file, evidence).is_err() {
-        return;
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while gate_file.is_file() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let _ = std::fs::remove_file(ready_file);
-}
-
-#[derive(Debug, Clone)]
-pub struct CheckpointConfig {
-    pub checkpoint_timeout: Duration,
-    pub(crate) cleanup_timeout: Duration,
-    pub(crate) quorum_timeout: Duration,
-    pub max_node_data_bytes: u64,
-}
-
-impl Default for CheckpointConfig {
-    fn default() -> Self {
-        Self {
-            checkpoint_timeout: Duration::from_secs(120),
-            cleanup_timeout: Duration::from_secs(30),
-            quorum_timeout: Duration::from_secs(3),
-            max_node_data_bytes:
-                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CheckpointRequest {
-    pub flags: u64,
-    pub handoff_replay_pending: bool,
-    /// Capture-time proof that this cut can be restored under a different vnode assignment.
-    pub reassignment_portable: bool,
-    pub assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
-    pub state_frames: Vec<CapturedStateFrame>,
-    pub(crate) managed_vnode_operators: Vec<ManagedVnodeOperator>,
-    pub source_names: Vec<String>,
-    pub channel_progress: Vec<ChannelProgress>,
-    pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
-    #[cfg(feature = "cluster")]
-    pub(crate) subscription_output:
-        Option<Arc<crate::subscription::cluster::PreparedNodeSubscriptionOutput>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CapturedStateFrame {
-    pub key: StateFrameKey,
-    pub state: Option<Bytes>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ManagedVnodePlacement {
-    GlobalSingleton,
-    VnodeKeyed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ManagedVnodeOperator {
-    pub(crate) operator_id: String,
-    pub(crate) placement: ManagedVnodePlacement,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum CheckpointPhase {
-    Idle,
-    PreCommitting,
-    Persisting,
-    Deciding,
-}
-
-impl std::fmt::Display for CheckpointPhase {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Idle => formatter.write_str("Idle"),
-            Self::PreCommitting => formatter.write_str("PreCommitting"),
-            Self::Persisting => formatter.write_str("Persisting"),
-            Self::Deciding => formatter.write_str("Deciding"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointFailureDisposition {
-    Retryable,
-    RequiresRecovery,
-}
-
-/// Determines who publishes a prepared successor sink epoch as writable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SinkEpochPublication {
-    /// Startup and direct coordinator APIs have no callback-owned transition guard.
-    Immediate,
-    /// A spawned pipeline tail publishes only after its terminal result is known successful.
-    DeferredToTail,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CheckpointResult {
-    pub success: bool,
-    pub checkpoint_id: u64,
-    pub epoch: u64,
-    pub duration: Duration,
-    pub error: Option<String>,
-    pub failure_disposition: Option<CheckpointFailureDisposition>,
-}
-
-impl CheckpointResult {
-    #[must_use]
-    pub fn continuation_error(&self) -> Option<&str> {
-        self.success.then_some(self.error.as_deref()).flatten()
-    }
-
-    #[must_use]
-    pub fn requires_recovery(&self) -> bool {
-        !self.success
-            && self.failure_disposition == Some(CheckpointFailureDisposition::RequiresRecovery)
-    }
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) type QuorumPeer = laminar_core::cluster::discovery::NodeId;
-
-#[derive(Debug, Clone)]
-pub(crate) enum QuorumStage {
-    RunInline,
-    #[cfg(feature = "cluster")]
-    Captured {
-        cluster_watermark: laminar_core::checkpoint::CheckpointWatermark,
-        participants: Vec<QuorumPeer>,
-        leader_proof: LeaderProof,
-    },
-}
-
-/// Follower-local durability state after immutable capture ownership has been acknowledged.
-#[cfg(feature = "cluster")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FollowerPrepareOutcome {
-    /// Manifest persistence completed with an acknowledgement.
-    Prepared,
-    /// Manifest Create may be visible even though its acknowledgement was lost. The captured
-    /// phase-one state must remain intact until an authoritative Commit or Abort is observed.
-    InDoubt,
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) struct PrepareQuorum<'a> {
-    attempt: CheckpointAttempt,
-    local_watermark: laminar_core::checkpoint::CheckpointWatermark,
-    assignment_fence: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
-    leader_proof: &'a LeaderProof,
-    flags: u64,
-}
-
-#[cfg(feature = "cluster")]
-impl<'a> PrepareQuorum<'a> {
-    pub(crate) const fn new(
-        attempt: CheckpointAttempt,
-        local_watermark: laminar_core::checkpoint::CheckpointWatermark,
-        assignment_fence: &'a laminar_core::checkpoint::CheckpointAssignmentFence,
-        leader_proof: &'a LeaderProof,
-        flags: u64,
-    ) -> Self {
-        Self {
-            attempt,
-            local_watermark,
-            assignment_fence,
-            leader_proof,
-            flags,
-        }
-    }
-}
 
 pub(crate) struct RegisteredSink {
     name: String,

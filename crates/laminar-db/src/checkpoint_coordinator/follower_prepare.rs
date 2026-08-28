@@ -1,5 +1,5 @@
 #[cfg(debug_assertions)]
-use super::checkpoint_kill_gate;
+use super::attempt::checkpoint_kill_gate;
 use super::{
     require_canonical_attempt, CheckpointAttempt, CheckpointCoordinator, CheckpointPhase,
     CheckpointRequest, DbError, FollowerPrepareOutcome, LeaderProof,

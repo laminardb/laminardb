@@ -1,7 +1,5 @@
 use std::time::Instant;
 
-#[cfg(feature = "cluster")]
-use super::publish_terminal_hint_until;
 use super::{
     checked_successor_epoch, CheckpointAttempt, CheckpointCoordinator,
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointScope, DbError,
@@ -9,6 +7,29 @@ use super::{
 };
 #[cfg(feature = "cluster")]
 use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+
+#[cfg(feature = "cluster")]
+pub(super) async fn publish_terminal_hint_until<F>(deadline: tokio::time::Instant, hint: F)
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    // Terminal hints accelerate observation but do not own the already-immutable durable verdict.
+    let _ = tokio::time::timeout_at(deadline, hint).await;
+}
+
+#[cfg(all(test, feature = "cluster"))]
+#[tokio::test]
+async fn terminal_checkpoint_hint_cannot_outlive_its_cleanup_deadline() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        publish_terminal_hint_until(
+            tokio::time::Instant::now(),
+            std::future::pending::<Result<(), String>>(),
+        ),
+    )
+    .await
+    .expect("an unresponsive terminal hint must be released at its private cleanup deadline");
+}
 
 impl CheckpointCoordinator {
     pub(super) async fn record_outcome_until(
