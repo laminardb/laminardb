@@ -8,12 +8,14 @@ use laminar_core::checkpoint::{
 };
 
 #[cfg(feature = "cluster")]
-use super::{publish_terminal_hint_until, subscription_output, BarrierAnnouncement, Phase};
+use super::{publish_terminal_hint_until, subscription_output};
 use super::{
     require_canonical_attempt, sink_epoch_admission, CheckpointCoordinator,
     CheckpointFailureDisposition, CheckpointPhase, CheckpointRequest, CheckpointResult, DbError,
     QuorumStage, SinkEpochPublication,
 };
+#[cfg(feature = "cluster")]
+use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
 
 struct CertifiedQuorum {
     scope: CheckpointScope,

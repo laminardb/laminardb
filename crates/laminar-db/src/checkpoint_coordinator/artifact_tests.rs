@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[cfg(feature = "cluster")]
 use super::recovery::recovery_sink_fence;
 use super::retention::{

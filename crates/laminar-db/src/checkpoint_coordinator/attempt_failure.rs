@@ -1,12 +1,14 @@
 use std::time::Instant;
 
+#[cfg(feature = "cluster")]
+use super::publish_terminal_hint_until;
 use super::{
     checked_successor_epoch, CheckpointAttempt, CheckpointCoordinator,
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointScope, DbError,
     LeaderProof, SinkEpochPublication,
 };
 #[cfg(feature = "cluster")]
-use super::{publish_terminal_hint_until, BarrierAnnouncement, Phase};
+use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
 
 impl CheckpointCoordinator {
     pub(super) async fn record_outcome_until(
