@@ -346,6 +346,10 @@ impl IcebergEpochWriter {
         let Some(mut active) = self.active.remove(key) else {
             return Ok(());
         };
+        #[cfg(test)]
+        super::fault_injection::fail_if(
+            super::fault_injection::IcebergFaultPoint::BeforeFileClose,
+        )?;
         let files = active
             .writer
             .close()
@@ -569,5 +573,41 @@ mod tests {
         assert!(byte_error.to_string().contains("max.buffer.bytes"));
         assert!(byte_writer.active.is_empty());
         assert_eq!(byte_writer.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn high_partition_cardinality_stays_within_writer_and_file_bounds() {
+        let fixture = create_test_table(true).await;
+        let mut config = fixture.config;
+        config.max_open_partitions = 4;
+        config.max_files_per_checkpoint = 128;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(22),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+
+        for id in 0_i64..128 {
+            let category = format!("partition-{id:03}");
+            writer
+                .write(batch(&fixture.table, &[(id, Some(&category))]))
+                .await
+                .unwrap();
+            assert!(writer.active.len() <= config.max_open_partitions);
+            assert!(writer.completed.len() <= config.max_files_per_checkpoint);
+        }
+        let extra = writer
+            .write(batch(&fixture.table, &[(128, Some("partition-128"))]))
+            .await
+            .expect_err("the next partition must exceed the file bound");
+        assert!(extra.to_string().contains("max.files.per.checkpoint"));
+        assert!(writer.active.len() <= config.max_open_partitions);
+        assert!(writer.completed.len() <= config.max_files_per_checkpoint);
+
+        let output = writer.close().await.unwrap();
+        assert_eq!(output.data_files.len(), 128);
+        assert_eq!(output.rows, 128);
     }
 }

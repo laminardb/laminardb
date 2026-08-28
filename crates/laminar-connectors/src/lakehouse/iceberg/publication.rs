@@ -31,11 +31,6 @@ const SUMMARY_DEPLOYMENT: &str = "laminardb.deployment.id";
 const SUMMARY_SINK: &str = "laminardb.sink.id";
 const SUMMARY_COMMIT_UUID: &str = "laminardb.commit.uuid";
 
-#[cfg(test)]
-tokio::task_local! {
-    static FAIL_AFTER_CATALOG_COMMIT: bool;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct UnresolvedIcebergPublication {
     pub(super) external_key: String,
@@ -269,6 +264,10 @@ pub(super) async fn read_committed_cursor(
 ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
     let started = std::time::Instant::now();
     let table = load_table_until(catalog, config, deadline, false).await?;
+    #[cfg(test)]
+    super::fault_injection::fail_outcome_unknown_if(
+        super::fault_injection::IcebergFaultPoint::DuringCommittedCursor,
+    )?;
     let record = cursor_record(&table, &namespace.external_key())?;
     if let (Some(record), Some(unresolved)) = (&record, unresolved) {
         let exact_fingerprint = hex(&unresolved.exact_batch_fingerprint);
@@ -444,12 +443,16 @@ async fn commit_once(
             .add_data_files(prepared.data_files.clone())
             .apply(tx)?
     };
+    #[cfg(test)]
+    if super::fault_injection::hit(super::fault_injection::IcebergFaultPoint::BeforeCatalogCommit) {
+        return Err(iceberg::Error::new(
+            ErrorKind::DataInvalid,
+            "injected failure before catalog commit dispatch",
+        ));
+    }
     let updated = tx.commit(catalog).await?;
     #[cfg(test)]
-    if FAIL_AFTER_CATALOG_COMMIT
-        .try_with(|enabled| *enabled)
-        .unwrap_or(false)
-    {
+    if super::fault_injection::hit(super::fault_injection::IcebergFaultPoint::AfterCatalogCommit) {
         return Err(iceberg::Error::new(
             ErrorKind::Unexpected,
             "injected response loss after applied catalog commit",
@@ -693,6 +696,20 @@ async fn load_table_until(
     unknown_context: bool,
 ) -> Result<iceberg::table::Table, ConnectorError> {
     ensure_deadline(deadline, "table metadata refresh")?;
+    #[cfg(test)]
+    if super::fault_injection::hit(super::fault_injection::IcebergFaultPoint::DuringMetadataRefresh)
+    {
+        return if unknown_context {
+            Err(ConnectorError::outcome_unknown(
+                "injected metadata refresh failure after ambiguous Iceberg publication",
+                true,
+            ))
+        } else {
+            Err(ConnectorError::ReadError(
+                "injected Iceberg metadata refresh failure".into(),
+            ))
+        };
+    }
     let ident = table_ident(config)?;
     match tokio::time::timeout_at(deadline, catalog.load_table(&ident)).await {
         Ok(Ok(table)) => Ok(table),
@@ -980,8 +997,11 @@ mod tests {
             vec![(1, Some(payload))],
         );
         let metrics = IcebergMetrics::new(None);
-        FAIL_AFTER_CATALOG_COMMIT
-            .scope(true, async {
+        super::super::fault_injection::scope(
+            [super::super::fault_injection::IcebergFault::first(
+                super::super::fault_injection::IcebergFaultPoint::AfterCatalogCommit,
+            )],
+            async {
                 publish_coordinated(
                     &fixture.catalog,
                     &fixture.config,
@@ -992,9 +1012,10 @@ mod tests {
                     &metrics,
                 )
                 .await
-            })
-            .await
-            .unwrap();
+            },
+        )
+        .await
+        .unwrap();
         let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
         assert_eq!(table.metadata().snapshots().count(), 1);
         assert_eq!(metrics.unknown_outcomes.get(), 1);

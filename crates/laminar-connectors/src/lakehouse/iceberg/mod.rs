@@ -7,10 +7,14 @@ mod commit_cursor;
 mod descriptor;
 #[cfg(feature = "iceberg-core")]
 mod epoch_writer;
+#[cfg(all(test, feature = "iceberg-core"))]
+mod fault_injection;
 #[cfg(feature = "iceberg-core")]
 mod metrics;
 #[cfg(feature = "iceberg-core")]
 mod publication;
+#[cfg(all(test, feature = "iceberg-core"))]
+mod recovery_tests;
 #[cfg(all(test, feature = "iceberg-core"))]
 pub(crate) mod test_support;
 
@@ -470,6 +474,8 @@ impl SinkConnector for IcebergSink {
             })?;
             self.active_epoch_id = None;
             let output = writer.close().await?;
+            #[cfg(test)]
+            fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterFileClose)?;
             self.metrics
                 .pre_commit_duration
                 .observe(started.elapsed().as_secs_f64());
@@ -482,6 +488,8 @@ impl SinkConnector for IcebergSink {
                 &self.epoch_identity(epoch)?,
                 output,
             )?;
+            #[cfg(test)]
+            fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterDescriptor)?;
             return Ok(Some(descriptor));
         }
 
