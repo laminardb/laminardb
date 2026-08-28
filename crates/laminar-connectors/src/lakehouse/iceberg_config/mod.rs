@@ -26,12 +26,15 @@ pub use modes::{
 pub(crate) use registry::{sink_config_keys, source_config_keys};
 pub(crate) use table_definition::{
     parse_parquet_compression, parse_table_fields, validate_distinct_names,
-    validate_persisted_properties, validate_table_definition, PARQUET_COMPRESSION_PROPERTY,
-    PARQUET_ROW_GROUP_SIZE_PROPERTY, TARGET_FILE_SIZE_PROPERTY,
+    validate_persisted_properties, validate_table_definition,
 };
 pub use table_definition::{
     IcebergNullOrder, IcebergPartitionField, IcebergSortDirection, IcebergSortField,
     IcebergTransform,
+};
+#[cfg(feature = "iceberg-core")]
+pub(crate) use table_definition::{
+    PARQUET_COMPRESSION_PROPERTY, PARQUET_ROW_GROUP_SIZE_PROPERTY, TARGET_FILE_SIZE_PROPERTY,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -480,6 +483,7 @@ impl IcebergSinkConfig {
         })
     }
 
+    #[cfg(feature = "iceberg-core")]
     pub(crate) fn validate_table_creation(&self) -> Result<(), ConnectorError> {
         if !matches!(self.format_version, 1..=3) {
             return Err(ConnectorError::ConfigurationError(
