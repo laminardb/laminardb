@@ -20,13 +20,15 @@ use laminar_core::lookup::source::{
 };
 use laminar_core::lookup::KeyAligner;
 
-use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
+use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
 
 /// Configuration for [`IcebergLookupSource`].
 #[derive(Debug, Clone)]
 pub struct IcebergLookupSourceConfig {
     /// Shared catalog connection settings (also carries namespace + table).
     pub catalog: IcebergCatalogConfig,
+    /// Table data-storage settings, separate from catalog authentication.
+    pub storage: IcebergStorageConfig,
     /// Primary key column names.
     pub primary_key_columns: Vec<String>,
 }
@@ -36,6 +38,7 @@ pub struct IcebergLookupSource {
     catalog: Arc<dyn Catalog>,
     namespace: String,
     table_name: String,
+    catalog_request_timeout: std::time::Duration,
     schema: SchemaRef,
     aligner: KeyAligner,
 }
@@ -48,13 +51,14 @@ impl IcebergLookupSource {
     /// Returns `LookupError` if the catalog/table cannot be opened or a primary
     /// key column is missing from the table schema.
     pub async fn open(config: IcebergLookupSourceConfig) -> Result<Self, LookupError> {
-        let catalog = crate::lakehouse::iceberg_io::build_catalog(&config.catalog)
+        let catalog = crate::lakehouse::iceberg_io::build_catalog(&config.catalog, &config.storage)
             .await
             .map_err(|e| LookupError::Connection(format!("iceberg catalog: {e}")))?;
-        let table = crate::lakehouse::iceberg_io::load_table(
+        let table = crate::lakehouse::iceberg_io::load_table_with_timeout(
             catalog.as_ref(),
             &config.catalog.namespace,
             &config.catalog.table_name,
+            config.catalog.request_timeout,
         )
         .await
         .map_err(|e| LookupError::Connection(format!("load iceberg table: {e}")))?;
@@ -81,6 +85,7 @@ impl IcebergLookupSource {
             catalog,
             namespace: config.catalog.namespace,
             table_name: config.catalog.table_name,
+            catalog_request_timeout: config.catalog.request_timeout,
             schema,
             aligner,
         })
@@ -204,10 +209,11 @@ impl LookupSource for IcebergLookupSource {
 
         // Reload the table per query so lookups see the latest snapshot
         // (eventually-consistent freshness; the cache layer adds TTL on top).
-        let table = crate::lakehouse::iceberg_io::load_table(
+        let table = crate::lakehouse::iceberg_io::load_table_with_timeout(
             self.catalog.as_ref(),
             &self.namespace,
             &self.table_name,
+            self.catalog_request_timeout,
         )
         .await
         .map_err(|e| LookupError::Query(format!("load iceberg table: {e}")))?;
@@ -255,10 +261,11 @@ impl LookupSource for IcebergLookupSource {
     }
 
     async fn health_check(&self) -> Result<(), LookupError> {
-        crate::lakehouse::iceberg_io::load_table(
+        crate::lakehouse::iceberg_io::load_table_with_timeout(
             self.catalog.as_ref(),
             &self.namespace,
             &self.table_name,
+            self.catalog_request_timeout,
         )
         .await
         .map(|_| ())

@@ -3,7 +3,7 @@
 //! Contains catalog construction, table loading, scanning, and writing
 //! functions. All code requires the `iceberg` feature.
 #![allow(clippy::disallowed_types)] // cold path: lakehouse I/O
-#![cfg(feature = "iceberg")]
+#![cfg(feature = "iceberg-core")]
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,53 +11,131 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{Catalog, CatalogBuilder, TableIdent};
+#[cfg(feature = "iceberg-catalog-rest")]
+use iceberg::CatalogBuilder;
+use iceberg::{Catalog, TableIdent};
+#[cfg(feature = "iceberg-catalog-rest")]
 use iceberg_catalog_rest::RestCatalogBuilder;
+#[cfg(any(
+    feature = "iceberg-storage-s3",
+    feature = "iceberg-storage-gcs",
+    feature = "iceberg-storage-azure",
+    feature = "iceberg-storage-fs"
+))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use tokio_stream::StreamExt;
 
-use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType};
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+use super::iceberg_config::IcebergStorageType;
+#[cfg(feature = "iceberg-catalog-rest")]
+use super::iceberg_config::{IcebergCatalogAuthType, IcebergStorageEncryption};
+use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType, IcebergStorageConfig};
 use crate::error::ConnectorError;
 
 /// Selects the `OpenDalStorageFactory` for the table-data URLs the catalog
 /// will return. Explicit `storage.type` wins; otherwise inferred from the
 /// `s3://` / `s3a://` / `file://` warehouse URL.
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn storage_factory(
     warehouse: &str,
-    storage_type: Option<&str>,
+    config: &IcebergStorageConfig,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    let scheme = storage_type
-        .map(str::to_lowercase)
-        .or_else(|| {
-            if warehouse.starts_with("s3a://") {
-                Some("s3a".to_string())
-            } else if warehouse.starts_with("s3://") {
-                Some("s3".to_string())
-            } else if warehouse.starts_with("file://") {
-                Some("fs".to_string())
-            } else {
-                None
-            }
-        })
+    let storage_type = config
+        .storage_type
+        .or_else(|| infer_storage_type(warehouse))
         .ok_or_else(|| {
             ConnectorError::ConfigurationError(format!(
                 "[LDB-5100] cannot infer storage backend from warehouse '{warehouse}'; \
-                 set storage.type = 's3' | 's3a' | 'fs'"
+                 set storage.type explicitly"
             ))
         })?;
 
-    let factory: Arc<dyn iceberg::io::StorageFactory> = match scheme.as_str() {
-        "s3" | "s3a" => Arc::new(OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        }),
-        "fs" => Arc::new(OpenDalStorageFactory::Fs),
-        other => {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "[LDB-5101] unsupported storage.type '{other}'; expected s3 | s3a | fs"
-            )));
-        }
-    };
-    Ok(factory)
+    match storage_type {
+        IcebergStorageType::S3 => s3_storage_factory(),
+        IcebergStorageType::Gcs => gcs_storage_factory(),
+        IcebergStorageType::Azure => azure_storage_factory(),
+        IcebergStorageType::Fs => fs_storage_factory(),
+    }
+}
+
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn infer_storage_type(warehouse: &str) -> Option<IcebergStorageType> {
+    if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
+        Some(IcebergStorageType::S3)
+    } else if warehouse.starts_with("gs://") || warehouse.starts_with("gcs://") {
+        Some(IcebergStorageType::Gcs)
+    } else if ["abfs://", "abfss://", "wasb://", "wasbs://"]
+        .iter()
+        .any(|prefix| warehouse.starts_with(prefix))
+    {
+        Some(IcebergStorageType::Azure)
+    } else if warehouse.starts_with("file://") {
+        Some(IcebergStorageType::Fs)
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "iceberg-storage-s3")]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+#[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
+fn s3_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(OpenDalStorageFactory::S3 {
+        customized_credential_load: None,
+    }))
+}
+
+#[cfg(not(feature = "iceberg-storage-s3"))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn s3_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Err(missing_storage_feature("s3", "iceberg-storage-s3"))
+}
+
+#[cfg(feature = "iceberg-storage-gcs")]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+#[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
+fn gcs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(OpenDalStorageFactory::Gcs))
+}
+
+#[cfg(not(feature = "iceberg-storage-gcs"))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn gcs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Err(missing_storage_feature("gcs", "iceberg-storage-gcs"))
+}
+
+#[cfg(feature = "iceberg-storage-azure")]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+#[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
+fn azure_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(OpenDalStorageFactory::Azdls))
+}
+
+#[cfg(not(feature = "iceberg-storage-azure"))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn azure_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Err(missing_storage_feature("azure", "iceberg-storage-azure"))
+}
+
+#[cfg(feature = "iceberg-storage-fs")]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+#[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
+fn fs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(OpenDalStorageFactory::Fs))
+}
+
+#[cfg(not(feature = "iceberg-storage-fs"))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn fs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Err(missing_storage_feature("fs", "iceberg-storage-fs"))
+}
+
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+fn missing_storage_feature(storage: &str, feature: &str) -> ConnectorError {
+    ConnectorError::FeatureUnsupported(format!(
+        "iceberg.storage.{storage}: build with the '{feature}' feature"
+    ))
 }
 
 /// Builds a REST catalog from configuration.
@@ -65,34 +143,185 @@ fn storage_factory(
 /// # Errors
 ///
 /// Returns `ConnectorError::ConnectionFailed` if catalog initialization fails.
+#[cfg_attr(not(feature = "iceberg-catalog-rest"), allow(clippy::unused_async))]
 pub async fn build_catalog(
     config: &IcebergCatalogConfig,
+    storage: &IcebergStorageConfig,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
     match config.catalog_type {
-        IcebergCatalogType::Rest => build_rest_catalog(config).await,
+        IcebergCatalogType::Rest => {
+            #[cfg(feature = "iceberg-catalog-rest")]
+            {
+                build_enabled_rest_catalog(config, storage).await
+            }
+            #[cfg(not(feature = "iceberg-catalog-rest"))]
+            {
+                let _ = storage;
+                Err(ConnectorError::FeatureUnsupported(
+                    "iceberg.catalog.rest: build with the 'iceberg-catalog-rest' feature".into(),
+                ))
+            }
+        }
+        IcebergCatalogType::Glue => Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.glue: released catalog APIs are not enabled in this build".into(),
+        )),
+        IcebergCatalogType::Hms => Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.hms: released catalog APIs are not enabled in this build".into(),
+        )),
+        IcebergCatalogType::S3Tables => Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.s3tables: released catalog APIs are not enabled in this build".into(),
+        )),
+        IcebergCatalogType::Sql => Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.sql: released catalog APIs are not enabled in this build".into(),
+        )),
     }
 }
 
-async fn build_rest_catalog(
+#[cfg(feature = "iceberg-catalog-rest")]
+async fn build_enabled_rest_catalog(
     config: &IcebergCatalogConfig,
+    storage: &IcebergStorageConfig,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
-    let storage_factory = storage_factory(&config.warehouse, config.storage_type.as_deref())?;
-
-    let mut props = HashMap::new();
+    validate_rest_auth(config)?;
+    validate_storage_options(&config.warehouse, storage)?;
+    let storage_factory = storage_factory(&config.warehouse, storage)?;
+    let mut props = rest_properties(config, storage);
     props.insert("uri".to_string(), config.catalog_uri.clone());
     props.insert("warehouse".to_string(), config.warehouse.clone());
-
-    for (k, v) in &config.properties {
-        props.insert(k.clone(), v.clone());
-    }
-
+    let client = delta_reqwest::Client::builder()
+        .connect_timeout(storage.connect_timeout)
+        .timeout(config.request_timeout)
+        .build()
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!("Iceberg REST HTTP client: {error}"))
+        })?;
     let catalog = RestCatalogBuilder::default()
         .with_storage_factory(storage_factory)
+        .with_client(client)
         .load("laminardb", props)
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("iceberg catalog: {e}")))?;
 
     Ok(Arc::new(catalog))
+}
+
+#[cfg(feature = "iceberg-catalog-rest")]
+fn validate_rest_auth(config: &IcebergCatalogConfig) -> Result<(), ConnectorError> {
+    match config.auth_type {
+        IcebergCatalogAuthType::None => Ok(()),
+        IcebergCatalogAuthType::Bearer if config.properties.contains_key("token") => Ok(()),
+        IcebergCatalogAuthType::Bearer => Err(ConnectorError::ConfigurationError(
+            "catalog.auth.type=bearer requires a resolved catalog.property.token".into(),
+        )),
+        IcebergCatalogAuthType::OAuth2 => Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.oauth2: iceberg-rust 0.10.1 does not automatically refresh expiring OAuth2 tokens"
+                .into(),
+        )),
+    }
+}
+
+#[cfg(feature = "iceberg-catalog-rest")]
+fn rest_properties(
+    config: &IcebergCatalogConfig,
+    storage: &IcebergStorageConfig,
+) -> HashMap<String, String> {
+    let mut properties = config.properties.clone();
+    properties.extend(storage.properties.clone());
+    if let Some(prefix) = &config.prefix {
+        properties.insert("prefix".into(), prefix.clone());
+    }
+    if let Some(uri) = &config.oauth2_server_uri {
+        properties.insert("oauth2-server-uri".into(), uri.clone());
+    }
+    if let Some(scope) = &config.oauth2_scope {
+        properties.insert("scope".into(), scope.clone());
+    }
+    if config.access_delegation {
+        properties.insert(
+            "header.X-Iceberg-Access-Delegation".into(),
+            "vended-credentials".into(),
+        );
+    }
+    apply_storage_properties(
+        &mut properties,
+        storage,
+        storage
+            .storage_type
+            .or_else(|| infer_storage_type(&config.warehouse)),
+    );
+    properties
+}
+
+#[cfg(feature = "iceberg-catalog-rest")]
+fn validate_storage_options(
+    warehouse: &str,
+    storage: &IcebergStorageConfig,
+) -> Result<(), ConnectorError> {
+    let storage_type = storage
+        .storage_type
+        .or_else(|| infer_storage_type(warehouse));
+    if storage_type == Some(IcebergStorageType::Azure) && storage.endpoint.is_some() {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.storage.azure.endpoint: iceberg-storage-opendal 0.10.1 derives the ADLS endpoint from the table URL and exposes no endpoint property"
+                .into(),
+        ));
+    }
+    if storage_type != Some(IcebergStorageType::S3)
+        && (storage.region.is_some()
+            || storage.path_style
+            || storage.encryption != IcebergStorageEncryption::None)
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "storage.region, storage.path_style, and storage.encryption are valid only for Iceberg S3 storage"
+                .into(),
+        ));
+    }
+    if storage_type == Some(IcebergStorageType::Fs) && storage.endpoint.is_some() {
+        return Err(ConnectorError::ConfigurationError(
+            "storage.endpoint is not valid for Iceberg filesystem storage".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "iceberg-catalog-rest")]
+fn apply_storage_properties(
+    properties: &mut HashMap<String, String>,
+    storage: &IcebergStorageConfig,
+    storage_type: Option<IcebergStorageType>,
+) {
+    if let Some(endpoint) = &storage.endpoint {
+        match storage_type {
+            Some(IcebergStorageType::S3) => {
+                properties.insert("s3.endpoint".into(), endpoint.clone());
+            }
+            Some(IcebergStorageType::Gcs) => {
+                properties.insert("gcs.service.path".into(), endpoint.clone());
+            }
+            Some(IcebergStorageType::Azure | IcebergStorageType::Fs) | None => {}
+        }
+    }
+    if storage_type == Some(IcebergStorageType::S3) {
+        if let Some(region) = &storage.region {
+            properties.insert("s3.region".into(), region.clone());
+        }
+        properties.insert(
+            "s3.path-style-access".into(),
+            storage.path_style.to_string(),
+        );
+        match storage.encryption {
+            IcebergStorageEncryption::None => {}
+            IcebergStorageEncryption::Sse => {
+                properties.insert("s3.sse.type".into(), "s3".into());
+            }
+            IcebergStorageEncryption::Kms => {
+                properties.insert("s3.sse.type".into(), "kms".into());
+                if let Some(key) = &storage.kms_key {
+                    properties.insert("s3.sse.key".into(), key.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Loads an Iceberg table from the catalog.
@@ -105,14 +334,38 @@ pub async fn load_table(
     namespace: &str,
     table_name: &str,
 ) -> Result<Table, ConnectorError> {
+    load_table_with_timeout(
+        catalog,
+        namespace,
+        table_name,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+/// Loads an Iceberg table within a bounded catalog operation.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the table cannot be loaded before the deadline.
+pub async fn load_table_with_timeout(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    table_name: &str,
+    timeout: std::time::Duration,
+) -> Result<Table, ConnectorError> {
     let ns = iceberg::NamespaceIdent::from_strs(namespace.split('.').collect::<Vec<_>>())
         .map_err(|e| ConnectorError::ConfigurationError(format!("invalid namespace: {e}")))?;
 
     let ident = TableIdent::new(ns, table_name.to_string());
 
-    catalog
-        .load_table(&ident)
+    tokio::time::timeout(timeout, catalog.load_table(&ident))
         .await
+        .map_err(|_| {
+            ConnectorError::ReadError(format!(
+                "[LDB-ICEBERG-CATALOG-TIMEOUT] load table '{table_name}' exceeded {timeout:?}"
+            ))
+        })?
         .map_err(|e| ConnectorError::ReadError(format!("load table '{table_name}': {e}")))
 }
 

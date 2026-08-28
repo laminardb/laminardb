@@ -61,18 +61,94 @@ fn test_defaults() {
 }
 
 #[test]
-fn test_unwired_storage_backends_are_rejected() {
+fn typed_storage_backends_parse_without_silent_fallback() {
     let mut config = ConnectorConfig::new("iceberg");
     config.set("catalog.uri", "http://localhost:8181");
     config.set("warehouse", "demo");
     config.set("storage.type", "gcs");
     config.set("namespace", "prod");
     config.set("table.name", "events");
-    assert!(IcebergSinkConfig::from_config(&config).is_err());
+    let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.storage.storage_type, Some(IcebergStorageType::Gcs));
 
-    config.set("storage.type", "s3");
-    config.set("warehouse", "abfs://container/warehouse");
+    config.set("storage.type", "hdfs");
     assert!(IcebergSinkConfig::from_config(&config).is_err());
+}
+
+#[test]
+fn legacy_and_typed_option_aliases_match() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "http://localhost:8181");
+    config.set("warehouse", "s3://bucket/wh");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("snapshot.id", "42");
+    config.set("select.columns", "id, payload");
+    config.set("target.file.size", "4096");
+    config.set("catalog.property.s3.path-style-access", "true");
+
+    let source = IcebergSourceConfig::from_config(&config).unwrap();
+    let sink = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_eq!(source.snapshot_id, Some(42));
+    assert_eq!(source.select_columns, ["id", "payload"]);
+    assert_eq!(sink.target_file_size_bytes, 4096);
+    assert!(sink.storage.path_style);
+}
+
+#[test]
+fn debug_redacts_catalog_and_storage_values() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "https://user:secret@catalog.test");
+    config.set("warehouse", "s3://bucket/wh?token=secret-token");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("catalog.property.token", "secret-token");
+    config.set("storage.endpoint", "https://secret-endpoint.test");
+    config.set("storage.property.aws_secret_access_key", "secret-key");
+
+    let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+    let debug = format!("{parsed:?}");
+    for secret in [
+        "user:secret",
+        "secret-token",
+        "secret-endpoint",
+        "secret-key",
+    ] {
+        assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+}
+
+#[test]
+fn invalid_mode_combinations_are_rejected() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "http://localhost:8181");
+    config.set("warehouse", "s3://bucket/wh");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("read.mode", "snapshot");
+    config.set("read.bootstrap", "none");
+    assert!(IcebergSourceConfig::from_config(&config).is_err());
+}
+
+#[test]
+fn catalog_auth_is_inferred_without_permitting_mixed_credentials() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "https://catalog.test");
+    config.set("catalog.warehouse", "s3://bucket/warehouse");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("catalog.property.token", "resolved-secret");
+    assert_eq!(
+        IcebergCatalogConfig::from_config(&config)
+            .unwrap()
+            .auth_type,
+        IcebergCatalogAuthType::Bearer
+    );
+
+    config.set("catalog.auth.type", "oauth2");
+    assert!(IcebergCatalogConfig::from_config(&config).is_err());
+    config.set("catalog.property.credential", "client:resolved-secret");
+    assert!(IcebergCatalogConfig::from_config(&config).is_err());
 }
 
 // ── Schema validation tests ──

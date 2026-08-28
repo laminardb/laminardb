@@ -18,7 +18,7 @@ pub use coordinated_commit::{
     MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
-pub use sink::{SinkConnector, WriteResult};
+pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
     SourceConnector, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition,
     SourceStart,

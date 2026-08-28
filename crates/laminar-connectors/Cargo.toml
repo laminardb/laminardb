@@ -42,6 +42,7 @@ url = { version = "2", optional = true }
 iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
+apache-avro = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 # Bytes (for cache value types)
@@ -145,7 +146,17 @@ delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Apache Iceberg
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet", "dep:arrow-row"]
+iceberg-core = ["dep:iceberg", "dep:apache-avro", "dep:tokio-stream", "dep:futures-util", "dep:parquet", "dep:arrow-row", "dep:base64"]
+iceberg-catalog-rest = ["iceberg-core", "dep:iceberg-catalog-rest", "dep:delta-reqwest"]
+iceberg-catalog-glue = ["iceberg-core"]
+iceberg-catalog-hms = ["iceberg-core"]
+iceberg-catalog-s3tables = ["iceberg-core"]
+iceberg-catalog-sql = ["iceberg-core"]
+iceberg-storage-s3 = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-s3"]
+iceberg-storage-gcs = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-gcs"]
+iceberg-storage-azure = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-azdls"]
+iceberg-storage-fs = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-fs"]
+iceberg = ["iceberg-catalog-rest", "iceberg-storage-s3", "iceberg-storage-fs"]
 # Parquet schema and codec helpers (not a standalone connector)
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink

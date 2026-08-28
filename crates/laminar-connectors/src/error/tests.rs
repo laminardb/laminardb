@@ -7,6 +7,18 @@ fn test_connector_error_display() {
 }
 
 #[test]
+fn unsupported_feature_is_stable_and_non_transient() {
+    let err = ConnectorError::FeatureUnsupported(
+        "iceberg.write.merge-on-read: RowDelta is unavailable".into(),
+    );
+    assert_eq!(
+        err.to_string(),
+        "feature unsupported: iceberg.write.merge-on-read: RowDelta is unavailable"
+    );
+    assert!(!err.is_transient());
+}
+
+#[test]
 fn test_serde_error_from_json() {
     let json_err: Result<serde_json::Value, _> = serde_json::from_str("{bad json");
     let serde_err: SerdeError = json_err.unwrap_err().into();

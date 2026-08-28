@@ -127,7 +127,8 @@ delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-featur
 # Apache Iceberg
 iceberg = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
-iceberg-storage-opendal = "=0.10.1"
+iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
+apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)
 chitchat = "0.10"

@@ -15,7 +15,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
-| Iceberg Source | `iceberg` | REST catalog polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
+| Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
 | File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
 
 ### On-demand lookup sources (partial cache mode)
@@ -46,7 +46,7 @@ backpressures rather than dropping rows.
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | Implemented |
 | Delta Lake | `delta-lake` | Coordinated append; cluster EO is certified only for direct S3/S3A | Implemented |
-| Iceberg | `iceberg` | REST catalog append, durable at-least-once; never checkpoint-committable | Implemented |
+| Iceberg | `iceberg` | Rolling append writer; direct ALO or coordinated local EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
@@ -119,7 +119,9 @@ requirements:
 | `delta-lake-gcs` | GCS storage backend for Delta Lake |
 | `delta-lake-unity` | Databricks Unity catalog for Delta Lake |
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
-| `iceberg` | Apache Iceberg source and sink (REST catalog) |
+| `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-catalog-rest` | REST catalog; other typed catalog features currently fail with an explicit capability error |
+| `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |

@@ -1,0 +1,1066 @@
+//! Atomic `FastAppend` publication and outcome reconciliation.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use iceberg::spec::{DataContentType, DataFile, ManifestStatus};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, ErrorKind, TableIdent};
+use sha2::{Digest, Sha256};
+
+use crate::connector::{
+    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
+    CoordinatedCommitNamespace,
+};
+use crate::error::ConnectorError;
+use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
+
+use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
+use super::descriptor::{IcebergCommitDescriptorV1, IcebergTableBindingV1};
+use super::metrics::IcebergMetrics;
+
+const MAX_AGGREGATE_DATA_FILES: usize = 4_096;
+const MAX_PUBLICATION_ATTEMPTS: usize = 3;
+const SUMMARY_NAMESPACE: &str = "laminardb.commit.namespace";
+const SUMMARY_CHECKPOINT: &str = "laminardb.checkpoint.id";
+const SUMMARY_FENCE: &str = "laminardb.fencing.token";
+const SUMMARY_BATCH_FINGERPRINT: &str = "laminardb.batch.fingerprint";
+const SUMMARY_FILE_SET: &str = "laminardb.file-set.fingerprint";
+const SUMMARY_DEPLOYMENT: &str = "laminardb.deployment.id";
+const SUMMARY_SINK: &str = "laminardb.sink.id";
+const SUMMARY_COMMIT_UUID: &str = "laminardb.commit.uuid";
+
+#[cfg(test)]
+tokio::task_local! {
+    static FAIL_AFTER_CATALOG_COMMIT: bool;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct UnresolvedIcebergPublication {
+    pub(super) external_key: String,
+    pub(super) target: CoordinatedCommitCursor,
+    pub(super) exact_batch_fingerprint: [u8; 32],
+}
+
+impl UnresolvedIcebergPublication {
+    pub(super) fn reconciled_by(&self, cursor: Option<CoordinatedCommitCursor>) -> bool {
+        cursor == Some(self.target)
+    }
+}
+
+#[derive(Debug)]
+struct PreparedPublication {
+    binding: IcebergTableBindingV1,
+    data_files: Vec<DataFile>,
+    expected_paths: HashSet<String>,
+    file_set_fingerprint: String,
+}
+
+struct PublicationIdentity {
+    exact_batch_hex: String,
+    external_key: String,
+    commit_uuid: uuid::Uuid,
+    target: CoordinatedCommitCursor,
+}
+
+pub(super) async fn publish_coordinated(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+    context: CoordinatedCommitContext,
+    metrics: &IcebergMetrics,
+) -> Result<(), ConnectorError> {
+    batch.validate_shape().map_err(|error| {
+        ConnectorError::TransactionError(format!(
+            "Iceberg coordinated batch validation failed: {error}"
+        ))
+    })?;
+    ensure_deadline(context.deadline(), "batch admission")?;
+    let (table, prepared, identity, already_published) =
+        admit_publication(catalog, config, batch, context.deadline()).await?;
+    if already_published {
+        return reconcile_exact_publication(
+            &table,
+            batch,
+            &prepared,
+            &identity.exact_batch_hex,
+            identity.commit_uuid,
+        )
+        .await;
+    }
+    let started = std::time::Instant::now();
+    let result = publish_with_retries(
+        catalog, config, batch, context, metrics, table, &prepared, &identity,
+    )
+    .await;
+    if result.is_ok() {
+        metrics
+            .publication_duration
+            .observe(started.elapsed().as_secs_f64());
+        record_success(metrics, identity.target.checkpoint_id);
+    }
+    result
+}
+
+async fn admit_publication(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+    deadline: tokio::time::Instant,
+) -> Result<
+    (
+        iceberg::table::Table,
+        PreparedPublication,
+        PublicationIdentity,
+        bool,
+    ),
+    ConnectorError,
+> {
+    let table = load_table_until(catalog, config, deadline, false).await?;
+    let prepared = prepare_publication(config, batch, &table)?;
+    validate_table_binding(config, &prepared.binding, &table)?;
+    let exact_batch_fingerprint = batch.exact_fingerprint();
+    let identity = PublicationIdentity {
+        exact_batch_hex: hex(&exact_batch_fingerprint),
+        external_key: batch.namespace.external_key(),
+        commit_uuid: deterministic_commit_uuid(batch, &exact_batch_fingerprint),
+        target: CoordinatedCommitCursor {
+            checkpoint_id: batch.target.checkpoint_id,
+            fencing_token: batch.fencing_token,
+        },
+    };
+    let existing = cursor_record(&table, &identity.external_key)?;
+    let already_published = validate_publication_cursor(batch, existing.as_ref())?;
+    Ok((table, prepared, identity, already_published))
+}
+
+fn validate_publication_cursor(
+    batch: &CoordinatedCommitBatch,
+    existing: Option<&CursorRecord>,
+) -> Result<bool, ConnectorError> {
+    batch
+        .validate_observed_cursor(existing.map(|record| record.cursor))
+        .map_err(|error| {
+            ConnectorError::TransactionError(format!(
+                "Iceberg coordinated cursor validation failed: {error}"
+            ))
+        })?;
+    let already_published =
+        existing.is_some_and(|record| record.cursor.checkpoint_id >= batch.target.checkpoint_id);
+    let exact_predecessor = existing.map(|record| record.cursor)
+        == Some(batch.expected_predecessor)
+        || (existing.is_none() && batch.expected_predecessor.checkpoint_id == 0);
+    if !already_published && !exact_predecessor {
+        return Err(ConnectorError::TransactionError(
+            "Iceberg external cursor is not the exact expected predecessor".into(),
+        ));
+    }
+    Ok(already_published)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn publish_with_retries(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+    context: CoordinatedCommitContext,
+    metrics: &IcebergMetrics,
+    mut table: iceberg::table::Table,
+    prepared: &PreparedPublication,
+    identity: &PublicationIdentity,
+) -> Result<(), ConnectorError> {
+    for attempt in 0..MAX_PUBLICATION_ATTEMPTS {
+        ensure_deadline(context.deadline(), "catalog publication")?;
+        if attempt > 0 {
+            metrics.commit_retries.inc();
+            table = load_table_until(catalog, config, context.deadline(), false).await?;
+            validate_table_binding(config, &prepared.binding, &table)?;
+            let existing = cursor_record(&table, &identity.external_key)?;
+            if validate_publication_cursor(batch, existing.as_ref())? {
+                return reconcile_exact_publication(
+                    &table,
+                    batch,
+                    prepared,
+                    &identity.exact_batch_hex,
+                    identity.commit_uuid,
+                )
+                .await;
+            }
+        }
+
+        let operation = commit_once(
+            catalog.as_ref(),
+            &table,
+            batch,
+            prepared,
+            &identity.external_key,
+            &identity.exact_batch_hex,
+            identity.commit_uuid,
+        );
+        let commit_deadline = commit_deadline(context, config.catalog.commit_timeout);
+        let result = tokio::time::timeout_at(commit_deadline, operation).await;
+        match result {
+            Ok(Ok(updated)) => {
+                reconcile_exact_publication(
+                    &updated,
+                    batch,
+                    prepared,
+                    &identity.exact_batch_hex,
+                    identity.commit_uuid,
+                )
+                .await?;
+                return Ok(());
+            }
+            Ok(Err(error)) if error.kind() == ErrorKind::CatalogCommitConflicts => {
+                metrics.commit_conflicts.inc();
+                if attempt + 1 == MAX_PUBLICATION_ATTEMPTS {
+                    return Err(ConnectorError::WriteError(format!(
+                        "Iceberg catalog commit conflict after {MAX_PUBLICATION_ATTEMPTS} bounded attempts: {error}"
+                    )));
+                }
+                jitter_before_retry(context.deadline(), attempt).await?;
+            }
+            Ok(Err(error)) if commit_outcome_may_be_unknown(&error) => {
+                metrics.unknown_outcomes.inc();
+                return reconcile_after_unknown(
+                    catalog,
+                    config,
+                    batch,
+                    prepared,
+                    &identity.exact_batch_hex,
+                    identity.commit_uuid,
+                    context.deadline(),
+                    metrics,
+                    format!("catalog commit returned {error}"),
+                )
+                .await;
+            }
+            Ok(Err(error)) => return Err(classify_rejected_commit(&error)),
+            Err(_) => {
+                metrics.unknown_outcomes.inc();
+                return reconcile_after_unknown(
+                    catalog,
+                    config,
+                    batch,
+                    prepared,
+                    &identity.exact_batch_hex,
+                    identity.commit_uuid,
+                    context.deadline(),
+                    metrics,
+                    "catalog commit exceeded its bounded dispatch deadline".into(),
+                )
+                .await;
+            }
+        }
+    }
+    Err(ConnectorError::Internal(
+        "Iceberg publication retry loop exited unexpectedly".into(),
+    ))
+}
+
+pub(super) async fn read_committed_cursor(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    namespace: &CoordinatedCommitNamespace,
+    deadline: tokio::time::Instant,
+    metrics: &IcebergMetrics,
+    unresolved: Option<&UnresolvedIcebergPublication>,
+) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
+    let started = std::time::Instant::now();
+    let table = load_table_until(catalog, config, deadline, false).await?;
+    let record = cursor_record(&table, &namespace.external_key())?;
+    if let (Some(record), Some(unresolved)) = (&record, unresolved) {
+        let exact_fingerprint = hex(&unresolved.exact_batch_fingerprint);
+        if unresolved.external_key == namespace.external_key()
+            && (record.cursor != unresolved.target || record.batch_fingerprint != exact_fingerprint)
+        {
+            return Err(ConnectorError::outcome_unknown(
+                "Iceberg cursor does not prove the exact unresolved publication fingerprint",
+                true,
+            ));
+        }
+    }
+    let cursor = record.map(|record| record.cursor);
+    metrics
+        .reconciliation_duration
+        .observe(started.elapsed().as_secs_f64());
+    if let Some(cursor) = cursor {
+        metrics
+            .committed_checkpoint
+            .set(i64::try_from(cursor.checkpoint_id).unwrap_or(i64::MAX));
+    }
+    Ok(cursor)
+}
+
+fn prepare_publication(
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+    table: &iceberg::table::Table,
+) -> Result<PreparedPublication, ConnectorError> {
+    let mut binding = None;
+    let mut data_files = Vec::new();
+    let mut expected_paths = HashSet::new();
+    let descriptor_limit = config
+        .max_descriptor_bytes
+        .min(crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
+    let file_limit = config
+        .max_files_per_checkpoint
+        .min(MAX_AGGREGATE_DATA_FILES);
+    for entry in &batch.entries {
+        let Some(payload) = &entry.payload else {
+            continue;
+        };
+        if payload.len() > descriptor_limit {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg participant descriptor is {} bytes; configured limit is {descriptor_limit}",
+                payload.len()
+            )));
+        }
+        let descriptor = IcebergCommitDescriptorV1::decode(payload)?;
+        if descriptor.deployment_id != batch.namespace.deployment_id
+            || descriptor.sink_id != batch.namespace.sink_id
+            || descriptor.participant_id != entry.participant_id
+            || descriptor.epoch_id != entry.attempt.epoch
+        {
+            return Err(ConnectorError::TransactionError(
+                "Iceberg descriptor runtime identity does not match its coordinated entry".into(),
+            ));
+        }
+        if descriptor.table.catalog_identity
+            != stable_catalog_identity(&config.catalog, &config.storage)
+        {
+            return Err(ConnectorError::TransactionError(
+                "Iceberg descriptor catalog identity differs from the configured catalog".into(),
+            ));
+        }
+        match &binding {
+            Some(expected) if expected != &descriptor.table => {
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg descriptors bind different tables, refs, schemas, specs, sort orders, or base metadata"
+                        .into(),
+                ));
+            }
+            None => binding = Some(descriptor.table.clone()),
+            Some(_) => {}
+        }
+        let decoded = descriptor.decode_data_files(table)?;
+        let projected = data_files.len().checked_add(decoded.len()).ok_or_else(|| {
+            ConnectorError::TransactionError("Iceberg aggregate file count overflow".into())
+        })?;
+        if projected > file_limit {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg coordinated publication exceeds the {file_limit}-file checkpoint limit"
+            )));
+        }
+        for file in decoded {
+            if file.content_type() != DataContentType::Data {
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg append descriptor contains a delete file".into(),
+                ));
+            }
+            if !expected_paths.insert(file.file_path().to_string()) {
+                return Err(ConnectorError::TransactionError(format!(
+                    "Iceberg coordinated descriptors repeat data file '{}'",
+                    file.file_path()
+                )));
+            }
+            data_files.push(file);
+        }
+    }
+    data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+    let binding = binding.unwrap_or_else(|| IcebergTableBindingV1::from_table(table, config));
+    let file_set_fingerprint = file_set_fingerprint(&data_files);
+    Ok(PreparedPublication {
+        binding,
+        data_files,
+        expected_paths,
+        file_set_fingerprint,
+    })
+}
+
+fn validate_table_binding(
+    config: &IcebergSinkConfig,
+    binding: &IcebergTableBindingV1,
+    table: &iceberg::table::Table,
+) -> Result<(), ConnectorError> {
+    let metadata = table.metadata();
+    let mismatch = binding.catalog_implementation != config.catalog.catalog_type.to_string()
+        || binding.catalog_identity != stable_catalog_identity(&config.catalog, &config.storage)
+        || binding.table_uuid != metadata.uuid().to_string()
+        || binding.table_identifier != table.identifier().to_string()
+        || binding.table_location != metadata.location()
+        || binding.table_ref != config.table_ref
+        || binding.schema_id != metadata.current_schema_id()
+        || binding.partition_spec_id != metadata.default_partition_spec_id()
+        || binding.sort_order_id != metadata.default_sort_order_id()
+        || binding.format_version
+            != super::descriptor::format_version_number(metadata.format_version());
+    if mismatch {
+        return Err(ConnectorError::TransactionError(
+            "Iceberg table UUID, ref, schema, partition spec, sort order, or catalog binding changed before publication"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn commit_once(
+    catalog: &dyn Catalog,
+    table: &iceberg::table::Table,
+    batch: &CoordinatedCommitBatch,
+    prepared: &PreparedPublication,
+    external_key: &str,
+    exact_batch_fingerprint: &str,
+    commit_uuid: uuid::Uuid,
+) -> iceberg::Result<iceberg::table::Table> {
+    let target = CoordinatedCommitCursor {
+        checkpoint_id: batch.target.checkpoint_id,
+        fencing_token: batch.fencing_token,
+    };
+    let keys = cursor_property_keys(external_key);
+    let tx = Transaction::new(table);
+    let properties = tx
+        .update_table_properties()
+        .set(keys.checkpoint, target.checkpoint_id.to_string())
+        .set(keys.fence, target.fencing_token.to_string())
+        .set(keys.batch_fingerprint, exact_batch_fingerprint.to_string())
+        .set(keys.file_set, prepared.file_set_fingerprint.clone())
+        .set(keys.commit_uuid, commit_uuid.to_string());
+    let tx = properties.apply(tx)?;
+    let tx = if prepared.data_files.is_empty() {
+        tx
+    } else {
+        tx.fast_append()
+            .set_commit_uuid(commit_uuid)
+            .set_snapshot_properties(summary_properties(
+                batch,
+                external_key,
+                exact_batch_fingerprint,
+                &prepared.file_set_fingerprint,
+                commit_uuid,
+            ))
+            .add_data_files(prepared.data_files.clone())
+            .apply(tx)?
+    };
+    let updated = tx.commit(catalog).await?;
+    #[cfg(test)]
+    if FAIL_AFTER_CATALOG_COMMIT
+        .try_with(|enabled| *enabled)
+        .unwrap_or(false)
+    {
+        return Err(iceberg::Error::new(
+            ErrorKind::Unexpected,
+            "injected response loss after applied catalog commit",
+        )
+        .with_retryable(true));
+    }
+    Ok(updated)
+}
+
+async fn reconcile_after_unknown(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedCommitBatch,
+    prepared: &PreparedPublication,
+    exact_batch_fingerprint: &str,
+    commit_uuid: uuid::Uuid,
+    deadline: tokio::time::Instant,
+    metrics: &IcebergMetrics,
+    cause: String,
+) -> Result<(), ConnectorError> {
+    let started = std::time::Instant::now();
+    let result = load_table_until(catalog, config, deadline, true).await;
+    metrics
+        .reconciliation_duration
+        .observe(started.elapsed().as_secs_f64());
+    let table = match result {
+        Ok(table) => table,
+        Err(error) => {
+            return Err(ConnectorError::outcome_unknown(
+                format!("{cause}; metadata reconciliation failed: {error}"),
+                true,
+            ));
+        }
+    };
+    match reconcile_exact_publication(
+        &table,
+        batch,
+        prepared,
+        exact_batch_fingerprint,
+        commit_uuid,
+    )
+    .await
+    {
+        Ok(()) => {
+            record_success(metrics, batch.target.checkpoint_id);
+            Ok(())
+        }
+        Err(error) => Err(ConnectorError::outcome_unknown(
+            format!("{cause}; exact Iceberg publication was not proven: {error}"),
+            true,
+        )),
+    }
+}
+
+async fn reconcile_exact_publication(
+    table: &iceberg::table::Table,
+    batch: &CoordinatedCommitBatch,
+    prepared: &PreparedPublication,
+    exact_batch_fingerprint: &str,
+    commit_uuid: uuid::Uuid,
+) -> Result<(), ConnectorError> {
+    let external_key = batch.namespace.external_key();
+    let record = cursor_record(table, &external_key)?.ok_or_else(|| {
+        ConnectorError::TransactionError("Iceberg coordinated cursor is absent".into())
+    })?;
+    let expected_cursor = CoordinatedCommitCursor {
+        checkpoint_id: batch.target.checkpoint_id,
+        fencing_token: batch.fencing_token,
+    };
+    if record.cursor.checkpoint_id < expected_cursor.checkpoint_id {
+        return Err(ConnectorError::TransactionError(format!(
+            "Iceberg cursor is at checkpoint {}, expected {}",
+            record.cursor.checkpoint_id, expected_cursor.checkpoint_id
+        )));
+    }
+    if record.cursor == expected_cursor
+        && (record.batch_fingerprint != exact_batch_fingerprint
+            || record.file_set_fingerprint != prepared.file_set_fingerprint
+            || record.commit_uuid != commit_uuid.to_string())
+    {
+        return Err(ConnectorError::TransactionError(
+            "Iceberg target checkpoint exists with a different fingerprint or commit UUID".into(),
+        ));
+    }
+    if prepared.data_files.is_empty() {
+        if record.cursor != expected_cursor {
+            return Err(ConnectorError::TransactionError(
+                "superseded empty Iceberg checkpoint cannot be proven from snapshot history".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let snapshot = find_exact_snapshot(
+        table,
+        &external_key,
+        expected_cursor,
+        exact_batch_fingerprint,
+        &prepared.file_set_fingerprint,
+        commit_uuid,
+    )?;
+    let observed_paths = added_paths_for_snapshot(table, snapshot).await?;
+    if observed_paths != prepared.expected_paths {
+        return Err(ConnectorError::TransactionError(
+            "Iceberg snapshot summary matched but its exact added data-file set did not".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn find_exact_snapshot<'a>(
+    table: &'a iceberg::table::Table,
+    external_key: &str,
+    cursor: CoordinatedCommitCursor,
+    exact_batch_fingerprint: &str,
+    file_set_fingerprint: &str,
+    commit_uuid: uuid::Uuid,
+) -> Result<&'a iceberg::spec::SnapshotRef, ConnectorError> {
+    table
+        .metadata()
+        .snapshots()
+        .find(|snapshot| {
+            let properties = &snapshot.summary().additional_properties;
+            properties.get(SUMMARY_NAMESPACE).map(String::as_str) == Some(external_key)
+                && properties.get(SUMMARY_CHECKPOINT).map(String::as_str)
+                    == Some(cursor.checkpoint_id.to_string().as_str())
+                && properties.get(SUMMARY_FENCE).map(String::as_str)
+                    == Some(cursor.fencing_token.to_string().as_str())
+                && properties
+                    .get(SUMMARY_BATCH_FINGERPRINT)
+                    .map(String::as_str)
+                    == Some(exact_batch_fingerprint)
+                && properties.get(SUMMARY_FILE_SET).map(String::as_str)
+                    == Some(file_set_fingerprint)
+                && properties.get(SUMMARY_COMMIT_UUID).map(String::as_str)
+                    == Some(commit_uuid.to_string().as_str())
+        })
+        .ok_or_else(|| {
+            ConnectorError::TransactionError(
+                "exact Iceberg snapshot summary is absent from retained history".into(),
+            )
+        })
+}
+
+async fn added_paths_for_snapshot(
+    table: &iceberg::table::Table,
+    snapshot: &iceberg::spec::SnapshotRef,
+) -> Result<HashSet<String>, ConnectorError> {
+    let manifest_list = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .map_err(|error| {
+            ConnectorError::ReadError(format!("read Iceberg publication manifest list: {error}"))
+        })?;
+    let mut paths = HashSet::new();
+    for manifest_file in manifest_list.entries() {
+        if manifest_file.added_snapshot_id != snapshot.snapshot_id() {
+            continue;
+        }
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .map_err(|error| {
+                ConnectorError::ReadError(format!("read Iceberg publication manifest: {error}"))
+            })?;
+        for entry in manifest.entries() {
+            if entry.snapshot_id() == Some(snapshot.snapshot_id())
+                && entry.status() == ManifestStatus::Added
+                && entry.content_type() == DataContentType::Data
+            {
+                paths.insert(entry.file_path().to_string());
+            }
+        }
+    }
+    Ok(paths)
+}
+
+fn summary_properties(
+    batch: &CoordinatedCommitBatch,
+    external_key: &str,
+    exact_batch_fingerprint: &str,
+    file_set_fingerprint: &str,
+    commit_uuid: uuid::Uuid,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (SUMMARY_NAMESPACE.into(), external_key.into()),
+        (
+            SUMMARY_CHECKPOINT.into(),
+            batch.target.checkpoint_id.to_string(),
+        ),
+        (SUMMARY_FENCE.into(), batch.fencing_token.to_string()),
+        (
+            SUMMARY_BATCH_FINGERPRINT.into(),
+            exact_batch_fingerprint.into(),
+        ),
+        (SUMMARY_FILE_SET.into(), file_set_fingerprint.into()),
+        (
+            SUMMARY_DEPLOYMENT.into(),
+            batch.namespace.deployment_id.clone(),
+        ),
+        (SUMMARY_SINK.into(), batch.namespace.sink_id.clone()),
+        (SUMMARY_COMMIT_UUID.into(), commit_uuid.to_string()),
+    ])
+}
+
+fn file_set_fingerprint(files: &[DataFile]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"laminardb-iceberg-file-set-v1\0");
+    for file in files {
+        hash.update(file.file_path().len().to_be_bytes());
+        hash.update(file.file_path().as_bytes());
+        hash.update(file.record_count().to_be_bytes());
+        hash.update(file.file_size_in_bytes().to_be_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+fn deterministic_commit_uuid(
+    batch: &CoordinatedCommitBatch,
+    exact_batch_fingerprint: &[u8; 32],
+) -> uuid::Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"laminardb-iceberg-commit-uuid-v1\0");
+    hash.update(batch.namespace.external_key().as_bytes());
+    hash.update(batch.target.checkpoint_id.to_be_bytes());
+    hash.update(batch.fencing_token.to_be_bytes());
+    hash.update(exact_batch_fingerprint);
+    let digest = hash.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+async fn load_table_until(
+    catalog: &Arc<dyn Catalog>,
+    config: &IcebergSinkConfig,
+    deadline: tokio::time::Instant,
+    unknown_context: bool,
+) -> Result<iceberg::table::Table, ConnectorError> {
+    ensure_deadline(deadline, "table metadata refresh")?;
+    let ident = table_ident(config)?;
+    match tokio::time::timeout_at(deadline, catalog.load_table(&ident)).await {
+        Ok(Ok(table)) => Ok(table),
+        Ok(Err(error)) if unknown_context => Err(ConnectorError::outcome_unknown(
+            format!("Iceberg metadata refresh after ambiguous publication failed: {error}"),
+            true,
+        )),
+        Ok(Err(error)) => Err(ConnectorError::ReadError(format!(
+            "refresh Iceberg table metadata: {error}"
+        ))),
+        Err(_) if unknown_context => Err(ConnectorError::outcome_unknown(
+            "Iceberg metadata refresh after ambiguous publication exceeded its deadline",
+            true,
+        )),
+        Err(_) => Err(ConnectorError::Timeout(
+            u64::try_from(config.catalog.request_timeout.as_millis()).unwrap_or(u64::MAX),
+        )),
+    }
+}
+
+fn table_ident(config: &IcebergSinkConfig) -> Result<TableIdent, ConnectorError> {
+    let namespace = iceberg::NamespaceIdent::from_strs(config.catalog.namespace.split('.'))
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!("invalid Iceberg namespace: {error}"))
+        })?;
+    Ok(TableIdent::new(
+        namespace,
+        config.catalog.table_name.clone(),
+    ))
+}
+
+fn commit_deadline(
+    context: CoordinatedCommitContext,
+    configured_timeout: Duration,
+) -> tokio::time::Instant {
+    let now = tokio::time::Instant::now();
+    let remaining = context.remaining();
+    let reserve = (remaining / 4).min(Duration::from_secs(5));
+    let outer_dispatch = context.deadline().checked_sub(reserve).unwrap_or(now);
+    (now + configured_timeout).min(outer_dispatch.max(now))
+}
+
+async fn jitter_before_retry(
+    deadline: tokio::time::Instant,
+    attempt: usize,
+) -> Result<(), ConnectorError> {
+    let base_ms = 25u64.saturating_mul(1u64 << attempt.min(6));
+    let jitter = rand::random_range(0..=base_ms);
+    let delay = Duration::from_millis(base_ms.saturating_add(jitter));
+    if tokio::time::Instant::now() + delay >= deadline {
+        return Err(ConnectorError::WriteError(
+            "Iceberg conflict retry deadline exhausted".into(),
+        ));
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
+}
+
+fn commit_outcome_may_be_unknown(error: &iceberg::Error) -> bool {
+    error.kind() == ErrorKind::Unexpected || error.retryable()
+}
+
+fn classify_rejected_commit(error: &iceberg::Error) -> ConnectorError {
+    ConnectorError::TransactionError(format!(
+        "Iceberg catalog rejected coordinated commit ({}): {error}",
+        error.kind()
+    ))
+}
+
+fn ensure_deadline(deadline: tokio::time::Instant, operation: &str) -> Result<(), ConnectorError> {
+    if deadline <= tokio::time::Instant::now() {
+        Err(ConnectorError::TransactionError(format!(
+            "Iceberg coordinated publication deadline elapsed during {operation}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn record_success(metrics: &IcebergMetrics, checkpoint_id: u64) {
+    metrics
+        .committed_checkpoint
+        .set(i64::try_from(checkpoint_id).unwrap_or(i64::MAX));
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    metrics
+        .last_successful_commit_timestamp
+        .set(i64::try_from(timestamp).unwrap_or(i64::MAX));
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+    use laminar_core::checkpoint::CheckpointAttempt;
+
+    use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitPayload};
+    use crate::lakehouse::iceberg::descriptor::IcebergCommitDescriptorV1;
+    use crate::lakehouse::iceberg::epoch_writer::{EpochIdentity, IcebergEpochWriter};
+    use crate::lakehouse::iceberg::test_support::{
+        batch as record_batch, create_test_table, table_ident,
+    };
+
+    use super::*;
+
+    fn batch() -> CoordinatedCommitBatch {
+        let target = CheckpointAttempt::canonical(9);
+        CoordinatedCommitBatch {
+            namespace: CoordinatedCommitNamespace::try_new(
+                PipelineIdentity::empty(),
+                "018f0000-0000-7000-8000-000000000001",
+                "orders",
+            )
+            .unwrap(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 8,
+                fencing_token: 2,
+            },
+            fencing_token: 3,
+            target,
+            entries: vec![CoordinatedCommitPayload {
+                attempt: target,
+                participant_id: 1,
+                payload: None,
+            }],
+        }
+    }
+
+    fn namespace() -> CoordinatedCommitNamespace {
+        CoordinatedCommitNamespace::try_new(
+            PipelineIdentity::empty(),
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+        )
+        .unwrap()
+    }
+
+    fn commit_batch(
+        checkpoint_id: u64,
+        predecessor: CoordinatedCommitCursor,
+        payloads: Vec<(u64, Option<Vec<u8>>)>,
+    ) -> CoordinatedCommitBatch {
+        let target = CheckpointAttempt::canonical(checkpoint_id);
+        CoordinatedCommitBatch {
+            namespace: namespace(),
+            expected_predecessor: predecessor,
+            fencing_token: 7,
+            target,
+            entries: payloads
+                .into_iter()
+                .map(|(participant_id, payload)| CoordinatedCommitPayload {
+                    attempt: target,
+                    participant_id,
+                    payload,
+                })
+                .collect(),
+        }
+    }
+
+    async fn descriptor(
+        table: &iceberg::table::Table,
+        config: &IcebergSinkConfig,
+        participant_id: u64,
+        checkpoint_id: u64,
+        rows: &[(i64, Option<&str>)],
+    ) -> Vec<u8> {
+        let identity = EpochIdentity {
+            deployment_id: namespace().deployment_id,
+            sink_id: "orders".into(),
+            participant_id,
+            epoch: checkpoint_id,
+        };
+        let mut writer =
+            IcebergEpochWriter::new(table, config, &identity, IcebergMetrics::new(None)).unwrap();
+        writer.write(record_batch(table, rows)).await.unwrap();
+        IcebergCommitDescriptorV1::encode(table, config, &identity, writer.close().await.unwrap())
+            .unwrap()
+    }
+
+    #[test]
+    fn logical_commit_uuid_is_replay_stable_and_version_seven() {
+        let batch = batch();
+        let fingerprint = batch.exact_fingerprint();
+        let first = deterministic_commit_uuid(&batch, &fingerprint);
+        assert_eq!(first, deterministic_commit_uuid(&batch, &fingerprint));
+        assert_eq!(first.get_version_num(), 7);
+    }
+
+    #[test]
+    fn logical_commit_uuid_changes_with_fence() {
+        let first = batch();
+        let mut second = first.clone();
+        second.fencing_token += 1;
+        assert_ne!(
+            deterministic_commit_uuid(&first, &first.exact_fingerprint()),
+            deterministic_commit_uuid(&second, &second.exact_fingerprint())
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_publishes_at_most_one_snapshot() {
+        use tokio_stream::StreamExt;
+
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(
+            &fixture.table,
+            &fixture.config,
+            1,
+            1,
+            &[(1, Some("a")), (2, Some("b"))],
+        )
+        .await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let metrics = IcebergMetrics::new(None);
+        for _ in 0..2 {
+            publish_coordinated(
+                &fixture.catalog,
+                &fixture.config,
+                &batch,
+                CoordinatedCommitContext::new(
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+                &metrics,
+            )
+            .await
+            .unwrap();
+        }
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 1);
+        assert_eq!(
+            cursor_record(&table, &batch.namespace.external_key())
+                .unwrap()
+                .unwrap()
+                .cursor,
+            CoordinatedCommitCursor {
+                checkpoint_id: 1,
+                fencing_token: 7,
+            }
+        );
+        let stream = table
+            .scan()
+            .select_all()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap();
+        let mut stream = std::pin::pin!(stream);
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(
+            rows, 2,
+            "published Parquet files must be complete and readable"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_loss_after_applied_commit_reconciles_as_success() {
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let metrics = IcebergMetrics::new(None);
+        FAIL_AFTER_CATALOG_COMMIT
+            .scope(true, async {
+                publish_coordinated(
+                    &fixture.catalog,
+                    &fixture.config,
+                    &batch,
+                    CoordinatedCommitContext::new(
+                        tokio::time::Instant::now() + Duration::from_secs(10),
+                    ),
+                    &metrics,
+                )
+                .await
+            })
+            .await
+            .unwrap();
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 1);
+        assert_eq!(metrics.unknown_outcomes.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_checkpoint_advances_table_metadata_without_snapshot() {
+        let fixture = create_test_table(false).await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, None)],
+        );
+        publish_coordinated(
+            &fixture.catalog,
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .unwrap();
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
+        assert_eq!(
+            cursor_record(&table, &batch.namespace.external_key())
+                .unwrap()
+                .unwrap()
+                .cursor
+                .checkpoint_id,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_table_descriptors_are_rejected() {
+        let first = create_test_table(false).await;
+        let second = create_test_table(false).await;
+        let mut second_config = second.config.clone();
+        second_config.catalog = first.config.catalog.clone();
+        second_config.storage = first.config.storage.clone();
+        let first_payload = descriptor(&first.table, &first.config, 1, 1, &[(1, Some("a"))]).await;
+        let second_payload =
+            descriptor(&second.table, &second_config, 2, 1, &[(2, Some("b"))]).await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(first_payload)), (2, Some(second_payload))],
+        );
+        let error = publish_coordinated(
+            &first.catalog,
+            &first.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .expect_err("mixed table UUIDs must fail closed");
+        assert!(error.to_string().contains("bind different tables"));
+        let table = first.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
+    }
+}

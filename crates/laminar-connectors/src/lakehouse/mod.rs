@@ -24,19 +24,17 @@ pub(crate) mod unity_catalog;
 // Apache Iceberg modules
 pub mod iceberg;
 pub mod iceberg_config;
-#[cfg(feature = "iceberg")]
-pub mod iceberg_incremental;
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 pub mod iceberg_io;
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 pub mod iceberg_lookup;
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 pub mod iceberg_reference;
 pub mod iceberg_source;
 
 // Common metrics
 pub mod metrics;
-#[cfg(any(test, feature = "delta-lake", feature = "iceberg"))]
+#[cfg(any(test, feature = "delta-lake", feature = "iceberg-core"))]
 mod snapshot_schema;
 
 // Re-export Delta Lake types at module level.
@@ -53,12 +51,15 @@ pub use metrics::LakehouseSinkMetrics;
 
 // Re-export Iceberg types at module level.
 pub use iceberg::IcebergSink;
+use iceberg_config::{
+    sink_config_keys as iceberg_sink_config_keys, source_config_keys as iceberg_source_config_keys,
+};
 pub use iceberg_config::{
     IcebergCatalogConfig, IcebergCatalogType, IcebergSinkConfig, IcebergSourceConfig,
 };
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 pub use iceberg_lookup::{IcebergLookupSource, IcebergLookupSourceConfig};
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 pub use iceberg_reference::IcebergReferenceTableSource;
 pub use iceberg_source::IcebergSource;
 
@@ -247,28 +248,20 @@ pub fn register_iceberg_source(
         "iceberg",
         info.clone(),
         Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            let mut config = crate::config::ConnectorConfig::new("iceberg");
+            config.set("catalog.uri", "http://localhost:8181");
+            config.set("catalog.warehouse", "s3://default/wh");
+            config.set("namespace", "default");
+            config.set("table.name", "default");
             Ok(Box::new(IcebergSource::new(
-                IcebergSourceConfig {
-                    catalog: IcebergCatalogConfig {
-                        catalog_type: IcebergCatalogType::Rest,
-                        catalog_uri: "http://localhost:8181".to_string(),
-                        warehouse: "s3://default/wh".to_string(),
-                        storage_type: None,
-                        namespace: "default".to_string(),
-                        table_name: "default".to_string(),
-                        properties: std::collections::HashMap::new(),
-                    },
-                    poll_interval: std::time::Duration::from_secs(60),
-                    snapshot_id: None,
-                    select_columns: Vec::new(),
-                },
+                IcebergSourceConfig::from_config(&config)?,
                 registry.map(Arc::as_ref),
             )))
         }),
     )?;
 
     // Register finite startup snapshots for replicated reference tables.
-    #[cfg(feature = "iceberg")]
+    #[cfg(feature = "iceberg-core")]
     registry.register_table_source(
         "iceberg",
         info.clone(),
@@ -280,16 +273,16 @@ pub fn register_iceberg_source(
     )?;
 
     // Register lookup source factory for on-demand/partial cache mode.
-    #[cfg(feature = "iceberg")]
+    #[cfg(feature = "iceberg-core")]
     registry.register_lookup_source("iceberg", info, Arc::new(IcebergLookupFactory))?;
 
     Ok(())
 }
 
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 struct IcebergLookupFactory;
 
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
 #[async_trait::async_trait]
 impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
     async fn build(
@@ -298,7 +291,7 @@ impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
         _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
-        use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
+        use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
         let pk_columns: Vec<String> = config
             .get("_primary_key_columns")
             .unwrap_or("")
@@ -314,8 +307,10 @@ impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
         }
 
         let catalog = IcebergCatalogConfig::from_config(&config)?;
+        let storage = IcebergStorageConfig::from_config(&config)?;
         let lookup_config = IcebergLookupSourceConfig {
             catalog,
+            storage,
             primary_key_columns: pk_columns,
         };
 
@@ -560,60 +555,6 @@ fn delta_lake_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "storage.google_service_account_path",
             "Path to GCS service account JSON",
-            "",
-        ),
-    ]
-}
-
-fn iceberg_sink_config_keys() -> Vec<ConfigKeySpec> {
-    vec![
-        ConfigKeySpec::required(
-            "catalog.uri",
-            "REST catalog URI (e.g., http://polaris:8181)",
-        ),
-        ConfigKeySpec::required(
-            "warehouse",
-            "Warehouse name (REST catalog) or URL (Hadoop catalog, e.g. s3://bucket/wh)",
-        ),
-        ConfigKeySpec::required("namespace", "Iceberg namespace (e.g., prod)"),
-        ConfigKeySpec::required("table.name", "Table name within the namespace"),
-        ConfigKeySpec::optional("catalog.type", "Catalog type: rest", "rest"),
-        ConfigKeySpec::optional(
-            "storage.type",
-            "Storage backend (s3 | s3a | fs). Required when warehouse is a name, not a URL",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "compression",
-            "Parquet compression: zstd, snappy, none",
-            "zstd",
-        ),
-        ConfigKeySpec::optional("auto.create", "Auto-create table if not exists", "false"),
-    ]
-}
-
-fn iceberg_source_config_keys() -> Vec<ConfigKeySpec> {
-    vec![
-        ConfigKeySpec::required(
-            "catalog.uri",
-            "REST catalog URI (e.g., http://polaris:8181)",
-        ),
-        ConfigKeySpec::required(
-            "warehouse",
-            "Warehouse location (e.g., s3://bucket/warehouse)",
-        ),
-        ConfigKeySpec::required("namespace", "Iceberg namespace (e.g., prod)"),
-        ConfigKeySpec::required("table.name", "Table name within the namespace"),
-        ConfigKeySpec::optional("catalog.type", "Catalog type: rest", "rest"),
-        ConfigKeySpec::optional(
-            "poll.interval.ms",
-            "How often to poll for new snapshots (ms)",
-            "60000",
-        ),
-        ConfigKeySpec::optional("snapshot.id", "Pin to a specific snapshot ID", ""),
-        ConfigKeySpec::optional(
-            "select.columns",
-            "Comma-separated column names to select (empty = all)",
             "",
         ),
     ]

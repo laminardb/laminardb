@@ -1,75 +1,158 @@
 //! Apache Iceberg append sink connector.
 
+pub(crate) mod capabilities;
+#[cfg(feature = "iceberg-core")]
+mod commit_cursor;
+#[cfg(feature = "iceberg-core")]
+mod descriptor;
+#[cfg(feature = "iceberg-core")]
+mod epoch_writer;
+#[cfg(feature = "iceberg-core")]
+mod metrics;
+#[cfg(feature = "iceberg-core")]
+mod publication;
+#[cfg(all(test, feature = "iceberg-core"))]
+pub(crate) mod test_support;
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-#[cfg(feature = "iceberg")]
+#[cfg(feature = "iceberg-core")]
+use parking_lot::Mutex;
+#[cfg(feature = "iceberg-core")]
 use tracing::info;
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    DeliveryGuarantee, SinkConnector, SinkConsistency, SinkContract, SinkInputMode,
+    SinkRuntimeContext, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 
-use super::iceberg_config::IcebergSinkConfig;
+use super::iceberg_config::{IcebergSinkConfig, IcebergStorageType};
+#[cfg(feature = "iceberg-core")]
+use descriptor::IcebergCommitDescriptorV1;
+#[cfg(feature = "iceberg-core")]
+use epoch_writer::{EpochIdentity, IcebergEpochWriter};
+#[cfg(feature = "iceberg-core")]
+use metrics::IcebergMetrics;
+#[cfg(feature = "iceberg-core")]
+use publication::UnresolvedIcebergPublication;
 
-/// Apache Iceberg sink connector.
-///
-/// Buffers `RecordBatch` data and publishes each flush with an Iceberg
-/// `fast_append` transaction.
+/// Apache Iceberg append sink.
 pub struct IcebergSink {
     config: IcebergSinkConfig,
     schema: Option<SchemaRef>,
     state: ConnectorState,
-    buffer: Vec<RecordBatch>,
-    buffered_rows: usize,
-    staged_batches: Vec<RecordBatch>,
-    #[cfg(feature = "iceberg")]
-    catalog: Option<std::sync::Arc<dyn iceberg::Catalog>>,
-    #[cfg(feature = "iceberg")]
+    runtime_context: Option<SinkRuntimeContext>,
+    #[cfg(feature = "iceberg-core")]
+    standalone_deployment_id: String,
+    #[cfg(feature = "iceberg-core")]
+    direct_epoch: u64,
+    #[cfg(feature = "iceberg-core")]
+    catalog: Option<Arc<dyn iceberg::Catalog>>,
+    #[cfg(feature = "iceberg-core")]
     table: Option<iceberg::table::Table>,
-    /// Arrow schema derived from the Iceberg table schema (carries
-    /// `PARQUET:field_id` metadata required by the Iceberg Parquet writer).
-    #[cfg(feature = "iceberg")]
+    #[cfg(feature = "iceberg-core")]
     iceberg_arrow_schema: Option<SchemaRef>,
+    #[cfg(feature = "iceberg-core")]
+    active_epoch: Mutex<Option<IcebergEpochWriter>>,
+    #[cfg(feature = "iceberg-core")]
+    active_epoch_id: Option<u64>,
+    #[cfg(feature = "iceberg-core")]
+    metrics: IcebergMetrics,
+    #[cfg(feature = "iceberg-core")]
+    unresolved_publication: Arc<Mutex<Option<UnresolvedIcebergPublication>>>,
 }
 
 impl IcebergSink {
-    /// Creates a new Iceberg sink with the given configuration.
+    /// Creates an Iceberg sink from validated connector configuration.
     #[must_use]
-    pub fn new(config: IcebergSinkConfig, _registry: Option<&prometheus::Registry>) -> Self {
+    pub fn new(config: IcebergSinkConfig, registry: Option<&prometheus::Registry>) -> Self {
+        #[cfg(not(feature = "iceberg-core"))]
+        let _ = registry;
         Self {
             config,
             schema: None,
             state: ConnectorState::Created,
-            buffer: Vec::new(),
-            buffered_rows: 0,
-            staged_batches: Vec::new(),
-            #[cfg(feature = "iceberg")]
+            runtime_context: None,
+            #[cfg(feature = "iceberg-core")]
+            standalone_deployment_id: uuid::Uuid::now_v7().to_string(),
+            #[cfg(feature = "iceberg-core")]
+            direct_epoch: 0,
+            #[cfg(feature = "iceberg-core")]
             catalog: None,
-            #[cfg(feature = "iceberg")]
+            #[cfg(feature = "iceberg-core")]
             table: None,
-            #[cfg(feature = "iceberg")]
+            #[cfg(feature = "iceberg-core")]
             iceberg_arrow_schema: None,
+            #[cfg(feature = "iceberg-core")]
+            active_epoch: Mutex::new(None),
+            #[cfg(feature = "iceberg-core")]
+            active_epoch_id: None,
+            #[cfg(feature = "iceberg-core")]
+            metrics: IcebergMetrics::new(registry),
+            #[cfg(feature = "iceberg-core")]
+            unresolved_publication: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn clear_buffer(&mut self) {
-        self.buffer.clear();
-        self.buffered_rows = 0;
+    fn is_coordinated(&self) -> bool {
+        self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
     }
 
-    #[cfg(feature = "iceberg")]
-    fn clear_staged(&mut self) {
-        self.staged_batches.clear();
+    #[cfg(feature = "iceberg-core")]
+    fn table(&self) -> Result<&iceberg::table::Table, ConnectorError> {
+        self.table
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink".into(),
+                actual: "table is not loaded".into(),
+            })
     }
 
-    /// Reproject a batch onto the Iceberg-derived Arrow schema so every field
-    /// carries the `PARQUET:field_id` metadata the Iceberg writer requires.
-    #[cfg(feature = "iceberg")]
+    #[cfg(feature = "iceberg-core")]
+    fn epoch_identity(&self, epoch: u64) -> Result<EpochIdentity, ConnectorError> {
+        if self.is_coordinated() {
+            let context =
+                self.runtime_context
+                    .as_ref()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "checkpoint runtime identity bound before open".into(),
+                        actual: "runtime identity is absent".into(),
+                    })?;
+            return Ok(EpochIdentity {
+                deployment_id: context.deployment_id.clone(),
+                sink_id: context.sink_id.clone(),
+                participant_id: context.participant_id,
+                epoch,
+            });
+        }
+        Ok(EpochIdentity {
+            deployment_id: self.standalone_deployment_id.clone(),
+            sink_id: format!(
+                "{}.{}",
+                self.config.catalog.namespace, self.config.catalog.table_name
+            ),
+            participant_id: 1,
+            epoch,
+        })
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn new_epoch_writer(&self, epoch: u64) -> Result<IcebergEpochWriter, ConnectorError> {
+        IcebergEpochWriter::new(
+            self.table()?,
+            &self.config,
+            &self.epoch_identity(epoch)?,
+            self.metrics.clone(),
+        )
+    }
+
+    #[cfg(feature = "iceberg-core")]
     fn align_batch_to_iceberg_schema(
         &self,
         batch: &RecordBatch,
@@ -78,207 +161,140 @@ impl IcebergSink {
             self.iceberg_arrow_schema
                 .as_ref()
                 .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "open".into(),
-                    actual: "iceberg arrow schema not initialized".into(),
+                    expected: "open Iceberg sink".into(),
+                    actual: "Iceberg Arrow schema is not initialized".into(),
                 })?;
-
-        // Fast path: field names, types, and count match — only metadata differs.
-        // Avoids per-column name lookup and Vec construction.
         let batch_schema = batch.schema();
-        if batch_schema.fields().len() == target_schema.fields().len()
-            && batch_schema
-                .fields()
-                .iter()
-                .zip(target_schema.fields().iter())
-                .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
-        {
-            return RecordBatch::try_new(target_schema.clone(), batch.columns().to_vec()).map_err(
-                |e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")),
-            );
-        }
-
-        // Slow path: column reordering, type casting, or null-filling needed.
         let mut columns = Vec::with_capacity(target_schema.fields().len());
-
-        for field in target_schema.fields() {
-            if let Ok(col_idx) = batch_schema.index_of(field.name()) {
-                let col = batch.column(col_idx);
-                if col.data_type() == field.data_type() {
-                    columns.push(col.clone());
-                } else {
-                    columns.push(arrow_cast::cast(col, field.data_type()).map_err(|e| {
-                        ConnectorError::WriteError(format!(
-                            "cast field '{}' from {} to {}: {e}",
-                            field.name(),
-                            col.data_type(),
-                            field.data_type(),
-                        ))
-                    })?);
+        for target in target_schema.fields() {
+            let column = match source_field_index(&batch_schema, target) {
+                Some(index) => {
+                    validate_supplied_field_id(&batch_schema.fields()[index], target)?;
+                    let column = batch.column(index);
+                    if column.data_type() == target.data_type() {
+                        Arc::clone(column)
+                    } else {
+                        arrow_cast::cast(column, target.data_type()).map_err(|error| {
+                            ConnectorError::SchemaMismatch(format!(
+                                "align Iceberg field '{}' by field ID: {error}",
+                                target.name()
+                            ))
+                        })?
+                    }
                 }
-            } else if field.is_nullable() {
-                // Nullable Iceberg column not in pipeline — fill with nulls.
-                columns.push(arrow_array::new_null_array(
-                    field.data_type(),
-                    batch.num_rows(),
-                ));
-            } else {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "Iceberg column '{}' is NOT NULL but missing from pipeline",
-                    field.name(),
-                )));
-            }
-        }
-
-        // Detect batch columns that would be silently dropped — every field
-        // in the source batch must map to a field in the target schema.
-        for field in batch_schema.fields() {
-            if target_schema.field_with_name(field.name()).is_err() {
-                return Err(ConnectorError::SchemaMismatch(format!(
-                    "pipeline column '{}' has no matching field in Iceberg table schema \
-                     (schema evolved since open?)",
-                    field.name(),
-                )));
-            }
-        }
-
-        RecordBatch::try_new(target_schema.clone(), columns)
-            .map_err(|e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")))
-    }
-
-    /// Parses compression config string to parquet Compression.
-    #[cfg(feature = "iceberg")]
-    fn parquet_compression(name: &str) -> parquet::basic::Compression {
-        match name.to_lowercase().as_str() {
-            "snappy" => parquet::basic::Compression::SNAPPY,
-            "none" | "uncompressed" => parquet::basic::Compression::UNCOMPRESSED,
-            "lz4" => parquet::basic::Compression::LZ4,
-            // Default to zstd(3) for anything else including "zstd".
-            _ => parquet::basic::Compression::ZSTD(
-                parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
-            ),
-        }
-    }
-
-    /// Checks that every pipeline field still exists in the refreshed
-    /// Iceberg Arrow schema. Returns `SchemaMismatch` on drift.
-    #[cfg(feature = "iceberg")]
-    fn validate_schema_not_drifted(&self) -> Result<(), ConnectorError> {
-        if let (Some(pipeline_schema), Some(target_schema)) =
-            (&self.schema, &self.iceberg_arrow_schema)
-        {
-            for field in pipeline_schema.fields() {
-                if target_schema.field_with_name(field.name()).is_err() {
+                None if target.is_nullable() => {
+                    arrow_array::new_null_array(target.data_type(), batch.num_rows())
+                }
+                None => {
                     return Err(ConnectorError::SchemaMismatch(format!(
-                        "pipeline field '{}' no longer exists in Iceberg table schema \
-                         (concurrent schema evolution?)",
-                        field.name(),
+                        "required Iceberg field '{}' is absent from the input batch",
+                        target.name()
                     )));
                 }
+            };
+            columns.push(column);
+        }
+        for source in batch_schema.fields() {
+            if source_field(target_schema.fields(), source).is_none() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "input field '{}' has no Iceberg field-ID binding",
+                    source.name()
+                )));
             }
         }
+        RecordBatch::try_new(Arc::clone(target_schema), columns).map_err(|error| {
+            ConnectorError::SchemaMismatch(format!("build Iceberg-aligned batch: {error}"))
+        })
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    async fn publish_direct_epoch(&mut self) -> Result<(), ConnectorError> {
+        let Some(writer) = self.active_epoch.get_mut().take() else {
+            return Ok(());
+        };
+        self.active_epoch_id = None;
+        let output = writer.close().await?;
+        if output.data_files.is_empty() {
+            return Ok(());
+        }
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink".into(),
+                actual: "catalog is not initialized".into(),
+            })?;
+        let updated = super::iceberg_io::commit_data_files_append(
+            self.table()?,
+            catalog.as_ref(),
+            output.data_files,
+        )
+        .await?;
+        self.table = Some(updated);
         Ok(())
     }
 
-    /// Write staged batches to Parquet data files (no catalog commit).
-    #[cfg(feature = "iceberg")]
-    async fn write_staged_data_files(
-        &self,
-    ) -> Result<Vec<iceberg::spec::DataFile>, ConnectorError> {
-        use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
-
-        let table = self
-            .table
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
-                actual: "table not loaded".into(),
-            })?;
-
-        let file_io = table.file_io().clone();
-        let location = table.metadata().location().to_string();
-        let schema = table.current_schema_ref();
-
-        self.validate_schema_not_drifted()?;
-
-        let props = parquet::file::properties::WriterProperties::builder()
-            .set_compression(Self::parquet_compression(&self.config.compression))
-            .build();
-        let writer_builder = ParquetWriterBuilder::new(props, schema);
-
-        // Stream every staged batch into ONE Parquet file (one S3 upload) per
-        // epoch. The source hands the sink many small batches (e.g. 1k-row Kafka
-        // polls); a file-per-batch loop would pay a full S3 multipart lifecycle
-        // for each, serializing the pipeline behind that I/O.
-        let mut writer = None;
-        for batch in &self.staged_batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-
-            // Reproject onto the Iceberg-derived Arrow schema so every field
-            // carries PARQUET:field_id metadata; without it the writer can't
-            // map Arrow fields to Iceberg field IDs ("Field id N not found").
-            let aligned = self.align_batch_to_iceberg_schema(batch)?;
-
-            // Open lazily on the first non-empty batch so an all-empty epoch
-            // leaves no zero-row file behind.
-            if writer.is_none() {
-                let file_path = format!("{location}/data/ldb-{}.parquet", uuid::Uuid::new_v4());
-                let output_file = file_io
-                    .new_output(&file_path)
-                    .map_err(|e| ConnectorError::WriteError(format!("create output: {e}")))?;
-                writer = Some(
-                    writer_builder
-                        .clone()
-                        .build(output_file)
-                        .await
-                        .map_err(|e| {
-                            ConnectorError::WriteError(format!("build parquet writer: {e}"))
-                        })?,
-                );
-            }
-
-            writer
-                .as_mut()
-                .expect("writer opened above")
-                .write(&aligned)
-                .await
-                .map_err(|e| ConnectorError::WriteError(format!("parquet write: {e}")))?;
+    #[cfg(feature = "iceberg-core")]
+    fn ensure_no_unresolved_publication(&self) -> Result<(), ConnectorError> {
+        if self.unresolved_publication.lock().is_some() {
+            Err(ConnectorError::InvalidState {
+                expected: "reconciliation of the exact ambiguous Iceberg publication".into(),
+                actual: "a prior coordinated publication remains unresolved".into(),
+            })
+        } else {
+            Ok(())
         }
+    }
 
-        let mut all_data_files = Vec::new();
+    #[cfg(feature = "iceberg-core")]
+    async fn discard_active_epoch(&mut self) -> Result<(), ConnectorError> {
+        let writer = self.active_epoch.get_mut().take();
+        self.active_epoch_id = None;
+        self.metrics.set_buffer(0, 0);
+        self.metrics.set_active_writers(0);
         if let Some(writer) = writer {
-            let data_file_builders = writer
-                .close()
-                .await
-                .map_err(|e| ConnectorError::WriteError(format!("close parquet writer: {e}")))?;
-            for dfb in data_file_builders {
-                let data_file = dfb
-                    .build()
-                    .map_err(|e| ConnectorError::WriteError(format!("data file build: {e}")))?;
-                all_data_files.push(data_file);
-            }
+            let _ = writer.close().await?;
         }
-
-        Ok(all_data_files)
+        Ok(())
     }
 }
 
 #[async_trait]
 impl SinkConnector for IcebergSink {
+    fn bind_runtime_context(&mut self, context: SinkRuntimeContext) -> Result<(), ConnectorError> {
+        let deployment = uuid::Uuid::parse_str(&context.deployment_id).map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "Iceberg runtime deployment ID must be a canonical non-nil UUID".into(),
+            )
+        })?;
+        if deployment.is_nil()
+            || deployment.to_string() != context.deployment_id
+            || context.sink_id.is_empty()
+            || context.participant_id == 0
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg runtime identity contains an invalid deployment, sink, or participant"
+                    .into(),
+            ));
+        }
+        self.runtime_context = Some(context);
+        Ok(())
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let config = IcebergSinkConfig::from_config(config)?;
+        capabilities::validate_sink(&config)?;
         let warehouse = config.catalog.warehouse.to_ascii_lowercase();
-        let shared_warehouse = ["s3://", "s3a://"]
-            .iter()
-            .any(|scheme| warehouse.starts_with(scheme))
-            || config
-                .catalog
-                .storage_type
-                .as_deref()
-                .is_some_and(|storage| matches!(storage, "s3" | "s3a"));
+        let shared_warehouse = warehouse.starts_with("s3://")
+            || warehouse.starts_with("s3a://")
+            || config.storage.storage_type == Some(IcebergStorageType::S3);
+        let consistency = if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            SinkConsistency::CheckpointCommittable
+        } else {
+            SinkConsistency::DurableAtLeastOnce
+        };
         Ok(SinkContract::new(
-            SinkConsistency::DurableAtLeastOnce,
+            consistency,
             if shared_warehouse {
                 SinkTopology::MultiWriter
             } else {
@@ -289,61 +305,77 @@ impl SinkConnector for IcebergSink {
     }
 
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        // Re-parse config from the runtime ConnectorConfig (not factory defaults).
         if !config.properties().is_empty() {
             self.config = IcebergSinkConfig::from_config(config)?;
         }
+        capabilities::validate_sink(&self.config)?;
+        if self.is_coordinated() && self.runtime_context.is_none() {
+            return Err(ConnectorError::ConfigurationError(
+                "exactly-once Iceberg append requires checkpoint runtime identity".into(),
+            ));
+        }
 
-        #[cfg(feature = "iceberg")]
+        #[cfg(feature = "iceberg-core")]
         {
-            let catalog = super::iceberg_io::build_catalog(&self.config.catalog).await?;
-            let ns = &self.config.catalog.namespace;
-            let tbl = &self.config.catalog.table_name;
-
+            let catalog =
+                super::iceberg_io::build_catalog(&self.config.catalog, &self.config.storage)
+                    .await?;
+            let namespace = &self.config.catalog.namespace;
+            let table_name = &self.config.catalog.table_name;
             if self.config.auto_create {
                 if let Some(schema) = config.arrow_schema() {
-                    super::iceberg_io::ensure_table_exists(catalog.as_ref(), ns, tbl, &schema)
-                        .await?;
+                    tokio::time::timeout(
+                        self.config.catalog.request_timeout,
+                        super::iceberg_io::ensure_table_exists(
+                            catalog.as_ref(),
+                            namespace,
+                            table_name,
+                            &schema,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ConnectorError::WriteError(
+                            "[LDB-ICEBERG-CATALOG-TIMEOUT] table creation exceeded catalog.request_timeout"
+                                .into(),
+                        )
+                    })??;
                 }
             }
-
-            let table = super::iceberg_io::load_table(catalog.as_ref(), ns, tbl).await?;
-
-            // Always derive the canonical schema from the Iceberg table.
-            let iceberg_schema = table.current_schema_ref();
-            let table_schema = std::sync::Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(|e| {
-                    ConnectorError::SchemaMismatch(format!("iceberg→arrow schema: {e}"))
-                })?,
+            let table = super::iceberg_io::load_table_with_timeout(
+                catalog.as_ref(),
+                namespace,
+                table_name,
+                self.config.catalog.request_timeout,
+            )
+            .await?;
+            let table_schema = Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).map_err(
+                    |error| {
+                        ConnectorError::SchemaMismatch(format!(
+                            "convert Iceberg schema to Arrow: {error}"
+                        ))
+                    },
+                )?,
             );
-
-            // Store the Iceberg-derived Arrow schema (with PARQUET:field_id
-            // metadata) for use during Parquet writes.
-            self.iceberg_arrow_schema = Some(table_schema.clone());
-
-            if self.schema.is_none() {
-                self.schema = Some(table_schema.clone());
-            }
-
-            // Validate pipeline schema against table schema, then use the
-            // pipeline schema as self.schema (it's what write_batch receives).
             if let Some(pipeline_schema) = config.arrow_schema() {
                 super::iceberg_config::validate_sink_schema(&pipeline_schema, &table_schema)?;
                 self.schema = Some(pipeline_schema);
+            } else {
+                self.schema = Some(Arc::clone(&table_schema));
             }
-
+            self.iceberg_arrow_schema = Some(table_schema);
             self.catalog = Some(catalog);
             self.table = Some(table);
             self.state = ConnectorState::Running;
-
-            info!(table = tbl, namespace = ns, "iceberg sink connected");
+            info!(namespace, table = table_name, "Iceberg sink connected");
             return Ok(());
         }
 
-        #[cfg(not(feature = "iceberg"))]
+        #[cfg(not(feature = "iceberg-core"))]
         {
             self.state = ConnectorState::Failed;
-            Err(ConnectorError::ConfigurationError(
+            Err(ConnectorError::FeatureUnsupported(
                 "Apache Iceberg requires the 'iceberg' feature".into(),
             ))
         }
@@ -353,86 +385,362 @@ impl SinkConnector for IcebergSink {
         if batch.num_rows() == 0 {
             return Ok(WriteResult::new(0, 0));
         }
-
-        if self.schema.is_none() {
-            self.schema = Some(batch.schema());
+        #[cfg(feature = "iceberg-core")]
+        {
+            if self.schema.is_none() {
+                self.schema = Some(batch.schema());
+            }
+            if self.active_epoch.get_mut().is_none() {
+                if self.is_coordinated() {
+                    return Err(ConnectorError::InvalidState {
+                        expected: "begin_epoch before an exactly-once Iceberg write".into(),
+                        actual: "no active epoch".into(),
+                    });
+                }
+                self.direct_epoch = self.direct_epoch.saturating_add(1);
+                *self.active_epoch.get_mut() = Some(self.new_epoch_writer(self.direct_epoch)?);
+                self.active_epoch_id = Some(self.direct_epoch);
+            }
+            let aligned = self.align_batch_to_iceberg_schema(batch)?;
+            let bytes = aligned.get_array_memory_size();
+            self.active_epoch
+                .get_mut()
+                .as_mut()
+                .ok_or_else(|| ConnectorError::Internal("Iceberg epoch writer disappeared".into()))?
+                .write(aligned)
+                .await?;
+            return Ok(WriteResult::new(
+                batch.num_rows(),
+                u64::try_from(bytes).unwrap_or(u64::MAX),
+            ));
         }
 
-        let rows = batch.num_rows();
-        self.buffer.push(batch.clone());
-        self.buffered_rows += rows;
-
-        Ok(WriteResult::new(rows, 0))
+        #[cfg(not(feature = "iceberg-core"))]
+        Err(ConnectorError::FeatureUnsupported(
+            "Apache Iceberg requires the 'iceberg' feature".into(),
+        ))
     }
 
     fn schema(&self) -> SchemaRef {
         self.schema
             .clone()
-            .unwrap_or_else(|| std::sync::Arc::new(arrow_schema::Schema::empty()))
+            .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()))
+    }
+
+    async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        #[cfg(not(feature = "iceberg-core"))]
+        let _ = epoch;
+        #[cfg(feature = "iceberg-core")]
+        {
+            if !self.is_coordinated() {
+                return Ok(());
+            }
+            self.ensure_no_unresolved_publication()?;
+            if self.active_epoch.get_mut().is_some() {
+                return Err(ConnectorError::InvalidState {
+                    expected: "previous Iceberg epoch prepared or rolled back".into(),
+                    actual: "an epoch writer is still active".into(),
+                });
+            }
+            *self.active_epoch.get_mut() = Some(self.new_epoch_writer(epoch)?);
+            self.active_epoch_id = Some(epoch);
+        }
+        Ok(())
+    }
+
+    async fn pre_commit(&mut self, epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
+        #[cfg(not(feature = "iceberg-core"))]
+        let _ = epoch;
+        #[cfg(feature = "iceberg-core")]
+        {
+            if !self.is_coordinated() {
+                self.flush().await?;
+                return Ok(None);
+            }
+            self.ensure_no_unresolved_publication()?;
+            if self.active_epoch_id != Some(epoch) {
+                return Err(ConnectorError::InvalidState {
+                    expected: format!("active Iceberg epoch {epoch}"),
+                    actual: format!("active epoch is {:?}", self.active_epoch_id),
+                });
+            }
+            let started = std::time::Instant::now();
+            let writer = self.active_epoch.get_mut().take().ok_or_else(|| {
+                ConnectorError::Internal("Iceberg active epoch has no writer".into())
+            })?;
+            self.active_epoch_id = None;
+            let output = writer.close().await?;
+            self.metrics
+                .pre_commit_duration
+                .observe(started.elapsed().as_secs_f64());
+            if output.data_files.is_empty() {
+                return Ok(None);
+            }
+            let descriptor = IcebergCommitDescriptorV1::encode(
+                self.table()?,
+                &self.config,
+                &self.epoch_identity(epoch)?,
+                output,
+            )?;
+            return Ok(Some(descriptor));
+        }
+
+        #[cfg(not(feature = "iceberg-core"))]
+        Err(ConnectorError::FeatureUnsupported(
+            "Apache Iceberg requires the 'iceberg' feature".into(),
+        ))
+    }
+
+    async fn rollback_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        #[cfg(not(feature = "iceberg-core"))]
+        let _ = epoch;
+        #[cfg(feature = "iceberg-core")]
+        {
+            if self.active_epoch_id.is_some_and(|active| active != epoch) {
+                return Err(ConnectorError::InvalidState {
+                    expected: format!("rollback active Iceberg epoch {epoch}"),
+                    actual: format!("active epoch is {:?}", self.active_epoch_id),
+                });
+            }
+            self.discard_active_epoch().await?;
+        }
+        Ok(())
     }
 
     fn suggested_write_timeout(&self) -> Duration {
-        // Iceberg catalog writes can be slow under contention.
-        Duration::from_secs(300)
+        self.config
+            .catalog
+            .commit_timeout
+            .min(self.config.storage.request_timeout)
+    }
+
+    fn flush_interval(&self) -> Duration {
+        self.config.max_flush_age.min(Duration::from_secs(5))
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        if self.staged_batches.is_empty() {
-            if self.buffer.is_empty() {
-                return Ok(());
-            }
-            std::mem::swap(&mut self.staged_batches, &mut self.buffer);
-            self.clear_buffer();
-        }
-
-        #[cfg(feature = "iceberg")]
+        #[cfg(feature = "iceberg-core")]
         {
-            let data_files = self.write_staged_data_files().await?;
-            if data_files.is_empty() {
-                self.clear_staged();
+            if self.is_coordinated() {
                 return Ok(());
             }
-            let catalog = self
-                .catalog
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "open".into(),
-                    actual: "catalog not initialized".into(),
-                })?;
-            let table = self
-                .table
-                .as_ref()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "open".into(),
-                    actual: "table not loaded".into(),
-                })?;
-            let updated =
-                super::iceberg_io::commit_data_files_append(table, catalog.as_ref(), data_files)
-                    .await?;
-            self.table = Some(updated);
-            self.clear_staged();
-            return Ok(());
+            return self.publish_direct_epoch().await;
         }
 
-        #[cfg(not(feature = "iceberg"))]
-        Err(ConnectorError::ConfigurationError(
+        #[cfg(not(feature = "iceberg-core"))]
+        Err(ConnectorError::FeatureUnsupported(
             "Apache Iceberg requires the 'iceberg' feature".into(),
         ))
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        while !self.staged_batches.is_empty() || !self.buffer.is_empty() {
-            self.flush().await?;
-        }
-        #[cfg(feature = "iceberg")]
+        #[cfg(feature = "iceberg-core")]
         {
+            if self.is_coordinated() {
+                self.discard_active_epoch().await?;
+            } else {
+                self.flush().await?;
+            }
             self.catalog = None;
             self.table = None;
             self.iceberg_arrow_schema = None;
+            self.metrics.set_buffer(0, 0);
+            self.metrics.set_active_writers(0);
         }
         self.state = ConnectorState::Closed;
         Ok(())
     }
+
+    #[cfg(feature = "iceberg-core")]
+    fn as_coordinated_committer(&self) -> Option<&dyn crate::connector::CoordinatedCommitter> {
+        self.is_coordinated()
+            .then_some(self as &dyn crate::connector::CoordinatedCommitter)
+    }
+}
+
+#[cfg(feature = "iceberg-core")]
+#[async_trait]
+impl crate::connector::CoordinatedCommitter for IcebergSink {
+    async fn commit_aggregated(
+        &self,
+        batch: crate::connector::CoordinatedCommitBatch,
+        context: crate::connector::CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink".into(),
+                actual: "catalog is not initialized".into(),
+            })?;
+        let pending = UnresolvedIcebergPublication {
+            external_key: batch.namespace.external_key(),
+            target: crate::connector::CoordinatedCommitCursor {
+                checkpoint_id: batch.target.checkpoint_id,
+                fencing_token: batch.fencing_token,
+            },
+            exact_batch_fingerprint: batch.exact_fingerprint(),
+        };
+        {
+            let mut unresolved = self.unresolved_publication.lock();
+            if unresolved
+                .as_ref()
+                .is_some_and(|existing| existing != &pending)
+            {
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg has a different unresolved publication; only that exact cut may be reconciled"
+                        .into(),
+                ));
+            }
+            *unresolved = Some(pending.clone());
+        }
+        let result =
+            publication::publish_coordinated(catalog, &self.config, &batch, context, &self.metrics)
+                .await;
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| !error.is_outcome_unknown())
+        {
+            let mut unresolved = self.unresolved_publication.lock();
+            if unresolved.as_ref() == Some(&pending) {
+                *unresolved = None;
+            }
+        }
+        result
+    }
+
+    async fn committed_cursor(
+        &self,
+        namespace: &crate::connector::CoordinatedCommitNamespace,
+    ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink".into(),
+                actual: "catalog is not initialized".into(),
+            })?;
+        let deadline = tokio::time::Instant::now() + self.config.catalog.request_timeout;
+        let pending = self.unresolved_publication.lock().clone();
+        let cursor = publication::read_committed_cursor(
+            catalog,
+            &self.config,
+            namespace,
+            deadline,
+            &self.metrics,
+            pending.as_ref(),
+        )
+        .await?;
+        let mut unresolved = self.unresolved_publication.lock();
+        if unresolved.as_ref().is_some_and(|pending| {
+            pending.external_key == namespace.external_key() && pending.reconciled_by(cursor)
+        }) {
+            *unresolved = None;
+        }
+        Ok(cursor)
+    }
+}
+
+#[cfg(feature = "iceberg-core")]
+fn parquet_compression(name: &str) -> parquet::basic::Compression {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "snappy" => parquet::basic::Compression::SNAPPY,
+        "none" | "uncompressed" => parquet::basic::Compression::UNCOMPRESSED,
+        "lz4" => parquet::basic::Compression::LZ4,
+        _ => parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
+        ),
+    }
+}
+
+#[cfg(feature = "iceberg-core")]
+fn validate_supplied_field_id(
+    source: &arrow_schema::Field,
+    target: &arrow_schema::Field,
+) -> Result<(), ConnectorError> {
+    const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    if let (Some(source_id), Some(target_id)) = (
+        source.metadata().get(FIELD_ID),
+        target.metadata().get(FIELD_ID),
+    ) {
+        if source_id != target_id {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "input field '{}' carries Iceberg field ID {source_id}, expected {target_id}",
+                source.name()
+            )));
+        }
+    }
+    match (source.data_type(), target.data_type()) {
+        (arrow_schema::DataType::Struct(source), arrow_schema::DataType::Struct(target)) => {
+            if source.len() != target.len() {
+                return Err(nested_field_mismatch(target.len(), source.len()));
+            }
+            for target in target {
+                let source = source_field(source, target).ok_or_else(|| {
+                    ConnectorError::SchemaMismatch(format!(
+                        "nested Iceberg field '{}' has no field-ID binding",
+                        target.name()
+                    ))
+                })?;
+                validate_supplied_field_id(source, target)?;
+            }
+        }
+        (arrow_schema::DataType::List(source), arrow_schema::DataType::List(target))
+        | (arrow_schema::DataType::LargeList(source), arrow_schema::DataType::LargeList(target))
+        | (arrow_schema::DataType::ListView(source), arrow_schema::DataType::ListView(target))
+        | (
+            arrow_schema::DataType::LargeListView(source),
+            arrow_schema::DataType::LargeListView(target),
+        )
+        | (arrow_schema::DataType::Map(source, _), arrow_schema::DataType::Map(target, _)) => {
+            validate_supplied_field_id(source, target)?;
+        }
+        (
+            arrow_schema::DataType::FixedSizeList(source, source_size),
+            arrow_schema::DataType::FixedSizeList(target, target_size),
+        ) if source_size == target_size => validate_supplied_field_id(source, target)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(feature = "iceberg-core")]
+fn source_field_index(
+    schema: &arrow_schema::Schema,
+    target: &arrow_schema::Field,
+) -> Option<usize> {
+    let fields = schema.fields();
+    source_field(fields, target).and_then(|source| {
+        fields
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate.as_ref(), source))
+    })
+}
+
+#[cfg(feature = "iceberg-core")]
+fn source_field<'a>(
+    fields: &'a arrow_schema::Fields,
+    target: &arrow_schema::Field,
+) -> Option<&'a arrow_schema::Field> {
+    const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    target
+        .metadata()
+        .get(FIELD_ID)
+        .and_then(|target_id| {
+            fields
+                .iter()
+                .find(|field| field.metadata().get(FIELD_ID) == Some(target_id))
+        })
+        .or_else(|| fields.iter().find(|field| field.name() == target.name()))
+        .map(AsRef::as_ref)
+}
+
+#[cfg(feature = "iceberg-core")]
+fn nested_field_mismatch(expected: usize, actual: usize) -> ConnectorError {
+    ConnectorError::SchemaMismatch(format!(
+        "nested Iceberg field count is {actual}, expected {expected}"
+    ))
 }
 
 #[cfg(test)]

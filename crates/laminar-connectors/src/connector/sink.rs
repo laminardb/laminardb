@@ -11,6 +11,17 @@ use super::{
     ConnectorCancellationPolicy, ConnectorTaskTracker, CoordinatedCommitter, SinkContract,
 };
 
+/// Durable runtime identity bound to checkpoint-committable sink staging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkRuntimeContext {
+    /// Create-once deployment UUID shared by checkpoint recovery.
+    pub deployment_id: String,
+    /// Stable sink registration name within the pipeline.
+    pub sink_id: String,
+    /// Stable nonzero checkpoint participant identifier.
+    pub participant_id: u64,
+}
+
 /// Summary of a successful `write_batch` call.
 #[derive(Debug, Clone)]
 pub struct WriteResult {
@@ -52,6 +63,19 @@ pub trait SinkConnector: Send {
     /// reused after cancellation until every lifecycle future has been audited.
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
         ConnectorCancellationPolicy::RetireConnector
+    }
+
+    /// Bind the checkpoint runtime identity before `open`.
+    ///
+    /// The default is a no-op for sinks whose object naming does not depend on
+    /// checkpoint identity.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return an error when the supplied identity is invalid
+    /// or cannot be applied in the connector's current lifecycle state.
+    fn bind_runtime_context(&mut self, _context: SinkRuntimeContext) -> Result<(), ConnectorError> {
+        Ok(())
     }
 
     /// Observe detached tasks whose lifetime may outlast this connector value.

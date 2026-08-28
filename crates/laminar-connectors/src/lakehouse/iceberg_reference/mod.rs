@@ -77,11 +77,13 @@ impl IcebergReferenceTableSource {
     }
 
     async fn load_initial_snapshot(&mut self) -> Result<(), ConnectorError> {
-        let catalog = super::iceberg_io::build_catalog(&self.config.catalog).await?;
-        let table = super::iceberg_io::load_table(
+        let catalog =
+            super::iceberg_io::build_catalog(&self.config.catalog, &self.config.storage).await?;
+        let table = super::iceberg_io::load_table_with_timeout(
             catalog.as_ref(),
             &self.config.catalog.namespace,
             &self.config.catalog.table_name,
+            self.config.catalog.request_timeout,
         )
         .await?;
 
