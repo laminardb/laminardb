@@ -25,7 +25,7 @@ pub(crate) fn sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "parquet.compression",
-            "Parquet compression: zstd, snappy, or none",
+            "Parquet compression: zstd, snappy, lz4, or uncompressed",
             "zstd",
         ),
         ConfigKeySpec::optional(
@@ -75,8 +75,12 @@ pub(crate) fn sink_config_keys() -> Vec<ConfigKeySpec> {
             "Iceberg format version for table creation",
             "2",
         ),
-        ConfigKeySpec::optional("partition.spec", "Partition spec for table creation", ""),
-        ConfigKeySpec::optional("sort.order", "Sort order for table creation", ""),
+        ConfigKeySpec::optional(
+            "partition.spec",
+            "JSON partition-field array for table creation",
+            "",
+        ),
+        ConfigKeySpec::optional("sort.order", "JSON sort-field array for table creation", ""),
     ]);
     keys
 }

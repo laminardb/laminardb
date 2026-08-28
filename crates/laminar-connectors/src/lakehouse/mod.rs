@@ -55,7 +55,11 @@ use iceberg_config::{
     sink_config_keys as iceberg_sink_config_keys, source_config_keys as iceberg_source_config_keys,
 };
 pub use iceberg_config::{
-    IcebergCatalogConfig, IcebergCatalogType, IcebergSinkConfig, IcebergSourceConfig,
+    IcebergCatalogAuthType, IcebergCatalogConfig, IcebergCatalogType, IcebergNullOrder,
+    IcebergPartitionField, IcebergReadBootstrap, IcebergReadMode, IcebergSchemaEvolutionMode,
+    IcebergSinkConfig, IcebergSortDirection, IcebergSortField, IcebergSourceConfig,
+    IcebergStorageConfig, IcebergStorageEncryption, IcebergStorageType, IcebergTransform,
+    IcebergWriteDistributionMode, IcebergWriteMode,
 };
 #[cfg(feature = "iceberg-core")]
 pub use iceberg_lookup::{IcebergLookupSource, IcebergLookupSourceConfig};

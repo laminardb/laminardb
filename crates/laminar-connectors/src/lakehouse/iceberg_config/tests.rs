@@ -60,6 +60,136 @@ fn test_defaults() {
     assert!(!cfg.auto_create);
 }
 
+fn table_definition_config() -> ConnectorConfig {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "http://localhost:8181");
+    config.set("catalog.warehouse", "file:///warehouse");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config
+}
+
+#[test]
+fn auto_create_table_definition_is_strongly_typed() {
+    let mut config = table_definition_config();
+    config.set("auto.create", "true");
+    config.set("identifier.fields", "id");
+    config.set(
+        "partition.spec",
+        r#"[{"source":"event_time","name":"event_month","transform":"month"}]"#,
+    );
+    config.set(
+        "sort.order",
+        r#"[{"source":"id","transform":"bucket[16]","direction":"desc","null_order":"nulls-first"}]"#,
+    );
+    config.set("table.property.owner", "streaming");
+
+    let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.identifier_fields, ["id"]);
+    assert_eq!(parsed.partition_spec.len(), 1);
+    assert_eq!(parsed.partition_spec[0].transform, IcebergTransform::Month);
+    assert_eq!(parsed.sort_order.len(), 1);
+    assert_eq!(parsed.sort_order[0].transform, IcebergTransform::Bucket(16));
+    assert_eq!(
+        parsed
+            .initial_table_properties
+            .get("owner")
+            .map(String::as_str),
+        Some("streaming")
+    );
+}
+
+#[test]
+fn table_creation_options_require_auto_create() {
+    for (key, value) in [
+        ("format.version", "3"),
+        (
+            "partition.spec",
+            r#"[{"source":"id","name":"id","transform":"identity"}]"#,
+        ),
+        ("table.property.owner", "streaming"),
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, value);
+        let error = IcebergSinkConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auto.create=true"), "got: {error}");
+    }
+}
+
+#[test]
+fn malformed_table_definitions_and_codecs_fail_closed() {
+    let mut transform = table_definition_config();
+    transform.set("auto.create", "true");
+    transform.set(
+        "partition.spec",
+        r#"[{"source":"id","name":"id_bucket","transform":"bucket[0]"}]"#,
+    );
+    assert!(IcebergSinkConfig::from_config(&transform).is_err());
+
+    let mut codec = table_definition_config();
+    codec.set("parquet.compression", "made-up");
+    let error = IcebergSinkConfig::from_config(&codec)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsupported parquet.compression"));
+}
+
+#[test]
+fn programmatic_zero_writer_limit_fails_closed() {
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.max_buffer_rows = 0;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("max.buffer.rows must be greater than zero"));
+}
+
+#[test]
+fn identifier_field_count_is_bounded_before_table_creation() {
+    let mut config = table_definition_config();
+    config.set(
+        "identifier.fields",
+        (0..129)
+            .map(|index| format!("field_{index}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let error = IcebergSinkConfig::from_config(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("more than 128 entries"));
+}
+
+#[test]
+fn table_properties_cannot_persist_or_expose_secrets() {
+    let mut config = table_definition_config();
+    config.set("auto.create", "true");
+    config.set("table.property.password", "do-not-log-this");
+    let error = IcebergSinkConfig::from_config(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("do-not-log-this"));
+
+    let mut safe = table_definition_config();
+    safe.set("auto.create", "true");
+    safe.set("table.property.owner", "private-owner-value");
+    let debug = format!("{:?}", IcebergSinkConfig::from_config(&safe).unwrap());
+    assert!(debug.contains("initial_table_property_count"));
+    assert!(!debug.contains("owner"));
+    assert!(!debug.contains("private-owner-value"));
+}
+
+#[test]
+fn typed_writer_properties_cannot_be_duplicated() {
+    let mut config = table_definition_config();
+    config.set("auto.create", "true");
+    config.set("table.property.write.target-file-size-bytes", "1");
+    let error = IcebergSinkConfig::from_config(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("duplicates a typed writer option"));
+}
+
 #[test]
 fn typed_storage_backends_parse_without_silent_fallback() {
     let mut config = ConnectorConfig::new("iceberg");

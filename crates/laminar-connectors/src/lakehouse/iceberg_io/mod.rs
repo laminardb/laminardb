@@ -33,6 +33,8 @@ use super::iceberg_config::{IcebergCatalogAuthType, IcebergStorageEncryption};
 use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType, IcebergStorageConfig};
 use crate::error::ConnectorError;
 
+mod table_creation;
+
 /// Selects the `OpenDalStorageFactory` for the table-data URLs the catalog
 /// will return. Explicit `storage.type` wins; otherwise inferred from the
 /// `s3://` / `s3a://` / `file://` warehouse URL.
@@ -475,14 +477,15 @@ fn iceberg_commit_error(error: &iceberg::Error) -> ConnectorError {
 /// Returns `ConnectorError` on creation failure.
 pub async fn ensure_table_exists(
     catalog: &dyn Catalog,
-    namespace: &str,
-    table_name: &str,
+    config: &super::iceberg_config::IcebergSinkConfig,
     arrow_schema: &arrow_schema::SchemaRef,
 ) -> Result<(), ConnectorError> {
+    let namespace = &config.catalog.namespace;
+    let table_name = &config.catalog.table_name;
     let ns = iceberg::NamespaceIdent::from_strs(namespace.split('.').collect::<Vec<_>>())
         .map_err(|e| ConnectorError::ConfigurationError(format!("invalid namespace: {e}")))?;
-
-    let ident = TableIdent::new(ns.clone(), table_name.to_string());
+    let ident = TableIdent::new(ns.clone(), table_name.clone());
+    let creation = table_creation::build_table_creation(config, arrow_schema)?;
 
     // Ensure the namespace exists before probing the table: a HEAD on a table in
     // a missing namespace returns 400 (not 404) on some REST catalogs. Creation
@@ -507,18 +510,6 @@ pub async fn ensure_table_exists(
     {
         return Ok(());
     }
-
-    // Pipeline-derived Arrow schemas don't carry `PARQUET:field_id`
-    // metadata; let iceberg-rust assign sequential IDs.
-    let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema)
-        .map_err(|e| {
-            ConnectorError::SchemaMismatch(format!("arrow→iceberg schema conversion: {e}"))
-        })?;
-
-    let creation = iceberg::TableCreation::builder()
-        .name(table_name.to_string())
-        .schema(iceberg_schema)
-        .build();
 
     // Same race tolerance for the table itself.
     if let Err(e) = catalog.create_table(&ns, creation).await {

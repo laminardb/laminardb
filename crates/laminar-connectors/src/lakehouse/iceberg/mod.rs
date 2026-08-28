@@ -299,8 +299,7 @@ impl SinkConnector for IcebergSink {
                         self.config.catalog.request_timeout,
                         super::iceberg_io::ensure_table_exists(
                             catalog.as_ref(),
-                            namespace,
-                            table_name,
+                            &self.config,
                             &schema,
                         ),
                     )
@@ -615,14 +614,17 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
 }
 
 #[cfg(feature = "iceberg-core")]
-fn parquet_compression(name: &str) -> parquet::basic::Compression {
+fn parquet_compression(name: &str) -> Result<parquet::basic::Compression, ConnectorError> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "snappy" => parquet::basic::Compression::SNAPPY,
-        "none" | "uncompressed" => parquet::basic::Compression::UNCOMPRESSED,
-        "lz4" => parquet::basic::Compression::LZ4,
-        _ => parquet::basic::Compression::ZSTD(
+        "snappy" => Ok(parquet::basic::Compression::SNAPPY),
+        "none" | "uncompressed" => Ok(parquet::basic::Compression::UNCOMPRESSED),
+        "lz4" => Ok(parquet::basic::Compression::LZ4),
+        "zstd" => Ok(parquet::basic::Compression::ZSTD(
             parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
-        ),
+        )),
+        other => Err(ConnectorError::ConfigurationError(format!(
+            "unsupported parquet.compression '{other}'"
+        ))),
     }
 }
 

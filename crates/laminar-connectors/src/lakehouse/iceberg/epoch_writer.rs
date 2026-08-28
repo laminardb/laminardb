@@ -111,6 +111,7 @@ impl IcebergEpochWriter {
         identity: &EpochIdentity,
         metrics: IcebergMetrics,
     ) -> Result<Self, ConnectorError> {
+        config.validate_writer_limits()?;
         let schema = table.current_schema_ref();
         let partition_spec = Arc::clone(table.metadata().default_partition_spec());
         let splitter = if partition_spec.fields().is_empty() {
@@ -126,7 +127,7 @@ impl IcebergEpochWriter {
         };
         let row_group_rows = approximate_row_group_rows(config);
         let properties = WriterProperties::builder()
-            .set_compression(super::parquet_compression(&config.compression))
+            .set_compression(super::parquet_compression(&config.compression)?)
             .set_max_row_group_row_count(Some(row_group_rows))
             .set_write_batch_size(row_group_rows.min(8_192))
             .build();

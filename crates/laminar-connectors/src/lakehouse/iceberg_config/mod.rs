@@ -3,6 +3,7 @@
 
 mod modes;
 mod registry;
+mod table_definition;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -23,8 +24,18 @@ pub use modes::{
     IcebergWriteDistributionMode, IcebergWriteMode,
 };
 pub(crate) use registry::{sink_config_keys, source_config_keys};
+pub(crate) use table_definition::{
+    parse_parquet_compression, parse_table_fields, validate_distinct_names,
+    validate_persisted_properties, validate_table_definition, PARQUET_COMPRESSION_PROPERTY,
+    PARQUET_ROW_GROUP_SIZE_PROPERTY, TARGET_FILE_SIZE_PROPERTY,
+};
+pub use table_definition::{
+    IcebergNullOrder, IcebergPartitionField, IcebergSortDirection, IcebergSortField,
+    IcebergTransform,
+};
 
 const MIB: usize = 1024 * 1024;
+const MAX_CONFIG_LIST_BYTES: usize = MIB;
 
 #[cfg(feature = "iceberg-core")]
 pub(crate) fn stable_catalog_identity(
@@ -302,7 +313,7 @@ impl IcebergStorageConfig {
 }
 
 /// Configuration for the Iceberg append sink.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IcebergSinkConfig {
     /// Catalog settings.
     pub catalog: IcebergCatalogConfig,
@@ -343,11 +354,47 @@ pub struct IcebergSinkConfig {
     /// Iceberg format version for auto-created tables.
     pub format_version: u8,
     /// Declarative partition spec for auto-create.
-    pub partition_spec: Option<String>,
+    pub partition_spec: Vec<IcebergPartitionField>,
     /// Declarative sort order for auto-create.
-    pub sort_order: Option<String>,
+    pub sort_order: Vec<IcebergSortField>,
     /// Initial table properties for auto-create.
     pub initial_table_properties: HashMap<String, String>,
+}
+
+impl fmt::Debug for IcebergSinkConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IcebergSinkConfig")
+            .field("catalog", &self.catalog)
+            .field("storage", &self.storage)
+            .field("write_mode", &self.write_mode)
+            .field("compression", &self.compression)
+            .field("target_file_size_bytes", &self.target_file_size_bytes)
+            .field(
+                "parquet_row_group_size_bytes",
+                &self.parquet_row_group_size_bytes,
+            )
+            .field("max_buffer_rows", &self.max_buffer_rows)
+            .field("max_buffer_bytes", &self.max_buffer_bytes)
+            .field("max_open_partitions", &self.max_open_partitions)
+            .field("max_files_per_checkpoint", &self.max_files_per_checkpoint)
+            .field("max_descriptor_bytes", &self.max_descriptor_bytes)
+            .field("max_flush_age", &self.max_flush_age)
+            .field("distribution_mode", &self.distribution_mode)
+            .field("identifier_fields", &self.identifier_fields)
+            .field("schema_evolution_mode", &self.schema_evolution_mode)
+            .field("delivery_guarantee", &self.delivery_guarantee)
+            .field("table_ref", &self.table_ref)
+            .field("auto_create", &self.auto_create)
+            .field("format_version", &self.format_version)
+            .field("partition_spec", &self.partition_spec)
+            .field("sort_order", &self.sort_order)
+            .field(
+                "initial_table_property_count",
+                &self.initial_table_properties.len(),
+            )
+            .finish()
+    }
 }
 
 impl IcebergSinkConfig {
@@ -364,10 +411,46 @@ impl IcebergSinkConfig {
             .unwrap_or("at-least-once")
             .parse()
             .map_err(ConnectorError::ConfigurationError)?;
+        let compression = parse_parquet_compression(
+            optional_alias(config, "parquet.compression", "compression").unwrap_or("zstd"),
+        )?;
+        let target_file_size_bytes = parse_nonzero_alias(
+            config,
+            "target.file.size.bytes",
+            "target.file.size",
+            128 * MIB,
+        )?;
+        let parquet_row_group_size_bytes =
+            parse_nonzero(config, "parquet.row.group.size.bytes", 128 * MIB)?;
         let format_version = config.get_parsed("format.version")?.unwrap_or(2);
         if !matches!(format_version, 1..=3) {
             return Err(ConnectorError::ConfigurationError(
                 "format.version must be 1, 2, or 3".into(),
+            ));
+        }
+        let auto_create = parse_bool(config, "auto.create", false)?;
+        let partition_spec = parse_table_fields(config, "partition.spec")?;
+        let sort_order = parse_table_fields(config, "sort.order")?;
+        validate_table_definition(&partition_spec, &sort_order)?;
+        let identifier_fields =
+            parse_comma_list(config.get("identifier.fields"), "identifier.fields", 128)?;
+        validate_distinct_names(&identifier_fields, "identifier.fields")?;
+        let initial_table_properties = config.properties_with_prefix("table.property.");
+        validate_persisted_properties(&initial_table_properties)?;
+        if !auto_create
+            && (config.get("format.version").is_some()
+                || !partition_spec.is_empty()
+                || !sort_order.is_empty()
+                || !initial_table_properties.is_empty())
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "format.version, partition.spec, sort.order, and table.property.* require auto.create=true"
+                    .into(),
+            ));
+        }
+        if auto_create && format_version == 1 && !identifier_fields.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "identifier.fields require format.version=2 or 3 for an auto-created table".into(),
             ));
         }
 
@@ -375,20 +458,9 @@ impl IcebergSinkConfig {
             catalog,
             storage,
             write_mode: parse_or_default(config, "write.mode")?,
-            compression: optional_alias(config, "parquet.compression", "compression")
-                .unwrap_or("zstd")
-                .to_string(),
-            target_file_size_bytes: parse_nonzero_alias(
-                config,
-                "target.file.size.bytes",
-                "target.file.size",
-                128 * MIB,
-            )?,
-            parquet_row_group_size_bytes: parse_nonzero(
-                config,
-                "parquet.row.group.size.bytes",
-                128 * MIB,
-            )?,
+            compression,
+            target_file_size_bytes,
+            parquet_row_group_size_bytes,
             max_buffer_rows: parse_nonzero(config, "max.buffer.rows", 65_536)?,
             max_buffer_bytes: parse_nonzero(config, "max.buffer.bytes", 64 * MIB)?,
             max_open_partitions: parse_nonzero(config, "max.open.partitions", 64)?,
@@ -396,16 +468,57 @@ impl IcebergSinkConfig {
             max_descriptor_bytes: parse_nonzero(config, "max.descriptor.bytes", 16 * MIB)?,
             max_flush_age: parse_duration(config, "max.flush.age", Duration::from_secs(300))?,
             distribution_mode: parse_or_default(config, "write.distribution.mode")?,
-            identifier_fields: parse_list(config.get("identifier.fields")),
+            identifier_fields,
             schema_evolution_mode: parse_or_default(config, "schema.evolution.mode")?,
             delivery_guarantee,
             table_ref: config.get("table.ref").unwrap_or("main").trim().to_string(),
-            auto_create: parse_bool(config, "auto.create", false)?,
+            auto_create,
             format_version,
-            partition_spec: optional_non_empty(config, "partition.spec"),
-            sort_order: optional_non_empty(config, "sort.order"),
-            initial_table_properties: config.properties_with_prefix("table.property."),
+            partition_spec,
+            sort_order,
+            initial_table_properties,
         })
+    }
+
+    pub(crate) fn validate_table_creation(&self) -> Result<(), ConnectorError> {
+        if !matches!(self.format_version, 1..=3) {
+            return Err(ConnectorError::ConfigurationError(
+                "format.version must be 1, 2, or 3".into(),
+            ));
+        }
+        parse_parquet_compression(&self.compression)?;
+        validate_distinct_names(&self.identifier_fields, "identifier.fields")?;
+        validate_table_definition(&self.partition_spec, &self.sort_order)?;
+        validate_persisted_properties(&self.initial_table_properties)?;
+        if self.format_version == 1 && !self.identifier_fields.is_empty() {
+            return Err(ConnectorError::ConfigurationError(
+                "identifier.fields require format.version=2 or 3 for an auto-created table".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_writer_limits(&self) -> Result<(), ConnectorError> {
+        for (name, value) in [
+            ("target.file.size.bytes", self.target_file_size_bytes),
+            (
+                "parquet.row.group.size.bytes",
+                self.parquet_row_group_size_bytes,
+            ),
+            ("max.buffer.rows", self.max_buffer_rows),
+            ("max.buffer.bytes", self.max_buffer_bytes),
+            ("max.open.partitions", self.max_open_partitions),
+            ("max.files.per.checkpoint", self.max_files_per_checkpoint),
+            ("max.descriptor.bytes", self.max_descriptor_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+        }
+        parse_parquet_compression(&self.compression)?;
+        Ok(())
     }
 }
 
@@ -477,7 +590,11 @@ impl IcebergSourceConfig {
             poll_interval,
             snapshot_id: parse_optional_alias(config, "start.snapshot.id", "snapshot.id")?,
             table_ref: config.get("table.ref").unwrap_or("main").trim().to_string(),
-            select_columns: parse_list(optional_alias(config, "projection", "select.columns")),
+            select_columns: parse_comma_list(
+                optional_alias(config, "projection", "select.columns"),
+                "projection",
+                1_024,
+            )?,
             filter: optional_non_empty(config, "filter"),
             max_snapshots_per_poll: parse_nonzero(config, "read.max.snapshots.per.poll", 1_024)?,
             max_planned_files: parse_nonzero(config, "read.max.planned.files", 65_536)?,
@@ -624,14 +741,31 @@ where
         .transpose()
 }
 
-fn parse_list(value: Option<&str>) -> Vec<String> {
-    value
-        .unwrap_or_default()
+fn parse_comma_list(
+    value: Option<&str>,
+    key: &str,
+    max_entries: usize,
+) -> Result<Vec<String>, ConnectorError> {
+    let value = value.unwrap_or_default();
+    if value.len() > MAX_CONFIG_LIST_BYTES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{key} is {} bytes; the limit is {MAX_CONFIG_LIST_BYTES}",
+            value.len()
+        )));
+    }
+    let values = value
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(str::to_string)
-        .collect()
+        .take(max_entries.saturating_add(1))
+        .collect::<Vec<_>>();
+    if values.len() > max_entries {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{key} contains more than {max_entries} entries"
+        )));
+    }
+    Ok(values)
 }
 
 /// Validates an Arrow pipeline schema against an Iceberg-derived Arrow schema.

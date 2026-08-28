@@ -25,6 +25,7 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
             ));
         }
     }
+    config.validate_writer_limits()?;
     if config.table_ref != "main" {
         return Err(ConnectorError::FeatureUnsupported(format!(
             "iceberg.write.table-ref: FastAppend in iceberg-rust 0.10.1 only publishes the main branch; requested '{}'",
@@ -34,18 +35,6 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
     if config.schema_evolution_mode != IcebergSchemaEvolutionMode::Strict {
         return Err(ConnectorError::FeatureUnsupported(
             "iceberg.schema-evolution.safe: checkpoint-bound schema update actions are not implemented"
-                .into(),
-        ));
-    }
-    if config.auto_create
-        && (config.format_version != 2
-            || config.partition_spec.is_some()
-            || config.sort_order.is_some()
-            || !config.identifier_fields.is_empty()
-            || !config.initial_table_properties.is_empty())
-    {
-        return Err(ConnectorError::FeatureUnsupported(
-            "iceberg.auto-create.advanced: format, partition, sort, identifier, and property actions are not yet applied atomically"
                 .into(),
         ));
     }
