@@ -1,7 +1,10 @@
+use std::time::Instant;
+
+use laminar_core::checkpoint::CheckpointAttemptRelation;
+
 use super::{
-    checked_successor_epoch, require_canonical_attempt, CheckpointAttempt,
-    CheckpointAttemptRelation, CheckpointCoordinator, CheckpointPhase, DbError, Instant,
-    SinkEpochPublication,
+    checked_successor_epoch, require_canonical_attempt, CheckpointAttempt, CheckpointCoordinator,
+    CheckpointPhase, DbError, SinkEpochPublication,
 };
 
 impl CheckpointCoordinator {

@@ -3,6 +3,58 @@ use laminar_core::checkpoint::{checkpoint_sha256, ObjectStoreCheckpointStore};
 use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
 
+fn checkpoint_error_message(error: DbError) -> String {
+    match error {
+        DbError::Checkpoint(message) => message,
+        other => panic!("expected checkpoint error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn request_validation_preserves_error_precedence() {
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "request-precedence");
+    let coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+
+    let unsupported = coordinator
+        .validate_request(&CheckpointRequest {
+            flags: laminar_core::checkpoint::flags::HANDOFF | 0x2,
+            handoff_replay_pending: true,
+            reassignment_portable: true,
+            ..CheckpointRequest::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        checkpoint_error_message(unsupported),
+        "checkpoint request carries unsupported flags 0x2"
+    );
+
+    let unqualified_replay = coordinator
+        .validate_request(&CheckpointRequest {
+            handoff_replay_pending: true,
+            reassignment_portable: true,
+            ..CheckpointRequest::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        checkpoint_error_message(unqualified_replay),
+        "aligned replay may only qualify an assignment handoff checkpoint"
+    );
+
+    let conflicting_capture = coordinator
+        .validate_request(&CheckpointRequest {
+            flags: laminar_core::checkpoint::flags::HANDOFF,
+            handoff_replay_pending: true,
+            reassignment_portable: true,
+            ..CheckpointRequest::default()
+        })
+        .unwrap_err();
+    assert_eq!(
+        checkpoint_error_message(conflicting_capture),
+        "a checkpoint with aligned replay pending cannot claim vnode reassignment portability"
+    );
+}
+
 #[tokio::test]
 async fn local_request_cannot_claim_cluster_reassignment_portability() {
     let store =
@@ -21,6 +73,95 @@ async fn local_request_cannot_claim_cluster_reassignment_portability() {
             .contains("local checkpoint cannot claim vnode reassignment portability"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn packed_checkpoint_preserves_exact_frame_layout_and_digests() {
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "packed-layout");
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id(uuid::Uuid::from_u128(1).to_string())
+        .unwrap();
+
+    let packed = coordinator
+        .pack_checkpoint(
+            CheckpointAttempt::canonical(7),
+            CheckpointRequest {
+                state_frames: vec![
+                    CapturedStateFrame {
+                        key: StateFrameKey::OperatorWhole {
+                            operator_id: "z".into(),
+                        },
+                        state: Some(Bytes::from_static(b"bbb")),
+                    },
+                    CapturedStateFrame {
+                        key: StateFrameKey::OperatorWhole {
+                            operator_id: "a".into(),
+                        },
+                        state: Some(Bytes::from_static(b"aa")),
+                    },
+                ],
+                ..CheckpointRequest::default()
+            },
+            BTreeMap::new(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        packed.node_data,
+        vec![Bytes::from_static(b"aa"), Bytes::from_static(b"bbb")]
+    );
+    assert_eq!(packed.manifest.node_data.object_length, 5);
+    assert_eq!(
+        packed.manifest.node_data.sha256,
+        checkpoint_sha256(b"aabbb")
+    );
+    assert_eq!(packed.manifest.state_frames.len(), 2);
+    assert_eq!(
+        packed.manifest.state_frames[0].key,
+        StateFrameKey::OperatorWhole {
+            operator_id: "a".into()
+        }
+    );
+    assert_eq!(
+        packed.manifest.state_frames[0].range,
+        ByteRange {
+            offset: 0,
+            length: 2
+        }
+    );
+    assert_eq!(
+        packed.manifest.state_frames[0].sha256,
+        checkpoint_sha256(b"aa")
+    );
+    assert_eq!(
+        packed.manifest.state_frames[1].key,
+        StateFrameKey::OperatorWhole {
+            operator_id: "z".into()
+        }
+    );
+    assert_eq!(
+        packed.manifest.state_frames[1].range,
+        ByteRange {
+            offset: 2,
+            length: 3
+        }
+    );
+    assert_eq!(
+        packed.manifest.state_frames[1].sha256,
+        checkpoint_sha256(b"bbb")
+    );
+    assert!(packed
+        .manifest
+        .state_frames
+        .iter()
+        .all(|frame| frame.chunk == packed.manifest.node_data.chunk));
 }
 
 #[tokio::test]
