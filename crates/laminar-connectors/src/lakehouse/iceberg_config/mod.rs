@@ -62,7 +62,7 @@ pub(crate) fn stable_catalog_identity(
         storage.endpoint.clone().unwrap_or_default(),
         storage.region.clone().unwrap_or_default(),
     ] {
-        hasher.update(value.len().to_le_bytes());
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(value.as_bytes());
     }
     let mut encoded = String::with_capacity(64);

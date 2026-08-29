@@ -26,6 +26,49 @@ fn test_sink_config_from_config() {
     assert_eq!(cfg.compression, "snappy");
 }
 
+#[cfg(feature = "iceberg-core")]
+#[test]
+fn stable_catalog_identity_is_platform_canonical_and_ignores_rotated_secrets() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.type", "rest");
+    config.set("catalog.uri", "https://catalog.example/v1");
+    config.set("catalog.warehouse", "s3://warehouse/root");
+    config.set("catalog.prefix", "prod");
+    config.set("catalog.auth.type", "bearer");
+    config.set("catalog.property.token", "first-secret");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("storage.type", "s3");
+    config.set("storage.endpoint", "https://objects.example");
+    config.set("storage.region", "eu-west-2");
+    config.set("storage.property.secret-access-key", "first-storage-secret");
+
+    let first = IcebergSinkConfig::from_config(&config).unwrap();
+    let identity = stable_catalog_identity(&first.catalog, &first.storage);
+    assert_eq!(
+        identity,
+        "682af55fe1359d4824fbe34beb29aadf02f2b11da497cd3df1468132ad78cdc4"
+    );
+
+    config.set("catalog.property.token", "rotated-secret");
+    config.set(
+        "storage.property.secret-access-key",
+        "rotated-storage-secret",
+    );
+    let rotated = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_eq!(
+        identity,
+        stable_catalog_identity(&rotated.catalog, &rotated.storage)
+    );
+
+    config.set("storage.region", "us-east-1");
+    let different = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_ne!(
+        identity,
+        stable_catalog_identity(&different.catalog, &different.storage)
+    );
+}
+
 #[test]
 fn test_source_config_from_config() {
     let mut config = ConnectorConfig::new("iceberg");
