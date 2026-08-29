@@ -176,7 +176,7 @@ fn rest_properties_keep_catalog_and_storage_configuration_separate() {
     raw_storage.set("storage.kms_key", "storage-secret");
     let storage = IcebergStorageConfig::from_config(&raw_storage).unwrap();
 
-    let properties = rest_properties(&catalog, &storage);
+    let properties = rest_properties(&catalog, &storage).unwrap();
     assert_eq!(properties.get("prefix").map(String::as_str), Some("tenant"));
     assert_eq!(
         properties.get("s3.endpoint").map(String::as_str),
@@ -198,13 +198,27 @@ fn rest_properties_keep_catalog_and_storage_configuration_separate() {
 
 #[cfg(feature = "iceberg-catalog-rest")]
 #[test]
+fn storage_properties_cannot_control_catalog_authentication() {
+    let catalog = catalog_config(|_| {});
+    for key in ["token", "credential", "header.Authorization"] {
+        let mut raw_storage = ConnectorConfig::new("iceberg");
+        raw_storage.set(format!("storage.property.{key}"), "storage-secret");
+        let storage = IcebergStorageConfig::from_config(&raw_storage).unwrap();
+        let error = rest_properties(&catalog, &storage).unwrap_err();
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.to_string().contains("storage-secret"));
+    }
+}
+
+#[cfg(feature = "iceberg-catalog-rest")]
+#[test]
 fn storage_specific_options_do_not_fall_through_to_s3() {
     let mut gcs_config = ConnectorConfig::new("iceberg");
     gcs_config.set("storage.type", "gcs");
     gcs_config.set("storage.endpoint", "https://storage.googleapis.test");
     let gcs = IcebergStorageConfig::from_config(&gcs_config).unwrap();
     validate_storage_options("gs://bucket/warehouse", &gcs).unwrap();
-    let properties = rest_properties(&catalog_config(|_| {}), &gcs);
+    let properties = rest_properties(&catalog_config(|_| {}), &gcs).unwrap();
     assert_eq!(
         properties.get("gcs.service.path").map(String::as_str),
         Some("https://storage.googleapis.test")
@@ -235,7 +249,7 @@ async fn rest_catalog_loads_server_config_before_using_server_overrides() {
             "defaults": {"prefix": "default-prefix"},
             "overrides": {"prefix": "server-prefix"}
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -257,9 +271,10 @@ async fn rest_catalog_loads_server_config_before_using_server_overrides() {
     assert!(catalog.list_namespaces(None).await.unwrap().is_empty());
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0].url.path(), "/v1/config");
-    assert_eq!(requests[1].url.path(), "/v1/server-prefix/namespaces");
+    assert_eq!(requests[1].url.path(), "/v1/config");
+    assert_eq!(requests[2].url.path(), "/v1/server-prefix/namespaces");
 }
 
 fn empty_fixture_table() -> Table {

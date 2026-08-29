@@ -5100,6 +5100,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
+ "jiff",
  "laminar-core",
  "laminardb-pgwire-replication",
  "libc",

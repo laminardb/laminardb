@@ -12,11 +12,7 @@ use arrow_array::RecordBatch;
 use futures_util::StreamExt;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-#[cfg(feature = "iceberg-catalog-rest")]
-use iceberg::CatalogBuilder;
 use iceberg::{Catalog, TableIdent};
-#[cfg(feature = "iceberg-catalog-rest")]
-use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(any(
     feature = "iceberg-storage-s3",
     feature = "iceberg-storage-gcs",
@@ -38,6 +34,22 @@ const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 const COMPAT_SCAN_CONCURRENCY: usize = 4;
 const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CatalogAccess {
+    Read,
+    Write { auto_create: bool },
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CatalogCapabilities {
+    pub(crate) idempotency_key_lifetime: Option<std::time::Duration>,
+}
+
+pub(crate) struct BuiltCatalog {
+    pub(crate) catalog: Arc<dyn Catalog>,
+    pub(crate) capabilities: CatalogCapabilities,
+}
+
 #[cfg(any(
     feature = "iceberg-storage-s3",
     feature = "iceberg-storage-gcs",
@@ -45,6 +57,12 @@ const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     feature = "iceberg-storage-fs"
 ))]
 mod bounded_storage;
+
+#[cfg(feature = "iceberg-catalog-rest")]
+mod rest_catalog;
+
+mod single_dispatch;
+pub(crate) use single_dispatch::SingleDispatchCatalog;
 
 #[cfg(any(
     feature = "iceberg-storage-s3",
@@ -224,15 +242,27 @@ pub async fn build_catalog(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
+    Ok(
+        build_catalog_for_access(config, storage, CatalogAccess::Read)
+            .await?
+            .catalog,
+    )
+}
+
+pub(crate) async fn build_catalog_for_access(
+    config: &IcebergCatalogConfig,
+    storage: &IcebergStorageConfig,
+    access: CatalogAccess,
+) -> Result<BuiltCatalog, ConnectorError> {
     match config.catalog_type {
         IcebergCatalogType::Rest => {
             #[cfg(feature = "iceberg-catalog-rest")]
             {
-                build_enabled_rest_catalog(config, storage).await
+                rest_catalog::build(config, storage, access).await
             }
             #[cfg(not(feature = "iceberg-catalog-rest"))]
             {
-                let _ = storage;
+                let _ = (storage, access);
                 Err(ConnectorError::FeatureUnsupported(
                     "iceberg.catalog.rest: build with the 'iceberg-catalog-rest' feature".into(),
                 ))
@@ -254,43 +284,60 @@ pub async fn build_catalog(
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
-async fn build_enabled_rest_catalog(
+pub(crate) async fn build_publication_catalog(
+    catalog: Arc<dyn Catalog>,
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
-) -> Result<Arc<dyn Catalog>, ConnectorError> {
-    super::iceberg::capabilities::validate_catalog_session(config)?;
-    validate_storage_options(&config.warehouse, storage)?;
-    let storage_factory = storage_factory(&config.warehouse, storage)?;
-    let mut props = rest_properties(config, storage);
-    props.insert("uri".to_string(), config.catalog_uri.clone());
-    props.insert("warehouse".to_string(), config.warehouse.clone());
-    let client = delta_reqwest::Client::builder()
-        .connect_timeout(config.request_timeout)
-        .timeout(config.request_timeout)
-        .build()
-        .map_err(|error| {
-            ConnectorError::ConfigurationError(format!("Iceberg REST HTTP client: {error}"))
-        })?;
-    let catalog = RestCatalogBuilder::default()
-        .with_storage_factory(storage_factory)
-        .with_client(client)
-        .load("laminardb", props)
+    capabilities: &CatalogCapabilities,
+    idempotency_key: uuid::Uuid,
+) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
+    if capabilities.idempotency_key_lifetime.is_none() {
+        return Ok(None);
+    }
+    rest_catalog::build_publication(catalog, config, storage, idempotency_key)
         .await
-        .map_err(|error| {
-            ConnectorError::ConnectionFailed(format!(
-                "Iceberg catalog initialization failed ({})",
-                external_error_summary(&error)
-            ))
-        })?;
+        .map(Some)
+}
 
-    Ok(Arc::new(catalog))
+#[cfg(not(feature = "iceberg-catalog-rest"))]
+pub(crate) async fn build_publication_catalog(
+    _catalog: Arc<dyn Catalog>,
+    _config: &IcebergCatalogConfig,
+    _storage: &IcebergStorageConfig,
+    _capabilities: &CatalogCapabilities,
+    _idempotency_key: uuid::Uuid,
+) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
+    Ok(None)
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
 fn rest_properties(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, ConnectorError> {
+    for key in storage.properties.keys() {
+        let normalized = key.to_ascii_lowercase();
+        if config.properties.contains_key(key)
+            || matches!(
+                normalized.as_str(),
+                "token"
+                    | "credential"
+                    | "oauth2-server-uri"
+                    | "scope"
+                    | "audience"
+                    | "resource"
+                    | "prefix"
+                    | "uri"
+                    | "warehouse"
+                    | "disable-header-redaction"
+            )
+            || normalized.starts_with("header.")
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "storage.property.{key} overlaps Iceberg REST catalog configuration"
+            )));
+        }
+    }
     let mut properties = config.properties.clone();
     properties.extend(storage.properties.clone());
     if let Some(prefix) = &config.prefix {
@@ -309,7 +356,7 @@ fn rest_properties(
             .storage_type
             .or_else(|| infer_storage_type(&config.warehouse)),
     );
-    properties
+    Ok(properties)
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]

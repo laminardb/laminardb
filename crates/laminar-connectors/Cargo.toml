@@ -44,6 +44,7 @@ iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true }
 typetag = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 # Bytes (for cache value types)
@@ -148,7 +149,7 @@ delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Apache Iceberg
 iceberg-core = ["dep:iceberg", "dep:apache-avro", "dep:tokio-stream", "dep:futures-util", "dep:parquet", "dep:arrow-row", "dep:base64"]
-iceberg-catalog-rest = ["iceberg-core", "dep:iceberg-catalog-rest", "dep:delta-reqwest"]
+iceberg-catalog-rest = ["iceberg-core", "dep:iceberg-catalog-rest", "dep:delta-reqwest", "dep:jiff"]
 iceberg-catalog-glue = ["iceberg-core"]
 iceberg-catalog-hms = ["iceberg-core"]
 iceberg-catalog-s3tables = ["iceberg-core"]
