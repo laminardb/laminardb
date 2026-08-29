@@ -93,6 +93,63 @@ fn test_storage_factory_infers_fs_from_file_url() {
 }
 
 #[test]
+#[cfg(feature = "iceberg-storage-gcs")]
+fn test_storage_factory_infers_gcs_from_gs_url() {
+    let f = storage_factory("gs://bucket/warehouse", &storage_config(None)).unwrap();
+    assert!(format!("{f:?}").contains("Gcs"));
+}
+
+#[test]
+#[cfg(feature = "iceberg-storage-azure")]
+fn test_storage_factory_infers_azure_from_abfss_url() {
+    let f = storage_factory(
+        "abfss://container@account.dfs.core.windows.net/warehouse",
+        &storage_config(None),
+    )
+    .unwrap();
+    assert!(format!("{f:?}").contains("Azdls"));
+}
+
+#[cfg(any(
+    not(feature = "iceberg-storage-s3"),
+    not(feature = "iceberg-storage-gcs"),
+    not(feature = "iceberg-storage-azure"),
+    not(feature = "iceberg-storage-fs")
+))]
+#[test]
+fn unavailable_storage_factories_fail_closed() {
+    for (storage_type, warehouse, enabled) in [
+        (
+            "s3",
+            "s3://bucket/warehouse",
+            cfg!(feature = "iceberg-storage-s3"),
+        ),
+        (
+            "gcs",
+            "gs://bucket/warehouse",
+            cfg!(feature = "iceberg-storage-gcs"),
+        ),
+        (
+            "azure",
+            "abfss://container@account/warehouse",
+            cfg!(feature = "iceberg-storage-azure"),
+        ),
+        (
+            "fs",
+            "file:///tmp/warehouse",
+            cfg!(feature = "iceberg-storage-fs"),
+        ),
+    ] {
+        if enabled {
+            continue;
+        }
+        let error = storage_factory(warehouse, &storage_config(Some(storage_type))).unwrap_err();
+        assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert!(error.to_string().contains(storage_type));
+    }
+}
+
+#[test]
 fn test_storage_factory_bare_path_requires_explicit_storage_type() {
     // Trimmed `/` and `./` inference: REST catalogs use logical names
     // and we don't want a silent default to local fs.
@@ -138,6 +195,30 @@ fn storage_scheme_inference_covers_cloud_backends() {
         infer_storage_type("abfss://container@account.dfs.core.windows.net/warehouse"),
         Some(IcebergStorageType::Azure)
     );
+}
+
+#[tokio::test]
+async fn unreleased_catalog_backends_fail_closed_before_io() {
+    for (catalog_type, capability) in [
+        ("glue", "iceberg.catalog.glue"),
+        ("hms", "iceberg.catalog.hms"),
+        ("s3tables", "iceberg.catalog.s3tables"),
+        ("sql", "iceberg.catalog.sql"),
+    ] {
+        let mut raw = ConnectorConfig::new("iceberg");
+        raw.set("catalog.type", catalog_type);
+        raw.set("catalog.uri", "https://catalog.invalid");
+        raw.set("catalog.warehouse", "s3://bucket/warehouse");
+        raw.set("namespace", "test");
+        raw.set("table.name", "events");
+        let catalog = IcebergCatalogConfig::from_config(&raw).unwrap();
+        let result = build_catalog(&catalog, &storage_config(Some("s3"))).await;
+        let Err(error) = result else {
+            panic!("{catalog_type} must remain unavailable until released APIs are sufficient");
+        };
+        assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert!(error.to_string().contains(capability));
+    }
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
