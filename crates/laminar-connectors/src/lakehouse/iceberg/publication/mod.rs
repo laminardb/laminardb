@@ -116,7 +116,7 @@ pub(super) fn unresolved_publication(
             fencing_token: batch.fencing_token,
         },
         exact_batch_fingerprint: batch.exact_fingerprint(),
-        expected_file_set_fingerprint: file_set_fingerprint(&files),
+        expected_file_set_fingerprint: file_set_fingerprint(&files)?,
     })
 }
 
@@ -524,7 +524,7 @@ fn prepare_publication(
     }
     data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
     let binding = binding.unwrap_or_else(|| IcebergTableBindingV1::from_table(table, config));
-    let file_set_fingerprint = data_file_set_fingerprint(&data_files);
+    let file_set_fingerprint = data_file_set_fingerprint(&data_files)?;
     Ok(PreparedPublication {
         binding,
         data_files,
@@ -941,6 +941,7 @@ mod tests {
             first,
             deterministic_idempotency_key(&batch, logical, 0).unwrap()
         );
+        assert_eq!(first.to_string(), "018f0000-0000-734d-8ebb-59f7c2ea7b91");
         assert_eq!(first.get_version_num(), 7);
         let deployment = uuid::Uuid::parse_str(&batch.namespace.deployment_id).unwrap();
         assert_eq!(&first.as_bytes()[..6], &deployment.as_bytes()[..6]);

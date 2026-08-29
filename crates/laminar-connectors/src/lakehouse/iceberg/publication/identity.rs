@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::connector::{CoordinatedCommitBatch, CoordinatedCommitCursor};
 use crate::error::ConnectorError;
 
-use super::super::descriptor::{data_file_fingerprint, IcebergFileFingerprintV1};
+use super::super::descriptor::IcebergFileFingerprintV1;
+use super::super::fingerprint::data_file_fingerprint;
 
 pub(super) const SUMMARY_NAMESPACE: &str = "laminardb.commit.namespace";
 pub(super) const SUMMARY_CHECKPOINT: &str = "laminardb.checkpoint.id";
@@ -52,25 +53,31 @@ pub(super) fn summary_properties(
     ])
 }
 
-pub(super) fn data_file_set_fingerprint(files: &[DataFile]) -> String {
-    let fingerprints = files.iter().map(data_file_fingerprint).collect::<Vec<_>>();
+pub(super) fn data_file_set_fingerprint(files: &[DataFile]) -> Result<String, ConnectorError> {
+    let fingerprints = files
+        .iter()
+        .map(data_file_fingerprint)
+        .collect::<Result<Vec<_>, _>>()?;
     file_set_fingerprint(&fingerprints)
 }
 
-pub(super) fn file_set_fingerprint(files: &[IcebergFileFingerprintV1]) -> String {
+pub(super) fn file_set_fingerprint(
+    files: &[IcebergFileFingerprintV1],
+) -> Result<String, ConnectorError> {
     let mut hash = Sha256::new();
-    hash.update(b"laminardb-iceberg-file-set-v1\0");
+    hash.update(b"laminardb-iceberg-file-set-v2\0");
     let mut files = files.iter().collect::<Vec<_>>();
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    hash.update(canonical_usize_bytes(files.len())?);
     for file in files {
-        hash.update(file.path.len().to_be_bytes());
+        hash.update(canonical_usize_bytes(file.path.len())?);
         hash.update(file.path.as_bytes());
-        hash.update(file.metadata_sha256.len().to_be_bytes());
+        hash.update(canonical_usize_bytes(file.metadata_sha256.len())?);
         hash.update(file.metadata_sha256.as_bytes());
         hash.update(file.records.to_be_bytes());
         hash.update(file.bytes.to_be_bytes());
     }
-    format!("{:x}", hash.finalize())
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 pub(super) fn deterministic_commit_uuid(
@@ -109,7 +116,7 @@ pub(super) fn deterministic_idempotency_key(
     let mut hash = Sha256::new();
     hash.update(b"laminardb-iceberg-rest-idempotency-v1\0");
     hash.update(logical_commit_uuid.as_bytes());
-    hash.update(attempt.to_be_bytes());
+    hash.update(canonical_usize_bytes(attempt)?);
     let digest = hash.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -117,6 +124,12 @@ pub(super) fn deterministic_idempotency_key(
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(uuid::Uuid::from_bytes(bytes))
+}
+
+fn canonical_usize_bytes(value: usize) -> Result<[u8; 8], ConnectorError> {
+    u64::try_from(value)
+        .map(u64::to_be_bytes)
+        .map_err(|_| ConnectorError::Internal("Iceberg fingerprint length exceeds u64".into()))
 }
 
 pub(super) fn hex(bytes: &[u8]) -> String {
@@ -127,4 +140,35 @@ pub(super) fn hex(bytes: &[u8]) -> String {
         let _ = write!(value, "{byte:02x}");
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str, digest: &str) -> IcebergFileFingerprintV1 {
+        IcebergFileFingerprintV1 {
+            path: path.into(),
+            metadata_sha256: digest.into(),
+            records: 7,
+            bytes: 99,
+        }
+    }
+
+    #[test]
+    fn file_set_fingerprint_has_a_locked_order_independent_value() {
+        let first = file("s3://bucket/a.parquet", &"a".repeat(64));
+        let second = file("s3://bucket/b.parquet", &"b".repeat(64));
+        let forward = file_set_fingerprint(&[first.clone(), second.clone()]).unwrap();
+        let reverse = file_set_fingerprint(&[second, first]).unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(
+            forward,
+            "fb60f3c31cc53c829e37a6a2950fc7247c8ee0fbede9322d88e023dbef2eb249"
+        );
+        assert_eq!(
+            file_set_fingerprint(&[]).unwrap(),
+            "cf53e8797fcbbf5822bd0146843bc3fd1e696246dfb9601c7e627bc2bf22c4ee"
+        );
+    }
 }

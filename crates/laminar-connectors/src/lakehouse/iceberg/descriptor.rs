@@ -16,6 +16,7 @@ use crate::lakehouse::iceberg_io::effective_data_location;
 
 use super::epoch_writer::{EpochIdentity, EpochOutput};
 use super::file_finalizer::validate_coordinated_file_name;
+use super::fingerprint::{data_file_fingerprint, hash_count, hash_len_prefixed};
 
 const DESCRIPTOR_VERSION: u8 = 1;
 
@@ -110,7 +111,7 @@ impl IcebergCommitDescriptorV1 {
             .data_files
             .iter()
             .map(data_file_fingerprint)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let record_count = checked_sum(
             output.data_files.iter().map(DataFile::record_count),
             "record count",
@@ -134,7 +135,7 @@ impl IcebergCommitDescriptorV1 {
             record_count,
             file_bytes,
             output.bytes,
-        );
+        )?;
         let descriptor = Self {
             version: DESCRIPTOR_VERSION,
             table: binding,
@@ -283,7 +284,7 @@ impl IcebergCommitDescriptorV1 {
         let observed = data_files
             .iter()
             .map(data_file_fingerprint)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         if observed != self.files {
             return Err(ConnectorError::TransactionError(
                 "Iceberg descriptor data-file fingerprints do not match its envelope".into(),
@@ -309,7 +310,7 @@ impl IcebergCommitDescriptorV1 {
             self.record_count,
             self.file_bytes,
             self.input_bytes,
-        );
+        )?;
         if fingerprint != self.batch_fingerprint {
             return Err(ConnectorError::TransactionError(
                 "Iceberg descriptor participant fingerprint does not match its contents".into(),
@@ -403,7 +404,7 @@ fn canonicalize_data_files_avro(
         canonicalize_avro_value(value)?;
     }
 
-    let marker = descriptor_sync_marker(fingerprints);
+    let marker = descriptor_sync_marker(fingerprints)?;
     let mut encoded = canonical_avro_header(&schema_json, marker)?;
     {
         let mut writer = apache_avro::Writer::builder()
@@ -477,17 +478,20 @@ fn avro_record_key(value: &AvroValue) -> Option<i64> {
     })
 }
 
-fn descriptor_sync_marker(fingerprints: &[IcebergFileFingerprintV1]) -> [u8; 16] {
+fn descriptor_sync_marker(
+    fingerprints: &[IcebergFileFingerprintV1],
+) -> Result<[u8; 16], ConnectorError> {
     let mut hash = Sha256::new();
-    hash.update(b"laminardb-iceberg-descriptor-avro-v1\0");
+    hash.update(b"laminardb-iceberg-descriptor-avro-v2\0");
+    hash_count(&mut hash, fingerprints.len())?;
     for file in fingerprints {
-        hash_len_prefixed(&mut hash, file.path.as_bytes());
-        hash_len_prefixed(&mut hash, file.metadata_sha256.as_bytes());
+        hash_len_prefixed(&mut hash, file.path.as_bytes())?;
+        hash_len_prefixed(&mut hash, file.metadata_sha256.as_bytes())?;
     }
     let digest: [u8; 32] = hash.finalize().into();
     let mut marker = [0; 16];
     marker.copy_from_slice(&digest[..16]);
-    marker
+    Ok(marker)
 }
 
 fn canonical_avro_header(schema_json: &[u8], marker: [u8; 16]) -> Result<Vec<u8>, ConnectorError> {
@@ -539,9 +543,9 @@ fn participant_fingerprint(
     records: u64,
     file_bytes: u64,
     input_bytes: u64,
-) -> String {
+) -> Result<String, ConnectorError> {
     let mut hash = Sha256::new();
-    hash.update(b"laminardb-iceberg-participant-v1\0");
+    hash.update(b"laminardb-iceberg-participant-v2\0");
     for value in [
         table.catalog_implementation.as_str(),
         table.catalog_identity.as_str(),
@@ -553,7 +557,7 @@ fn participant_fingerprint(
         identity.deployment_id.as_str(),
         identity.sink_id.as_str(),
     ] {
-        hash_len_prefixed(&mut hash, value.as_bytes());
+        hash_len_prefixed(&mut hash, value.as_bytes())?;
     }
     hash.update(table.base_snapshot_id.unwrap_or(-1).to_be_bytes());
     hash.update(table.schema_id.to_be_bytes());
@@ -565,71 +569,14 @@ fn participant_fingerprint(
     hash.update(records.to_be_bytes());
     hash.update(file_bytes.to_be_bytes());
     hash.update(input_bytes.to_be_bytes());
+    hash_count(&mut hash, files.len())?;
     for file in files {
-        hash_len_prefixed(&mut hash, file.path.as_bytes());
-        hash_len_prefixed(&mut hash, file.metadata_sha256.as_bytes());
+        hash_len_prefixed(&mut hash, file.path.as_bytes())?;
+        hash_len_prefixed(&mut hash, file.metadata_sha256.as_bytes())?;
         hash.update(file.records.to_be_bytes());
         hash.update(file.bytes.to_be_bytes());
     }
-    format!("{:x}", hash.finalize())
-}
-
-pub(super) fn data_file_fingerprint(file: &DataFile) -> IcebergFileFingerprintV1 {
-    let mut hash = Sha256::new();
-    hash.update(b"laminardb-iceberg-data-file-v1\0");
-    hash_len_prefixed(&mut hash, file.file_path().as_bytes());
-    hash_len_prefixed(&mut hash, file.file_format().to_string().as_bytes());
-    hash.update((file.content_type() as i32).to_be_bytes());
-    hash.update(file.record_count().to_be_bytes());
-    hash.update(file.file_size_in_bytes().to_be_bytes());
-    hash_len_prefixed(&mut hash, format!("{:?}", file.partition()).as_bytes());
-    hash_i32_u64_map(&mut hash, file.column_sizes());
-    hash_i32_u64_map(&mut hash, file.value_counts());
-    hash_i32_u64_map(&mut hash, file.null_value_counts());
-    hash_i32_u64_map(&mut hash, file.nan_value_counts());
-    hash_i32_debug_map(&mut hash, file.lower_bounds());
-    hash_i32_debug_map(&mut hash, file.upper_bounds());
-    hash_len_prefixed(&mut hash, file.key_metadata().unwrap_or_default());
-    for offset in file.split_offsets().unwrap_or_default() {
-        hash.update(offset.to_be_bytes());
-    }
-    for field_id in file.equality_ids().unwrap_or_default() {
-        hash.update(field_id.to_be_bytes());
-    }
-    hash.update(file.first_row_id().unwrap_or(-1).to_be_bytes());
-    hash.update(file.sort_order_id().unwrap_or(-1).to_be_bytes());
-    IcebergFileFingerprintV1 {
-        path: file.file_path().to_string(),
-        metadata_sha256: format!("{:x}", hash.finalize()),
-        records: file.record_count(),
-        bytes: file.file_size_in_bytes(),
-    }
-}
-
-fn hash_i32_u64_map(hash: &mut Sha256, values: &std::collections::HashMap<i32, u64>) {
-    let mut entries = values.iter().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(key, _)| **key);
-    for (key, value) in entries {
-        hash.update(key.to_be_bytes());
-        hash.update(value.to_be_bytes());
-    }
-}
-
-fn hash_i32_debug_map<T: std::fmt::Debug>(
-    hash: &mut Sha256,
-    values: &std::collections::HashMap<i32, T>,
-) {
-    let mut entries = values.iter().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(key, _)| **key);
-    for (key, value) in entries {
-        hash.update(key.to_be_bytes());
-        hash_len_prefixed(hash, format!("{value:?}").as_bytes());
-    }
-}
-
-fn hash_len_prefixed(hash: &mut Sha256, bytes: &[u8]) {
-    hash.update(bytes.len().to_be_bytes());
-    hash.update(bytes);
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn checked_sum(mut values: impl Iterator<Item = u64>, label: &str) -> Result<u64, ConnectorError> {
@@ -704,19 +651,23 @@ mod tests {
             FormatVersion::V2,
         )
         .unwrap();
-        let fingerprints = files.iter().map(data_file_fingerprint).collect::<Vec<_>>();
+        let fingerprints = files
+            .iter()
+            .map(data_file_fingerprint)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         canonicalize_data_files_avro(&generated, &fingerprints).unwrap()
     }
 
     #[test]
     fn file_fingerprint_is_deterministic_and_content_sensitive() {
         assert_eq!(
-            data_file_fingerprint(&data_file("a")),
-            data_file_fingerprint(&data_file("a"))
+            data_file_fingerprint(&data_file("a")).unwrap(),
+            data_file_fingerprint(&data_file("a")).unwrap()
         );
         assert_ne!(
-            data_file_fingerprint(&data_file("a")),
-            data_file_fingerprint(&data_file("b"))
+            data_file_fingerprint(&data_file("a")).unwrap(),
+            data_file_fingerprint(&data_file("b")).unwrap()
         );
     }
 

@@ -130,7 +130,7 @@ pub(super) async fn reconcile_exact_publication(
             "Iceberg snapshot summary matched but its exact added data-file set did not".into(),
         ));
     }
-    if data_file_set_fingerprint(&observed_files) != prepared.file_set_fingerprint {
+    if data_file_set_fingerprint(&observed_files)? != prepared.file_set_fingerprint {
         return Err(ConnectorError::TransactionError(
             "Iceberg snapshot contains data-file metadata different from its descriptor set".into(),
         ));
@@ -169,7 +169,7 @@ async fn verify_cursor_record(
     record: &CursorRecord,
     deadline: tokio::time::Instant,
 ) -> Result<(), ConnectorError> {
-    if record.file_set_fingerprint == file_set_fingerprint(&[]) {
+    if record.file_set_fingerprint == file_set_fingerprint(&[])? {
         return Ok(());
     }
     let commit_uuid = uuid::Uuid::parse_str(&record.commit_uuid).map_err(|_| {
@@ -185,7 +185,7 @@ async fn verify_cursor_record(
         deadline,
     )?;
     let observed = added_data_files_for_snapshot(table, snapshot, deadline).await?;
-    if data_file_set_fingerprint(&observed) != record.file_set_fingerprint {
+    if data_file_set_fingerprint(&observed)? != record.file_set_fingerprint {
         return Err(ConnectorError::TransactionError(
             "Iceberg cursor snapshot does not match its recorded data-file set".into(),
         ));

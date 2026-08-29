@@ -12,6 +12,8 @@ mod fault_injection;
 #[cfg(feature = "iceberg-core")]
 mod file_finalizer;
 #[cfg(feature = "iceberg-core")]
+mod fingerprint;
+#[cfg(feature = "iceberg-core")]
 mod metrics;
 #[cfg(feature = "iceberg-core")]
 mod publication;
