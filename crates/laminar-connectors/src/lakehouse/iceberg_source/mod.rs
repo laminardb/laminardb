@@ -441,9 +441,14 @@ impl SourceConnector for IcebergSource {
                     Some(IcebergSourceCursorV1::from_checkpoint(checkpoint)?)
                 }
             };
-            let catalog =
-                super::iceberg_io::build_catalog(&self.config.catalog, &self.config.storage)
-                    .await?;
+            let catalog = super::iceberg_io::build_catalog_for_access_with_metrics(
+                &self.config.catalog,
+                &self.config.storage,
+                super::iceberg_io::CatalogAccess::Read,
+                Some(self.metrics.credential_refresh_failures.clone()),
+            )
+            .await?
+            .catalog;
             let table = super::iceberg_io::load_table_with_timeout(
                 catalog.as_ref(),
                 &self.config.catalog.namespace,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use iceberg::table::Table;
@@ -9,29 +10,32 @@ use iceberg::{
 };
 use iceberg_catalog_rest::CommitTableRequest;
 
-use crate::lakehouse::iceberg_config::IcebergCatalogAuthType;
+use super::oauth::{OAuthCatalogState, RestAuthentication};
 
 pub(super) struct RestCommitTransport {
     client: delta_reqwest::Client,
-    auth_type: IcebergCatalogAuthType,
+    authentication: RestAuthentication,
     effective_uri: String,
     properties: HashMap<String, String>,
+    request_timeout: Duration,
     idempotency_key: uuid::Uuid,
 }
 
 impl RestCommitTransport {
     pub(super) fn new(
         client: delta_reqwest::Client,
-        auth_type: IcebergCatalogAuthType,
+        authentication: RestAuthentication,
         effective_uri: String,
         properties: HashMap<String, String>,
+        request_timeout: Duration,
         idempotency_key: uuid::Uuid,
     ) -> Self {
         Self {
             client,
-            auth_type,
+            authentication,
             effective_uri,
             properties,
+            request_timeout,
             idempotency_key,
         }
     }
@@ -52,8 +56,14 @@ impl RestCommitTransport {
             .post(self.table_endpoint(&identifier))
             .header("Idempotency-Key", self.idempotency_key.to_string())
             .json(&body);
-        let request = super::apply_request_properties(request, self.auth_type, &self.properties)
-            .map_err(|_| Error::new(ErrorKind::DataInvalid, "invalid REST commit request"))?;
+        let request = super::apply_request_properties(
+            request,
+            &self.authentication,
+            &self.properties,
+            self.request_timeout,
+        )
+        .await
+        .map_err(|_| Error::new(ErrorKind::DataInvalid, "invalid REST commit request"))?;
         let response = request
             .send()
             .await
@@ -126,21 +136,42 @@ fn classify_dispatch_error(error: &delta_reqwest::Error) -> Error {
 }
 
 pub(super) struct RestCatalogFacade {
-    inner: Arc<dyn Catalog>,
+    inner: RestCatalogInner,
     commit: Option<RestCommitTransport>,
+}
+
+enum RestCatalogInner {
+    Static(Arc<dyn Catalog>),
+    OAuth(Arc<OAuthCatalogState>),
+}
+
+impl RestCatalogInner {
+    async fn current(&self) -> iceberg::Result<Arc<dyn Catalog>> {
+        match self {
+            Self::Static(catalog) => Ok(Arc::clone(catalog)),
+            Self::OAuth(state) => state.current().await,
+        }
+    }
 }
 
 impl RestCatalogFacade {
     pub(super) fn read(inner: Arc<dyn Catalog>) -> Self {
         Self {
-            inner,
+            inner: RestCatalogInner::Static(inner),
+            commit: None,
+        }
+    }
+
+    pub(super) fn oauth(state: OAuthCatalogState) -> Self {
+        Self {
+            inner: RestCatalogInner::OAuth(Arc::new(state)),
             commit: None,
         }
     }
 
     pub(super) fn publication(inner: Arc<dyn Catalog>, commit: RestCommitTransport) -> Self {
         Self {
-            inner,
+            inner: RestCatalogInner::Static(inner),
             commit: Some(commit),
         }
     }
@@ -160,7 +191,7 @@ impl Catalog for RestCatalogFacade {
         &self,
         parent: Option<&NamespaceIdent>,
     ) -> iceberg::Result<Vec<NamespaceIdent>> {
-        self.inner.list_namespaces(parent).await
+        self.inner.current().await?.list_namespaces(parent).await
     }
 
     async fn create_namespace(
@@ -168,15 +199,23 @@ impl Catalog for RestCatalogFacade {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<Namespace> {
-        self.inner.create_namespace(namespace, properties).await
+        self.inner
+            .current()
+            .await?
+            .create_namespace(namespace, properties)
+            .await
     }
 
     async fn get_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<Namespace> {
-        self.inner.get_namespace(namespace).await
+        self.inner.current().await?.get_namespace(namespace).await
     }
 
     async fn namespace_exists(&self, namespace: &NamespaceIdent) -> iceberg::Result<bool> {
-        self.inner.namespace_exists(namespace).await
+        self.inner
+            .current()
+            .await?
+            .namespace_exists(namespace)
+            .await
     }
 
     async fn update_namespace(
@@ -184,15 +223,19 @@ impl Catalog for RestCatalogFacade {
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> iceberg::Result<()> {
-        self.inner.update_namespace(namespace, properties).await
+        self.inner
+            .current()
+            .await?
+            .update_namespace(namespace, properties)
+            .await
     }
 
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> iceberg::Result<()> {
-        self.inner.drop_namespace(namespace).await
+        self.inner.current().await?.drop_namespace(namespace).await
     }
 
     async fn list_tables(&self, namespace: &NamespaceIdent) -> iceberg::Result<Vec<TableIdent>> {
-        self.inner.list_tables(namespace).await
+        self.inner.current().await?.list_tables(namespace).await
     }
 
     async fn create_table(
@@ -200,27 +243,35 @@ impl Catalog for RestCatalogFacade {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> iceberg::Result<Table> {
-        self.inner.create_table(namespace, creation).await
+        self.inner
+            .current()
+            .await?
+            .create_table(namespace, creation)
+            .await
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
-        self.inner.load_table(table).await
+        self.inner.current().await?.load_table(table).await
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
-        self.inner.drop_table(table).await
+        self.inner.current().await?.drop_table(table).await
     }
 
     async fn purge_table(&self, table: &TableIdent) -> iceberg::Result<()> {
-        self.inner.purge_table(table).await
+        self.inner.current().await?.purge_table(table).await
     }
 
     async fn table_exists(&self, table: &TableIdent) -> iceberg::Result<bool> {
-        self.inner.table_exists(table).await
+        self.inner.current().await?.table_exists(table).await
     }
 
     async fn rename_table(&self, source: &TableIdent, target: &TableIdent) -> iceberg::Result<()> {
-        self.inner.rename_table(source, target).await
+        self.inner
+            .current()
+            .await?
+            .rename_table(source, target)
+            .await
     }
 
     async fn register_table(
@@ -228,13 +279,18 @@ impl Catalog for RestCatalogFacade {
         table: &TableIdent,
         metadata_location: String,
     ) -> iceberg::Result<Table> {
-        self.inner.register_table(table, metadata_location).await
+        self.inner
+            .current()
+            .await?
+            .register_table(table, metadata_location)
+            .await
     }
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        let inner = self.inner.current().await?;
         match &self.commit {
-            Some(transport) => transport.update_table(commit, self.inner.as_ref()).await,
-            None => self.inner.update_table(commit).await,
+            Some(transport) => transport.update_table(commit, inner.as_ref()).await,
+            None => inner.update_table(commit).await,
         }
     }
 }

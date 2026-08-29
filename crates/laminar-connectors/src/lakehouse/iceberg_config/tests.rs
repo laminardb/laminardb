@@ -379,6 +379,42 @@ fn catalog_auth_is_inferred_without_permitting_mixed_credentials() {
     assert!(IcebergCatalogConfig::from_config(&config).is_err());
 }
 
+#[test]
+fn catalog_auth_rejects_empty_secret_material() {
+    for (auth_type, property) in [("bearer", "token"), ("oauth2", "credential")] {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "https://catalog.test");
+        config.set("catalog.warehouse", "s3://bucket/warehouse");
+        config.set("namespace", "prod");
+        config.set("table.name", "events");
+        config.set("catalog.auth.type", auth_type);
+        config.set(format!("catalog.property.{property}"), "");
+        assert!(IcebergCatalogConfig::from_config(&config).is_err());
+    }
+}
+
+#[test]
+fn oauth_typed_client_configuration_is_preserved() {
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.uri", "https://catalog.test");
+    config.set("catalog.warehouse", "s3://bucket/warehouse");
+    config.set("namespace", "prod");
+    config.set("table.name", "events");
+    config.set("catalog.auth.type", "oauth2");
+    config.set("catalog.oauth2.server_uri", "https://identity.test/token");
+    config.set("catalog.oauth2.client_id", "laminar-client");
+    config.set("catalog.oauth2.scope", "catalog:read catalog:write");
+    config.set("catalog.property.credential", "resolved-client-secret");
+
+    let parsed = IcebergCatalogConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.auth_type, IcebergCatalogAuthType::OAuth2);
+    assert_eq!(parsed.oauth2_client_id.as_deref(), Some("laminar-client"));
+    assert_eq!(
+        parsed.oauth2_server_uri.as_deref(),
+        Some("https://identity.test/token")
+    );
+}
+
 // ── Schema validation tests ──
 
 use arrow_schema::{DataType, Field, Schema};

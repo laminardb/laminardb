@@ -21,6 +21,7 @@ pub(super) struct IcebergSourceMetrics {
     pub(super) read_rows: IntCounter,
     pub(super) read_bytes: IntCounter,
     pub(super) read_storage_bytes: IntCounter,
+    pub(super) credential_refresh_failures: IntCounter,
 }
 
 impl IcebergSourceMetrics {
@@ -111,6 +112,10 @@ impl IcebergSourceMetrics {
             read_storage_bytes: handle.counter(
                 "iceberg_source_read_storage_bytes_total",
                 "Object bytes read from Iceberg data and delete files by successful scans",
+            ),
+            credential_refresh_failures: handle.counter(
+                "iceberg_source_credential_refresh_failures_total",
+                "Failed proactive Iceberg catalog credential refreshes",
             ),
         }
     }

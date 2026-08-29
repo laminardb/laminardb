@@ -45,9 +45,16 @@ pub(crate) struct CatalogCapabilities {
     pub(crate) idempotency_key_lifetime: Option<std::time::Duration>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct CatalogSession {
+    #[cfg(feature = "iceberg-catalog-rest")]
+    rest_authentication: Option<rest_catalog::RestAuthentication>,
+}
+
 pub(crate) struct BuiltCatalog {
     pub(crate) catalog: Arc<dyn Catalog>,
     pub(crate) capabilities: CatalogCapabilities,
+    pub(crate) session: CatalogSession,
 }
 
 #[cfg(any(
@@ -254,15 +261,24 @@ pub(crate) async fn build_catalog_for_access(
     storage: &IcebergStorageConfig,
     access: CatalogAccess,
 ) -> Result<BuiltCatalog, ConnectorError> {
+    build_catalog_for_access_with_metrics(config, storage, access, None).await
+}
+
+pub(crate) async fn build_catalog_for_access_with_metrics(
+    config: &IcebergCatalogConfig,
+    storage: &IcebergStorageConfig,
+    access: CatalogAccess,
+    credential_refresh_failures: Option<prometheus::IntCounter>,
+) -> Result<BuiltCatalog, ConnectorError> {
     match config.catalog_type {
         IcebergCatalogType::Rest => {
             #[cfg(feature = "iceberg-catalog-rest")]
             {
-                rest_catalog::build(config, storage, access).await
+                rest_catalog::build(config, storage, access, credential_refresh_failures).await
             }
             #[cfg(not(feature = "iceberg-catalog-rest"))]
             {
-                let _ = (storage, access);
+                let _ = (storage, access, credential_refresh_failures);
                 Err(ConnectorError::FeatureUnsupported(
                     "iceberg.catalog.rest: build with the 'iceberg-catalog-rest' feature".into(),
                 ))
@@ -289,12 +305,13 @@ pub(crate) async fn build_publication_catalog(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
     capabilities: &CatalogCapabilities,
+    session: &CatalogSession,
     idempotency_key: uuid::Uuid,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
     if capabilities.idempotency_key_lifetime.is_none() {
         return Ok(None);
     }
-    rest_catalog::build_publication(catalog, config, storage, idempotency_key)
+    rest_catalog::build_publication(catalog, config, storage, session, idempotency_key)
         .await
         .map(Some)
 }
@@ -305,6 +322,7 @@ pub(crate) async fn build_publication_catalog(
     _config: &IcebergCatalogConfig,
     _storage: &IcebergStorageConfig,
     _capabilities: &CatalogCapabilities,
+    _session: &CatalogSession,
     _idempotency_key: uuid::Uuid,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
     Ok(None)

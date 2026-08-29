@@ -21,7 +21,7 @@ use crate::lakehouse::iceberg_config::{
 };
 use crate::lakehouse::iceberg_io::{
     build_publication_catalog, external_error_summary, validate_loaded_table_locations,
-    CatalogCapabilities, SingleDispatchCatalog,
+    CatalogCapabilities, CatalogSession, SingleDispatchCatalog,
 };
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
@@ -130,6 +130,7 @@ struct PreparedPublication {
 pub(super) async fn publish_coordinated(
     catalog: &Arc<dyn Catalog>,
     catalog_capabilities: &CatalogCapabilities,
+    catalog_session: &CatalogSession,
     config: &IcebergSinkConfig,
     batch: &CoordinatedCommitBatch,
     context: CoordinatedCommitContext,
@@ -165,6 +166,7 @@ pub(super) async fn publish_coordinated(
     let result = publish_with_retries(
         catalog,
         catalog_capabilities,
+        catalog_session,
         config,
         batch,
         context,
@@ -243,6 +245,7 @@ fn validate_publication_cursor(
 async fn publish_with_retries(
     catalog: &Arc<dyn Catalog>,
     catalog_capabilities: &CatalogCapabilities,
+    catalog_session: &CatalogSession,
     config: &IcebergSinkConfig,
     batch: &CoordinatedCommitBatch,
     context: CoordinatedCommitContext,
@@ -274,6 +277,7 @@ async fn publish_with_retries(
         let attempt_catalog = publication_catalog_for_attempt(
             catalog,
             catalog_capabilities,
+            catalog_session,
             config,
             batch,
             identity.commit_uuid,
@@ -418,6 +422,7 @@ async fn refresh_after_conflict(
 async fn publication_catalog_for_attempt(
     catalog: &Arc<dyn Catalog>,
     capabilities: &CatalogCapabilities,
+    session: &CatalogSession,
     config: &IcebergSinkConfig,
     batch: &CoordinatedCommitBatch,
     logical_commit_uuid: uuid::Uuid,
@@ -433,6 +438,7 @@ async fn publication_catalog_for_attempt(
         &config.catalog,
         &config.storage,
         capabilities,
+        session,
         idempotency_key,
     )
     .await
@@ -959,6 +965,7 @@ mod tests {
             publish_coordinated(
                 &fixture.catalog,
                 &NO_CATALOG_CAPABILITIES,
+                &CatalogSession::default(),
                 &fixture.config,
                 &batch,
                 CoordinatedCommitContext::new(
@@ -1021,6 +1028,7 @@ mod tests {
                 publish_coordinated(
                     &fixture.catalog,
                     &NO_CATALOG_CAPABILITIES,
+                    &CatalogSession::default(),
                     &fixture.config,
                     &batch,
                     CoordinatedCommitContext::new(
@@ -1058,6 +1066,7 @@ mod tests {
         publish_coordinated(
             &fixture.catalog,
             &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
             &fixture.config,
             &batch,
             CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
@@ -1121,6 +1130,7 @@ mod tests {
         publish_coordinated(
             &fixture.catalog,
             &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
             &fixture.config,
             &batch,
             CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
@@ -1161,6 +1171,7 @@ mod tests {
         let error = publish_coordinated(
             &first.catalog,
             &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
             &first.config,
             &batch,
             CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
@@ -1216,6 +1227,7 @@ mod tests {
         publish_coordinated(
             &fixture.catalog,
             &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
             &fixture.config,
             &batch,
             CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),

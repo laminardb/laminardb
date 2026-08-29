@@ -9,9 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::error::ConnectorError;
-use crate::lakehouse::iceberg_config::{
-    IcebergCatalogAuthType, IcebergCatalogConfig, IcebergStorageConfig,
-};
+use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
 
 use super::{
     rest_properties, storage_factory, validate_storage_options, BuiltCatalog, CatalogAccess,
@@ -20,6 +18,9 @@ use super::{
 
 mod facade;
 use facade::{RestCatalogFacade, RestCommitTransport};
+mod oauth;
+pub(super) use oauth::RestAuthentication;
+use oauth::{OAuthCatalogState, RestCatalogTemplate};
 
 const MAX_CONFIG_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CONFIG_ENDPOINTS: usize = 512;
@@ -53,6 +54,7 @@ pub(super) async fn build(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
     access: CatalogAccess,
+    credential_refresh_failures: Option<prometheus::IntCounter>,
 ) -> Result<BuiltCatalog, ConnectorError> {
     super::super::iceberg::capabilities::validate_catalog_session(config)?;
     validate_storage_options(&config.warehouse, storage)?;
@@ -60,11 +62,29 @@ pub(super) async fn build(
     let properties = rest_properties(config, storage)?;
     validate_rest_properties(&properties)?;
     let client = http_client(config)?;
-    let discovered = discover(config, &client, &properties, access).await?;
-    let catalog = build_inner(config, factory, client, properties).await?;
+    let authentication = RestAuthentication::initialize(
+        config,
+        client.clone(),
+        &properties,
+        credential_refresh_failures,
+    )
+    .await?;
+    let discovered = discover(config, &client, &properties, access, &authentication).await?;
+    let catalog = match authentication.oauth_session() {
+        Some(session) => {
+            let template = RestCatalogTemplate::new(config, factory, client, properties);
+            Arc::new(RestCatalogFacade::oauth(
+                OAuthCatalogState::new(session, template).await?,
+            )) as Arc<dyn Catalog>
+        }
+        None => build_inner(config, factory, client, properties).await?,
+    };
     Ok(BuiltCatalog {
         catalog,
         capabilities: discovered.capabilities,
+        session: super::CatalogSession {
+            rest_authentication: Some(authentication),
+        },
     })
 }
 
@@ -72,6 +92,7 @@ pub(super) async fn build_publication(
     catalog: Arc<dyn Catalog>,
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
+    session: &super::CatalogSession,
     idempotency_key: uuid::Uuid,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
     if idempotency_key.get_version_num() != 7 {
@@ -84,11 +105,26 @@ pub(super) async fn build_publication(
     let properties = rest_properties(config, storage)?;
     validate_rest_properties(&properties)?;
     let client = http_client(config)?;
+    let authentication =
+        session
+            .rest_authentication
+            .clone()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg REST catalog session".into(),
+                actual: "REST authentication session is absent".into(),
+            })?;
+    if !authentication.matches(config.auth_type) {
+        return Err(ConnectorError::InvalidState {
+            expected: "Iceberg REST authentication bound during open".into(),
+            actual: "publication authentication mode changed".into(),
+        });
+    }
     let discovered = discover(
         config,
         &client,
         &properties,
         CatalogAccess::Write { auto_create: false },
+        &authentication,
     )
     .await?;
     if discovered.capabilities.idempotency_key_lifetime.is_none() {
@@ -101,9 +137,10 @@ pub(super) async fn build_publication(
         catalog,
         RestCommitTransport::new(
             client,
-            config.auth_type,
+            authentication,
             discovered.effective_uri,
             discovered.effective_properties,
+            config.request_timeout,
             idempotency_key,
         ),
     )))
@@ -148,12 +185,14 @@ async fn discover(
     client: &delta_reqwest::Client,
     properties: &HashMap<String, String>,
     access: CatalogAccess,
+    authentication: &RestAuthentication,
 ) -> Result<RestDiscovery, ConnectorError> {
     let endpoint = format!("{}/v1/config", config.catalog_uri.trim_end_matches('/'));
     let mut request = client
         .get(endpoint)
         .query(&[("warehouse", config.warehouse.as_str())]);
-    request = apply_request_properties(request, config.auth_type, properties)?;
+    request = apply_request_properties(request, authentication, properties, config.request_timeout)
+        .await?;
     let response = request.send().await.map_err(|_| {
         ConnectorError::ConnectionFailed(
             "Iceberg REST /v1/config request failed before catalog initialization".into(),
@@ -179,11 +218,19 @@ async fn discover(
         .get("uri")
         .cloned()
         .unwrap_or_else(|| config.catalog_uri.clone());
+    if crate::security::value_contains_uri_secret(&effective_uri, false) {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.uri: server override embeds credential material".into(),
+        ));
+    }
     let mut effective_properties = response.defaults;
     effective_properties.extend(properties.clone());
     effective_properties.extend(response.overrides);
     effective_properties.remove("uri");
-    validate_request_properties(config.auth_type, &effective_properties)?;
+    validate_request_properties(&effective_properties)?;
+    authentication.update_from_discovery(&effective_uri, &effective_properties)?;
+    effective_properties.remove("credential");
+    effective_properties.remove("token");
     Ok(RestDiscovery {
         capabilities: CatalogCapabilities {
             idempotency_key_lifetime,
@@ -193,28 +240,20 @@ async fn discover(
     })
 }
 
-fn apply_request_properties(
+async fn apply_request_properties(
     mut request: delta_reqwest::RequestBuilder,
-    auth_type: IcebergCatalogAuthType,
+    authentication: &RestAuthentication,
     properties: &HashMap<String, String>,
+    required_validity: Duration,
 ) -> Result<delta_reqwest::RequestBuilder, ConnectorError> {
     for (name, value) in configured_headers(properties)? {
         request = request.header(name, value);
     }
-    if auth_type == IcebergCatalogAuthType::Bearer {
-        request = request.bearer_auth(bearer_token(properties)?);
-    }
-    Ok(request)
+    authentication.apply(request, required_validity).await
 }
 
-fn validate_request_properties(
-    auth_type: IcebergCatalogAuthType,
-    properties: &HashMap<String, String>,
-) -> Result<(), ConnectorError> {
+fn validate_request_properties(properties: &HashMap<String, String>) -> Result<(), ConnectorError> {
     let _ = configured_headers(properties)?;
-    if auth_type == IcebergCatalogAuthType::Bearer {
-        let _ = bearer_token(properties)?;
-    }
     Ok(())
 }
 
@@ -241,7 +280,7 @@ fn configured_headers(
     Ok(headers)
 }
 
-fn bearer_token(properties: &HashMap<String, String>) -> Result<&str, ConnectorError> {
+pub(super) fn bearer_token(properties: &HashMap<String, String>) -> Result<&str, ConnectorError> {
     properties.get("token").map(String::as_str).ok_or_else(|| {
         ConnectorError::ConfigurationError(
             "catalog.auth.type=bearer requires a resolved catalog.property.token".into(),
@@ -324,6 +363,12 @@ fn validate_server_properties(properties: &HashMap<String, String>) -> Result<()
         if normalized == "header.authorization" {
             return Err(ConnectorError::FeatureUnsupported(
                 "iceberg.catalog.rest.authentication: server configuration supplies an Authorization header"
+                    .into(),
+            ));
+        }
+        if matches!(normalized.as_str(), "credential" | "token") {
+            return Err(ConnectorError::FeatureUnsupported(
+                "iceberg.catalog.rest.authentication: server configuration supplies catalog credentials"
                     .into(),
             ));
         }
@@ -465,6 +510,20 @@ mod tests {
         IcebergCatalogConfig::from_config(&config).unwrap()
     }
 
+    fn oauth_catalog_config(uri: &str) -> IcebergCatalogConfig {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", uri);
+        config.set("catalog.warehouse", "warehouse");
+        config.set("namespace", "test");
+        config.set("table.name", "events");
+        config.set("catalog.auth.type", "oauth2");
+        config.set("catalog.oauth2.server_uri", format!("{uri}/tokens"));
+        config.set("catalog.oauth2.client_id", "laminar-client");
+        config.set("catalog.property.credential", "catalog-client-secret");
+        config.set("catalog.request_timeout", "1s");
+        IcebergCatalogConfig::from_config(&config).unwrap()
+    }
+
     #[test]
     fn parses_fixed_iso_idempotency_lifetimes() {
         assert_eq!(
@@ -493,6 +552,16 @@ mod tests {
         assert!(error.to_string().contains(COMMIT_TABLE_ENDPOINT));
     }
 
+    #[test]
+    fn server_configuration_cannot_replace_catalog_credentials() {
+        for property in ["token", "credential", "header.Authorization"] {
+            let properties = HashMap::from([(property.into(), "server-secret".into())]);
+            let error = validate_server_properties(&properties).unwrap_err();
+            assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+            assert!(!error.to_string().contains("server-secret"));
+        }
+    }
+
     #[tokio::test]
     async fn discovery_authenticates_and_reads_capabilities() {
         let server = MockServer::start().await;
@@ -510,15 +579,22 @@ mod tests {
             .mount(&server)
             .await;
         let config = catalog_config(&server.uri());
+        let client = http_client(&config).unwrap();
+        let properties = rest_properties(
+            &config,
+            &IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap(),
+        )
+        .unwrap();
+        let authentication =
+            RestAuthentication::initialize(&config, client.clone(), &properties, None)
+                .await
+                .unwrap();
         let discovered = discover(
             &config,
-            &http_client(&config).unwrap(),
-            &rest_properties(
-                &config,
-                &IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap(),
-            )
-            .unwrap(),
+            &client,
+            &properties,
             CatalogAccess::Read,
+            &authentication,
         )
         .await
         .unwrap();
@@ -557,11 +633,16 @@ mod tests {
         let storage = IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap();
         let properties = rest_properties(&config, &storage).unwrap();
         let client = http_client(&config).unwrap();
+        let authentication =
+            RestAuthentication::initialize(&config, client.clone(), &properties, None)
+                .await
+                .unwrap();
         let discovered = discover(
             &config,
             &client,
             &properties,
             CatalogAccess::Write { auto_create: false },
+            &authentication,
         )
         .await
         .unwrap();
@@ -570,9 +651,10 @@ mod tests {
             fixture.catalog,
             RestCommitTransport::new(
                 client,
-                config.auth_type,
+                authentication,
                 discovered.effective_uri,
                 discovered.effective_properties,
+                config.request_timeout,
                 idempotency_key,
             ),
         );
@@ -593,6 +675,84 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(config_requests.len(), 1);
         assert!(!config_requests[0].headers.contains_key("idempotency-key"));
+    }
+
+    #[tokio::test]
+    async fn oauth_rejection_is_not_retried_after_commit_dispatch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "short-lived-catalog-token",
+                "token_type": "Bearer",
+                "expires_in": 60
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(header("authorization", "Bearer short-lived-catalog-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {},
+                "overrides": {},
+                "idempotency-key-lifetime": "PT30M",
+                "endpoints": [LOAD_TABLE_ENDPOINT, COMMIT_TABLE_ENDPOINT]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let idempotency_key = uuid::Uuid::now_v7();
+        Mock::given(method("POST"))
+            .and(path("/v1/namespaces/test/tables/events"))
+            .and(header("authorization", "Bearer short-lived-catalog-token"))
+            .and(header("idempotency-key", idempotency_key.to_string()))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = oauth_catalog_config(&server.uri());
+        let storage = IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap();
+        let properties = rest_properties(&config, &storage).unwrap();
+        let client = http_client(&config).unwrap();
+        let authentication =
+            RestAuthentication::initialize(&config, client.clone(), &properties, None)
+                .await
+                .unwrap();
+        let discovered = discover(
+            &config,
+            &client,
+            &properties,
+            CatalogAccess::Write { auto_create: false },
+            &authentication,
+        )
+        .await
+        .unwrap();
+        let fixture = super::super::super::iceberg::test_support::create_test_table(false).await;
+        let catalog = RestCatalogFacade::publication(
+            fixture.catalog,
+            RestCommitTransport::new(
+                client,
+                authentication,
+                discovered.effective_uri,
+                discovered.effective_properties,
+                config.request_timeout,
+                idempotency_key,
+            ),
+        );
+        let transaction = Transaction::new(&fixture.table);
+        let transaction = transaction
+            .update_table_properties()
+            .set("test".into(), "value".into())
+            .apply(transaction)
+            .unwrap();
+        let single_dispatch = super::super::SingleDispatchCatalog::new(&catalog, &fixture.table);
+        let error = transaction.commit(&single_dispatch).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        let error = error.to_string();
+        assert!(!error.contains("short-lived-catalog-token"));
+        assert!(!error.contains("catalog-client-secret"));
     }
 
     #[tokio::test]

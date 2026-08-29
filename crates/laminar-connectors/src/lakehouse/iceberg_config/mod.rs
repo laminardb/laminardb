@@ -177,9 +177,11 @@ impl IcebergCatalogConfig {
             None => IcebergCatalogAuthType::None,
         };
         match auth_type {
-            IcebergCatalogAuthType::Bearer if !properties.contains_key("token") => {
+            IcebergCatalogAuthType::Bearer
+                if properties.get("token").is_none_or(String::is_empty) =>
+            {
                 return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=bearer requires catalog.property.token".into(),
+                    "catalog.auth.type=bearer requires a non-empty catalog.property.token".into(),
                 ));
             }
             IcebergCatalogAuthType::Bearer if properties.contains_key("credential") => {
@@ -188,9 +190,11 @@ impl IcebergCatalogConfig {
                         .into(),
                 ));
             }
-            IcebergCatalogAuthType::OAuth2 if !properties.contains_key("credential") => {
+            IcebergCatalogAuthType::OAuth2
+                if properties.get("credential").is_none_or(String::is_empty) =>
+            {
                 return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=oauth2 requires a resolved catalog.property.credential"
+                    "catalog.auth.type=oauth2 requires a non-empty resolved catalog.property.credential"
                         .into(),
                 ));
             }

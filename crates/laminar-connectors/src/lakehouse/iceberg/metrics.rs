@@ -19,6 +19,7 @@ pub(super) struct IcebergMetrics {
     pub(super) commit_conflicts: IntCounter,
     pub(super) commit_retries: IntCounter,
     pub(super) unknown_outcomes: IntCounter,
+    pub(super) credential_refresh_failures: IntCounter,
     pub(super) committed_checkpoint: IntGauge,
     pub(super) last_successful_commit_timestamp: IntGauge,
 }
@@ -93,6 +94,10 @@ impl IcebergMetrics {
             unknown_outcomes: handle.counter(
                 "iceberg_sink_unknown_outcomes_total",
                 "Iceberg publications with an initially unknown outcome",
+            ),
+            credential_refresh_failures: handle.counter(
+                "iceberg_sink_credential_refresh_failures_total",
+                "Failed proactive Iceberg catalog credential refreshes",
             ),
             committed_checkpoint: handle.gauge(
                 "iceberg_sink_committed_checkpoint",

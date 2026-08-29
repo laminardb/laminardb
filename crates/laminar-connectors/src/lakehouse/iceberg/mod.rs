@@ -67,6 +67,8 @@ pub struct IcebergSink {
     #[cfg(feature = "iceberg-core")]
     catalog_capabilities: super::iceberg_io::CatalogCapabilities,
     #[cfg(feature = "iceberg-core")]
+    catalog_session: super::iceberg_io::CatalogSession,
+    #[cfg(feature = "iceberg-core")]
     table: Option<iceberg::table::Table>,
     #[cfg(feature = "iceberg-core")]
     iceberg_arrow_schema: Option<SchemaRef>,
@@ -101,6 +103,8 @@ impl IcebergSink {
             catalog: None,
             #[cfg(feature = "iceberg-core")]
             catalog_capabilities: super::iceberg_io::CatalogCapabilities::default(),
+            #[cfg(feature = "iceberg-core")]
+            catalog_session: super::iceberg_io::CatalogSession::default(),
             #[cfg(feature = "iceberg-core")]
             table: None,
             #[cfg(feature = "iceberg-core")]
@@ -303,12 +307,13 @@ impl SinkConnector for IcebergSink {
 
         #[cfg(feature = "iceberg-core")]
         {
-            let built = super::iceberg_io::build_catalog_for_access(
+            let built = super::iceberg_io::build_catalog_for_access_with_metrics(
                 &self.config.catalog,
                 &self.config.storage,
                 super::iceberg_io::CatalogAccess::Write {
                     auto_create: self.config.auto_create,
                 },
+                Some(self.metrics.credential_refresh_failures.clone()),
             )
             .await?;
             let catalog = built.catalog;
@@ -360,6 +365,7 @@ impl SinkConnector for IcebergSink {
             self.schema = Some(input_schema);
             self.iceberg_arrow_schema = Some(table_schema);
             self.catalog_capabilities = built.capabilities;
+            self.catalog_session = built.session;
             self.catalog = Some(catalog);
             self.table = Some(table);
             self.state = ConnectorState::Running;
@@ -542,6 +548,7 @@ impl SinkConnector for IcebergSink {
             }
             self.catalog = None;
             self.catalog_capabilities = super::iceberg_io::CatalogCapabilities::default();
+            self.catalog_session = super::iceberg_io::CatalogSession::default();
             self.table = None;
             self.iceberg_arrow_schema = None;
             self.alignment_plan = None;
@@ -591,6 +598,7 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
         let result = publication::publish_coordinated(
             catalog,
             &self.catalog_capabilities,
+            &self.catalog_session,
             &self.config,
             &batch,
             context,

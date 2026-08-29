@@ -87,17 +87,11 @@ pub(crate) fn validate_catalog_session(
     if catalog.catalog_type != IcebergCatalogType::Rest {
         return Ok(());
     }
-    if catalog.auth_type == IcebergCatalogAuthType::OAuth2 {
-        return Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.rest.oauth2: iceberg-rust 0.10.1 cannot refresh expiring OAuth2 tokens"
-                .into(),
-        ));
-    }
     if catalog.auth_type == IcebergCatalogAuthType::Bearer
-        && !catalog.properties.contains_key("token")
+        && catalog.properties.get("token").is_none_or(String::is_empty)
     {
         return Err(ConnectorError::ConfigurationError(
-            "catalog.auth.type=bearer requires a resolved catalog.property.token".into(),
+            "catalog.auth.type=bearer requires a non-empty resolved catalog.property.token".into(),
         ));
     }
     if catalog.access_delegation {
@@ -147,31 +141,19 @@ mod tests {
     }
 
     #[test]
-    fn refresh_dependent_rest_sessions_fail_before_catalog_io() {
-        for (key, value, property) in [
-            (
-                "catalog.auth.type",
-                "oauth2",
-                Some(("catalog.property.credential", "client:secret")),
-            ),
-            ("catalog.access_delegation", "true", None),
-        ] {
-            let mut config = connector_config();
-            config.set(key, value);
-            if let Some((property_key, property_value)) = property {
-                config.set(property_key, property_value);
-            }
-            let sink = IcebergSinkConfig::from_config(&config).unwrap();
-            let source = IcebergSourceConfig::from_config(&config).unwrap();
-            assert!(matches!(
-                validate_sink(&sink),
-                Err(ConnectorError::FeatureUnsupported(_))
-            ));
-            assert!(matches!(
-                validate_source(&source),
-                Err(ConnectorError::FeatureUnsupported(_))
-            ));
-        }
+    fn access_delegation_fails_before_catalog_io() {
+        let mut config = connector_config();
+        config.set("catalog.access_delegation", "true");
+        let sink = IcebergSinkConfig::from_config(&config).unwrap();
+        let source = IcebergSourceConfig::from_config(&config).unwrap();
+        assert!(matches!(
+            validate_sink(&sink),
+            Err(ConnectorError::FeatureUnsupported(_))
+        ));
+        assert!(matches!(
+            validate_source(&source),
+            Err(ConnectorError::FeatureUnsupported(_))
+        ));
     }
 
     #[test]

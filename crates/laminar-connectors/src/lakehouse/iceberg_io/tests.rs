@@ -142,7 +142,7 @@ fn storage_scheme_inference_covers_cloud_backends() {
 
 #[cfg(feature = "iceberg-catalog-rest")]
 #[test]
-fn rest_auth_fails_closed_when_refresh_or_token_is_unavailable() {
+fn oauth_is_admitted_but_access_delegation_remains_fail_closed() {
     let oauth = catalog_config(|config| {
         config.set("catalog.auth.type", "oauth2");
         config.set("catalog.property.credential", "client:secret");
@@ -150,12 +150,11 @@ fn rest_auth_fails_closed_when_refresh_or_token_is_unavailable() {
     let delegated = catalog_config(|config| {
         config.set("catalog.access_delegation", "true");
     });
-    for config in [&oauth, &delegated] {
-        assert!(matches!(
-            super::super::iceberg::capabilities::validate_catalog_session(config).unwrap_err(),
-            ConnectorError::FeatureUnsupported(_)
-        ));
-    }
+    super::super::iceberg::capabilities::validate_catalog_session(&oauth).unwrap();
+    assert!(matches!(
+        super::super::iceberg::capabilities::validate_catalog_session(&delegated).unwrap_err(),
+        ConnectorError::FeatureUnsupported(_)
+    ));
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
