@@ -361,7 +361,7 @@ fn prepare_publication(
     batch: &CoordinatedCommitBatch,
     table: &iceberg::table::Table,
 ) -> Result<PreparedPublication, ConnectorError> {
-    let mut binding = None;
+    let mut binding: Option<IcebergTableBindingV1> = None;
     let mut data_files = Vec::new();
     let mut expected_paths = HashSet::new();
     let descriptor_limit = config
@@ -398,9 +398,9 @@ fn prepare_publication(
             ));
         }
         match &binding {
-            Some(expected) if expected != &descriptor.table => {
+            Some(expected) if !expected.has_same_append_target(&descriptor.table) => {
                 return Err(ConnectorError::TransactionError(
-                    "Iceberg descriptors bind different tables, refs, schemas, specs, sort orders, or base metadata"
+                    "Iceberg descriptors bind different tables, refs, schemas, specs, or sort orders"
                         .into(),
                 ));
             }
@@ -1033,5 +1033,58 @@ mod tests {
         assert!(error.to_string().contains("bind different tables"));
         let table = first.catalog.load_table(&table_ident()).await.unwrap();
         assert_eq!(table.metadata().snapshots().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn participants_loaded_across_compatible_append_metadata_are_accepted() {
+        let fixture = create_test_table(false).await;
+        let first_payload =
+            descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+
+        let outside_identity = EpochIdentity {
+            deployment_id: "018f0000-0000-7000-8000-000000000099".into(),
+            sink_id: "outside-writer".into(),
+            participant_id: 9,
+            epoch: 1,
+        };
+        let mut outside = IcebergEpochWriter::new(
+            &fixture.table,
+            &fixture.config,
+            &outside_identity,
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        outside
+            .write(record_batch(&fixture.table, &[(10, Some("outside"))]))
+            .await
+            .unwrap();
+        let refreshed = crate::lakehouse::iceberg_io::commit_data_files_append(
+            &fixture.table,
+            fixture.catalog.as_ref(),
+            outside.close().await.unwrap().data_files,
+        )
+        .await
+        .unwrap();
+        let second_payload = descriptor(&refreshed, &fixture.config, 2, 1, &[(2, Some("b"))]).await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(first_payload)), (2, Some(second_payload))],
+        );
+
+        publish_coordinated(
+            &fixture.catalog,
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .unwrap();
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 2);
     }
 }

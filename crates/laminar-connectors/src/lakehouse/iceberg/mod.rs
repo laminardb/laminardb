@@ -9,6 +9,7 @@ mod descriptor;
 mod epoch_writer;
 #[cfg(all(test, feature = "iceberg-core"))]
 mod fault_injection;
+mod file_finalizer;
 #[cfg(feature = "iceberg-core")]
 mod metrics;
 #[cfg(feature = "iceberg-core")]
@@ -264,7 +265,7 @@ impl SinkConnector for IcebergSink {
         } else {
             SinkConsistency::DurableAtLeastOnce
         };
-        Ok(SinkContract::new(
+        let contract = SinkContract::new(
             consistency,
             if shared_warehouse {
                 SinkTopology::MultiWriter
@@ -272,7 +273,16 @@ impl SinkConnector for IcebergSink {
                 SinkTopology::Singleton
             },
             SinkInputMode::AppendOnly,
-        ))
+        );
+        Ok(
+            if consistency == SinkConsistency::CheckpointCommittable
+                && capabilities::cluster_exact_append_certified(&config)
+            {
+                contract.with_cluster_exact_delivery_certification()
+            } else {
+                contract
+            },
+        )
     }
 
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {

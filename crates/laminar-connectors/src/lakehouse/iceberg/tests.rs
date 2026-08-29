@@ -49,7 +49,35 @@ fn exactly_once_append_exposes_checkpoint_committer() {
     let contract = sink.contract(&connector).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
     assert!(sink.as_coordinated_committer().is_some());
-    assert!(!contract.is_cluster_exact_delivery_certified());
+    assert_eq!(
+        contract.is_cluster_exact_delivery_certified(),
+        cfg!(all(
+            feature = "iceberg-catalog-rest",
+            feature = "iceberg-storage-s3"
+        ))
+    );
+}
+
+#[test]
+fn cluster_exact_contract_fails_closed_outside_rest_s3() {
+    for (key, value) in [
+        ("catalog.type", "glue"),
+        ("storage.type", "fs"),
+        ("catalog.warehouse", "file:///tmp/iceberg"),
+        ("catalog.access_delegation", "true"),
+    ] {
+        let mut connector = test_connector_config();
+        connector.set("delivery.guarantee", "exactly-once");
+        connector.set(key, value);
+        let sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+        assert!(
+            !sink
+                .contract(&connector)
+                .unwrap()
+                .is_cluster_exact_delivery_certified(),
+            "{key}={value} must remain fail closed"
+        );
+    }
 }
 
 #[test]

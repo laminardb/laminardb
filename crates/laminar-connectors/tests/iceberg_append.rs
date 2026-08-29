@@ -59,6 +59,10 @@ async fn open_sink(table: &str) -> IcebergSink {
 }
 
 async fn open_coordinated_sink(table: &str) -> IcebergSink {
+    open_coordinated_participant(table, 1).await
+}
+
+async fn open_coordinated_participant(table: &str, participant_id: u64) -> IcebergSink {
     let mut connector_config = config(table);
     connector_config.set("delivery.guarantee", "exactly-once");
     let mut sink = IcebergSink::new(
@@ -68,7 +72,7 @@ async fn open_coordinated_sink(table: &str) -> IcebergSink {
     sink.bind_runtime_context(SinkRuntimeContext {
         deployment_id: DEPLOYMENT_ID.into(),
         sink_id: SINK_ID.into(),
-        participant_id: 1,
+        participant_id,
     })
     .unwrap();
     sink.open(&connector_config).await.unwrap();
@@ -85,17 +89,34 @@ fn commit_batch(
     fencing_token: u64,
     descriptor: Vec<u8>,
 ) -> CoordinatedCommitBatch {
+    commit_participant_batch(
+        checkpoint_id,
+        expected_predecessor,
+        fencing_token,
+        vec![(1, descriptor)],
+    )
+}
+
+fn commit_participant_batch(
+    checkpoint_id: u64,
+    expected_predecessor: CoordinatedCommitCursor,
+    fencing_token: u64,
+    descriptors: Vec<(u64, Vec<u8>)>,
+) -> CoordinatedCommitBatch {
     let target = CheckpointAttempt::canonical(checkpoint_id);
     CoordinatedCommitBatch {
         namespace: commit_namespace(),
         expected_predecessor,
         fencing_token,
         target,
-        entries: vec![CoordinatedCommitPayload {
-            attempt: target,
-            participant_id: 1,
-            payload: Some(descriptor),
-        }],
+        entries: descriptors
+            .into_iter()
+            .map(|(participant_id, descriptor)| CoordinatedCommitPayload {
+                attempt: target,
+                participant_id,
+                payload: Some(descriptor),
+            })
+            .collect(),
     }
 }
 
@@ -287,4 +308,53 @@ async fn coordinated_checkpoint_restart_replay_soak() {
     let (snapshots, rows) = inspect(&table).await;
     assert_eq!(snapshots, 8);
     assert_eq!(rows, 16);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker: tests/docker/iceberg-compose.yml"]
+async fn coordinated_multi_participant_checkpoint_is_one_snapshot() {
+    require_catalog();
+    let table = format!("cluster_{}", uuid::Uuid::new_v4().simple());
+    open_sink(&table).await.close().await.unwrap();
+    let mut first = open_coordinated_participant(&table, 1).await;
+    let mut second = open_coordinated_participant(&table, 2).await;
+    first.begin_epoch(1).await.unwrap();
+    second.begin_epoch(1).await.unwrap();
+    first
+        .write_batch(
+            &RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap(),
+        )
+        .await
+        .unwrap();
+    second
+        .write_batch(
+            &RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![3, 4]))]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_descriptor = first.pre_commit(1).await.unwrap().unwrap();
+    let second_descriptor = second.pre_commit(1).await.unwrap().unwrap();
+    let batch = commit_participant_batch(
+        1,
+        CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        101,
+        vec![(1, first_descriptor), (2, second_descriptor)],
+    );
+    first
+        .commit_aggregated(batch.clone(), commit_context())
+        .await
+        .unwrap();
+    second
+        .commit_aggregated(batch, commit_context())
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
+
+    let (snapshots, rows) = inspect(&table).await;
+    assert_eq!(snapshots, 1);
+    assert_eq!(rows, 4);
 }

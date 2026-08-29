@@ -1,7 +1,6 @@
 //! Bounded partition-aware Iceberg epoch writer.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,22 +8,20 @@ use arrow_array::RecordBatch;
 use iceberg::arrow::RecordBatchPartitionSplitter;
 use iceberg::spec::{DataFile, PartitionKey};
 use iceberg::writer::base_writer::data_file_writer::{DataFileWriter, DataFileWriterBuilder};
-use iceberg::writer::file_writer::location_generator::{
-    DefaultLocationGenerator, FileNameGenerator,
-};
+use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{CurrentFileStatus, IcebergWriter, IcebergWriterBuilder};
 use parquet::file::properties::WriterProperties;
-use sha2::{Digest, Sha256};
 
 use crate::error::ConnectorError;
 
 use super::super::iceberg_config::{IcebergSinkConfig, IcebergWriteDistributionMode};
+use super::file_finalizer::{finalize_coordinated_files, ReplaySafeFileNameGenerator};
 use super::metrics::IcebergMetrics;
 
 type PartitionWriter =
-    DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, DeterministicFileNameGenerator>;
+    DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, ReplaySafeFileNameGenerator>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EpochIdentity {
@@ -50,42 +47,15 @@ pub(super) struct EpochOutput {
     pub(super) bytes: u64,
 }
 
-#[derive(Debug, Clone)]
-struct DeterministicFileNameGenerator {
-    prefix: String,
-    ordinal: Arc<AtomicU64>,
-}
-
-impl DeterministicFileNameGenerator {
-    fn new(identity: &EpochIdentity) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(b"laminardb-iceberg-data-v1\0");
-        digest.update(identity.deployment_id.as_bytes());
-        digest.update([0]);
-        digest.update(identity.sink_id.as_bytes());
-        digest.update(identity.participant_id.to_be_bytes());
-        digest.update(identity.epoch.to_be_bytes());
-        Self {
-            prefix: format!("ldb-{:x}", digest.finalize()),
-            ordinal: Arc::new(AtomicU64::new(0)),
-        }
-    }
-}
-
-impl FileNameGenerator for DeterministicFileNameGenerator {
-    fn generate_file_name(&self) -> String {
-        let ordinal = self.ordinal.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{ordinal:08}.parquet", self.prefix)
-    }
-}
-
 /// Streams one checkpoint participant's rows into bounded rolling writers.
 pub(super) struct IcebergEpochWriter {
     splitter: Option<RecordBatchPartitionSplitter>,
     parquet_builder: ParquetWriterBuilder,
     file_io: iceberg::io::FileIO,
     location_generator: DefaultLocationGenerator,
-    file_name_generator: DeterministicFileNameGenerator,
+    file_name_generator: ReplaySafeFileNameGenerator,
+    partition_spec_id: i32,
+    coordinated: bool,
     target_file_size_bytes: usize,
     max_open_partitions: usize,
     max_files: usize,
@@ -114,6 +84,7 @@ impl IcebergEpochWriter {
         config.validate_writer_limits()?;
         let schema = table.current_schema_ref();
         let partition_spec = Arc::clone(table.metadata().default_partition_spec());
+        let partition_spec_id = partition_spec.spec_id();
         let splitter = if partition_spec.fields().is_empty() {
             None
         } else {
@@ -140,7 +111,16 @@ impl IcebergEpochWriter {
             parquet_builder,
             file_io: table.file_io().clone(),
             location_generator,
-            file_name_generator: DeterministicFileNameGenerator::new(identity),
+            file_name_generator: ReplaySafeFileNameGenerator::new(
+                &identity.deployment_id,
+                &identity.sink_id,
+                identity.participant_id,
+                identity.epoch,
+                config.delivery_guarantee == crate::connector::DeliveryGuarantee::ExactlyOnce,
+            ),
+            partition_spec_id,
+            coordinated: config.delivery_guarantee
+                == crate::connector::DeliveryGuarantee::ExactlyOnce,
             target_file_size_bytes: config.target_file_size_bytes,
             max_open_partitions: config.max_open_partitions,
             max_files: config.max_files_per_checkpoint,
@@ -351,11 +331,22 @@ impl IcebergEpochWriter {
         super::fault_injection::fail_if(
             super::fault_injection::IcebergFaultPoint::BeforeFileClose,
         )?;
-        let files = active
+        let mut files = active
             .writer
             .close()
             .await
             .map_err(|error| iceberg_write_error("close partition writer", &error))?;
+        if self.coordinated {
+            files = finalize_coordinated_files(
+                &self.file_io,
+                &self.file_name_generator,
+                self.partition_spec_id,
+                self.max_buffer_bytes,
+                &self.metrics,
+                files,
+            )
+            .await?;
+        }
         self.metrics
             .observe_files(&files, self.target_file_size_bytes);
         self.completed.extend(files);
@@ -412,6 +403,8 @@ fn iceberg_write_error(context: &str, error: &iceberg::Error) -> ConnectorError 
 
 #[cfg(test)]
 mod tests {
+    use iceberg::writer::file_writer::location_generator::FileNameGenerator;
+
     use crate::lakehouse::iceberg::test_support::{batch, create_test_table};
 
     use super::*;
@@ -427,13 +420,38 @@ mod tests {
 
     #[test]
     fn deterministic_names_are_replay_stable_and_epoch_scoped() {
-        let first = DeterministicFileNameGenerator::new(&identity(11));
-        let replay = DeterministicFileNameGenerator::new(&identity(11));
+        let current = identity(11);
+        let generator = || {
+            ReplaySafeFileNameGenerator::new(
+                &current.deployment_id,
+                &current.sink_id,
+                current.participant_id,
+                current.epoch,
+                false,
+            )
+        };
+        let first = generator();
+        let replay = generator();
         assert_eq!(first.generate_file_name(), replay.generate_file_name());
         assert_eq!(first.generate_file_name(), replay.generate_file_name());
+        let other = identity(12);
         assert_ne!(
-            DeterministicFileNameGenerator::new(&identity(11)).generate_file_name(),
-            DeterministicFileNameGenerator::new(&identity(12)).generate_file_name()
+            ReplaySafeFileNameGenerator::new(
+                &current.deployment_id,
+                &current.sink_id,
+                current.participant_id,
+                current.epoch,
+                false,
+            )
+            .generate_file_name(),
+            ReplaySafeFileNameGenerator::new(
+                &other.deployment_id,
+                &other.sink_id,
+                other.participant_id,
+                other.epoch,
+                false,
+            )
+            .generate_file_name()
         );
     }
 
@@ -506,11 +524,13 @@ mod tests {
     #[tokio::test]
     async fn deterministic_paths_survive_participant_replay() {
         let fixture = create_test_table(false).await;
+        let mut config = fixture.config.clone();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
         let input = batch(&fixture.table, &[(1, Some("a")), (2, Some("b")), (3, None)]);
         let write = || {
             IcebergEpochWriter::new(
                 &fixture.table,
-                &fixture.config,
+                &config,
                 &identity(19),
                 IcebergMetrics::new(None),
             )
@@ -533,8 +553,72 @@ mod tests {
                 .map(DataFile::file_path)
                 .collect::<Vec<_>>()
         );
+        assert!(first
+            .data_files
+            .iter()
+            .all(|file| !file.file_path().contains("-stage-")));
         assert_eq!(first.rows, replay.rows);
         assert_eq!(first.data_files, replay.data_files);
+    }
+
+    #[tokio::test]
+    async fn timing_changed_rotation_cannot_overwrite_replay_files() {
+        let fixture = create_test_table(false).await;
+        let mut rotated_config = fixture.config.clone();
+        rotated_config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        rotated_config.max_flush_age = std::time::Duration::ZERO;
+        let mut rotated = IcebergEpochWriter::new(
+            &fixture.table,
+            &rotated_config,
+            &identity(23),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        rotated
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+        rotated
+            .write(batch(&fixture.table, &[(2, Some("b"))]))
+            .await
+            .unwrap();
+        let rotated = rotated.close().await.unwrap();
+
+        let mut combined_config = rotated_config;
+        combined_config.max_flush_age = std::time::Duration::from_secs(60);
+        let mut combined = IcebergEpochWriter::new(
+            &fixture.table,
+            &combined_config,
+            &identity(23),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        combined
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+        combined
+            .write(batch(&fixture.table, &[(2, Some("b"))]))
+            .await
+            .unwrap();
+        let combined = combined.close().await.unwrap();
+
+        assert_eq!(rotated.data_files.len(), 2);
+        assert_eq!(combined.data_files.len(), 1);
+        let rotated_paths = rotated
+            .data_files
+            .iter()
+            .map(DataFile::file_path)
+            .collect::<HashSet<_>>();
+        let combined_paths = combined
+            .data_files
+            .iter()
+            .map(DataFile::file_path)
+            .collect::<HashSet<_>>();
+        assert!(rotated_paths.is_disjoint(&combined_paths));
+        for path in rotated_paths.into_iter().chain(combined_paths) {
+            assert!(fixture.table.file_io().exists(path).await.unwrap());
+        }
     }
 
     #[tokio::test]

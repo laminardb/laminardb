@@ -51,6 +51,19 @@ impl IcebergTableBindingV1 {
             format_version: format_version_number(metadata.format_version()),
         }
     }
+
+    pub(super) fn has_same_append_target(&self, other: &Self) -> bool {
+        self.catalog_implementation == other.catalog_implementation
+            && self.catalog_identity == other.catalog_identity
+            && self.table_uuid == other.table_uuid
+            && self.table_identifier == other.table_identifier
+            && self.table_location == other.table_location
+            && self.table_ref == other.table_ref
+            && self.schema_id == other.schema_id
+            && self.partition_spec_id == other.partition_spec_id
+            && self.sort_order_id == other.sort_order_id
+            && self.format_version == other.format_version
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

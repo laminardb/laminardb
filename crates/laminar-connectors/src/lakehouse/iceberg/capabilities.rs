@@ -1,7 +1,8 @@
+use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{
-    IcebergReadMode, IcebergSchemaEvolutionMode, IcebergSinkConfig, IcebergSourceConfig,
-    IcebergWriteMode,
+    IcebergCatalogAuthType, IcebergCatalogType, IcebergReadMode, IcebergSchemaEvolutionMode,
+    IcebergSinkConfig, IcebergSourceConfig, IcebergStorageType, IcebergWriteMode,
 };
 
 const MOR_MISSING_ACTIONS: &str =
@@ -39,6 +40,32 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
         ));
     }
     Ok(())
+}
+
+pub(crate) fn cluster_exact_append_certified(config: &IcebergSinkConfig) -> bool {
+    cfg!(all(
+        feature = "iceberg-catalog-rest",
+        feature = "iceberg-storage-s3"
+    )) && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+        && config.write_mode == IcebergWriteMode::Append
+        && config.catalog.catalog_type == IcebergCatalogType::Rest
+        && matches!(
+            config.catalog.auth_type,
+            IcebergCatalogAuthType::None | IcebergCatalogAuthType::Bearer
+        )
+        && !config.catalog.access_delegation
+        && matches!(
+            config.storage.storage_type,
+            None | Some(IcebergStorageType::S3)
+        )
+        && direct_s3_warehouse(&config.catalog.warehouse)
+}
+
+fn direct_s3_warehouse(warehouse: &str) -> bool {
+    warehouse.split_once("://").is_some_and(|(scheme, path)| {
+        (scheme.eq_ignore_ascii_case("s3") || scheme.eq_ignore_ascii_case("s3a"))
+            && !path.is_empty()
+    })
 }
 
 pub(crate) fn validate_source(config: &IcebergSourceConfig) -> Result<(), ConnectorError> {
@@ -85,5 +112,41 @@ mod tests {
         let error = validate_source(&IcebergSourceConfig::from_config(&config).unwrap())
             .expect_err("unsupported changelog must be rejected");
         assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    }
+
+    #[test]
+    fn cluster_exact_certification_is_rest_s3_only() {
+        let mut config = connector_config();
+        config.set("catalog.warehouse", "s3://warehouse/root");
+        config.set("storage.type", "s3");
+        config.set("delivery.guarantee", "exactly-once");
+        let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+        assert_eq!(
+            cluster_exact_append_certified(&parsed),
+            cfg!(all(
+                feature = "iceberg-catalog-rest",
+                feature = "iceberg-storage-s3"
+            ))
+        );
+
+        for (key, value) in [
+            ("catalog.type", "glue"),
+            ("storage.type", "gcs"),
+            ("catalog.warehouse", "file:///tmp/warehouse"),
+            ("catalog.auth.type", "oauth2"),
+            ("catalog.access_delegation", "true"),
+        ] {
+            let mut rejected = config.clone();
+            rejected.set(key, value);
+            if key == "catalog.auth.type" {
+                rejected.set("catalog.property.credential", "resolved-secret");
+            }
+            assert!(
+                !cluster_exact_append_certified(
+                    &IcebergSinkConfig::from_config(&rejected).unwrap()
+                ),
+                "{key}={value} must not be cluster-certified"
+            );
+        }
     }
 }

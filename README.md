@@ -402,7 +402,7 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | ✅ |
 | Delta Lake | `delta-lake` | Coordinated append supports local exact delivery; cluster exact admission is limited to direct S3/S3A. Azure/GCS targets remain cluster at-least-once pending native fault soaks | ✅ |
-| Iceberg | `iceberg` | Bounded rolling append writers; coordinated local exactly-once append, not cluster-certified; MOR/COW fail closed | ✅ |
+| Iceberg | `iceberg` | Bounded rolling append writers; coordinated local exactly-once and REST + direct S3/S3A cluster exactly-once append; MOR/COW fail closed | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
