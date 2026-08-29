@@ -517,8 +517,9 @@ mod tests {
             .write(batch(&fixture.table, &[(1, Some("a"))]))
             .await
             .unwrap();
-        writer.active.values_mut().next().unwrap().opened_at =
-            Instant::now() - std::time::Duration::from_secs(61);
+        writer.active.values_mut().next().unwrap().opened_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .unwrap();
         let error = writer
             .write(batch(&fixture.table, &[(2, Some("a"))]))
             .await
@@ -543,8 +544,9 @@ mod tests {
             .write(batch(&fixture.table, &[(1, Some("a"))]))
             .await
             .unwrap();
-        writer.active.get_mut("category=a").unwrap().opened_at =
-            Instant::now() - std::time::Duration::from_secs(61);
+        writer.active.get_mut("category=a").unwrap().opened_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .unwrap();
 
         writer
             .write(batch(&fixture.table, &[(2, Some("b"))]))
@@ -613,8 +615,9 @@ mod tests {
             .write(batch(&fixture.table, &[(1, Some("a"))]))
             .await
             .unwrap();
-        rotated.active.values_mut().next().unwrap().opened_at =
-            Instant::now() - std::time::Duration::from_secs(61);
+        rotated.active.values_mut().next().unwrap().opened_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .unwrap();
         rotated
             .write(batch(&fixture.table, &[(2, Some("b"))]))
             .await
