@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use iceberg::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
-use iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type};
+use iceberg::spec::{
+    FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, Transform, Type,
+};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 
@@ -20,6 +22,13 @@ pub(crate) struct TestTable {
 }
 
 pub(crate) async fn create_test_table(partitioned: bool) -> TestTable {
+    create_test_table_with_format(partitioned, FormatVersion::V2).await
+}
+
+pub(crate) async fn create_test_table_with_format(
+    partitioned: bool,
+    format_version: FormatVersion,
+) -> TestTable {
     let warehouse = format!("memory:///laminardb-test/{}", uuid::Uuid::now_v7());
     let catalog = Arc::new(
         MemoryCatalogBuilder::default()
@@ -58,10 +67,12 @@ pub(crate) async fn create_test_table(partitioned: bool) -> TestTable {
             .name("events".to_string())
             .schema(schema)
             .partition_spec(spec)
+            .format_version(format_version)
             .build(),
         None => TableCreation::builder()
             .name("events".to_string())
             .schema(schema)
+            .format_version(format_version)
             .build(),
     };
     let table = catalog.create_table(&namespace, creation).await.unwrap();

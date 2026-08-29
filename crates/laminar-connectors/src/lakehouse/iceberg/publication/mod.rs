@@ -801,7 +801,7 @@ mod tests {
     use crate::lakehouse::iceberg::descriptor::IcebergCommitDescriptorV1;
     use crate::lakehouse::iceberg::epoch_writer::{EpochIdentity, IcebergEpochWriter};
     use crate::lakehouse::iceberg::test_support::{
-        batch as record_batch, create_test_table, table_ident,
+        batch as record_batch, create_test_table, create_test_table_with_format, table_ident,
     };
 
     use super::*;
@@ -1021,6 +1021,85 @@ mod tests {
             rows, 2,
             "published Parquet files must be complete and readable"
         );
+    }
+
+    #[tokio::test]
+    async fn format_v3_unknown_outcome_replay_preserves_row_lineage() {
+        use iceberg::spec::FormatVersion;
+        use tokio_stream::StreamExt;
+
+        let fixture = create_test_table_with_format(false, FormatVersion::V3).await;
+        let payload = descriptor(
+            &fixture.table,
+            &fixture.config,
+            1,
+            1,
+            &[(1, Some("a")), (2, Some("b"))],
+        )
+        .await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let metrics = IcebergMetrics::new(None);
+        super::super::fault_injection::scope(
+            [super::super::fault_injection::IcebergFault::first(
+                super::super::fault_injection::IcebergFaultPoint::AfterCatalogCommit,
+            )],
+            publish_coordinated(
+                &fixture.catalog,
+                &NO_CATALOG_CAPABILITIES,
+                &CatalogSession::default(),
+                &fixture.config,
+                &batch,
+                CoordinatedCommitContext::new(
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+                &metrics,
+            ),
+        )
+        .await
+        .unwrap();
+        publish_coordinated(
+            &fixture.catalog,
+            &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().format_version(), FormatVersion::V3);
+        assert_eq!(table.metadata().snapshots().count(), 1);
+        assert_eq!(table.metadata().next_row_id(), 2);
+        assert_eq!(
+            table.metadata().current_snapshot().unwrap().row_range(),
+            Some((0, 2))
+        );
+        assert_eq!(metrics.unknown_outcomes.get(), 1);
+
+        let stream = table
+            .scan()
+            .select_all()
+            .build()
+            .unwrap()
+            .to_arrow()
+            .await
+            .unwrap();
+        let mut stream = std::pin::pin!(stream);
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            rows += batch.unwrap().num_rows();
+        }
+        assert_eq!(rows, 2);
     }
 
     #[tokio::test]
