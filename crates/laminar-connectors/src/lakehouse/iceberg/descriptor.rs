@@ -5,15 +5,17 @@ use std::collections::HashSet;
 use apache_avro::types::Value as AvroValue;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use iceberg::spec::{DataFile, FormatVersion};
+use iceberg::spec::{DataFile, DataFileFormat, FormatVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
+use crate::lakehouse::iceberg_io::effective_data_location;
 
 use super::epoch_writer::{EpochIdentity, EpochOutput};
+use super::file_finalizer::validate_coordinated_file_name;
 
 const DESCRIPTOR_VERSION: u8 = 1;
 
@@ -98,6 +100,9 @@ impl IcebergCommitDescriptorV1 {
         identity: &EpochIdentity,
         mut output: EpochOutput,
     ) -> Result<Vec<u8>, ConnectorError> {
+        for file in &output.data_files {
+            validate_descriptor_data_file(table, identity, file)?;
+        }
         output
             .data_files
             .sort_by(|left, right| left.file_path().cmp(right.file_path()));
@@ -163,7 +168,12 @@ impl IcebergCommitDescriptorV1 {
 
     pub(super) fn decode(payload: &[u8]) -> Result<Self, ConnectorError> {
         let descriptor: Self = serde_json::from_slice(payload).map_err(|error| {
-            ConnectorError::TransactionError(format!("decode Iceberg commit descriptor: {error}"))
+            ConnectorError::TransactionError(format!(
+                "[LDB-ICEBERG-DESCRIPTOR-JSON] invalid Iceberg commit descriptor ({:?} at line {} column {})",
+                error.classify(),
+                error.line(),
+                error.column()
+            ))
         })?;
         if descriptor.version != DESCRIPTOR_VERSION {
             return Err(ConnectorError::TransactionError(format!(
@@ -171,7 +181,10 @@ impl IcebergCommitDescriptorV1 {
                 descriptor.version
             )));
         }
-        if descriptor.participant_id == 0 || descriptor.deployment_id.is_empty() {
+        if descriptor.participant_id == 0
+            || descriptor.deployment_id.is_empty()
+            || descriptor.sink_id.is_empty()
+        {
             return Err(ConnectorError::TransactionError(
                 "Iceberg commit descriptor has an invalid runtime identity".into(),
             ));
@@ -186,16 +199,22 @@ impl IcebergCommitDescriptorV1 {
             "participant batch fingerprint",
         )?;
         for file in &descriptor.files {
+            validate_coordinated_file_name(
+                &file.path,
+                &descriptor.deployment_id,
+                &descriptor.sink_id,
+                descriptor.participant_id,
+                descriptor.epoch_id,
+            )?;
             validate_sha256(&file.metadata_sha256, "data-file metadata fingerprint")?;
         }
         let mut paths = HashSet::with_capacity(descriptor.files.len());
         let mut previous = None;
         for file in &descriptor.files {
             if !paths.insert(file.path.as_str()) {
-                return Err(ConnectorError::TransactionError(format!(
-                    "Iceberg commit descriptor repeats data file '{}'",
-                    file.path
-                )));
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg commit descriptor repeats a data file".into(),
+                ));
             }
             if previous.is_some_and(|value: &str| value >= file.path.as_str()) {
                 return Err(ConnectorError::TransactionError(
@@ -228,7 +247,8 @@ impl IcebergCommitDescriptorV1 {
             })?;
         let partition_type = spec.partition_type(schema).map_err(|error| {
             ConnectorError::TransactionError(format!(
-                "resolve Iceberg descriptor partition type: {error}"
+                "resolve Iceberg descriptor partition type ({})",
+                error.kind()
             ))
         })?;
         let encoded = BASE64.decode(&self.data_files_avro).map_err(|error| {
@@ -246,9 +266,19 @@ impl IcebergCommitDescriptorV1 {
         )
         .map_err(|error| {
             ConnectorError::TransactionError(format!(
-                "parse Iceberg descriptor data files: {error}"
+                "[LDB-ICEBERG-DESCRIPTOR-DATA-FILES] parse Iceberg descriptor data files ({})",
+                error.kind()
             ))
         })?;
+        let identity = EpochIdentity {
+            deployment_id: self.deployment_id.clone(),
+            sink_id: self.sink_id.clone(),
+            participant_id: self.participant_id,
+            epoch: self.epoch_id,
+        };
+        for file in &data_files {
+            validate_descriptor_data_file(table, &identity, file)?;
+        }
         data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
         let observed = data_files
             .iter()
@@ -272,12 +302,6 @@ impl IcebergCommitDescriptorV1 {
                 "Iceberg descriptor aggregate counts do not match decoded data files".into(),
             ));
         }
-        let identity = EpochIdentity {
-            deployment_id: self.deployment_id.clone(),
-            sink_id: self.sink_id.clone(),
-            participant_id: self.participant_id,
-            epoch: self.epoch_id,
-        };
         let fingerprint = participant_fingerprint(
             &self.table,
             &identity,
@@ -293,6 +317,47 @@ impl IcebergCommitDescriptorV1 {
         }
         Ok(data_files)
     }
+}
+
+fn validate_descriptor_data_file(
+    table: &iceberg::table::Table,
+    identity: &EpochIdentity,
+    file: &DataFile,
+) -> Result<(), ConnectorError> {
+    validate_coordinated_file_name(
+        file.file_path(),
+        &identity.deployment_id,
+        &identity.sink_id,
+        identity.participant_id,
+        identity.epoch,
+    )?;
+    if file.file_format() != DataFileFormat::Parquet {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DATA-FILE-FORMAT] coordinated append descriptors require Parquet data files"
+                .into(),
+        ));
+    }
+    let prefix = format!("{}/", effective_data_location(table));
+    let relative = file.file_path().strip_prefix(&prefix).ok_or_else(|| {
+        ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DATA-FILE-LOCATION] coordinated data file is outside the table data location"
+                .into(),
+        )
+    })?;
+    if relative.is_empty()
+        || relative
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b'?' | b'#'))
+        || relative
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DATA-FILE-LOCATION] coordinated data file has an invalid relative location"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn encode_data_files(
@@ -670,6 +735,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn descriptor_rejects_a_foreign_data_location_without_echoing_it() {
+        let fixture = crate::lakehouse::iceberg::test_support::create_test_table(false).await;
+        let identity = EpochIdentity {
+            deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
+            sink_id: "events".into(),
+            participant_id: 1,
+            epoch: 7,
+        };
+        let prefix = super::super::file_finalizer::replay_safe_prefix(
+            &identity.deployment_id,
+            &identity.sink_id,
+            identity.participant_id,
+            identity.epoch,
+        );
+        let path = format!(
+            "memory:///foreign/data/{prefix}-00000000-{}.parquet",
+            "a".repeat(64)
+        );
+        let error = validate_descriptor_data_file(&fixture.table, &identity, &data_file(&path))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-DATA-FILE-LOCATION"));
+        assert!(!error.contains("memory:///foreign"));
+    }
+
     #[test]
     fn future_descriptor_version_is_rejected() {
         let descriptor = IcebergCommitDescriptorV1 {
@@ -704,22 +795,43 @@ mod tests {
         assert!(IcebergCommitDescriptorV1::decode(&payload).is_err());
     }
 
+    #[test]
+    fn malformed_descriptor_errors_do_not_echo_untrusted_values() {
+        let payload = br#"{"version":"https://user:descriptor-secret@objects.test"}"#;
+        let error = IcebergCommitDescriptorV1::decode(payload)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-JSON"));
+        assert!(!error.contains("descriptor-secret"));
+    }
+
     #[tokio::test]
     async fn configured_descriptor_limit_is_enforced() {
         let fixture = crate::lakehouse::iceberg::test_support::create_test_table(false).await;
-        let mut config = fixture.config;
-        config.max_descriptor_bytes = 1;
-        let output = EpochOutput {
-            data_files: vec![data_file("file:///warehouse/data/a.parquet")],
-            rows: 2,
-            bytes: 100,
-        };
+        let mut config = fixture.config.clone();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
         let identity = EpochIdentity {
             deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
             sink_id: "events".into(),
             participant_id: 1,
             epoch: 7,
         };
+        let mut writer = super::super::epoch_writer::IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity,
+            super::super::metrics::IcebergMetrics::new(None),
+        )
+        .unwrap();
+        writer
+            .write(crate::lakehouse::iceberg::test_support::batch(
+                &fixture.table,
+                &[(1, Some("a")), (2, Some("b"))],
+            ))
+            .await
+            .unwrap();
+        let output = writer.close().await.unwrap();
+        config.max_descriptor_bytes = 1;
         let error = IcebergCommitDescriptorV1::encode(&fixture.table, &config, &identity, output)
             .expect_err("descriptor must respect configured byte limit");
         assert!(error.to_string().contains("configured limit is 1"));

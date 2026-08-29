@@ -188,6 +188,11 @@ impl IcebergEpochWriter {
                 .collect::<Vec<_>>(),
             None => vec![(String::new(), None, batch)],
         };
+        for (path, partition, _) in &partitions {
+            if let Some(partition) = partition {
+                validate_partition_path(partition, path)?;
+            }
+        }
         partitions.sort_by(|left, right| left.0.cmp(&right.0));
         let rotation_cutoff = Instant::now();
         self.preflight_batch(&partitions, rotation_cutoff)?;
@@ -522,6 +527,39 @@ fn clustered_partition_error(key: &str) -> ConnectorError {
     ))
 }
 
+fn validate_partition_path(partition: &PartitionKey, path: &str) -> Result<(), ConnectorError> {
+    if path.is_empty()
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b'?' | b'#'))
+    {
+        return Err(invalid_partition_path());
+    }
+    let mut components = path.split('/');
+    for field in partition.spec().fields() {
+        let Some(component) = components.next() else {
+            return Err(invalid_partition_path());
+        };
+        let valid = component
+            .strip_prefix(&field.name)
+            .is_some_and(|value| value.starts_with('='));
+        if !valid {
+            return Err(invalid_partition_path());
+        }
+    }
+    if components.next().is_some() {
+        return Err(invalid_partition_path());
+    }
+    Ok(())
+}
+
+fn invalid_partition_path() -> ConnectorError {
+    ConnectorError::WriteError(
+        "[LDB-ICEBERG-PARTITION-PATH] Iceberg partition value cannot be represented as a safe object path"
+            .into(),
+    )
+}
+
 fn approximate_row_group_rows(config: &IcebergSinkConfig) -> usize {
     let per_writer_budget = config
         .max_buffer_bytes
@@ -701,6 +739,28 @@ mod tests {
         assert!(writer.completed.is_empty());
         assert_eq!(writer.file_count, 0);
         assert_eq!(writer.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn unsafe_partition_paths_fail_before_opening_a_writer() {
+        for value in ["safe/../../escape", "safe\\..\\escape", "safe?token=value"] {
+            let fixture = create_test_table(true).await;
+            let mut writer = IcebergEpochWriter::new(
+                &fixture.table,
+                &fixture.config,
+                &identity(13),
+                IcebergMetrics::new(None),
+            )
+            .unwrap();
+            let error = writer
+                .write(batch(&fixture.table, &[(1, Some(value))]))
+                .await
+                .expect_err("unsafe partition path must fail before writer creation");
+            assert!(error.to_string().contains("LDB-ICEBERG-PARTITION-PATH"));
+            assert!(writer.active.is_empty());
+            assert!(writer.completed.is_empty());
+            assert_eq!(writer.file_count, 0);
+        }
     }
 
     #[tokio::test]

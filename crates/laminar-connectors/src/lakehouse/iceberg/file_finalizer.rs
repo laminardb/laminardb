@@ -13,6 +13,8 @@ use crate::error::ConnectorError;
 use super::metrics::IcebergMetrics;
 
 const MAX_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const CONTENT_HASH_BYTES: usize = 64;
+const FILE_ORDINAL_BYTES: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(super) struct ReplaySafeFileNameGenerator {
@@ -29,15 +31,8 @@ impl ReplaySafeFileNameGenerator {
         epoch: u64,
         coordinated: bool,
     ) -> Self {
-        let mut digest = Sha256::new();
-        digest.update(b"laminardb-iceberg-data-v2\0");
-        digest.update(deployment_id.as_bytes());
-        digest.update([0]);
-        digest.update(sink_id.as_bytes());
-        digest.update(participant_id.to_be_bytes());
-        digest.update(epoch.to_be_bytes());
         Self {
-            prefix: format!("ldb-{:x}", digest.finalize()),
+            prefix: replay_safe_prefix(deployment_id, sink_id, participant_id, epoch),
             staging_id: coordinated.then(|| uuid::Uuid::now_v7().simple().to_string()),
             ordinal: Arc::new(AtomicU64::new(0)),
         }
@@ -66,6 +61,61 @@ impl ReplaySafeFileNameGenerator {
             format!("{parent}/{name}")
         })
     }
+}
+
+pub(super) fn validate_coordinated_file_name(
+    path: &str,
+    deployment_id: &str,
+    sink_id: &str,
+    participant_id: u64,
+    epoch: u64,
+) -> Result<(), ConnectorError> {
+    if crate::security::value_contains_uri_secret(path, false) {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DATA-FILE-CREDENTIALS] coordinated data-file paths must not embed credentials"
+                .into(),
+        ));
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let prefix = format!(
+        "{}-",
+        replay_safe_prefix(deployment_id, sink_id, participant_id, epoch)
+    );
+    let valid = name
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(".parquet"))
+        .and_then(|value| value.split_once('-'))
+        .is_some_and(|(ordinal, content_hash)| {
+            ordinal.len() == FILE_ORDINAL_BYTES
+                && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+                && content_hash.len() == CONTENT_HASH_BYTES
+                && content_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if !valid {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DATA-FILE-NAMESPACE] coordinated data file is outside its deterministic checkpoint namespace"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn replay_safe_prefix(
+    deployment_id: &str,
+    sink_id: &str,
+    participant_id: u64,
+    epoch: u64,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"laminardb-iceberg-data-v2\0");
+    digest.update(deployment_id.as_bytes());
+    digest.update([0]);
+    digest.update(sink_id.as_bytes());
+    digest.update(participant_id.to_be_bytes());
+    digest.update(epoch.to_be_bytes());
+    format!("ldb-{:x}", digest.finalize())
 }
 
 impl FileNameGenerator for ReplaySafeFileNameGenerator {
@@ -362,6 +412,62 @@ mod tests {
             19,
             true,
         )
+    }
+
+    #[test]
+    fn final_file_names_are_bound_to_the_epoch_identity() {
+        let names = names();
+        let path = names
+            .final_path(
+                &format!("memory:///table/data/{}", names.generate_file_name()),
+                &"a".repeat(CONTENT_HASH_BYTES),
+            )
+            .unwrap();
+        validate_coordinated_file_name(
+            &path,
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+            7,
+            19,
+        )
+        .unwrap();
+        assert!(validate_coordinated_file_name(
+            &path,
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+            8,
+            19,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn staging_and_credential_bearing_file_names_are_rejected_without_echoing() {
+        let names = names();
+        let staging = format!("memory:///table/data/{}", names.generate_file_name());
+        let error = validate_coordinated_file_name(
+            &staging,
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+            7,
+            19,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("LDB-ICEBERG-DATA-FILE-NAMESPACE"));
+
+        let secret_path = "https://user:file-secret@objects.test/data/a.parquet";
+        let error = validate_coordinated_file_name(
+            secret_path,
+            "018f0000-0000-7000-8000-000000000001",
+            "orders",
+            7,
+            19,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("LDB-ICEBERG-DATA-FILE-CREDENTIALS"));
+        assert!(!error.contains("file-secret"));
     }
 
     async fn staged_file(

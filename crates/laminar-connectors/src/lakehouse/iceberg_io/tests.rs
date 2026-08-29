@@ -276,7 +276,7 @@ async fn rest_catalog_loads_server_config_before_using_server_overrides() {
     assert_eq!(requests[2].url.path(), "/v1/server-prefix/namespaces");
 }
 
-fn empty_fixture_table() -> Table {
+fn fixture_table_with_properties(properties: std::collections::HashMap<String, String>) -> Table {
     let schema = iceberg::spec::Schema::builder()
         .with_fields(vec![])
         .build()
@@ -286,6 +286,7 @@ fn empty_fixture_table() -> Table {
         .name("test_table".to_string())
         .schema(schema)
         .location("s3://test/location".to_string())
+        .properties(properties)
         .build();
 
     let metadata = iceberg::spec::TableMetadataBuilder::from_table_creation(creation)
@@ -303,6 +304,50 @@ fn empty_fixture_table() -> Table {
         .runtime(iceberg::Runtime::try_current().unwrap())
         .build()
         .unwrap()
+}
+
+fn empty_fixture_table() -> Table {
+    fixture_table_with_properties(std::collections::HashMap::new())
+}
+
+#[tokio::test]
+async fn credential_bearing_data_locations_are_rejected_without_echoing() {
+    for property in [WRITE_DATA_PATH_PROPERTY, WRITE_FOLDER_STORAGE_PATH_PROPERTY] {
+        let table = fixture_table_with_properties(std::collections::HashMap::from([(
+            property.to_string(),
+            "https://user:data-secret@objects.test/data".to_string(),
+        )]));
+        let error = validate_loaded_table_locations(&table)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-CREDENTIAL-LOCATION"));
+        assert!(!error.contains("data-secret"));
+    }
+}
+
+#[tokio::test]
+async fn effective_data_location_matches_iceberg_precedence() {
+    let folder_only = fixture_table_with_properties(std::collections::HashMap::from([(
+        WRITE_FOLDER_STORAGE_PATH_PROPERTY.to_string(),
+        "s3://bucket/folder".to_string(),
+    )]));
+    assert_eq!(effective_data_location(&folder_only), "s3://bucket/folder");
+
+    let explicit = fixture_table_with_properties(std::collections::HashMap::from([
+        (
+            WRITE_FOLDER_STORAGE_PATH_PROPERTY.to_string(),
+            "s3://bucket/folder".to_string(),
+        ),
+        (
+            WRITE_DATA_PATH_PROPERTY.to_string(),
+            "s3://bucket/data".to_string(),
+        ),
+    ]));
+    assert_eq!(effective_data_location(&explicit), "s3://bucket/data");
+    assert_eq!(
+        effective_data_location(&empty_fixture_table()),
+        "s3://test/location/data"
+    );
 }
 
 #[tokio::test]

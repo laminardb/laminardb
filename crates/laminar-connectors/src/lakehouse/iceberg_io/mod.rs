@@ -33,6 +33,8 @@ const COMPAT_SCAN_MAX_BATCHES: usize = 65_536;
 const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 const COMPAT_SCAN_CONCURRENCY: usize = 4;
 const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const WRITE_DATA_PATH_PROPERTY: &str = "write.data.path";
+const WRITE_FOLDER_STORAGE_PATH_PROPERTY: &str = "write.folder-storage.path";
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CatalogAccess {
@@ -520,7 +522,33 @@ pub(crate) fn validate_loaded_table_locations(table: &Table) -> Result<(), Conne
     if let Some(location) = table.metadata_location() {
         validate_credential_free_location("metadata location", location)?;
     }
+    for (label, property) in [
+        ("data location", WRITE_DATA_PATH_PROPERTY),
+        (
+            "folder storage location",
+            WRITE_FOLDER_STORAGE_PATH_PROPERTY,
+        ),
+    ] {
+        if let Some(location) = table.metadata().properties().get(property) {
+            validate_credential_free_location(label, location)?;
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn effective_data_location(table: &Table) -> String {
+    let metadata = table.metadata();
+    // COMPAT: this is the precedence used by Iceberg's DefaultLocationGenerator.
+    metadata
+        .properties()
+        .get(WRITE_DATA_PATH_PROPERTY)
+        .or_else(|| {
+            metadata
+                .properties()
+                .get(WRITE_FOLDER_STORAGE_PATH_PROPERTY)
+        })
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", metadata.location()))
 }
 
 fn validate_credential_free_location(label: &str, location: &str) -> Result<(), ConnectorError> {

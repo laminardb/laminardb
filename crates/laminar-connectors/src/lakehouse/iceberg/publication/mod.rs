@@ -1,6 +1,7 @@
 //! Atomic `FastAppend` publication and outcome reconciliation.
 
 mod identity;
+mod preflight;
 mod reconciliation;
 
 pub(super) use reconciliation::read_committed_cursor;
@@ -32,6 +33,7 @@ use identity::{
     file_set_fingerprint, hex, summary_properties, PublicationIdentity, SUMMARY_BATCH_FINGERPRINT,
     SUMMARY_CHECKPOINT, SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
 };
+use preflight::validate_data_file_objects;
 
 const MAX_PUBLICATION_ATTEMPTS: usize = 3;
 
@@ -99,10 +101,9 @@ pub(super) fn unresolved_publication(
         }
         for file in descriptor.files {
             if !paths.insert(file.path.clone()) {
-                return Err(ConnectorError::TransactionError(format!(
-                    "Iceberg coordinated descriptors repeat data file '{}'",
-                    file.path
-                )));
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg coordinated descriptors repeat a data file".into(),
+                ));
             }
             files.push(file);
         }
@@ -273,6 +274,9 @@ async fn publish_with_retries(
                 Some(refreshed) => table = refreshed,
             }
         }
+
+        let preflight_deadline = commit_deadline(context, config.catalog.commit_timeout);
+        validate_data_file_objects(&table, &prepared.data_files, preflight_deadline).await?;
 
         let attempt_catalog = publication_catalog_for_attempt(
             catalog,
@@ -511,10 +515,9 @@ fn prepare_publication(
                 ));
             }
             if !expected_paths.insert(file.file_path().to_string()) {
-                return Err(ConnectorError::TransactionError(format!(
-                    "Iceberg coordinated descriptors repeat data file '{}'",
-                    file.file_path()
-                )));
+                return Err(ConnectorError::TransactionError(
+                    "Iceberg coordinated descriptors repeat a data file".into(),
+                ));
             }
             data_files.push(file);
         }
@@ -874,11 +877,23 @@ mod tests {
             participant_id,
             epoch: checkpoint_id,
         };
-        let mut writer =
-            IcebergEpochWriter::new(table, config, &identity, IcebergMetrics::new(None)).unwrap();
+        let mut coordinated_config = config.clone();
+        coordinated_config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        let mut writer = IcebergEpochWriter::new(
+            table,
+            &coordinated_config,
+            &identity,
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
         writer.write(record_batch(table, rows)).await.unwrap();
-        IcebergCommitDescriptorV1::encode(table, config, &identity, writer.close().await.unwrap())
-            .unwrap()
+        IcebergCommitDescriptorV1::encode(
+            table,
+            &coordinated_config,
+            &identity,
+            writer.close().await.unwrap(),
+        )
+        .unwrap()
     }
 
     fn table_with_metadata(
@@ -1044,6 +1059,80 @@ mod tests {
         let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
         assert_eq!(table.metadata().snapshots().count(), 1);
         assert_eq!(metrics.unknown_outcomes.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_data_file_is_rejected_before_catalog_commit() {
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+        let path = IcebergCommitDescriptorV1::decode(&payload).unwrap().files[0]
+            .path
+            .clone();
+        fixture.table.file_io().delete(&path).await.unwrap();
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let error = publish_coordinated(
+            &fixture.catalog,
+            &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .expect_err("a missing participant file must not be published");
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-DATA-FILE-PREFLIGHT"));
+        assert!(!error.to_string().contains(&path));
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_data_file_is_rejected_before_catalog_commit() {
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+        let path = IcebergCommitDescriptorV1::decode(&payload).unwrap().files[0]
+            .path
+            .clone();
+        fixture
+            .table
+            .file_io()
+            .new_output(&path)
+            .unwrap()
+            .write(bytes::Bytes::from_static(b"incomplete"))
+            .await
+            .unwrap();
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let error = publish_coordinated(
+            &fixture.catalog,
+            &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .expect_err("an incomplete participant file must not be published");
+        assert!(error.to_string().contains("LDB-ICEBERG-DATA-FILE-SIZE"));
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
     }
 
     #[tokio::test]
