@@ -57,7 +57,7 @@ impl PipelineIdentity {
 
     /// Whether this identity uses the current canonical version and digest encoding.
     #[must_use]
-    pub(crate) fn is_canonical(&self) -> bool {
+    pub fn is_canonical(&self) -> bool {
         self.validation_error().is_none()
     }
 }

@@ -476,6 +476,11 @@ mod tests {
             sha256: "NOT-A-DIGEST".into(),
         };
         assert!(CoordinatedCommitNamespace::try_new(malformed, DEPLOYMENT, "orders").is_err());
+        let future_version = PipelineIdentity {
+            canonical_version: PIPELINE_IDENTITY_VERSION + 1,
+            sha256: PipelineIdentity::empty().sha256,
+        };
+        assert!(CoordinatedCommitNamespace::try_new(future_version, DEPLOYMENT, "orders").is_err());
         assert!(
             CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "").is_err()
         );

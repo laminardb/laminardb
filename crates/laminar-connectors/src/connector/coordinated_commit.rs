@@ -38,8 +38,8 @@ impl CoordinatedCommitNamespace {
     /// Construct and validate a namespace before any external metadata lookup.
     ///
     /// # Errors
-    /// Returns a configuration error for a malformed pipeline digest or empty
-    /// sink id.
+    /// Returns a configuration error for a non-canonical pipeline identity or
+    /// empty sink id.
     pub fn try_new(
         pipeline_identity: laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity,
         deployment_id: impl Into<String>,
@@ -47,15 +47,9 @@ impl CoordinatedCommitNamespace {
     ) -> Result<Self, ConnectorError> {
         let deployment_id = deployment_id.into();
         let sink_id = sink_id.into();
-        if pipeline_identity.sha256.len() != 64
-            || !pipeline_identity
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !pipeline_identity.is_canonical() {
             return Err(ConnectorError::ConfigurationError(
-                "coordinated commit requires a canonical lowercase SHA-256 pipeline identity"
-                    .into(),
+                "coordinated commit requires the current canonical pipeline identity".into(),
             ));
         }
         if sink_id.is_empty() {
