@@ -203,7 +203,8 @@ async fn admitted_filter_is_applied_by_the_scan() {
     let (table, _) =
         append_rows(&fixture, &fixture.table, 1, &[(1, None), (2, Some("drop"))]).await;
     let mut config = test_source_config();
-    config.filter = Some(serde_json::to_string(&Reference::new("category").is_null()).unwrap());
+    config.filter =
+        Some(serde_json::to_string(&(!Reference::new("category").is_not_null())).unwrap());
     let mut source = IcebergSource::new(config, None);
     source.table = Some(table);
     source.start_initial_scan().unwrap();
@@ -217,6 +218,68 @@ async fn admitted_filter_is_applied_by_the_scan() {
         .unwrap();
     assert_eq!(ids.values(), &[1]);
     assert!(source.poll_batch(8_192).await.unwrap().is_none());
+    source.close().await.unwrap();
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn append_file_limit_counts_only_files_added_after_the_cursor() {
+    use arrow_array::Int64Array;
+    use iceberg::expr::Reference;
+
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("old"))]).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::None;
+    config.max_planned_files = 1;
+    config.filter = Some(serde_json::to_string(&Reference::new("category").is_null()).unwrap());
+    let mut source = IcebergSource::new(config, None);
+    source.catalog = Some(Arc::clone(&fixture.catalog));
+    source.table = Some(first.clone());
+    source.start_initial_scan().unwrap();
+
+    let _ = append_rows(&fixture, &first, 2, &[(2, None), (3, Some("filtered"))]).await;
+    let batch = source.poll_batch(8_192).await.unwrap().unwrap();
+    let ids = batch
+        .records
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[2]);
+    assert!(source.poll_batch(8_192).await.unwrap().is_none());
+    source.close().await.unwrap();
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn append_direct_tasks_read_partitioned_files() {
+    use arrow_array::StringArray;
+
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(true).await;
+    let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("old"))]).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::None;
+    let mut source = IcebergSource::new(config, None);
+    source.catalog = Some(Arc::clone(&fixture.catalog));
+    source.table = Some(first.clone());
+    source.start_initial_scan().unwrap();
+
+    let _ = append_rows(&fixture, &first, 2, &[(2, Some("new"))]).await;
+    let batch = source.poll_batch(8_192).await.unwrap().unwrap();
+    let categories = batch
+        .records
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(categories.value(0), "new");
     source.close().await.unwrap();
 }
 

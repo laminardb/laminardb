@@ -89,6 +89,10 @@ impl ReadSchemaBinding {
         self.schema_id
     }
 
+    pub fn field_ids(&self) -> &[i32] {
+        &self.field_ids
+    }
+
     pub fn projection(
         &self,
         snapshot_schema: &IcebergSchema,

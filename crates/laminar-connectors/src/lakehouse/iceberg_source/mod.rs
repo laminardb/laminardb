@@ -344,7 +344,7 @@ impl IcebergSource {
                 .planning_duration
                 .observe(planning_started.elapsed().as_secs_f64());
             let planned_files = plans.iter().fold(0_u64, |total, plan| {
-                total.saturating_add(u64::try_from(plan.added_file_paths.len()).unwrap_or(u64::MAX))
+                total.saturating_add(u64::try_from(plan.added_files.len()).unwrap_or(u64::MAX))
             });
             let planned_manifests = plans.iter().fold(0_u64, |total, plan| {
                 total.saturating_add(u64::try_from(plan.manifest_count).unwrap_or(u64::MAX))

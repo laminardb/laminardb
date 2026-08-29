@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use iceberg::expr::{Bind, Predicate};
+use iceberg::expr::{Bind, BoundPredicate, Predicate};
 use iceberg::scan::{FileScanTaskStream, TableScan};
 use iceberg::spec::{Manifest, ManifestFile, ManifestList, SchemaRef, SnapshotRef};
 use iceberg::table::Table;
@@ -28,15 +28,24 @@ pub(crate) fn parse_and_bind_filter(
                 error.column()
             ))
         })?;
-    if let Some(predicate) = predicate.as_ref() {
-        predicate.bind(schema, true).map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "[LDB-ICEBERG-FILTER-BIND] Iceberg filter predicate is incompatible with the selected snapshot schema ({})",
-                error.kind()
-            ))
-        })?;
-    }
+    bind_filter(predicate.as_ref(), schema)?;
     Ok(predicate)
+}
+
+pub(crate) fn bind_filter(
+    predicate: Option<&Predicate>,
+    schema: SchemaRef,
+) -> Result<Option<BoundPredicate>, ConnectorError> {
+    predicate
+        .map(|predicate| {
+            predicate.clone().rewrite_not().bind(schema, true).map_err(|error| {
+                ConnectorError::ConfigurationError(format!(
+                    "[LDB-ICEBERG-FILTER-BIND] Iceberg filter predicate is incompatible with the selected snapshot schema ({})",
+                    error.kind()
+                ))
+            })
+        })
+        .transpose()
 }
 
 #[derive(Debug, Clone, Copy)]

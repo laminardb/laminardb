@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus, Operation, SnapshotRef};
+use iceberg::spec::{
+    DataContentType, DataFile, ManifestContentType, ManifestStatus, Operation, SnapshotRef,
+};
 use iceberg::table::Table;
 
 use crate::error::ConnectorError;
@@ -10,9 +12,15 @@ use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, Manifest
 use super::cursor::IcebergSourceCursorV1;
 
 #[derive(Debug)]
+pub(super) struct AddedDataFile {
+    pub data_file: DataFile,
+    pub partition_spec_id: i32,
+}
+
+#[derive(Debug)]
 pub(super) struct AppendSnapshotPlan {
     pub snapshot: SnapshotRef,
-    pub added_file_paths: HashSet<String>,
+    pub added_files: Vec<AddedDataFile>,
     pub manifest_count: usize,
 }
 
@@ -27,14 +35,14 @@ pub(super) async fn plan_appends(
     let mut remaining_files = config.max_planned_files;
     let mut plans = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let (added_file_paths, manifest_count) =
+        let (added_files, manifest_count) =
             added_files_for_snapshot(table, &snapshot, remaining_files, limits, deadline).await?;
         remaining_files = remaining_files
-            .checked_sub(added_file_paths.len())
+            .checked_sub(added_files.len())
             .ok_or_else(file_limit_error)?;
         plans.push(AppendSnapshotPlan {
             snapshot,
-            added_file_paths,
+            added_files,
             manifest_count,
         });
     }
@@ -108,7 +116,7 @@ async fn added_files_for_snapshot(
     max_files: usize,
     limits: ManifestReadLimits,
     deadline: tokio::time::Instant,
-) -> Result<(HashSet<String>, usize), ConnectorError> {
+) -> Result<(Vec<AddedDataFile>, usize), ConnectorError> {
     if snapshot.summary().operation != Operation::Append {
         return Err(non_append_error(
             snapshot.snapshot_id(),
@@ -118,6 +126,7 @@ async fn added_files_for_snapshot(
 
     let manifest_list = load_manifest_list(table, snapshot, limits, deadline).await?;
     let mut paths = HashSet::new();
+    let mut files = Vec::new();
     for manifest_file in manifest_list.entries() {
         if manifest_file.added_snapshot_id != snapshot.snapshot_id()
             && !manifest_file.has_deleted_files()
@@ -140,8 +149,17 @@ async fn added_files_for_snapshot(
             }
             match entry.status() {
                 ManifestStatus::Added if entry.content_type() == DataContentType::Data => {
-                    paths.insert(entry.file_path().to_string());
-                    if paths.len() > max_files {
+                    if !paths.insert(entry.file_path().to_string()) {
+                        return Err(ConnectorError::TransactionError(
+                            "[LDB-ICEBERG-APPEND-DUPLICATE-FILE] append snapshot adds the same data-file path more than once"
+                                .into(),
+                        ));
+                    }
+                    files.push(AddedDataFile {
+                        data_file: entry.data_file().clone(),
+                        partition_spec_id: manifest_file.partition_spec_id,
+                    });
+                    if files.len() > max_files {
                         return Err(file_limit_error());
                     }
                 }
@@ -161,7 +179,7 @@ async fn added_files_for_snapshot(
             }
         }
     }
-    Ok((paths, manifest_list.entries().len()))
+    Ok((files, manifest_list.entries().len()))
 }
 
 fn non_append_error(snapshot_id: i64, operation: &str) -> ConnectorError {
@@ -263,18 +281,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![second_id, third_id]
         );
+        let planned_paths = |plan: &AppendSnapshotPlan| {
+            plan.added_files
+                .iter()
+                .map(|file| file.data_file.file_path().to_string())
+                .collect::<HashSet<_>>()
+        };
         assert_eq!(
-            plans[0].added_file_paths,
+            planned_paths(&plans[0]),
             second_paths.into_iter().collect::<HashSet<_>>()
         );
         assert_eq!(
-            plans[1].added_file_paths,
+            planned_paths(&plans[1]),
             third_paths.into_iter().collect::<HashSet<_>>()
         );
         assert!(plans.iter().all(|plan| plan.manifest_count > 0));
-        assert!(plans.iter().all(|plan| first_paths
+        let first_paths = first_paths.into_iter().collect::<HashSet<_>>();
+        assert!(plans
             .iter()
-            .all(|path| !plan.added_file_paths.contains(path))));
+            .all(|plan| planned_paths(plan).is_disjoint(&first_paths)));
         let current = IcebergSourceCursorV1::from_snapshot(
             &config,
             &third,

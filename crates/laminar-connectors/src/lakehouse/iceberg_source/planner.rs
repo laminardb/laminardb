@@ -1,22 +1,22 @@
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow_array::RecordBatch;
-use futures_util::{future, StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
-use iceberg::scan::{ArrowRecordBatchStream, FileScanTaskStream};
+use iceberg::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
+use iceberg::spec::{NameMapping, SchemaRef, SnapshotRef, DEFAULT_SCHEMA_NAME_MAPPING};
 use iceberg::table::Table;
 use tokio::sync::mpsc;
 
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::IcebergSourceConfig;
 use crate::lakehouse::iceberg_scan::{
-    connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
+    bind_filter, connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
 };
 
-use super::append_lineage::AppendSnapshotPlan;
+use super::append_lineage::{AddedDataFile, AppendSnapshotPlan};
 use super::cursor::IcebergSourceCursorV1;
 use super::read_schema::{ReadProjection, ReadSchemaBinding};
 
@@ -40,7 +40,7 @@ pub(super) struct ScanTask {
 
 enum ScanFiles {
     All,
-    Added(Arc<HashSet<String>>),
+    Added(Vec<AddedDataFile>),
 }
 
 struct ScanPlan {
@@ -93,7 +93,7 @@ pub(super) fn append_task(
         .into_iter()
         .map(|plan| ScanPlan {
             snapshot_id: plan.snapshot.snapshot_id(),
-            files: ScanFiles::Added(Arc::new(plan.added_file_paths)),
+            files: ScanFiles::Added(plan.added_files),
             cursor: IcebergSourceCursorV1::from_snapshot(
                 config,
                 &table,
@@ -176,11 +176,55 @@ async fn run_plan(
         )
     })?;
     let projection = read_schema.projection(&snapshot_schema)?;
+    let tasks = match files {
+        ScanFiles::All => {
+            full_snapshot_tasks(
+                table,
+                snapshot,
+                &projection,
+                predicate,
+                concurrency,
+                max_planned_files,
+                metadata_limits,
+                request_timeout,
+            )
+            .await?
+        }
+        ScanFiles::Added(files) => added_file_tasks(
+            table,
+            snapshot_schema,
+            read_schema.field_ids(),
+            predicate.as_ref(),
+            files,
+        )?,
+    };
+    read_tasks(
+        table,
+        tasks,
+        cursor,
+        projection,
+        concurrency,
+        request_timeout,
+        sender,
+    )
+    .await
+}
+
+async fn full_snapshot_tasks(
+    table: &Table,
+    snapshot: &SnapshotRef,
+    projection: &ReadProjection,
+    predicate: Option<Predicate>,
+    concurrency: usize,
+    max_planned_files: usize,
+    metadata_limits: ManifestReadLimits,
+    request_timeout: std::time::Duration,
+) -> Result<FileScanTaskStream, ConnectorError> {
     let planning_deadline = tokio::time::Instant::now() + request_timeout;
     preflight_snapshot(table, snapshot, metadata_limits, planning_deadline).await?;
     let mut builder = table
         .scan()
-        .snapshot_id(snapshot_id)
+        .snapshot_id(snapshot.snapshot_id())
         .with_batch_size(Some(8_192))
         .with_concurrency_limit(concurrency);
     builder = builder.select(projection.columns.iter().map(String::as_str));
@@ -189,17 +233,86 @@ async fn run_plan(
     }
     let scan = builder.build().map_err(|error| {
         connector_scan_error(
-            &format!("[LDB-ICEBERG-SCAN-BUILD] snapshot {snapshot_id} scan build failed"),
+            &format!(
+                "[LDB-ICEBERG-SCAN-BUILD] snapshot {} scan build failed",
+                snapshot.snapshot_id()
+            ),
             &error,
         )
     })?;
-    let tasks = plan_files(&scan, max_planned_files, planning_deadline).await?;
-    let tasks = match files {
-        ScanFiles::All => tasks,
-        ScanFiles::Added(paths) => Box::pin(
-            tasks.try_filter(move |task| future::ready(paths.contains(task.data_file_path()))),
-        ),
-    };
+    plan_files(&scan, max_planned_files, planning_deadline).await
+}
+
+fn added_file_tasks(
+    table: &Table,
+    snapshot_schema: SchemaRef,
+    field_ids: &[i32],
+    predicate: Option<&Predicate>,
+    files: Vec<AddedDataFile>,
+) -> Result<FileScanTaskStream, ConnectorError> {
+    let bound_predicate = bind_filter(predicate, Arc::clone(&snapshot_schema))?;
+    let name_mapping = table
+        .metadata()
+        .properties()
+        .get(DEFAULT_SCHEMA_NAME_MAPPING)
+        .map(|encoded| serde_json::from_str::<NameMapping>(encoded))
+        .transpose()
+        .map_err(|_| {
+            ConnectorError::TransactionError(
+                "[LDB-ICEBERG-NAME-MAPPING-INVALID] table name mapping is invalid".into(),
+            )
+        })?
+        .map(Arc::new);
+    for added in &files {
+        if table
+            .metadata()
+            .partition_spec_by_id(added.partition_spec_id)
+            .is_none()
+        {
+            return Err(
+                ConnectorError::TransactionError(format!(
+                    "[LDB-ICEBERG-PARTITION-SPEC-MISSING] data file references missing partition spec {}",
+                    added.partition_spec_id
+                )),
+            );
+        }
+    }
+    let field_ids = field_ids.to_vec();
+    let tasks = files.into_iter().map(move |added| {
+        let file = added.data_file;
+        let size = file.file_size_in_bytes();
+        Ok(FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(size)
+            .with_record_count(Some(file.record_count()))
+            .with_data_file_path(file.file_path().to_string())
+            .with_data_file_format(file.file_format())
+            .with_schema(Arc::clone(&snapshot_schema))
+            .with_project_field_ids(field_ids.clone())
+            .with_predicate(bound_predicate.clone())
+            // INVARIANT: prior deletes cannot apply to later-sequence append files, and lineage
+            // admission rejects every delete-file addition after the retained cursor.
+            .with_deletes(Vec::new())
+            .with_partition(Some(file.partition().clone()))
+            // COMPAT: Iceberg 0.10.1 native scan tasks leave this unset; setting it changes the reader schema.
+            .with_partition_spec(None)
+            .with_name_mapping(name_mapping.clone())
+            .with_case_sensitive(true)
+            .build())
+    });
+    Ok(Box::pin(futures_util::stream::iter(tasks)))
+}
+
+async fn read_tasks(
+    table: &Table,
+    tasks: FileScanTaskStream,
+    cursor: IcebergSourceCursorV1,
+    projection: ReadProjection,
+    concurrency: usize,
+    request_timeout: std::time::Duration,
+    sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
+) -> Result<(), ConnectorError> {
     let read_files = Arc::new(AtomicU64::new(0));
     let read_file_counter = Arc::clone(&read_files);
     let counted_tasks: FileScanTaskStream = Box::pin(tasks.map_ok(move |task| {
