@@ -41,6 +41,7 @@ fn append_contract_is_at_least_once_by_default() {
     assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
 }
 
+#[cfg(feature = "iceberg-core")]
 #[test]
 fn exactly_once_append_exposes_checkpoint_committer() {
     let mut connector = test_connector_config();
@@ -56,6 +57,21 @@ fn exactly_once_append_exposes_checkpoint_committer() {
             feature = "iceberg-storage-s3"
         ))
     );
+}
+
+#[cfg(not(feature = "iceberg-core"))]
+#[tokio::test]
+async fn append_without_iceberg_core_fails_before_catalog_io() {
+    let mut sink = IcebergSink::new(test_config(), None);
+
+    let error = sink
+        .open(&test_connector_config())
+        .await
+        .expect_err("a build without iceberg-core must fail before catalog access");
+
+    assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    assert_eq!(sink.state, ConnectorState::Failed);
+    assert!(sink.as_coordinated_committer().is_none());
 }
 
 #[cfg(feature = "iceberg-core")]

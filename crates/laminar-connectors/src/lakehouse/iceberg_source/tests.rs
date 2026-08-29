@@ -88,6 +88,7 @@ async fn changelog_fails_before_catalog_io() {
     assert_eq!(source.state, ConnectorState::Created);
 }
 
+#[cfg(feature = "iceberg-core")]
 #[tokio::test]
 async fn malformed_declared_schema_fails_before_catalog_io() {
     let mut config = connector_config();
@@ -106,6 +107,27 @@ async fn malformed_declared_schema_fails_before_catalog_io() {
         .expect_err("malformed engine schema must fail before catalog access");
     assert!(error.to_string().contains("_arrow_schema"));
     assert_eq!(source.state, ConnectorState::Created);
+}
+
+#[cfg(not(feature = "iceberg-core"))]
+#[tokio::test]
+async fn source_without_iceberg_core_fails_before_catalog_io() {
+    let mut source = IcebergSource::new(test_source_config(), None);
+
+    let error = source
+        .start(
+            SourceStart::new(
+                connector_config(),
+                SourcePosition::Initial,
+                crate::connector::DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect_err("a build without iceberg-core must fail before catalog access");
+
+    assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    assert_eq!(source.state, ConnectorState::Failed);
 }
 
 #[test]
