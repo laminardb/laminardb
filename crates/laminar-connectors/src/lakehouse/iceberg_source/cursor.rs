@@ -1,6 +1,7 @@
 use iceberg::spec::Snapshot;
 use iceberg::table::Table;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::error::ConnectorError;
@@ -8,9 +9,11 @@ use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSourceCon
 
 const CURSOR_KEY: &str = "iceberg.cursor";
 const CURSOR_VERSION: u8 = 1;
+const MAX_CURSOR_BYTES: usize = 16 * 1024;
 
 /// Replay position for an Iceberg snapshot lineage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IcebergSourceCursorV1 {
     /// Serialized cursor version.
     pub version: u8,
@@ -30,6 +33,28 @@ pub struct IcebergSourceCursorV1 {
     pub read_schema_id: i32,
     /// Metadata file observed when the cursor was created.
     pub metadata_location: String,
+}
+
+impl fmt::Debug for IcebergSourceCursorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let table_identifier =
+            crate::security::sanitize_identity_value("table_identifier", &self.table_identifier);
+        let table_ref = crate::security::sanitize_identity_value("table_ref", &self.table_ref);
+        let metadata_location =
+            crate::security::sanitize_identity_value("metadata_location", &self.metadata_location);
+        formatter
+            .debug_struct("IcebergSourceCursorV1")
+            .field("version", &self.version)
+            .field("catalog_identity", &self.catalog_identity)
+            .field("table_uuid", &self.table_uuid)
+            .field("table_identifier", &table_identifier)
+            .field("table_ref", &table_ref)
+            .field("snapshot_id", &self.snapshot_id)
+            .field("sequence_number", &self.sequence_number)
+            .field("read_schema_id", &self.read_schema_id)
+            .field("metadata_location", &metadata_location)
+            .finish()
+    }
 }
 
 impl IcebergSourceCursorV1 {
@@ -125,8 +150,15 @@ impl IcebergSourceCursorV1 {
     ///
     /// Returns a serialization error if the cursor cannot be encoded.
     pub fn to_checkpoint(&self) -> Result<SourceCheckpoint, ConnectorError> {
+        self.validate_payload()?;
         let encoded =
             serde_json::to_string(self).map_err(|error| ConnectorError::Serde(error.into()))?;
+        if encoded.len() > MAX_CURSOR_BYTES {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-SIZE",
+                "Iceberg cursor exceeds its fixed durability bound",
+            ));
+        }
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset(CURSOR_KEY, encoded);
         checkpoint.set_metadata("connector_type", "iceberg");
@@ -139,21 +171,92 @@ impl IcebergSourceCursorV1 {
     ///
     /// Returns a stable configuration error for missing or unknown versions.
     pub fn from_checkpoint(checkpoint: &SourceCheckpoint) -> Result<Self, ConnectorError> {
+        if checkpoint.get_metadata("connector_type") != Some("iceberg") {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-CONNECTOR",
+                "resume checkpoint is not bound to the Iceberg connector",
+            ));
+        }
         let encoded = checkpoint.get_offset(CURSOR_KEY).ok_or_else(|| {
             cursor_error(
                 "LDB-ICEBERG-CURSOR-MISSING",
                 "resume checkpoint has no versioned Iceberg cursor",
             )
         })?;
-        let cursor: Self = serde_json::from_str(encoded)
-            .map_err(|error| cursor_error("LDB-ICEBERG-CURSOR-DECODE", &error.to_string()))?;
-        if cursor.version != CURSOR_VERSION {
+        if encoded.len() > MAX_CURSOR_BYTES {
             return Err(cursor_error(
-                "LDB-ICEBERG-CURSOR-VERSION",
-                &format!("unsupported cursor version {}", cursor.version),
+                "LDB-ICEBERG-CURSOR-SIZE",
+                "Iceberg cursor exceeds its fixed durability bound",
             ));
         }
+        let cursor: Self = serde_json::from_str(encoded).map_err(|_| {
+            cursor_error(
+                "LDB-ICEBERG-CURSOR-DECODE",
+                "Iceberg cursor is not valid versioned JSON",
+            )
+        })?;
+        cursor.validate_payload()?;
         Ok(cursor)
+    }
+
+    fn validate_payload(&self) -> Result<(), ConnectorError> {
+        if self.version != CURSOR_VERSION {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-VERSION",
+                &format!("unsupported cursor version {}", self.version),
+            ));
+        }
+        if self.catalog_identity.len() != 64
+            || !self
+                .catalog_identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-CATALOG-IDENTITY",
+                "cursor catalog identity is not a canonical SHA-256 digest",
+            ));
+        }
+        let table_uuid = uuid::Uuid::parse_str(&self.table_uuid).map_err(|_| {
+            cursor_error(
+                "LDB-ICEBERG-CURSOR-TABLE-UUID-FORMAT",
+                "cursor table UUID is not canonical",
+            )
+        })?;
+        if table_uuid.is_nil() || table_uuid.to_string() != self.table_uuid {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-TABLE-UUID-FORMAT",
+                "cursor table UUID is not canonical",
+            ));
+        }
+        for (code, label, value) in [
+            (
+                "LDB-ICEBERG-CURSOR-TABLE-FORMAT",
+                "table identifier",
+                self.table_identifier.as_str(),
+            ),
+            (
+                "LDB-ICEBERG-CURSOR-REF-FORMAT",
+                "table ref",
+                self.table_ref.as_str(),
+            ),
+        ] {
+            if value.is_empty() || value.chars().any(char::is_control) {
+                return Err(cursor_error(
+                    code,
+                    &format!("cursor {label} is empty or contains control characters"),
+                ));
+            }
+        }
+        if self.metadata_location.chars().any(char::is_control)
+            || crate::security::value_contains_uri_secret(&self.metadata_location, false)
+        {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-METADATA-LOCATION",
+                "cursor metadata location is not safe for durable state",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -172,8 +275,8 @@ mod tests {
     fn cursor() -> IcebergSourceCursorV1 {
         IcebergSourceCursorV1 {
             version: 1,
-            catalog_identity: "catalog".into(),
-            table_uuid: "uuid".into(),
+            catalog_identity: "0".repeat(64),
+            table_uuid: "018f0f9d-7b2f-7a61-b72d-f4be1c7f43e1".into(),
             table_identifier: "ns.table".into(),
             table_ref: "main".into(),
             snapshot_id: 42,
@@ -181,6 +284,13 @@ mod tests {
             read_schema_id: 3,
             metadata_location: "s3://bucket/metadata/v7.json".into(),
         }
+    }
+
+    fn unchecked_checkpoint(cursor: &IcebergSourceCursorV1) -> SourceCheckpoint {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset(CURSOR_KEY, serde_json::to_string(cursor).unwrap());
+        checkpoint.set_metadata("connector_type", "iceberg");
+        checkpoint
     }
 
     #[test]
@@ -197,9 +307,77 @@ mod tests {
     fn unknown_cursor_version_is_rejected() {
         let mut cursor = cursor();
         cursor.version = 2;
-        let error = IcebergSourceCursorV1::from_checkpoint(&cursor.to_checkpoint().unwrap())
+        let error = IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&cursor))
             .expect_err("future cursor version must fail closed");
         assert!(error.to_string().contains("LDB-ICEBERG-CURSOR-VERSION"));
+    }
+
+    #[test]
+    fn cursor_shape_and_size_fail_closed_without_echoing_payloads() {
+        let mut wrong_connector = cursor().to_checkpoint().unwrap();
+        wrong_connector.set_metadata("connector_type", "kafka");
+        assert!(IcebergSourceCursorV1::from_checkpoint(&wrong_connector)
+            .unwrap_err()
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-CONNECTOR"));
+
+        let mut oversized = SourceCheckpoint::new();
+        oversized.set_metadata("connector_type", "iceberg");
+        oversized.set_offset(CURSOR_KEY, "x".repeat(MAX_CURSOR_BYTES + 1));
+        assert!(IcebergSourceCursorV1::from_checkpoint(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-SIZE"));
+
+        let mut encoded = serde_json::to_value(cursor()).unwrap();
+        encoded["oauth_client_secret=do-not-echo"] = serde_json::Value::Bool(true);
+        let mut unknown = SourceCheckpoint::new();
+        unknown.set_metadata("connector_type", "iceberg");
+        unknown.set_offset(CURSOR_KEY, serde_json::to_string(&encoded).unwrap());
+        let message = IcebergSourceCursorV1::from_checkpoint(&unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("LDB-ICEBERG-CURSOR-DECODE"));
+        assert!(!message.contains("do-not-echo"));
+    }
+
+    #[test]
+    fn credential_bearing_metadata_location_is_never_durable_or_echoed() {
+        let mut cursor = cursor();
+        cursor.metadata_location = "s3://catalog-user:do-not-echo@bucket/metadata/v7.json".into();
+        let debug = format!("{cursor:?}");
+        assert!(!debug.contains("catalog-user"));
+        assert!(!debug.contains("do-not-echo"));
+        let message = cursor.to_checkpoint().unwrap_err().to_string();
+        assert!(message.contains("LDB-ICEBERG-CURSOR-METADATA-LOCATION"));
+        assert!(!message.contains("do-not-echo"));
+
+        let message = IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&cursor))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("LDB-ICEBERG-CURSOR-METADATA-LOCATION"));
+        assert!(!message.contains("do-not-echo"));
+    }
+
+    #[test]
+    fn noncanonical_cursor_identities_are_rejected() {
+        let mut invalid_catalog = cursor();
+        invalid_catalog.catalog_identity = "A".repeat(64);
+        assert!(
+            IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&invalid_catalog))
+                .unwrap_err()
+                .to_string()
+                .contains("LDB-ICEBERG-CURSOR-CATALOG-IDENTITY")
+        );
+
+        let mut invalid_uuid = cursor();
+        invalid_uuid.table_uuid = uuid::Uuid::nil().to_string();
+        assert!(
+            IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&invalid_uuid))
+                .unwrap_err()
+                .to_string()
+                .contains("LDB-ICEBERG-CURSOR-TABLE-UUID-FORMAT")
+        );
     }
 
     #[tokio::test]
