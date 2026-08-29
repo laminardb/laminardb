@@ -264,6 +264,7 @@ pub(crate) async fn build_catalog_for_access(
     build_catalog_for_access_with_metrics(config, storage, access, None).await
 }
 
+#[cfg(feature = "iceberg-catalog-rest")]
 pub(crate) async fn build_catalog_for_access_with_metrics(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
@@ -272,31 +273,44 @@ pub(crate) async fn build_catalog_for_access_with_metrics(
 ) -> Result<BuiltCatalog, ConnectorError> {
     match config.catalog_type {
         IcebergCatalogType::Rest => {
-            #[cfg(feature = "iceberg-catalog-rest")]
-            {
-                rest_catalog::build(config, storage, access, credential_refresh_failures).await
-            }
-            #[cfg(not(feature = "iceberg-catalog-rest"))]
-            {
-                let _ = (storage, access, credential_refresh_failures);
-                Err(ConnectorError::FeatureUnsupported(
-                    "iceberg.catalog.rest: build with the 'iceberg-catalog-rest' feature".into(),
-                ))
-            }
+            rest_catalog::build(config, storage, access, credential_refresh_failures).await
         }
-        IcebergCatalogType::Glue => Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.glue: released catalog APIs are not enabled in this build".into(),
-        )),
-        IcebergCatalogType::Hms => Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.hms: released catalog APIs are not enabled in this build".into(),
-        )),
-        IcebergCatalogType::S3Tables => Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.s3tables: released catalog APIs are not enabled in this build".into(),
-        )),
-        IcebergCatalogType::Sql => Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.sql: released catalog APIs are not enabled in this build".into(),
-        )),
+        other => Err(unsupported_catalog(other)),
     }
+}
+
+#[cfg(not(feature = "iceberg-catalog-rest"))]
+pub(crate) fn build_catalog_for_access_with_metrics(
+    config: &IcebergCatalogConfig,
+    _storage: &IcebergStorageConfig,
+    access: CatalogAccess,
+    _credential_refresh_failures: Option<prometheus::IntCounter>,
+) -> std::future::Ready<Result<BuiltCatalog, ConnectorError>> {
+    if let CatalogAccess::Write { auto_create } = access {
+        let _ = auto_create;
+    }
+    std::future::ready(Err(unsupported_catalog(config.catalog_type)))
+}
+
+fn unsupported_catalog(catalog_type: IcebergCatalogType) -> ConnectorError {
+    let message = match catalog_type {
+        IcebergCatalogType::Rest => {
+            "iceberg.catalog.rest: build with the 'iceberg-catalog-rest' feature"
+        }
+        IcebergCatalogType::Glue => {
+            "iceberg.catalog.glue: released catalog APIs are not enabled in this build"
+        }
+        IcebergCatalogType::Hms => {
+            "iceberg.catalog.hms: released catalog APIs are not enabled in this build"
+        }
+        IcebergCatalogType::S3Tables => {
+            "iceberg.catalog.s3tables: released catalog APIs are not enabled in this build"
+        }
+        IcebergCatalogType::Sql => {
+            "iceberg.catalog.sql: released catalog APIs are not enabled in this build"
+        }
+    };
+    ConnectorError::FeatureUnsupported(message.into())
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]

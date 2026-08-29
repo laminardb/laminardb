@@ -723,7 +723,7 @@ mod tests {
         );
         let template = RestCatalogTemplate::new(
             &config,
-            Arc::new(iceberg_storage_opendal::OpenDalStorageFactory::Fs),
+            Arc::new(iceberg::io::MemoryStorageFactory),
             client,
             properties,
         );

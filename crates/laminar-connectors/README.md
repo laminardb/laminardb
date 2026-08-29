@@ -51,7 +51,7 @@ backpressures rather than dropping rows.
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
 
-Iceberg REST supports no authentication or a resolved static bearer token. OAuth2 and access delegation fail closed until the released client provides the required refresh and remote-signing lifecycle.
+Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix.
 
 ### Upsert sinks and changelog collapse
 

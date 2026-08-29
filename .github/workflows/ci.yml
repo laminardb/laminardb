@@ -260,20 +260,21 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
           # Iceberg catalog and storage isolation
-          cargo check -p laminar-connectors --no-default-features --features iceberg-core
-          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-rest
-          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-glue
-          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-hms
-          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-s3tables
-          cargo check -p laminar-connectors --no-default-features --features iceberg-catalog-sql
-          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-s3
-          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-gcs
-          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-azure
-          cargo check -p laminar-connectors --no-default-features --features iceberg-storage-fs
-          cargo check -p laminar-connectors --no-default-features --features iceberg
-          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
-          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
-          cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-core
+          cargo clippy -p laminar-connectors --all-targets --no-default-features --features iceberg-core -- -D warnings
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-rest
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-glue
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-hms
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-s3tables
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-sql
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-s3
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-gcs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-azure
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-fs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
 
   iceberg-integration:
     name: Iceberg REST, S3, and cluster recovery

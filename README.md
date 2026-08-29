@@ -408,7 +408,7 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
 
 Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs. Iceberg's umbrella feature includes REST, S3, and local filesystem support; GCS and ADLS are isolated as `iceberg-storage-gcs` and `iceberg-storage-azure`. Glue, HMS, S3 Tables, and SQL Iceberg catalog selections currently return explicit unsupported-capability errors.
-Iceberg REST authentication currently supports no authentication or a resolved static bearer token. OAuth2 and access delegation fail closed until the released client can refresh catalog and vended storage credentials and support remote signing.
+Iceberg REST authentication supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication until the OAuth2 path has a cluster recovery fault matrix.
 
 ### Connector Example
 
