@@ -276,26 +276,34 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
 
   iceberg-integration:
-    name: Iceberg REST and S3 integration
+    name: Iceberg REST, S3, and cluster recovery
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: iceberg-integration
-      - name: Start Iceberg REST and MinIO
-        run: docker compose -f tests/docker/iceberg-compose.yml up -d --wait
+      - name: Start Iceberg REST, MinIO, and Redpanda
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml up -d --wait redpanda
       - name: Run Iceberg append integration tests
-        run: cargo test -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
+      - name: Run Iceberg cluster recovery test
+        run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka,iceberg" --test iceberg_cluster_soak -- --ignored --exact --test-threads=1 --nocapture
       - name: Capture service logs after failure
         if: failure()
         continue-on-error: true
-        run: docker compose -f tests/docker/iceberg-compose.yml logs --no-color
-      - name: Stop Iceberg REST and MinIO
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml logs --no-color
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml logs --no-color redpanda
+      - name: Stop Iceberg REST, MinIO, and Redpanda
         if: always()
-        run: docker compose -f tests/docker/iceberg-compose.yml down -v
+        run: |
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml down -v
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml down -v
 
   dependency-generations:
     name: Analytical Dependency Generations

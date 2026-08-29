@@ -9,6 +9,45 @@ use super::{CheckpointCoordinator, DbError, RegisteredSink};
 
 const MAX_EXTERNAL_SINK_COMMIT_CONCURRENCY: usize = 8;
 
+#[cfg(all(debug_assertions, feature = "cluster"))]
+async fn external_sink_commit_gate(
+    sink_name: &str,
+    attempt: CheckpointAttempt,
+    fencing_token: u64,
+) {
+    static GATE_FILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(gate_file) = GATE_FILE
+        .get_or_init(|| std::env::var_os("LAMINAR_EXTERNAL_SINK_COMMIT_GATE_FILE").map(Into::into))
+        .as_ref()
+    else {
+        return;
+    };
+    if std::fs::read_to_string(gate_file)
+        .ok()
+        .is_none_or(|requested| requested.trim() != sink_name)
+    {
+        return;
+    }
+
+    let ready_file = gate_file.with_extension("ready");
+    if std::fs::write(
+        &ready_file,
+        format!(
+            "{sink_name} {} {} {fencing_token}",
+            attempt.checkpoint_id, attempt.epoch
+        ),
+    )
+    .is_err()
+    {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    while gate_file.is_file() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let _ = std::fs::remove_file(ready_file);
+}
+
 impl CheckpointCoordinator {
     pub(super) async fn commit_external_sinks_until(
         &self,
@@ -134,6 +173,46 @@ impl CheckpointCoordinator {
             cursor
         };
 
+        let entries = self
+            .load_external_sink_entries(sink, attempt, manifests, deadline)
+            .await?;
+        let batch = CoordinatedCommitBatch {
+            namespace,
+            expected_predecessor,
+            fencing_token,
+            target: attempt,
+            entries,
+        };
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        let has_payload = batch.entries.iter().any(|entry| entry.payload.is_some());
+        batch.validate_shape().map_err(|error| {
+            DbError::Checkpoint(format!("sink '{}' commit batch: {error}", sink.name))
+        })?;
+        tokio::time::timeout_at(deadline, sink.handle.commit_aggregated(batch))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!("sink '{}' external commit timed out", sink.name))
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "sink '{}' external commit failed: {error}",
+                    sink.name
+                ))
+            })?;
+        #[cfg(all(debug_assertions, feature = "cluster"))]
+        if has_payload {
+            external_sink_commit_gate(&sink.name, attempt, fencing_token).await;
+        }
+        Ok(())
+    }
+
+    async fn load_external_sink_entries(
+        &self,
+        sink: &RegisteredSink,
+        attempt: CheckpointAttempt,
+        manifests: &[&CheckpointManifest],
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<CoordinatedCommitPayload>, DbError> {
         let mut entries = Vec::with_capacity(manifests.len());
         for manifest in manifests {
             let descriptor = manifest
@@ -168,26 +247,6 @@ impl CheckpointCoordinator {
             });
         }
         entries.sort_unstable_by_key(|entry| entry.participant_id);
-        let batch = CoordinatedCommitBatch {
-            namespace,
-            expected_predecessor,
-            fencing_token,
-            target: attempt,
-            entries,
-        };
-        batch.validate_shape().map_err(|error| {
-            DbError::Checkpoint(format!("sink '{}' commit batch: {error}", sink.name))
-        })?;
-        tokio::time::timeout_at(deadline, sink.handle.commit_aggregated(batch))
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(format!("sink '{}' external commit timed out", sink.name))
-            })?
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "sink '{}' external commit failed: {error}",
-                    sink.name
-                ))
-            })
+        Ok(entries)
     }
 }
