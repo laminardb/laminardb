@@ -22,6 +22,7 @@ use super::metrics::IcebergMetrics;
 
 type PartitionWriter =
     DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, ReplaySafeFileNameGenerator>;
+type PartitionBatch = (String, Option<PartitionKey>, RecordBatch);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct EpochIdentity {
@@ -37,6 +38,12 @@ struct ActiveWriter {
     opened_at: Instant,
     last_used: u64,
     has_written: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WriterAdmissionState {
+    last_used: u64,
+    starts_file: bool,
 }
 
 /// Immutable output returned after every writer is closed.
@@ -166,7 +173,6 @@ impl IcebergEpochWriter {
     }
 
     async fn write_bounded(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        self.close_expired_partitions().await?;
         let rows = u64::try_from(batch.num_rows()).map_err(|_| {
             ConnectorError::WriteError("Iceberg batch row count exceeds u64".into())
         })?;
@@ -178,14 +184,18 @@ impl IcebergEpochWriter {
                 .split(&batch)
                 .map_err(|error| iceberg_write_error("evaluate partition spec", &error))?
                 .into_iter()
-                .map(|(partition, batch)| (Some(partition), batch))
+                .map(|(partition, batch)| (partition.to_path(), Some(partition), batch))
                 .collect::<Vec<_>>(),
-            None => vec![(None, batch)],
+            None => vec![(String::new(), None, batch)],
         };
-        partitions.sort_by_key(|(partition, _)| partition_path(partition.as_ref()));
+        partitions.sort_by(|left, right| left.0.cmp(&right.0));
+        let rotation_cutoff = Instant::now();
+        self.preflight_batch(&partitions, rotation_cutoff)?;
+        self.close_expired_partitions(rotation_cutoff).await?;
 
-        for (partition, partition_batch) in partitions {
-            self.write_partition(partition, partition_batch).await?;
+        for (key, partition, partition_batch) in partitions {
+            self.write_partition(key, partition, partition_batch)
+                .await?;
         }
         self.rows = self
             .rows
@@ -199,10 +209,10 @@ impl IcebergEpochWriter {
 
     async fn write_partition(
         &mut self,
+        key: String,
         partition: Option<PartitionKey>,
         batch: RecordBatch,
     ) -> Result<(), ConnectorError> {
-        let key = partition_path(partition.as_ref());
         self.prepare_partition(&key).await?;
         if !self.active.contains_key(&key) {
             self.open_partition(key.clone(), partition).await?;
@@ -219,10 +229,7 @@ impl IcebergEpochWriter {
                 ConnectorError::WriteError("Iceberg epoch file count overflow".into())
             })?;
             if next > self.max_files {
-                return Err(ConnectorError::WriteError(format!(
-                    "Iceberg checkpoint would exceed max.files.per.checkpoint ({})",
-                    self.max_files
-                )));
+                return Err(file_limit_error(self.max_files));
             }
             self.file_count = next;
         }
@@ -236,6 +243,118 @@ impl IcebergEpochWriter {
         Ok(())
     }
 
+    fn preflight_batch(
+        &self,
+        partitions: &[PartitionBatch],
+        rotation_cutoff: Instant,
+    ) -> Result<(), ConnectorError> {
+        let mut keys = HashSet::with_capacity(partitions.len());
+        for (key, _, _) in partitions {
+            if !keys.insert(key.as_str()) {
+                return Err(ConnectorError::Internal(
+                    "Iceberg partition splitter returned a duplicate partition".into(),
+                ));
+            }
+        }
+        let additional_files = match self.distribution {
+            IcebergWriteDistributionMode::Clustered => {
+                self.preflight_clustered(partitions, rotation_cutoff)?
+            }
+            IcebergWriteDistributionMode::Fanout => {
+                self.preflight_fanout(partitions, rotation_cutoff)?
+            }
+        };
+        let projected = self
+            .file_count
+            .checked_add(additional_files)
+            .ok_or_else(|| {
+                ConnectorError::WriteError("Iceberg epoch file count overflow".into())
+            })?;
+        if projected > self.max_files {
+            return Err(file_limit_error(self.max_files));
+        }
+        Ok(())
+    }
+
+    fn preflight_clustered(
+        &self,
+        partitions: &[PartitionBatch],
+        rotation_cutoff: Instant,
+    ) -> Result<usize, ConnectorError> {
+        let mut current = self.clustered_current.clone();
+        let mut newly_closed = HashSet::new();
+        let mut additional_files = 0_usize;
+        for (key, _, _) in partitions {
+            if current.as_deref() == Some(key) {
+                let starts_file = self.active.get(key).is_none_or(|active| {
+                    self.writer_expired(active, rotation_cutoff)
+                        || !active.has_written
+                        || active.writer.current_written_size() > self.target_file_size_bytes
+                });
+                additional_files = add_file_start(additional_files, starts_file)?;
+                continue;
+            }
+            if self.clustered_closed.contains(key) || newly_closed.contains(key) {
+                return Err(clustered_partition_error(key));
+            }
+            if let Some(previous) = current.replace(key.clone()) {
+                newly_closed.insert(previous);
+            }
+            additional_files = add_file_start(additional_files, true)?;
+        }
+        Ok(additional_files)
+    }
+
+    fn preflight_fanout(
+        &self,
+        partitions: &[PartitionBatch],
+        rotation_cutoff: Instant,
+    ) -> Result<usize, ConnectorError> {
+        let mut active = self
+            .active
+            .iter()
+            .filter(|(_, writer)| !self.writer_expired(writer, rotation_cutoff))
+            .map(|(key, writer)| {
+                (
+                    key.clone(),
+                    WriterAdmissionState {
+                        last_used: writer.last_used,
+                        starts_file: !writer.has_written
+                            || writer.writer.current_written_size() > self.target_file_size_bytes,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut use_clock = self.use_clock;
+        let mut additional_files = 0_usize;
+        for (key, _, _) in partitions {
+            if !active.contains_key(key) && active.len() >= self.max_open_partitions {
+                let evicted = least_recently_used(&active).ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "Iceberg fanout preflight found no writer to evict".into(),
+                    )
+                })?;
+                active.remove(&evicted);
+            }
+            let writer = active.entry(key.clone()).or_insert(WriterAdmissionState {
+                last_used: use_clock,
+                starts_file: true,
+            });
+            additional_files = add_file_start(additional_files, writer.starts_file)?;
+            use_clock = use_clock.saturating_add(1);
+            writer.last_used = use_clock;
+            writer.starts_file = false;
+        }
+        Ok(additional_files)
+    }
+
+    fn writer_expired(&self, writer: &ActiveWriter, cutoff: Instant) -> bool {
+        writer.has_written
+            && cutoff
+                .checked_duration_since(writer.opened_at)
+                .is_some_and(|age| age >= self.max_flush_age)
+    }
+
     async fn prepare_partition(&mut self, key: &str) -> Result<(), ConnectorError> {
         match self.distribution {
             IcebergWriteDistributionMode::Clustered => {
@@ -243,9 +362,7 @@ impl IcebergEpochWriter {
                     return Ok(());
                 }
                 if self.clustered_closed.contains(key) {
-                    return Err(ConnectorError::WriteError(format!(
-                        "clustered Iceberg input returned to closed partition '{key}'"
-                    )));
+                    return Err(clustered_partition_error(key));
                 }
                 if let Some(previous) = self.clustered_current.take() {
                     self.close_partition(&previous).await?;
@@ -267,13 +384,11 @@ impl IcebergEpochWriter {
         Ok(())
     }
 
-    async fn close_expired_partitions(&mut self) -> Result<(), ConnectorError> {
+    async fn close_expired_partitions(&mut self, cutoff: Instant) -> Result<(), ConnectorError> {
         let mut expired = self
             .active
             .iter()
-            .filter(|(_, active)| {
-                active.has_written && active.opened_at.elapsed() >= self.max_flush_age
-            })
+            .filter(|(_, active)| self.writer_expired(active, cutoff))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         expired.sort_unstable();
@@ -375,8 +490,36 @@ impl IcebergEpochWriter {
     }
 }
 
-fn partition_path(partition: Option<&PartitionKey>) -> String {
-    partition.map(PartitionKey::to_path).unwrap_or_default()
+fn add_file_start(current: usize, starts_file: bool) -> Result<usize, ConnectorError> {
+    if !starts_file {
+        return Ok(current);
+    }
+    current
+        .checked_add(1)
+        .ok_or_else(|| ConnectorError::WriteError("Iceberg epoch file count overflow".into()))
+}
+
+fn least_recently_used(active: &HashMap<String, WriterAdmissionState>) -> Option<String> {
+    active
+        .iter()
+        .min_by(|(left_key, left), (right_key, right)| {
+            left.last_used
+                .cmp(&right.last_used)
+                .then_with(|| left_key.cmp(right_key))
+        })
+        .map(|(key, _)| key.clone())
+}
+
+fn file_limit_error(max_files: usize) -> ConnectorError {
+    ConnectorError::WriteError(format!(
+        "Iceberg checkpoint would exceed max.files.per.checkpoint ({max_files})"
+    ))
+}
+
+fn clustered_partition_error(key: &str) -> ConnectorError {
+    ConnectorError::WriteError(format!(
+        "clustered Iceberg input returned to closed partition '{key}'"
+    ))
 }
 
 fn approximate_row_group_rows(config: &IcebergSinkConfig) -> usize {
@@ -525,6 +668,108 @@ mod tests {
             .await
             .expect_err("second file must exceed the checkpoint bound");
         assert!(error.to_string().contains("max.files.per.checkpoint"));
+        assert_eq!(writer.rows, 1);
+        assert_eq!(writer.active.len(), 1);
+        assert!(writer.completed.is_empty());
+        assert_eq!(writer.file_count, 1);
+    }
+
+    #[tokio::test]
+    async fn partitioned_file_limit_rejects_before_opening_any_writer() {
+        let fixture = create_test_table(true).await;
+        let mut config = fixture.config;
+        config.max_open_partitions = 2;
+        config.max_files_per_checkpoint = 2;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(25),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+
+        let error = writer
+            .write(batch(
+                &fixture.table,
+                &[(1, Some("a")), (2, Some("b")), (3, Some("c"))],
+            ))
+            .await
+            .expect_err("three partitions must exceed the two-file limit");
+
+        assert!(error.to_string().contains("max.files.per.checkpoint"));
+        assert!(writer.active.is_empty());
+        assert!(writer.completed.is_empty());
+        assert_eq!(writer.file_count, 0);
+        assert_eq!(writer.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn fanout_preflight_accounts_for_reopening_an_evicted_partition() {
+        let fixture = create_test_table(true).await;
+        let mut config = fixture.config;
+        config.max_open_partitions = 2;
+        config.max_files_per_checkpoint = 3;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(26),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("z"))]))
+            .await
+            .unwrap();
+        writer
+            .write(batch(&fixture.table, &[(2, Some("a"))]))
+            .await
+            .unwrap();
+        let active_before = writer.active.keys().cloned().collect::<HashSet<_>>();
+
+        let error = writer
+            .write(batch(&fixture.table, &[(3, Some("b")), (4, Some("z"))]))
+            .await
+            .expect_err("opening b must evict z, so z needs a fourth file");
+
+        assert!(error.to_string().contains("max.files.per.checkpoint"));
+        assert_eq!(
+            writer.active.keys().cloned().collect::<HashSet<_>>(),
+            active_before
+        );
+        assert!(writer.completed.is_empty());
+        assert_eq!(writer.file_count, 2);
+        assert_eq!(writer.rows, 2);
+    }
+
+    #[tokio::test]
+    async fn clustered_preflight_rejects_return_before_closing_current_partition() {
+        let fixture = create_test_table(true).await;
+        let mut config = fixture.config;
+        config.distribution_mode = IcebergWriteDistributionMode::Clustered;
+        config.max_open_partitions = 1;
+        config.max_files_per_checkpoint = 8;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(27),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("z"))]))
+            .await
+            .unwrap();
+
+        let error = writer
+            .write(batch(&fixture.table, &[(2, Some("a")), (3, Some("z"))]))
+            .await
+            .expect_err("sorted a,z input returns to the current z partition");
+
+        assert!(error.to_string().contains("closed partition 'category=z'"));
+        assert_eq!(writer.clustered_current.as_deref(), Some("category=z"));
+        assert!(writer.active.contains_key("category=z"));
+        assert!(writer.completed.is_empty());
+        assert_eq!(writer.file_count, 1);
         assert_eq!(writer.rows, 1);
     }
 
