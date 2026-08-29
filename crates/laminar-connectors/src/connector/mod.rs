@@ -451,6 +451,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.external_key(), same.external_key());
+        assert_eq!(
+            first.external_key(),
+            "ldb-c3-ab2cbc74e7e5dc7bbbde532272f6e7998fba65710e88151f4d1dd24e97fa0b56"
+        );
         assert_ne!(first.external_key(), other.external_key());
         assert_ne!(first.external_key(), other_deployment.external_key());
         assert_eq!(first.external_key().len(), "ldb-c3-".len() + 64);
@@ -511,6 +515,14 @@ mod tests {
         };
         let expected = batch.exact_fingerprint();
         assert_eq!(expected, batch.clone().exact_fingerprint());
+        assert_eq!(
+            expected,
+            [
+                0x58, 0x5e, 0xa2, 0xf8, 0xdf, 0x8c, 0xd0, 0x3a, 0xca, 0x01, 0xed, 0x95, 0x7e, 0xe6,
+                0xc1, 0xf0, 0x36, 0x41, 0x28, 0xbd, 0xd6, 0xe1, 0xb6, 0xfa, 0x21, 0xbe, 0xf7, 0x4f,
+                0x97, 0xf7, 0xa5, 0xc4,
+            ]
+        );
 
         let mut variants = Vec::new();
         let mut variant = batch.clone();
