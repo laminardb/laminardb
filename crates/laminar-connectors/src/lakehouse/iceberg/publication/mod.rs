@@ -1136,6 +1136,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_size_invalid_parquet_file_is_rejected_before_catalog_commit() {
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+        let file = IcebergCommitDescriptorV1::decode(&payload).unwrap().files[0].clone();
+        let mut corrupt = vec![b'x'; usize::try_from(file.bytes).unwrap()];
+        let trailer_magic = corrupt.len() - 4;
+        corrupt[..4].copy_from_slice(b"PAR1");
+        corrupt[trailer_magic..].copy_from_slice(b"PAR1");
+        fixture
+            .table
+            .file_io()
+            .new_output(&file.path)
+            .unwrap()
+            .write(bytes::Bytes::from(corrupt))
+            .await
+            .unwrap();
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let error = publish_coordinated(
+            &fixture.catalog,
+            &NO_CATALOG_CAPABILITIES,
+            &CatalogSession::default(),
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .expect_err("a same-size invalid Parquet participant file must not be published");
+        assert!(error.to_string().contains("LDB-ICEBERG-DATA-FILE-PARQUET"));
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
+    }
+
+    #[tokio::test]
     async fn reconciliation_rejects_a_matching_detached_snapshot() {
         use iceberg::spec::{Operation, Snapshot, Summary};
 
