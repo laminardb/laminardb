@@ -9,6 +9,7 @@ mod descriptor;
 mod epoch_writer;
 #[cfg(all(test, feature = "iceberg-core"))]
 mod fault_injection;
+#[cfg(feature = "iceberg-core")]
 mod file_finalizer;
 #[cfg(feature = "iceberg-core")]
 mod metrics;

@@ -405,6 +405,7 @@ impl IcebergSource {
 impl SourceConnector for IcebergSource {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        #[cfg(feature = "iceberg-core")]
         let declared_schema = if config.get("_arrow_schema").is_some() {
             let schema = config.arrow_schema().ok_or_else(|| {
                 ConnectorError::ConfigurationError(
