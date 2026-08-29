@@ -45,7 +45,7 @@ use planner::{ScanOutput, ScanTask};
 use read_schema::ReadSchemaBinding;
 
 #[cfg(feature = "iceberg-core")]
-pub use cursor::IcebergSourceCursorV1;
+pub use cursor::{IcebergSourceCursorOriginV1, IcebergSourceCursorV1};
 
 #[cfg(feature = "iceberg-core")]
 struct PendingBatch {
@@ -278,8 +278,16 @@ impl IcebergSource {
             self.bind_read_schema(&root_schema, None)?;
         }
         let Some(snapshot) = selected else {
-            self.bounded_snapshot_complete = self.config.read_mode == IcebergReadMode::Snapshot;
-            return Ok(());
+            if self.config.read_mode == IcebergReadMode::Snapshot {
+                self.bounded_snapshot_complete = true;
+                return Ok(());
+            }
+            let cursor = IcebergSourceCursorV1::from_empty_table(
+                &self.config,
+                &table,
+                self.read_schema()?.schema_id(),
+            )?;
+            return self.install_cursor(cursor);
         };
         let cursor = IcebergSourceCursorV1::from_snapshot(
             &self.config,

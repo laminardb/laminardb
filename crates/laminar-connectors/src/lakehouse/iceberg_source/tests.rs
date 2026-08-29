@@ -22,6 +22,7 @@ fn replay_cursor(snapshot_id: i64) -> IcebergSourceCursorV1 {
         table_uuid: "018f0f9d-7b2f-7a61-b72d-f4be1c7f43e1".into(),
         table_identifier: "test.events".into(),
         table_ref: "main".into(),
+        origin: IcebergSourceCursorOriginV1::Snapshot,
         snapshot_id,
         sequence_number: snapshot_id,
         read_schema_id: 0,
@@ -318,6 +319,52 @@ async fn append_without_bootstrap_rejects_unbound_filter_before_cursor_install()
     assert!(error.to_string().contains("FILTER-BIND"));
     assert!(source.cursor.is_none());
     assert!(source.scan.is_none());
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn empty_append_checkpoint_resumes_before_the_first_snapshot() {
+    use arrow_array::Int64Array;
+
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::None;
+    let mut initial = IcebergSource::new(config.clone(), None);
+    initial.table = Some(fixture.table.clone());
+    initial.start_initial_scan().unwrap();
+
+    let checkpoint = initial.try_checkpoint().unwrap().unwrap();
+    let empty_cursor = IcebergSourceCursorV1::from_checkpoint(&checkpoint).unwrap();
+    assert!(empty_cursor.is_empty_table());
+    assert!(initial.scan.is_none());
+    initial.close().await.unwrap();
+
+    let (current, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("first"))]).await;
+    empty_cursor.validate_binding(&config, &current).unwrap();
+    let retained_schema = empty_cursor.retained_schema(&current).unwrap();
+    let mut resumed = IcebergSource::new(config, None);
+    resumed.bind_read_schema(&retained_schema, None).unwrap();
+    resumed.catalog = Some(Arc::clone(&fixture.catalog));
+    resumed.table = Some(current);
+    resumed.install_cursor(empty_cursor).unwrap();
+
+    let batch = resumed.poll_batch(8_192).await.unwrap().unwrap();
+    let ids = batch
+        .records
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1]);
+    assert!(
+        !IcebergSourceCursorV1::from_checkpoint(&resumed.checkpoint())
+            .unwrap()
+            .is_empty_table()
+    );
+    resumed.close().await.unwrap();
 }
 
 #[cfg(feature = "iceberg-core")]

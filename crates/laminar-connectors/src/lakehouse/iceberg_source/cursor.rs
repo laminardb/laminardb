@@ -11,6 +11,23 @@ const CURSOR_KEY: &str = "iceberg.cursor";
 const CURSOR_VERSION: u8 = 1;
 const MAX_CURSOR_BYTES: usize = 16 * 1024;
 
+/// Origin represented by an Iceberg source cursor.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IcebergSourceCursorOriginV1 {
+    /// A concrete Iceberg snapshot.
+    #[default]
+    Snapshot,
+    /// The durable table state before its first snapshot.
+    EmptyTable,
+}
+
+impl IcebergSourceCursorOriginV1 {
+    fn is_snapshot(&self) -> bool {
+        self == &Self::Snapshot
+    }
+}
+
 /// Replay position for an Iceberg snapshot lineage.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +42,12 @@ pub struct IcebergSourceCursorV1 {
     pub table_identifier: String,
     /// Iceberg ref followed by this source.
     pub table_ref: String,
+    /// Durable origin of the replay position.
+    #[serde(
+        default,
+        skip_serializing_if = "IcebergSourceCursorOriginV1::is_snapshot"
+    )]
+    pub origin: IcebergSourceCursorOriginV1,
     /// Last completely emitted snapshot.
     pub snapshot_id: i64,
     /// Sequence number of that snapshot.
@@ -49,6 +72,7 @@ impl fmt::Debug for IcebergSourceCursorV1 {
             .field("table_uuid", &self.table_uuid)
             .field("table_identifier", &table_identifier)
             .field("table_ref", &table_ref)
+            .field("origin", &self.origin)
             .field("snapshot_id", &self.snapshot_id)
             .field("sequence_number", &self.sequence_number)
             .field("read_schema_id", &self.read_schema_id)
@@ -70,11 +94,40 @@ impl IcebergSourceCursorV1 {
             table_uuid: table.metadata().uuid().to_string(),
             table_identifier: table_identifier(config),
             table_ref: config.table_ref.clone(),
+            origin: IcebergSourceCursorOriginV1::Snapshot,
             snapshot_id: snapshot.snapshot_id(),
             sequence_number: snapshot.sequence_number(),
             read_schema_id,
             metadata_location: table.metadata_location().unwrap_or_default().to_string(),
         }
+    }
+
+    pub(super) fn from_empty_table(
+        config: &IcebergSourceConfig,
+        table: &Table,
+        read_schema_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        let metadata_location = table
+            .metadata_location()
+            .filter(|location| !location.is_empty())
+            .ok_or_else(|| {
+                ConnectorError::FeatureUnsupported(
+                    "[LDB-ICEBERG-EMPTY-CURSOR-METADATA] append from an empty table requires a durable metadata location"
+                        .into(),
+                )
+            })?;
+        Ok(Self {
+            version: CURSOR_VERSION,
+            catalog_identity: stable_catalog_identity(&config.catalog, &config.storage),
+            table_uuid: table.metadata().uuid().to_string(),
+            table_identifier: table_identifier(config),
+            table_ref: config.table_ref.clone(),
+            origin: IcebergSourceCursorOriginV1::EmptyTable,
+            snapshot_id: 0,
+            sequence_number: 0,
+            read_schema_id,
+            metadata_location: metadata_location.to_string(),
+        })
     }
 
     pub(super) fn validate_binding(
@@ -105,6 +158,10 @@ impl IcebergSourceCursorV1 {
                 "LDB-ICEBERG-CURSOR-REF",
                 "checkpoint table ref differs from configured table ref",
             ));
+        }
+        if self.is_empty_table() {
+            self.retained_schema(table)?;
+            return Ok(());
         }
         let snapshot = table
             .metadata()
@@ -206,6 +263,18 @@ impl IcebergSourceCursorV1 {
                 &format!("unsupported cursor version {}", self.version),
             ));
         }
+        if self.is_empty_table() && (self.snapshot_id != 0 || self.sequence_number != 0) {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-EMPTY-POSITION",
+                "empty-table cursor contains a snapshot or sequence position",
+            ));
+        }
+        if self.is_empty_table() && self.table_ref != "main" {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-EMPTY-REF",
+                "empty-table cursor must follow the main ref",
+            ));
+        }
         if self.catalog_identity.len() != 64
             || !self
                 .catalog_identity
@@ -258,6 +327,10 @@ impl IcebergSourceCursorV1 {
         }
         Ok(())
     }
+
+    pub(super) fn is_empty_table(&self) -> bool {
+        self.origin == IcebergSourceCursorOriginV1::EmptyTable
+    }
 }
 
 fn cursor_error(code: &str, detail: &str) -> ConnectorError {
@@ -279,6 +352,7 @@ mod tests {
             table_uuid: "018f0f9d-7b2f-7a61-b72d-f4be1c7f43e1".into(),
             table_identifier: "ns.table".into(),
             table_ref: "main".into(),
+            origin: IcebergSourceCursorOriginV1::Snapshot,
             snapshot_id: 42,
             sequence_number: 7,
             read_schema_id: 3,
@@ -301,6 +375,39 @@ mod tests {
             IcebergSourceCursorV1::from_checkpoint(&checkpoint).unwrap(),
             cursor
         );
+    }
+
+    #[test]
+    fn empty_table_position_is_explicit_and_version_compatible() {
+        let regular = cursor();
+        let regular_json = serde_json::to_value(&regular).unwrap();
+        assert!(regular_json.get("origin").is_none());
+        assert_eq!(
+            IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&regular)).unwrap(),
+            regular
+        );
+
+        let mut empty = cursor();
+        empty.origin = IcebergSourceCursorOriginV1::EmptyTable;
+        empty.snapshot_id = 0;
+        empty.sequence_number = 0;
+        assert_eq!(
+            IcebergSourceCursorV1::from_checkpoint(&empty.to_checkpoint().unwrap()).unwrap(),
+            empty
+        );
+
+        empty.snapshot_id = 1;
+        let error = IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&empty))
+            .expect_err("empty position must not conceal a snapshot");
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-EMPTY-POSITION"));
+
+        empty.snapshot_id = 0;
+        empty.table_ref = "audit".into();
+        let error = IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&empty))
+            .expect_err("an empty cursor cannot invent a branch origin");
+        assert!(error.to_string().contains("LDB-ICEBERG-CURSOR-EMPTY-REF"));
     }
 
     #[test]

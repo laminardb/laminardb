@@ -63,24 +63,28 @@ fn lineage_after(
     max_snapshots: usize,
 ) -> Result<Vec<SnapshotRef>, ConnectorError> {
     let metadata = table.metadata();
-    if metadata.snapshot_by_id(cursor.snapshot_id).is_none() {
+    if !cursor.is_empty_table() && metadata.snapshot_by_id(cursor.snapshot_id).is_none() {
         return Err(ConnectorError::ConfigurationError(
             "[LDB-ICEBERG-CURSOR-EXPIRED] checkpoint snapshot is absent from retained table history"
                 .into(),
         ));
     }
-    let mut snapshot = metadata
-        .snapshot_for_ref(&cursor.table_ref)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "[LDB-ICEBERG-CURSOR-REF-MISSING] table ref '{}' no longer exists",
-                cursor.table_ref
-            ))
-        })?
-        .clone();
+    let Some(mut snapshot) = metadata.snapshot_for_ref(&cursor.table_ref).cloned() else {
+        if cursor.is_empty_table()
+            && cursor.table_ref == "main"
+            && metadata.current_snapshot().is_none()
+            && table.metadata_location() == Some(cursor.metadata_location.as_str())
+        {
+            return Ok(Vec::new());
+        }
+        return Err(ConnectorError::ConfigurationError(format!(
+            "[LDB-ICEBERG-CURSOR-REF-MISSING] table ref '{}' no longer exists",
+            cursor.table_ref
+        )));
+    };
     let mut reverse_lineage = Vec::new();
     let mut visited = HashSet::new();
-    while snapshot.snapshot_id() != cursor.snapshot_id {
+    while cursor.is_empty_table() || snapshot.snapshot_id() != cursor.snapshot_id {
         if reverse_lineage.len() == max_snapshots {
             return Err(ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-APPEND-SNAPSHOT-LIMIT] lineage exceeded read.max.snapshots.per.poll"
@@ -93,12 +97,15 @@ fn lineage_after(
             ));
         }
         reverse_lineage.push(snapshot.clone());
-        let parent_id = snapshot.parent_snapshot_id().ok_or_else(|| {
-            ConnectorError::ConfigurationError(
+        let Some(parent_id) = snapshot.parent_snapshot_id() else {
+            if cursor.is_empty_table() {
+                break;
+            }
+            return Err(ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-CURSOR-DIVERGED] checkpoint snapshot is not an ancestor of the configured ref"
                     .into(),
-            )
-        })?;
+            ));
+        };
         snapshot = metadata.snapshot_by_id(parent_id).cloned().ok_or_else(|| {
             ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-CURSOR-EXPIRED] snapshot history needed for resume has expired"
@@ -106,8 +113,45 @@ fn lineage_after(
             )
         })?;
     }
+    if cursor.is_empty_table() {
+        validate_empty_origin(table, cursor, &reverse_lineage)?;
+    }
     reverse_lineage.reverse();
     Ok(reverse_lineage)
+}
+
+fn validate_empty_origin(
+    table: &Table,
+    cursor: &IcebergSourceCursorV1,
+    reverse_lineage: &[SnapshotRef],
+) -> Result<(), ConnectorError> {
+    let metadata = table.metadata();
+    let complete_main_history = metadata.history().len() == reverse_lineage.len()
+        && metadata
+            .history()
+            .iter()
+            .zip(reverse_lineage.iter().rev())
+            .all(|(history, snapshot)| history.snapshot_id == snapshot.snapshot_id());
+    if !complete_main_history {
+        return Err(ConnectorError::ConfigurationError(
+            "[LDB-ICEBERG-CURSOR-DIVERGED] current main snapshot history diverged after the empty-table cursor"
+                .into(),
+        ));
+    }
+    let retained_metadata = table
+        .metadata_location()
+        .is_some_and(|location| location == cursor.metadata_location.as_str())
+        || metadata
+            .metadata_log()
+            .iter()
+            .any(|entry| entry.metadata_file == cursor.metadata_location.as_str());
+    if retained_metadata {
+        return Ok(());
+    }
+    Err(ConnectorError::ConfigurationError(
+        "[LDB-ICEBERG-CURSOR-EXPIRED] metadata and snapshot history needed for the empty-table cursor have expired"
+            .into(),
+    ))
 }
 
 async fn added_files_for_snapshot(
@@ -307,6 +351,46 @@ mod tests {
             third.metadata().current_schema_id(),
         );
         assert!(plan(&third, &current, &config).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_cursor_requires_retained_origin_evidence() {
+        let fixture = create_test_table(false).await;
+        let config = source_config(&fixture);
+        let cursor = IcebergSourceCursorV1::from_empty_table(
+            &config,
+            &fixture.table,
+            fixture.table.metadata().current_schema_id(),
+        )
+        .unwrap();
+        let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, None)]).await;
+        assert_eq!(plan(&first, &cursor, &config).await.unwrap().len(), 1);
+
+        let mut unprovable = cursor;
+        unprovable.metadata_location = "memory:///expired/metadata.json".into();
+        let error = plan(&first, &unprovable, &config).await.unwrap_err();
+        assert!(error.to_string().contains("LDB-ICEBERG-CURSOR-EXPIRED"));
+
+        let cursor = IcebergSourceCursorV1::from_empty_table(
+            &config,
+            &fixture.table,
+            fixture.table.metadata().current_schema_id(),
+        )
+        .unwrap();
+        let first_snapshot_id = first.metadata().current_snapshot_id().unwrap();
+        let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
+        let metadata = second
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_ref("main", branch(first_snapshot_id))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let rewound = table_with_metadata(&second, metadata);
+        let error = plan(&rewound, &cursor, &config).await.unwrap_err();
+        assert!(error.to_string().contains("LDB-ICEBERG-CURSOR-DIVERGED"));
     }
 
     #[tokio::test]
