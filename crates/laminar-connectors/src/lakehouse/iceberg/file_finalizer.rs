@@ -341,7 +341,10 @@ fn rebuild_data_file(
 }
 
 fn file_error(operation: &str, error: &iceberg::Error) -> ConnectorError {
-    ConnectorError::WriteError(format!("Iceberg {operation}: {error}"))
+    ConnectorError::WriteError(format!(
+        "Iceberg {operation} ({})",
+        crate::lakehouse::iceberg_io::external_error_summary(error)
+    ))
 }
 
 #[cfg(test)]

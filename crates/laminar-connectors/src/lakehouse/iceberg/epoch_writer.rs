@@ -398,7 +398,10 @@ fn approximate_row_group_rows(config: &IcebergSinkConfig) -> usize {
 }
 
 fn iceberg_write_error(context: &str, error: &iceberg::Error) -> ConnectorError {
-    ConnectorError::WriteError(format!("Iceberg {context}: {error}"))
+    ConnectorError::WriteError(format!(
+        "Iceberg {context} ({})",
+        crate::lakehouse::iceberg_io::external_error_summary(error)
+    ))
 }
 
 #[cfg(test)]

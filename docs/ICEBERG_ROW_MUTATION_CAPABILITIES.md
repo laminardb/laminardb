@@ -1,8 +1,8 @@
 # Iceberg row-mutation capability decision
 
 - **Status:** accepted
-- **Updated:** 2026-08-28
-- **Applies to:** embedded and single-node Iceberg connectors; cluster admission remains unchanged
+- **Updated:** 2026-08-29
+- **Applies to:** Iceberg connectors in embedded, single-node, and cluster modes
 
 ## Decision
 
@@ -39,8 +39,10 @@ Copy-on-write may be enabled only after one released dependency set provides and
 - deterministic replacement-file replay and unknown-outcome reconciliation; and
 - an explicit limit failure instead of a whole-table rewrite fallback.
 
-Each mode requires its own capability gate and recovery matrix. Cluster exactly-once admission is a
-separate decision and is not implied by local connector support.
+Each mode requires its own capability gate and recovery matrix. Cluster exactly-once admission is
+independently limited to coordinated append through a REST catalog and direct S3/S3A storage, with
+static bearer or no catalog authentication and no access delegation. That append certification
+does not imply cluster support for either row-mutation mode.
 
 ## Consequences
 

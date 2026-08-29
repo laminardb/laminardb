@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::connector::{CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor};
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
+use crate::lakehouse::iceberg_io::{external_error_summary, validate_loaded_table_locations};
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
 use super::descriptor::{
@@ -313,7 +314,8 @@ async fn publish_with_retries(
                 metrics.commit_conflicts.inc();
                 if attempt + 1 == MAX_PUBLICATION_ATTEMPTS {
                     return Err(ConnectorError::WriteError(format!(
-                        "Iceberg catalog commit conflict after {MAX_PUBLICATION_ATTEMPTS} bounded attempts: {error}"
+                        "Iceberg catalog commit conflict after {MAX_PUBLICATION_ATTEMPTS} bounded attempts ({})",
+                        external_error_summary(&error)
                     )));
                 }
                 jitter_before_retry(context.deadline(), attempt).await?;
@@ -329,7 +331,7 @@ async fn publish_with_retries(
                     identity.commit_uuid,
                     context.deadline(),
                     metrics,
-                    format!("catalog commit returned {error}"),
+                    format!("catalog commit returned {}", external_error_summary(&error)),
                 )
                 .await;
             }
@@ -662,13 +664,24 @@ async fn load_table_until(
     }
     let ident = table_ident(config)?;
     match tokio::time::timeout_at(deadline, catalog.load_table(&ident)).await {
-        Ok(Ok(table)) => Ok(table),
+        Ok(Ok(table)) => match validate_loaded_table_locations(&table) {
+            Ok(()) => Ok(table),
+            Err(error) if unknown_context => Err(ConnectorError::outcome_unknown(
+                format!("Iceberg metadata refresh after ambiguous publication was unsafe: {error}"),
+                false,
+            )),
+            Err(error) => Err(error),
+        },
         Ok(Err(error)) if unknown_context => Err(ConnectorError::outcome_unknown(
-            format!("Iceberg metadata refresh after ambiguous publication failed: {error}"),
+            format!(
+                "Iceberg metadata refresh after ambiguous publication failed ({})",
+                external_error_summary(&error)
+            ),
             true,
         )),
         Ok(Err(error)) => Err(ConnectorError::ReadError(format!(
-            "refresh Iceberg table metadata: {error}"
+            "refresh Iceberg table metadata ({})",
+            external_error_summary(&error)
         ))),
         Err(_) if unknown_context => Err(ConnectorError::outcome_unknown(
             "Iceberg metadata refresh after ambiguous publication exceeded its deadline",
@@ -724,8 +737,8 @@ fn commit_outcome_may_be_unknown(error: &iceberg::Error) -> bool {
 
 fn classify_rejected_commit(error: &iceberg::Error) -> ConnectorError {
     ConnectorError::TransactionError(format!(
-        "Iceberg catalog rejected coordinated commit ({}): {error}",
-        error.kind()
+        "Iceberg catalog rejected coordinated commit ({})",
+        external_error_summary(error)
     ))
 }
 

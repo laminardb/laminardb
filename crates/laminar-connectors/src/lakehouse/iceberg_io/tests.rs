@@ -31,6 +31,36 @@ fn catalog_commit_failure_has_unknown_outcome() {
 }
 
 #[test]
+fn external_errors_do_not_expose_provider_messages() {
+    let source = iceberg::Error::new(
+        iceberg::ErrorKind::Unexpected,
+        "https://user:secret@objects.test/data?token=credential",
+    )
+    .with_retryable(true);
+    let summary = external_error_summary(&source);
+    let commit = iceberg_commit_error(&source).to_string();
+    for value in [summary, commit] {
+        assert!(value.contains("Unexpected"));
+        assert!(!value.contains("secret"));
+        assert!(!value.contains("credential"));
+    }
+}
+
+#[test]
+fn credential_bearing_catalog_locations_are_rejected_without_echoing() {
+    for location in [
+        "https://user:location-secret@objects.test/table",
+        "s3://bucket/metadata.json?X-Amz-Signature=location-secret",
+    ] {
+        let error = validate_credential_free_location("test location", location)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-CREDENTIAL-LOCATION"));
+        assert!(!error.contains("location-secret"));
+    }
+}
+
+#[test]
 fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
     let source = iceberg::Error::new(
         iceberg::ErrorKind::CatalogCommitConflicts,
@@ -117,10 +147,15 @@ fn rest_auth_fails_closed_when_refresh_or_token_is_unavailable() {
         config.set("catalog.auth.type", "oauth2");
         config.set("catalog.property.credential", "client:secret");
     });
-    assert!(matches!(
-        validate_rest_auth(&oauth).unwrap_err(),
-        ConnectorError::FeatureUnsupported(_)
-    ));
+    let delegated = catalog_config(|config| {
+        config.set("catalog.access_delegation", "true");
+    });
+    for config in [&oauth, &delegated] {
+        assert!(matches!(
+            super::super::iceberg::capabilities::validate_catalog_session(config).unwrap_err(),
+            ConnectorError::FeatureUnsupported(_)
+        ));
+    }
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
@@ -129,10 +164,9 @@ fn rest_properties_keep_catalog_and_storage_configuration_separate() {
     let catalog = catalog_config(|config| {
         config.set("catalog.prefix", "tenant");
         config.set("catalog.auth.type", "bearer");
-        config.set("catalog.access_delegation", "true");
         config.set("catalog.property.token", "catalog-secret");
     });
-    validate_rest_auth(&catalog).unwrap();
+    super::super::iceberg::capabilities::validate_catalog_session(&catalog).unwrap();
     let mut raw_storage = ConnectorConfig::new("iceberg");
     raw_storage.set("storage.type", "s3");
     raw_storage.set("storage.endpoint", "https://objects.test");
@@ -144,12 +178,6 @@ fn rest_properties_keep_catalog_and_storage_configuration_separate() {
 
     let properties = rest_properties(&catalog, &storage);
     assert_eq!(properties.get("prefix").map(String::as_str), Some("tenant"));
-    assert_eq!(
-        properties
-            .get("header.X-Iceberg-Access-Delegation")
-            .map(String::as_str),
-        Some("vended-credentials")
-    );
     assert_eq!(
         properties.get("s3.endpoint").map(String::as_str),
         Some("https://objects.test")

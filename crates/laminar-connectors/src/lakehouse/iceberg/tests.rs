@@ -64,7 +64,6 @@ fn cluster_exact_contract_fails_closed_outside_rest_s3() {
         ("catalog.type", "glue"),
         ("storage.type", "fs"),
         ("catalog.warehouse", "file:///tmp/iceberg"),
-        ("catalog.access_delegation", "true"),
     ] {
         let mut connector = test_connector_config();
         connector.set("delivery.guarantee", "exactly-once");
@@ -78,6 +77,15 @@ fn cluster_exact_contract_fails_closed_outside_rest_s3() {
             "{key}={value} must remain fail closed"
         );
     }
+
+    let mut delegated = test_connector_config();
+    delegated.set("delivery.guarantee", "exactly-once");
+    delegated.set("catalog.access_delegation", "true");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&delegated).unwrap(), None);
+    assert!(matches!(
+        sink.contract(&delegated),
+        Err(ConnectorError::FeatureUnsupported(_))
+    ));
 }
 
 #[test]

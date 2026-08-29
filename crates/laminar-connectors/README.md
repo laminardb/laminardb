@@ -51,6 +51,8 @@ backpressures rather than dropping rows.
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
 
+Iceberg REST supports no authentication or a resolved static bearer token. OAuth2 and access delegation fail closed until the released client provides the required refresh and remote-signing lifecycle.
+
 ### Upsert sinks and changelog collapse
 
 An upsert sink (`write.mode = 'upsert'`) holds the current per-key state of its

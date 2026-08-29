@@ -158,6 +158,16 @@ impl IcebergCatalogConfig {
                 )));
             }
         }
+        for (name, value) in [
+            ("catalog.uri", catalog_uri.as_str()),
+            ("catalog.warehouse", warehouse.as_str()),
+        ] {
+            if crate::security::value_contains_uri_secret(value, false) {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "{name} must not embed credentials; use resolved catalog or storage secret options"
+                )));
+            }
+        }
         let properties = config.properties_with_prefix("catalog.property.");
         let auth_type = match config.get("catalog.auth.type") {
             Some(value) => value.parse().map_err(ConnectorError::ConfigurationError)?,
@@ -193,13 +203,23 @@ impl IcebergCatalogConfig {
             | IcebergCatalogAuthType::OAuth2 => {}
         }
 
+        let oauth2_server_uri = optional_non_empty(config, "catalog.oauth2.server_uri");
+        if oauth2_server_uri
+            .as_deref()
+            .is_some_and(|value| crate::security::value_contains_uri_secret(value, false))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.oauth2.server_uri must not embed credentials".into(),
+            ));
+        }
+
         Ok(Self {
             catalog_type,
             catalog_uri,
             warehouse,
             prefix: optional_non_empty(config, "catalog.prefix"),
             auth_type,
-            oauth2_server_uri: optional_non_empty(config, "catalog.oauth2.server_uri"),
+            oauth2_server_uri,
             oauth2_client_id: optional_non_empty(config, "catalog.oauth2.client_id"),
             oauth2_scope: optional_non_empty(config, "catalog.oauth2.scope"),
             access_delegation: parse_bool(config, "catalog.access_delegation", false)?,
@@ -295,9 +315,19 @@ impl IcebergStorageConfig {
             false,
         )?;
 
+        let endpoint = optional_non_empty(config, "storage.endpoint");
+        if endpoint
+            .as_deref()
+            .is_some_and(|value| crate::security::value_contains_uri_secret(value, false))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "storage.endpoint must not embed credentials".into(),
+            ));
+        }
+
         Ok(Self {
             storage_type,
-            endpoint: optional_non_empty(config, "storage.endpoint"),
+            endpoint,
             region: optional_non_empty(config, "storage.region"),
             path_style,
             request_timeout: parse_duration(

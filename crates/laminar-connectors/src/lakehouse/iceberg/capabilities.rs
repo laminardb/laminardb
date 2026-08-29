@@ -1,8 +1,9 @@
 use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{
-    IcebergCatalogAuthType, IcebergCatalogType, IcebergReadMode, IcebergSchemaEvolutionMode,
-    IcebergSinkConfig, IcebergSourceConfig, IcebergStorageType, IcebergWriteMode,
+    IcebergCatalogAuthType, IcebergCatalogConfig, IcebergCatalogType, IcebergReadMode,
+    IcebergSchemaEvolutionMode, IcebergSinkConfig, IcebergSourceConfig, IcebergStorageType,
+    IcebergWriteMode,
 };
 
 const MOR_MISSING_ACTIONS: &str =
@@ -39,6 +40,7 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
                 .into(),
         ));
     }
+    validate_catalog_session(&config.catalog)?;
     Ok(())
 }
 
@@ -73,6 +75,35 @@ pub(crate) fn validate_source(config: &IcebergSourceConfig) -> Result<(), Connec
     if config.read_mode == IcebergReadMode::Changelog {
         return Err(ConnectorError::FeatureUnsupported(
             CHANGELOG_MISSING_RECONCILIATION.into(),
+        ));
+    }
+    validate_catalog_session(&config.catalog)?;
+    Ok(())
+}
+
+pub(crate) fn validate_catalog_session(
+    catalog: &IcebergCatalogConfig,
+) -> Result<(), ConnectorError> {
+    if catalog.catalog_type != IcebergCatalogType::Rest {
+        return Ok(());
+    }
+    if catalog.auth_type == IcebergCatalogAuthType::OAuth2 {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.oauth2: iceberg-rust 0.10.1 cannot refresh expiring OAuth2 tokens"
+                .into(),
+        ));
+    }
+    if catalog.auth_type == IcebergCatalogAuthType::Bearer
+        && !catalog.properties.contains_key("token")
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "catalog.auth.type=bearer requires a resolved catalog.property.token".into(),
+        ));
+    }
+    if catalog.access_delegation {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.access-delegation: iceberg-rust 0.10.1 does not provide refreshable vended credentials or remote signing"
+                .into(),
         ));
     }
     Ok(())
@@ -113,6 +144,34 @@ mod tests {
         let error = validate_source(&IcebergSourceConfig::from_config(&config).unwrap())
             .expect_err("unsupported changelog must be rejected");
         assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    }
+
+    #[test]
+    fn refresh_dependent_rest_sessions_fail_before_catalog_io() {
+        for (key, value, property) in [
+            (
+                "catalog.auth.type",
+                "oauth2",
+                Some(("catalog.property.credential", "client:secret")),
+            ),
+            ("catalog.access_delegation", "true", None),
+        ] {
+            let mut config = connector_config();
+            config.set(key, value);
+            if let Some((property_key, property_value)) = property {
+                config.set(property_key, property_value);
+            }
+            let sink = IcebergSinkConfig::from_config(&config).unwrap();
+            let source = IcebergSourceConfig::from_config(&config).unwrap();
+            assert!(matches!(
+                validate_sink(&sink),
+                Err(ConnectorError::FeatureUnsupported(_))
+            ));
+            assert!(matches!(
+                validate_source(&source),
+                Err(ConnectorError::FeatureUnsupported(_))
+            ));
+        }
     }
 
     #[test]

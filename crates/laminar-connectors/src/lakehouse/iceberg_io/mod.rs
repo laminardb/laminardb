@@ -26,10 +26,10 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
+#[cfg(feature = "iceberg-catalog-rest")]
+use super::iceberg_config::IcebergStorageEncryption;
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 use super::iceberg_config::IcebergStorageType;
-#[cfg(feature = "iceberg-catalog-rest")]
-use super::iceberg_config::{IcebergCatalogAuthType, IcebergStorageEncryption};
 use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType, IcebergStorageConfig};
 use crate::error::ConnectorError;
 
@@ -37,6 +37,18 @@ const COMPAT_SCAN_MAX_BATCHES: usize = 65_536;
 const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 const COMPAT_SCAN_CONCURRENCY: usize = 4;
 const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn external_error_summary(error: &iceberg::Error) -> String {
+    format!(
+        "{} ({})",
+        error.kind(),
+        if error.retryable() {
+            "retryable"
+        } else {
+            "terminal"
+        }
+    )
+}
 
 mod table_creation;
 
@@ -197,7 +209,7 @@ async fn build_enabled_rest_catalog(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
-    validate_rest_auth(config)?;
+    super::iceberg::capabilities::validate_catalog_session(config)?;
     validate_storage_options(&config.warehouse, storage)?;
     let storage_factory = storage_factory(&config.warehouse, storage)?;
     let mut props = rest_properties(config, storage);
@@ -215,24 +227,14 @@ async fn build_enabled_rest_catalog(
         .with_client(client)
         .load("laminardb", props)
         .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("iceberg catalog: {e}")))?;
+        .map_err(|error| {
+            ConnectorError::ConnectionFailed(format!(
+                "Iceberg catalog initialization failed ({})",
+                external_error_summary(&error)
+            ))
+        })?;
 
     Ok(Arc::new(catalog))
-}
-
-#[cfg(feature = "iceberg-catalog-rest")]
-fn validate_rest_auth(config: &IcebergCatalogConfig) -> Result<(), ConnectorError> {
-    match config.auth_type {
-        IcebergCatalogAuthType::None => Ok(()),
-        IcebergCatalogAuthType::Bearer if config.properties.contains_key("token") => Ok(()),
-        IcebergCatalogAuthType::Bearer => Err(ConnectorError::ConfigurationError(
-            "catalog.auth.type=bearer requires a resolved catalog.property.token".into(),
-        )),
-        IcebergCatalogAuthType::OAuth2 => Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.rest.oauth2: iceberg-rust 0.10.1 does not automatically refresh expiring OAuth2 tokens"
-                .into(),
-        )),
-    }
 }
 
 #[cfg(feature = "iceberg-catalog-rest")]
@@ -250,12 +252,6 @@ fn rest_properties(
     }
     if let Some(scope) = &config.oauth2_scope {
         properties.insert("scope".into(), scope.clone());
-    }
-    if config.access_delegation {
-        properties.insert(
-            "header.X-Iceberg-Access-Delegation".into(),
-            "vended-credentials".into(),
-        );
     }
     apply_storage_properties(
         &mut properties,
@@ -374,7 +370,7 @@ pub async fn load_table_with_timeout(
 
     let ident = TableIdent::new(ns, table_name.to_string());
 
-    tokio::time::timeout(timeout, catalog.load_table(&ident))
+    let table = tokio::time::timeout(timeout, catalog.load_table(&ident))
         .await
         .map_err(|_| {
             ConnectorError::ReadError(format!(
@@ -386,7 +382,26 @@ pub async fn load_table_with_timeout(
                 "[LDB-ICEBERG-CATALOG-LOAD] load table '{table_name}' failed ({})",
                 error.kind()
             ))
-        })
+        })?;
+    validate_loaded_table_locations(&table)?;
+    Ok(table)
+}
+
+pub(crate) fn validate_loaded_table_locations(table: &Table) -> Result<(), ConnectorError> {
+    validate_credential_free_location("table location", table.metadata().location())?;
+    if let Some(location) = table.metadata_location() {
+        validate_credential_free_location("metadata location", location)?;
+    }
+    Ok(())
+}
+
+fn validate_credential_free_location(label: &str, location: &str) -> Result<(), ConnectorError> {
+    if crate::security::value_contains_uri_secret(location, false) {
+        return Err(ConnectorError::ReadError(format!(
+            "[LDB-ICEBERG-CREDENTIAL-LOCATION] catalog {label} must not embed credentials"
+        )));
+    }
+    Ok(())
 }
 
 /// Scans a table into a compatibility buffer with fixed file, batch, byte, and time bounds.
@@ -516,7 +531,12 @@ pub async fn commit_data_files_append(
         tx.fast_append()
             .add_data_files(data_files)
             .apply(tx)
-            .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?
+            .map_err(|error| {
+                ConnectorError::TransactionError(format!(
+                    "apply Iceberg fast_append ({})",
+                    external_error_summary(&error)
+                ))
+            })?
     };
     tx.commit(catalog)
         .await
@@ -528,9 +548,10 @@ fn iceberg_commit_error(error: &iceberg::Error) -> ConnectorError {
 
     let kind = error.kind();
     let retryable = error.retryable();
+    let summary = external_error_summary(error);
     match kind {
         ErrorKind::CatalogCommitConflicts => {
-            ConnectorError::WriteError(format!("Iceberg catalog commit conflict: {error}"))
+            ConnectorError::WriteError(format!("Iceberg catalog commit conflict ({summary})"))
         }
         ErrorKind::PreconditionFailed
         | ErrorKind::DataInvalid
@@ -538,15 +559,15 @@ fn iceberg_commit_error(error: &iceberg::Error) -> ConnectorError {
         | ErrorKind::TableAlreadyExists
         | ErrorKind::NamespaceNotFound
         | ErrorKind::TableNotFound
-        | ErrorKind::FeatureUnsupported => ConnectorError::TransactionError(format!(
-            "Iceberg catalog rejected commit ({kind}): {error}"
-        )),
+        | ErrorKind::FeatureUnsupported => {
+            ConnectorError::TransactionError(format!("Iceberg catalog rejected commit ({summary})"))
+        }
         ErrorKind::Unexpected => ConnectorError::outcome_unknown(
-            format!("Iceberg catalog commit failed after dispatch and may have applied: {error}"),
+            format!("Iceberg catalog commit may have applied ({summary})"),
             retryable,
         ),
         _ => ConnectorError::outcome_unknown(
-            format!("Iceberg catalog returned an unclassified commit failure: {error}"),
+            format!("Iceberg catalog returned an unclassified commit failure ({summary})"),
             retryable,
         ),
     }
@@ -573,30 +594,38 @@ pub async fn ensure_table_exists(
     // a missing namespace returns 400 (not 404) on some REST catalogs. Creation
     // tolerates a concurrent creator (N writers may auto-create the
     // same namespace at once) by re-checking existence on failure.
-    if !catalog
-        .namespace_exists(&ns)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("namespace_exists: {e}")))?
-    {
-        if let Err(e) = catalog.create_namespace(&ns, HashMap::new()).await {
+    if !catalog.namespace_exists(&ns).await.map_err(|error| {
+        ConnectorError::ReadError(format!(
+            "inspect Iceberg namespace ({})",
+            external_error_summary(&error)
+        ))
+    })? {
+        if let Err(error) = catalog.create_namespace(&ns, HashMap::new()).await {
             if !catalog.namespace_exists(&ns).await.unwrap_or(false) {
-                return Err(ConnectorError::WriteError(format!("create namespace: {e}")));
+                return Err(ConnectorError::WriteError(format!(
+                    "create Iceberg namespace ({})",
+                    external_error_summary(&error)
+                )));
             }
         }
     }
 
-    if catalog
-        .table_exists(&ident)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("table_exists: {e}")))?
-    {
+    if catalog.table_exists(&ident).await.map_err(|error| {
+        ConnectorError::ReadError(format!(
+            "inspect Iceberg table ({})",
+            external_error_summary(&error)
+        ))
+    })? {
         return Ok(());
     }
 
     // Same race tolerance for the table itself.
-    if let Err(e) = catalog.create_table(&ns, creation).await {
+    if let Err(error) = catalog.create_table(&ns, creation).await {
         if !catalog.table_exists(&ident).await.unwrap_or(false) {
-            return Err(ConnectorError::WriteError(format!("create table: {e}")));
+            return Err(ConnectorError::WriteError(format!(
+                "create Iceberg table ({})",
+                external_error_summary(&error)
+            )));
         }
     }
 

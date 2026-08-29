@@ -258,8 +258,8 @@ fn legacy_and_typed_option_aliases_match() {
 #[test]
 fn debug_redacts_catalog_and_storage_values() {
     let mut config = ConnectorConfig::new("iceberg");
-    config.set("catalog.uri", "https://user:secret@catalog.test");
-    config.set("warehouse", "s3://bucket/wh?token=secret-token");
+    config.set("catalog.uri", "https://catalog.test");
+    config.set("warehouse", "s3://bucket/wh");
     config.set("namespace", "prod");
     config.set("table.name", "events");
     config.set("catalog.property.token", "secret-token");
@@ -268,13 +268,31 @@ fn debug_redacts_catalog_and_storage_values() {
 
     let parsed = IcebergSinkConfig::from_config(&config).unwrap();
     let debug = format!("{parsed:?}");
-    for secret in [
-        "user:secret",
-        "secret-token",
-        "secret-endpoint",
-        "secret-key",
-    ] {
+    for secret in ["secret-token", "secret-endpoint", "secret-key"] {
         assert!(!debug.contains(secret), "Debug leaked {secret}");
+    }
+}
+
+#[test]
+fn inline_uri_credentials_are_rejected_without_echoing() {
+    for (key, value) in [
+        ("catalog.uri", "https://user:inline-secret@catalog.test"),
+        (
+            "catalog.warehouse",
+            "s3://bucket/warehouse?token=inline-secret",
+        ),
+        (
+            "storage.endpoint",
+            "https://objects.test?credential=inline-secret",
+        ),
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, value);
+        let error = IcebergSinkConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "got: {error}");
+        assert!(!error.contains("inline-secret"), "got: {error}");
     }
 }
 
