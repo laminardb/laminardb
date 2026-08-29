@@ -1024,6 +1024,25 @@ fn exactly_once_is_coordinated_append_only() {
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
+async fn coordinated_cursor_rejects_a_mutated_namespace_before_table_io() {
+    use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitter};
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+
+    let sink = DeltaLakeSink::new(coordinated_config("unused"), None);
+    let mut namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "events",
+    )
+    .unwrap();
+    namespace.deployment_id = "not-a-uuid".into();
+
+    let error = sink.committed_cursor(&namespace).await.unwrap_err();
+    assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
 async fn coordinated_millisecond_timestamp_is_widened_before_materialization() {
     use arrow_array::TimestampMillisecondArray;
     use arrow_schema::TimeUnit;

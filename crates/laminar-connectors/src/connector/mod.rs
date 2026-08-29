@@ -607,6 +607,17 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_batch_rejects_a_mutated_namespace() {
+        let mut batch = valid_coordinated_batch();
+        batch.namespace.sink_id.clear();
+
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("sink id cannot be empty"));
+    }
+
+    #[test]
     fn coordinated_batch_rejects_noncanonical_entry_before_other_shape_checks() {
         use laminar_core::checkpoint::CheckpointAttempt;
 

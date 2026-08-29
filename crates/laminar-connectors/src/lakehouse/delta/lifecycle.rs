@@ -598,6 +598,7 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
         &self,
         namespace: &crate::connector::CoordinatedCommitNamespace,
     ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
+        namespace.validate()?;
         let external_key = namespace.external_key();
         let deadline = self.operation_deadline();
         // RECOVERY: both operations are metadata reads. Retrying typed transient failures cannot

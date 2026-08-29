@@ -624,6 +624,7 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
         &self,
         namespace: &crate::connector::CoordinatedCommitNamespace,
     ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
+        namespace.validate()?;
         let catalog = self
             .catalog
             .as_ref()

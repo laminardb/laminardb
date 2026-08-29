@@ -45,33 +45,42 @@ impl CoordinatedCommitNamespace {
         deployment_id: impl Into<String>,
         sink_id: impl Into<String>,
     ) -> Result<Self, ConnectorError> {
-        let deployment_id = deployment_id.into();
-        let sink_id = sink_id.into();
-        if !pipeline_identity.is_canonical() {
+        let namespace = Self {
+            pipeline_identity,
+            deployment_id: deployment_id.into(),
+            sink_id: sink_id.into(),
+        };
+        namespace.validate()?;
+        Ok(namespace)
+    }
+
+    /// Validate a namespace received through a public or serialized boundary.
+    ///
+    /// # Errors
+    /// Returns a configuration error when any identity component is not
+    /// canonical.
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        if !self.pipeline_identity.is_canonical() {
             return Err(ConnectorError::ConfigurationError(
                 "coordinated commit requires the current canonical pipeline identity".into(),
             ));
         }
-        if sink_id.is_empty() {
+        if self.sink_id.is_empty() {
             return Err(ConnectorError::ConfigurationError(
                 "coordinated commit sink id cannot be empty".into(),
             ));
         }
-        let parsed_deployment = uuid::Uuid::parse_str(&deployment_id).map_err(|error| {
+        let parsed_deployment = uuid::Uuid::parse_str(&self.deployment_id).map_err(|error| {
             ConnectorError::ConfigurationError(format!(
                 "coordinated commit deployment id is not a UUID: {error}"
             ))
         })?;
-        if parsed_deployment.is_nil() || parsed_deployment.to_string() != deployment_id {
+        if parsed_deployment.is_nil() || parsed_deployment.to_string() != self.deployment_id {
             return Err(ConnectorError::ConfigurationError(
                 "coordinated commit deployment id must be a canonical non-nil UUID".into(),
             ));
         }
-        Ok(Self {
-            pipeline_identity,
-            deployment_id,
-            sink_id,
-        })
+        Ok(())
     }
 
     /// Bounded, filesystem/catalog-safe key for external transaction metadata.
@@ -208,6 +217,9 @@ impl CoordinatedCommitBatch {
     pub fn validate_shape(&self) -> Result<(), String> {
         use laminar_core::checkpoint::CheckpointAttemptRelation;
 
+        self.namespace
+            .validate()
+            .map_err(|error| error.to_string())?;
         if !self.target.is_canonical() {
             return Err(
                 "coordinated batch target must use one nonzero canonical checkpoint ID".into(),
@@ -404,6 +416,7 @@ pub trait CoordinatedCommitter: Send + Sync {
     /// Highest checkpoint and fencing authority committed in `namespace`.
     /// A metadata read error must be returned, never converted to an absent
     /// cursor, because that could duplicate a previously committed batch.
+    /// Implementations must validate the namespace before external I/O.
     async fn committed_cursor(
         &self,
         namespace: &CoordinatedCommitNamespace,

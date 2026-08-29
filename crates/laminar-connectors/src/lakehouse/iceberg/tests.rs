@@ -58,6 +58,25 @@ fn exactly_once_append_exposes_checkpoint_committer() {
     );
 }
 
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn committed_cursor_rejects_a_mutated_namespace_before_catalog_io() {
+    use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitter};
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+
+    let sink = IcebergSink::new(test_config(), None);
+    let mut namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "events",
+    )
+    .unwrap();
+    namespace.deployment_id = "not-a-uuid".into();
+
+    let error = sink.committed_cursor(&namespace).await.unwrap_err();
+    assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+}
+
 #[test]
 fn cluster_exact_contract_fails_closed_outside_rest_s3() {
     for (key, value) in [
