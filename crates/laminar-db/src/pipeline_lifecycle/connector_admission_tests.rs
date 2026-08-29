@@ -3033,15 +3033,19 @@ fn rest_s3_iceberg_is_cluster_exact_admitted_before_io() {
 
 #[cfg(all(feature = "cluster", feature = "iceberg"))]
 #[test]
-fn uncertified_iceberg_targets_fail_cluster_admission_before_io() {
+fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
     use laminar_connectors::lakehouse::iceberg::IcebergSink;
     use laminar_connectors::lakehouse::iceberg_config::IcebergSinkConfig;
 
-    for (key, value) in [
-        ("catalog.type", "glue"),
-        ("storage.type", "fs"),
-        ("catalog.warehouse", "file:///tmp/warehouse"),
-        ("catalog.access_delegation", "true"),
+    for (key, value, expected_reason) in [
+        ("catalog.type", "glue", "cluster exactly-once"),
+        ("storage.type", "fs", "cluster exactly-once"),
+        (
+            "catalog.warehouse",
+            "file:///tmp/warehouse",
+            "cluster exactly-once",
+        ),
+        ("catalog.access_delegation", "true", "access-delegation"),
     ] {
         let mut config = ConnectorConfig::new("iceberg");
         config.set("catalog.uri", "http://catalog.invalid");
@@ -3066,10 +3070,7 @@ fn uncertified_iceberg_targets_fail_cluster_admission_before_io() {
             },
         )
         .expect_err("uncertified Iceberg target must fail before connector open");
-        assert!(
-            error.to_string().contains("cluster exactly-once"),
-            "{error}"
-        );
+        assert!(error.to_string().contains(expected_reason), "{error}");
     }
 }
 

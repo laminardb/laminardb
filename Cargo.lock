@@ -5292,6 +5292,7 @@ dependencies = [
  "object_store",
  "openssl",
  "parking_lot 0.12.5",
+ "parquet",
  "percent-encoding",
  "prometheus",
  "rand 0.10.2",

@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use arrow_array::{Array as _, Int64Array};
 use futures::TryStreamExt as _;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore as _;
 use object_store::ObjectStoreExt as _;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -39,6 +41,7 @@ const SECOND_ROWS: i64 = 30;
 const THIRD_ROWS: i64 = 30;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
 const CATALOG_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+const DATA_FILE_ORACLE_LIMIT: u64 = 8 * 1024 * 1024;
 
 struct Node {
     id: usize,
@@ -242,6 +245,8 @@ impl TableMetadata {
             );
             for required in [
                 "laminardb.commit.namespace",
+                "laminardb.deployment.id",
+                "laminardb.sink.id",
                 "laminardb.fencing.token",
                 "laminardb.batch.fingerprint",
                 "laminardb.file-set.fingerprint",
@@ -256,6 +261,13 @@ impl TableMetadata {
                 );
             }
         }
+    }
+
+    fn laminar_snapshot_count(&self) -> usize {
+        self.snapshots
+            .iter()
+            .filter(|snapshot| snapshot.summary.contains_key("laminardb.checkpoint.id"))
+            .count()
     }
 }
 
@@ -355,12 +367,16 @@ async fn leader_restart_reconciles_one_iceberg_snapshot_per_checkpoint() {
     let final_state =
         wait_for_total_records(&client, &mut nodes, &namespace, table, expected_rows).await;
     final_state.validate_exact_commit_identities();
+    assert!(
+        final_state.laminar_snapshot_count() >= 3,
+        "three input waves must publish at least three non-empty checkpoints"
+    );
     assert_eq!(
         final_state.commit_uuid(gate.checkpoint_id),
         Some(fault_commit_uuid.as_str()),
         "leader restart changed the logical Iceberg commit identity"
     );
-    verify_complete_data_files(&final_state, expected_rows).await;
+    verify_exact_data_files(&final_state, expected_rows).await;
 }
 
 async fn require_dependencies(client: &reqwest::Client) {
@@ -541,6 +557,13 @@ connector = "iceberg"
 namespace = "{namespace}"
 "table.name" = "{table}"
 "write.mode" = "append"
+"target.file.size.bytes" = "1048576"
+"parquet.row.group.size.bytes" = "262144"
+"max.buffer.rows" = "128"
+"max.buffer.bytes" = "1048576"
+"max.open.partitions" = "1"
+"max.files.per.checkpoint" = "64"
+"max.descriptor.bytes" = "1048576"
 "catalog.property.s3.endpoint" = "{S3_ENDPOINT}"
 "catalog.property.s3.access-key-id" = "{S3_ACCESS_KEY}"
 "catalog.property.s3.secret-access-key" = "$${{ICEBERG_CLUSTER_S3_SECRET_KEY}}"
@@ -772,7 +795,7 @@ async fn load_table(
         .map_err(|error| error.to_string())
 }
 
-async fn verify_complete_data_files(metadata: &TableMetadata, expected_rows: u64) {
+async fn verify_exact_data_files(metadata: &TableMetadata, expected_rows: u64) {
     assert_eq!(metadata.total_records(), expected_rows);
     let prefix = metadata
         .location
@@ -787,39 +810,76 @@ async fn verify_complete_data_files(metadata: &TableMetadata, expected_rows: u64
         .with_allow_http(true)
         .build()
         .expect("build MinIO data-file verifier");
-    let objects = store
-        .list(Some(&ObjectPath::from(format!("{prefix}/data"))))
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("list Iceberg data files");
-    assert!(
-        objects
-            .iter()
-            .all(|object| !object.location.as_ref().contains("-stage-")),
-        "a publish-ineligible staging object survived recovery"
-    );
-    let parquet = objects
-        .into_iter()
-        .filter(|object| object.location.as_ref().ends_with(".parquet"))
-        .collect::<Vec<_>>();
+    let expected_files = metadata.total_data_files();
+    let mut objects = store.list(Some(&ObjectPath::from(format!("{prefix}/data"))));
+    let mut parquet_count = 0_u64;
+    let expected_end = i64::try_from(expected_rows).expect("expected row count fits i64");
+    let mut observed_ids = BTreeSet::new();
+    while let Some(object) = objects.try_next().await.expect("list Iceberg data files") {
+        assert!(
+            !object.location.as_ref().contains("-stage-"),
+            "a publish-ineligible staging object survived recovery"
+        );
+        if !object.location.as_ref().ends_with(".parquet") {
+            continue;
+        }
+        parquet_count = parquet_count
+            .checked_add(1)
+            .expect("data-file count must not overflow");
+        assert!(
+            parquet_count <= expected_files,
+            "listed Parquet files exceed Iceberg's current data-file count"
+        );
+        assert!(object.size >= 8, "Iceberg data file is incomplete");
+        assert!(
+            object.size <= DATA_FILE_ORACLE_LIMIT,
+            "Iceberg data file exceeds the bounded soak oracle"
+        );
+        let object_size = usize::try_from(object.size).expect("bounded data-file size fits usize");
+        let bytes = store
+            .get(&object.location)
+            .await
+            .expect("read Iceberg data file")
+            .bytes()
+            .await
+            .expect("collect bounded Iceberg data file");
+        assert_eq!(bytes.len(), object_size, "Iceberg data file was truncated");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("read Iceberg Parquet metadata")
+            .with_batch_size(128)
+            .build()
+            .expect("build Iceberg Parquet row oracle");
+        for batch in reader {
+            let batch = batch.expect("decode Iceberg Parquet rows");
+            let id_index = batch.schema().index_of("id").expect("Iceberg id column");
+            let ids = batch
+                .column(id_index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Iceberg id column must be Int64");
+            for row in 0..ids.len() {
+                assert!(!ids.is_null(row), "Iceberg id must not be null");
+                let id = ids.value(row);
+                assert!(
+                    (0..expected_end).contains(&id),
+                    "Iceberg contains out-of-range id {id}"
+                );
+                assert!(
+                    observed_ids.insert(id),
+                    "Iceberg contains duplicate id {id} after checkpoint replay"
+                );
+            }
+        }
+    }
     assert_eq!(
-        u64::try_from(parquet.len()).expect("data-file count fits u64"),
-        metadata.total_data_files(),
+        parquet_count, expected_files,
         "listed Parquet files differ from Iceberg's current data-file count"
     );
-    for object in parquet {
-        assert!(object.size >= 8, "Iceberg data file is incomplete");
-        let head = store
-            .get_range(&object.location, 0..4)
-            .await
-            .expect("read Parquet header");
-        let tail = store
-            .get_range(&object.location, object.size - 4..object.size)
-            .await
-            .expect("read Parquet footer");
-        assert_eq!(head.as_ref(), b"PAR1", "invalid Parquet header");
-        assert_eq!(tail.as_ref(), b"PAR1", "invalid Parquet footer");
-    }
+    assert_eq!(
+        observed_ids.len(),
+        usize::try_from(expected_rows).expect("expected row count fits usize"),
+        "Iceberg is missing committed input rows"
+    );
 }
 
 fn remove_file_if_present(path: &Path) {
