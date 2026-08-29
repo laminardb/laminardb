@@ -5136,6 +5136,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tungstenite 0.28.0",
+ "typetag",
  "url",
  "uuid",
  "webpki-roots 1.0.9",

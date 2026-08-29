@@ -43,6 +43,7 @@ iceberg = { workspace = true, optional = true }
 iceberg-catalog-rest = { workspace = true, optional = true }
 iceberg-storage-opendal = { workspace = true, optional = true }
 apache-avro = { workspace = true, optional = true }
+typetag = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 # Bytes (for cache value types)
@@ -152,10 +153,10 @@ iceberg-catalog-glue = ["iceberg-core"]
 iceberg-catalog-hms = ["iceberg-core"]
 iceberg-catalog-s3tables = ["iceberg-core"]
 iceberg-catalog-sql = ["iceberg-core"]
-iceberg-storage-s3 = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-s3"]
-iceberg-storage-gcs = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-gcs"]
-iceberg-storage-azure = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-azdls"]
-iceberg-storage-fs = ["iceberg-core", "dep:iceberg-storage-opendal", "iceberg-storage-opendal/opendal-fs"]
+iceberg-storage-s3 = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-s3"]
+iceberg-storage-gcs = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-gcs"]
+iceberg-storage-azure = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-azdls"]
+iceberg-storage-fs = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-fs"]
 iceberg = ["iceberg-catalog-rest", "iceberg-storage-s3", "iceberg-storage-fs"]
 # Parquet schema and codec helpers (not a standalone connector)
 parquet-lookup = ["dep:parquet", "dep:object_store"]

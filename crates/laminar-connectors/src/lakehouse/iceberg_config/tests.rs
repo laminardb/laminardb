@@ -192,6 +192,11 @@ fn programmatic_writer_limits_fail_closed() {
     parsed.max_descriptor_bytes = crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1;
     let error = parsed.validate_writer_limits().unwrap_err().to_string();
     assert!(error.contains("max.descriptor.bytes must not exceed"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.storage.connect_timeout = Duration::ZERO;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("storage.connect_timeout must be greater than zero"));
 }
 
 #[test]

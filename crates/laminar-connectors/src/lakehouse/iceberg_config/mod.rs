@@ -569,6 +569,18 @@ impl IcebergSinkConfig {
                 "max.flush.age must be greater than zero".into(),
             ));
         }
+        for (name, value) in [
+            ("catalog.request_timeout", self.catalog.request_timeout),
+            ("catalog.commit_timeout", self.catalog.commit_timeout),
+            ("storage.request_timeout", self.storage.request_timeout),
+            ("storage.connect_timeout", self.storage.connect_timeout),
+        ] {
+            if value.is_zero() {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "{name} must be greater than zero"
+                )));
+            }
+        }
         if self.max_files_per_checkpoint > ICEBERG_MAX_FILES_PER_CHECKPOINT {
             return Err(ConnectorError::ConfigurationError(format!(
                 "max.files.per.checkpoint must not exceed {ICEBERG_MAX_FILES_PER_CHECKPOINT}"

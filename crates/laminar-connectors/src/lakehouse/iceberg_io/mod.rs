@@ -38,6 +38,23 @@ const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
 const COMPAT_SCAN_CONCURRENCY: usize = 4;
 const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[cfg(any(
+    feature = "iceberg-storage-s3",
+    feature = "iceberg-storage-gcs",
+    feature = "iceberg-storage-azure",
+    feature = "iceberg-storage-fs"
+))]
+mod bounded_storage;
+
+#[cfg(any(
+    feature = "iceberg-storage-s3",
+    feature = "iceberg-storage-gcs",
+    feature = "iceberg-storage-azure",
+    feature = "iceberg-storage-fs"
+))]
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+use bounded_storage::BoundedStorageFactory;
+
 pub(crate) fn external_error_summary(error: &iceberg::Error) -> String {
     format!(
         "{} ({})",
@@ -71,10 +88,10 @@ fn storage_factory(
         })?;
 
     match storage_type {
-        IcebergStorageType::S3 => s3_storage_factory(),
-        IcebergStorageType::Gcs => gcs_storage_factory(),
-        IcebergStorageType::Azure => azure_storage_factory(),
-        IcebergStorageType::Fs => fs_storage_factory(),
+        IcebergStorageType::S3 => s3_storage_factory(config),
+        IcebergStorageType::Gcs => gcs_storage_factory(config),
+        IcebergStorageType::Azure => azure_storage_factory(config),
+        IcebergStorageType::Fs => fs_storage_factory(config),
     }
 }
 
@@ -99,54 +116,86 @@ fn infer_storage_type(warehouse: &str) -> Option<IcebergStorageType> {
 #[cfg(feature = "iceberg-storage-s3")]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
-fn s3_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Ok(Arc::new(OpenDalStorageFactory::S3 {
-        customized_credential_load: None,
-    }))
+fn s3_storage_factory(
+    storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(BoundedStorageFactory::new(
+        OpenDalStorageFactory::S3 {
+            customized_credential_load: None,
+        },
+        storage.connect_timeout,
+        storage.request_timeout,
+    )))
 }
 
 #[cfg(not(feature = "iceberg-storage-s3"))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
-fn s3_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+fn s3_storage_factory(
+    _storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("s3", "iceberg-storage-s3"))
 }
 
 #[cfg(feature = "iceberg-storage-gcs")]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
-fn gcs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Ok(Arc::new(OpenDalStorageFactory::Gcs))
+fn gcs_storage_factory(
+    storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(BoundedStorageFactory::new(
+        OpenDalStorageFactory::Gcs,
+        storage.connect_timeout,
+        storage.request_timeout,
+    )))
 }
 
 #[cfg(not(feature = "iceberg-storage-gcs"))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
-fn gcs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+fn gcs_storage_factory(
+    _storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("gcs", "iceberg-storage-gcs"))
 }
 
 #[cfg(feature = "iceberg-storage-azure")]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
-fn azure_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Ok(Arc::new(OpenDalStorageFactory::Azdls))
+fn azure_storage_factory(
+    storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(BoundedStorageFactory::new(
+        OpenDalStorageFactory::Azdls,
+        storage.connect_timeout,
+        storage.request_timeout,
+    )))
 }
 
 #[cfg(not(feature = "iceberg-storage-azure"))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
-fn azure_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+fn azure_storage_factory(
+    _storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("azure", "iceberg-storage-azure"))
 }
 
 #[cfg(feature = "iceberg-storage-fs")]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
-fn fs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Ok(Arc::new(OpenDalStorageFactory::Fs))
+fn fs_storage_factory(
+    storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    Ok(Arc::new(BoundedStorageFactory::new(
+        OpenDalStorageFactory::Fs,
+        storage.connect_timeout,
+        storage.request_timeout,
+    )))
 }
 
 #[cfg(not(feature = "iceberg-storage-fs"))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
-fn fs_storage_factory() -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+fn fs_storage_factory(
+    _storage: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("fs", "iceberg-storage-fs"))
 }
 
@@ -216,7 +265,7 @@ async fn build_enabled_rest_catalog(
     props.insert("uri".to_string(), config.catalog_uri.clone());
     props.insert("warehouse".to_string(), config.warehouse.clone());
     let client = delta_reqwest::Client::builder()
-        .connect_timeout(storage.connect_timeout)
+        .connect_timeout(config.request_timeout)
         .timeout(config.request_timeout)
         .build()
         .map_err(|error| {
