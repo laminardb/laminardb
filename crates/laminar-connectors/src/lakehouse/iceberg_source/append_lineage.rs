@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use iceberg::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestStatus, Operation, SnapshotRef,
+    DataContentType, DataFile, FormatVersion, ManifestContentType, ManifestStatus, Operation,
+    SnapshotRef,
 };
 use iceberg::table::Table;
 
@@ -106,12 +107,14 @@ fn lineage_after(
                     .into(),
             ));
         };
-        snapshot = metadata.snapshot_by_id(parent_id).cloned().ok_or_else(|| {
+        let parent = metadata.snapshot_by_id(parent_id).cloned().ok_or_else(|| {
             ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-CURSOR-EXPIRED] snapshot history needed for resume has expired"
                     .into(),
             )
         })?;
+        validate_snapshot_sequence(metadata.format_version(), &snapshot, &parent)?;
+        snapshot = parent;
     }
     if cursor.is_empty_table() {
         validate_empty_origin(table, cursor, &reverse_lineage)?;
@@ -193,6 +196,7 @@ async fn added_files_for_snapshot(
             }
             match entry.status() {
                 ManifestStatus::Added if entry.content_type() == DataContentType::Data => {
+                    validate_added_data_sequence(snapshot, entry.sequence_number())?;
                     if !paths.insert(entry.file_path().to_string()) {
                         return Err(ConnectorError::TransactionError(
                             "[LDB-ICEBERG-APPEND-DUPLICATE-FILE] append snapshot adds the same data-file path more than once"
@@ -226,6 +230,33 @@ async fn added_files_for_snapshot(
     Ok((files, manifest_list.entries().len()))
 }
 
+fn validate_snapshot_sequence(
+    format_version: FormatVersion,
+    child: &SnapshotRef,
+    parent: &SnapshotRef,
+) -> Result<(), ConnectorError> {
+    if format_version == FormatVersion::V1 || parent.sequence_number() < child.sequence_number() {
+        return Ok(());
+    }
+    Err(ConnectorError::ConfigurationError(
+        "[LDB-ICEBERG-APPEND-SEQUENCE-ORDER] append snapshot ancestry is not strictly sequence-monotonic"
+            .into(),
+    ))
+}
+
+fn validate_added_data_sequence(
+    snapshot: &SnapshotRef,
+    data_sequence_number: Option<i64>,
+) -> Result<(), ConnectorError> {
+    if data_sequence_number == Some(snapshot.sequence_number()) {
+        return Ok(());
+    }
+    Err(ConnectorError::ConfigurationError(format!(
+        "[LDB-ICEBERG-APPEND-DATA-SEQUENCE] snapshot {} adds a data file with a preserved or invalid data sequence; append mode cannot omit delete reconciliation",
+        snapshot.snapshot_id()
+    )))
+}
+
 fn non_append_error(snapshot_id: i64, operation: &str) -> ConnectorError {
     ConnectorError::ConfigurationError(format!(
         "[LDB-ICEBERG-APPEND-NON-APPEND] snapshot {snapshot_id} contains {operation}; append mode cannot represent it"
@@ -241,11 +272,17 @@ fn file_limit_error() -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
-    use iceberg::spec::{Operation, Snapshot, SnapshotReference, SnapshotRetention, Summary};
+    use iceberg::spec::{
+        DataFileBuilder, DataFileFormat, ManifestListWriter, ManifestWriterBuilder, Operation,
+        Snapshot, SnapshotReference, SnapshotRetention, Struct, Summary,
+    };
 
     use crate::config::ConnectorConfig;
-    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+    use crate::lakehouse::iceberg::test_support::{
+        append_rows, create_test_table, create_test_table_with_format,
+    };
     use crate::lakehouse::iceberg_config::{IcebergReadMode, IcebergSourceConfig};
 
     use super::*;
@@ -296,6 +333,92 @@ mod tests {
     ) -> Result<Vec<AppendSnapshotPlan>, ConnectorError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         plan_appends(table, cursor, config, deadline).await
+    }
+
+    async fn append_with_preserved_data_sequence(table: &Table) -> Table {
+        let parent = table.metadata().current_snapshot().unwrap();
+        let snapshot_id = parent.snapshot_id() ^ 1;
+        let sequence_number = parent.sequence_number() + 1;
+        let manifest_path = format!(
+            "{}/metadata/preserved-sequence-{snapshot_id}.avro",
+            table.metadata().location()
+        );
+        let mut manifest_writer = ManifestWriterBuilder::new(
+            table.file_io().new_output(&manifest_path).unwrap(),
+            Some(snapshot_id),
+            table.current_schema_ref(),
+            table.metadata().default_partition_spec().as_ref().clone(),
+        )
+        .build_v2_data();
+        manifest_writer
+            .add_file(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path(format!(
+                        "{}/data/preserved-sequence-{snapshot_id}.parquet",
+                        table.metadata().location()
+                    ))
+                    .file_format(DataFileFormat::Parquet)
+                    .partition(Struct::empty())
+                    .record_count(1)
+                    .file_size_in_bytes(1)
+                    .partition_spec_id(table.metadata().default_partition_spec_id())
+                    .build()
+                    .unwrap(),
+                parent.sequence_number(),
+            )
+            .unwrap();
+        let manifest = manifest_writer.write_manifest_file().await.unwrap();
+        let inherited = table.manifest_list_reader(parent).load().await.unwrap();
+        let manifest_list_path = format!(
+            "{}/metadata/preserved-sequence-list-{snapshot_id}.avro",
+            table.metadata().location()
+        );
+        let mut list_writer = ManifestListWriter::v2(
+            table
+                .file_io()
+                .new_output(&manifest_list_path)
+                .unwrap()
+                .writer()
+                .await
+                .unwrap(),
+            snapshot_id,
+            Some(parent.snapshot_id()),
+            sequence_number,
+        );
+        list_writer
+            .add_manifests(
+                inherited
+                    .entries()
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(manifest)),
+            )
+            .unwrap();
+        list_writer.close().await.unwrap();
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(Some(parent.snapshot_id()))
+            .with_sequence_number(sequence_number)
+            .with_timestamp_ms(parent.timestamp_ms() + 1)
+            .with_manifest_list(manifest_list_path)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(table.metadata().current_schema_id())
+            .build();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_branch_snapshot(snapshot, "main")
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        table_with_metadata(table, metadata)
     }
 
     #[tokio::test]
@@ -354,6 +477,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn format_v1_zero_sequences_remain_replayable() {
+        let fixture = create_test_table_with_format(false, FormatVersion::V1).await;
+        let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, None)]).await;
+        let config = source_config(&fixture);
+        let cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &first,
+            first.metadata().current_snapshot().unwrap(),
+            first.metadata().current_schema_id(),
+        );
+        let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
+        assert_eq!(plan(&second, &cursor, &config).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn empty_cursor_requires_retained_origin_evidence() {
         let fixture = create_test_table(false).await;
         let config = source_config(&fixture);
@@ -391,6 +529,59 @@ mod tests {
         let rewound = table_with_metadata(&second, metadata);
         let error = plan(&rewound, &cursor, &config).await.unwrap_err();
         assert!(error.to_string().contains("LDB-ICEBERG-CURSOR-DIVERGED"));
+    }
+
+    #[tokio::test]
+    async fn preserved_data_sequence_requires_delete_reconciliation() {
+        let fixture = create_test_table(false).await;
+        let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, None)]).await;
+        let config = source_config(&fixture);
+        let cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &first,
+            first.metadata().current_snapshot().unwrap(),
+            first.metadata().current_schema_id(),
+        );
+        let invalid = append_with_preserved_data_sequence(&first).await;
+        let error = plan(&invalid, &cursor, &config).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-APPEND-DATA-SEQUENCE"));
+        assert!(!error.is_transient());
+    }
+
+    #[test]
+    fn non_monotonic_snapshot_sequences_fail_closed() {
+        let parent = Arc::new(
+            Snapshot::builder()
+                .with_snapshot_id(1)
+                .with_sequence_number(2)
+                .with_timestamp_ms(1)
+                .with_manifest_list("memory:///parent-list.avro")
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(0)
+                .build(),
+        );
+        let child = Arc::new(
+            Snapshot::builder()
+                .with_snapshot_id(2)
+                .with_parent_snapshot_id(Some(parent.snapshot_id()))
+                .with_sequence_number(2)
+                .with_timestamp_ms(2)
+                .with_manifest_list("memory:///child-list.avro")
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .with_schema_id(0)
+                .build(),
+        );
+        let error = validate_snapshot_sequence(FormatVersion::V2, &child, &parent).unwrap_err();
+        assert!(error.to_string().contains("APPEND-SEQUENCE-ORDER"));
+        assert!(!error.is_transient());
     }
 
     #[tokio::test]
