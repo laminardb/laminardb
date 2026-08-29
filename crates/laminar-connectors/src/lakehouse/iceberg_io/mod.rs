@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use futures_util::StreamExt;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 #[cfg(feature = "iceberg-catalog-rest")]
@@ -24,7 +25,6 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 ))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 use iceberg_storage_opendal::OpenDalStorageFactory;
-use tokio_stream::StreamExt;
 
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 use super::iceberg_config::IcebergStorageType;
@@ -32,6 +32,11 @@ use super::iceberg_config::IcebergStorageType;
 use super::iceberg_config::{IcebergCatalogAuthType, IcebergStorageEncryption};
 use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType, IcebergStorageConfig};
 use crate::error::ConnectorError;
+
+const COMPAT_SCAN_MAX_BATCHES: usize = 65_536;
+const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
+const COMPAT_SCAN_CONCURRENCY: usize = 4;
+const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 mod table_creation;
 
@@ -376,48 +381,117 @@ pub async fn load_table_with_timeout(
                 "[LDB-ICEBERG-CATALOG-TIMEOUT] load table '{table_name}' exceeded {timeout:?}"
             ))
         })?
-        .map_err(|e| ConnectorError::ReadError(format!("load table '{table_name}': {e}")))
+        .map_err(|error| {
+            ConnectorError::ReadError(format!(
+                "[LDB-ICEBERG-CATALOG-LOAD] load table '{table_name}' failed ({})",
+                error.kind()
+            ))
+        })
 }
 
-/// Scans a table and returns all record batches for the current snapshot.
+/// Scans a table into a compatibility buffer with fixed file, batch, byte, and time bounds.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` on scan failure.
+/// Returns `ConnectorError::ReadError` when the snapshot is absent, a bound is exceeded, or the
+/// scan fails.
+#[deprecated(since = "0.30.0", note = "use IcebergSource for streaming reads")]
 pub async fn scan_table(
     table: &Table,
     snapshot_id: Option<i64>,
     select_columns: &[String],
 ) -> Result<Vec<RecordBatch>, ConnectorError> {
-    let mut scan_builder = table.scan();
-
-    if let Some(sid) = snapshot_id {
-        scan_builder = scan_builder.snapshot_id(sid);
-    }
-
-    if select_columns.is_empty() {
-        scan_builder = scan_builder.select_all();
+    let snapshot = match snapshot_id {
+        Some(snapshot_id) => table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| {
+                ConnectorError::ReadError(format!(
+                    "[LDB-ICEBERG-SNAPSHOT-MISSING] snapshot {snapshot_id} does not exist"
+                ))
+            })?,
+        None => match table.metadata().current_snapshot() {
+            Some(snapshot) => snapshot,
+            None => return Ok(Vec::new()),
+        },
+    };
+    let mut builder = table
+        .scan()
+        .snapshot_id(snapshot.snapshot_id())
+        .with_batch_size(Some(8_192))
+        .with_concurrency_limit(COMPAT_SCAN_CONCURRENCY);
+    builder = if select_columns.is_empty() {
+        builder.select_all()
     } else {
-        scan_builder = scan_builder.select(select_columns.iter().map(String::as_str));
-    }
-
-    let scan = scan_builder
+        builder.select(select_columns.iter().map(String::as_str))
+    };
+    let scan = builder.build().map_err(|error| {
+        super::iceberg_scan::connector_scan_error("build compatibility Iceberg scan", &error)
+    })?;
+    let deadline = tokio::time::Instant::now() + COMPAT_SCAN_TIMEOUT;
+    super::iceberg_scan::preflight_snapshot(
+        table,
+        snapshot,
+        super::iceberg_scan::ManifestReadLimits::fixed(),
+        deadline,
+    )
+    .await?;
+    let tasks = super::iceberg_scan::plan_files(
+        &scan,
+        super::iceberg_scan::DEFAULT_MAX_PLANNED_FILES,
+        deadline,
+    )
+    .await?;
+    let reader = table
+        .reader_builder()
+        .with_batch_size(8_192)
+        .with_data_file_concurrency_limit(COMPAT_SCAN_CONCURRENCY)
         .build()
-        .map_err(|e| ConnectorError::ReadError(format!("build scan: {e}")))?;
+        .read(tasks)
+        .map_err(|error| {
+            super::iceberg_scan::connector_scan_error("create compatibility Iceberg reader", &error)
+        })?;
+    collect_compat_scan(reader.stream(), deadline).await
+}
 
-    let stream = scan
-        .to_arrow()
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("scan to arrow: {e}")))?;
-
+async fn collect_compat_scan(
+    mut stream: iceberg::scan::ArrowRecordBatchStream,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
     let mut batches = Vec::new();
-    let mut stream = std::pin::pin!(stream);
-    while let Some(result) = stream.next().await {
-        let batch = result.map_err(|e| ConnectorError::ReadError(format!("read batch: {e}")))?;
+    let mut bytes = 0_usize;
+    while let Some(result) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| {
+            ConnectorError::ReadError(
+                "[LDB-ICEBERG-COMPAT-SCAN-TIMEOUT] compatibility scan exceeded 30 seconds".into(),
+            )
+        })?
+    {
+        let batch = result.map_err(|error| {
+            super::iceberg_scan::connector_scan_error("compatibility Iceberg read failed", &error)
+        })?;
+        if batches.len() == COMPAT_SCAN_MAX_BATCHES {
+            return Err(compat_scan_limit_error());
+        }
+        bytes = batch.columns().iter().try_fold(bytes, |total, column| {
+            total
+                .checked_add(column.get_array_memory_size())
+                .ok_or_else(compat_scan_limit_error)
+        })?;
+        if bytes > COMPAT_SCAN_MAX_BYTES {
+            return Err(compat_scan_limit_error());
+        }
         batches.push(batch);
     }
-
     Ok(batches)
+}
+
+fn compat_scan_limit_error() -> ConnectorError {
+    ConnectorError::ReadError(
+        "[LDB-ICEBERG-COMPAT-SCAN-LIMIT] compatibility scan exceeded its fixed buffer bounds"
+            .into(),
+    )
 }
 
 /// Returns the current snapshot ID of a table, if any.

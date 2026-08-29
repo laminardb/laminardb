@@ -267,14 +267,10 @@ impl IcebergSource {
         if let Some(cursor) = self.cursor.as_ref() {
             cursor.validate_binding(&self.config, &table)?;
             let planning_started = Instant::now();
-            let plans = tokio::time::timeout(
-                self.config.storage.request_timeout,
-                append_lineage::plan_appends(
-                    &table,
-                    cursor,
-                    self.config.max_snapshots_per_poll,
-                    self.config.max_planned_files,
-                ),
+            let deadline = tokio::time::Instant::now() + self.config.storage.request_timeout;
+            let plans = tokio::time::timeout_at(
+                deadline,
+                append_lineage::plan_appends(&table, cursor, &self.config, deadline),
             )
             .await
             .map_err(|_| {

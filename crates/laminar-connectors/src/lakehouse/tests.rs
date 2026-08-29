@@ -228,6 +228,9 @@ fn test_iceberg_source_config_keys() {
         "poll.interval",
         "projection",
         "filter",
+        "read.max.manifest.list.bytes",
+        "read.max.manifest.bytes",
+        "read.max.manifests.per.snapshot",
     ] {
         assert!(optional.contains(&expected), "missing {expected}");
     }

@@ -1,17 +1,23 @@
 //! Iceberg startup snapshot source for reference tables.
 
-use std::collections::VecDeque;
-
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use iceberg::expr::Predicate;
+use iceberg::scan::ArrowRecordBatchStream;
+use iceberg::spec::SnapshotRef;
 use tracing::info;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
 
+use super::iceberg_config::IcebergReadMode;
 use super::iceberg_config::IcebergSourceConfig;
+use super::iceberg_scan::{
+    connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
+};
 use super::snapshot_schema::{conform_snapshot_batch, validate_snapshot_schema};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +25,7 @@ enum Phase {
     Ready,
     Draining,
     Done,
+    Failed,
     Closed,
 }
 
@@ -27,7 +34,9 @@ pub struct IcebergReferenceTableSource {
     config: IcebergSourceConfig,
     declared_schema: SchemaRef,
     phase: Phase,
-    snapshot_batches: VecDeque<RecordBatch>,
+    snapshot_stream: Option<ArrowRecordBatchStream>,
+    snapshot_id: Option<i64>,
+    emitted_rows: u64,
 }
 
 impl IcebergReferenceTableSource {
@@ -40,6 +49,12 @@ impl IcebergReferenceTableSource {
         config: IcebergSourceConfig,
         declared_schema: SchemaRef,
     ) -> Result<Self, ConnectorError> {
+        config.validate_read_limits()?;
+        if config.read_mode != IcebergReadMode::Snapshot {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg reference tables require read.mode=snapshot".into(),
+            ));
+        }
         let declared_columns = declared_schema
             .fields()
             .iter()
@@ -60,7 +75,9 @@ impl IcebergReferenceTableSource {
             config,
             declared_schema,
             phase: Phase::Ready,
-            snapshot_batches: VecDeque::new(),
+            snapshot_stream: None,
+            snapshot_id: None,
+            emitted_rows: 0,
         })
     }
 
@@ -87,15 +104,15 @@ impl IcebergReferenceTableSource {
         )
         .await?;
 
-        let physical_schema =
-            match iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    return Err(ConnectorError::SchemaMismatch(format!(
-                        "Iceberg to Arrow schema: {error}"
-                    )));
-                }
-            };
+        let snapshot = selected_snapshot(&table, &self.config)?;
+        let snapshot_schema = match &snapshot {
+            Some(snapshot) => snapshot
+                .schema(table.metadata())
+                .map_err(|error| connector_scan_error("resolve Iceberg snapshot schema", &error))?,
+            None => table.current_schema_ref(),
+        };
+        let physical_schema = iceberg::arrow::schema_to_arrow_schema(&snapshot_schema)
+            .map_err(|error| connector_scan_error("convert Iceberg snapshot schema", &error))?;
         let projected_fields = self
             .declared_schema
             .fields()
@@ -114,22 +131,112 @@ impl IcebergReferenceTableSource {
             .collect::<Result<Vec<_>, _>>()?;
         let projected_schema = arrow_schema::Schema::new(projected_fields);
         validate_snapshot_schema(&projected_schema, self.declared_schema.as_ref())?;
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
 
-        let snapshot_id = self
+        let predicate = self
             .config
-            .snapshot_id
-            .or_else(|| super::iceberg_io::current_snapshot_id(&table));
-        let batches =
-            super::iceberg_io::scan_table(&table, snapshot_id, &self.config.select_columns)
-                .await?
-                .into_iter()
-                .map(|batch| conform_snapshot_batch(&batch, &self.declared_schema))
-                .collect::<Result<Vec<_>, _>>()?;
-        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        info!(snapshot = ?snapshot_id, rows, "Iceberg reference snapshot loaded");
-        self.snapshot_batches = batches.into();
+            .filter
+            .as_deref()
+            .map(serde_json::from_str::<Predicate>)
+            .transpose()
+            .map_err(|error| {
+                ConnectorError::ConfigurationError(format!(
+                    "invalid Iceberg filter predicate JSON: {error}"
+                ))
+            })?;
+        let mut builder = table
+            .scan()
+            .snapshot_id(snapshot.snapshot_id())
+            .with_batch_size(Some(8_192))
+            .with_concurrency_limit(self.config.scan_concurrency)
+            .select(self.config.select_columns.iter().map(String::as_str));
+        if let Some(predicate) = predicate {
+            builder = builder.with_filter(predicate);
+        }
+        let scan = builder
+            .build()
+            .map_err(|error| connector_scan_error("build Iceberg reference scan", &error))?;
+        let deadline = tokio::time::Instant::now() + self.config.storage.request_timeout;
+        preflight_snapshot(
+            &table,
+            &snapshot,
+            ManifestReadLimits::from_source(&self.config),
+            deadline,
+        )
+        .await?;
+        let tasks = plan_files(&scan, self.config.max_planned_files, deadline).await?;
+        let reader = table
+            .reader_builder()
+            .with_batch_size(8_192)
+            .with_data_file_concurrency_limit(self.config.scan_concurrency)
+            .build()
+            .read(tasks)
+            .map_err(|error| connector_scan_error("create Iceberg reference reader", &error))?;
+        self.snapshot_id = Some(snapshot.snapshot_id());
+        self.snapshot_stream = Some(reader.stream());
         Ok(())
     }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
+        loop {
+            let Some(stream) = self.snapshot_stream.as_mut() else {
+                return Ok(None);
+            };
+            let next = tokio::time::timeout(self.config.storage.request_timeout, stream.next())
+                .await
+                .map_err(|_| {
+                    ConnectorError::ReadError(
+                        "[LDB-ICEBERG-STORAGE-TIMEOUT] reference snapshot read made no progress"
+                            .into(),
+                    )
+                })?;
+            let Some(result) = next else {
+                self.snapshot_stream = None;
+                return Ok(None);
+            };
+            let batch = result.map_err(|error| {
+                connector_scan_error("Iceberg reference snapshot read failed", &error)
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let batch = conform_snapshot_batch(&batch, &self.declared_schema)?;
+            self.emitted_rows = self
+                .emitted_rows
+                .saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
+            return Ok(Some(batch));
+        }
+    }
+}
+
+fn selected_snapshot(
+    table: &iceberg::table::Table,
+    config: &IcebergSourceConfig,
+) -> Result<Option<SnapshotRef>, ConnectorError> {
+    if let Some(snapshot_id) = config.snapshot_id {
+        return table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                ConnectorError::ReadError(format!(
+                    "[LDB-ICEBERG-SNAPSHOT-MISSING] snapshot {snapshot_id} does not exist"
+                ))
+            });
+    }
+    if let Some(snapshot) = table.metadata().snapshot_for_ref(&config.table_ref) {
+        return Ok(Some(snapshot.clone()));
+    }
+    if config.table_ref == "main" && table.metadata().current_snapshot().is_none() {
+        return Ok(None);
+    }
+    Err(ConnectorError::ReadError(format!(
+        "[LDB-ICEBERG-REF-MISSING] table ref '{}' does not exist",
+        config.table_ref
+    )))
 }
 
 #[async_trait]
@@ -143,23 +250,44 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
                 });
             }
             Phase::Done => return Ok(None),
+            Phase::Failed => {
+                return Err(ConnectorError::InvalidState {
+                    expected: "readable reference snapshot source".into(),
+                    actual: "failed".into(),
+                });
+            }
             Phase::Ready => {
-                self.load_initial_snapshot().await?;
+                if let Err(error) = self.load_initial_snapshot().await {
+                    self.phase = Phase::Failed;
+                    return Err(error);
+                }
                 self.phase = Phase::Draining;
             }
             Phase::Draining => {}
         }
 
-        if let Some(batch) = self.snapshot_batches.pop_front() {
-            return Ok(Some(batch));
+        match self.next_batch().await {
+            Ok(Some(batch)) => Ok(Some(batch)),
+            Ok(None) => {
+                self.phase = Phase::Done;
+                info!(
+                    snapshot = ?self.snapshot_id,
+                    rows = self.emitted_rows,
+                    "Iceberg reference snapshot completed"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                self.snapshot_stream = None;
+                self.phase = Phase::Failed;
+                Err(error)
+            }
         }
-        self.phase = Phase::Done;
-        Ok(None)
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.phase = Phase::Closed;
-        self.snapshot_batches.clear();
+        self.snapshot_stream = None;
         Ok(())
     }
 }

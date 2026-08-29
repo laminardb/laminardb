@@ -113,7 +113,22 @@ pub(crate) fn source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "read.max.planned.files",
-            "Maximum added files planned by one poll",
+            "Maximum files exposed by scan planning",
+            "65536",
+        ),
+        ConfigKeySpec::optional(
+            "read.max.manifest.list.bytes",
+            "Maximum encoded manifest-list size",
+            "67108864",
+        ),
+        ConfigKeySpec::optional(
+            "read.max.manifest.bytes",
+            "Maximum encoded size of one manifest",
+            "67108864",
+        ),
+        ConfigKeySpec::optional(
+            "read.max.manifests.per.snapshot",
+            "Maximum manifests referenced by one snapshot",
             "65536",
         ),
         ConfigKeySpec::optional(

@@ -4,6 +4,8 @@ use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus, Operat
 use iceberg::table::Table;
 
 use crate::error::ConnectorError;
+use crate::lakehouse::iceberg_config::IcebergSourceConfig;
+use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, ManifestReadLimits};
 
 use super::cursor::IcebergSourceCursorV1;
 
@@ -17,15 +19,16 @@ pub(super) struct AppendSnapshotPlan {
 pub(super) async fn plan_appends(
     table: &Table,
     cursor: &IcebergSourceCursorV1,
-    max_snapshots: usize,
-    max_files: usize,
+    config: &IcebergSourceConfig,
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<AppendSnapshotPlan>, ConnectorError> {
-    let snapshots = lineage_after(table, cursor, max_snapshots)?;
-    let mut remaining_files = max_files;
+    let snapshots = lineage_after(table, cursor, config.max_snapshots_per_poll)?;
+    let limits = ManifestReadLimits::from_source(config);
+    let mut remaining_files = config.max_planned_files;
     let mut plans = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
         let (added_file_paths, manifest_count) =
-            added_files_for_snapshot(table, &snapshot, remaining_files).await?;
+            added_files_for_snapshot(table, &snapshot, remaining_files, limits, deadline).await?;
         remaining_files = remaining_files
             .checked_sub(added_file_paths.len())
             .ok_or_else(file_limit_error)?;
@@ -103,6 +106,8 @@ async fn added_files_for_snapshot(
     table: &Table,
     snapshot: &SnapshotRef,
     max_files: usize,
+    limits: ManifestReadLimits,
+    deadline: tokio::time::Instant,
 ) -> Result<(HashSet<String>, usize), ConnectorError> {
     if snapshot.summary().operation != Operation::Append {
         return Err(non_append_error(
@@ -111,16 +116,7 @@ async fn added_files_for_snapshot(
         ));
     }
 
-    let manifest_list = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .map_err(|error| {
-            ConnectorError::ReadError(format!(
-                "[LDB-ICEBERG-APPEND-MANIFEST-LIST] snapshot {}: {error}",
-                snapshot.snapshot_id()
-            ))
-        })?;
+    let manifest_list = load_manifest_list(table, snapshot, limits, deadline).await?;
     let mut paths = HashSet::new();
     for manifest_file in manifest_list.entries() {
         if manifest_file.added_snapshot_id != snapshot.snapshot_id()
@@ -137,15 +133,7 @@ async fn added_files_for_snapshot(
                 "delete-file addition",
             ));
         }
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
-            .await
-            .map_err(|error| {
-                ConnectorError::ReadError(format!(
-                    "[LDB-ICEBERG-APPEND-MANIFEST] snapshot {}: {error}",
-                    snapshot.snapshot_id()
-                ))
-            })?;
+        let manifest = load_manifest(table, manifest_file, limits, deadline).await?;
         for entry in manifest.entries() {
             if entry.snapshot_id() != Some(snapshot.snapshot_id()) {
                 continue;
@@ -239,6 +227,15 @@ mod tests {
         }
     }
 
+    async fn plan(
+        table: &Table,
+        cursor: &IcebergSourceCursorV1,
+        config: &IcebergSourceConfig,
+    ) -> Result<Vec<AppendSnapshotPlan>, ConnectorError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        plan_appends(table, cursor, config, deadline).await
+    }
+
     #[tokio::test]
     async fn traverses_every_append_in_lineage_order_without_bootstrap_files() {
         let fixture = create_test_table(false).await;
@@ -253,7 +250,7 @@ mod tests {
         let (third, third_paths) = append_rows(&fixture, &second, 3, &[(3, Some("c"))]).await;
         let third_id = third.metadata().current_snapshot_id().unwrap();
 
-        let plans = plan_appends(&third, &cursor, 10, 10).await.unwrap();
+        let plans = plan(&third, &cursor, &config).await.unwrap();
         assert_eq!(
             plans
                 .iter()
@@ -278,10 +275,7 @@ mod tests {
             &third,
             third.metadata().current_snapshot().unwrap(),
         );
-        assert!(plan_appends(&third, &current, 10, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(plan(&third, &current, &config).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -340,7 +334,7 @@ mod tests {
             .unwrap()
             .metadata;
         let overwrite_table = table_with_metadata(&second, metadata);
-        assert!(plan_appends(&overwrite_table, &second_cursor, 10, 10)
+        assert!(plan(&overwrite_table, &second_cursor, &config)
             .await
             .unwrap_err()
             .to_string()
@@ -359,12 +353,16 @@ mod tests {
         );
         let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
         let (third, _) = append_rows(&fixture, &second, 3, &[(3, None)]).await;
-        assert!(plan_appends(&third, &cursor, 1, 10)
+        let mut snapshot_limited = config.clone();
+        snapshot_limited.max_snapshots_per_poll = 1;
+        assert!(plan(&third, &cursor, &snapshot_limited)
             .await
             .unwrap_err()
             .to_string()
             .contains("SNAPSHOT-LIMIT"));
-        assert!(plan_appends(&third, &cursor, 10, 1)
+        let mut file_limited = config;
+        file_limited.max_planned_files = 1;
+        assert!(plan(&third, &cursor, &file_limited)
             .await
             .unwrap_err()
             .to_string()

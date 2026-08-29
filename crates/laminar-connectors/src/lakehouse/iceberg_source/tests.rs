@@ -101,3 +101,31 @@ async fn completed_scan_observes_files_and_storage_bytes() {
     assert_eq!(source.metrics.read_files.get(), 1);
     assert!(source.metrics.read_storage_bytes.get() > 0);
 }
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn full_snapshot_scan_enforces_planned_file_limit() {
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let (first, _) = append_rows(&fixture, &fixture.table, 1, &[(1, None)]).await;
+    let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
+    let mut config = test_source_config();
+    config.max_planned_files = 1;
+    let mut source = IcebergSource::new(config, None);
+    source.table = Some(second);
+    source.start_initial_scan().unwrap();
+
+    let error = loop {
+        match source.poll_batch(8_192).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("two-file snapshot bypassed read.max.planned.files"),
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        error.to_string().contains("SCAN-FILE-LIMIT"),
+        "got: {error}"
+    );
+    source.close().await.unwrap();
+}

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use futures_util::StreamExt;
 use laminar_connectors::config::{encode_arrow_schema_ipc, ConnectorConfig};
 use laminar_connectors::connector::{
     CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
@@ -177,12 +178,11 @@ async fn inspect(table: &str) -> (usize, usize) {
     .await
     .unwrap();
     let snapshots = table.metadata().snapshots().count();
-    let rows = iceberg_io::scan_table(&table, None, &[])
-        .await
-        .unwrap()
-        .iter()
-        .map(RecordBatch::num_rows)
-        .sum();
+    let mut stream = table.scan().build().unwrap().to_arrow().await.unwrap();
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        rows += batch.unwrap().num_rows();
+    }
     (snapshots, rows)
 }
 

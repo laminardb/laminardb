@@ -12,6 +12,9 @@ use tokio::sync::mpsc;
 
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::IcebergSourceConfig;
+use crate::lakehouse::iceberg_scan::{
+    connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
+};
 
 use super::append_lineage::AppendSnapshotPlan;
 use super::cursor::IcebergSourceCursorV1;
@@ -107,6 +110,8 @@ fn spawn_scan(
     let projection = config.select_columns.clone();
     let concurrency = config.scan_concurrency;
     let request_timeout = config.storage.request_timeout;
+    let max_planned_files = config.max_planned_files;
+    let metadata_limits = ManifestReadLimits::from_source(config);
     let (sender, receiver) = mpsc::channel(config.scan_channel_capacity);
     let handle = tokio::spawn(async move {
         for plan in plans {
@@ -116,6 +121,8 @@ fn spawn_scan(
                 predicate.clone(),
                 concurrency,
                 request_timeout,
+                max_planned_files,
+                metadata_limits,
                 plan,
                 &sender,
             )
@@ -139,9 +146,22 @@ async fn run_plan(
     predicate: Option<Predicate>,
     concurrency: usize,
     request_timeout: std::time::Duration,
+    max_planned_files: usize,
+    metadata_limits: ManifestReadLimits,
     plan: ScanPlan,
     sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
 ) -> Result<(), ConnectorError> {
+    let snapshot = table
+        .metadata()
+        .snapshot_by_id(plan.snapshot_id)
+        .ok_or_else(|| {
+            ConnectorError::ReadError(format!(
+                "[LDB-ICEBERG-SNAPSHOT-MISSING] snapshot {} does not exist",
+                plan.snapshot_id
+            ))
+        })?;
+    let planning_deadline = tokio::time::Instant::now() + request_timeout;
+    preflight_snapshot(table, snapshot, metadata_limits, planning_deadline).await?;
     let mut builder = table
         .scan()
         .snapshot_id(plan.snapshot_id)
@@ -156,15 +176,15 @@ async fn run_plan(
         builder = builder.with_filter(predicate);
     }
     let scan = builder.build().map_err(|error| {
-        ConnectorError::ReadError(format!(
-            "[LDB-ICEBERG-SCAN-BUILD] snapshot {}: {error}",
-            plan.snapshot_id
-        ))
+        connector_scan_error(
+            &format!(
+                "[LDB-ICEBERG-SCAN-BUILD] snapshot {} scan build failed",
+                plan.snapshot_id
+            ),
+            &error,
+        )
     })?;
-    let tasks = tokio::time::timeout(request_timeout, scan.plan_files())
-        .await
-        .map_err(|_| scan_timeout(request_timeout))?
-        .map_err(|error| scan_error(&error))?;
+    let tasks = plan_files(&scan, max_planned_files, planning_deadline).await?;
     let tasks = match plan.files {
         ScanFiles::All => tasks,
         ScanFiles::Added(paths) => Box::pin(
@@ -183,7 +203,7 @@ async fn run_plan(
         .with_data_file_concurrency_limit(concurrency)
         .build()
         .read(counted_tasks)
-        .map_err(|error| scan_error(&error))?;
+        .map_err(|error| connector_scan_error("Iceberg reader creation failed", &error))?;
     let scan_metrics = result.metrics().clone();
     send_stream(result.stream(), plan.cursor, sender, request_timeout).await?;
     send(
@@ -210,7 +230,8 @@ async fn send_stream(
         let Some(result) = result else {
             break;
         };
-        let batch = result.map_err(|error| scan_error(&error))?;
+        let batch =
+            result.map_err(|error| connector_scan_error("Iceberg data read failed", &error))?;
         if batch.num_rows() == 0 {
             continue;
         }
@@ -253,8 +274,4 @@ async fn send(
         .send(Ok(output))
         .await
         .map_err(|_| ConnectorError::Closed)
-}
-
-fn scan_error(error: &iceberg::Error) -> ConnectorError {
-    ConnectorError::ReadError(format!("Iceberg scan failed: {error}"))
 }

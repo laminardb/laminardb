@@ -30,6 +30,8 @@ pub mod iceberg_io;
 pub mod iceberg_lookup;
 #[cfg(feature = "iceberg-core")]
 pub mod iceberg_reference;
+#[cfg(feature = "iceberg-core")]
+mod iceberg_scan;
 pub mod iceberg_source;
 
 // Common metrics

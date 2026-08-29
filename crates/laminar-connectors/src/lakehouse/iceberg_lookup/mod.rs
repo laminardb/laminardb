@@ -10,6 +10,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_row::SortField;
 use arrow_schema::SchemaRef;
+use futures_util::StreamExt;
 use iceberg::expr::{Predicate as IcebergPredicate, Reference};
 use iceberg::spec::Datum;
 use iceberg::Catalog;
@@ -21,6 +22,15 @@ use laminar_core::lookup::source::{
 use laminar_core::lookup::KeyAligner;
 
 use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
+use crate::lakehouse::iceberg_scan::{
+    connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
+    DEFAULT_MAX_PLANNED_FILES,
+};
+
+const MAX_LOOKUP_KEYS: usize = 4_096;
+const MAX_LOOKUP_KEY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LOOKUP_RESULT_BYTES: usize = 64 * 1024 * 1024;
+const LOOKUP_SCAN_CONCURRENCY: usize = 4;
 
 /// Configuration for [`IcebergLookupSource`].
 #[derive(Debug, Clone)]
@@ -39,6 +49,7 @@ pub struct IcebergLookupSource {
     namespace: String,
     table_name: String,
     catalog_request_timeout: std::time::Duration,
+    storage_request_timeout: std::time::Duration,
     schema: SchemaRef,
     aligner: KeyAligner,
 }
@@ -51,6 +62,7 @@ impl IcebergLookupSource {
     /// Returns `LookupError` if the catalog/table cannot be opened or a primary
     /// key column is missing from the table schema.
     pub async fn open(config: IcebergLookupSourceConfig) -> Result<Self, LookupError> {
+        validate_lookup_config(&config)?;
         let catalog = crate::lakehouse::iceberg_io::build_catalog(&config.catalog, &config.storage)
             .await
             .map_err(|e| LookupError::Connection(format!("iceberg catalog: {e}")))?;
@@ -86,6 +98,7 @@ impl IcebergLookupSource {
             namespace: config.catalog.namespace,
             table_name: config.catalog.table_name,
             catalog_request_timeout: config.catalog.request_timeout,
+            storage_request_timeout: config.storage.request_timeout,
             schema,
             aligner,
         })
@@ -190,6 +203,131 @@ impl IcebergLookupSource {
     }
 }
 
+fn validate_lookup_config(config: &IcebergLookupSourceConfig) -> Result<(), LookupError> {
+    if config.primary_key_columns.is_empty() || config.primary_key_columns.len() > 128 {
+        return Err(LookupError::Internal(
+            "Iceberg lookup requires between 1 and 128 primary-key columns".into(),
+        ));
+    }
+    let mut names = std::collections::HashSet::with_capacity(config.primary_key_columns.len());
+    for name in &config.primary_key_columns {
+        if name.is_empty() || !names.insert(name) {
+            return Err(LookupError::Internal(
+                "Iceberg lookup primary-key columns must be nonempty and distinct".into(),
+            ));
+        }
+    }
+    for (name, timeout) in [
+        ("catalog.request_timeout", config.catalog.request_timeout),
+        ("storage.request_timeout", config.storage.request_timeout),
+        ("storage.connect_timeout", config.storage.connect_timeout),
+    ] {
+        if timeout.is_zero() {
+            return Err(LookupError::Internal(format!(
+                "Iceberg lookup {name} must be greater than zero"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_lookup_keys(keys: &[&[u8]]) -> Result<(), LookupError> {
+    if keys.len() > MAX_LOOKUP_KEYS {
+        return Err(LookupError::Query(format!(
+            "Iceberg lookup received {} keys, exceeding the fixed {MAX_LOOKUP_KEYS}-key batch limit",
+            keys.len()
+        )));
+    }
+    let bytes = keys.iter().try_fold(0_usize, |total, key| {
+        total
+            .checked_add(key.len())
+            .ok_or_else(|| LookupError::Query("Iceberg lookup key byte count overflow".into()))
+    })?;
+    if bytes > MAX_LOOKUP_KEY_BYTES {
+        return Err(LookupError::Query(format!(
+            "Iceberg lookup received {bytes} key bytes, exceeding the fixed {MAX_LOOKUP_KEY_BYTES}-byte batch limit"
+        )));
+    }
+    Ok(())
+}
+
+async fn read_lookup_batches(
+    mut stream: iceberg::scan::ArrowRecordBatchStream,
+    max_rows: usize,
+    deadline: tokio::time::Instant,
+    timeout: std::time::Duration,
+) -> Result<Vec<RecordBatch>, LookupError> {
+    let mut batches = Vec::new();
+    let mut rows = 0_usize;
+    let mut bytes = 0_usize;
+    loop {
+        let next = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .map_err(|_| LookupError::Timeout(timeout))?;
+        let Some(result) = next else {
+            return Ok(batches);
+        };
+        let batch = result.map_err(|error| {
+            LookupError::Query(
+                connector_scan_error("Iceberg lookup data read failed", &error).to_string(),
+            )
+        })?;
+        rows = rows
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| LookupError::Query("Iceberg lookup result row count overflow".into()))?;
+        if rows > max_rows {
+            return Err(LookupError::Query(format!(
+                "Iceberg lookup returned more than {max_rows} distinct-key rows"
+            )));
+        }
+        bytes = batch.columns().iter().try_fold(bytes, |total, column| {
+            total
+                .checked_add(column.get_array_memory_size())
+                .ok_or_else(|| {
+                    LookupError::Query("Iceberg lookup result byte count overflow".into())
+                })
+        })?;
+        if bytes > MAX_LOOKUP_RESULT_BYTES {
+            return Err(LookupError::Query(format!(
+                "Iceberg lookup retained {bytes} result bytes, exceeding the fixed {MAX_LOOKUP_RESULT_BYTES}-byte limit"
+            )));
+        }
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+}
+
+fn project_aligned_rows(
+    aligned: Vec<Option<RecordBatch>>,
+    names: &[String],
+) -> Result<Vec<Option<RecordBatch>>, LookupError> {
+    aligned
+        .into_iter()
+        .map(|batch| {
+            batch
+                .map(|batch| {
+                    let indices = names
+                        .iter()
+                        .map(|name| {
+                            batch.schema().index_of(name).map_err(|_| {
+                                LookupError::Internal(format!(
+                                    "Iceberg lookup result omitted projected column '{name}'"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    batch.project(&indices).map_err(|error| {
+                        LookupError::Internal(format!(
+                            "project aligned Iceberg lookup row: {error}"
+                        ))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
 impl LookupSource for IcebergLookupSource {
     async fn query(
         &self,
@@ -197,11 +335,10 @@ impl LookupSource for IcebergLookupSource {
         _predicates: &[Predicate],
         projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
-        use tokio_stream::StreamExt;
-
         if keys.is_empty() {
             return Ok(Vec::new());
         }
+        validate_lookup_keys(keys)?;
 
         let pk_arrays = self.aligner.decode_keys(keys)?;
         let predicate =
@@ -218,36 +355,73 @@ impl LookupSource for IcebergLookupSource {
         .await
         .map_err(|e| LookupError::Query(format!("load iceberg table: {e}")))?;
 
-        // Projection pushdown: select only the requested columns (always incl.
-        // the key, so realignment still works), else every column.
-        let mut builder = table.scan().with_filter(predicate);
-        builder = if projection.is_empty() {
-            builder.select_all()
-        } else {
-            builder.select(projection_names(&self.schema, projection)?)
-        };
-        let scan = builder
-            .build()
-            .map_err(|e| LookupError::Query(format!("build iceberg scan: {e}")))?;
-        let stream = scan
-            .to_arrow()
-            .await
-            .map_err(|e| LookupError::Query(format!("iceberg scan to arrow: {e}")))?;
-
-        let mut batches = Vec::new();
-        let mut stream = std::pin::pin!(stream);
-        while let Some(result) = stream.next().await {
-            batches
-                .push(result.map_err(|e| LookupError::Query(format!("read iceberg batch: {e}")))?);
+        let requested_names = projection_names(&self.schema, projection)?;
+        let mut scan_names = requested_names.clone();
+        if !projection.is_empty() {
+            for key_name in self.aligner.pk_columns() {
+                if !scan_names.contains(key_name) {
+                    scan_names.push(key_name.clone());
+                }
+            }
         }
-
-        self.aligner.align(keys, &batches)
+        let project_after_alignment = scan_names != requested_names;
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(vec![None; keys.len()]);
+        };
+        let mut builder = table
+            .scan()
+            .snapshot_id(snapshot.snapshot_id())
+            .with_filter(predicate)
+            .with_concurrency_limit(LOOKUP_SCAN_CONCURRENCY);
+        builder = builder.select(&scan_names);
+        let scan = builder.build().map_err(|error| {
+            LookupError::Query(
+                connector_scan_error("build Iceberg lookup scan", &error).to_string(),
+            )
+        })?;
+        let deadline = tokio::time::Instant::now() + self.storage_request_timeout;
+        preflight_snapshot(&table, snapshot, ManifestReadLimits::fixed(), deadline)
+            .await
+            .map_err(|error| LookupError::Query(error.to_string()))?;
+        let tasks = plan_files(&scan, DEFAULT_MAX_PLANNED_FILES, deadline)
+            .await
+            .map_err(|error| LookupError::Query(error.to_string()))?;
+        let reader = table
+            .reader_builder()
+            .with_batch_size(8_192)
+            .with_data_file_concurrency_limit(LOOKUP_SCAN_CONCURRENCY)
+            .build()
+            .read(tasks)
+            .map_err(|error| {
+                LookupError::Query(
+                    connector_scan_error("create Iceberg lookup reader", &error).to_string(),
+                )
+            })?;
+        let unique_keys = keys
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let batches = read_lookup_batches(
+            reader.stream(),
+            unique_keys,
+            deadline,
+            self.storage_request_timeout,
+        )
+        .await?;
+        let aligned = self.aligner.align(keys, &batches)?;
+        if project_after_alignment {
+            project_aligned_rows(aligned, &requested_names)
+        } else {
+            Ok(aligned)
+        }
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
             supports_projection_pushdown: true,
+            max_batch_size: MAX_LOOKUP_KEYS,
             ..LookupSourceCapabilities::none()
         }
     }

@@ -9,6 +9,7 @@ use crate::connector::{
 };
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::IcebergSinkConfig;
+use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, ManifestReadLimits};
 
 use super::{
     data_file_set_fingerprint, ensure_deadline, file_set_fingerprint, hex, load_table_until,
@@ -234,38 +235,15 @@ async fn added_data_files_for_snapshot(
     crate::lakehouse::iceberg::fault_injection::fail_if(
         crate::lakehouse::iceberg::fault_injection::IcebergFaultPoint::DuringManifestReconciliation,
     )?;
-    let manifest_list =
-        tokio::time::timeout_at(deadline, table.manifest_list_reader(snapshot).load())
-            .await
-            .map_err(|_| {
-                ConnectorError::ReadError(
-                    "Iceberg publication manifest-list read exceeded its reconciliation deadline"
-                        .into(),
-                )
-            })?
-            .map_err(|error| {
-                ConnectorError::ReadError(format!(
-                    "read Iceberg publication manifest list: {error}"
-                ))
-            })?;
+    let limits = ManifestReadLimits::fixed();
+    let manifest_list = load_manifest_list(table, snapshot, limits, deadline).await?;
     let mut paths = HashSet::new();
     let mut files = Vec::new();
     for manifest_file in manifest_list.entries() {
         if manifest_file.added_snapshot_id != snapshot.snapshot_id() {
             continue;
         }
-        let manifest =
-            tokio::time::timeout_at(deadline, manifest_file.load_manifest(table.file_io()))
-                .await
-                .map_err(|_| {
-                    ConnectorError::ReadError(
-                        "Iceberg publication manifest read exceeded its reconciliation deadline"
-                            .into(),
-                    )
-                })?
-                .map_err(|error| {
-                    ConnectorError::ReadError(format!("read Iceberg publication manifest: {error}"))
-                })?;
+        let manifest = load_manifest(table, manifest_file, limits, deadline).await?;
         collect_added_files(
             snapshot.snapshot_id(),
             manifest.entries(),

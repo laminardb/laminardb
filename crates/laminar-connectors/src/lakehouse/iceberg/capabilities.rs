@@ -69,6 +69,7 @@ fn direct_s3_warehouse(warehouse: &str) -> bool {
 }
 
 pub(crate) fn validate_source(config: &IcebergSourceConfig) -> Result<(), ConnectorError> {
+    config.validate_read_limits()?;
     if config.read_mode == IcebergReadMode::Changelog {
         return Err(ConnectorError::FeatureUnsupported(
             CHANGELOG_MISSING_RECONCILIATION.into(),

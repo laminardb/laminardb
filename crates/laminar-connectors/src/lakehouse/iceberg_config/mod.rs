@@ -3,6 +3,7 @@
 
 mod modes;
 mod registry;
+mod source;
 mod table_definition;
 
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ pub use modes::{
     IcebergWriteDistributionMode, IcebergWriteMode,
 };
 pub(crate) use registry::{sink_config_keys, source_config_keys};
+pub use source::IcebergSourceConfig;
 pub(crate) use table_definition::{
     parse_parquet_compression, parse_table_fields, validate_distinct_names,
     validate_persisted_properties, validate_table_definition,
@@ -523,88 +525,6 @@ impl IcebergSinkConfig {
         }
         parse_parquet_compression(&self.compression)?;
         Ok(())
-    }
-}
-
-/// Configuration for bounded snapshot and append reads.
-#[derive(Debug, Clone)]
-pub struct IcebergSourceConfig {
-    /// Catalog settings.
-    pub catalog: IcebergCatalogConfig,
-    /// Table storage settings.
-    pub storage: IcebergStorageConfig,
-    /// Requested read semantics.
-    pub read_mode: IcebergReadMode,
-    /// Append bootstrap policy.
-    pub bootstrap: IcebergReadBootstrap,
-    /// How often append mode refreshes table metadata.
-    pub poll_interval: Duration,
-    /// Selected start or bounded snapshot.
-    pub snapshot_id: Option<i64>,
-    /// Named Iceberg table ref.
-    pub table_ref: String,
-    /// Projected columns; empty selects all columns.
-    pub select_columns: Vec<String>,
-    /// Serialized Iceberg predicate pushed into scan planning.
-    pub filter: Option<String>,
-    /// Maximum lineage snapshots processed by one poll.
-    pub max_snapshots_per_poll: usize,
-    /// Maximum added files retained while planning one poll.
-    pub max_planned_files: usize,
-    /// Capacity of the scan-to-ingestion batch channel.
-    pub scan_channel_capacity: usize,
-    /// Maximum concurrent manifest and data-file reads.
-    pub scan_concurrency: usize,
-}
-
-impl IcebergSourceConfig {
-    /// Parses source settings from resolved connector configuration.
-    ///
-    /// `snapshot` mode without an explicit ID selects the current snapshot at
-    /// open and remains pinned to it. `append` mode uses that same selection as
-    /// its lineage root.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for missing, malformed, or contradictory settings.
-    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let read_mode = parse_or_default(config, "read.mode")?;
-        if config.get("read.bootstrap").is_some() && read_mode != IcebergReadMode::Append {
-            return Err(ConnectorError::ConfigurationError(
-                "read.bootstrap is only valid when read.mode=append".into(),
-            ));
-        }
-        let poll_interval = match optional_alias(config, "poll.interval", "poll.interval.ms") {
-            Some(value) if config.get("poll.interval").is_some() => {
-                parse_duration_value("poll.interval", value)?
-            }
-            Some(value) => Duration::from_millis(
-                u64::try_from(parse_nonzero_value("poll.interval.ms", value)?).map_err(|_| {
-                    ConnectorError::ConfigurationError("poll.interval.ms is too large".into())
-                })?,
-            ),
-            None => Duration::from_secs(60),
-        };
-
-        Ok(Self {
-            catalog: IcebergCatalogConfig::from_config(config)?,
-            storage: IcebergStorageConfig::from_config(config)?,
-            read_mode,
-            bootstrap: parse_or_default(config, "read.bootstrap")?,
-            poll_interval,
-            snapshot_id: parse_optional_alias(config, "start.snapshot.id", "snapshot.id")?,
-            table_ref: config.get("table.ref").unwrap_or("main").trim().to_string(),
-            select_columns: parse_comma_list(
-                optional_alias(config, "projection", "select.columns"),
-                "projection",
-                1_024,
-            )?,
-            filter: optional_non_empty(config, "filter"),
-            max_snapshots_per_poll: parse_nonzero(config, "read.max.snapshots.per.poll", 1_024)?,
-            max_planned_files: parse_nonzero(config, "read.max.planned.files", 65_536)?,
-            scan_channel_capacity: parse_nonzero(config, "read.channel.capacity", 2)?,
-            scan_concurrency: parse_nonzero(config, "read.scan.concurrency", 4)?,
-        })
     }
 }
 

@@ -35,10 +35,40 @@ fn test_source_config_from_config() {
     config.set("table.name", "dim_customers");
     config.set("poll.interval.ms", "30000");
     config.set("snapshot.id", "42");
+    config.set("read.max.manifest.list.bytes", "8192");
+    config.set("read.max.manifest.bytes", "4096");
+    config.set("read.max.manifests.per.snapshot", "16");
 
     let cfg = IcebergSourceConfig::from_config(&config).unwrap();
     assert_eq!(cfg.poll_interval, Duration::from_secs(30));
     assert_eq!(cfg.snapshot_id, Some(42));
+    assert_eq!(cfg.max_manifest_list_bytes, 8192);
+    assert_eq!(cfg.max_manifest_bytes, 4096);
+    assert_eq!(cfg.max_manifests_per_snapshot, 16);
+}
+
+#[test]
+fn source_metadata_limits_must_be_nonzero() {
+    for key in [
+        "read.max.manifest.list.bytes",
+        "read.max.manifest.bytes",
+        "read.max.manifests.per.snapshot",
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, "0");
+        let error = IcebergSourceConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "got: {error}");
+    }
+}
+
+#[test]
+fn programmatic_zero_source_limit_fails_closed() {
+    let mut parsed = IcebergSourceConfig::from_config(&table_definition_config()).unwrap();
+    parsed.scan_concurrency = 0;
+    let error = parsed.validate_read_limits().unwrap_err().to_string();
+    assert!(error.contains("read.scan.concurrency"));
 }
 
 #[test]
