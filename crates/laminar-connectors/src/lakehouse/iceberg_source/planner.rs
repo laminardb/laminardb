@@ -308,7 +308,7 @@ async fn read_tasks(
     table: &Table,
     tasks: FileScanTaskStream,
     cursor: IcebergSourceCursorV1,
-    projection: ReadProjection,
+    projection: Arc<ReadProjection>,
     concurrency: usize,
     request_timeout: std::time::Duration,
     sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
@@ -341,7 +341,7 @@ async fn read_tasks(
 async fn send_stream(
     mut stream: ArrowRecordBatchStream,
     cursor: IcebergSourceCursorV1,
-    projection: ReadProjection,
+    projection: Arc<ReadProjection>,
     sender: &mpsc::Sender<Result<ScanOutput, ConnectorError>>,
     request_timeout: std::time::Duration,
 ) -> Result<(), ConnectorError> {

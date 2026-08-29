@@ -4,12 +4,14 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, FieldRef, Fields, Schema, SchemaRef};
 use iceberg::spec::Schema as IcebergSchema;
+use quick_cache::sync::Cache;
 
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg::SchemaAlignmentPlan;
 
 const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 const EVOLUTION_ERROR: &str = "[LDB-ICEBERG-SCHEMA-EVOLUTION]";
+const MAX_CACHED_SCHEMA_PLANS: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct ReadSchemaBinding {
@@ -17,6 +19,7 @@ pub(super) struct ReadSchemaBinding {
     output_schema: SchemaRef,
     bound_schema: SchemaRef,
     field_ids: Vec<i32>,
+    projection_cache: Arc<Cache<i32, Arc<ReadProjection>>>,
 }
 
 pub(super) struct ReadProjection {
@@ -76,6 +79,7 @@ impl ReadSchemaBinding {
             output_schema,
             bound_schema,
             field_ids,
+            projection_cache: Arc::new(Cache::new(MAX_CACHED_SCHEMA_PLANS)),
         };
         binding.projection(root)?;
         Ok(binding)
@@ -96,7 +100,10 @@ impl ReadSchemaBinding {
     pub fn projection(
         &self,
         snapshot_schema: &IcebergSchema,
-    ) -> Result<ReadProjection, ConnectorError> {
+    ) -> Result<Arc<ReadProjection>, ConnectorError> {
+        if let Some(cached) = self.projection_cache.get(&snapshot_schema.schema_id()) {
+            return Ok(cached);
+        }
         let physical = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(snapshot_schema).map_err(|error| {
                 schema_error(format!(
@@ -138,11 +145,14 @@ impl ReadSchemaBinding {
                 snapshot_schema.schema_id()
             ))
         })?;
-        Ok(ReadProjection {
+        let projection = Arc::new(ReadProjection {
             columns,
             alignment,
             output_schema: Arc::clone(&self.output_schema),
-        })
+        });
+        self.projection_cache
+            .insert(snapshot_schema.schema_id(), Arc::clone(&projection));
+        Ok(projection)
     }
 }
 
@@ -403,6 +413,21 @@ mod tests {
             .err()
             .expect("field replacement must fail");
         assert!(error.to_string().contains("retained field ID 3"));
+    }
+
+    #[test]
+    fn projection_cache_is_shared_and_bounded_by_schema_id() {
+        let root = schema(1, 7, "id", PrimitiveType::Long);
+        let binding = ReadSchemaBinding::bind(&root, &[], None).unwrap();
+        let first = binding.projection(&root).unwrap();
+        let cloned = binding.clone();
+        assert!(Arc::ptr_eq(&first, &cloned.projection(&root).unwrap()));
+
+        for schema_id in 2..=i32::try_from(MAX_CACHED_SCHEMA_PLANS + 16).unwrap() {
+            let evolved = schema(schema_id, 7, "id", PrimitiveType::Long);
+            binding.projection(&evolved).unwrap();
+        }
+        assert!(binding.projection_cache.len() <= MAX_CACHED_SCHEMA_PLANS);
     }
 
     #[test]
