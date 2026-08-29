@@ -72,10 +72,8 @@ fn null_key_adds_is_null_term() {
 fn lookup_key_limits_are_fixed() {
     let too_many = vec![b"k".as_slice(); MAX_LOOKUP_KEYS + 1];
     assert!(validate_lookup_keys(&too_many).is_err());
-    let too_large = vec![vec![0_u8; MAX_LOOKUP_KEY_BYTES + 1]];
-    assert!(
-        validate_lookup_keys(&too_large.iter().map(Vec::as_slice).collect::<Vec<_>>()).is_err()
-    );
+    let too_large = vec![0_u8; MAX_LOOKUP_KEY_BYTES + 1];
+    assert!(validate_lookup_keys(&[too_large.as_slice()]).is_err());
 }
 
 #[test]
