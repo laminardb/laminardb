@@ -8,6 +8,7 @@ pub(super) use reconciliation::read_committed_cursor;
 use reconciliation::reconcile_exact_publication;
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -242,6 +243,12 @@ fn validate_publication_cursor(
     Ok(already_published)
 }
 
+enum CommitAttemptOutcome {
+    Committed(iceberg::table::Table),
+    Conflict(String),
+    OutcomeUnknown(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_with_retries(
     catalog: &Arc<dyn Catalog>,
@@ -289,19 +296,18 @@ async fn publish_with_retries(
         )
         .await?;
         let commit_catalog = attempt_catalog.as_ref().unwrap_or(catalog);
-        let operation = commit_once(
+        let outcome = dispatch_commit_attempt(
             commit_catalog.as_ref(),
             &table,
             batch,
             prepared,
-            &identity.external_key,
-            &identity.exact_batch_hex,
-            identity.commit_uuid,
-        );
-        let commit_deadline = commit_deadline(context, config.catalog.commit_timeout);
-        let result = tokio::time::timeout_at(commit_deadline, operation).await;
-        match result {
-            Ok(Ok(updated)) => {
+            identity,
+            context,
+            config.catalog.commit_timeout,
+        )
+        .await?;
+        match outcome {
+            CommitAttemptOutcome::Committed(updated) => {
                 reconcile_successful_commit(
                     &updated,
                     batch,
@@ -313,17 +319,16 @@ async fn publish_with_retries(
                 .await?;
                 return Ok(());
             }
-            Ok(Err(error)) if error.kind() == ErrorKind::CatalogCommitConflicts => {
+            CommitAttemptOutcome::Conflict(error) => {
                 metrics.commit_conflicts.inc();
                 if attempt + 1 == MAX_PUBLICATION_ATTEMPTS {
                     return Err(ConnectorError::WriteError(format!(
-                        "Iceberg catalog commit conflict after {MAX_PUBLICATION_ATTEMPTS} bounded attempts ({})",
-                        external_error_summary(&error)
+                        "Iceberg catalog commit conflict after {MAX_PUBLICATION_ATTEMPTS} bounded attempts ({error})"
                     )));
                 }
                 jitter_before_retry(context.deadline(), attempt).await?;
             }
-            Ok(Err(error)) if commit_outcome_may_be_unknown(&error) => {
+            CommitAttemptOutcome::OutcomeUnknown(reason) => {
                 metrics.unknown_outcomes.inc();
                 return reconcile_after_unknown(
                     catalog,
@@ -334,23 +339,7 @@ async fn publish_with_retries(
                     identity.commit_uuid,
                     context.deadline(),
                     metrics,
-                    format!("catalog commit returned {}", external_error_summary(&error)),
-                )
-                .await;
-            }
-            Ok(Err(error)) => return Err(classify_rejected_commit(&error)),
-            Err(_) => {
-                metrics.unknown_outcomes.inc();
-                return reconcile_after_unknown(
-                    catalog,
-                    config,
-                    batch,
-                    prepared,
-                    &identity.exact_batch_hex,
-                    identity.commit_uuid,
-                    context.deadline(),
-                    metrics,
-                    "catalog commit exceeded its bounded dispatch deadline".into(),
+                    reason,
                 )
                 .await;
             }
@@ -359,6 +348,54 @@ async fn publish_with_retries(
     Err(ConnectorError::Internal(
         "Iceberg publication retry loop exited unexpectedly".into(),
     ))
+}
+
+async fn dispatch_commit_attempt(
+    catalog: &dyn Catalog,
+    table: &iceberg::table::Table,
+    batch: &CoordinatedCommitBatch,
+    prepared: &PreparedPublication,
+    identity: &PublicationIdentity,
+    context: CoordinatedCommitContext,
+    configured_timeout: Duration,
+) -> Result<CommitAttemptOutcome, ConnectorError> {
+    let catalog_update_started = AtomicBool::new(false);
+    let operation = commit_once(
+        catalog,
+        table,
+        batch,
+        prepared,
+        &identity.external_key,
+        &identity.exact_batch_hex,
+        identity.commit_uuid,
+        &catalog_update_started,
+    );
+    let deadline = commit_deadline(context, configured_timeout);
+    let result = tokio::time::timeout_at(deadline, operation).await;
+    let update_started = catalog_update_started.load(Ordering::Relaxed);
+    match result {
+        Ok(Ok(updated)) => Ok(CommitAttemptOutcome::Committed(updated)),
+        Ok(Err(error)) if update_started && error.kind() == ErrorKind::CatalogCommitConflicts => {
+            Ok(CommitAttemptOutcome::Conflict(external_error_summary(
+                &error,
+            )))
+        }
+        Ok(Err(error)) if update_started && commit_outcome_may_be_unknown(&error) => {
+            Ok(CommitAttemptOutcome::OutcomeUnknown(format!(
+                "catalog commit returned {}",
+                external_error_summary(&error)
+            )))
+        }
+        Ok(Err(error)) if !update_started => Err(classify_pre_dispatch_failure(&error)),
+        Ok(Err(error)) => Err(classify_rejected_commit(&error)),
+        Err(_) if update_started => Ok(CommitAttemptOutcome::OutcomeUnknown(
+            "catalog commit exceeded its bounded dispatch deadline".into(),
+        )),
+        Err(_) => Err(ConnectorError::WriteError(
+            "Iceberg commit preparation exceeded its bounded deadline before catalog dispatch"
+                .into(),
+        )),
+    }
 }
 
 async fn reconcile_successful_commit(
@@ -568,6 +605,7 @@ async fn commit_once(
     external_key: &str,
     exact_batch_fingerprint: &str,
     logical_commit_uuid: uuid::Uuid,
+    catalog_update_started: &AtomicBool,
 ) -> iceberg::Result<iceberg::table::Table> {
     let target = CoordinatedCommitCursor {
         checkpoint_id: batch.target.checkpoint_id,
@@ -608,7 +646,7 @@ async fn commit_once(
             "injected failure before catalog commit dispatch",
         ));
     }
-    let single_dispatch = SingleDispatchCatalog::new(catalog, table);
+    let single_dispatch = SingleDispatchCatalog::new(catalog, table, catalog_update_started);
     let updated = tx.commit(&single_dispatch).await?;
     #[cfg(test)]
     if super::fault_injection::hit(super::fault_injection::IcebergFaultPoint::AfterCatalogCommit) {
@@ -764,6 +802,13 @@ fn commit_outcome_may_be_unknown(error: &iceberg::Error) -> bool {
 fn classify_rejected_commit(error: &iceberg::Error) -> ConnectorError {
     ConnectorError::TransactionError(format!(
         "Iceberg catalog rejected coordinated commit ({})",
+        external_error_summary(error)
+    ))
+}
+
+fn classify_pre_dispatch_failure(error: &iceberg::Error) -> ConnectorError {
+    ConnectorError::WriteError(format!(
+        "Iceberg commit preparation failed before catalog dispatch ({})",
         external_error_summary(error)
     ))
 }

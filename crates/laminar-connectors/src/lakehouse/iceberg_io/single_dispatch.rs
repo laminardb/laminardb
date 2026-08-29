@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use iceberg::table::Table;
@@ -15,11 +16,20 @@ use iceberg::{
 pub(crate) struct SingleDispatchCatalog<'a> {
     inner: &'a dyn Catalog,
     base: &'a Table,
+    update_started: &'a AtomicBool,
 }
 
 impl<'a> SingleDispatchCatalog<'a> {
-    pub(crate) fn new(inner: &'a dyn Catalog, base: &'a Table) -> Self {
-        Self { inner, base }
+    pub(crate) fn new(
+        inner: &'a dyn Catalog,
+        base: &'a Table,
+        update_started: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            inner,
+            base,
+            update_started,
+        }
     }
 }
 
@@ -115,6 +125,7 @@ impl Catalog for SingleDispatchCatalog<'_> {
     }
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        self.update_started.store(true, Ordering::Relaxed);
         self.inner
             .update_table(commit)
             .await
@@ -124,6 +135,8 @@ impl Catalog for SingleDispatchCatalog<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
     use super::*;
@@ -147,11 +160,36 @@ mod tests {
             Some("new")
         );
 
-        let catalog = SingleDispatchCatalog::new(fixture.catalog.as_ref(), &fixture.table);
+        let update_started = AtomicBool::new(false);
+        let catalog =
+            SingleDispatchCatalog::new(fixture.catalog.as_ref(), &fixture.table, &update_started);
         let refreshed = catalog
             .load_table(fixture.table.identifier())
             .await
             .unwrap();
         assert!(!refreshed.metadata().properties().contains_key("revision"));
+    }
+
+    #[tokio::test]
+    async fn update_probe_marks_only_the_catalog_mutation_boundary() {
+        let fixture = crate::lakehouse::iceberg::test_support::create_test_table(false).await;
+        let update_started = AtomicBool::new(false);
+        let catalog =
+            SingleDispatchCatalog::new(fixture.catalog.as_ref(), &fixture.table, &update_started);
+
+        catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .unwrap();
+        assert!(!update_started.load(Ordering::Relaxed));
+
+        let transaction = Transaction::new(&fixture.table);
+        let transaction = transaction
+            .update_table_properties()
+            .set("revision".into(), "tracked".into())
+            .apply(transaction)
+            .unwrap();
+        transaction.commit(&catalog).await.unwrap();
+        assert!(update_started.load(Ordering::Relaxed));
     }
 }

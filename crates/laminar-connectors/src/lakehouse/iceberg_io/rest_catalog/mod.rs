@@ -489,6 +489,8 @@ impl CatalogAccess {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::ErrorKind;
     use wiremock::matchers::{header, method, path, query_param};
@@ -664,7 +666,9 @@ mod tests {
             .set("test".into(), "value".into())
             .apply(transaction)
             .unwrap();
-        let single_dispatch = super::super::SingleDispatchCatalog::new(&catalog, &fixture.table);
+        let update_started = AtomicBool::new(false);
+        let single_dispatch =
+            super::super::SingleDispatchCatalog::new(&catalog, &fixture.table, &update_started);
         let error = transaction.commit(&single_dispatch).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
 
@@ -747,7 +751,9 @@ mod tests {
             .set("test".into(), "value".into())
             .apply(transaction)
             .unwrap();
-        let single_dispatch = super::super::SingleDispatchCatalog::new(&catalog, &fixture.table);
+        let update_started = AtomicBool::new(false);
+        let single_dispatch =
+            super::super::SingleDispatchCatalog::new(&catalog, &fixture.table, &update_started);
         let error = transaction.commit(&single_dispatch).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         let error = error.to_string();
