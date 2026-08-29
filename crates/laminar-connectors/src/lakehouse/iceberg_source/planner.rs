@@ -53,6 +53,7 @@ pub(super) fn full_snapshot_task(
     table: Table,
     config: &IcebergSourceConfig,
     read_schema: &ReadSchemaBinding,
+    predicate: Option<Predicate>,
     snapshot_id: i64,
 ) -> Result<ScanTask, ConnectorError> {
     let snapshot = table
@@ -65,26 +66,28 @@ pub(super) fn full_snapshot_task(
         })?;
     let cursor =
         IcebergSourceCursorV1::from_snapshot(config, &table, snapshot, read_schema.schema_id());
-    spawn_scan(
+    Ok(spawn_scan(
         table,
         config,
         read_schema,
+        predicate,
         vec![ScanPlan {
             snapshot_id,
             files: ScanFiles::All,
             cursor,
         }],
-    )
+    ))
 }
 
 pub(super) fn append_task(
     table: Table,
     config: &IcebergSourceConfig,
     read_schema: &ReadSchemaBinding,
+    predicate: Option<Predicate>,
     plans: Vec<AppendSnapshotPlan>,
-) -> Result<Option<ScanTask>, ConnectorError> {
+) -> Option<ScanTask> {
     if plans.is_empty() {
-        return Ok(None);
+        return None;
     }
     let plans = plans
         .into_iter()
@@ -99,25 +102,16 @@ pub(super) fn append_task(
             ),
         })
         .collect();
-    spawn_scan(table, config, read_schema, plans).map(Some)
+    Some(spawn_scan(table, config, read_schema, predicate, plans))
 }
 
 fn spawn_scan(
     table: Table,
     config: &IcebergSourceConfig,
     read_schema: &ReadSchemaBinding,
+    predicate: Option<Predicate>,
     plans: Vec<ScanPlan>,
-) -> Result<ScanTask, ConnectorError> {
-    let predicate = config
-        .filter
-        .as_deref()
-        .map(serde_json::from_str::<Predicate>)
-        .transpose()
-        .map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid Iceberg filter predicate JSON: {error}"
-            ))
-        })?;
+) -> ScanTask {
     let concurrency = config.scan_concurrency;
     let request_timeout = config.storage.request_timeout;
     let max_planned_files = config.max_planned_files;
@@ -144,11 +138,11 @@ fn spawn_scan(
             }
         }
     });
-    Ok(ScanTask {
+    ScanTask {
         receiver,
         handle,
         started_at: Instant::now(),
-    })
+    }
 }
 
 async fn run_plan(

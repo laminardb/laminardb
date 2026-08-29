@@ -153,6 +153,75 @@ async fn full_snapshot_scan_enforces_planned_file_limit() {
 
 #[cfg(feature = "iceberg-core")]
 #[tokio::test]
+async fn append_without_bootstrap_rejects_malformed_filter_before_cursor_install() {
+    use crate::lakehouse::iceberg::test_support::create_test_table;
+
+    let fixture = create_test_table(false).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::None;
+    config.filter = Some("{".into());
+    let mut source = IcebergSource::new(config, None);
+    source.table = Some(fixture.table);
+
+    let error = source.start_initial_scan().unwrap_err();
+    assert!(error.to_string().contains("FILTER-SYNTAX"));
+    assert!(source.cursor.is_none());
+    assert!(source.scan.is_none());
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn append_without_bootstrap_rejects_unbound_filter_before_cursor_install() {
+    use iceberg::expr::Reference;
+
+    use crate::lakehouse::iceberg::test_support::create_test_table;
+
+    let fixture = create_test_table(false).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::None;
+    config.filter = Some(serde_json::to_string(&Reference::new("missing").is_null()).unwrap());
+    let mut source = IcebergSource::new(config, None);
+    source.table = Some(fixture.table);
+
+    let error = source.start_initial_scan().unwrap_err();
+    assert!(error.to_string().contains("FILTER-BIND"));
+    assert!(source.cursor.is_none());
+    assert!(source.scan.is_none());
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn admitted_filter_is_applied_by_the_scan() {
+    use arrow_array::Int64Array;
+    use iceberg::expr::Reference;
+
+    use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let (table, _) =
+        append_rows(&fixture, &fixture.table, 1, &[(1, None), (2, Some("drop"))]).await;
+    let mut config = test_source_config();
+    config.filter = Some(serde_json::to_string(&Reference::new("category").is_null()).unwrap());
+    let mut source = IcebergSource::new(config, None);
+    source.table = Some(table);
+    source.start_initial_scan().unwrap();
+
+    let batch = source.poll_batch(8_192).await.unwrap().unwrap();
+    let ids = batch
+        .records
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1]);
+    assert!(source.poll_batch(8_192).await.unwrap().is_none());
+    source.close().await.unwrap();
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
 async fn append_schema_binding_ignores_later_nullable_columns() {
     use std::time::Duration;
 

@@ -20,6 +20,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 #[cfg(feature = "iceberg-core")]
+use iceberg::expr::Predicate;
+#[cfg(feature = "iceberg-core")]
 use iceberg::spec::SnapshotRef;
 #[cfg(feature = "iceberg-core")]
 use tracing::info;
@@ -79,6 +81,8 @@ pub struct IcebergSource {
     table: Option<iceberg::table::Table>,
     #[cfg(feature = "iceberg-core")]
     read_schema: Option<ReadSchemaBinding>,
+    #[cfg(feature = "iceberg-core")]
+    filter_predicate: Option<Predicate>,
 }
 
 impl IcebergSource {
@@ -116,6 +120,8 @@ impl IcebergSource {
             table: None,
             #[cfg(feature = "iceberg-core")]
             read_schema: None,
+            #[cfg(feature = "iceberg-core")]
+            filter_predicate: None,
         }
     }
 
@@ -125,9 +131,14 @@ impl IcebergSource {
         root: &iceberg::spec::Schema,
         declared: Option<SchemaRef>,
     ) -> Result<(), ConnectorError> {
+        let predicate = super::iceberg_scan::parse_and_bind_filter(
+            self.config.filter.as_deref(),
+            Arc::new(root.clone()),
+        )?;
         let binding = ReadSchemaBinding::bind(root, &self.config.select_columns, declared)?;
         self.schema = Some(binding.output_schema());
         self.read_schema = Some(binding);
+        self.filter_predicate = predicate;
         Ok(())
     }
 
@@ -277,6 +288,7 @@ impl IcebergSource {
             table,
             &self.config,
             self.read_schema()?,
+            self.filter_predicate.clone(),
             snapshot.snapshot_id(),
         )?);
         Ok(())
@@ -340,14 +352,20 @@ impl IcebergSource {
             self.metrics.planned_files.inc_by(planned_files);
             self.metrics.planned_manifests.inc_by(planned_manifests);
             self.set_pending_snapshots(plans.len());
-            self.scan =
-                planner::append_task(table.clone(), &self.config, self.read_schema()?, plans)?;
+            self.scan = planner::append_task(
+                table.clone(),
+                &self.config,
+                self.read_schema()?,
+                self.filter_predicate.clone(),
+                plans,
+            );
         } else if let Some(snapshot) = Self::selected_snapshot(&table, &self.config)? {
             if self.config.bootstrap == IcebergReadBootstrap::Initial {
                 self.scan = Some(planner::full_snapshot_task(
                     table.clone(),
                     &self.config,
                     self.read_schema()?,
+                    self.filter_predicate.clone(),
                     snapshot.snapshot_id(),
                 )?);
             } else {
@@ -609,6 +627,7 @@ impl SourceConnector for IcebergSource {
             self.catalog = None;
             self.table = None;
             self.read_schema = None;
+            self.filter_predicate = None;
             self.pending = None;
         }
         self.state = ConnectorState::Closed;

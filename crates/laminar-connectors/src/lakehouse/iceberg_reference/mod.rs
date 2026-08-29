@@ -4,7 +4,6 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use iceberg::expr::Predicate;
 use iceberg::scan::ArrowRecordBatchStream;
 use iceberg::spec::SnapshotRef;
 use tracing::info;
@@ -111,6 +110,10 @@ impl IcebergReferenceTableSource {
                 .map_err(|error| connector_scan_error("resolve Iceberg snapshot schema", &error))?,
             None => table.current_schema_ref(),
         };
+        let predicate = super::iceberg_scan::parse_and_bind_filter(
+            self.config.filter.as_deref(),
+            snapshot_schema.clone(),
+        )?;
         let physical_schema = iceberg::arrow::schema_to_arrow_schema(&snapshot_schema)
             .map_err(|error| connector_scan_error("convert Iceberg snapshot schema", &error))?;
         let projected_fields = self
@@ -135,17 +138,6 @@ impl IcebergReferenceTableSource {
             return Ok(());
         };
 
-        let predicate = self
-            .config
-            .filter
-            .as_deref()
-            .map(serde_json::from_str::<Predicate>)
-            .transpose()
-            .map_err(|error| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid Iceberg filter predicate JSON: {error}"
-                ))
-            })?;
         let mut builder = table
             .scan()
             .snapshot_id(snapshot.snapshot_id())

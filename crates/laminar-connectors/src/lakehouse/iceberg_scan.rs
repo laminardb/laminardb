@@ -1,6 +1,7 @@
 use futures_util::StreamExt;
+use iceberg::expr::{Bind, Predicate};
 use iceberg::scan::{FileScanTaskStream, TableScan};
-use iceberg::spec::{Manifest, ManifestFile, ManifestList, SnapshotRef};
+use iceberg::spec::{Manifest, ManifestFile, ManifestList, SchemaRef, SnapshotRef};
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind};
 
@@ -12,6 +13,31 @@ const DEFAULT_MAX_MANIFEST_LIST_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_MAX_MANIFESTS_PER_SNAPSHOT: usize = 65_536;
 pub(crate) const DEFAULT_MAX_PLANNED_FILES: usize = 65_536;
+
+pub(crate) fn parse_and_bind_filter(
+    encoded: Option<&str>,
+    schema: SchemaRef,
+) -> Result<Option<Predicate>, ConnectorError> {
+    let predicate = encoded
+        .map(serde_json::from_str::<Predicate>)
+        .transpose()
+        .map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "[LDB-ICEBERG-FILTER-SYNTAX] invalid Iceberg filter predicate JSON at line {} column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
+    if let Some(predicate) = predicate.as_ref() {
+        predicate.bind(schema, true).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "[LDB-ICEBERG-FILTER-BIND] Iceberg filter predicate is incompatible with the selected snapshot schema ({})",
+                error.kind()
+            ))
+        })?;
+    }
+    Ok(predicate)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ManifestReadLimits {
