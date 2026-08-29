@@ -44,6 +44,7 @@ pub(crate) struct ManifestReadLimits {
     manifest_list_bytes: u64,
     manifest_bytes: u64,
     manifests_per_snapshot: usize,
+    metadata_concurrency: usize,
 }
 
 impl ManifestReadLimits {
@@ -52,6 +53,7 @@ impl ManifestReadLimits {
             manifest_list_bytes: usize_to_u64(config.max_manifest_list_bytes),
             manifest_bytes: usize_to_u64(config.max_manifest_bytes),
             manifests_per_snapshot: config.max_manifests_per_snapshot,
+            metadata_concurrency: config.scan_concurrency,
         }
     }
 
@@ -60,6 +62,7 @@ impl ManifestReadLimits {
             manifest_list_bytes: DEFAULT_MAX_MANIFEST_LIST_BYTES,
             manifest_bytes: DEFAULT_MAX_MANIFEST_BYTES,
             manifests_per_snapshot: DEFAULT_MAX_MANIFESTS_PER_SNAPSHOT,
+            metadata_concurrency: 4,
         }
     }
 }
@@ -70,9 +73,17 @@ pub(crate) async fn preflight_snapshot(
     limits: ManifestReadLimits,
     deadline: tokio::time::Instant,
 ) -> Result<(), ConnectorError> {
-    load_manifest_list(table, snapshot, limits, deadline)
-        .await
-        .map(|_| ())
+    let list = load_manifest_list(table, snapshot, limits, deadline).await?;
+    let checks = futures_util::stream::iter(list.entries().iter().cloned())
+        .map(|manifest| async move {
+            validate_manifest_object_size(table, &manifest, limits, deadline).await
+        })
+        .buffer_unordered(limits.metadata_concurrency);
+    futures_util::pin_mut!(checks);
+    while let Some(result) = checks.next().await {
+        result?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn load_manifest_list(
@@ -110,6 +121,19 @@ pub(crate) async fn load_manifest(
     limits: ManifestReadLimits,
     deadline: tokio::time::Instant,
 ) -> Result<Manifest, ConnectorError> {
+    validate_manifest_object_size(table, manifest_file, limits, deadline).await?;
+    tokio::time::timeout_at(deadline, manifest_file.load_manifest(table.file_io()))
+        .await
+        .map_err(|_| metadata_timeout("manifest read"))?
+        .map_err(|error| metadata_read_error("manifest read", &error))
+}
+
+async fn validate_manifest_object_size(
+    table: &Table,
+    manifest_file: &ManifestFile,
+    limits: ManifestReadLimits,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
     validate_manifest_size(manifest_file.manifest_length, limits.manifest_bytes)?;
     let input = table
         .file_io()
@@ -125,10 +149,7 @@ pub(crate) async fn load_manifest(
             limits.manifest_bytes,
         ));
     }
-    tokio::time::timeout_at(deadline, manifest_file.load_manifest(table.file_io()))
-        .await
-        .map_err(|_| metadata_timeout("manifest read"))?
-        .map_err(|error| metadata_read_error("manifest read", &error))
+    Ok(())
 }
 
 pub(crate) async fn plan_files(
@@ -317,6 +338,33 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("MANIFEST-COUNT-LIMIT"));
+        assert!(!error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn actual_manifest_object_size_cannot_bypass_the_declared_limit() {
+        let fixture = create_test_table(false).await;
+        let (table, _) = append_rows(&fixture, &fixture.table, 1, &[(1, None)]).await;
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let list = load_manifest_list(&table, snapshot, ManifestReadLimits::fixed(), deadline)
+            .await
+            .unwrap();
+        let mut understated = list.entries()[0].clone();
+        understated.manifest_length = 1;
+
+        let error = validate_manifest_object_size(
+            &table,
+            &understated,
+            ManifestReadLimits {
+                manifest_bytes: 1,
+                ..ManifestReadLimits::fixed()
+            },
+            deadline,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("MANIFEST-BYTE-LIMIT"));
         assert!(!error.is_transient());
     }
 }
