@@ -167,11 +167,56 @@ fn malformed_table_definitions_and_codecs_fail_closed() {
 }
 
 #[test]
-fn programmatic_zero_writer_limit_fails_closed() {
+fn programmatic_writer_limits_fail_closed() {
     let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
     parsed.max_buffer_rows = 0;
     let error = parsed.validate_writer_limits().unwrap_err().to_string();
     assert!(error.contains("max.buffer.rows must be greater than zero"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.max_flush_age = Duration::ZERO;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("max.flush.age must be greater than zero"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.max_files_per_checkpoint = ICEBERG_MAX_FILES_PER_CHECKPOINT + 1;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("max.files.per.checkpoint must not exceed"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.max_open_partitions = parsed.max_files_per_checkpoint + 1;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("max.open.partitions must not exceed"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.max_descriptor_bytes = crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("max.descriptor.bytes must not exceed"));
+}
+
+#[test]
+fn configured_writer_limits_fail_during_parsing() {
+    for (key, value) in [
+        (
+            "max.files.per.checkpoint",
+            (ICEBERG_MAX_FILES_PER_CHECKPOINT + 1).to_string(),
+        ),
+        (
+            "max.open.partitions",
+            (ICEBERG_MAX_FILES_PER_CHECKPOINT + 1).to_string(),
+        ),
+        (
+            "max.descriptor.bytes",
+            (crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1).to_string(),
+        ),
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, value);
+        let error = IcebergSinkConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "got: {error}");
+    }
 }
 
 #[test]

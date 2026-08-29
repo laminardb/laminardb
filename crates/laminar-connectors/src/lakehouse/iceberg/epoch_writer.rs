@@ -166,6 +166,7 @@ impl IcebergEpochWriter {
     }
 
     async fn write_bounded(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        self.close_expired_partitions().await?;
         let rows = u64::try_from(batch.num_rows()).map_err(|_| {
             ConnectorError::WriteError("Iceberg batch row count exceeds u64".into())
         })?;
@@ -203,7 +204,6 @@ impl IcebergEpochWriter {
     ) -> Result<(), ConnectorError> {
         let key = partition_path(partition.as_ref());
         self.prepare_partition(&key).await?;
-        self.rotate_expired(&key, partition.as_ref()).await?;
         if !self.active.contains_key(&key) {
             self.open_partition(key.clone(), partition).await?;
         }
@@ -267,18 +267,18 @@ impl IcebergEpochWriter {
         Ok(())
     }
 
-    async fn rotate_expired(
-        &mut self,
-        key: &str,
-        partition: Option<&PartitionKey>,
-    ) -> Result<(), ConnectorError> {
-        let expired = self.active.get(key).is_some_and(|active| {
-            active.has_written && active.opened_at.elapsed() >= self.max_flush_age
-        });
-        if expired {
-            self.close_partition(key).await?;
-            self.open_partition(key.to_string(), partition.cloned())
-                .await?;
+    async fn close_expired_partitions(&mut self) -> Result<(), ConnectorError> {
+        let mut expired = self
+            .active
+            .iter()
+            .filter(|(_, active)| {
+                active.has_written && active.opened_at.elapsed() >= self.max_flush_age
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        expired.sort_unstable();
+        for key in expired {
+            self.close_partition(&key).await?;
         }
         Ok(())
     }
@@ -503,7 +503,8 @@ mod tests {
     async fn age_rotation_and_file_limit_fail_before_extra_rows_are_written() {
         let fixture = create_test_table(false).await;
         let mut config = fixture.config;
-        config.max_flush_age = std::time::Duration::ZERO;
+        config.max_flush_age = std::time::Duration::from_secs(60);
+        config.max_open_partitions = 1;
         config.max_files_per_checkpoint = 1;
         let mut writer = IcebergEpochWriter::new(
             &fixture.table,
@@ -516,12 +517,43 @@ mod tests {
             .write(batch(&fixture.table, &[(1, Some("a"))]))
             .await
             .unwrap();
+        writer.active.values_mut().next().unwrap().opened_at =
+            Instant::now() - std::time::Duration::from_secs(61);
         let error = writer
             .write(batch(&fixture.table, &[(2, Some("a"))]))
             .await
             .expect_err("second file must exceed the checkpoint bound");
         assert!(error.to_string().contains("max.files.per.checkpoint"));
         assert_eq!(writer.rows, 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_closes_expired_inactive_partitions() {
+        let fixture = create_test_table(true).await;
+        let mut config = fixture.config;
+        config.max_flush_age = std::time::Duration::from_secs(60);
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(24),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+        writer.active.get_mut("category=a").unwrap().opened_at =
+            Instant::now() - std::time::Duration::from_secs(61);
+
+        writer
+            .write(batch(&fixture.table, &[(2, Some("b"))]))
+            .await
+            .unwrap();
+
+        assert!(!writer.active.contains_key("category=a"));
+        assert!(writer.active.contains_key("category=b"));
+        assert_eq!(writer.completed.len(), 1);
     }
 
     #[tokio::test]
@@ -569,7 +601,7 @@ mod tests {
         let fixture = create_test_table(false).await;
         let mut rotated_config = fixture.config.clone();
         rotated_config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
-        rotated_config.max_flush_age = std::time::Duration::ZERO;
+        rotated_config.max_flush_age = std::time::Duration::from_secs(60);
         let mut rotated = IcebergEpochWriter::new(
             &fixture.table,
             &rotated_config,
@@ -581,6 +613,8 @@ mod tests {
             .write(batch(&fixture.table, &[(1, Some("a"))]))
             .await
             .unwrap();
+        rotated.active.values_mut().next().unwrap().opened_at =
+            Instant::now() - std::time::Duration::from_secs(61);
         rotated
             .write(batch(&fixture.table, &[(2, Some("b"))]))
             .await

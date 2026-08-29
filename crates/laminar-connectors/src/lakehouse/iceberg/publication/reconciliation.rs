@@ -13,12 +13,12 @@ use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, Manifest
 
 use super::{
     data_file_set_fingerprint, ensure_deadline, file_set_fingerprint, hex, load_table_until,
-    PreparedPublication, UnresolvedIcebergPublication, MAX_AGGREGATE_DATA_FILES,
-    SUMMARY_BATCH_FINGERPRINT, SUMMARY_CHECKPOINT, SUMMARY_COMMIT_UUID, SUMMARY_FENCE,
-    SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
+    PreparedPublication, UnresolvedIcebergPublication, SUMMARY_BATCH_FINGERPRINT,
+    SUMMARY_CHECKPOINT, SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
 };
 use crate::lakehouse::iceberg::commit_cursor::{cursor_record, CursorRecord};
 use crate::lakehouse::iceberg::metrics::IcebergMetrics;
+use crate::lakehouse::iceberg_config::ICEBERG_MAX_FILES_PER_CHECKPOINT;
 
 pub(in crate::lakehouse::iceberg) async fn read_committed_cursor(
     catalog: &Arc<dyn Catalog>,
@@ -278,9 +278,9 @@ fn collect_added_files(
                 "Iceberg append snapshot contains an added delete file".into(),
             ));
         }
-        if files.len() == MAX_AGGREGATE_DATA_FILES {
+        if files.len() == ICEBERG_MAX_FILES_PER_CHECKPOINT {
             return Err(ConnectorError::TransactionError(format!(
-                "Iceberg publication snapshot exceeds the {MAX_AGGREGATE_DATA_FILES}-file verification limit"
+                "Iceberg publication snapshot exceeds the {ICEBERG_MAX_FILES_PER_CHECKPOINT}-file verification limit"
             )));
         }
         if !paths.insert(entry.file_path().to_string()) {

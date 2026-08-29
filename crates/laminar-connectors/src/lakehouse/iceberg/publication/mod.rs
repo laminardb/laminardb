@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 
 use crate::connector::{CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor};
 use crate::error::ConnectorError;
-use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
+use crate::lakehouse::iceberg_config::{
+    stable_catalog_identity, IcebergSinkConfig, ICEBERG_MAX_FILES_PER_CHECKPOINT,
+};
 use crate::lakehouse::iceberg_io::{external_error_summary, validate_loaded_table_locations};
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
@@ -26,7 +28,6 @@ use super::descriptor::{
 };
 use super::metrics::IcebergMetrics;
 
-const MAX_AGGREGATE_DATA_FILES: usize = 4_096;
 const MAX_PUBLICATION_ATTEMPTS: usize = 3;
 const SUMMARY_NAMESPACE: &str = "laminardb.commit.namespace";
 const SUMMARY_CHECKPOINT: &str = "laminardb.checkpoint.id";
@@ -65,7 +66,7 @@ pub(super) fn unresolved_publication(
         .min(crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
     let file_limit = config
         .max_files_per_checkpoint
-        .min(MAX_AGGREGATE_DATA_FILES);
+        .min(ICEBERG_MAX_FILES_PER_CHECKPOINT);
     let mut files = Vec::new();
     let mut paths = HashSet::new();
     for entry in &batch.entries {
@@ -371,7 +372,7 @@ fn prepare_publication(
         .min(crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
     let file_limit = config
         .max_files_per_checkpoint
-        .min(MAX_AGGREGATE_DATA_FILES);
+        .min(ICEBERG_MAX_FILES_PER_CHECKPOINT);
     for entry in &batch.entries {
         let Some(payload) = &entry.payload else {
             continue;

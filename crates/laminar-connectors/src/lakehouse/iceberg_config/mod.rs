@@ -40,6 +40,7 @@ pub(crate) use table_definition::{
 };
 
 const MIB: usize = 1024 * 1024;
+pub(crate) const ICEBERG_MAX_FILES_PER_CHECKPOINT: usize = 4_096;
 const MAX_CONFIG_LIST_BYTES: usize = MIB;
 
 #[cfg(feature = "iceberg-core")]
@@ -489,7 +490,7 @@ impl IcebergSinkConfig {
             ));
         }
 
-        Ok(Self {
+        let parsed = Self {
             catalog,
             storage,
             write_mode: parse_or_default(config, "write.mode")?,
@@ -499,8 +500,16 @@ impl IcebergSinkConfig {
             max_buffer_rows: parse_nonzero(config, "max.buffer.rows", 65_536)?,
             max_buffer_bytes: parse_nonzero(config, "max.buffer.bytes", 64 * MIB)?,
             max_open_partitions: parse_nonzero(config, "max.open.partitions", 64)?,
-            max_files_per_checkpoint: parse_nonzero(config, "max.files.per.checkpoint", 4_096)?,
-            max_descriptor_bytes: parse_nonzero(config, "max.descriptor.bytes", 16 * MIB)?,
+            max_files_per_checkpoint: parse_nonzero(
+                config,
+                "max.files.per.checkpoint",
+                ICEBERG_MAX_FILES_PER_CHECKPOINT,
+            )?,
+            max_descriptor_bytes: parse_nonzero(
+                config,
+                "max.descriptor.bytes",
+                crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+            )?,
             max_flush_age: parse_duration(config, "max.flush.age", Duration::from_secs(300))?,
             distribution_mode: parse_or_default(config, "write.distribution.mode")?,
             identifier_fields,
@@ -512,7 +521,9 @@ impl IcebergSinkConfig {
             partition_spec,
             sort_order,
             initial_table_properties,
-        })
+        };
+        parsed.validate_writer_limits()?;
+        Ok(parsed)
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -552,6 +563,27 @@ impl IcebergSinkConfig {
                     "{name} must be greater than zero"
                 )));
             }
+        }
+        if self.max_flush_age.is_zero() {
+            return Err(ConnectorError::ConfigurationError(
+                "max.flush.age must be greater than zero".into(),
+            ));
+        }
+        if self.max_files_per_checkpoint > ICEBERG_MAX_FILES_PER_CHECKPOINT {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.files.per.checkpoint must not exceed {ICEBERG_MAX_FILES_PER_CHECKPOINT}"
+            )));
+        }
+        if self.max_open_partitions > self.max_files_per_checkpoint {
+            return Err(ConnectorError::ConfigurationError(
+                "max.open.partitions must not exceed max.files.per.checkpoint".into(),
+            ));
+        }
+        if self.max_descriptor_bytes > crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.descriptor.bytes must not exceed {}",
+                crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
+            )));
         }
         parse_parquet_compression(&self.compression)?;
         Ok(())
