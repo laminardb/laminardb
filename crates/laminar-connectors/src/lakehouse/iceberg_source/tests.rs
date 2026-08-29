@@ -14,6 +14,21 @@ fn test_source_config() -> IcebergSourceConfig {
     IcebergSourceConfig::from_config(&connector_config()).unwrap()
 }
 
+#[cfg(feature = "iceberg-core")]
+fn replay_cursor(snapshot_id: i64) -> IcebergSourceCursorV1 {
+    IcebergSourceCursorV1 {
+        version: 1,
+        catalog_identity: "0".repeat(64),
+        table_uuid: "018f0f9d-7b2f-7a61-b72d-f4be1c7f43e1".into(),
+        table_identifier: "test.events".into(),
+        table_ref: "main".into(),
+        snapshot_id,
+        sequence_number: snapshot_id,
+        read_schema_id: 0,
+        metadata_location: "s3://test/wh/test/events/metadata/v1.json".into(),
+    }
+}
+
 #[test]
 fn new_source_has_no_uncommitted_scan_state() {
     let source = IcebergSource::new(test_source_config(), None);
@@ -23,6 +38,8 @@ fn new_source_has_no_uncommitted_scan_state() {
         assert!(source.cursor.is_none());
         assert!(source.pending.is_none());
         assert!(source.scan.is_none());
+        assert!(!source.replay_unit_in_progress);
+        assert!(!source.scan_failed);
     }
     assert_eq!(
         source.checkpoint.get_metadata("connector_type"),
@@ -103,6 +120,96 @@ fn contracts_match_typed_read_modes() {
     let append = source.contract(&append_config).unwrap();
     assert_eq!(append.consistency, SourceConsistency::Replayable);
     assert_eq!(append.input_mode, SourceInputMode::AppendOnly);
+}
+
+#[cfg(feature = "iceberg-core")]
+#[test]
+fn split_snapshot_batches_block_barriers_until_the_completed_cursor() {
+    use arrow_array::Int64Array;
+
+    let mut source = IcebergSource::new(test_source_config(), None);
+    source.install_cursor(replay_cursor(1)).unwrap();
+    source.pending = Some(PendingBatch {
+        batch: RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "id",
+                arrow_schema::DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap(),
+        completed_cursor: Some(replay_cursor(2)),
+    });
+
+    for expected_snapshot in [1, 1] {
+        let mut batch = source.emit_pending(1).unwrap().unwrap();
+        let crate::connector::SourceBatchCursor::Complete(checkpoint) =
+            batch.take_cursor().unwrap()
+        else {
+            panic!("Iceberg batches require complete snapshot cursors");
+        };
+        assert_eq!(
+            IcebergSourceCursorV1::from_checkpoint(&checkpoint)
+                .unwrap()
+                .snapshot_id,
+            expected_snapshot
+        );
+        assert!(source.try_checkpoint().unwrap().is_none());
+    }
+
+    let mut final_batch = source.emit_pending(1).unwrap().unwrap();
+    let crate::connector::SourceBatchCursor::Complete(checkpoint) =
+        final_batch.take_cursor().unwrap()
+    else {
+        panic!("Iceberg batches require complete snapshot cursors");
+    };
+    assert_eq!(
+        IcebergSourceCursorV1::from_checkpoint(&checkpoint)
+            .unwrap()
+            .snapshot_id,
+        2
+    );
+    assert!(source.try_checkpoint().unwrap().is_some());
+    assert_eq!(
+        source.checkpoint_unavailable_policy(),
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
+    );
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn scan_failures_cannot_complete_or_retry_a_partial_replay_unit() {
+    async fn failed_scan(source: &mut IcebergSource) -> ConnectorError {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Err(ConnectorError::ReadError("injected".into())))
+            .await
+            .unwrap();
+        drop(sender);
+        source.scan = Some(ScanTask {
+            receiver,
+            handle: tokio::spawn(async {}),
+            started_at: Instant::now(),
+        });
+        match source.next_scan_output().await {
+            Err(error) => error,
+            Ok(_) => panic!("injected scan failure was not returned"),
+        }
+    }
+
+    let mut before_output = IcebergSource::new(test_source_config(), None);
+    let error = failed_scan(&mut before_output).await;
+    assert!(error.is_transient());
+    assert!(before_output.next_scan_output().await.unwrap().is_none());
+    assert!(!before_output.bounded_snapshot_complete);
+
+    let mut after_output = IcebergSource::new(test_source_config(), None);
+    after_output.replay_unit_in_progress = true;
+    let error = failed_scan(&mut after_output).await;
+    assert!(error.to_string().contains("LDB-ICEBERG-PARTIAL-SCAN"));
+    assert!(!error.is_transient());
+    after_output.close().await.unwrap();
 }
 
 #[cfg(feature = "iceberg-core")]

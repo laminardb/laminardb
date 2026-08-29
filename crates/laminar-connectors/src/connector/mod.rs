@@ -20,8 +20,8 @@ pub use coordinated_commit::{
 };
 pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
-    SourceConnector, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition,
-    SourceStart,
+    SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
+    SourceDrainResolution, SourcePosition, SourceStart,
 };
 pub use source_batch::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,

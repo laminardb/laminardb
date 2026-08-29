@@ -71,6 +71,19 @@ impl SourceConnectorLifecycle {
         self.data_plane_faulted = true;
     }
 
+    pub(super) fn report_fault(
+        &mut self,
+        fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
+        source: &str,
+        error: &impl std::fmt::Display,
+    ) {
+        self.fault_data_plane();
+        let _ = fault_tx.send(SourceFault {
+            source: Arc::from(source),
+            error: error.to_string(),
+        });
+    }
+
     pub(super) fn may_poll_or_ack(&self) -> bool {
         self.may_invoke_connector() && !self.data_plane_faulted
     }

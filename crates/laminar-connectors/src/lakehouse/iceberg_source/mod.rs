@@ -29,8 +29,8 @@ use tracing::info;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
-    SourcePosition, SourceStart, SourceTopology,
+    SourceBatch, SourceCheckpointUnavailablePolicy, SourceConnector, SourceConsistency,
+    SourceContract, SourceInputMode, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -65,6 +65,10 @@ pub struct IcebergSource {
     pending: Option<PendingBatch>,
     #[cfg(feature = "iceberg-core")]
     scan: Option<ScanTask>,
+    #[cfg(feature = "iceberg-core")]
+    replay_unit_in_progress: bool,
+    #[cfg(feature = "iceberg-core")]
+    scan_failed: bool,
     #[cfg(feature = "iceberg-core")]
     last_poll_time: Option<Instant>,
     #[cfg(feature = "iceberg-core")]
@@ -104,6 +108,10 @@ impl IcebergSource {
             pending: None,
             #[cfg(feature = "iceberg-core")]
             scan: None,
+            #[cfg(feature = "iceberg-core")]
+            replay_unit_in_progress: false,
+            #[cfg(feature = "iceberg-core")]
+            scan_failed: false,
             #[cfg(feature = "iceberg-core")]
             last_poll_time: None,
             #[cfg(feature = "iceberg-core")]
@@ -154,6 +162,7 @@ impl IcebergSource {
 
     #[cfg(feature = "iceberg-core")]
     fn install_cursor(&mut self, cursor: IcebergSourceCursorV1) -> Result<(), ConnectorError> {
+        self.replay_unit_in_progress = false;
         self.metrics.processed_snapshot_id.set(cursor.snapshot_id);
         self.pending_snapshots = self.pending_snapshots.saturating_sub(1);
         self.metrics
@@ -201,12 +210,19 @@ impl IcebergSource {
                 .batch
                 .slice(max_records, pending.batch.num_rows() - max_records);
             self.pending = Some(pending);
-            return Ok(Some(SourceBatch::new(emitted)));
+            self.replay_unit_in_progress = true;
+            return Ok(Some(
+                SourceBatch::new(emitted).with_checkpoint(self.checkpoint.clone()),
+            ));
         }
         if let Some(cursor) = pending.completed_cursor {
             self.install_cursor(cursor)?;
+        } else {
+            self.replay_unit_in_progress = true;
         }
-        Ok(Some(SourceBatch::new(pending.batch)))
+        Ok(Some(
+            SourceBatch::new(pending.batch).with_checkpoint(self.checkpoint.clone()),
+        ))
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -390,6 +406,7 @@ impl IcebergSource {
         let Some(scan) = self.scan.take() else {
             return Ok(());
         };
+        let failed = std::mem::take(&mut self.scan_failed);
         scan.handle.await.map_err(|error| {
             ConnectorError::Internal(format!(
                 "Iceberg scan task terminated unexpectedly: {error}"
@@ -398,7 +415,7 @@ impl IcebergSource {
         self.metrics
             .read_duration
             .observe(scan.started_at.elapsed().as_secs_f64());
-        if self.config.read_mode == IcebergReadMode::Snapshot {
+        if self.config.read_mode == IcebergReadMode::Snapshot && !failed {
             self.bounded_snapshot_complete = true;
         }
         Ok(())
@@ -411,7 +428,16 @@ impl IcebergSource {
             None => return Ok(None),
         };
         if let Some(result) = result {
-            result.map(Some)
+            if result.is_err() {
+                self.scan_failed = true;
+            }
+            match result {
+                Err(_) if self.replay_unit_in_progress => Err(ConnectorError::TransactionError(
+                    "[LDB-ICEBERG-PARTIAL-SCAN] Iceberg scan failed after partial snapshot emission; recovery from the last durable cursor is required"
+                        .into(),
+                )),
+                result => result.map(Some),
+            }
         } else {
             self.finish_scan().await?;
             Ok(None)
@@ -571,6 +597,13 @@ impl SourceConnector for IcebergSource {
                 if self.bounded_snapshot_complete {
                     return Ok(None);
                 }
+                if self.config.read_mode == IcebergReadMode::Snapshot {
+                    self.start_initial_scan()?;
+                    if self.scan.is_some() {
+                        continue;
+                    }
+                    return Ok(None);
+                }
                 if self.config.read_mode == IcebergReadMode::Append {
                     self.refresh_append().await?;
                     if self.scan.is_some() {
@@ -596,6 +629,18 @@ impl SourceConnector for IcebergSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         self.checkpoint.clone()
+    }
+
+    fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        if self.replay_unit_in_progress {
+            return Ok(None);
+        }
+        Ok(Some(self.checkpoint()))
+    }
+
+    fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
@@ -629,6 +674,8 @@ impl SourceConnector for IcebergSource {
             self.read_schema = None;
             self.filter_predicate = None;
             self.pending = None;
+            self.replay_unit_in_progress = false;
+            self.scan_failed = false;
         }
         self.state = ConnectorState::Closed;
         Ok(())

@@ -18,9 +18,9 @@ use laminar_connectors::checkpoint::SourceCheckpointDelta;
 use laminar_connectors::connector::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
     strip_source_row_positions, ConnectorCancellationPolicy, ConnectorTaskTracker,
-    DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceConnector, SourceConsistency,
-    SourceContract, SourceInputMode, SourcePosition, SourceRowPositionCapability, SourceStart,
-    SOURCE_MUTATION_COLUMN,
+    DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceCheckpointUnavailablePolicy,
+    SourceConnector, SourceConsistency, SourceContract, SourceInputMode, SourcePosition,
+    SourceRowPositionCapability, SourceStart, SOURCE_MUTATION_COLUMN,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -74,9 +74,7 @@ mod source_drain;
 mod source_lifecycle;
 mod source_runtime;
 
-use source_drain::{
-    acknowledge_latest_source_commit, take_assignment_bound_batch_cursor, try_source_checkpoint,
-};
+use source_drain::{acknowledge_latest_source_commit, take_batch_cursor, try_source_checkpoint};
 #[cfg(feature = "cluster")]
 use source_drain::{
     apply_latest_source_drain_command_fenced, publish_source_drain_ready_fenced,

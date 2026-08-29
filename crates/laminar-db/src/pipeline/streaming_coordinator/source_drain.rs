@@ -10,7 +10,8 @@ use super::{
 use super::{
     run_source_operation, source_operation_deadline_error, Arc, ConnectorCancellationPolicy,
     ConnectorError, DeliveryGuarantee, SourceBatch, SourceBatchCursor, SourceCheckpoint,
-    SourceConnector, SourceConnectorLifecycle, SourceFault, SourceOperationOutcome,
+    SourceCheckpointUnavailablePolicy, SourceConnector, SourceConnectorLifecycle, SourceFault,
+    SourceOperationOutcome,
 };
 
 pub(super) fn try_source_checkpoint(
@@ -40,26 +41,37 @@ pub(super) fn validate_source_checkpoint_scope(
     }
 }
 
-pub(super) fn take_assignment_bound_batch_cursor(
+pub(super) fn take_batch_cursor(
     batch: &mut SourceBatch,
     assignment_scoped: bool,
+    unavailable_policy: SourceCheckpointUnavailablePolicy,
 ) -> Result<Option<SourceBatchCursor>, ConnectorError> {
-    if !assignment_scoped {
-        return Ok(None);
-    }
-    let cursor = batch.take_cursor().ok_or_else(|| {
-        ConnectorError::Internal(
-            "cluster-assigned source batch is missing its assignment-bound checkpoint".into(),
-        )
-    })?;
+    let Some(cursor) = batch.take_cursor() else {
+        return match (assignment_scoped, unavailable_policy) {
+            (true, _) => Err(ConnectorError::Internal(
+                "cluster-assigned source batch is missing its assignment-bound checkpoint".into(),
+            )),
+            (_, SourceCheckpointUnavailablePolicy::PollToReplayBoundary) => {
+                Err(ConnectorError::Internal(
+                    "source polling to a replay boundary returned a batch without an exact checkpoint"
+                        .into(),
+                ))
+            }
+            (_, SourceCheckpointUnavailablePolicy::HoldIntake) => Ok(None),
+        };
+    };
     if let SourceBatchCursor::Complete(checkpoint) = &cursor {
-        validate_source_checkpoint_scope(checkpoint, true)?;
-        if checkpoint.input_channels().is_none() {
+        validate_source_checkpoint_scope(checkpoint, assignment_scoped)?;
+        if assignment_scoped && checkpoint.input_channels().is_none() {
             return Err(ConnectorError::Internal(
                 "cluster-assigned source batch checkpoint is missing its input-channel inventory"
                     .into(),
             ));
         }
+    } else if !assignment_scoped {
+        return Err(ConnectorError::Internal(
+            "local source batch cannot carry an assignment-scoped checkpoint delta".into(),
+        ));
     }
     Ok(Some(cursor))
 }
