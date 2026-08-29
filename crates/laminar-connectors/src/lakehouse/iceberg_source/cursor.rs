@@ -26,6 +26,8 @@ pub struct IcebergSourceCursorV1 {
     pub snapshot_id: i64,
     /// Sequence number of that snapshot.
     pub sequence_number: i64,
+    /// Schema that binds the declared output columns to Iceberg field IDs.
+    pub read_schema_id: i32,
     /// Metadata file observed when the cursor was created.
     pub metadata_location: String,
 }
@@ -35,6 +37,7 @@ impl IcebergSourceCursorV1 {
         config: &IcebergSourceConfig,
         table: &Table,
         snapshot: &Snapshot,
+        read_schema_id: i32,
     ) -> Self {
         Self {
             version: CURSOR_VERSION,
@@ -44,6 +47,7 @@ impl IcebergSourceCursorV1 {
             table_ref: config.table_ref.clone(),
             snapshot_id: snapshot.snapshot_id(),
             sequence_number: snapshot.sequence_number(),
+            read_schema_id,
             metadata_location: table.metadata_location().unwrap_or_default().to_string(),
         }
     }
@@ -92,7 +96,27 @@ impl IcebergSourceCursorV1 {
                 "checkpoint snapshot sequence number differs from table metadata",
             ));
         }
+        self.retained_schema(table)?;
         Ok(())
+    }
+
+    pub(super) fn retained_schema(
+        &self,
+        table: &Table,
+    ) -> Result<iceberg::spec::SchemaRef, ConnectorError> {
+        table
+            .metadata()
+            .schema_by_id(self.read_schema_id)
+            .cloned()
+            .ok_or_else(|| {
+                cursor_error(
+                    "LDB-ICEBERG-CURSOR-SCHEMA-EXPIRED",
+                    &format!(
+                        "checkpoint read schema {} is absent from retained table metadata",
+                        self.read_schema_id
+                    ),
+                )
+            })
     }
 
     /// Encodes this cursor as a connector checkpoint.
@@ -154,6 +178,7 @@ mod tests {
             table_ref: "main".into(),
             snapshot_id: 42,
             sequence_number: 7,
+            read_schema_id: 3,
             metadata_location: "s3://bucket/metadata/v7.json".into(),
         }
     }
@@ -194,7 +219,12 @@ mod tests {
         raw.set("table.name", "events");
         let config = IcebergSourceConfig::from_config(&raw).unwrap();
         let snapshot = table.metadata().current_snapshot().unwrap();
-        let cursor = IcebergSourceCursorV1::from_snapshot(&config, &table, snapshot);
+        let cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &table,
+            snapshot,
+            table.metadata().current_schema_id(),
+        );
 
         let mut wrong_uuid = cursor.clone();
         wrong_uuid.table_uuid = uuid::Uuid::now_v7().to_string();
@@ -211,5 +241,18 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("LDB-ICEBERG-CURSOR-REF"));
+
+        let mut missing_schema = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &table,
+            snapshot,
+            table.metadata().current_schema_id(),
+        );
+        missing_schema.read_schema_id = i32::MAX;
+        assert!(missing_schema
+            .validate_binding(&config, &table)
+            .unwrap_err()
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-SCHEMA-EXPIRED"));
     }
 }

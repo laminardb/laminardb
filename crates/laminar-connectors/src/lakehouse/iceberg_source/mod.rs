@@ -8,6 +8,8 @@ mod cursor;
 mod metrics;
 #[cfg(feature = "iceberg-core")]
 mod planner;
+#[cfg(feature = "iceberg-core")]
+mod read_schema;
 
 use std::sync::Arc;
 #[cfg(feature = "iceberg-core")]
@@ -37,6 +39,8 @@ use super::iceberg_config::{IcebergReadMode, IcebergSourceConfig};
 use metrics::IcebergSourceMetrics;
 #[cfg(feature = "iceberg-core")]
 use planner::{ScanOutput, ScanTask};
+#[cfg(feature = "iceberg-core")]
+use read_schema::ReadSchemaBinding;
 
 #[cfg(feature = "iceberg-core")]
 pub use cursor::IcebergSourceCursorV1;
@@ -73,6 +77,8 @@ pub struct IcebergSource {
     catalog: Option<Arc<dyn iceberg::Catalog>>,
     #[cfg(feature = "iceberg-core")]
     table: Option<iceberg::table::Table>,
+    #[cfg(feature = "iceberg-core")]
+    read_schema: Option<ReadSchemaBinding>,
 }
 
 impl IcebergSource {
@@ -108,7 +114,31 @@ impl IcebergSource {
             catalog: None,
             #[cfg(feature = "iceberg-core")]
             table: None,
+            #[cfg(feature = "iceberg-core")]
+            read_schema: None,
         }
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn bind_read_schema(
+        &mut self,
+        root: &iceberg::spec::Schema,
+        declared: Option<SchemaRef>,
+    ) -> Result<(), ConnectorError> {
+        let binding = ReadSchemaBinding::bind(root, &self.config.select_columns, declared)?;
+        self.schema = Some(binding.output_schema());
+        self.read_schema = Some(binding);
+        Ok(())
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    fn read_schema(&self) -> Result<&ReadSchemaBinding, ConnectorError> {
+        self.read_schema
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "Iceberg source bound to a retained snapshot schema".into(),
+                actual: "read schema is unavailable".into(),
+            })
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -207,11 +237,29 @@ impl IcebergSource {
                 actual: "table unavailable".into(),
             })?
             .clone();
-        let Some(snapshot) = Self::selected_snapshot(&table, &self.config)? else {
+        let selected = Self::selected_snapshot(&table, &self.config)?;
+        if self.read_schema.is_none() {
+            let root_schema = match selected.as_ref() {
+                Some(snapshot) => snapshot.schema(table.metadata()).map_err(|error| {
+                    super::iceberg_scan::connector_scan_error(
+                        "resolve retained Iceberg snapshot schema",
+                        &error,
+                    )
+                })?,
+                None => table.current_schema_ref(),
+            };
+            self.bind_read_schema(&root_schema, None)?;
+        }
+        let Some(snapshot) = selected else {
             self.bounded_snapshot_complete = self.config.read_mode == IcebergReadMode::Snapshot;
             return Ok(());
         };
-        let cursor = IcebergSourceCursorV1::from_snapshot(&self.config, &table, &snapshot);
+        let cursor = IcebergSourceCursorV1::from_snapshot(
+            &self.config,
+            &table,
+            &snapshot,
+            self.read_schema()?.schema_id(),
+        );
         if self.config.read_mode == IcebergReadMode::Append {
             append_lineage::validate_cursor_lineage(
                 &table,
@@ -228,6 +276,7 @@ impl IcebergSource {
         self.scan = Some(planner::full_snapshot_task(
             table,
             &self.config,
+            self.read_schema()?,
             snapshot.snapshot_id(),
         )?);
         Ok(())
@@ -291,20 +340,24 @@ impl IcebergSource {
             self.metrics.planned_files.inc_by(planned_files);
             self.metrics.planned_manifests.inc_by(planned_manifests);
             self.set_pending_snapshots(plans.len());
-            self.scan = planner::append_task(table.clone(), &self.config, plans)?;
+            self.scan =
+                planner::append_task(table.clone(), &self.config, self.read_schema()?, plans)?;
         } else if let Some(snapshot) = Self::selected_snapshot(&table, &self.config)? {
             if self.config.bootstrap == IcebergReadBootstrap::Initial {
                 self.scan = Some(planner::full_snapshot_task(
                     table.clone(),
                     &self.config,
+                    self.read_schema()?,
                     snapshot.snapshot_id(),
                 )?);
             } else {
-                self.install_cursor(IcebergSourceCursorV1::from_snapshot(
+                let cursor = IcebergSourceCursorV1::from_snapshot(
                     &self.config,
                     &table,
                     &snapshot,
-                ))?;
+                    self.read_schema()?.schema_id(),
+                );
+                self.install_cursor(cursor)?;
             }
         }
         self.table = Some(table);
@@ -352,6 +405,21 @@ impl IcebergSource {
 impl SourceConnector for IcebergSource {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        let declared_schema = if config.get("_arrow_schema").is_some() {
+            let schema = config.arrow_schema().ok_or_else(|| {
+                ConnectorError::ConfigurationError(
+                    "invalid Iceberg source '_arrow_schema' encoding".into(),
+                )
+            })?;
+            if schema.fields().is_empty() {
+                return Err(ConnectorError::ConfigurationError(
+                    "Iceberg source '_arrow_schema' must declare at least one column".into(),
+                ));
+            }
+            Some(schema)
+        } else {
+            None
+        };
         if !config.properties().is_empty() {
             self.config = IcebergSourceConfig::from_config(&config)?;
         }
@@ -366,6 +434,12 @@ impl SourceConnector for IcebergSource {
 
         #[cfg(feature = "iceberg-core")]
         {
+            let recovered_cursor = match &position {
+                SourcePosition::Initial => None,
+                SourcePosition::Resume { checkpoint, .. } => {
+                    Some(IcebergSourceCursorV1::from_checkpoint(checkpoint)?)
+                }
+            };
             let catalog =
                 super::iceberg_io::build_catalog(&self.config.catalog, &self.config.storage)
                     .await?;
@@ -376,11 +450,26 @@ impl SourceConnector for IcebergSource {
                 self.config.catalog.request_timeout,
             )
             .await?;
-            let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref())
-                .map_err(|error| {
-                    ConnectorError::SchemaMismatch(format!("Iceberg to Arrow schema: {error}"))
-                })?;
-            self.schema = Some(Arc::new(arrow_schema));
+            let root_schema = if let Some(cursor) = recovered_cursor.as_ref() {
+                cursor.validate_binding(&self.config, &table)?;
+                append_lineage::validate_cursor_lineage(
+                    &table,
+                    cursor,
+                    self.config.max_snapshots_per_poll,
+                )?;
+                cursor.retained_schema(&table)?
+            } else {
+                match Self::selected_snapshot(&table, &self.config)? {
+                    Some(snapshot) => snapshot.schema(table.metadata()).map_err(|error| {
+                        super::iceberg_scan::connector_scan_error(
+                            "resolve initial Iceberg snapshot schema",
+                            &error,
+                        )
+                    })?,
+                    None => table.current_schema_ref(),
+                }
+            };
+            self.bind_read_schema(&root_schema, declared_schema)?;
             self.catalog = Some(catalog);
             let head = table
                 .metadata()
@@ -393,22 +482,12 @@ impl SourceConnector for IcebergSource {
 
             match position {
                 SourcePosition::Initial => self.start_initial_scan()?,
-                SourcePosition::Resume { checkpoint, .. } => {
-                    let cursor = IcebergSourceCursorV1::from_checkpoint(&checkpoint)?;
-                    let table =
-                        self.table
-                            .as_ref()
-                            .ok_or_else(|| ConnectorError::InvalidState {
-                                expected: "loaded Iceberg table".into(),
-                                actual: "table unavailable".into(),
-                            })?;
-                    cursor.validate_binding(&self.config, table)?;
-                    append_lineage::validate_cursor_lineage(
-                        table,
-                        &cursor,
-                        self.config.max_snapshots_per_poll,
-                    )?;
-                    self.install_cursor(cursor)?;
+                SourcePosition::Resume { .. } => {
+                    self.install_cursor(recovered_cursor.ok_or_else(|| {
+                        ConnectorError::Internal(
+                            "Iceberg resume cursor was not retained during startup".into(),
+                        )
+                    })?)?;
                 }
             }
             self.state = ConnectorState::Running;
@@ -523,6 +602,7 @@ impl SourceConnector for IcebergSource {
             }
             self.catalog = None;
             self.table = None;
+            self.read_schema = None;
             self.pending = None;
         }
         self.state = ConnectorState::Closed;

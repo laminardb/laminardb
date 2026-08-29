@@ -71,6 +71,26 @@ async fn changelog_fails_before_catalog_io() {
     assert_eq!(source.state, ConnectorState::Created);
 }
 
+#[tokio::test]
+async fn malformed_declared_schema_fails_before_catalog_io() {
+    let mut config = connector_config();
+    config.set("_arrow_schema", "not-arrow-ipc");
+    let mut source = IcebergSource::new(test_source_config(), None);
+    let error = source
+        .start(
+            SourceStart::new(
+                config,
+                SourcePosition::Initial,
+                crate::connector::DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
+        .await
+        .expect_err("malformed engine schema must fail before catalog access");
+    assert!(error.to_string().contains("_arrow_schema"));
+    assert_eq!(source.state, ConnectorState::Created);
+}
+
 #[test]
 fn contracts_match_typed_read_modes() {
     let source = IcebergSource::new(test_source_config(), None);
@@ -126,6 +146,82 @@ async fn full_snapshot_scan_enforces_planned_file_limit() {
     assert!(
         error.to_string().contains("SCAN-FILE-LIMIT"),
         "got: {error}"
+    );
+    source.close().await.unwrap();
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn append_schema_binding_ignores_later_nullable_columns() {
+    use std::time::Duration;
+
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    use iceberg::spec::{PrimitiveType, Type};
+    use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+
+    use crate::lakehouse::iceberg::test_support::{append_batch, append_rows, create_test_table};
+
+    let fixture = create_test_table(false).await;
+    let (root, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("root"))]).await;
+    let root_schema_id = root.metadata().current_schema_id();
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.bootstrap = IcebergReadBootstrap::Initial;
+    config.poll_interval = Duration::from_millis(1);
+    let mut source = IcebergSource::new(config, None);
+    source.catalog = Some(Arc::clone(&fixture.catalog));
+    source.table = Some(root.clone());
+    source.start_initial_scan().unwrap();
+
+    let first = source.poll_batch(8_192).await.unwrap().unwrap();
+    assert_eq!(first.records.num_columns(), 2);
+    assert!(source.poll_batch(8_192).await.unwrap().is_none());
+
+    let transaction = Transaction::new(&root);
+    let transaction = transaction
+        .update_schema()
+        .add_column(AddColumn::optional(
+            "later",
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(transaction)
+        .unwrap();
+    let evolved = transaction.commit(fixture.catalog.as_ref()).await.unwrap();
+    let evolved_schema =
+        Arc::new(iceberg::arrow::schema_to_arrow_schema(&evolved.current_schema_ref()).unwrap());
+    let evolved_batch = RecordBatch::try_new(
+        evolved_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("next")])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("ignored")])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let _ = append_batch(&fixture, &evolved, 2, evolved_batch).await;
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let appended = source.poll_batch(8_192).await.unwrap().unwrap();
+    assert_eq!(appended.records.num_columns(), 2);
+    assert_eq!(appended.records.schema(), first.records.schema());
+    assert_eq!(
+        appended
+            .records
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+    let cursor = IcebergSourceCursorV1::from_checkpoint(&source.checkpoint()).unwrap();
+    assert_eq!(cursor.read_schema_id, root_schema_id);
+    assert_eq!(
+        cursor
+            .retained_schema(source.table.as_ref().unwrap())
+            .unwrap()
+            .schema_id(),
+        root_schema_id
     );
     source.close().await.unwrap();
 }

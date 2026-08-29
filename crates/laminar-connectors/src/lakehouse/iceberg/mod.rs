@@ -49,7 +49,7 @@ use metrics::IcebergMetrics;
 #[cfg(feature = "iceberg-core")]
 use publication::UnresolvedIcebergPublication;
 #[cfg(feature = "iceberg-core")]
-use schema_alignment::SchemaAlignmentPlan;
+pub(in crate::lakehouse) use schema_alignment::SchemaAlignmentPlan;
 
 /// Apache Iceberg append sink.
 pub struct IcebergSink {

@@ -13,7 +13,7 @@ use crate::lakehouse::iceberg_config::is_safe_iceberg_widening;
 const FIELD_ID: &str = parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 #[derive(Debug)]
-pub(super) struct SchemaAlignmentPlan {
+pub(in crate::lakehouse) struct SchemaAlignmentPlan {
     schema_id: i32,
     source_schema: SchemaRef,
     target_schema: SchemaRef,
@@ -53,11 +53,54 @@ enum ValuePlan {
     },
 }
 
+#[derive(Clone, Copy)]
+enum AlignmentUse {
+    SinkWrite,
+    ReadProjection,
+}
+
+impl AlignmentUse {
+    const fn allows_missing_nullable_target(self) -> bool {
+        matches!(self, Self::SinkWrite)
+    }
+
+    const fn allows_unused_source(self) -> bool {
+        matches!(self, Self::ReadProjection)
+    }
+}
+
 impl SchemaAlignmentPlan {
-    pub(super) fn new(
+    pub(in crate::lakehouse) fn new(
         schema_id: i32,
         source_schema: SchemaRef,
         target_schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_policy(
+            schema_id,
+            source_schema,
+            target_schema,
+            AlignmentUse::SinkWrite,
+        )
+    }
+
+    pub(in crate::lakehouse) fn new_read_projection(
+        schema_id: i32,
+        source_schema: SchemaRef,
+        target_schema: SchemaRef,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_policy(
+            schema_id,
+            source_schema,
+            target_schema,
+            AlignmentUse::ReadProjection,
+        )
+    }
+
+    fn with_policy(
+        schema_id: i32,
+        source_schema: SchemaRef,
+        target_schema: SchemaRef,
+        alignment_use: AlignmentUse,
     ) -> Result<Self, ConnectorError> {
         if schema_id < 0 {
             return Err(ConnectorError::SchemaMismatch(
@@ -68,6 +111,7 @@ impl SchemaAlignmentPlan {
             source_schema.fields(),
             target_schema.fields(),
             "table schema",
+            alignment_use,
         )?;
         Ok(Self {
             schema_id,
@@ -77,7 +121,10 @@ impl SchemaAlignmentPlan {
         })
     }
 
-    pub(super) fn align(&self, batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
+    pub(in crate::lakehouse) fn align(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, ConnectorError> {
         if batch.schema().as_ref() != self.source_schema.as_ref() {
             return Err(ConnectorError::SchemaMismatch(format!(
                 "input schema changed after Iceberg alignment plan {} was bound",
@@ -99,6 +146,7 @@ fn build_field_plans(
     source: &Fields,
     target: &Fields,
     path: &str,
+    alignment_use: AlignmentUse,
 ) -> Result<Vec<FieldPlan>, ConnectorError> {
     let source_ids = indexed_field_ids(source, path)?;
     let _ = indexed_field_ids(target, path)?;
@@ -123,12 +171,16 @@ fn build_field_plans(
                         "nullable input field '{field_path}' cannot bind required Iceberg field"
                     )));
                 }
-                build_value_plan(source_field, target_field, &field_path)?
+                build_value_plan(source_field, target_field, &field_path, alignment_use)?
             }
-            None if target_field.is_nullable() => ValuePlan::Null,
+            None if alignment_use.allows_missing_nullable_target()
+                && target_field.is_nullable() =>
+            {
+                ValuePlan::Null
+            }
             None => {
                 return Err(ConnectorError::SchemaMismatch(format!(
-                    "required Iceberg field '{field_path}' is absent from the input schema"
+                    "Iceberg field '{field_path}' is absent from the input schema"
                 )));
             }
         };
@@ -138,15 +190,17 @@ fn build_field_plans(
             value,
         });
     }
-    if let Some((_, field)) = source
-        .iter()
-        .enumerate()
-        .find(|(index, _)| !used.contains(index))
-    {
-        return Err(ConnectorError::SchemaMismatch(format!(
-            "input field '{path}.{}' has no Iceberg field-ID binding",
-            field.name()
-        )));
+    if !alignment_use.allows_unused_source() {
+        if let Some((_, field)) = source
+            .iter()
+            .enumerate()
+            .find(|(index, _)| !used.contains(index))
+        {
+            return Err(ConnectorError::SchemaMismatch(format!(
+                "input field '{path}.{}' has no Iceberg field-ID binding",
+                field.name()
+            )));
+        }
     }
     Ok(plans)
 }
@@ -215,6 +269,7 @@ fn build_value_plan(
     source: &Field,
     target: &Field,
     path: &str,
+    alignment_use: AlignmentUse,
 ) -> Result<ValuePlan, ConnectorError> {
     let source_id = field_id(source, path)?;
     let target_id = field_id(target, path)?;
@@ -234,16 +289,16 @@ fn build_value_plan(
         return Ok(ValuePlan::Identity);
     }
     match (source.data_type(), target.data_type()) {
-        (DataType::Struct(source), DataType::Struct(target)) => {
-            Ok(ValuePlan::Struct(build_field_plans(source, target, path)?))
-        }
+        (DataType::Struct(source), DataType::Struct(target)) => Ok(ValuePlan::Struct(
+            build_field_plans(source, target, path, alignment_use)?,
+        )),
         (DataType::List(source), DataType::List(target)) => Ok(ValuePlan::List {
             field: Arc::clone(target),
-            value: Box::new(build_value_plan(source, target, path)?),
+            value: Box::new(build_value_plan(source, target, path, alignment_use)?),
         }),
         (DataType::LargeList(source), DataType::LargeList(target)) => Ok(ValuePlan::LargeList {
             field: Arc::clone(target),
-            value: Box::new(build_value_plan(source, target, path)?),
+            value: Box::new(build_value_plan(source, target, path, alignment_use)?),
         }),
         (
             DataType::FixedSizeList(source, source_size),
@@ -251,7 +306,7 @@ fn build_value_plan(
         ) if source_size == target_size => Ok(ValuePlan::FixedSizeList {
             field: Arc::clone(target),
             size: *target_size,
-            value: Box::new(build_value_plan(source, target, path)?),
+            value: Box::new(build_value_plan(source, target, path, alignment_use)?),
         }),
         (DataType::Map(source, source_ordered), DataType::Map(target, target_ordered))
             if source_ordered == target_ordered =>
@@ -259,7 +314,7 @@ fn build_value_plan(
             Ok(ValuePlan::Map {
                 field: Arc::clone(target),
                 ordered: *target_ordered,
-                entries: Box::new(build_value_plan(source, target, path)?),
+                entries: Box::new(build_value_plan(source, target, path, alignment_use)?),
             })
         }
         (from, to) if is_safe_iceberg_widening(from, to) => Ok(ValuePlan::Cast(to.clone())),

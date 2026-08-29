@@ -244,7 +244,12 @@ mod tests {
         let config = source_config(&fixture);
         assert_eq!(config.read_mode, IcebergReadMode::Append);
         let first_snapshot = first.metadata().current_snapshot().unwrap().clone();
-        let cursor = IcebergSourceCursorV1::from_snapshot(&config, &first, &first_snapshot);
+        let cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &first,
+            &first_snapshot,
+            first.metadata().current_schema_id(),
+        );
         let (second, second_paths) = append_rows(&fixture, &first, 2, &[(2, Some("b"))]).await;
         let second_id = second.metadata().current_snapshot_id().unwrap();
         let (third, third_paths) = append_rows(&fixture, &second, 3, &[(3, Some("c"))]).await;
@@ -274,6 +279,7 @@ mod tests {
             &config,
             &third,
             third.metadata().current_snapshot().unwrap(),
+            third.metadata().current_schema_id(),
         );
         assert!(plan(&third, &current, &config).await.unwrap().is_empty());
     }
@@ -286,9 +292,18 @@ mod tests {
         let config = source_config(&fixture);
         let first_snapshot = first.metadata().current_snapshot().unwrap().clone();
         let second_snapshot = second.metadata().current_snapshot().unwrap().clone();
-        let first_cursor = IcebergSourceCursorV1::from_snapshot(&config, &second, &first_snapshot);
-        let second_cursor =
-            IcebergSourceCursorV1::from_snapshot(&config, &second, &second_snapshot);
+        let first_cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &second,
+            &first_snapshot,
+            second.metadata().current_schema_id(),
+        );
+        let second_cursor = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &second,
+            &second_snapshot,
+            second.metadata().current_schema_id(),
+        );
 
         let mut expired = first_cursor.clone();
         expired.snapshot_id = i64::MAX;
@@ -350,6 +365,7 @@ mod tests {
             &config,
             &first,
             first.metadata().current_snapshot().unwrap(),
+            first.metadata().current_schema_id(),
         );
         let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
         let (third, _) = append_rows(&fixture, &second, 3, &[(3, None)]).await;

@@ -101,6 +101,15 @@ pub(crate) async fn append_rows(
     epoch: u64,
     values: &[(i64, Option<&str>)],
 ) -> (iceberg::table::Table, Vec<String>) {
+    append_batch(fixture, table, epoch, batch(table, values)).await
+}
+
+pub(crate) async fn append_batch(
+    fixture: &TestTable,
+    table: &iceberg::table::Table,
+    epoch: u64,
+    batch: RecordBatch,
+) -> (iceberg::table::Table, Vec<String>) {
     let identity = EpochIdentity {
         deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
         sink_id: "source-test".into(),
@@ -110,7 +119,7 @@ pub(crate) async fn append_rows(
     let mut writer =
         IcebergEpochWriter::new(table, &fixture.config, &identity, IcebergMetrics::new(None))
             .unwrap();
-    writer.write(batch(table, values)).await.unwrap();
+    writer.write(batch).await.unwrap();
     let output = writer.close().await.unwrap();
     let paths = output
         .data_files
