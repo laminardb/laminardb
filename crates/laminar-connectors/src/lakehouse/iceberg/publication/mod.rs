@@ -479,7 +479,7 @@ async fn commit_once(
     prepared: &PreparedPublication,
     external_key: &str,
     exact_batch_fingerprint: &str,
-    commit_uuid: uuid::Uuid,
+    logical_commit_uuid: uuid::Uuid,
 ) -> iceberg::Result<iceberg::table::Table> {
     let target = CoordinatedCommitCursor {
         checkpoint_id: batch.target.checkpoint_id,
@@ -493,19 +493,22 @@ async fn commit_once(
         .set(keys.fence, target.fencing_token.to_string())
         .set(keys.batch_fingerprint, exact_batch_fingerprint.to_string())
         .set(keys.file_set, prepared.file_set_fingerprint.clone())
-        .set(keys.commit_uuid, commit_uuid.to_string());
+        .set(keys.commit_uuid, logical_commit_uuid.to_string());
     let tx = properties.apply(tx)?;
     let tx = if prepared.data_files.is_empty() {
         tx
     } else {
+        // RECOVERY: Iceberg uses this UUID in manifest paths, so every dispatch needs a
+        // distinct physical namespace. The replay-stable logical UUID stays in the commit state.
+        let manifest_commit_uuid = uuid::Uuid::now_v7();
         tx.fast_append()
-            .set_commit_uuid(commit_uuid)
+            .set_commit_uuid(manifest_commit_uuid)
             .set_snapshot_properties(summary_properties(
                 batch,
                 external_key,
                 exact_batch_fingerprint,
                 &prepared.file_set_fingerprint,
-                commit_uuid,
+                logical_commit_uuid,
             ))
             .add_data_files(prepared.data_files.clone())
             .apply(tx)?
@@ -637,7 +640,7 @@ fn deterministic_commit_uuid(
     let digest = hash.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes)
 }
@@ -862,13 +865,28 @@ mod tests {
             .unwrap()
     }
 
+    fn table_with_metadata(
+        table: &iceberg::table::Table,
+        metadata: iceberg::spec::TableMetadata,
+    ) -> iceberg::table::Table {
+        let mut builder = iceberg::table::Table::builder()
+            .identifier(table.identifier().clone())
+            .metadata(metadata)
+            .file_io(table.file_io().clone())
+            .runtime(iceberg::Runtime::try_current().unwrap());
+        if let Some(location) = table.metadata_location() {
+            builder = builder.metadata_location(location);
+        }
+        builder.build().unwrap()
+    }
+
     #[test]
-    fn logical_commit_uuid_is_replay_stable_and_version_seven() {
+    fn logical_commit_uuid_is_replay_stable_and_version_eight() {
         let batch = batch();
         let fingerprint = batch.exact_fingerprint();
         let first = deterministic_commit_uuid(&batch, &fingerprint);
         assert_eq!(first, deterministic_commit_uuid(&batch, &fingerprint));
-        assert_eq!(first.get_version_num(), 7);
+        assert_eq!(first.get_version_num(), 8);
     }
 
     #[test]
@@ -983,6 +1001,74 @@ mod tests {
         let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
         assert_eq!(table.metadata().snapshots().count(), 1);
         assert_eq!(metrics.unknown_outcomes.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_rejects_a_matching_detached_snapshot() {
+        use iceberg::spec::{Operation, Snapshot, Summary};
+
+        let fixture = create_test_table(false).await;
+        let payload = descriptor(&fixture.table, &fixture.config, 1, 1, &[(1, Some("a"))]).await;
+        let batch = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, Some(payload))],
+        );
+        let exact_fingerprint = batch.exact_fingerprint();
+        let exact_fingerprint_hex = hex(&exact_fingerprint);
+        let logical_commit_uuid = deterministic_commit_uuid(&batch, &exact_fingerprint);
+        publish_coordinated(
+            &fixture.catalog,
+            &fixture.config,
+            &batch,
+            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
+            &IcebergMetrics::new(None),
+        )
+        .await
+        .unwrap();
+        let published = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        let prepared = prepare_publication(&fixture.config, &batch, &published).unwrap();
+        let current = published.metadata().current_snapshot().unwrap();
+        let detached_main = Snapshot::builder()
+            .with_snapshot_id(current.snapshot_id().wrapping_add(1))
+            .with_parent_snapshot_id(None)
+            .with_sequence_number(current.sequence_number().saturating_add(1))
+            .with_timestamp_ms(current.timestamp_ms().saturating_add(1))
+            .with_manifest_list("memory:///unused-detached-manifest-list.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(published.metadata().current_schema_id())
+            .build();
+        let metadata = published
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_branch_snapshot(detached_main, "main")
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let detached = table_with_metadata(&published, metadata);
+
+        let error = reconciliation::find_exact_snapshot(
+            &detached,
+            &batch.namespace.external_key(),
+            CoordinatedCommitCursor {
+                checkpoint_id: 1,
+                fencing_token: 7,
+            },
+            &exact_fingerprint_hex,
+            &prepared.file_set_fingerprint,
+            logical_commit_uuid,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .expect_err("detached snapshot evidence must not reconcile the main branch cursor");
+        assert!(error.to_string().contains("current snapshot lineage"));
     }
 
     #[tokio::test]

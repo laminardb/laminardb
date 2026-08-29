@@ -64,7 +64,7 @@ pub(crate) async fn load_manifest_list(
         .map_err(|_| metadata_timeout("manifest list metadata"))?
         .map_err(|error| metadata_read_error("manifest list metadata", &error))?;
     if metadata.size > limits.manifest_list_bytes {
-        return Err(ConnectorError::ReadError(format!(
+        return Err(ConnectorError::ConfigurationError(format!(
             "[LDB-ICEBERG-MANIFEST-LIST-BYTE-LIMIT] manifest list has {} bytes; limit is {}",
             metadata.size, limits.manifest_list_bytes
         )));
@@ -133,12 +133,12 @@ fn bound_file_tasks(tasks: FileScanTaskStream, max_files: usize) -> FileScanTask
 }
 
 pub(crate) fn connector_scan_error(context: &str, error: &Error) -> ConnectorError {
-    let message = if is_scan_file_limit(error) {
-        "[LDB-ICEBERG-SCAN-FILE-LIMIT] scan planning exceeded read.max.planned.files".to_string()
-    } else {
-        format!("{context} ({})", error.kind())
-    };
-    ConnectorError::ReadError(message)
+    if is_scan_file_limit(error) {
+        return ConnectorError::ConfigurationError(
+            "[LDB-ICEBERG-SCAN-FILE-LIMIT] scan planning exceeded read.max.planned.files".into(),
+        );
+    }
+    ConnectorError::ReadError(format!("{context} ({})", error.kind()))
 }
 
 fn validate_manifest_list(
@@ -146,7 +146,7 @@ fn validate_manifest_list(
     limits: ManifestReadLimits,
 ) -> Result<(), ConnectorError> {
     if list.entries().len() > limits.manifests_per_snapshot {
-        return Err(ConnectorError::ReadError(format!(
+        return Err(ConnectorError::ConfigurationError(format!(
             "[LDB-ICEBERG-MANIFEST-COUNT-LIMIT] snapshot references {} manifests; limit is {}",
             list.entries().len(),
             limits.manifests_per_snapshot
@@ -160,7 +160,7 @@ fn validate_manifest_list(
 
 fn validate_manifest_size(declared: i64, limit: u64) -> Result<(), ConnectorError> {
     let size = u64::try_from(declared).map_err(|_| {
-        ConnectorError::ReadError(
+        ConnectorError::TransactionError(
             "[LDB-ICEBERG-MANIFEST-SIZE-INVALID] manifest length is negative".into(),
         )
     })?;
@@ -171,7 +171,7 @@ fn validate_manifest_size(declared: i64, limit: u64) -> Result<(), ConnectorErro
 }
 
 fn manifest_byte_limit_error(size: u64, limit: u64) -> ConnectorError {
-    ConnectorError::ReadError(format!(
+    ConnectorError::ConfigurationError(format!(
         "[LDB-ICEBERG-MANIFEST-BYTE-LIMIT] manifest has {size} bytes; limit is {limit}"
     ))
 }
@@ -257,6 +257,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(list_error.to_string().contains("MANIFEST-LIST-BYTE-LIMIT"));
+        assert!(!list_error.is_transient());
 
         let manifest_error = load_manifest_list(
             &table,
@@ -270,6 +271,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(manifest_error.to_string().contains("MANIFEST-BYTE-LIMIT"));
+        assert!(!manifest_error.is_transient());
     }
 
     #[tokio::test]
@@ -289,5 +291,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("MANIFEST-COUNT-LIMIT"));
+        assert!(!error.is_transient());
     }
 }

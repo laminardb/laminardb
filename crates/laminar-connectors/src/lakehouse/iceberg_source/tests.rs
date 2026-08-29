@@ -147,6 +147,7 @@ async fn full_snapshot_scan_enforces_planned_file_limit() {
         error.to_string().contains("SCAN-FILE-LIMIT"),
         "got: {error}"
     );
+    assert!(!error.is_transient());
     source.close().await.unwrap();
 }
 

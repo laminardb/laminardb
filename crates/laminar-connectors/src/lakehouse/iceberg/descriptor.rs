@@ -419,9 +419,10 @@ fn descriptor_sync_marker(fingerprints: &[IcebergFileFingerprintV1]) -> [u8; 16]
         hash_len_prefixed(&mut hash, file.path.as_bytes());
         hash_len_prefixed(&mut hash, file.metadata_sha256.as_bytes());
     }
-    hash.finalize()[..16]
-        .try_into()
-        .expect("SHA-256 is 32 bytes")
+    let digest: [u8; 32] = hash.finalize().into();
+    let mut marker = [0; 16];
+    marker.copy_from_slice(&digest[..16]);
+    marker
 }
 
 fn canonical_avro_header(schema_json: &[u8], marker: [u8; 16]) -> Result<Vec<u8>, ConnectorError> {

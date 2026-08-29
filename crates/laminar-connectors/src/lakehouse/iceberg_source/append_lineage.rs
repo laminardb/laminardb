@@ -56,7 +56,7 @@ fn lineage_after(
 ) -> Result<Vec<SnapshotRef>, ConnectorError> {
     let metadata = table.metadata();
     if metadata.snapshot_by_id(cursor.snapshot_id).is_none() {
-        return Err(ConnectorError::ReadError(
+        return Err(ConnectorError::ConfigurationError(
             "[LDB-ICEBERG-CURSOR-EXPIRED] checkpoint snapshot is absent from retained table history"
                 .into(),
         ));
@@ -64,7 +64,7 @@ fn lineage_after(
     let mut snapshot = metadata
         .snapshot_for_ref(&cursor.table_ref)
         .ok_or_else(|| {
-            ConnectorError::ReadError(format!(
+            ConnectorError::ConfigurationError(format!(
                 "[LDB-ICEBERG-CURSOR-REF-MISSING] table ref '{}' no longer exists",
                 cursor.table_ref
             ))
@@ -74,25 +74,25 @@ fn lineage_after(
     let mut visited = HashSet::new();
     while snapshot.snapshot_id() != cursor.snapshot_id {
         if reverse_lineage.len() == max_snapshots {
-            return Err(ConnectorError::ReadError(
+            return Err(ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-APPEND-SNAPSHOT-LIMIT] lineage exceeded read.max.snapshots.per.poll"
                     .into(),
             ));
         }
         if !visited.insert(snapshot.snapshot_id()) {
-            return Err(ConnectorError::ReadError(
+            return Err(ConnectorError::TransactionError(
                 "[LDB-ICEBERG-APPEND-LINEAGE-CYCLE] snapshot ancestry contains a cycle".into(),
             ));
         }
         reverse_lineage.push(snapshot.clone());
         let parent_id = snapshot.parent_snapshot_id().ok_or_else(|| {
-            ConnectorError::ReadError(
+            ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-CURSOR-DIVERGED] checkpoint snapshot is not an ancestor of the configured ref"
                     .into(),
             )
         })?;
         snapshot = metadata.snapshot_by_id(parent_id).cloned().ok_or_else(|| {
-            ConnectorError::ReadError(
+            ConnectorError::ConfigurationError(
                 "[LDB-ICEBERG-CURSOR-EXPIRED] snapshot history needed for resume has expired"
                     .into(),
             )
@@ -165,13 +165,13 @@ async fn added_files_for_snapshot(
 }
 
 fn non_append_error(snapshot_id: i64, operation: &str) -> ConnectorError {
-    ConnectorError::ReadError(format!(
+    ConnectorError::ConfigurationError(format!(
         "[LDB-ICEBERG-APPEND-NON-APPEND] snapshot {snapshot_id} contains {operation}; append mode cannot represent it"
     ))
 }
 
 fn file_limit_error() -> ConnectorError {
-    ConnectorError::ReadError(
+    ConnectorError::ConfigurationError(
         "[LDB-ICEBERG-APPEND-FILE-LIMIT] append planning exceeded read.max.planned.files".into(),
     )
 }
@@ -307,10 +307,9 @@ mod tests {
 
         let mut expired = first_cursor.clone();
         expired.snapshot_id = i64::MAX;
-        assert!(validate_cursor_lineage(&second, &expired, 10)
-            .unwrap_err()
-            .to_string()
-            .contains("CURSOR-EXPIRED"));
+        let error = validate_cursor_lineage(&second, &expired, 10).unwrap_err();
+        assert!(error.to_string().contains("CURSOR-EXPIRED"));
+        assert!(!error.is_transient());
 
         let metadata = second
             .metadata()
@@ -322,10 +321,9 @@ mod tests {
             .unwrap()
             .metadata;
         let divergent = table_with_metadata(&second, metadata);
-        assert!(validate_cursor_lineage(&divergent, &second_cursor, 10)
-            .unwrap_err()
-            .to_string()
-            .contains("CURSOR-DIVERGED"));
+        let error = validate_cursor_lineage(&divergent, &second_cursor, 10).unwrap_err();
+        assert!(error.to_string().contains("CURSOR-DIVERGED"));
+        assert!(!error.is_transient());
 
         let overwrite = Snapshot::builder()
             .with_snapshot_id(second_snapshot.snapshot_id() + 1)
@@ -349,11 +347,11 @@ mod tests {
             .unwrap()
             .metadata;
         let overwrite_table = table_with_metadata(&second, metadata);
-        assert!(plan(&overwrite_table, &second_cursor, &config)
+        let error = plan(&overwrite_table, &second_cursor, &config)
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("APPEND-NON-APPEND"));
+            .unwrap_err();
+        assert!(error.to_string().contains("APPEND-NON-APPEND"));
+        assert!(!error.is_transient());
     }
 
     #[tokio::test]
@@ -371,17 +369,13 @@ mod tests {
         let (third, _) = append_rows(&fixture, &second, 3, &[(3, None)]).await;
         let mut snapshot_limited = config.clone();
         snapshot_limited.max_snapshots_per_poll = 1;
-        assert!(plan(&third, &cursor, &snapshot_limited)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("SNAPSHOT-LIMIT"));
+        let error = plan(&third, &cursor, &snapshot_limited).await.unwrap_err();
+        assert!(error.to_string().contains("SNAPSHOT-LIMIT"));
+        assert!(!error.is_transient());
         let mut file_limited = config;
         file_limited.max_planned_files = 1;
-        assert!(plan(&third, &cursor, &file_limited)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("FILE-LIMIT"));
+        let error = plan(&third, &cursor, &file_limited).await.unwrap_err();
+        assert!(error.to_string().contains("FILE-LIMIT"));
+        assert!(!error.is_transient());
     }
 }

@@ -118,6 +118,7 @@ pub(super) async fn reconcile_exact_publication(
         exact_batch_fingerprint,
         &prepared.file_set_fingerprint,
         commit_uuid,
+        deadline,
     )?;
     let observed_files = added_data_files_for_snapshot(table, snapshot, deadline).await?;
     let observed_paths = observed_files
@@ -181,6 +182,7 @@ async fn verify_cursor_record(
         &record.batch_fingerprint,
         &record.file_set_fingerprint,
         commit_uuid,
+        deadline,
     )?;
     let observed = added_data_files_for_snapshot(table, snapshot, deadline).await?;
     if data_file_set_fingerprint(&observed) != record.file_set_fingerprint {
@@ -191,38 +193,52 @@ async fn verify_cursor_record(
     Ok(())
 }
 
-fn find_exact_snapshot<'a>(
+pub(super) fn find_exact_snapshot<'a>(
     table: &'a iceberg::table::Table,
     external_key: &str,
     cursor: CoordinatedCommitCursor,
     exact_batch_fingerprint: &str,
     file_set_fingerprint: &str,
     commit_uuid: uuid::Uuid,
+    deadline: tokio::time::Instant,
 ) -> Result<&'a iceberg::spec::SnapshotRef, ConnectorError> {
-    table
-        .metadata()
-        .snapshots()
-        .find(|snapshot| {
-            let properties = &snapshot.summary().additional_properties;
-            properties.get(SUMMARY_NAMESPACE).map(String::as_str) == Some(external_key)
-                && properties.get(SUMMARY_CHECKPOINT).map(String::as_str)
-                    == Some(cursor.checkpoint_id.to_string().as_str())
-                && properties.get(SUMMARY_FENCE).map(String::as_str)
-                    == Some(cursor.fencing_token.to_string().as_str())
-                && properties
-                    .get(SUMMARY_BATCH_FINGERPRINT)
-                    .map(String::as_str)
-                    == Some(exact_batch_fingerprint)
-                && properties.get(SUMMARY_FILE_SET).map(String::as_str)
-                    == Some(file_set_fingerprint)
-                && properties.get(SUMMARY_COMMIT_UUID).map(String::as_str)
-                    == Some(commit_uuid.to_string().as_str())
-        })
-        .ok_or_else(|| {
-            ConnectorError::TransactionError(
-                "exact Iceberg snapshot summary is absent from retained history".into(),
-            )
-        })
+    let metadata = table.metadata();
+    let checkpoint_id = cursor.checkpoint_id.to_string();
+    let fencing_token = cursor.fencing_token.to_string();
+    let commit_uuid = commit_uuid.to_string();
+    let mut snapshot = metadata.current_snapshot();
+    for _ in 0..metadata.snapshots().count() {
+        ensure_deadline(deadline, "snapshot-history reconciliation")?;
+        let Some(current) = snapshot else {
+            break;
+        };
+        let properties = &current.summary().additional_properties;
+        let matches = properties.get(SUMMARY_NAMESPACE).map(String::as_str) == Some(external_key)
+            && properties.get(SUMMARY_CHECKPOINT).map(String::as_str)
+                == Some(checkpoint_id.as_str())
+            && properties.get(SUMMARY_FENCE).map(String::as_str) == Some(fencing_token.as_str())
+            && properties
+                .get(SUMMARY_BATCH_FINGERPRINT)
+                .map(String::as_str)
+                == Some(exact_batch_fingerprint)
+            && properties.get(SUMMARY_FILE_SET).map(String::as_str) == Some(file_set_fingerprint)
+            && properties.get(SUMMARY_COMMIT_UUID).map(String::as_str)
+                == Some(commit_uuid.as_str());
+        if matches {
+            return Ok(current);
+        }
+        snapshot = match current.parent_snapshot_id() {
+            Some(parent_id) => Some(metadata.snapshot_by_id(parent_id).ok_or_else(|| {
+                ConnectorError::TransactionError(
+                    "Iceberg current snapshot lineage references expired history".into(),
+                )
+            })?),
+            None => None,
+        };
+    }
+    Err(ConnectorError::TransactionError(
+        "exact Iceberg snapshot summary is absent from the current snapshot lineage".into(),
+    ))
 }
 
 async fn added_data_files_for_snapshot(

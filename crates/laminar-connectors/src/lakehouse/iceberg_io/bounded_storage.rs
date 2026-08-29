@@ -3,6 +3,7 @@
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -48,6 +49,7 @@ impl StorageFactory for BoundedStorageFactory {
             connect_timeout: self.connect_timeout,
             request_timeout: self.request_timeout,
             inner: Arc::new(OnceLock::new()),
+            initial_request: Arc::default(),
         }))
     }
 }
@@ -60,6 +62,36 @@ struct BoundedStorage {
     request_timeout: Duration,
     #[serde(skip)]
     inner: Arc<OnceLock<Arc<dyn Storage>>>,
+    #[serde(skip)]
+    initial_request: Arc<InitialRequestState>,
+}
+
+#[derive(Default)]
+struct InitialRequestState {
+    complete: AtomicBool,
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl InitialRequestState {
+    async fn run<T>(
+        &self,
+        future: impl Future<Output = Result<T>>,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<T> {
+        if !self.complete.load(Ordering::Acquire) {
+            // INVARIANT: only a successful operation releases later requests from the connect bound.
+            let _initial = self.gate.lock().await;
+            if !self.complete.load(Ordering::Acquire) {
+                let result = bounded(future, connect_timeout, "connection").await;
+                if result.is_ok() {
+                    self.complete.store(true, Ordering::Release);
+                }
+                return result;
+            }
+        }
+        bounded(future, request_timeout, "request").await
+    }
 }
 
 impl fmt::Debug for BoundedStorage {
@@ -94,11 +126,9 @@ impl BoundedStorage {
     }
 
     async fn initial<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        bounded(future, self.initial_timeout(), "connection").await
-    }
-
-    async fn request<T>(&self, future: impl Future<Output = Result<T>>) -> Result<T> {
-        bounded(future, self.request_timeout, "request").await
+        self.initial_request
+            .run(future, self.initial_timeout(), self.request_timeout)
+            .await
     }
 }
 
@@ -123,7 +153,7 @@ impl Storage for BoundedStorage {
             inner: reader,
             initial_timeout: self.initial_timeout(),
             request_timeout: self.request_timeout,
-            initial_complete: std::sync::atomic::AtomicBool::new(false),
+            initial_complete: AtomicBool::new(false),
             initial_gate: tokio::sync::Mutex::new(()),
         }))
     }
@@ -151,7 +181,7 @@ impl Storage for BoundedStorage {
     }
 
     async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.request(self.storage()?.delete_stream(paths)).await
+        self.initial(self.storage()?.delete_stream(paths)).await
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
@@ -167,27 +197,20 @@ struct BoundedFileRead {
     inner: Box<dyn FileRead>,
     initial_timeout: Duration,
     request_timeout: Duration,
-    initial_complete: std::sync::atomic::AtomicBool,
+    initial_complete: AtomicBool,
     initial_gate: tokio::sync::Mutex<()>,
 }
 
 #[async_trait]
 impl FileRead for BoundedFileRead {
     async fn read(&self, range: Range<u64>) -> Result<Bytes> {
-        if !self
-            .initial_complete
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !self.initial_complete.load(Ordering::Acquire) {
             // INVARIANT: waiters retain the connect bound until one initial read succeeds.
             let _initial = self.initial_gate.lock().await;
-            if !self
-                .initial_complete
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if !self.initial_complete.load(Ordering::Acquire) {
                 let result = bounded(self.inner.read(range), self.initial_timeout, "read").await;
                 if result.is_ok() {
-                    self.initial_complete
-                        .store(true, std::sync::atomic::Ordering::Release);
+                    self.initial_complete.store(true, Ordering::Release);
                 }
                 return result;
             }
@@ -251,6 +274,43 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Unexpected => Iceberg storage read timed out"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_success_releases_requests_from_the_connection_bound() {
+        let state = InitialRequestState::default();
+        let failure = Error::new(ErrorKind::Unexpected, "injected failure");
+        assert!(state
+            .run(
+                std::future::ready(Err::<(), _>(failure)),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await
+            .is_err());
+        assert!(!state.complete.load(Ordering::Acquire));
+
+        state
+            .run(
+                std::future::ready(Ok(())),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert!(state.complete.load(Ordering::Acquire));
+        let error = state
+            .run(
+                std::future::pending::<Result<()>>(),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Unexpected => Iceberg storage request timed out"
         );
     }
 
