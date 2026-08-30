@@ -4,11 +4,15 @@ use laminar_connectors::connector::{
     CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
     MAX_COORDINATED_COMMIT_BATCH_ENTRIES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
-use laminar_core::checkpoint::{CheckpointAttempt, CheckpointManifest, PipelineIdentity};
+use laminar_core::checkpoint::{
+    CheckpointAttempt, CheckpointManifest, CheckpointStore, PipelineIdentity,
+    PreparedSinkDescriptor,
+};
 
 use super::{CheckpointCoordinator, DbError, RegisteredSink};
 
 const MAX_EXTERNAL_SINK_COMMIT_CONCURRENCY: usize = 8;
+pub(super) const MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY: usize = 8;
 
 #[cfg(all(debug_assertions, feature = "cluster"))]
 async fn external_sink_commit_gate(
@@ -215,31 +219,66 @@ impl CheckpointCoordinator {
         deadline: tokio::time::Instant,
     ) -> Result<Vec<CoordinatedCommitPayload>, DbError> {
         let descriptors = validated_external_sink_descriptors(&sink.name, manifests)?;
-        let mut entries = Vec::with_capacity(descriptors.len());
-        for (manifest, descriptor) in descriptors {
-            let payload = tokio::time::timeout_at(
-                deadline,
-                self.store
-                    .load_prepared_sink_descriptor(manifest, descriptor),
-            )
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "sink '{}' descriptor read timed out for participant {}",
-                    sink.name, manifest.participant_id
-                ))
-            })?
-            .map_err(DbError::from)?
-            .map(|bytes| bytes.to_vec());
-            entries.push(CoordinatedCommitPayload {
+        let mut pending = descriptors.into_iter();
+        let mut active = FuturesOrdered::new();
+        for (manifest, descriptor) in pending
+            .by_ref()
+            .take(MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY)
+        {
+            active.push_back(load_external_sink_entry(
+                self.store.as_ref(),
+                &sink.name,
                 attempt,
-                participant_id: manifest.participant_id,
-                payload,
-            });
+                manifest,
+                descriptor,
+                deadline,
+            ));
+        }
+        let mut entries = Vec::with_capacity(manifests.len());
+        while let Some(entry) = active.next().await {
+            entries.push(entry?);
+            if let Some((manifest, descriptor)) = pending.next() {
+                active.push_back(load_external_sink_entry(
+                    self.store.as_ref(),
+                    &sink.name,
+                    attempt,
+                    manifest,
+                    descriptor,
+                    deadline,
+                ));
+            }
         }
         entries.sort_unstable_by_key(|entry| entry.participant_id);
         Ok(entries)
     }
+}
+
+async fn load_external_sink_entry(
+    store: &dyn CheckpointStore,
+    sink_name: &str,
+    attempt: CheckpointAttempt,
+    manifest: &CheckpointManifest,
+    descriptor: &PreparedSinkDescriptor,
+    deadline: tokio::time::Instant,
+) -> Result<CoordinatedCommitPayload, DbError> {
+    let payload = tokio::time::timeout_at(
+        deadline,
+        store.load_prepared_sink_descriptor(manifest, descriptor),
+    )
+    .await
+    .map_err(|_| {
+        DbError::Checkpoint(format!(
+            "sink '{sink_name}' descriptor read timed out for participant {}",
+            manifest.participant_id
+        ))
+    })?
+    .map_err(DbError::from)?
+    .map(|bytes| bytes.to_vec());
+    Ok(CoordinatedCommitPayload {
+        attempt,
+        participant_id: manifest.participant_id,
+        payload,
+    })
 }
 
 pub(super) fn validated_external_sink_descriptors<'a>(

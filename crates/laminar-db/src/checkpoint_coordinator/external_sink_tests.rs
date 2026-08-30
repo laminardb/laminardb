@@ -13,8 +13,8 @@ use laminar_connectors::connector::{
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{
     checkpoint_descriptor_sha256, ByteRange, CheckpointAttempt, CheckpointManifest,
-    ObjectStoreCheckpointStore, PipelineIdentity, PreparedSinkDescriptor,
-    PREPARED_SINK_DESCRIPTOR_VERSION,
+    CheckpointStore, CheckpointStoreError, ObjectStoreCheckpointStore, PipelineIdentity,
+    PreparedSinkDescriptor, StateChunkId, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
@@ -61,6 +61,105 @@ fn external_sink_descriptor_bounds_precede_object_reads() {
     );
     let error = sink_commit::validated_external_sink_descriptors("sink", &references).unwrap_err();
     assert!(error.to_string().contains("aggregate bytes"));
+}
+
+struct DescriptorReadGuard(Arc<AtomicUsize>);
+
+impl Drop for DescriptorReadGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DescriptorReadProbeStore {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+}
+
+impl DescriptorReadProbeStore {
+    fn unused<T>() -> Result<T, CheckpointStoreError> {
+        Err(CheckpointStoreError::Invalid(
+            "unused descriptor-read probe operation".into(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl CheckpointStore for DescriptorReadProbeStore {
+    fn max_node_data_bytes(&self) -> u64 {
+        laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES
+    }
+
+    async fn save_checkpoint(
+        &self,
+        _manifest: &CheckpointManifest,
+        _node_data: &[bytes::Bytes],
+    ) -> Result<bytes::Bytes, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn seal_aborted_manifest(
+        &self,
+        _chunk: StateChunkId,
+        _expected_artifact_identity_sha256: &str,
+    ) -> Result<Option<(CheckpointManifest, bytes::Bytes)>, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn seal_aborted_node_data(
+        &self,
+        _chunk: StateChunkId,
+        _expected_artifact_identity_sha256: &str,
+    ) -> Result<(), CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn load_manifest_for_participant(
+        &self,
+        _participant_id: u64,
+        _checkpoint_id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn load_manifest_verified(
+        &self,
+        _participant_id: u64,
+        _checkpoint_id: u64,
+        _expected_len: u64,
+        _expected_sha256: &str,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn load_node_data_ranges(
+        &self,
+        _chunk: StateChunkId,
+        _expected_object_length: u64,
+        _ranges: &[ByteRange],
+    ) -> Result<Option<Vec<bytes::Bytes>>, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn delete_manifest(&self, _chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn delete_node_data(&self, _chunk: StateChunkId) -> Result<(), CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn load_prepared_sink_descriptor(
+        &self,
+        _manifest: &CheckpointManifest,
+        descriptor: &PreparedSinkDescriptor,
+    ) -> Result<Option<bytes::Bytes>, CheckpointStoreError> {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::AcqRel);
+        let _guard = DescriptorReadGuard(Arc::clone(&self.active));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(descriptor.payload.map(|_| bytes::Bytes::from_static(b"x")))
+    }
 }
 
 struct BarrierCommitSink {
@@ -181,6 +280,76 @@ impl CoordinatedCommitter for BarrierCommitSink {
     ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
         Ok(None)
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn external_sink_descriptor_reads_use_a_bounded_window() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let store = DescriptorReadProbeStore {
+        active: Arc::clone(&active),
+        peak: Arc::clone(&peak),
+    };
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id("018f0000-0000-7000-8000-000000000001".into())
+        .unwrap();
+
+    let commits = Arc::new(AtomicUsize::new(0));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "sink".into(),
+        sink_id: Arc::from("sink"),
+        connector: Box::new(BarrierCommitSink {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            commits: Arc::clone(&commits),
+            schema: Arc::new(Schema::empty()),
+        }),
+        contract: SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    coordinator.register_sink("sink", handle.clone());
+
+    let manifest_count = sink_commit::MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY + 3;
+    let manifests = (1..=u64::try_from(manifest_count).unwrap())
+        .map(|participant| descriptor_manifest(participant, 1))
+        .collect::<Vec<_>>();
+    let references = manifests.iter().collect::<Vec<_>>();
+    coordinator
+        .commit_external_sinks_until(
+            CheckpointAttempt::canonical(1),
+            &references,
+            1,
+            0,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(active.load(Ordering::Acquire), 0);
+    assert_eq!(
+        peak.load(Ordering::Acquire),
+        sink_commit::MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY
+    );
+    assert_eq!(commits.load(Ordering::Acquire), 1);
+    handle.close().await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
