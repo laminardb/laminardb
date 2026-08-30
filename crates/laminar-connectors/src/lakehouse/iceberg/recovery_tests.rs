@@ -10,9 +10,9 @@ use tokio_stream::StreamExt;
 
 use crate::config::ConnectorState;
 use crate::connector::{
-    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
-    CoordinatedCommitNamespace, CoordinatedCommitPayload, CoordinatedCommitter, DeliveryGuarantee,
-    SinkConnector, SinkRuntimeContext,
+    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitContext,
+    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    CoordinatedCommitter, DeliveryGuarantee, SinkConnector, SinkRuntimeContext,
 };
 use crate::error::ConnectorError;
 
@@ -37,6 +37,20 @@ fn commit_batch(checkpoint_id: u64, descriptor: Vec<u8>) -> CoordinatedCommitBat
             checkpoint_id: 0,
             fencing_token: 0,
         },
+        fencing_token: 7,
+        target,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: target,
+            participant_id: 1,
+            payload: Some(descriptor),
+        }],
+    }
+}
+
+fn abort_batch(checkpoint_id: u64, descriptor: Vec<u8>) -> CoordinatedAbortBatch {
+    let target = CheckpointAttempt::canonical(checkpoint_id);
+    CoordinatedAbortBatch {
+        namespace: namespace(),
         fencing_token: 7,
         target,
         entries: vec![CoordinatedCommitPayload {
@@ -179,6 +193,65 @@ async fn durable_abort_deletes_only_the_prepared_epochs_exact_artifacts() {
     }
     let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(table.metadata().snapshots().count(), 0);
+}
+
+#[tokio::test]
+async fn restarted_abort_cleanup_uses_the_durable_descriptor_and_is_idempotent() {
+    let fixture = create_test_table(false).await;
+    let mut writer = coordinated_sink(&fixture, fixture.table.clone());
+    let payload = descriptor(&mut writer, &fixture, 1).await;
+    let final_path = super::descriptor::IcebergCommitDescriptorV1::decode(&payload)
+        .unwrap()
+        .files[0]
+        .path
+        .clone();
+    writer.close().await.unwrap();
+    assert!(fixture.table.file_io().exists(&final_path).await.unwrap());
+
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    let restarted = coordinated_sink(&fixture, current);
+    restarted
+        .cleanup_aborted(abort_batch(1, payload.clone()), commit_context())
+        .await
+        .unwrap();
+    restarted
+        .cleanup_aborted(abort_batch(1, payload), commit_context())
+        .await
+        .unwrap();
+
+    assert!(!fixture.table.file_io().exists(&final_path).await.unwrap());
+    assert_eq!(restarted.metrics.artifact_delete_successes.get(), 1);
+    assert_eq!(restarted.metrics.artifact_cleanup_failures.get(), 0);
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 0);
+}
+
+#[tokio::test]
+async fn abort_cleanup_never_deletes_a_file_with_published_checkpoint_evidence() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let payload = descriptor(&mut sink, &fixture, 1).await;
+    let final_path = super::descriptor::IcebergCommitDescriptorV1::decode(&payload)
+        .unwrap()
+        .files[0]
+        .path
+        .clone();
+    sink.commit_aggregated(commit_batch(1, payload.clone()), commit_context())
+        .await
+        .unwrap();
+
+    let error = sink
+        .cleanup_aborted(abort_batch(1, payload), commit_context())
+        .await
+        .expect_err("published checkpoint evidence must fence cleanup");
+
+    assert!(error.is_outcome_unknown());
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-ABORT-CLEANUP-PUBLISHED"));
+    assert!(fixture.table.file_io().exists(&final_path).await.unwrap());
+    assert_eq!(sink.metrics.artifact_delete_successes.get(), 0);
+    assert_eq!(sink.metrics.unknown_outcomes.get(), 1);
 }
 
 #[tokio::test]

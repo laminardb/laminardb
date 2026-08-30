@@ -12,6 +12,7 @@ use laminar_core::cluster::control::ClusterController;
 #[cfg(feature = "cluster")]
 use std::collections::BTreeMap;
 
+use super::artifacts::AbortedSinkCleanup;
 use super::{checked_successor_epoch, CheckpointCoordinator, CheckpointPhase};
 use crate::error::DbError;
 use crate::recovery_manager::{ClusterRecoveryTarget, RecoveredState, RecoveryManager};
@@ -396,8 +397,12 @@ impl CheckpointCoordinator {
             )
             .await?;
         }
-        self.cleanup_local_checkpoint_artifacts_until(inventory.attempt, deadline)
-            .await
+        self.cleanup_local_checkpoint_artifacts_until(
+            inventory.attempt,
+            AbortedSinkCleanup::Recover { fencing_token: 1 },
+            deadline,
+        )
+        .await
     }
 
     async fn recover_local_until(

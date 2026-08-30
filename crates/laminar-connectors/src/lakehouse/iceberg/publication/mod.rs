@@ -12,15 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use iceberg::spec::{DataContentType, DataFile};
+use iceberg::spec::DataFile;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, ErrorKind, TableIdent};
 
 use crate::connector::{CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor};
 use crate::error::ConnectorError;
-use crate::lakehouse::iceberg_config::{
-    stable_catalog_identity, IcebergSinkConfig, ICEBERG_MAX_FILES_PER_CHECKPOINT,
-};
+use crate::lakehouse::iceberg_config::{IcebergSinkConfig, ICEBERG_MAX_FILES_PER_CHECKPOINT};
 use crate::lakehouse::iceberg_io::{
     build_publication_catalog, external_error_summary, validate_loaded_table_locations,
     AtomicTableRequirements, CatalogCapabilities, CatalogSession, SingleDispatchCatalog,
@@ -28,12 +26,14 @@ use crate::lakehouse::iceberg_io::{
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
 use super::descriptor::{IcebergCommitDescriptorV1, IcebergTableBindingV1};
+use super::descriptor_batch::{prepare_descriptor_files, validate_table_binding};
 use super::metrics::IcebergMetrics;
 use identity::{
     data_file_set_fingerprint, deterministic_commit_uuid, deterministic_idempotency_key,
     file_set_fingerprint, hex, summary_properties, PublicationIdentity, SUMMARY_BATCH_FINGERPRINT,
-    SUMMARY_CHECKPOINT, SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
+    SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET,
 };
+pub(super) use identity::{SUMMARY_CHECKPOINT, SUMMARY_NAMESPACE};
 use preflight::validate_data_file_objects;
 
 const MAX_PUBLICATION_ATTEMPTS: usize = 3;
@@ -490,113 +490,14 @@ fn prepare_publication(
     batch: &CoordinatedCommitBatch,
     table: &iceberg::table::Table,
 ) -> Result<PreparedPublication, ConnectorError> {
-    let mut binding: Option<IcebergTableBindingV1> = None;
-    let mut data_files = Vec::new();
-    let mut expected_paths = HashSet::new();
-    let descriptor_limit = config
-        .max_descriptor_bytes
-        .min(crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
-    let file_limit = config
-        .max_files_per_checkpoint
-        .min(ICEBERG_MAX_FILES_PER_CHECKPOINT);
-    for entry in &batch.entries {
-        let Some(payload) = &entry.payload else {
-            continue;
-        };
-        if payload.len() > descriptor_limit {
-            return Err(ConnectorError::TransactionError(format!(
-                "Iceberg participant descriptor is {} bytes; configured limit is {descriptor_limit}",
-                payload.len()
-            )));
-        }
-        let descriptor = IcebergCommitDescriptorV1::decode(payload)?;
-        if descriptor.deployment_id != batch.namespace.deployment_id
-            || descriptor.sink_id != batch.namespace.sink_id
-            || descriptor.participant_id != entry.participant_id
-            || descriptor.epoch_id != entry.attempt.epoch
-        {
-            return Err(ConnectorError::TransactionError(
-                "Iceberg descriptor runtime identity does not match its coordinated entry".into(),
-            ));
-        }
-        if descriptor.table.catalog_identity
-            != stable_catalog_identity(&config.catalog, &config.storage)
-        {
-            return Err(ConnectorError::TransactionError(
-                "Iceberg descriptor catalog identity differs from the configured catalog".into(),
-            ));
-        }
-        match &binding {
-            Some(expected) if !expected.has_same_append_target(&descriptor.table) => {
-                return Err(ConnectorError::TransactionError(
-                    "Iceberg descriptors bind different tables, refs, schemas, specs, or sort orders"
-                        .into(),
-                ));
-            }
-            None => binding = Some(descriptor.table.clone()),
-            Some(_) => {}
-        }
-        let decoded = descriptor.decode_data_files(table)?;
-        let projected = data_files.len().checked_add(decoded.len()).ok_or_else(|| {
-            ConnectorError::TransactionError("Iceberg aggregate file count overflow".into())
-        })?;
-        if projected > file_limit {
-            return Err(ConnectorError::TransactionError(format!(
-                "Iceberg coordinated publication exceeds the {file_limit}-file checkpoint limit"
-            )));
-        }
-        for file in decoded {
-            if file.content_type() != DataContentType::Data {
-                return Err(ConnectorError::TransactionError(
-                    "Iceberg append descriptor contains a delete file".into(),
-                ));
-            }
-            if !expected_paths.insert(file.file_path().to_string()) {
-                return Err(ConnectorError::TransactionError(
-                    "Iceberg coordinated descriptors repeat a data file".into(),
-                ));
-            }
-            data_files.push(file);
-        }
-    }
-    data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
-    let binding = match binding {
-        Some(binding) => binding,
-        None => IcebergTableBindingV1::from_table(table, config)?,
-    };
-    let file_set_fingerprint = data_file_set_fingerprint(&data_files)?;
+    let prepared = prepare_descriptor_files(config, &batch.namespace, &batch.entries, table)?;
+    let file_set_fingerprint = data_file_set_fingerprint(&prepared.data_files)?;
     Ok(PreparedPublication {
-        binding,
-        data_files,
-        expected_paths,
+        binding: prepared.binding,
+        data_files: prepared.data_files,
+        expected_paths: prepared.expected_paths,
         file_set_fingerprint,
     })
-}
-
-fn validate_table_binding(
-    config: &IcebergSinkConfig,
-    binding: &IcebergTableBindingV1,
-    table: &iceberg::table::Table,
-) -> Result<(), ConnectorError> {
-    let metadata = table.metadata();
-    let mismatch = binding.catalog_implementation != config.catalog.catalog_type.to_string()
-        || binding.catalog_identity != stable_catalog_identity(&config.catalog, &config.storage)
-        || binding.table_uuid != metadata.uuid().to_string()
-        || binding.table_identifier != table.identifier().to_string()
-        || binding.table_location != metadata.location()
-        || binding.table_ref != config.table_ref
-        || binding.schema_id != metadata.current_schema_id()
-        || binding.partition_spec_id != metadata.default_partition_spec_id()
-        || binding.sort_order_id != metadata.default_sort_order_id()
-        || binding.format_version
-            != super::descriptor::format_version_number(metadata.format_version());
-    if mismatch {
-        return Err(ConnectorError::TransactionError(
-            "Iceberg table UUID, ref, schema, partition spec, sort order, or catalog binding changed before publication"
-                .into(),
-        ));
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -708,7 +609,7 @@ async fn reconcile_after_unknown(
     }
 }
 
-async fn load_table_until(
+pub(super) async fn load_table_until(
     catalog: &Arc<dyn Catalog>,
     config: &IcebergSinkConfig,
     deadline: tokio::time::Instant,

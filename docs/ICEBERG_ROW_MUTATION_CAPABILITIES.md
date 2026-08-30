@@ -62,10 +62,13 @@ While a checkpoint participant remains alive, it retains a bounded, exact in-mem
 staging paths and final files created by its current epoch. Before a descriptor is issued, Abort or
 close deletes only those exact owned paths. After descriptor issuance, a proven durable Abort does
 the same; a successor epoch or close removes staging paths but leaves potentially published final
-files intact. An unresolved publication fences rollback cleanup. This lifecycle is not a
-table-wide orphan scan and does not infer reachability from object-store listings. Process loss can
-strand unreferenced paths; reclaiming them requires the shared fenced maintenance authority
-described above.
+files intact. The checkpoint abort seal retains durable participant descriptors across process
+loss. Local recovery or the current cluster leader reconciles publication evidence, deletes only
+the exact descriptor paths, and durably marks cleanup before checkpoint node data can be sealed.
+An unresolved publication fences that cleanup. This lifecycle is not a table-wide orphan scan and
+does not infer reachability from object-store listings. Process loss before descriptor durability
+can still strand staging or finalized paths; reclaiming those requires the shared fenced
+maintenance authority described above.
 
 The released API also lacks the transaction actions needed for data-file compaction, delete-file
 rewrites, manifest rewrites, and format-aware orphan cleanup. LaminarDB therefore starts no

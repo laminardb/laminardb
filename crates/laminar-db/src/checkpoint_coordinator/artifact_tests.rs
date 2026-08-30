@@ -144,6 +144,142 @@ struct AmbiguousFollowerSink {
 }
 
 #[cfg(feature = "cluster")]
+struct ClusterAbortCleanupSink {
+    cleanups: Arc<std::sync::atomic::AtomicU64>,
+    expected_fencing_token: u64,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for ClusterAbortCleanupSink {
+    fn cancellation_policy(&self) -> laminar_connectors::connector::ConnectorCancellationPolicy {
+        laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe
+    }
+
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    fn as_coordinated_committer(
+        &self,
+    ) -> Option<&dyn laminar_connectors::connector::CoordinatedCommitter> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::CoordinatedCommitter for ClusterAbortCleanupSink {
+    async fn commit_aggregated(
+        &self,
+        _batch: laminar_connectors::connector::CoordinatedCommitBatch,
+        _context: laminar_connectors::connector::CoordinatedCommitContext,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Err(laminar_connectors::error::ConnectorError::InvalidState {
+            expected: "abort cleanup only".into(),
+            actual: "external publication".into(),
+        })
+    }
+
+    async fn cleanup_aborted(
+        &self,
+        batch: laminar_connectors::connector::CoordinatedAbortBatch,
+        _context: laminar_connectors::connector::CoordinatedCommitContext,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        batch
+            .validate_shape()
+            .map_err(laminar_connectors::error::ConnectorError::TransactionError)?;
+        if batch.fencing_token != self.expected_fencing_token
+            || batch.entries.len() != 2
+            || batch.entries.iter().any(|entry| entry.payload.is_some())
+        {
+            return Err(laminar_connectors::error::ConnectorError::InvalidState {
+                expected: "current leader fence and two empty participant markers".into(),
+                actual: format!(
+                    "fence {}, {} participant markers",
+                    batch.fencing_token,
+                    batch.entries.len()
+                ),
+            });
+        }
+        self.cleanups
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    async fn committed_cursor(
+        &self,
+        _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
+    ) -> Result<
+        Option<laminar_connectors::connector::CoordinatedCommitCursor>,
+        laminar_connectors::error::ConnectorError,
+    > {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn register_cluster_cleanup_probe(
+    coordinator: &mut CheckpointCoordinator,
+    cleanups: Arc<std::sync::atomic::AtomicU64>,
+    expected_fencing_token: u64,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    laminar_core::streaming::channel::AsyncConsumer<crate::sink_task::SinkEvent>,
+) {
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "probe".into(),
+        sink_id: Arc::from("probe"),
+        connector: Box::new(ClusterAbortCleanupSink {
+            cleanups,
+            expected_fencing_token,
+            schema: Arc::new(arrow::datatypes::Schema::empty()),
+        }),
+        contract: laminar_connectors::connector::SinkContract::new(
+            laminar_connectors::connector::SinkConsistency::CheckpointCommittable,
+            laminar_connectors::connector::SinkTopology::MultiWriter,
+            laminar_connectors::connector::SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coordinator.register_sink("probe", handle.clone());
+    (handle, event_rx)
+}
+
+#[cfg(feature = "cluster")]
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SinkConnector for AmbiguousFollowerSink {
     async fn open(
@@ -300,13 +436,14 @@ async fn save_cluster_manifests(
     deployment_id: &str,
     fence: &CheckpointAssignmentFence,
     key_groups: KeyGroupCount,
+    prepared_sink: Option<&str>,
 ) -> Vec<(CheckpointManifest, Bytes)> {
     let mut manifests = Vec::with_capacity(2);
     for (participant_id, vnode) in [(1, 0), (2, 1)] {
         let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
             .with_key_group_count(key_groups)
             .with_participant_id(participant_id);
-        let (manifest, payload) = cluster_manifest(
+        let (mut manifest, payload) = cluster_manifest(
             checkpoint_id,
             participant_id,
             vnode,
@@ -314,6 +451,15 @@ async fn save_cluster_manifests(
             fence,
             key_groups,
         );
+        if let Some(sink_name) = prepared_sink {
+            manifest.sink_names = vec![sink_name.into()];
+            manifest.prepared_sinks.push(PreparedSinkDescriptor {
+                sink_name: sink_name.into(),
+                format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+                payload: None,
+                sha256: checkpoint_descriptor_sha256(None),
+            });
+        }
         let encoded = store
             .save_checkpoint(&manifest, std::slice::from_ref(&payload))
             .await
@@ -1734,6 +1880,12 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         .bind_pipeline_identity(PipelineIdentity::empty())
         .unwrap();
     coordinator.set_cluster_controller(Arc::clone(&controller));
+    let cleanup_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (cleanup_handle, _cleanup_events) = register_cluster_cleanup_probe(
+        &mut coordinator,
+        Arc::clone(&cleanup_calls),
+        proof.fencing_token,
+    );
 
     let nonportable_request = CheckpointRequest {
         assignment_fence: Some(fence.clone()),
@@ -1767,6 +1919,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         &deployment_id,
         &fence,
         key_groups,
+        None,
     )
     .await;
     let mut nonportable_manifests = predecessor_manifests.clone();
@@ -1847,6 +2000,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         &deployment_id,
         &fence,
         key_groups,
+        Some("probe"),
     )
     .await;
     let candidate_index = coordinator
@@ -1895,6 +2049,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
     assert!(coordinator.failure_requires_recovery);
     assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
     assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
+    assert_eq!(cleanup_calls.load(std::sync::atomic::Ordering::Acquire), 0);
 
     let first_chunk = manifests[0].0.node_data.chunk;
     let first_identity = checkpoint_artifact_identity_sha256(&inventory, first_chunk).unwrap();
@@ -1905,6 +2060,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         .seal_aborted_manifest(first_chunk, &first_identity)
         .await
         .unwrap()
+        .original_manifest
         .is_some());
 
     assert!(coordinator
@@ -1914,6 +2070,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         )
         .await
         .unwrap());
+    assert_eq!(cleanup_calls.load(std::sync::atomic::Ordering::Acquire), 1);
     assert!(authority
         .cluster_checkpoint_artifacts()
         .await
@@ -1975,4 +2132,5 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
     assert!(coordinator.failure_requires_recovery);
     assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
     assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
+    cleanup_handle.close().await.unwrap();
 }

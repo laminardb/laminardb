@@ -5,16 +5,18 @@ use std::time::Duration;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, CoordinatedCommitBatch, CoordinatedCommitContext,
-    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter, SinkConnector,
-    SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
-    MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
+    ConnectorCancellationPolicy, CoordinatedAbortBatch, CoordinatedCommitBatch,
+    CoordinatedCommitContext, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+    CoordinatedCommitter, SinkConnector, SinkConsistency, SinkContract, SinkInputMode,
+    SinkTopology, WriteResult, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+    MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{
-    checkpoint_descriptor_sha256, ByteRange, CheckpointAttempt, CheckpointManifest,
-    CheckpointStore, CheckpointStoreError, ObjectStoreCheckpointStore, PipelineIdentity,
-    PreparedSinkDescriptor, StateChunkId, PREPARED_SINK_DESCRIPTOR_VERSION,
+    checkpoint_artifact_identity_sha256, checkpoint_descriptor_sha256, checkpoint_sha256,
+    ByteRange, CheckpointAttempt, CheckpointManifest, CheckpointManifestAbortSeal, CheckpointStore,
+    CheckpointStoreError, ObjectStoreCheckpointStore, PipelineIdentity, PreparedSinkDescriptor,
+    StateChunkId, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
@@ -102,7 +104,15 @@ impl CheckpointStore for DescriptorReadProbeStore {
         &self,
         _chunk: StateChunkId,
         _expected_artifact_identity_sha256: &str,
-    ) -> Result<Option<(CheckpointManifest, bytes::Bytes)>, CheckpointStoreError> {
+    ) -> Result<CheckpointManifestAbortSeal, CheckpointStoreError> {
+        Self::unused()
+    }
+
+    async fn complete_aborted_sink_cleanup(
+        &self,
+        _chunk: StateChunkId,
+        _expected_artifact_identity_sha256: &str,
+    ) -> Result<CheckpointManifestAbortSeal, CheckpointStoreError> {
         Self::unused()
     }
 
@@ -165,6 +175,9 @@ impl CheckpointStore for DescriptorReadProbeStore {
 struct BarrierCommitSink {
     barrier: Arc<tokio::sync::Barrier>,
     commits: Arc<AtomicUsize>,
+    cleanups: Arc<AtomicUsize>,
+    fail_cleanup: bool,
+    expected_cleanup_payload: Option<&'static [u8]>,
     schema: SchemaRef,
 }
 
@@ -274,6 +287,30 @@ impl CoordinatedCommitter for BarrierCommitSink {
         Ok(())
     }
 
+    async fn cleanup_aborted(
+        &self,
+        batch: CoordinatedAbortBatch,
+        _context: CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError> {
+        batch
+            .validate_shape()
+            .map_err(ConnectorError::TransactionError)?;
+        if self.expected_cleanup_payload.is_some_and(|expected| {
+            batch.entries.len() != 1 || batch.entries[0].payload.as_deref() != Some(expected)
+        }) {
+            return Err(ConnectorError::TransactionError(
+                "cleanup did not receive the durable participant descriptor".into(),
+            ));
+        }
+        self.cleanups.fetch_add(1, Ordering::AcqRel);
+        if self.fail_cleanup {
+            return Err(ConnectorError::TransactionError(
+                "injected aborted artifact cleanup failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn committed_cursor(
         &self,
         _namespace: &CoordinatedCommitNamespace,
@@ -300,6 +337,7 @@ async fn external_sink_descriptor_reads_use_a_bounded_window() {
         .unwrap();
 
     let commits = Arc::new(AtomicUsize::new(0));
+    let cleanups = Arc::new(AtomicUsize::new(0));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
     >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
@@ -309,6 +347,9 @@ async fn external_sink_descriptor_reads_use_a_bounded_window() {
         connector: Box::new(BarrierCommitSink {
             barrier: Arc::new(tokio::sync::Barrier::new(1)),
             commits: Arc::clone(&commits),
+            cleanups,
+            fail_cleanup: false,
+            expected_cleanup_payload: None,
             schema: Arc::new(Schema::empty()),
         }),
         contract: SinkContract::new(
@@ -368,6 +409,7 @@ async fn committed_external_sinks_publish_concurrently() {
 
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let commits = Arc::new(AtomicUsize::new(0));
+    let cleanups = Arc::new(AtomicUsize::new(0));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
     >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
@@ -379,6 +421,9 @@ async fn committed_external_sinks_publish_concurrently() {
             connector: Box::new(BarrierCommitSink {
                 barrier: Arc::clone(&barrier),
                 commits: Arc::clone(&commits),
+                cleanups: Arc::clone(&cleanups),
+                fail_cleanup: false,
+                expected_cleanup_payload: None,
                 schema: Arc::new(Schema::empty()),
             }),
             contract: SinkContract::new(
@@ -511,4 +556,240 @@ async fn partial_phase_one_failure_rolls_back_every_sink_and_preserves_primary_e
     for handle in handles {
         handle.close().await.unwrap();
     }
+}
+
+async fn durable_cleanup_coordinator(
+    objects: Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> (
+    CheckpointCoordinator,
+    Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+) {
+    let decisions = Arc::new(
+        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(&objects)),
+    );
+    let store = ObjectStoreCheckpointStore::new(objects, prefix)
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_durable_decision_store(Arc::clone(&decisions))
+        .await
+        .unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    (coordinator, decisions)
+}
+
+fn durable_sink_manifest(
+    attempt: CheckpointAttempt,
+    deployment_id: &str,
+    payload: &[u8],
+) -> CheckpointManifest {
+    let mut manifest = CheckpointManifest::new_with_key_group_count(
+        attempt.epoch,
+        attempt.checkpoint_id,
+        KeyGroupCount::try_from(1_u16).unwrap(),
+    );
+    manifest.deployment_id = deployment_id.into();
+    manifest.sink_names = vec!["sink".into()];
+    manifest.prepared_sinks.push(PreparedSinkDescriptor {
+        sink_name: "sink".into(),
+        format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+        payload: Some(ByteRange {
+            offset: 0,
+            length: u64::try_from(payload.len()).unwrap(),
+        }),
+        sha256: checkpoint_descriptor_sha256(Some(payload)),
+    });
+    manifest.node_data.object_length = u64::try_from(payload.len()).unwrap();
+    manifest.node_data.sha256 = checkpoint_sha256(payload);
+    manifest
+}
+
+async fn persist_durable_cleanup_descriptor(
+    coordinator: &CheckpointCoordinator,
+    attempt: CheckpointAttempt,
+    payload: &'static [u8],
+) -> (
+    CheckpointManifest,
+    laminar_core::checkpoint_decision::CheckpointArtifactInventory,
+) {
+    coordinator
+        .begin_checkpoint_artifacts_until(
+            attempt,
+            None,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let manifest = durable_sink_manifest(
+        attempt,
+        coordinator.expected_deployment_id().unwrap(),
+        payload,
+    );
+    coordinator
+        .store
+        .save_checkpoint(&manifest, &[bytes::Bytes::from_static(payload)])
+        .await
+        .unwrap();
+    let inventory = coordinator
+        .checkpoint_artifact_inventory(attempt, None)
+        .unwrap();
+    (manifest, inventory)
+}
+
+fn register_cleanup_probe(
+    coordinator: &mut CheckpointCoordinator,
+    cleanups: Arc<AtomicUsize>,
+    fail_cleanup: bool,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    laminar_core::streaming::channel::AsyncConsumer<crate::sink_task::SinkEvent>,
+) {
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "sink".into(),
+        sink_id: Arc::from("sink"),
+        connector: Box::new(BarrierCommitSink {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+            commits: Arc::new(AtomicUsize::new(0)),
+            cleanups,
+            fail_cleanup,
+            expected_cleanup_payload: Some(b"durable-descriptor"),
+            schema: Arc::new(Schema::empty()),
+        }),
+        contract: SinkContract::new(
+            SinkConsistency::CheckpointCommittable,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    coordinator.register_sink("sink", handle.clone());
+    (handle, event_rx)
+}
+
+#[tokio::test]
+async fn aborted_sink_cleanup_retries_before_destroying_durable_descriptors() {
+    const PREFIX: &str = "durable-aborted-sink-cleanup";
+    const DESCRIPTOR: &[u8] = b"durable-descriptor";
+
+    let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let (interrupted, decisions) = durable_cleanup_coordinator(Arc::clone(&objects), PREFIX).await;
+    let attempt = CheckpointAttempt::canonical(1);
+    let (manifest, _) = persist_durable_cleanup_descriptor(&interrupted, attempt, DESCRIPTOR).await;
+    drop(interrupted);
+
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    let (mut first_restart, _) = durable_cleanup_coordinator(Arc::clone(&objects), PREFIX).await;
+    let (first_handle, _first_events) =
+        register_cleanup_probe(&mut first_restart, Arc::clone(&cleanups), true);
+    let error = first_restart.recover().await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("injected aborted artifact cleanup failure"));
+    assert_eq!(cleanups.load(Ordering::Acquire), 1);
+
+    let inventory = decisions
+        .checkpoint_decision_head()
+        .await
+        .unwrap()
+        .unwrap()
+        .active_artifacts
+        .unwrap();
+    let identity =
+        checkpoint_artifact_identity_sha256(&inventory, manifest.node_data.chunk).unwrap();
+    let seal = first_restart
+        .store
+        .seal_aborted_manifest(manifest.node_data.chunk, &identity)
+        .await
+        .unwrap();
+    assert!(!seal.sink_cleanup_complete);
+    assert_eq!(
+        first_restart
+            .store
+            .load_prepared_sink_descriptor(&manifest, &manifest.prepared_sinks[0])
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(DESCRIPTOR)
+    );
+    first_handle.close().await.unwrap();
+    drop(first_restart);
+
+    let (mut second_restart, _) = durable_cleanup_coordinator(Arc::clone(&objects), PREFIX).await;
+    let (second_handle, _second_events) =
+        register_cleanup_probe(&mut second_restart, Arc::clone(&cleanups), false);
+    assert!(second_restart.recover().await.unwrap().is_none());
+    assert_eq!(cleanups.load(Ordering::Acquire), 2);
+    assert!(decisions
+        .checkpoint_decision_head()
+        .await
+        .unwrap()
+        .unwrap()
+        .active_artifacts
+        .is_none());
+    assert!(second_restart
+        .store
+        .load_prepared_sink_descriptor(&manifest, &manifest.prepared_sinks[0])
+        .await
+        .is_err());
+    second_handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn completed_abort_cleanup_is_not_repeated_after_restart() {
+    const PREFIX: &str = "completed-aborted-sink-cleanup";
+    const DESCRIPTOR: &[u8] = b"durable-descriptor";
+
+    let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let (interrupted, decisions) = durable_cleanup_coordinator(Arc::clone(&objects), PREFIX).await;
+    let attempt = CheckpointAttempt::canonical(1);
+    let (manifest, inventory) =
+        persist_durable_cleanup_descriptor(&interrupted, attempt, DESCRIPTOR).await;
+    let identity =
+        checkpoint_artifact_identity_sha256(&inventory, manifest.node_data.chunk).unwrap();
+    interrupted
+        .store
+        .seal_aborted_manifest(manifest.node_data.chunk, &identity)
+        .await
+        .unwrap();
+    let completed = interrupted
+        .store
+        .complete_aborted_sink_cleanup(manifest.node_data.chunk, &identity)
+        .await
+        .unwrap();
+    assert!(completed.sink_cleanup_complete);
+    drop(interrupted);
+
+    let cleanups = Arc::new(AtomicUsize::new(0));
+    let (mut restarted, _) = durable_cleanup_coordinator(Arc::clone(&objects), PREFIX).await;
+    let (handle, _events) = register_cleanup_probe(&mut restarted, Arc::clone(&cleanups), true);
+    assert!(restarted.recover().await.unwrap().is_none());
+    assert_eq!(cleanups.load(Ordering::Acquire), 0);
+    assert!(decisions
+        .checkpoint_decision_head()
+        .await
+        .unwrap()
+        .unwrap()
+        .active_artifacts
+        .is_none());
+    assert!(restarted
+        .store
+        .load_prepared_sink_descriptor(&manifest, &manifest.prepared_sinks[0])
+        .await
+        .is_err());
+    handle.close().await.unwrap();
 }

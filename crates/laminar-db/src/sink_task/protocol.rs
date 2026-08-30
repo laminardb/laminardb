@@ -14,7 +14,7 @@ pub(super) type SinkCommandRx = AsyncRx<mpsc::Array<SinkCommand>>;
 use laminar_core::cluster::control::ClusterController;
 
 pub(super) use laminar_connectors::connector::{
-    ConnectorTaskTracker, CoordinatedCommitBatch, CoordinatedCommitCursor,
+    ConnectorTaskTracker, CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitCursor,
     CoordinatedCommitNamespace, SinkConnector, SinkContract,
 };
 use laminar_connectors::error::ConnectorError;
@@ -109,6 +109,11 @@ pub(crate) enum SinkOperation {
     /// epoch into one external commit (coordinated-commit sinks only).
     CommitAggregated {
         batch: CoordinatedCommitBatch,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
+    },
+    /// Abort-only recovery path for descriptors retained in sealed checkpoint manifests.
+    CleanupAborted {
+        batch: CoordinatedAbortBatch,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// Highest exact checkpoint and authority committed in this external namespace.

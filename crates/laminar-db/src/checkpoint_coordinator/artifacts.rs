@@ -6,6 +6,17 @@ use super::{
     MAX_RETENTION_IO_CONCURRENCY,
 };
 
+#[derive(Clone, Copy)]
+pub(super) enum AbortedSinkCleanup {
+    LiveRollback,
+    Recover { fencing_token: u64 },
+}
+
+struct SealedParticipantManifests {
+    loaded: BTreeMap<u64, (CheckpointManifest, Bytes)>,
+    sink_cleanup_complete: bool,
+}
+
 impl CheckpointCoordinator {
     pub(super) fn checkpoint_artifact_inventory(
         &self,
@@ -161,6 +172,7 @@ impl CheckpointCoordinator {
         &mut self,
         inventory: &CheckpointArtifactInventory,
         predecessor: Option<CommittedCheckpointRef>,
+        sink_cleanup: AbortedSinkCleanup,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         self.validate_checkpoint_artifact_inventory(inventory)?;
@@ -168,14 +180,32 @@ impl CheckpointCoordinator {
             || vec![laminar_core::state::LOCAL_NODE_ID.0],
             laminar_core::checkpoint::CheckpointAssignmentFence::participant_ids,
         );
-        let loaded = self
+        let sealed = self
             .seal_participant_manifests_until(inventory, &participant_ids, deadline)
             .await?;
+        if !sealed.sink_cleanup_complete {
+            if let AbortedSinkCleanup::Recover { fencing_token } = sink_cleanup {
+                let manifests = sealed
+                    .loaded
+                    .values()
+                    .map(|(manifest, _)| manifest)
+                    .collect::<Vec<_>>();
+                self.cleanup_aborted_external_sinks_until(
+                    inventory.attempt,
+                    &manifests,
+                    fencing_token,
+                    deadline,
+                )
+                .await?;
+            }
+            self.complete_participant_sink_cleanup_until(inventory, &participant_ids, deadline)
+                .await?;
+        }
         self.seal_candidate_index_if_complete_until(
             inventory,
             predecessor,
             participant_ids.len(),
-            loaded,
+            sealed.loaded,
             deadline,
         )
         .await?;
@@ -190,7 +220,7 @@ impl CheckpointCoordinator {
         inventory: &CheckpointArtifactInventory,
         participant_ids: &[u64],
         deadline: tokio::time::Instant,
-    ) -> Result<BTreeMap<u64, (CheckpointManifest, Bytes)>, DbError> {
+    ) -> Result<SealedParticipantManifests, DbError> {
         let mut manifest_seals = futures::stream::iter(participant_ids.iter().copied())
             .map(|participant_id| {
                 let store = Arc::clone(&self.store);
@@ -202,7 +232,7 @@ impl CheckpointCoordinator {
                     checkpoint_artifact_identity_sha256(inventory, chunk).map_err(DbError::from);
                 async move {
                     let artifact_identity = artifact_identity?;
-                    let manifest = tokio::time::timeout_at(deadline, async {
+                    let seal = tokio::time::timeout_at(deadline, async {
                         store.seal_aborted_manifest(chunk, &artifact_identity).await
                     })
                     .await
@@ -212,14 +242,16 @@ impl CheckpointCoordinator {
                         ))
                     })?
                     .map_err(DbError::from)?;
-                    Ok::<_, DbError>((participant_id, manifest))
+                    Ok::<_, DbError>((participant_id, seal))
                 }
             })
             .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY);
         let mut loaded = BTreeMap::new();
+        let mut sink_cleanup_complete = true;
         while let Some(result) = manifest_seals.next().await {
-            let (participant_id, manifest) = result?;
-            if let Some((manifest, encoded)) = manifest {
+            let (participant_id, seal) = result?;
+            sink_cleanup_complete &= seal.sink_cleanup_complete;
+            if let Some((manifest, encoded)) = seal.original_manifest {
                 if manifest.deployment_id != inventory.deployment_id
                     || manifest.pipeline_identity != inventory.pipeline_identity
                     || manifest.epoch != inventory.attempt.epoch
@@ -240,7 +272,54 @@ impl CheckpointCoordinator {
                 loaded.insert(participant_id, (manifest, encoded));
             }
         }
-        Ok(loaded)
+        Ok(SealedParticipantManifests {
+            loaded,
+            sink_cleanup_complete,
+        })
+    }
+
+    async fn complete_participant_sink_cleanup_until(
+        &self,
+        inventory: &CheckpointArtifactInventory,
+        participant_ids: &[u64],
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let mut completions = futures::stream::iter(participant_ids.iter().copied())
+            .map(|participant_id| {
+                let store = Arc::clone(&self.store);
+                let chunk = StateChunkId {
+                    participant_id,
+                    checkpoint_id: inventory.attempt.checkpoint_id,
+                };
+                let artifact_identity =
+                    checkpoint_artifact_identity_sha256(inventory, chunk).map_err(DbError::from);
+                async move {
+                    let artifact_identity = artifact_identity?;
+                    let seal = tokio::time::timeout_at(deadline, async {
+                        store
+                            .complete_aborted_sink_cleanup(chunk, &artifact_identity)
+                            .await
+                    })
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(format!(
+                            "participant {participant_id} sink cleanup marker timed out"
+                        ))
+                    })?
+                    .map_err(DbError::from)?;
+                    if !seal.sink_cleanup_complete {
+                        return Err(DbError::Checkpoint(format!(
+                            "participant {participant_id} sink cleanup marker was not durable"
+                        )));
+                    }
+                    Ok(())
+                }
+            })
+            .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY);
+        while let Some(result) = completions.next().await {
+            result?;
+        }
+        Ok(())
     }
 
     async fn seal_candidate_index_if_complete_until(
@@ -326,6 +405,7 @@ impl CheckpointCoordinator {
     pub(super) async fn cleanup_local_checkpoint_artifacts_until(
         &mut self,
         attempt: CheckpointAttempt,
+        sink_cleanup: AbortedSinkCleanup,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         let store = Arc::clone(self.decision_store.as_ref().ok_or_else(|| {
@@ -362,7 +442,7 @@ impl CheckpointCoordinator {
         let predecessor = head
             .latest_commit
             .and_then(|outcome| outcome.committed_checkpoint);
-        self.seal_checkpoint_artifacts_until(&inventory, predecessor, deadline)
+        self.seal_checkpoint_artifacts_until(&inventory, predecessor, sink_cleanup, deadline)
             .await?;
         let result = tokio::time::timeout_at(
             deadline,
@@ -469,8 +549,15 @@ impl CheckpointCoordinator {
             )));
         }
         let predecessor = latest_commit.and_then(|outcome| outcome.committed_checkpoint);
-        self.seal_checkpoint_artifacts_until(&inventory, predecessor, deadline)
-            .await?;
+        self.seal_checkpoint_artifacts_until(
+            &inventory,
+            predecessor,
+            AbortedSinkCleanup::Recover {
+                fencing_token: proof.fencing_token,
+            },
+            deadline,
+        )
+        .await?;
         tokio::time::timeout_at(
             deadline,
             authority.finish_cluster_checkpoint_artifact_cleanup(proof, &inventory),

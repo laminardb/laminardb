@@ -13,9 +13,9 @@ pub use contracts::{
     SourceTopology,
 };
 pub use coordinated_commit::{
-    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
-    CoordinatedCommitNamespace, CoordinatedCommitPayload, CoordinatedCommitter,
-    MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
+    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitContext,
+    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    CoordinatedCommitter, MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
@@ -586,6 +586,39 @@ mod tests {
                 payload: None,
             }],
         }
+    }
+
+    #[test]
+    fn coordinated_abort_batch_accepts_only_one_exact_attempt() {
+        use laminar_core::checkpoint::CheckpointAttempt;
+
+        let commit = valid_coordinated_batch();
+        let mut batch = CoordinatedAbortBatch {
+            namespace: commit.namespace,
+            fencing_token: commit.fencing_token,
+            target: commit.target,
+            entries: commit.entries,
+        };
+        batch.validate_shape().unwrap();
+
+        batch.entries.insert(
+            0,
+            CoordinatedCommitPayload {
+                attempt: CheckpointAttempt::canonical(101),
+                participant_id: 1,
+                payload: None,
+            },
+        );
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("exact target attempt"));
+        batch.entries.remove(0);
+        batch.fencing_token = 0;
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("fencing token"));
     }
 
     #[test]

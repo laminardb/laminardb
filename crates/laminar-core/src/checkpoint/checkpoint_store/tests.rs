@@ -9,6 +9,7 @@ use crate::checkpoint::{
     OutputPartitionId, OutputSegmentRef, PartitionSequence, StateFrame, StreamGeneration,
     SubscriptionDigest, SubscriptionProtocolVersion,
 };
+use crate::checkpoint_decision::CheckpointArtifactInventory;
 
 fn manifest_with_payload(payload: &[u8]) -> CheckpointManifest {
     let one = KeyGroupCount::try_from(1_u16).unwrap();
@@ -195,10 +196,31 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
         Some(manifest.clone())
     );
 
-    let expected = Some((manifest.clone(), canonical.clone()));
+    let expected = CheckpointManifestAbortSeal {
+        original_manifest: Some((manifest.clone(), canonical.clone())),
+        sink_cleanup_complete: false,
+    };
     assert_eq!(
         store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
         expected
+    );
+    let completed = CheckpointManifestAbortSeal {
+        original_manifest: expected.original_manifest.clone(),
+        sink_cleanup_complete: true,
+    };
+    assert_eq!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap(),
+        completed
+    );
+    assert_eq!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap(),
+        completed
     );
     store
         .seal_aborted_node_data(chunk, &identity)
@@ -206,7 +228,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
         .unwrap();
     assert_eq!(
         store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
-        expected
+        completed
     );
     store
         .seal_aborted_node_data(chunk, &identity)
@@ -226,6 +248,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     assert_eq!(manifest_seal.artifact_identity_sha256, identity);
     assert_eq!(manifest_seal.chunk, chunk);
     assert_eq!(manifest_seal.original_manifest, Some(manifest));
+    assert!(manifest_seal.sink_cleanup_complete);
     let node_seal: CheckpointArtifactAbortSeal = serde_json::from_slice(
         &backing
             .get(&store.node_data_path(chunk))
@@ -237,6 +260,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     )
     .unwrap();
     assert_eq!(node_seal.original_manifest, None);
+    assert!(!node_seal.sink_cleanup_complete);
 
     for path in [store.manifest_path(chunk), store.node_data_path(chunk)] {
         assert!(matches!(
@@ -263,12 +287,23 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     };
     let missing_identity =
         checkpoint_artifact_identity_sha256(&missing_inventory, missing_chunk).unwrap();
+    let missing = CheckpointManifestAbortSeal {
+        original_manifest: None,
+        sink_cleanup_complete: false,
+    };
     assert_eq!(
         store
             .seal_aborted_manifest(missing_chunk, &missing_identity)
             .await
             .unwrap(),
-        None
+        missing
+    );
+    assert!(
+        store
+            .complete_aborted_sink_cleanup(missing_chunk, &missing_identity)
+            .await
+            .unwrap()
+            .sink_cleanup_complete
     );
     store
         .seal_aborted_node_data(missing_chunk, &missing_identity)
@@ -279,8 +314,83 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
             .seal_aborted_manifest(missing_chunk, &missing_identity)
             .await
             .unwrap(),
-        None
+        CheckpointManifestAbortSeal {
+            original_manifest: None,
+            sink_cleanup_complete: true,
+        }
     );
+}
+
+#[tokio::test]
+async fn legacy_abort_seal_requires_cleanup_before_node_data_sealing() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(Arc::clone(&backing));
+    let payload = Bytes::from_static(b"bcdef");
+    let manifest = manifest_with_payload(&payload);
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: manifest.deployment_id.clone(),
+        pipeline_identity: manifest.pipeline_identity.clone(),
+        attempt: crate::checkpoint::CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+        assignment_fence: manifest.assignment_fence.clone(),
+    };
+    let chunk = manifest.node_data.chunk;
+    let identity = checkpoint_artifact_identity_sha256(&inventory, chunk).unwrap();
+    let canonical = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+    store
+        .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+        .await
+        .unwrap();
+
+    let legacy = CheckpointArtifactAbortSeal {
+        version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1,
+        artifact_identity_sha256: identity.clone(),
+        chunk,
+        original_manifest: Some(manifest.clone()),
+        sink_cleanup_complete: false,
+    };
+    backing
+        .put(
+            &store.manifest_path(chunk),
+            PutPayload::from_bytes(checkpoint_artifact_abort_seal_bytes(&legacy).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("sink cleanup is incomplete"));
+    assert_eq!(
+        store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
+        CheckpointManifestAbortSeal {
+            original_manifest: Some((manifest, canonical)),
+            sink_cleanup_complete: false,
+        }
+    );
+    assert!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap()
+            .sink_cleanup_complete
+    );
+    store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap();
+    let upgraded: CheckpointArtifactAbortSeal = serde_json::from_slice(
+        &backing
+            .get(&store.manifest_path(chunk))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(upgraded.version, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION);
+    assert!(upgraded.sink_cleanup_complete);
 }
 
 #[tokio::test]

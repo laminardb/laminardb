@@ -48,8 +48,8 @@ pub use checkpoint_manifest::{
 };
 pub use checkpoint_store::{
     checkpoint_artifact_identity_sha256, checkpoint_manifest_bytes,
-    probe_object_store_conditional_create, probe_object_store_conditional_update, CheckpointStore,
-    CheckpointStoreError, ObjectStoreCheckpointStore,
+    probe_object_store_conditional_create, probe_object_store_conditional_update,
+    CheckpointManifestAbortSeal, CheckpointStore, CheckpointStoreError, ObjectStoreCheckpointStore,
 };
 pub use committed_checkpoint::{
     canonical_json_bytes, canonical_json_sha256, CheckpointScope, CheckpointWatermark,

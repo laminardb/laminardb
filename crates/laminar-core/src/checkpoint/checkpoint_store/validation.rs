@@ -5,14 +5,17 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CheckpointArtifactAbortSeal, CheckpointStoreError, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
-    MAX_ABORT_SEAL_BYTES,
+    CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1, MAX_ABORT_SEAL_BYTES,
 };
 use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, StateChunkId};
 use crate::state::KeyGroupCount;
 
 pub(super) enum ManifestAbortState {
-    Sealed(Option<(CheckpointManifest, Bytes)>),
+    Sealed {
+        original_manifest: Option<(CheckpointManifest, Bytes)>,
+        sink_cleanup_complete: bool,
+    },
     Manifest(CheckpointManifest, Bytes),
 }
 
@@ -64,9 +67,12 @@ pub(super) fn validate_abort_seal(
     expected_artifact_identity_sha256: &str,
 ) -> Result<(), CheckpointStoreError> {
     validate_abort_seal_request(expected_chunk, expected_artifact_identity_sha256)?;
-    if seal.version != CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
-        || seal.chunk != expected_chunk
+    if !matches!(
+        seal.version,
+        CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1 | CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
+    ) || seal.chunk != expected_chunk
         || seal.artifact_identity_sha256 != expected_artifact_identity_sha256
+        || (seal.version == CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1 && seal.sink_cleanup_complete)
     {
         return Err(CheckpointStoreError::Invalid(format!(
             "participant {} checkpoint {} has a different abort seal",

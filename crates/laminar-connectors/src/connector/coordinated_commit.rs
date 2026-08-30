@@ -135,6 +135,19 @@ pub struct CoordinatedCommitBatch {
     pub entries: Vec<CoordinatedCommitPayload>,
 }
 
+/// Exact prepared descriptors released only after an authoritative Abort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedAbortBatch {
+    /// External cursor namespace that owned the aborted attempt.
+    pub namespace: CoordinatedCommitNamespace,
+    /// Current non-zero cleanup authority token.
+    pub fencing_token: u64,
+    /// Exact aborted checkpoint attempt.
+    pub target: laminar_core::checkpoint::CheckpointAttempt,
+    /// Every durable participant marker for the aborted attempt.
+    pub entries: Vec<CoordinatedCommitPayload>,
+}
+
 /// Runtime-owned deadline for one designated external publication.
 ///
 /// The deadline is created before the command enters the sink actor, so a
@@ -215,26 +228,7 @@ impl CoordinatedCommitBatch {
     /// # Errors
     /// Returns a diagnostic when the batch is malformed or exceeds a fixed bound.
     pub fn validate_shape(&self) -> Result<(), String> {
-        use laminar_core::checkpoint::CheckpointAttemptRelation;
-
-        self.namespace
-            .validate()
-            .map_err(|error| error.to_string())?;
-        if !self.target.is_canonical() {
-            return Err(
-                "coordinated batch target must use one nonzero canonical checkpoint ID".into(),
-            );
-        }
-        if let Some(entry) = self
-            .entries
-            .iter()
-            .find(|entry| entry.participant_id == 0 || !entry.attempt.is_canonical())
-        {
-            return Err(format!(
-                "coordinated batch entry must use a nonzero participant and canonical checkpoint ID; got participant {}",
-                entry.participant_id
-            ));
-        }
+        validate_prepared_entries(&self.namespace, self.target, &self.entries)?;
         if self.expected_predecessor.checkpoint_id >= self.target.checkpoint_id {
             return Err(format!(
                 "invalid coordinated batch predecessor {} for target {}",
@@ -252,14 +246,6 @@ impl CoordinatedCommitBatch {
         if self.fencing_token == 0 {
             return Err("coordinated batch fencing token must be non-zero".into());
         }
-        if self.entries.is_empty() || self.entries.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
-            return Err(format!(
-                "coordinated batch entry count must be in 1..={MAX_COORDINATED_COMMIT_BATCH_ENTRIES}"
-            ));
-        }
-
-        let mut total_payload_bytes = 0usize;
-        let mut previous: Option<&CoordinatedCommitPayload> = None;
         for entry in &self.entries {
             if entry.attempt.checkpoint_id <= self.expected_predecessor.checkpoint_id
                 || entry.attempt.checkpoint_id > self.target.checkpoint_id
@@ -269,45 +255,6 @@ impl CoordinatedCommitBatch {
                         .into(),
                 );
             }
-            if let Some(payload) = &entry.payload {
-                if payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
-                    return Err(format!(
-                        "coordinated participant payload exceeds the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} byte limit"
-                    ));
-                }
-                total_payload_bytes = total_payload_bytes
-                    .checked_add(payload.len())
-                    .ok_or_else(|| "coordinated batch payload byte count overflow".to_owned())?;
-                if total_payload_bytes > MAX_COORDINATED_COMMIT_BATCH_BYTES {
-                    return Err(format!(
-                        "coordinated batch payloads exceed the fixed {MAX_COORDINATED_COMMIT_BATCH_BYTES} byte limit"
-                    ));
-                }
-            }
-
-            if let Some(previous) = previous {
-                match entry.attempt.relation_to(previous.attempt) {
-                    CheckpointAttemptRelation::Exact
-                        if entry.participant_id > previous.participant_id => {}
-                    CheckpointAttemptRelation::Newer => {}
-                    CheckpointAttemptRelation::Exact => {
-                        return Err(
-                            "coordinated batch contains a duplicate or out-of-order attempt/participant key"
-                                .into(),
-                        );
-                    }
-                    CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
-                        return Err(
-                            "coordinated batch attempts are not in coherent epoch/checkpoint order"
-                                .into(),
-                        );
-                    }
-                }
-            }
-            previous = Some(entry);
-        }
-        if previous.map(|entry| entry.attempt) != Some(self.target) {
-            return Err("coordinated batch target is not its final exact attempt".into());
         }
         Ok(())
     }
@@ -396,6 +343,98 @@ impl CoordinatedCommitBatch {
     }
 }
 
+impl CoordinatedAbortBatch {
+    /// Validate exact-attempt membership and fixed control-plane bounds.
+    ///
+    /// # Errors
+    /// Returns a diagnostic for a malformed authority, participant, or payload.
+    pub fn validate_shape(&self) -> Result<(), String> {
+        if self.fencing_token == 0 {
+            return Err("coordinated abort fencing token must be non-zero".into());
+        }
+        validate_prepared_entries(&self.namespace, self.target, &self.entries)?;
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.attempt != self.target)
+        {
+            return Err("coordinated abort entries must belong to its exact target attempt".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_prepared_entries(
+    namespace: &CoordinatedCommitNamespace,
+    target: laminar_core::checkpoint::CheckpointAttempt,
+    entries: &[CoordinatedCommitPayload],
+) -> Result<(), String> {
+    use laminar_core::checkpoint::CheckpointAttemptRelation;
+
+    namespace.validate().map_err(|error| error.to_string())?;
+    if !target.is_canonical() {
+        return Err("coordinated batch target must use one nonzero canonical checkpoint ID".into());
+    }
+    if entries.is_empty() || entries.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
+        return Err(format!(
+            "coordinated batch entry count must be in 1..={MAX_COORDINATED_COMMIT_BATCH_ENTRIES}"
+        ));
+    }
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.participant_id == 0 || !entry.attempt.is_canonical())
+    {
+        return Err(format!(
+            "coordinated batch entry must use a nonzero participant and canonical checkpoint ID; got participant {}",
+            entry.participant_id
+        ));
+    }
+
+    let mut total_payload_bytes = 0usize;
+    let mut previous: Option<&CoordinatedCommitPayload> = None;
+    for entry in entries {
+        if let Some(payload) = &entry.payload {
+            if payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+                return Err(format!(
+                    "coordinated participant payload exceeds the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} byte limit"
+                ));
+            }
+            total_payload_bytes = total_payload_bytes
+                .checked_add(payload.len())
+                .ok_or_else(|| "coordinated batch payload byte count overflow".to_owned())?;
+            if total_payload_bytes > MAX_COORDINATED_COMMIT_BATCH_BYTES {
+                return Err(format!(
+                    "coordinated batch payloads exceed the fixed {MAX_COORDINATED_COMMIT_BATCH_BYTES} byte limit"
+                ));
+            }
+        }
+        if let Some(previous) = previous {
+            match entry.attempt.relation_to(previous.attempt) {
+                CheckpointAttemptRelation::Exact
+                    if entry.participant_id > previous.participant_id => {}
+                CheckpointAttemptRelation::Newer => {}
+                CheckpointAttemptRelation::Exact => {
+                    return Err(
+                        "coordinated batch contains a duplicate or out-of-order attempt/participant key"
+                            .into(),
+                    );
+                }
+                CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
+                    return Err(
+                        "coordinated batch attempts are not in coherent epoch/checkpoint order"
+                            .into(),
+                    );
+                }
+            }
+        }
+        previous = Some(entry);
+    }
+    if previous.map(|entry| entry.attempt) != Some(target) {
+        return Err("coordinated batch target is not its final exact attempt".into());
+    }
+    Ok(())
+}
+
 /// Leader-side commit for checkpoint-committable sinks.
 ///
 /// The designated committer aggregates every writer's `pre_commit` descriptor
@@ -412,6 +451,17 @@ pub trait CoordinatedCommitter: Send + Sync {
         batch: CoordinatedCommitBatch,
         context: CoordinatedCommitContext,
     ) -> Result<(), ConnectorError>;
+
+    /// Release exact durable participant artifacts after the runtime proves an
+    /// authoritative Abort. Implementations must be idempotent and retain any
+    /// artifact whose external publication status is ambiguous.
+    async fn cleanup_aborted(
+        &self,
+        _batch: CoordinatedAbortBatch,
+        _context: CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
 
     /// Highest checkpoint and fencing authority committed in `namespace`.
     /// A metadata read error must be returned, never converted to an absent

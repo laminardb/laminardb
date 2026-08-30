@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::operation::process_authority_error;
 use arrow::array::RecordBatch;
 use crossfire::{mpsc, oneshot, SendTimeoutError};
-use laminar_connectors::connector::CoordinatedCommitBatch;
+use laminar_connectors::connector::{CoordinatedAbortBatch, CoordinatedCommitBatch};
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming::Producer;
 use tokio::time::Instant;
@@ -753,6 +753,18 @@ impl SinkTaskHandle {
         self.request("commit-aggregated", |ack| SinkOperation::CommitAggregated {
             batch,
             ack,
+        })
+        .await
+    }
+
+    /// Release durable participant artifacts after an authoritative Abort.
+    pub async fn cleanup_aborted_until(
+        &self,
+        batch: CoordinatedAbortBatch,
+        deadline: Instant,
+    ) -> Result<(), ConnectorError> {
+        self.request_until("cleanup-aborted", deadline, |ack| {
+            SinkOperation::CleanupAborted { batch, ack }
         })
         .await
     }

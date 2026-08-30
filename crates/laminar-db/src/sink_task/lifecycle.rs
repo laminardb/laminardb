@@ -344,6 +344,12 @@ pub(super) fn reject_unstarted_sink_operation(
                 "coordinated external commit",
             )));
         }
+        SinkOperation::CleanupAborted { ack, .. } => {
+            ack.send(Err(process_authority_error(
+                &inner.name,
+                "aborted coordinated artifact cleanup",
+            )));
+        }
         SinkOperation::CommittedCursor { ack, .. } => {
             ack.send(Err(process_authority_error(
                 &inner.name,

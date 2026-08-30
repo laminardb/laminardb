@@ -9,8 +9,9 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use crossfire::oneshot;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, CoordinatedCommitBatch, CoordinatedCommitContext,
-    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter,
+    ConnectorCancellationPolicy, CoordinatedAbortBatch, CoordinatedCommitBatch,
+    CoordinatedCommitContext, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+    CoordinatedCommitter,
 };
 use laminar_connectors::error::ConnectorError;
 #[cfg(feature = "cluster")]
@@ -87,6 +88,21 @@ pub(super) async fn handle_sink_command(
             let cancellation_policy = inner.sink.cancellation_policy();
             let committer = inner.sink.as_coordinated_committer();
             let (result, operation_retired) = commit_aggregated_sink(
+                &inner.name,
+                committer,
+                batch,
+                deadline,
+                cancellation_policy,
+                #[cfg(feature = "cluster")]
+                inner.process_authority.clone(),
+            )
+            .await;
+            retire = finish_command(ack, result, operation_retired, actor_state);
+        }
+        SinkOperation::CleanupAborted { batch, ack } => {
+            let cancellation_policy = inner.sink.cancellation_policy();
+            let committer = inner.sink.as_coordinated_committer();
+            let (result, operation_retired) = cleanup_aborted_sink(
                 &inner.name,
                 committer,
                 batch,
@@ -296,6 +312,38 @@ pub(super) async fn commit_aggregated_sink(
                 #[cfg(feature = "cluster")]
                 process_authority,
                 || committer.commit_aggregated(batch, context),
+            )
+            .await
+        }
+        None => (
+            Err(ConnectorError::InvalidState {
+                expected: "coordinated committer".into(),
+                actual: format!("sink '{sink_name}' is not coordinated"),
+            }),
+            false,
+        ),
+    }
+}
+
+pub(super) async fn cleanup_aborted_sink(
+    sink_name: &str,
+    committer: Option<&dyn CoordinatedCommitter>,
+    batch: CoordinatedAbortBatch,
+    deadline: Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
+) -> (Result<(), ConnectorError>, bool) {
+    match committer {
+        Some(committer) => {
+            let context = CoordinatedCommitContext::new(deadline);
+            bounded_connector_operation(
+                sink_name,
+                "aborted coordinated artifact cleanup",
+                deadline,
+                cancellation_policy,
+                #[cfg(feature = "cluster")]
+                process_authority,
+                || committer.cleanup_aborted(batch, context),
             )
             .await
         }

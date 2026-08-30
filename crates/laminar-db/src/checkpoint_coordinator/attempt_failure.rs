@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use super::artifacts::AbortedSinkCleanup;
 use super::{
     checked_successor_epoch, CheckpointAttempt, CheckpointCoordinator,
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointScope, DbError,
@@ -154,24 +155,21 @@ impl CheckpointCoordinator {
         )
         .await?;
         let cleanup_deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
-        let rollback = self
-            .rollback_sinks_until(attempt.epoch, cleanup_deadline)
-            .await;
-        let witness_cleanup = if rollback.is_ok() {
-            self.clear_sink_witness_until(cleanup_deadline).await
-        } else {
-            Ok(())
-        };
+        self.rollback_sinks_until(attempt.epoch, cleanup_deadline)
+            .await?;
         let artifact_cleanup = if cluster_scope {
             self.failure_requires_recovery = true;
             Ok(())
         } else {
-            self.cleanup_local_checkpoint_artifacts_until(attempt, cleanup_deadline)
-                .await
+            self.cleanup_local_checkpoint_artifacts_until(
+                attempt,
+                AbortedSinkCleanup::LiveRollback,
+                cleanup_deadline,
+            )
+            .await
         };
-        rollback?;
-        witness_cleanup?;
         artifact_cleanup?;
+        self.clear_sink_witness_until(cleanup_deadline).await?;
         self.allocator.advance_epoch_to(checked_successor_epoch(
             attempt.epoch,
             "closing an aborted checkpoint",

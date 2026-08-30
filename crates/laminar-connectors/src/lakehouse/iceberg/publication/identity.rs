@@ -9,8 +9,8 @@ use crate::error::ConnectorError;
 use super::super::descriptor::IcebergFileFingerprintV1;
 use super::super::fingerprint::data_file_fingerprint;
 
-pub(super) const SUMMARY_NAMESPACE: &str = "laminardb.commit.namespace";
-pub(super) const SUMMARY_CHECKPOINT: &str = "laminardb.checkpoint.id";
+pub(in crate::lakehouse::iceberg) const SUMMARY_NAMESPACE: &str = "laminardb.commit.namespace";
+pub(in crate::lakehouse::iceberg) const SUMMARY_CHECKPOINT: &str = "laminardb.checkpoint.id";
 pub(super) const SUMMARY_FENCE: &str = "laminardb.fencing.token";
 pub(super) const SUMMARY_BATCH_FINGERPRINT: &str = "laminardb.batch.fingerprint";
 pub(super) const SUMMARY_FILE_SET: &str = "laminardb.file-set.fingerprint";

@@ -1,7 +1,7 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use laminar_connectors::connector::{
-    CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
-    CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitCursor,
+    CoordinatedCommitNamespace, CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
     MAX_COORDINATED_COMMIT_BATCH_ENTRIES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_core::checkpoint::{
@@ -54,6 +54,99 @@ async fn external_sink_commit_gate(
 }
 
 impl CheckpointCoordinator {
+    pub(super) async fn cleanup_aborted_external_sinks_until(
+        &self,
+        attempt: CheckpointAttempt,
+        manifests: &[&CheckpointManifest],
+        fencing_token: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if !self.has_checkpoint_committable_sinks() || manifests.is_empty() {
+            return Ok(());
+        }
+        if fencing_token == 0 {
+            return Err(DbError::Checkpoint(
+                "external sink cleanup requires a nonzero fencing token".into(),
+            ));
+        }
+        let identity = self.expected_pipeline_identity()?;
+        let deployment_id = self.expected_deployment_id()?.to_owned();
+        let mut pending = self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.checkpoint_committable());
+        let mut active = FuturesOrdered::new();
+        for sink in pending.by_ref().take(MAX_EXTERNAL_SINK_COMMIT_CONCURRENCY) {
+            active.push_back(self.cleanup_aborted_external_sink_until(
+                sink,
+                attempt,
+                manifests,
+                fencing_token,
+                &identity,
+                &deployment_id,
+                deadline,
+            ));
+        }
+        let mut first_error = None;
+        while let Some(result) = active.next().await {
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+            if let Some(sink) = pending.next() {
+                active.push_back(self.cleanup_aborted_external_sink_until(
+                    sink,
+                    attempt,
+                    manifests,
+                    fencing_token,
+                    &identity,
+                    &deployment_id,
+                    deadline,
+                ));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Exact abort authority stays visible at connector I/O.
+    async fn cleanup_aborted_external_sink_until(
+        &self,
+        sink: &RegisteredSink,
+        attempt: CheckpointAttempt,
+        manifests: &[&CheckpointManifest],
+        fencing_token: u64,
+        identity: &PipelineIdentity,
+        deployment_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let namespace = CoordinatedCommitNamespace::try_new(
+            identity.clone(),
+            deployment_id.to_owned(),
+            sink.name.clone(),
+        )
+        .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        let entries = self
+            .load_external_sink_entries(sink, attempt, manifests, deadline)
+            .await?;
+        let batch = CoordinatedAbortBatch {
+            namespace,
+            fencing_token,
+            target: attempt,
+            entries,
+        };
+        batch.validate_shape().map_err(|error| {
+            DbError::Checkpoint(format!("sink '{}' abort cleanup batch: {error}", sink.name))
+        })?;
+        sink.handle
+            .cleanup_aborted_until(batch, deadline)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "sink '{}' aborted artifact cleanup failed: {error}",
+                    sink.name
+                ))
+            })
+    }
+
     pub(super) async fn commit_external_sinks_until(
         &self,
         attempt: CheckpointAttempt,
