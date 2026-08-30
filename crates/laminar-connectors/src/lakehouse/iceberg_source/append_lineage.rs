@@ -434,7 +434,8 @@ mod tests {
             &first,
             &first_snapshot,
             first.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         let (second, second_paths) = append_rows(&fixture, &first, 2, &[(2, Some("b"))]).await;
         let second_id = second.metadata().current_snapshot_id().unwrap();
         let (third, third_paths) = append_rows(&fixture, &second, 3, &[(3, Some("c"))]).await;
@@ -472,7 +473,8 @@ mod tests {
             &third,
             third.metadata().current_snapshot().unwrap(),
             third.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         assert!(plan(&third, &current, &config).await.unwrap().is_empty());
     }
 
@@ -486,7 +488,8 @@ mod tests {
             &first,
             first.metadata().current_snapshot().unwrap(),
             first.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
         assert_eq!(plan(&second, &cursor, &config).await.unwrap().len(), 1);
     }
@@ -541,7 +544,8 @@ mod tests {
             &first,
             first.metadata().current_snapshot().unwrap(),
             first.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         let invalid = append_with_preserved_data_sequence(&first).await;
         let error = plan(&invalid, &cursor, &config).await.unwrap_err();
         assert!(error
@@ -597,13 +601,15 @@ mod tests {
             &second,
             &first_snapshot,
             second.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         let second_cursor = IcebergSourceCursorV1::from_snapshot(
             &config,
             &second,
             &second_snapshot,
             second.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
 
         let mut expired = first_cursor.clone();
         expired.snapshot_id = i64::MAX;
@@ -664,7 +670,8 @@ mod tests {
             &first,
             first.metadata().current_snapshot().unwrap(),
             first.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         let (second, _) = append_rows(&fixture, &first, 2, &[(2, None)]).await;
         let (third, _) = append_rows(&fixture, &second, 3, &[(3, None)]).await;
         let mut snapshot_limited = config.clone();

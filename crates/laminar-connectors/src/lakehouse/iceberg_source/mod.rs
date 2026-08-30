@@ -165,6 +165,7 @@ impl IcebergSource {
 
     #[cfg(feature = "iceberg-core")]
     fn install_cursor(&mut self, cursor: IcebergSourceCursorV1) -> Result<(), ConnectorError> {
+        let checkpoint = cursor.to_checkpoint()?;
         self.replay_unit_in_progress = false;
         self.metrics.processed_snapshot_id.set(cursor.snapshot_id);
         self.pending_snapshots = self.pending_snapshots.saturating_sub(1);
@@ -176,7 +177,7 @@ impl IcebergSource {
                 .sequence_lag
                 .set(current.saturating_sub(cursor.sequence_number));
         }
-        self.checkpoint = cursor.to_checkpoint()?;
+        self.checkpoint = checkpoint;
         self.cursor = Some(cursor);
         Ok(())
     }
@@ -297,7 +298,7 @@ impl IcebergSource {
             &table,
             &snapshot,
             self.read_schema()?.schema_id(),
-        );
+        )?;
         if self.config.read_mode == IcebergReadMode::Append {
             append_lineage::validate_cursor_lineage(
                 &table,
@@ -384,7 +385,7 @@ impl IcebergSource {
                 self.read_schema()?,
                 self.filter_predicate.clone(),
                 plans,
-            );
+            )?;
         } else if let Some(snapshot) = Self::selected_snapshot(&table, &self.config)? {
             if self.config.bootstrap == IcebergReadBootstrap::Initial {
                 self.scan = Some(planner::full_snapshot_task(
@@ -400,7 +401,7 @@ impl IcebergSource {
                     &table,
                     &snapshot,
                     self.read_schema()?.schema_id(),
-                );
+                )?;
                 self.install_cursor(cursor)?;
             }
         }

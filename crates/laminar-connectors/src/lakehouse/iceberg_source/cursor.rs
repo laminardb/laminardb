@@ -87,8 +87,8 @@ impl IcebergSourceCursorV1 {
         table: &Table,
         snapshot: &Snapshot,
         read_schema_id: i32,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ConnectorError> {
+        let cursor = Self {
             version: CURSOR_VERSION,
             catalog_identity: stable_catalog_identity(&config.catalog, &config.storage),
             table_uuid: table.metadata().uuid().to_string(),
@@ -98,8 +98,10 @@ impl IcebergSourceCursorV1 {
             snapshot_id: snapshot.snapshot_id(),
             sequence_number: snapshot.sequence_number(),
             read_schema_id,
-            metadata_location: table.metadata_location().unwrap_or_default().to_string(),
-        }
+            metadata_location: durable_metadata_location(table)?.to_string(),
+        };
+        cursor.encoded_payload()?;
+        Ok(cursor)
     }
 
     pub(super) fn from_empty_table(
@@ -116,7 +118,7 @@ impl IcebergSourceCursorV1 {
                         .into(),
                 )
             })?;
-        Ok(Self {
+        let cursor = Self {
             version: CURSOR_VERSION,
             catalog_identity: stable_catalog_identity(&config.catalog, &config.storage),
             table_uuid: table.metadata().uuid().to_string(),
@@ -127,7 +129,9 @@ impl IcebergSourceCursorV1 {
             sequence_number: 0,
             read_schema_id,
             metadata_location: metadata_location.to_string(),
-        })
+        };
+        cursor.encoded_payload()?;
+        Ok(cursor)
     }
 
     pub(super) fn validate_binding(
@@ -207,15 +211,7 @@ impl IcebergSourceCursorV1 {
     ///
     /// Returns a serialization error if the cursor cannot be encoded.
     pub fn to_checkpoint(&self) -> Result<SourceCheckpoint, ConnectorError> {
-        self.validate_payload()?;
-        let encoded =
-            serde_json::to_string(self).map_err(|error| ConnectorError::Serde(error.into()))?;
-        if encoded.len() > MAX_CURSOR_BYTES {
-            return Err(cursor_error(
-                "LDB-ICEBERG-CURSOR-SIZE",
-                "Iceberg cursor exceeds its fixed durability bound",
-            ));
-        }
+        let encoded = self.encoded_payload()?;
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset(CURSOR_KEY, encoded);
         checkpoint.set_metadata("connector_type", "iceberg");
@@ -254,6 +250,19 @@ impl IcebergSourceCursorV1 {
         })?;
         cursor.validate_payload()?;
         Ok(cursor)
+    }
+
+    fn encoded_payload(&self) -> Result<String, ConnectorError> {
+        self.validate_payload()?;
+        let encoded =
+            serde_json::to_string(self).map_err(|error| ConnectorError::Serde(error.into()))?;
+        if encoded.len() > MAX_CURSOR_BYTES {
+            return Err(cursor_error(
+                "LDB-ICEBERG-CURSOR-SIZE",
+                "Iceberg cursor exceeds its fixed durability bound",
+            ));
+        }
+        Ok(encoded)
     }
 
     fn validate_payload(&self) -> Result<(), ConnectorError> {
@@ -317,7 +326,8 @@ impl IcebergSourceCursorV1 {
                 ));
             }
         }
-        if self.metadata_location.chars().any(char::is_control)
+        if self.metadata_location.is_empty()
+            || self.metadata_location.chars().any(char::is_control)
             || crate::security::value_contains_uri_secret(&self.metadata_location, false)
         {
             return Err(cursor_error(
@@ -331,6 +341,18 @@ impl IcebergSourceCursorV1 {
     pub(super) fn is_empty_table(&self) -> bool {
         self.origin == IcebergSourceCursorOriginV1::EmptyTable
     }
+}
+
+fn durable_metadata_location(table: &Table) -> Result<&str, ConnectorError> {
+    table
+        .metadata_location()
+        .filter(|location| !location.is_empty())
+        .ok_or_else(|| {
+            cursor_error(
+                "LDB-ICEBERG-CURSOR-METADATA-LOCATION",
+                "loaded table has no durable metadata location",
+            )
+        })
 }
 
 fn cursor_error(code: &str, detail: &str) -> ConnectorError {
@@ -459,6 +481,13 @@ mod tests {
         assert!(message.contains("LDB-ICEBERG-CURSOR-METADATA-LOCATION"));
         assert!(!message.contains("do-not-echo"));
 
+        cursor.metadata_location.clear();
+        assert!(cursor
+            .to_checkpoint()
+            .unwrap_err()
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-METADATA-LOCATION"));
+
         let message = IcebergSourceCursorV1::from_checkpoint(&unchecked_checkpoint(&cursor))
             .unwrap_err()
             .to_string();
@@ -509,7 +538,8 @@ mod tests {
             &table,
             snapshot,
             table.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
 
         let mut wrong_uuid = cursor.clone();
         wrong_uuid.table_uuid = uuid::Uuid::now_v7().to_string();
@@ -532,12 +562,63 @@ mod tests {
             &table,
             snapshot,
             table.metadata().current_schema_id(),
-        );
+        )
+        .unwrap();
         missing_schema.read_schema_id = i32::MAX;
         assert!(missing_schema
             .validate_binding(&config, &table)
             .unwrap_err()
             .to_string()
             .contains("LDB-ICEBERG-CURSOR-SCHEMA-EXPIRED"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_cursor_requires_durable_metadata_location() {
+        use crate::config::ConnectorConfig;
+        use crate::lakehouse::iceberg::test_support::{append_rows, create_test_table};
+
+        let fixture = create_test_table(false).await;
+        let (table, _) = append_rows(&fixture, &fixture.table, 1, &[(1, Some("a"))]).await;
+        let mut raw = ConnectorConfig::new("iceberg");
+        raw.set("catalog.uri", fixture.config.catalog.catalog_uri.clone());
+        raw.set(
+            "catalog.warehouse",
+            fixture.config.catalog.warehouse.clone(),
+        );
+        raw.set("namespace", "test");
+        raw.set("table.name", "events");
+        let config = IcebergSourceConfig::from_config(&raw).unwrap();
+        let table_without_location = Table::builder()
+            .identifier(table.identifier().clone())
+            .metadata(table.metadata().clone())
+            .file_io(table.file_io().clone())
+            .runtime(iceberg::Runtime::try_current().unwrap())
+            .build()
+            .unwrap();
+        let snapshot = table_without_location
+            .metadata()
+            .current_snapshot()
+            .unwrap();
+        let error = IcebergSourceCursorV1::from_snapshot(
+            &config,
+            &table_without_location,
+            snapshot,
+            table_without_location.metadata().current_schema_id(),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-CURSOR-METADATA-LOCATION"));
+
+        let error = IcebergSourceCursorV1::from_empty_table(
+            &config,
+            &table_without_location,
+            table_without_location.metadata().current_schema_id(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-EMPTY-CURSOR-METADATA"));
     }
 }

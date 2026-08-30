@@ -65,7 +65,7 @@ pub(super) fn full_snapshot_task(
             ))
         })?;
     let cursor =
-        IcebergSourceCursorV1::from_snapshot(config, &table, snapshot, read_schema.schema_id());
+        IcebergSourceCursorV1::from_snapshot(config, &table, snapshot, read_schema.schema_id())?;
     Ok(spawn_scan(
         table,
         config,
@@ -85,24 +85,33 @@ pub(super) fn append_task(
     read_schema: &ReadSchemaBinding,
     predicate: Option<Predicate>,
     plans: Vec<AppendSnapshotPlan>,
-) -> Option<ScanTask> {
+) -> Result<Option<ScanTask>, ConnectorError> {
     if plans.is_empty() {
-        return None;
+        return Ok(None);
     }
     let plans = plans
         .into_iter()
-        .map(|plan| ScanPlan {
-            snapshot_id: plan.snapshot.snapshot_id(),
-            files: ScanFiles::Added(plan.added_files),
-            cursor: IcebergSourceCursorV1::from_snapshot(
+        .map(|plan| {
+            let cursor = IcebergSourceCursorV1::from_snapshot(
                 config,
                 &table,
                 &plan.snapshot,
                 read_schema.schema_id(),
-            ),
+            )?;
+            Ok(ScanPlan {
+                snapshot_id: plan.snapshot.snapshot_id(),
+                files: ScanFiles::Added(plan.added_files),
+                cursor,
+            })
         })
-        .collect();
-    Some(spawn_scan(table, config, read_schema, predicate, plans))
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    Ok(Some(spawn_scan(
+        table,
+        config,
+        read_schema,
+        predicate,
+        plans,
+    )))
 }
 
 fn spawn_scan(
