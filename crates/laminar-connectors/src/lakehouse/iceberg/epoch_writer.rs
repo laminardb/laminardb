@@ -178,7 +178,8 @@ impl IcebergEpochWriter {
     }
 
     async fn write_bounded(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        let rows = u64::try_from(batch.num_rows()).map_err(|_| {
+        let batch_rows = batch.num_rows();
+        let rows = u64::try_from(batch_rows).map_err(|_| {
             ConnectorError::WriteError("Iceberg batch row count exceeds u64".into())
         })?;
         let bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
@@ -191,15 +192,21 @@ impl IcebergEpochWriter {
         let total_bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
             ConnectorError::WriteError("Iceberg epoch byte count overflow".into())
         })?;
-        let mut partitions = match &self.splitter {
-            Some(splitter) => splitter
+        let mut partitions = if let Some(splitter) = &self.splitter {
+            let partitions = splitter
                 .split(&batch)
                 .map_err(|error| iceberg_write_error("evaluate partition spec", &error))?
                 .into_iter()
                 .map(|(partition, batch)| (partition.to_path(), Some(partition), batch))
-                .collect::<Vec<_>>(),
-            None => vec![(String::new(), None, batch)],
+                .collect::<Vec<_>>();
+            drop(batch);
+            partitions
+        } else {
+            vec![(String::new(), None, batch)]
         };
+        let retained_bytes =
+            validate_split_batches(&partitions, batch_rows, self.max_buffer_bytes)?;
+        self.metrics.set_buffer(batch_rows, retained_bytes);
         for (path, partition, _) in &partitions {
             if let Some(partition) = partition {
                 validate_partition_path(partition, path)?;
@@ -620,6 +627,36 @@ fn invalid_partition_path() -> ConnectorError {
         "[LDB-ICEBERG-PARTITION-PATH] Iceberg partition value cannot be represented as a safe object path"
             .into(),
     )
+}
+
+fn validate_split_batches(
+    partitions: &[PartitionBatch],
+    expected_rows: usize,
+    max_buffer_bytes: usize,
+) -> Result<usize, ConnectorError> {
+    let mut rows = 0_usize;
+    let mut bytes = 0_usize;
+    for (_, _, batch) in partitions {
+        rows = rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            ConnectorError::WriteError("Iceberg split batch row count overflow".into())
+        })?;
+        bytes = bytes
+            .checked_add(batch.get_array_memory_size())
+            .ok_or_else(|| {
+                ConnectorError::WriteError("Iceberg split batch byte count overflow".into())
+            })?;
+        if bytes > max_buffer_bytes {
+            return Err(ConnectorError::WriteError(format!(
+                "[LDB-ICEBERG-SPLIT-BUFFER] partitioned batch retains more than max.buffer.bytes ({max_buffer_bytes})"
+            )));
+        }
+    }
+    if rows != expected_rows {
+        return Err(ConnectorError::Internal(format!(
+            "Iceberg partition splitter changed row count from {expected_rows} to {rows}"
+        )));
+    }
+    Ok(bytes)
 }
 
 fn approximate_row_group_rows(config: &IcebergSinkConfig) -> usize {
@@ -1066,6 +1103,51 @@ mod tests {
         assert!(byte_error.to_string().contains("max.buffer.bytes"));
         assert!(byte_writer.active.is_empty());
         assert_eq!(byte_writer.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn split_buffer_limit_rejects_before_opening_a_writer() {
+        let fixture = create_test_table(true).await;
+        let values = (0_i64..32)
+            .map(|id| (id, Some(format!("partition-{id:02}"))))
+            .collect::<Vec<_>>();
+        let borrowed = values
+            .iter()
+            .map(|(id, value)| (*id, value.as_deref()))
+            .collect::<Vec<_>>();
+        let input = batch(&fixture.table, &borrowed);
+        let probe = IcebergEpochWriter::new(
+            &fixture.table,
+            &fixture.config,
+            &identity(28),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        let split = probe.splitter.as_ref().unwrap().split(&input).unwrap();
+        let split_bytes = split
+            .iter()
+            .map(|(_, batch)| batch.get_array_memory_size())
+            .sum::<usize>();
+        assert!(split_bytes > input.get_array_memory_size());
+        drop(split);
+
+        let mut config = fixture.config;
+        config.max_buffer_bytes = split_bytes - 1;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(28),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        let error = writer
+            .write(input)
+            .await
+            .expect_err("split Arrow buffers must remain within max.buffer.bytes");
+        assert!(error.to_string().contains("LDB-ICEBERG-SPLIT-BUFFER"));
+        assert!(writer.active.is_empty());
+        assert_eq!(writer.file_count, 0);
+        assert_eq!(writer.rows, 0);
     }
 
     #[tokio::test]
