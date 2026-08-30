@@ -12,8 +12,8 @@ use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
 
 use super::{
-    rest_properties, storage_factory, validate_storage_options, BuiltCatalog, CatalogAccess,
-    CatalogCapabilities,
+    rest_properties, storage_factory, validate_storage_options, AtomicTableRequirements,
+    BuiltCatalog, CatalogAccess, CatalogCapabilities,
 };
 
 mod facade;
@@ -93,9 +93,11 @@ pub(super) async fn build_publication(
     config: &IcebergCatalogConfig,
     storage: &IcebergStorageConfig,
     session: &super::CatalogSession,
-    idempotency_key: uuid::Uuid,
+    capabilities: &CatalogCapabilities,
+    idempotency_key: Option<uuid::Uuid>,
+    requirements: AtomicTableRequirements,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
-    if idempotency_key.get_version_num() != 7 {
+    if idempotency_key.is_some_and(|key| key.get_version_num() != 7) {
         return Err(ConnectorError::Internal(
             "Iceberg REST idempotency key is not UUIDv7".into(),
         ));
@@ -127,7 +129,9 @@ pub(super) async fn build_publication(
         &authentication,
     )
     .await?;
-    if discovered.capabilities.idempotency_key_lifetime.is_none() {
+    if capabilities.idempotency_key_lifetime.is_some()
+        && discovered.capabilities.idempotency_key_lifetime.is_none()
+    {
         return Err(ConnectorError::FeatureUnsupported(
             "iceberg.catalog.rest.idempotency: server no longer advertises idempotency-key-lifetime"
                 .into(),
@@ -142,6 +146,7 @@ pub(super) async fn build_publication(
             discovered.effective_properties,
             config.request_timeout,
             idempotency_key,
+            requirements,
         ),
     )))
 }
@@ -649,6 +654,7 @@ mod tests {
         .await
         .unwrap();
         let fixture = super::super::super::iceberg::test_support::create_test_table(false).await;
+        let requirements = AtomicTableRequirements::from_table(&fixture.table);
         let catalog = RestCatalogFacade::publication(
             fixture.catalog,
             RestCommitTransport::new(
@@ -657,7 +663,8 @@ mod tests {
                 discovered.effective_uri,
                 discovered.effective_properties,
                 config.request_timeout,
-                idempotency_key,
+                Some(idempotency_key),
+                requirements,
             ),
         );
         let transaction = Transaction::new(&fixture.table);
@@ -679,6 +686,75 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(config_requests.len(), 1);
         assert!(!config_requests[0].headers.contains_key("idempotency-key"));
+    }
+
+    #[tokio::test]
+    async fn publication_without_idempotency_still_fences_table_layout() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/namespaces/test/tables/events"))
+            .and(header("authorization", "Bearer catalog-secret"))
+            .respond_with(ResponseTemplate::new(409))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = catalog_config(&server.uri());
+        let storage = IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap();
+        let properties = rest_properties(&config, &storage).unwrap();
+        let client = http_client(&config).unwrap();
+        let authentication =
+            RestAuthentication::initialize(&config, client.clone(), &properties, None)
+                .await
+                .unwrap();
+        let fixture = super::super::super::iceberg::test_support::create_test_table(false).await;
+        let requirements = AtomicTableRequirements::from_table(&fixture.table);
+        let catalog = RestCatalogFacade::publication(
+            fixture.catalog,
+            RestCommitTransport::new(
+                client,
+                authentication,
+                server.uri(),
+                properties,
+                config.request_timeout,
+                None,
+                requirements,
+            ),
+        );
+        let transaction = Transaction::new(&fixture.table);
+        let transaction = transaction
+            .update_table_properties()
+            .set("test".into(), "value".into())
+            .apply(transaction)
+            .unwrap();
+        let update_started = AtomicBool::new(false);
+        let single_dispatch =
+            super::super::SingleDispatchCatalog::new(&catalog, &fixture.table, &update_started);
+        let error = transaction.commit(&single_dispatch).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+
+        let requests = server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST")
+            .unwrap();
+        assert!(!request.headers.contains_key("idempotency-key"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let requirement_types = body["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|requirement| requirement["type"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            requirement_types,
+            HashSet::from([
+                "assert-table-uuid",
+                "assert-current-schema-id",
+                "assert-default-spec-id",
+                "assert-default-sort-order-id",
+            ])
+        );
     }
 
     #[tokio::test]
@@ -734,6 +810,7 @@ mod tests {
         .await
         .unwrap();
         let fixture = super::super::super::iceberg::test_support::create_test_table(false).await;
+        let requirements = AtomicTableRequirements::from_table(&fixture.table);
         let catalog = RestCatalogFacade::publication(
             fixture.catalog,
             RestCommitTransport::new(
@@ -742,7 +819,8 @@ mod tests {
                 discovered.effective_uri,
                 discovered.effective_properties,
                 config.request_timeout,
-                idempotency_key,
+                Some(idempotency_key),
+                requirements,
             ),
         );
         let transaction = Transaction::new(&fixture.table);

@@ -59,6 +59,25 @@ pub(crate) struct BuiltCatalog {
     pub(crate) session: CatalogSession,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtomicTableRequirements {
+    pub(crate) table_uuid: uuid::Uuid,
+    pub(crate) schema_id: i32,
+    pub(crate) partition_spec_id: i32,
+    pub(crate) sort_order_id: i64,
+}
+
+impl AtomicTableRequirements {
+    pub(crate) fn from_table(table: &Table) -> Self {
+        Self {
+            table_uuid: table.metadata().uuid(),
+            schema_id: table.metadata().current_schema_id(),
+            partition_spec_id: table.metadata().default_partition_spec_id(),
+            sort_order_id: table.metadata().default_sort_order_id(),
+        }
+    }
+}
+
 #[cfg(any(
     feature = "iceberg-storage-s3",
     feature = "iceberg-storage-gcs",
@@ -322,14 +341,23 @@ pub(crate) async fn build_publication_catalog(
     storage: &IcebergStorageConfig,
     capabilities: &CatalogCapabilities,
     session: &CatalogSession,
-    idempotency_key: uuid::Uuid,
+    idempotency_key: Option<uuid::Uuid>,
+    requirements: AtomicTableRequirements,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
-    if capabilities.idempotency_key_lifetime.is_none() {
+    if session.rest_authentication.is_none() {
         return Ok(None);
     }
-    rest_catalog::build_publication(catalog, config, storage, session, idempotency_key)
-        .await
-        .map(Some)
+    rest_catalog::build_publication(
+        catalog,
+        config,
+        storage,
+        session,
+        capabilities,
+        idempotency_key,
+        requirements,
+    )
+    .await
+    .map(Some)
 }
 
 #[cfg(not(feature = "iceberg-catalog-rest"))]
@@ -339,7 +367,8 @@ pub(crate) async fn build_publication_catalog(
     _storage: &IcebergStorageConfig,
     _capabilities: &CatalogCapabilities,
     _session: &CatalogSession,
-    _idempotency_key: uuid::Uuid,
+    _idempotency_key: Option<uuid::Uuid>,
+    _requirements: AtomicTableRequirements,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
     Ok(None)
 }

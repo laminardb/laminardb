@@ -23,7 +23,7 @@ use crate::lakehouse::iceberg_config::{
 };
 use crate::lakehouse::iceberg_io::{
     build_publication_catalog, external_error_summary, validate_loaded_table_locations,
-    CatalogCapabilities, CatalogSession, SingleDispatchCatalog,
+    AtomicTableRequirements, CatalogCapabilities, CatalogSession, SingleDispatchCatalog,
 };
 
 use super::commit_cursor::{cursor_property_keys, cursor_record, CursorRecord};
@@ -291,6 +291,7 @@ async fn publish_with_retries(
             catalog_session,
             config,
             batch,
+            &table,
             identity.commit_uuid,
             attempt,
         )
@@ -466,14 +467,14 @@ async fn publication_catalog_for_attempt(
     session: &CatalogSession,
     config: &IcebergSinkConfig,
     batch: &CoordinatedCommitBatch,
+    table: &iceberg::table::Table,
     logical_commit_uuid: uuid::Uuid,
     attempt: usize,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
-    if capabilities.idempotency_key_lifetime.is_none() {
-        return Ok(None);
-    }
-    // RECOVERY: only a definite conflict changes the request and its key.
-    let idempotency_key = deterministic_idempotency_key(batch, logical_commit_uuid, attempt)?;
+    let idempotency_key = capabilities
+        .idempotency_key_lifetime
+        .map(|_| deterministic_idempotency_key(batch, logical_commit_uuid, attempt))
+        .transpose()?;
     build_publication_catalog(
         Arc::clone(catalog),
         &config.catalog,
@@ -481,6 +482,7 @@ async fn publication_catalog_for_attempt(
         capabilities,
         session,
         idempotency_key,
+        AtomicTableRequirements::from_table(table),
     )
     .await
 }

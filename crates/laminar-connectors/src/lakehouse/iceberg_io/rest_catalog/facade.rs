@@ -7,9 +7,11 @@ use async_trait::async_trait;
 use iceberg::table::Table;
 use iceberg::{
     Catalog, Error, ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
+    TableRequirement,
 };
 use iceberg_catalog_rest::CommitTableRequest;
 
+use super::super::AtomicTableRequirements;
 use super::oauth::{OAuthCatalogState, RestAuthentication};
 
 pub(super) struct RestCommitTransport {
@@ -18,7 +20,8 @@ pub(super) struct RestCommitTransport {
     effective_uri: String,
     properties: HashMap<String, String>,
     request_timeout: Duration,
-    idempotency_key: uuid::Uuid,
+    idempotency_key: Option<uuid::Uuid>,
+    requirements: AtomicTableRequirements,
 }
 
 impl RestCommitTransport {
@@ -28,7 +31,8 @@ impl RestCommitTransport {
         effective_uri: String,
         properties: HashMap<String, String>,
         request_timeout: Duration,
-        idempotency_key: uuid::Uuid,
+        idempotency_key: Option<uuid::Uuid>,
+        requirements: AtomicTableRequirements,
     ) -> Self {
         Self {
             client,
@@ -37,6 +41,7 @@ impl RestCommitTransport {
             properties,
             request_timeout,
             idempotency_key,
+            requirements,
         }
     }
 
@@ -46,16 +51,19 @@ impl RestCommitTransport {
         catalog: &dyn Catalog,
     ) -> iceberg::Result<Table> {
         let identifier = commit.identifier().clone();
+        let requirements = atomic_requirements(commit.take_requirements(), self.requirements)?;
         let body = CommitTableRequest {
             identifier: Some(identifier.clone()),
-            requirements: commit.take_requirements(),
+            requirements,
             updates: commit.take_updates(),
         };
-        let request = self
+        let mut request = self
             .client
             .post(self.table_endpoint(&identifier))
-            .header("Idempotency-Key", self.idempotency_key.to_string())
             .json(&body);
+        if let Some(key) = self.idempotency_key {
+            request = request.header("Idempotency-Key", key.to_string());
+        }
         let request = super::apply_request_properties(
             request,
             &self.authentication,
@@ -118,6 +126,59 @@ impl RestCommitTransport {
             table.name
         )
     }
+}
+
+fn atomic_requirements(
+    mut requirements: Vec<TableRequirement>,
+    expected: AtomicTableRequirements,
+) -> iceberg::Result<Vec<TableRequirement>> {
+    let required = [
+        TableRequirement::UuidMatch {
+            uuid: expected.table_uuid,
+        },
+        TableRequirement::CurrentSchemaIdMatch {
+            current_schema_id: expected.schema_id,
+        },
+        TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: expected.partition_spec_id,
+        },
+        TableRequirement::DefaultSortOrderIdMatch {
+            default_sort_order_id: expected.sort_order_id,
+        },
+    ];
+    for requirement in required {
+        if requirements.iter().any(|existing| {
+            same_requirement_kind(existing, &requirement) && existing != &requirement
+        }) {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST commit contains a conflicting atomic table requirement",
+            ));
+        }
+        if !requirements.contains(&requirement) {
+            requirements.push(requirement);
+        }
+    }
+    Ok(requirements)
+}
+
+fn same_requirement_kind(left: &TableRequirement, right: &TableRequirement) -> bool {
+    matches!(
+        (left, right),
+        (
+            TableRequirement::UuidMatch { .. },
+            TableRequirement::UuidMatch { .. }
+        ) | (
+            TableRequirement::CurrentSchemaIdMatch { .. },
+            TableRequirement::CurrentSchemaIdMatch { .. }
+        ) | (
+            TableRequirement::DefaultSpecIdMatch { .. },
+            TableRequirement::DefaultSpecIdMatch { .. }
+        ) | (
+            TableRequirement::DefaultSortOrderIdMatch { .. },
+            TableRequirement::DefaultSortOrderIdMatch { .. }
+        )
+    )
 }
 
 fn classify_dispatch_error(error: &delta_reqwest::Error) -> Error {
@@ -292,5 +353,46 @@ impl Catalog for RestCatalogFacade {
             Some(transport) => transport.update_table(commit, inner.as_ref()).await,
             None => inner.update_table(commit).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_requirements_reject_conflicting_layout_binding() {
+        let expected = AtomicTableRequirements {
+            table_uuid: uuid::Uuid::now_v7(),
+            schema_id: 7,
+            partition_spec_id: 11,
+            sort_order_id: 13,
+        };
+        let error = atomic_requirements(
+            vec![TableRequirement::CurrentSchemaIdMatch {
+                current_schema_id: expected.schema_id + 1,
+            }],
+            expected,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn atomic_requirements_do_not_duplicate_matching_binding() {
+        let expected = AtomicTableRequirements {
+            table_uuid: uuid::Uuid::now_v7(),
+            schema_id: 7,
+            partition_spec_id: 11,
+            sort_order_id: 13,
+        };
+        let requirements = atomic_requirements(
+            vec![TableRequirement::UuidMatch {
+                uuid: expected.table_uuid,
+            }],
+            expected,
+        )
+        .unwrap();
+        assert_eq!(requirements.len(), 4);
     }
 }
