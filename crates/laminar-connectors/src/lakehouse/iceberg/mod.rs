@@ -236,7 +236,7 @@ impl IcebergSink {
         self.metrics.set_buffer(0, 0);
         self.metrics.set_active_writers(0);
         if let Some(writer) = writer {
-            let _ = writer.close().await?;
+            writer.abort().await?;
         }
         Ok(())
     }

@@ -5,6 +5,7 @@ use crate::error::ConnectorError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IcebergFaultPoint {
+    BeforePartitionWrite,
     BeforeFileClose,
     AfterFileClose,
     AfterDescriptor,

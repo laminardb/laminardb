@@ -78,6 +78,7 @@ pub(super) struct IcebergEpochWriter {
     use_clock: u64,
     rows: u64,
     bytes: u64,
+    poisoned: bool,
     metrics: IcebergMetrics,
 }
 
@@ -143,11 +144,15 @@ impl IcebergEpochWriter {
             use_clock: 0,
             rows: 0,
             bytes: 0,
+            poisoned: false,
             metrics,
         })
     }
 
     pub(super) async fn write(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        if self.poisoned {
+            return Err(poisoned_epoch_error());
+        }
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -179,6 +184,13 @@ impl IcebergEpochWriter {
         let bytes = u64::try_from(batch.get_array_memory_size()).map_err(|_| {
             ConnectorError::WriteError("Iceberg batch byte count exceeds u64".into())
         })?;
+        let total_rows = self
+            .rows
+            .checked_add(rows)
+            .ok_or_else(|| ConnectorError::WriteError("Iceberg epoch row count overflow".into()))?;
+        let total_bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
+            ConnectorError::WriteError("Iceberg epoch byte count overflow".into())
+        })?;
         let mut partitions = match &self.splitter {
             Some(splitter) => splitter
                 .split(&batch)
@@ -196,19 +208,27 @@ impl IcebergEpochWriter {
         partitions.sort_by(|left, right| left.0.cmp(&right.0));
         let rotation_cutoff = Instant::now();
         self.preflight_batch(&partitions, rotation_cutoff)?;
-        self.close_expired_partitions(rotation_cutoff).await?;
+        let write_result = self.write_partitions(partitions, rotation_cutoff).await;
+        if write_result.is_err() {
+            self.poisoned = true;
+        }
+        write_result?;
 
+        self.rows = total_rows;
+        self.bytes = total_bytes;
+        Ok(())
+    }
+
+    async fn write_partitions(
+        &mut self,
+        partitions: Vec<PartitionBatch>,
+        rotation_cutoff: Instant,
+    ) -> Result<(), ConnectorError> {
+        self.close_expired_partitions(rotation_cutoff).await?;
         for (key, partition, partition_batch) in partitions {
             self.write_partition(key, partition, partition_batch)
                 .await?;
         }
-        self.rows = self
-            .rows
-            .checked_add(rows)
-            .ok_or_else(|| ConnectorError::WriteError("Iceberg epoch row count overflow".into()))?;
-        self.bytes = self.bytes.checked_add(bytes).ok_or_else(|| {
-            ConnectorError::WriteError("Iceberg epoch byte count overflow".into())
-        })?;
         Ok(())
     }
 
@@ -239,6 +259,10 @@ impl IcebergEpochWriter {
             self.file_count = next;
         }
         active.last_used = self.use_clock;
+        #[cfg(test)]
+        super::fault_injection::fail_if(
+            super::fault_injection::IcebergFaultPoint::BeforePartitionWrite,
+        )?;
         active
             .writer
             .write(batch)
@@ -447,6 +471,7 @@ impl IcebergEpochWriter {
         let Some(mut active) = self.active.remove(key) else {
             return Ok(());
         };
+        self.metrics.set_active_writers(self.active.len());
         #[cfg(test)]
         super::fault_injection::fail_if(
             super::fault_injection::IcebergFaultPoint::BeforeFileClose,
@@ -470,16 +495,22 @@ impl IcebergEpochWriter {
         self.metrics
             .observe_files(&files, self.target_file_size_bytes);
         self.completed.extend(files);
-        self.metrics.set_active_writers(self.active.len());
         Ok(())
     }
 
     pub(super) async fn close(mut self) -> Result<EpochOutput, ConnectorError> {
-        let mut keys = self.active.keys().cloned().collect::<Vec<_>>();
-        keys.sort_unstable();
-        for key in keys {
-            self.close_partition(&key).await?;
+        let poisoned = self.poisoned;
+        let close_result = self.close_all_partitions().await;
+        if poisoned {
+            return match close_result {
+                Ok(()) => Err(poisoned_epoch_error()),
+                Err(error) => Err(ConnectorError::WriteError(format!(
+                    "{}; writer cleanup also failed: {error}",
+                    poisoned_epoch_message()
+                ))),
+            };
         }
+        close_result?;
         if self.completed.len() != self.file_count || self.completed.len() > self.max_files {
             return Err(ConnectorError::Internal(format!(
                 "Iceberg file accounting mismatch: predicted {}, completed {}",
@@ -493,6 +524,37 @@ impl IcebergEpochWriter {
             bytes: self.bytes,
         })
     }
+
+    pub(super) async fn abort(mut self) -> Result<(), ConnectorError> {
+        self.close_all_partitions().await
+    }
+
+    async fn close_all_partitions(&mut self) -> Result<(), ConnectorError> {
+        let mut keys = self.active.keys().cloned().collect::<Vec<_>>();
+        keys.sort_unstable();
+        let mut errors = Vec::new();
+        for key in keys {
+            if let Err(error) = self.close_partition(&key).await {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ConnectorError::WriteError(format!(
+                "Iceberg writer close failed: {}",
+                errors.join("; ")
+            )))
+        }
+    }
+}
+
+const fn poisoned_epoch_message() -> &'static str {
+    "[LDB-ICEBERG-EPOCH-POISONED] Iceberg epoch contains a failed write and cannot be published"
+}
+
+fn poisoned_epoch_error() -> ConnectorError {
+    ConnectorError::WriteError(poisoned_epoch_message().into())
 }
 
 fn add_file_start(current: usize, starts_file: bool) -> Result<usize, ConnectorError> {

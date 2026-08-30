@@ -41,16 +41,22 @@ fn commit_batch(checkpoint_id: u64, descriptor: Vec<u8>) -> CoordinatedCommitBat
     }
 }
 
-fn coordinated_sink(fixture: &TestTable, table: iceberg::table::Table) -> IcebergSink {
+fn configured_sink(
+    fixture: &TestTable,
+    table: iceberg::table::Table,
+    delivery_guarantee: DeliveryGuarantee,
+) -> IcebergSink {
     let mut config = fixture.config.clone();
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    config.delivery_guarantee = delivery_guarantee;
     let mut sink = IcebergSink::new(config, None);
-    sink.bind_runtime_context(SinkRuntimeContext {
-        deployment_id: DEPLOYMENT_ID.into(),
-        sink_id: SINK_ID.into(),
-        participant_id: 1,
-    })
-    .unwrap();
+    if delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        sink.bind_runtime_context(SinkRuntimeContext {
+            deployment_id: DEPLOYMENT_ID.into(),
+            sink_id: SINK_ID.into(),
+            participant_id: 1,
+        })
+        .unwrap();
+    }
     let schema =
         Arc::new(iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).unwrap());
     sink.schema = Some(Arc::clone(&schema));
@@ -67,6 +73,10 @@ fn coordinated_sink(fixture: &TestTable, table: iceberg::table::Table) -> Iceber
     sink.table = Some(table);
     sink.state = ConnectorState::Running;
     sink
+}
+
+fn coordinated_sink(fixture: &TestTable, table: iceberg::table::Table) -> IcebergSink {
+    configured_sink(fixture, table, DeliveryGuarantee::ExactlyOnce)
 }
 
 async fn descriptor(sink: &mut IcebergSink, fixture: &TestTable, epoch: u64) -> Vec<u8> {
@@ -138,6 +148,43 @@ async fn precommit_fault_boundaries_leave_no_snapshot_and_restart_replays_safely
         assert_eq!(table.metadata().snapshots().count(), 1, "point={point:?}");
         assert_eq!(table_row_count(&table).await, 2, "point={point:?}");
     }
+}
+
+#[tokio::test]
+async fn partial_partition_write_cannot_be_published_by_direct_flush() {
+    let fixture = create_test_table(true).await;
+    let mut sink = configured_sink(
+        &fixture,
+        fixture.table.clone(),
+        DeliveryGuarantee::AtLeastOnce,
+    );
+    let error = scope(
+        [IcebergFault::on_occurrence(
+            IcebergFaultPoint::BeforePartitionWrite,
+            2,
+        )],
+        sink.write_batch(&record_batch(
+            &fixture.table,
+            &[(1, Some("a")), (2, Some("b"))],
+        )),
+    )
+    .await
+    .expect_err("the second partition write must fail after the first mutates its writer");
+    assert!(error.to_string().contains("LDB-ICEBERG-FAULT-INJECTION"));
+
+    let retry = sink
+        .write_batch(&record_batch(&fixture.table, &[(3, Some("c"))]))
+        .await
+        .expect_err("a partially written epoch must remain poisoned");
+    assert!(retry.to_string().contains("LDB-ICEBERG-EPOCH-POISONED"));
+    let flush = sink
+        .flush()
+        .await
+        .expect_err("direct flush must not publish a partially written epoch");
+    assert!(flush.to_string().contains("LDB-ICEBERG-EPOCH-POISONED"));
+
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 0);
 }
 
 #[tokio::test]
