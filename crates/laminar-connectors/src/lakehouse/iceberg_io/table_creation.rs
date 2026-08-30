@@ -1,4 +1,4 @@
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, FieldRef, Fields, SchemaRef};
 use iceberg::spec::{
     FormatVersion, NullOrder, PartitionSpec, Schema, SortDirection, SortField, SortOrder, Transform,
 };
@@ -34,10 +34,12 @@ fn table_schema(
     config: &IcebergSinkConfig,
     arrow_schema: &SchemaRef,
 ) -> Result<Schema, ConnectorError> {
-    let schema =
-        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema).map_err(|error| {
-            ConnectorError::SchemaMismatch(format!("arrow to Iceberg schema: {error}"))
-        })?;
+    let schema = if fields_contain_ids(arrow_schema.fields()) {
+        iceberg::arrow::arrow_schema_to_schema(arrow_schema)
+    } else {
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema)
+    }
+    .map_err(|error| ConnectorError::SchemaMismatch(format!("arrow to Iceberg schema: {error}")))?;
     if config.identifier_fields.is_empty() {
         return Ok(schema);
     }
@@ -61,6 +63,24 @@ fn table_schema(
         .map_err(|error| {
             ConnectorError::SchemaMismatch(format!("invalid Iceberg identifier fields: {error}"))
         })
+}
+
+fn fields_contain_ids(fields: &Fields) -> bool {
+    fields.iter().any(field_contains_id)
+}
+
+fn field_contains_id(field: &FieldRef) -> bool {
+    field
+        .metadata()
+        .contains_key(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+        || match field.data_type() {
+            DataType::Struct(fields) => fields_contain_ids(fields),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => field_contains_id(field),
+            _ => false,
+        }
 }
 
 fn partition_spec(
@@ -176,6 +196,7 @@ fn null_order(value: IcebergNullOrder) -> NullOrder {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
@@ -267,6 +288,48 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("payload", DataType::Utf8, true),
         ]));
+
+        assert!(matches!(
+            build_table_creation(&config, &schema).unwrap_err(),
+            ConnectorError::SchemaMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn table_creation_preserves_complete_nested_field_ids() {
+        let mut config = advanced_config();
+        config.identifier_fields.clear();
+        config.partition_spec.clear();
+        config.sort_order.clear();
+        let field_id = |id: i32| {
+            HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                id.to_string(),
+            )])
+        };
+        let nested = Field::new("value", DataType::Utf8, true).with_metadata(field_id(42));
+        let payload = Field::new("payload", DataType::Struct(vec![nested].into()), true)
+            .with_metadata(field_id(10));
+        let schema = Arc::new(ArrowSchema::new(vec![payload]));
+
+        let creation = build_table_creation(&config, &schema).unwrap();
+        assert_eq!(creation.schema.field_id_by_name("payload"), Some(10));
+        assert_eq!(creation.schema.field_id_by_name("payload.value"), Some(42));
+    }
+
+    #[test]
+    fn partial_nested_field_ids_fail_instead_of_being_reassigned() {
+        let mut config = advanced_config();
+        config.identifier_fields.clear();
+        config.partition_spec.clear();
+        config.sort_order.clear();
+        let nested = Field::new("value", DataType::Utf8, true);
+        let payload = Field::new("payload", DataType::Struct(vec![nested].into()), true)
+            .with_metadata(HashMap::from([(
+                parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+                "10".into(),
+            )]));
+        let schema = Arc::new(ArrowSchema::new(vec![payload]));
 
         assert!(matches!(
             build_table_creation(&config, &schema).unwrap_err(),
