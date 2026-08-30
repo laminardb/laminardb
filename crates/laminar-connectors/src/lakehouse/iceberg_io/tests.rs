@@ -67,8 +67,7 @@ fn unknown_warehouse_scheme_is_not_echoed() {
         "https://catalog-user:do-not-echo@warehouse.test/root?token=do-not-echo",
         &storage_config(None),
     )
-    .err()
-    .expect("an unknown warehouse scheme must require storage.type")
+    .expect_err("an unknown warehouse scheme must require storage.type")
     .to_string();
     assert!(error.contains("LDB-5100"));
     assert!(!error.contains("do-not-echo"));
