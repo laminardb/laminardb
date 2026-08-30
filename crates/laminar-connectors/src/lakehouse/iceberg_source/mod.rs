@@ -48,6 +48,9 @@ use read_schema::ReadSchemaBinding;
 pub use cursor::{IcebergSourceCursorOriginV1, IcebergSourceCursorV1};
 
 #[cfg(feature = "iceberg-core")]
+const PARTIAL_SCAN_ERROR: &str = "[LDB-ICEBERG-PARTIAL-SCAN] Iceberg scan failed after partial snapshot emission; recovery from the last durable cursor is required";
+
+#[cfg(feature = "iceberg-core")]
 struct PendingBatch {
     batch: RecordBatch,
     completed_cursor: Option<IcebergSourceCursorV1>,
@@ -430,25 +433,35 @@ impl IcebergSource {
     }
 
     #[cfg(feature = "iceberg-core")]
+    fn fail_partial_scan(&mut self) -> ConnectorError {
+        self.state = ConnectorState::Failed;
+        ConnectorError::TransactionError(PARTIAL_SCAN_ERROR.into())
+    }
+
+    #[cfg(feature = "iceberg-core")]
     async fn next_scan_output(&mut self) -> Result<Option<ScanOutput>, ConnectorError> {
         let result = match self.scan.as_mut() {
             Some(scan) => scan.receiver.recv().await,
             None => return Ok(None),
         };
         if let Some(result) = result {
-            if result.is_err() {
-                self.scan_failed = true;
-            }
             match result {
-                Err(_) if self.replay_unit_in_progress => Err(ConnectorError::TransactionError(
-                    "[LDB-ICEBERG-PARTIAL-SCAN] Iceberg scan failed after partial snapshot emission; recovery from the last durable cursor is required"
-                        .into(),
-                )),
-                result => result.map(Some),
+                Err(error) => {
+                    self.scan_failed = true;
+                    if self.replay_unit_in_progress {
+                        Err(self.fail_partial_scan())
+                    } else {
+                        Err(error)
+                    }
+                }
+                Ok(output) => Ok(Some(output)),
             }
         } else {
-            self.finish_scan().await?;
-            Ok(None)
+            match self.finish_scan().await {
+                Ok(()) => Ok(None),
+                Err(_) if self.replay_unit_in_progress => Err(self.fail_partial_scan()),
+                Err(error) => Err(error),
+            }
         }
     }
 }
@@ -578,6 +591,16 @@ impl SourceConnector for IcebergSource {
         }
         #[cfg(feature = "iceberg-core")]
         {
+            if self.state == ConnectorState::Failed {
+                return if self.replay_unit_in_progress {
+                    Err(ConnectorError::TransactionError(PARTIAL_SCAN_ERROR.into()))
+                } else {
+                    Err(ConnectorError::InvalidState {
+                        expected: "Running".into(),
+                        actual: self.state.to_string(),
+                    })
+                };
+            }
             loop {
                 if let Some(batch) = self.emit_pending(max_records)? {
                     return Ok(Some(batch));

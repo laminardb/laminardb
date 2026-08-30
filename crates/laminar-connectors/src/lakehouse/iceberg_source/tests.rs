@@ -228,11 +228,43 @@ async fn scan_failures_cannot_complete_or_retry_a_partial_replay_unit() {
     assert!(!before_output.bounded_snapshot_complete);
 
     let mut after_output = IcebergSource::new(test_source_config(), None);
+    after_output.state = ConnectorState::Running;
     after_output.replay_unit_in_progress = true;
     let error = failed_scan(&mut after_output).await;
     assert!(error.to_string().contains("LDB-ICEBERG-PARTIAL-SCAN"));
     assert!(!error.is_transient());
+    assert_eq!(after_output.state, ConnectorState::Failed);
+    assert!(after_output.try_checkpoint().unwrap().is_none());
+
+    let retry = after_output.poll_batch(1).await.unwrap_err();
+    assert!(retry.to_string().contains("LDB-ICEBERG-PARTIAL-SCAN"));
+    assert!(!retry.is_transient());
+    assert!(after_output.scan.is_some());
     after_output.close().await.unwrap();
+
+    let mut after_output_join_failure = IcebergSource::new(test_source_config(), None);
+    after_output_join_failure.state = ConnectorState::Running;
+    after_output_join_failure.replay_unit_in_progress = true;
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    drop(sender);
+    let handle = tokio::spawn(std::future::pending());
+    handle.abort();
+    after_output_join_failure.scan = Some(ScanTask {
+        receiver,
+        handle,
+        started_at: Instant::now(),
+    });
+
+    let error = match after_output_join_failure.next_scan_output().await {
+        Err(error) => error,
+        Ok(_) => panic!("cancelled scan task was not reported"),
+    };
+    assert!(error.to_string().contains("LDB-ICEBERG-PARTIAL-SCAN"));
+    assert_eq!(after_output_join_failure.state, ConnectorState::Failed);
+    assert!(after_output_join_failure
+        .try_checkpoint()
+        .unwrap()
+        .is_none());
 }
 
 #[cfg(feature = "iceberg-core")]
