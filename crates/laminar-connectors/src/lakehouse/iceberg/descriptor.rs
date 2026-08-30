@@ -257,6 +257,7 @@ impl IcebergCommitDescriptorV1 {
                 "decode Iceberg descriptor data files: {error}"
             ))
         })?;
+        validate_data_file_record_count(&encoded, self.files.len())?;
         let mut reader = encoded.as_slice();
         let mut data_files = iceberg::spec::read_data_files_from_avro(
             &mut reader,
@@ -318,6 +319,60 @@ impl IcebergCommitDescriptorV1 {
         }
         Ok(data_files)
     }
+}
+
+fn validate_data_file_record_count(encoded: &[u8], expected: usize) -> Result<(), ConnectorError> {
+    validate_data_file_avro_codec(encoded)?;
+    let mut reader = apache_avro::Reader::new(encoded).map_err(|_| {
+        ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DESCRIPTOR-AVRO] Iceberg descriptor data files are not valid Avro".into(),
+        )
+    })?;
+    for _ in 0..expected {
+        match reader.next() {
+            Some(Ok(_)) => {}
+            Some(Err(_)) => return Err(invalid_data_file_avro()),
+            None => return Err(data_file_count_error()),
+        }
+    }
+    match reader.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(data_file_count_error()),
+        Some(Err(_)) => Err(invalid_data_file_avro()),
+    }
+}
+
+fn validate_data_file_avro_codec(encoded: &[u8]) -> Result<(), ConnectorError> {
+    let mut header = encoded
+        .strip_prefix(b"Obj\x01")
+        .ok_or_else(invalid_data_file_avro)?;
+    let metadata_schema = apache_avro::Schema::map(apache_avro::Schema::Bytes);
+    let metadata = apache_avro::from_avro_datum(&metadata_schema, &mut header, None)
+        .map_err(|_| invalid_data_file_avro())?;
+    let AvroValue::Map(metadata) = metadata else {
+        return Err(invalid_data_file_avro());
+    };
+    let codec = metadata.get("avro.codec");
+    if matches!(codec, Some(AvroValue::Bytes(value)) if value == b"null") {
+        return Ok(());
+    }
+    Err(ConnectorError::TransactionError(
+        "[LDB-ICEBERG-DESCRIPTOR-AVRO-CODEC] Iceberg descriptor data files must use the uncompressed canonical Avro codec"
+            .into(),
+    ))
+}
+
+fn invalid_data_file_avro() -> ConnectorError {
+    ConnectorError::TransactionError(
+        "[LDB-ICEBERG-DESCRIPTOR-AVRO] Iceberg descriptor data files are not valid Avro".into(),
+    )
+}
+
+fn data_file_count_error() -> ConnectorError {
+    ConnectorError::TransactionError(
+        "[LDB-ICEBERG-DESCRIPTOR-FILE-COUNT] Iceberg descriptor Avro record count does not match its bounded envelope"
+            .into(),
+    )
 }
 
 fn validate_descriptor_data_file(
@@ -684,6 +739,43 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn descriptor_avro_count_is_checked_before_bulk_decode() {
+        let encoded = canonical_payload(&[data_file("a"), data_file("b")]);
+        validate_data_file_record_count(&encoded, 2).unwrap();
+        for expected in [0, 1, 3] {
+            let error = validate_data_file_record_count(&encoded, expected)
+                .expect_err("mismatched Avro record count must fail")
+                .to_string();
+            assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-FILE-COUNT"));
+        }
+    }
+
+    #[test]
+    fn compressed_descriptor_avro_is_rejected_before_decode() {
+        let generated = canonical_payload(&[data_file("a")]);
+        let mut reader = apache_avro::Reader::new(generated.as_slice()).unwrap();
+        let schema = reader.writer_schema().clone();
+        let values = reader.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+        let mut compressed = Vec::new();
+        {
+            let mut writer = apache_avro::Writer::with_codec(
+                &schema,
+                &mut compressed,
+                apache_avro::Codec::Deflate(Default::default()),
+            );
+            for value in values {
+                writer.append(value).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let error = validate_data_file_record_count(&compressed, 1)
+            .expect_err("compressed descriptor Avro must fail closed")
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-AVRO-CODEC"));
     }
 
     #[tokio::test]
