@@ -8,10 +8,11 @@ use laminar_connectors::connector::{
     ConnectorCancellationPolicy, CoordinatedCommitBatch, CoordinatedCommitContext,
     CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter, SinkConnector,
     SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::checkpoint::{
-    checkpoint_descriptor_sha256, CheckpointAttempt, CheckpointManifest,
+    checkpoint_descriptor_sha256, ByteRange, CheckpointAttempt, CheckpointManifest,
     ObjectStoreCheckpointStore, PipelineIdentity, PreparedSinkDescriptor,
     PREPARED_SINK_DESCRIPTOR_VERSION,
 };
@@ -19,6 +20,48 @@ use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
 
 use super::*;
+
+fn descriptor_manifest(participant_id: u64, payload_length: u64) -> CheckpointManifest {
+    let mut manifest =
+        CheckpointManifest::new_with_key_group_count(1, 1, KeyGroupCount::try_from(1_u16).unwrap());
+    manifest.bind_participant(participant_id);
+    manifest.prepared_sinks.push(PreparedSinkDescriptor {
+        sink_name: "sink".into(),
+        format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+        payload: Some(ByteRange {
+            offset: 0,
+            length: payload_length,
+        }),
+        sha256: checkpoint_descriptor_sha256(Some(&[])),
+    });
+    manifest
+}
+
+#[test]
+fn external_sink_descriptor_bounds_precede_object_reads() {
+    let oversized = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES).unwrap() + 1;
+    let manifest = descriptor_manifest(1, oversized);
+    let error = sink_commit::validated_external_sink_descriptors("sink", &[&manifest]).unwrap_err();
+    assert!(error.to_string().contains("descriptor exceeds"));
+
+    let per_participant = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES).unwrap();
+    let manifests = (1..=5)
+        .map(|participant| descriptor_manifest(participant, per_participant))
+        .collect::<Vec<_>>();
+    assert!(
+        per_participant * u64::try_from(manifests.len()).unwrap()
+            > u64::try_from(MAX_COORDINATED_COMMIT_BATCH_BYTES).unwrap()
+    );
+    let references = manifests.iter().collect::<Vec<_>>();
+    assert_eq!(
+        sink_commit::validated_external_sink_descriptors("sink", &references[..4])
+            .unwrap()
+            .len(),
+        4
+    );
+    let error = sink_commit::validated_external_sink_descriptors("sink", &references).unwrap_err();
+    assert!(error.to_string().contains("aggregate bytes"));
+}
 
 struct BarrierCommitSink {
     barrier: Arc<tokio::sync::Barrier>,

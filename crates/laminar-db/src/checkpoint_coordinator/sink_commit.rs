@@ -1,7 +1,8 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use laminar_connectors::connector::{
     CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
-    CoordinatedCommitPayload,
+    CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+    MAX_COORDINATED_COMMIT_BATCH_ENTRIES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_core::checkpoint::{CheckpointAttempt, CheckpointManifest, PipelineIdentity};
 
@@ -213,19 +214,9 @@ impl CheckpointCoordinator {
         manifests: &[&CheckpointManifest],
         deadline: tokio::time::Instant,
     ) -> Result<Vec<CoordinatedCommitPayload>, DbError> {
-        let mut entries = Vec::with_capacity(manifests.len());
-        for manifest in manifests {
-            let descriptor = manifest
-                .prepared_sinks
-                .binary_search_by(|descriptor| descriptor.sink_name.cmp(&sink.name))
-                .ok()
-                .map(|index| &manifest.prepared_sinks[index])
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "participant {} has no prepared descriptor for sink '{}'",
-                        manifest.participant_id, sink.name
-                    ))
-                })?;
+        let descriptors = validated_external_sink_descriptors(&sink.name, manifests)?;
+        let mut entries = Vec::with_capacity(descriptors.len());
+        for (manifest, descriptor) in descriptors {
             let payload = tokio::time::timeout_at(
                 deadline,
                 self.store
@@ -249,4 +240,58 @@ impl CheckpointCoordinator {
         entries.sort_unstable_by_key(|entry| entry.participant_id);
         Ok(entries)
     }
+}
+
+pub(super) fn validated_external_sink_descriptors<'a>(
+    sink_name: &str,
+    manifests: &[&'a CheckpointManifest],
+) -> Result<
+    Vec<(
+        &'a CheckpointManifest,
+        &'a laminar_core::checkpoint::PreparedSinkDescriptor,
+    )>,
+    DbError,
+> {
+    if manifests.is_empty() || manifests.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
+        return Err(DbError::Checkpoint(format!(
+            "sink '{sink_name}' participant count must be in 1..={MAX_COORDINATED_COMMIT_BATCH_ENTRIES}"
+        )));
+    }
+    let per_entry_limit = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES)
+        .map_err(|_| DbError::Checkpoint("external sink payload limit exceeds u64".into()))?;
+    let aggregate_limit = u64::try_from(MAX_COORDINATED_COMMIT_BATCH_BYTES)
+        .map_err(|_| DbError::Checkpoint("external sink aggregate limit exceeds u64".into()))?;
+    let mut aggregate_bytes = 0_u64;
+    let mut descriptors = Vec::with_capacity(manifests.len());
+    for &manifest in manifests {
+        let descriptor = manifest
+            .prepared_sinks
+            .binary_search_by(|descriptor| descriptor.sink_name.as_str().cmp(sink_name))
+            .ok()
+            .map(|index| &manifest.prepared_sinks[index])
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "participant {} has no prepared descriptor for sink '{sink_name}'",
+                    manifest.participant_id
+                ))
+            })?;
+        if let Some(payload) = descriptor.payload {
+            if payload.length > per_entry_limit {
+                return Err(DbError::Checkpoint(format!(
+                    "sink '{sink_name}' participant {} descriptor exceeds {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} bytes",
+                    manifest.participant_id
+                )));
+            }
+            aggregate_bytes = aggregate_bytes
+                .checked_add(payload.length)
+                .ok_or_else(|| DbError::Checkpoint("external sink payload byte overflow".into()))?;
+            if aggregate_bytes > aggregate_limit {
+                return Err(DbError::Checkpoint(format!(
+                    "sink '{sink_name}' descriptors exceed {MAX_COORDINATED_COMMIT_BATCH_BYTES} aggregate bytes"
+                )));
+            }
+        }
+        descriptors.push((manifest, descriptor));
+    }
+    Ok(descriptors)
 }
