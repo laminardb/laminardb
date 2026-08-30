@@ -300,12 +300,50 @@ fn collect_added_files(
             )));
         }
         if !paths.insert(entry.file_path().to_string()) {
-            return Err(ConnectorError::TransactionError(format!(
-                "Iceberg publication snapshot repeats data file '{}'",
-                entry.file_path()
-            )));
+            return Err(ConnectorError::TransactionError(
+                "[LDB-ICEBERG-PUBLICATION-DUPLICATE-FILE] Iceberg publication snapshot repeats a data file"
+                    .into(),
+            ));
         }
         files.push(entry.data_file().clone());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use iceberg::spec::{DataFileBuilder, DataFileFormat, ManifestEntry, ManifestStatus, Struct};
+
+    use super::*;
+
+    #[test]
+    fn duplicate_manifest_paths_are_not_echoed() {
+        let secret_path =
+            "s3://catalog-user:do-not-echo@bucket/data.parquet?X-Amz-Signature=do-not-echo";
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path(secret_path.into())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .record_count(1)
+            .file_size_in_bytes(12)
+            .build()
+            .unwrap();
+        let entry = Arc::new(
+            ManifestEntry::builder()
+                .status(ManifestStatus::Added)
+                .snapshot_id(7)
+                .data_file(file)
+                .build(),
+        );
+        let mut paths = HashSet::new();
+        let mut files = Vec::new();
+        let error = collect_added_files(7, &[Arc::clone(&entry), entry], &mut paths, &mut files)
+            .expect_err("duplicate manifest paths must fail")
+            .to_string();
+
+        assert!(error.contains("LDB-ICEBERG-PUBLICATION-DUPLICATE-FILE"));
+        assert!(!error.contains("do-not-echo"));
+        assert!(!error.contains("catalog-user"));
+    }
 }

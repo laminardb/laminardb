@@ -108,10 +108,10 @@ fn storage_factory(
         .storage_type
         .or_else(|| infer_storage_type(warehouse))
         .ok_or_else(|| {
-            ConnectorError::ConfigurationError(format!(
-                "[LDB-5100] cannot infer storage backend from warehouse '{warehouse}'; \
-                 set storage.type explicitly"
-            ))
+            ConnectorError::ConfigurationError(
+                "[LDB-5100] cannot infer storage backend from catalog warehouse; set storage.type explicitly"
+                    .into(),
+            )
         })?;
 
     match storage_type {

@@ -61,6 +61,21 @@ fn credential_bearing_catalog_locations_are_rejected_without_echoing() {
 }
 
 #[test]
+#[cfg(feature = "iceberg-storage-s3")]
+fn unknown_warehouse_scheme_is_not_echoed() {
+    let error = storage_factory(
+        "https://catalog-user:do-not-echo@warehouse.test/root?token=do-not-echo",
+        &storage_config(None),
+    )
+    .err()
+    .expect("an unknown warehouse scheme must require storage.type")
+    .to_string();
+    assert!(error.contains("LDB-5100"));
+    assert!(!error.contains("do-not-echo"));
+    assert!(!error.contains("catalog-user"));
+}
+
+#[test]
 fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
     let source = iceberg::Error::new(
         iceberg::ErrorKind::CatalogCommitConflicts,
