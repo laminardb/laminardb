@@ -600,10 +600,7 @@ impl SinkConnector for IcebergSink {
     }
 
     fn suggested_write_timeout(&self) -> Duration {
-        self.config
-            .catalog
-            .commit_timeout
-            .min(self.config.storage.request_timeout)
+        self.config.catalog.commit_timeout
     }
 
     fn flush_interval(&self) -> Duration {

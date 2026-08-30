@@ -49,7 +49,17 @@ fn append_contract_is_at_least_once_by_default() {
     assert_eq!(contract.topology, SinkTopology::MultiWriter);
     assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
     assert!(sink.as_coordinated_committer().is_none());
-    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(120));
+}
+
+#[test]
+fn commit_timeout_is_not_capped_by_the_per_request_timeout() {
+    let mut connector = test_connector_config();
+    connector.set("catalog.commit_timeout", "75s");
+    connector.set("storage.request_timeout", "2s");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(75));
 }
 
 #[cfg(feature = "iceberg-core")]

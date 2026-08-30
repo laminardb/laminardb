@@ -33,11 +33,7 @@ pub(super) async fn publish_direct_append(
     data_files: Vec<DataFile>,
     metrics: &IcebergMetrics,
 ) -> Result<Table, ConnectorError> {
-    let timeout = config
-        .catalog
-        .commit_timeout
-        .min(config.storage.request_timeout);
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + config.catalog.commit_timeout;
     let mut current = load_current_table(config, catalog, deadline).await?;
 
     for attempt in 0..MAX_DIRECT_APPEND_ATTEMPTS {
