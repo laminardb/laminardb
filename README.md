@@ -148,8 +148,10 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 
 > [!IMPORTANT]
 > Cluster exactly-once is admitted only for exact-certified sources and a cluster-certified,
-> checkpoint-committable sink. The current admitted path is Kafka input to direct S3/S3A
-> append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
+> checkpoint-committable sink. Current admitted compositions use Kafka input with either direct
+> S3/S3A append-mode Delta Lake or coordinated append-mode Iceberg through a REST catalog and
+> direct S3/S3A storage. Iceberg catalog authentication is limited to none or a static bearer token.
+> Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
 > before connector I/O.
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
 > object-store-only checkpoint durability. The strict three-node cluster at-least-once fault profile
