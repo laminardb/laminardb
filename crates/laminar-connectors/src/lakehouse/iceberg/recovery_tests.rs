@@ -184,6 +184,16 @@ fn commit_context() -> CoordinatedCommitContext {
     CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10))
 }
 
+async fn cleanup_aborted(
+    sink: &IcebergSink,
+    batch: CoordinatedAbortBatch,
+) -> Result<(), ConnectorError> {
+    sink.coordinated_abort_cleaner()
+        .expect("coordinated Iceberg sink must expose its detached abort cleaner")
+        .cleanup_aborted(batch, commit_context())
+        .await
+}
+
 #[tokio::test]
 async fn epoch_artifact_intent_is_deterministic_and_debug_redacted() {
     let fixture = create_test_table(false).await;
@@ -262,12 +272,10 @@ async fn restarted_abort_cleanup_uses_the_durable_descriptor_and_is_idempotent()
 
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     let restarted = coordinated_sink(&fixture, current);
-    restarted
-        .cleanup_aborted(abort_batch(1, payload.clone()), commit_context())
+    cleanup_aborted(&restarted, abort_batch(1, payload.clone()))
         .await
         .unwrap();
-    restarted
-        .cleanup_aborted(abort_batch(1, payload), commit_context())
+    cleanup_aborted(&restarted, abort_batch(1, payload))
         .await
         .unwrap();
 
@@ -292,8 +300,7 @@ async fn abort_cleanup_never_deletes_a_file_with_published_checkpoint_evidence()
         .await
         .unwrap();
 
-    let error = sink
-        .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
+    let error = cleanup_aborted(&sink, open_abort_batch(1, Some(intent)))
         .await
         .expect_err("published checkpoint evidence must fence cleanup");
 
@@ -686,8 +693,7 @@ async fn durable_intent_cleans_pre_descriptor_files_after_process_loss() {
         drop(failed);
 
         let restarted = coordinated_sink(&fixture, fixture.table.clone());
-        restarted
-            .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
+        cleanup_aborted(&restarted, open_abort_batch(1, Some(intent)))
             .await
             .unwrap();
         for path in &paths {
@@ -724,8 +730,7 @@ async fn open_abort_without_durable_intent_fails_before_file_deletion() {
     drop(failed);
 
     let restarted = coordinated_sink(&fixture, fixture.table.clone());
-    let error = restarted
-        .cleanup_aborted(open_abort_batch(1, None), commit_context())
+    let error = cleanup_aborted(&restarted, open_abort_batch(1, None))
         .await
         .expect_err("open cleanup without durable intent must fail closed");
     assert!(error
@@ -733,8 +738,7 @@ async fn open_abort_without_durable_intent_fails_before_file_deletion() {
         .contains("LDB-ICEBERG-EPOCH-INTENT-MISSING"));
     assert!(fixture.table.file_io().exists(&paths[0]).await.unwrap());
 
-    restarted
-        .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
+    cleanup_aborted(&restarted, open_abort_batch(1, Some(intent)))
         .await
         .unwrap();
     assert!(!fixture.table.file_io().exists(&paths[0]).await.unwrap());

@@ -74,7 +74,6 @@ impl Node {
             .arg(&self.config_path)
             .env(S3_SECRET_ENV, S3_SECRET_KEY)
             .env("LAMINAR_EXTERNAL_SINK_COMMIT_GATE_FILE", &self.gate_path)
-            .env("LAMINAR_SOAK_ALLOW_S3_EMULATOR", "1")
             .env(
                 "RUST_LOG",
                 "laminardb=info,laminar_server=info,laminar_db=info",

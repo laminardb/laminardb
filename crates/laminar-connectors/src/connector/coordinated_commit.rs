@@ -533,17 +533,6 @@ pub trait CoordinatedCommitter: Send + Sync {
         context: CoordinatedCommitContext,
     ) -> Result<(), ConnectorError>;
 
-    /// Release exact durable participant artifacts after the runtime proves an
-    /// authoritative Abort. Implementations must be idempotent and retain any
-    /// artifact whose external publication status is ambiguous.
-    async fn cleanup_aborted(
-        &self,
-        _batch: CoordinatedAbortBatch,
-        _context: CoordinatedCommitContext,
-    ) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-
     /// Highest checkpoint and fencing authority committed in `namespace`.
     /// A metadata read error must be returned, never converted to an absent
     /// cursor, because that could duplicate a previously committed batch.

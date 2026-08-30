@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 
 use crate::connector::{
-    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitContext,
-    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter,
+    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
+    CoordinatedCommitNamespace, CoordinatedCommitter,
 };
 use crate::error::ConnectorError;
 
-use super::{aborted_cleanup, publication, IcebergSink};
+use super::{publication, IcebergSink};
 
 #[async_trait]
 impl CoordinatedCommitter for IcebergSink {
@@ -55,37 +55,6 @@ impl CoordinatedCommitter for IcebergSink {
             if unresolved.as_ref() == Some(&pending) {
                 *unresolved = None;
             }
-        }
-        result
-    }
-
-    async fn cleanup_aborted(
-        &self,
-        batch: CoordinatedAbortBatch,
-        context: CoordinatedCommitContext,
-    ) -> Result<(), ConnectorError> {
-        self.ensure_no_unresolved_publication()?;
-        let catalog = self
-            .catalog
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open Iceberg sink".into(),
-                actual: "catalog is not initialized".into(),
-            })?;
-        let result = aborted_cleanup::cleanup_aborted_files(
-            catalog,
-            &self.config,
-            &batch,
-            context,
-            &self.metrics,
-        )
-        .await;
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(ConnectorError::is_outcome_unknown)
-        {
-            self.metrics.unknown_outcomes.inc();
         }
         result
     }

@@ -56,12 +56,23 @@ impl CoordinatedAbortCleaner for IcebergAbortCleaner {
         context: CoordinatedCommitContext,
     ) -> Result<(), ConnectorError> {
         if self.unresolved_publication.lock().is_some() {
+            self.metrics.unknown_outcomes.inc();
             return Err(ConnectorError::outcome_unknown(
                 "[LDB-ICEBERG-ABORT-CLEANUP-OUTCOME-UNKNOWN] exact publication reconciliation is incomplete",
                 true,
             ));
         }
-        cleanup_aborted_files(&self.catalog, &self.config, &batch, context, &self.metrics).await
+        let result =
+            cleanup_aborted_files(&self.catalog, &self.config, &batch, context, &self.metrics)
+                .await;
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(ConnectorError::is_outcome_unknown)
+        {
+            self.metrics.unknown_outcomes.inc();
+        }
+        result
     }
 }
 

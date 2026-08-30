@@ -453,6 +453,16 @@ impl CoordinatedCommitter for BarrierCommitSink {
         Ok(())
     }
 
+    async fn committed_cursor(
+        &self,
+        _namespace: &CoordinatedCommitNamespace,
+    ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
+        Ok(None)
+    }
+}
+
+#[async_trait::async_trait]
+impl CoordinatedAbortCleaner for BarrierCommitSink {
     async fn cleanup_aborted(
         &self,
         batch: CoordinatedAbortBatch,
@@ -485,24 +495,6 @@ impl CoordinatedCommitter for BarrierCommitSink {
             ));
         }
         Ok(())
-    }
-
-    async fn committed_cursor(
-        &self,
-        _namespace: &CoordinatedCommitNamespace,
-    ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
-        Ok(None)
-    }
-}
-
-#[async_trait::async_trait]
-impl CoordinatedAbortCleaner for BarrierCommitSink {
-    async fn cleanup_aborted(
-        &self,
-        batch: CoordinatedAbortBatch,
-        context: CoordinatedCommitContext,
-    ) -> Result<(), ConnectorError> {
-        <Self as CoordinatedCommitter>::cleanup_aborted(self, batch, context).await
     }
 }
 

@@ -213,6 +213,20 @@ impl laminar_connectors::connector::CoordinatedCommitter for ClusterAbortCleanup
         })
     }
 
+    async fn committed_cursor(
+        &self,
+        _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
+    ) -> Result<
+        Option<laminar_connectors::connector::CoordinatedCommitCursor>,
+        laminar_connectors::error::ConnectorError,
+    > {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::CoordinatedAbortCleaner for ClusterAbortCleanupSink {
     async fn cleanup_aborted(
         &self,
         batch: laminar_connectors::connector::CoordinatedAbortBatch,
@@ -242,31 +256,6 @@ impl laminar_connectors::connector::CoordinatedCommitter for ClusterAbortCleanup
         self.cleanups
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
-    }
-
-    async fn committed_cursor(
-        &self,
-        _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
-    ) -> Result<
-        Option<laminar_connectors::connector::CoordinatedCommitCursor>,
-        laminar_connectors::error::ConnectorError,
-    > {
-        Ok(None)
-    }
-}
-
-#[cfg(feature = "cluster")]
-#[async_trait::async_trait]
-impl laminar_connectors::connector::CoordinatedAbortCleaner for ClusterAbortCleanupSink {
-    async fn cleanup_aborted(
-        &self,
-        batch: laminar_connectors::connector::CoordinatedAbortBatch,
-        context: laminar_connectors::connector::CoordinatedCommitContext,
-    ) -> Result<(), laminar_connectors::error::ConnectorError> {
-        <Self as laminar_connectors::connector::CoordinatedCommitter>::cleanup_aborted(
-            self, batch, context,
-        )
-        .await
     }
 }
 
