@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::ConnectorError;
 
+use super::artifact_inventory::EpochArtifactTracker;
 use super::metrics::IcebergMetrics;
 
 const MAX_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -21,9 +22,11 @@ pub(super) struct ReplaySafeFileNameGenerator {
     prefix: String,
     staging_id: Option<String>,
     ordinal: Arc<AtomicU64>,
+    artifacts: EpochArtifactTracker,
 }
 
 impl ReplaySafeFileNameGenerator {
+    #[cfg(test)]
     pub(super) fn new(
         deployment_id: &str,
         sink_id: &str,
@@ -31,10 +34,29 @@ impl ReplaySafeFileNameGenerator {
         epoch: u64,
         coordinated: bool,
     ) -> Self {
+        Self::with_artifacts(
+            deployment_id,
+            sink_id,
+            participant_id,
+            epoch,
+            coordinated,
+            EpochArtifactTracker::default(),
+        )
+    }
+
+    pub(super) fn with_artifacts(
+        deployment_id: &str,
+        sink_id: &str,
+        participant_id: u64,
+        epoch: u64,
+        coordinated: bool,
+        artifacts: EpochArtifactTracker,
+    ) -> Self {
         Self {
             prefix: replay_safe_prefix(deployment_id, sink_id, participant_id, epoch),
             staging_id: coordinated.then(|| uuid::Uuid::now_v7().simple().to_string()),
             ordinal: Arc::new(AtomicU64::new(0)),
+            artifacts,
         }
     }
 
@@ -198,6 +220,7 @@ async fn finalize_file(
             ));
         }
     } else {
+        names.artifacts.record_created_final(final_path.clone());
         copy_file(
             file_io,
             staging_path,

@@ -1,7 +1,7 @@
 # Iceberg row-mutation capability decision
 
 - **Status:** accepted
-- **Updated:** 2026-08-29
+- **Updated:** 2026-08-30
 - **Applies to:** Iceberg connectors in embedded, single-node, and cluster modes
 
 ## Decision
@@ -57,6 +57,15 @@ from a connector instance. Safe expiration needs one fenced authority with the c
 of active source cursors, retained checkpoint recovery points, and unresolved external commits.
 No such cross-pipeline maintenance authority exists today. Connector-local expiration would risk
 removing replay or reconciliation state.
+
+While a checkpoint participant remains alive, it retains a bounded, exact in-memory inventory of
+staging paths and final files created by its current epoch. Before a descriptor is issued, Abort or
+close deletes only those exact owned paths. After descriptor issuance, a proven durable Abort does
+the same; a successor epoch or close removes staging paths but leaves potentially published final
+files intact. An unresolved publication fences rollback cleanup. This lifecycle is not a
+table-wide orphan scan and does not infer reachability from object-store listings. Process loss can
+strand unreferenced paths; reclaiming them requires the shared fenced maintenance authority
+described above.
 
 The released API also lacks the transaction actions needed for data-file compaction, delete-file
 rewrites, manifest rewrites, and format-aware orphan cleanup. LaminarDB therefore starts no

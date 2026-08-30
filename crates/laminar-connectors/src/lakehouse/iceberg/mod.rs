@@ -1,5 +1,7 @@
 //! Apache Iceberg append sink connector.
 
+#[cfg(feature = "iceberg-core")]
+mod artifact_inventory;
 pub(crate) mod capabilities;
 #[cfg(feature = "iceberg-core")]
 mod commit_cursor;
@@ -46,6 +48,8 @@ use crate::error::ConnectorError;
 
 use super::iceberg_config::{IcebergSinkConfig, IcebergStorageType};
 #[cfg(feature = "iceberg-core")]
+use artifact_inventory::{PreparedEpochArtifacts, PreparedEpochCleanup};
+#[cfg(feature = "iceberg-core")]
 use descriptor::IcebergCommitDescriptorV1;
 #[cfg(feature = "iceberg-core")]
 use epoch_writer::{EpochIdentity, IcebergEpochWriter};
@@ -83,6 +87,8 @@ pub struct IcebergSink {
     #[cfg(feature = "iceberg-core")]
     active_epoch_id: Option<u64>,
     #[cfg(feature = "iceberg-core")]
+    prepared_epoch: Option<PreparedEpochArtifacts>,
+    #[cfg(feature = "iceberg-core")]
     metrics: IcebergMetrics,
     #[cfg(feature = "iceberg-core")]
     unresolved_publication: Arc<Mutex<Option<UnresolvedIcebergPublication>>>,
@@ -119,6 +125,8 @@ impl IcebergSink {
             active_epoch: Mutex::new(None),
             #[cfg(feature = "iceberg-core")]
             active_epoch_id: None,
+            #[cfg(feature = "iceberg-core")]
+            prepared_epoch: None,
             #[cfg(feature = "iceberg-core")]
             metrics: IcebergMetrics::new(registry),
             #[cfg(feature = "iceberg-core")]
@@ -237,7 +245,7 @@ impl IcebergSink {
             return Ok(());
         };
         let writer_table = self.table()?.clone();
-        let output = match writer.close().await {
+        let mut output = match writer.close().await {
             Ok(output) => output,
             Err(error) => {
                 self.state = ConnectorState::Failed;
@@ -247,6 +255,7 @@ impl IcebergSink {
         if output.data_files.is_empty() {
             return Ok(());
         }
+        let artifacts = std::mem::take(&mut output.artifacts);
         let catalog = self
             .catalog
             .clone()
@@ -271,33 +280,20 @@ impl IcebergSink {
             }
             Err(error) => {
                 self.state = ConnectorState::Failed;
-                Err(error)
+                if error.is_outcome_unknown() {
+                    return Err(error);
+                }
+                let cleanup = artifacts
+                    .cleanup_aborted(writer_table.file_io().clone(), self.metrics.clone())
+                    .await;
+                Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup) => ConnectorError::WriteError(format!(
+                        "{error}; exact artifact cleanup also failed: {cleanup}"
+                    )),
+                })
             }
         }
-    }
-
-    #[cfg(feature = "iceberg-core")]
-    fn ensure_no_unresolved_publication(&self) -> Result<(), ConnectorError> {
-        if self.unresolved_publication.lock().is_some() {
-            Err(ConnectorError::InvalidState {
-                expected: "reconciliation of the exact ambiguous Iceberg publication".into(),
-                actual: "a prior coordinated publication remains unresolved".into(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-
-    #[cfg(feature = "iceberg-core")]
-    async fn discard_active_epoch(&mut self) -> Result<(), ConnectorError> {
-        let writer = self.active_epoch.get_mut().take();
-        self.active_epoch_id = None;
-        self.metrics.set_buffer(0, 0);
-        self.metrics.set_active_writers(0);
-        if let Some(writer) = writer {
-            writer.abort().await?;
-        }
-        Ok(())
     }
 }
 
@@ -527,6 +523,8 @@ impl SinkConnector for IcebergSink {
                     actual: "an epoch identity or writer is still active".into(),
                 });
             }
+            self.cleanup_prepared_epoch(PreparedEpochCleanup::Successor { next_epoch: epoch })
+                .await?;
             self.active_epoch_id = Some(epoch);
         }
         Ok(())
@@ -548,6 +546,12 @@ impl SinkConnector for IcebergSink {
                     actual: format!("active epoch is {:?}", self.active_epoch_id),
                 });
             }
+            if self.prepared_epoch.is_some() {
+                return Err(ConnectorError::InvalidState {
+                    expected: "no previously prepared Iceberg epoch".into(),
+                    actual: "prepared artifact ownership is still active".into(),
+                });
+            }
             let started = std::time::Instant::now();
             let writer = self.active_epoch.get_mut().take();
             self.active_epoch_id = None;
@@ -557,15 +561,31 @@ impl SinkConnector for IcebergSink {
                     .observe(started.elapsed().as_secs_f64());
                 return Ok(None);
             };
+            self.prepared_epoch = Some(PreparedEpochArtifacts::new(
+                epoch,
+                writer.artifact_tracker(),
+                &self.metrics,
+            ));
             let output = writer.close().await?;
-            #[cfg(test)]
-            fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterFileClose)?;
             self.metrics
                 .pre_commit_duration
                 .observe(started.elapsed().as_secs_f64());
             if output.data_files.is_empty() {
+                self.prepared_epoch = None;
+                self.metrics.pending_artifact_paths.set(0);
                 return Ok(None);
             }
+            self.prepared_epoch
+                .as_ref()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "Iceberg prepared artifact ownership disappeared during writer close"
+                            .into(),
+                    )
+                })?
+                .seal(&output.artifacts, &self.metrics)?;
+            #[cfg(test)]
+            fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterFileClose)?;
             let descriptor = IcebergCommitDescriptorV1::encode(
                 self.table()?,
                 &self.config,
@@ -574,6 +594,15 @@ impl SinkConnector for IcebergSink {
             )?;
             #[cfg(test)]
             fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterDescriptor)?;
+            self.prepared_epoch
+                .as_mut()
+                .ok_or_else(|| {
+                    ConnectorError::Internal(
+                        "Iceberg prepared artifact ownership disappeared before descriptor issue"
+                            .into(),
+                    )
+                })?
+                .mark_descriptor_issued();
             return Ok(Some(descriptor));
         }
 
@@ -594,7 +623,19 @@ impl SinkConnector for IcebergSink {
                     actual: format!("active epoch is {:?}", self.active_epoch_id),
                 });
             }
-            self.discard_active_epoch().await?;
+            let active_cleanup = self.discard_active_epoch().await;
+            let prepared_cleanup = self
+                .cleanup_prepared_epoch(PreparedEpochCleanup::Abort { epoch })
+                .await;
+            match (active_cleanup, prepared_cleanup) {
+                (Ok(()), Ok(())) => {}
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                (Err(active), Err(prepared)) => {
+                    return Err(ConnectorError::WriteError(format!(
+                        "{active}; prepared artifact cleanup also failed: {prepared}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -633,6 +674,8 @@ impl SinkConnector for IcebergSink {
         {
             if self.is_coordinated() {
                 self.discard_active_epoch().await?;
+                self.cleanup_prepared_epoch(PreparedEpochCleanup::Close)
+                    .await?;
             } else {
                 self.flush().await?;
             }
@@ -644,6 +687,7 @@ impl SinkConnector for IcebergSink {
             self.alignment_plan = None;
             self.metrics.set_buffer(0, 0);
             self.metrics.set_active_writers(0);
+            self.metrics.pending_artifact_paths.set(0);
         }
         self.state = ConnectorState::Closed;
         Ok(())

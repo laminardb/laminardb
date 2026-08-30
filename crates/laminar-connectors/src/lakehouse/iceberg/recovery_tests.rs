@@ -147,6 +147,131 @@ async fn empty_coordinated_epoch_does_not_open_a_writer() {
 }
 
 #[tokio::test]
+async fn durable_abort_deletes_only_the_prepared_epochs_exact_artifacts() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let _ = descriptor(&mut sink, &fixture, 1).await;
+    let artifacts = sink
+        .prepared_epoch
+        .as_ref()
+        .expect("non-empty pre-commit must retain exact artifact ownership")
+        .artifacts();
+    assert_eq!(artifacts.generated_paths().len(), 1);
+    assert_eq!(artifacts.created_final_paths().len(), 1);
+    assert_eq!(
+        sink.metrics.pending_artifact_paths.get(),
+        i64::try_from(artifacts.path_count()).unwrap()
+    );
+    for path in artifacts.created_final_paths() {
+        assert!(fixture.table.file_io().exists(path).await.unwrap());
+    }
+
+    sink.rollback_epoch(1).await.unwrap();
+
+    assert!(sink.prepared_epoch.is_none());
+    assert_eq!(sink.metrics.pending_artifact_paths.get(), 0);
+    for path in artifacts
+        .generated_paths()
+        .iter()
+        .chain(artifacts.created_final_paths())
+    {
+        assert!(!fixture.table.file_io().exists(path).await.unwrap());
+    }
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 0);
+}
+
+#[tokio::test]
+async fn successor_epoch_cleans_staging_but_retains_committed_data_files() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let payload = descriptor(&mut sink, &fixture, 1).await;
+    let artifacts = sink.prepared_epoch.as_ref().unwrap().artifacts();
+    let staging_path = artifacts.generated_paths()[0].clone();
+    let final_path = artifacts.created_final_paths()[0].clone();
+    fixture
+        .table
+        .file_io()
+        .new_output(&staging_path)
+        .unwrap()
+        .write(bytes::Bytes::from_static(b"unreferenced-staging-retry"))
+        .await
+        .unwrap();
+    sink.commit_aggregated(commit_batch(1, payload), commit_context())
+        .await
+        .unwrap();
+    assert!(fixture.table.file_io().exists(&staging_path).await.unwrap());
+    assert!(fixture.table.file_io().exists(&final_path).await.unwrap());
+
+    sink.begin_epoch(2).await.unwrap();
+
+    assert!(sink.prepared_epoch.is_none());
+    assert!(!fixture.table.file_io().exists(&staging_path).await.unwrap());
+    assert!(fixture.table.file_io().exists(&final_path).await.unwrap());
+    assert_eq!(sink.metrics.pending_artifact_paths.get(), 0);
+    sink.rollback_epoch(2).await.unwrap();
+    let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(table.metadata().snapshots().count(), 1);
+    assert_eq!(table_row_count(&table).await, 2);
+}
+
+#[tokio::test]
+async fn close_deletes_final_files_when_precommit_never_issued_a_descriptor() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    sink.begin_epoch(1).await.unwrap();
+    sink.write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
+        .await
+        .unwrap();
+    let error = scope(
+        [IcebergFault::first(IcebergFaultPoint::AfterFileClose)],
+        sink.pre_commit(1),
+    )
+    .await
+    .expect_err("the descriptor must not escape the injected boundary");
+    assert!(error.to_string().contains("LDB-ICEBERG-FAULT-INJECTION"));
+    let artifacts = sink.prepared_epoch.as_ref().unwrap().artifacts();
+    assert_eq!(artifacts.created_final_paths().len(), 1);
+    assert!(fixture
+        .table
+        .file_io()
+        .exists(&artifacts.created_final_paths()[0])
+        .await
+        .unwrap());
+
+    sink.close().await.unwrap();
+
+    for path in artifacts
+        .generated_paths()
+        .iter()
+        .chain(artifacts.created_final_paths())
+    {
+        assert!(!fixture.table.file_io().exists(path).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn close_retains_final_files_after_descriptor_issuance() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let _ = descriptor(&mut sink, &fixture, 1).await;
+    let artifacts = sink.prepared_epoch.as_ref().unwrap().artifacts();
+    assert_eq!(artifacts.created_final_paths().len(), 1);
+
+    sink.close().await.unwrap();
+
+    assert!(fixture
+        .table
+        .file_io()
+        .exists(&artifacts.created_final_paths()[0])
+        .await
+        .unwrap());
+    for path in artifacts.generated_paths() {
+        assert!(!fixture.table.file_io().exists(path).await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn first_write_refreshes_the_descriptor_base_snapshot() {
     let fixture = create_test_table(false).await;
     let stale = fixture.table.clone();
@@ -227,6 +352,12 @@ async fn direct_flush_rejects_schema_change_without_creating_a_snapshot() {
     sink.write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
         .await
         .unwrap();
+    let artifacts = sink
+        .active_epoch
+        .get_mut()
+        .as_ref()
+        .unwrap()
+        .artifact_tracker();
     add_optional_column(&fixture.table, &fixture).await;
 
     let error = sink.flush().await.unwrap_err();
@@ -241,6 +372,9 @@ async fn direct_flush_rejects_schema_change_without_creating_a_snapshot() {
     ));
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(current.metadata().snapshots().count(), 0);
+    for path in artifacts.snapshot().generated_paths() {
+        assert!(!fixture.table.file_io().exists(path).await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -254,12 +388,21 @@ async fn direct_flush_rebases_over_a_compatible_external_append() {
     sink.write_batch(&record_batch(&fixture.table, &[(1, Some("sink"))]))
         .await
         .unwrap();
+    let artifacts = sink
+        .active_epoch
+        .get_mut()
+        .as_ref()
+        .unwrap()
+        .artifact_tracker();
     let _ = append_rows(&fixture, &fixture.table, 90, &[(2, Some("external"))]).await;
 
     sink.flush().await.unwrap();
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(current.metadata().snapshots().count(), 2);
     assert_eq!(table_row_count(&current).await, 2);
+    for path in artifacts.snapshot().generated_paths() {
+        assert!(fixture.table.file_io().exists(path).await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -303,6 +446,12 @@ async fn direct_response_loss_is_not_retried_or_allowed_to_advance() {
     sink.write_batch(&record_batch(&fixture.table, &[(1, Some("sink"))]))
         .await
         .unwrap();
+    let artifacts = sink
+        .active_epoch
+        .get_mut()
+        .as_ref()
+        .unwrap()
+        .artifact_tracker();
 
     let error = scope(
         [IcebergFault::first(IcebergFaultPoint::AfterCatalogCommit)],
@@ -322,6 +471,9 @@ async fn direct_response_loss_is_not_retried_or_allowed_to_advance() {
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(current.metadata().snapshots().count(), 1);
     assert_eq!(table_row_count(&current).await, 1);
+    for path in artifacts.snapshot().generated_paths() {
+        assert!(fixture.table.file_io().exists(path).await.unwrap());
+    }
 }
 
 #[tokio::test]
@@ -345,6 +497,9 @@ async fn precommit_fault_boundaries_leave_no_snapshot_and_restart_replays_safely
             .await
             .expect_err("fault must interrupt pre-commit");
         assert!(error.to_string().contains("LDB-ICEBERG-FAULT-INJECTION"));
+        assert!(failed.prepared_epoch.is_some());
+        failed.rollback_epoch(1).await.unwrap();
+        assert!(failed.prepared_epoch.is_none());
         let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
         assert_eq!(table.metadata().snapshots().count(), 0, "point={point:?}");
 
@@ -471,6 +626,53 @@ async fn unknown_refresh_and_cursor_faults_block_until_exact_reconciliation() {
     let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(table.metadata().snapshots().count(), 1);
     assert_eq!(table_row_count(&table).await, 2);
+}
+
+#[tokio::test]
+async fn unknown_publication_blocks_artifact_deletion_until_reconciled() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let batch = commit_batch(1, descriptor(&mut sink, &fixture, 1).await);
+    let final_paths = sink
+        .prepared_epoch
+        .as_ref()
+        .unwrap()
+        .artifacts()
+        .created_final_paths()
+        .to_vec();
+    let error = scope(
+        [
+            IcebergFault::first(IcebergFaultPoint::AfterCatalogCommit),
+            IcebergFault::on_occurrence(IcebergFaultPoint::DuringMetadataRefresh, 2),
+        ],
+        sink.commit_aggregated(batch, commit_context()),
+    )
+    .await
+    .expect_err("lost commit response must remain ambiguous");
+    assert!(error.is_outcome_unknown());
+
+    let rollback = sink
+        .rollback_epoch(1)
+        .await
+        .expect_err("ambiguous publication must fence artifact deletion");
+    assert!(rollback.to_string().contains("remains unresolved"));
+    assert!(sink.prepared_epoch.is_some());
+    for path in &final_paths {
+        assert!(fixture.table.file_io().exists(path).await.unwrap());
+    }
+
+    assert_eq!(
+        sink.committed_cursor(&namespace()).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 1,
+            fencing_token: 7,
+        })
+    );
+    sink.begin_epoch(2).await.unwrap();
+    for path in &final_paths {
+        assert!(fixture.table.file_io().exists(path).await.unwrap());
+    }
+    sink.rollback_epoch(2).await.unwrap();
 }
 
 #[tokio::test]

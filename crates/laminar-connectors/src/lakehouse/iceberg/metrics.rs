@@ -19,6 +19,9 @@ pub(super) struct IcebergMetrics {
     pub(super) commit_conflicts: IntCounter,
     pub(super) commit_retries: IntCounter,
     pub(super) unknown_outcomes: IntCounter,
+    pub(super) pending_artifact_paths: IntGauge,
+    pub(super) artifact_delete_successes: IntCounter,
+    pub(super) artifact_cleanup_failures: IntCounter,
     pub(super) credential_refresh_failures: IntCounter,
     pub(super) committed_checkpoint: IntGauge,
     pub(super) last_successful_commit_timestamp: IntGauge,
@@ -94,6 +97,18 @@ impl IcebergMetrics {
             unknown_outcomes: handle.counter(
                 "iceberg_sink_unknown_outcomes_total",
                 "Iceberg publications with an initially unknown outcome",
+            ),
+            pending_artifact_paths: handle.gauge(
+                "iceberg_sink_pending_artifact_paths",
+                "Exact checkpoint-owned paths awaiting a terminal commit or rollback",
+            ),
+            artifact_delete_successes: handle.counter(
+                "iceberg_sink_artifact_delete_successes_total",
+                "Successful idempotent deletes of exact checkpoint-owned Iceberg paths",
+            ),
+            artifact_cleanup_failures: handle.counter(
+                "iceberg_sink_artifact_cleanup_failures_total",
+                "Exact Iceberg checkpoint artifact deletions that failed",
             ),
             credential_refresh_failures: handle.counter(
                 "iceberg_sink_credential_refresh_failures_total",

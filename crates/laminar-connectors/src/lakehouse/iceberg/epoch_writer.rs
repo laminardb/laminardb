@@ -17,11 +17,12 @@ use parquet::file::properties::WriterProperties;
 use crate::error::ConnectorError;
 
 use super::super::iceberg_config::{IcebergSinkConfig, IcebergWriteDistributionMode};
+use super::artifact_inventory::{EpochArtifactTracker, EpochArtifacts, InventoryLocationGenerator};
 use super::file_finalizer::{finalize_coordinated_files, ReplaySafeFileNameGenerator};
 use super::metrics::IcebergMetrics;
 
 type PartitionWriter =
-    DataFileWriter<ParquetWriterBuilder, DefaultLocationGenerator, ReplaySafeFileNameGenerator>;
+    DataFileWriter<ParquetWriterBuilder, InventoryLocationGenerator, ReplaySafeFileNameGenerator>;
 type PartitionBatch = (String, Option<PartitionKey>, RecordBatch);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub(super) struct EpochOutput {
     pub(super) data_files: Vec<DataFile>,
     pub(super) rows: u64,
     pub(super) bytes: u64,
+    pub(super) artifacts: EpochArtifacts,
 }
 
 /// Streams one checkpoint participant's rows into bounded rolling writers.
@@ -59,8 +61,9 @@ pub(super) struct IcebergEpochWriter {
     splitter: Option<RecordBatchPartitionSplitter>,
     parquet_builder: ParquetWriterBuilder,
     file_io: iceberg::io::FileIO,
-    location_generator: DefaultLocationGenerator,
+    location_generator: InventoryLocationGenerator,
     file_name_generator: ReplaySafeFileNameGenerator,
+    artifact_tracker: EpochArtifactTracker,
     partition_spec_id: i32,
     coordinated: bool,
     target_file_size_bytes: usize,
@@ -106,21 +109,27 @@ impl IcebergEpochWriter {
         };
         let properties = parquet_writer_properties(config)?;
         let parquet_builder = ParquetWriterBuilder::new(properties, schema);
-        let location_generator = DefaultLocationGenerator::new(table.metadata())
+        let default_location = DefaultLocationGenerator::new(table.metadata())
             .map_err(|error| iceberg_write_error("resolve table data location", &error))?;
+        let artifact_tracker = EpochArtifactTracker::default();
+        let location_generator =
+            InventoryLocationGenerator::new(default_location, artifact_tracker.clone());
+        let file_name_generator = ReplaySafeFileNameGenerator::with_artifacts(
+            &identity.deployment_id,
+            &identity.sink_id,
+            identity.participant_id,
+            identity.epoch,
+            config.delivery_guarantee == crate::connector::DeliveryGuarantee::ExactlyOnce,
+            artifact_tracker.clone(),
+        );
 
         Ok(Self {
             splitter,
             parquet_builder,
             file_io: table.file_io().clone(),
             location_generator,
-            file_name_generator: ReplaySafeFileNameGenerator::new(
-                &identity.deployment_id,
-                &identity.sink_id,
-                identity.participant_id,
-                identity.epoch,
-                config.delivery_guarantee == crate::connector::DeliveryGuarantee::ExactlyOnce,
-            ),
+            file_name_generator,
+            artifact_tracker,
             partition_spec_id,
             coordinated: config.delivery_guarantee
                 == crate::connector::DeliveryGuarantee::ExactlyOnce,
@@ -142,6 +151,10 @@ impl IcebergEpochWriter {
             poisoned: false,
             metrics,
         })
+    }
+
+    pub(super) fn artifact_tracker(&self) -> EpochArtifactTracker {
+        self.artifact_tracker.clone()
     }
 
     pub(super) async fn write(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
@@ -503,32 +516,59 @@ impl IcebergEpochWriter {
     pub(super) async fn close(mut self) -> Result<EpochOutput, ConnectorError> {
         let poisoned = self.poisoned;
         let close_result = self.close_all_partitions().await;
-        if poisoned {
-            return match close_result {
-                Ok(()) => Err(poisoned_epoch_error()),
-                Err(error) => Err(ConnectorError::WriteError(format!(
-                    "{}; writer cleanup also failed: {error}",
-                    poisoned_epoch_message()
-                ))),
-            };
+        let close_result = match (poisoned, close_result) {
+            (true, Ok(())) => Err(poisoned_epoch_error()),
+            (true, Err(error)) => Err(ConnectorError::WriteError(format!(
+                "{}; writer cleanup also failed: {error}",
+                poisoned_epoch_message()
+            ))),
+            (false, result) => result,
+        };
+        if let Err(error) = close_result {
+            let cleanup = self.cleanup_unpublished_artifacts().await;
+            return Err(attach_cleanup_error(error, cleanup));
         }
-        close_result?;
         if self.completed.len() != self.file_count || self.completed.len() > self.max_files {
-            return Err(ConnectorError::Internal(format!(
+            let error = ConnectorError::Internal(format!(
                 "Iceberg file accounting mismatch: predicted {}, completed {}",
                 self.file_count,
                 self.completed.len()
-            )));
+            ));
+            let cleanup = self.cleanup_unpublished_artifacts().await;
+            return Err(attach_cleanup_error(error, cleanup));
+        }
+        let artifacts = self.artifact_tracker.snapshot();
+        let completed_paths = self
+            .completed
+            .iter()
+            .map(DataFile::file_path)
+            .collect::<Vec<_>>();
+        if let Err(error) = artifacts.validate_completed(&completed_paths, self.max_files) {
+            let cleanup = self.cleanup_unpublished_artifacts().await;
+            return Err(attach_cleanup_error(error, cleanup));
         }
         Ok(EpochOutput {
             data_files: self.completed,
             rows: self.rows,
             bytes: self.bytes,
+            artifacts,
         })
     }
 
     pub(super) async fn abort(mut self) -> Result<(), ConnectorError> {
-        self.close_all_partitions().await
+        let close = self.close_all_partitions().await;
+        let cleanup = self.cleanup_unpublished_artifacts().await;
+        match close {
+            Ok(()) => cleanup,
+            Err(error) => Err(attach_cleanup_error(error, cleanup)),
+        }
+    }
+
+    async fn cleanup_unpublished_artifacts(&mut self) -> Result<(), ConnectorError> {
+        let artifacts = self.artifact_tracker.snapshot();
+        artifacts
+            .cleanup_aborted(self.file_io.clone(), self.metrics.clone())
+            .await
     }
 
     async fn close_all_partitions(&mut self) -> Result<(), ConnectorError> {
@@ -548,6 +588,18 @@ impl IcebergEpochWriter {
                 errors.join("; ")
             )))
         }
+    }
+}
+
+fn attach_cleanup_error(
+    primary: ConnectorError,
+    cleanup: Result<(), ConnectorError>,
+) -> ConnectorError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup) => ConnectorError::WriteError(format!(
+            "{primary}; exact artifact cleanup also failed: {cleanup}"
+        )),
     }
 }
 
@@ -1025,6 +1077,82 @@ mod tests {
             .all(|file| !file.file_path().contains("-stage-")));
         assert_eq!(first.rows, replay.rows);
         assert_eq!(first.data_files, replay.data_files);
+        assert_eq!(first.artifacts.created_final_paths().len(), 1);
+        assert!(replay.artifacts.created_final_paths().is_empty());
+        let final_path = replay.data_files[0].file_path().to_string();
+        replay
+            .artifacts
+            .cleanup_aborted(fixture.table.file_io().clone(), IcebergMetrics::new(None))
+            .await
+            .unwrap();
+        assert!(fixture.table.file_io().exists(final_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn abort_deletes_every_exact_file_created_by_the_epoch() {
+        let fixture = create_test_table(false).await;
+        let mut config = fixture.config.clone();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(29),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        let artifacts = writer.artifact_tracker.clone();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+
+        writer.abort().await.unwrap();
+
+        let artifacts = artifacts.snapshot();
+        assert_eq!(artifacts.generated_paths().len(), 1);
+        assert_eq!(artifacts.created_final_paths().len(), 1);
+        for path in artifacts
+            .generated_paths()
+            .iter()
+            .chain(artifacts.created_final_paths())
+        {
+            assert!(!fixture.table.file_io().exists(path).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn close_failure_cleans_exact_paths_before_losing_writer_state() {
+        let fixture = create_test_table(false).await;
+        let mut config = fixture.config.clone();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        let mut writer = IcebergEpochWriter::new(
+            &fixture.table,
+            &config,
+            &identity(30),
+            IcebergMetrics::new(None),
+        )
+        .unwrap();
+        let artifacts = writer.artifact_tracker.clone();
+        writer
+            .write(batch(&fixture.table, &[(1, Some("a"))]))
+            .await
+            .unwrap();
+
+        let error = super::super::fault_injection::scope(
+            [super::super::fault_injection::IcebergFault::first(
+                super::super::fault_injection::IcebergFaultPoint::BeforeFileClose,
+            )],
+            writer.close(),
+        )
+        .await
+        .expect_err("injected close failure must abort the epoch");
+
+        assert!(error.to_string().contains("LDB-ICEBERG-FAULT-INJECTION"));
+        let artifacts = artifacts.snapshot();
+        assert_eq!(artifacts.generated_paths().len(), 1);
+        for path in artifacts.generated_paths() {
+            assert!(!fixture.table.file_io().exists(path).await.unwrap());
+        }
     }
 
     #[tokio::test]
