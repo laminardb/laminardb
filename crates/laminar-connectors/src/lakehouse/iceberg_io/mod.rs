@@ -563,9 +563,16 @@ pub async fn load_table_with_timeout(
 
 pub(crate) fn validate_loaded_table_locations(table: &Table) -> Result<(), ConnectorError> {
     validate_credential_free_location("table location", table.metadata().location())?;
-    if let Some(location) = table.metadata_location() {
-        validate_credential_free_location("metadata location", location)?;
-    }
+    let metadata_location = table
+        .metadata_location()
+        .filter(|location| !location.is_empty())
+        .ok_or_else(|| {
+            ConnectorError::ReadError(
+                "[LDB-ICEBERG-METADATA-LOCATION-MISSING] loaded table has no durable metadata location"
+                    .into(),
+            )
+        })?;
+    validate_credential_free_location("metadata location", metadata_location)?;
     for (label, property) in [
         ("data location", WRITE_DATA_PATH_PROPERTY),
         (

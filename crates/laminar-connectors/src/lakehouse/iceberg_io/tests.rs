@@ -392,6 +392,7 @@ fn fixture_table_with_properties(properties: std::collections::HashMap<String, S
 
     Table::builder()
         .metadata(metadata.metadata)
+        .metadata_location("s3://test/location/metadata/v1.json")
         .identifier(TableIdent::new(
             iceberg::NamespaceIdent::new("test".to_string()),
             "t".to_string(),
@@ -404,6 +405,23 @@ fn fixture_table_with_properties(properties: std::collections::HashMap<String, S
 
 fn empty_fixture_table() -> Table {
     fixture_table_with_properties(std::collections::HashMap::new())
+}
+
+#[tokio::test]
+async fn loaded_table_requires_a_durable_metadata_location() {
+    let table = empty_fixture_table();
+    let table = Table::builder()
+        .metadata(table.metadata().clone())
+        .identifier(table.identifier().clone())
+        .file_io(table.file_io().clone())
+        .runtime(iceberg::Runtime::try_current().unwrap())
+        .build()
+        .unwrap();
+
+    let error = validate_loaded_table_locations(&table).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-METADATA-LOCATION-MISSING"));
 }
 
 #[tokio::test]

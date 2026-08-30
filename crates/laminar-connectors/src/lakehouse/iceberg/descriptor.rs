@@ -1,6 +1,7 @@
 //! Versioned participant descriptors for coordinated Iceberg publication.
 
 use std::collections::HashSet;
+use std::fmt;
 
 use apache_avro::types::Value as AvroValue;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -11,7 +12,9 @@ use sha2::{Digest, Sha256};
 
 use crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
 use crate::error::ConnectorError;
-use crate::lakehouse::iceberg_config::{stable_catalog_identity, IcebergSinkConfig};
+use crate::lakehouse::iceberg_config::{
+    stable_catalog_identity, IcebergSinkConfig, ICEBERG_MAX_FILES_PER_CHECKPOINT,
+};
 use crate::lakehouse::iceberg_io::effective_data_location;
 
 use super::epoch_writer::{EpochIdentity, EpochOutput};
@@ -20,7 +23,8 @@ use super::fingerprint::{data_file_fingerprint, hash_count, hash_len_prefixed};
 
 const DESCRIPTOR_VERSION: u8 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct IcebergTableBindingV1 {
     pub(super) catalog_implementation: String,
     pub(super) catalog_identity: String,
@@ -37,9 +41,12 @@ pub(super) struct IcebergTableBindingV1 {
 }
 
 impl IcebergTableBindingV1 {
-    pub(super) fn from_table(table: &iceberg::table::Table, config: &IcebergSinkConfig) -> Self {
+    pub(super) fn from_table(
+        table: &iceberg::table::Table,
+        config: &IcebergSinkConfig,
+    ) -> Result<Self, ConnectorError> {
         let metadata = table.metadata();
-        Self {
+        let binding = Self {
             catalog_implementation: config.catalog.catalog_type.to_string(),
             catalog_identity: stable_catalog_identity(&config.catalog, &config.storage),
             table_uuid: metadata.uuid().to_string(),
@@ -52,7 +59,9 @@ impl IcebergTableBindingV1 {
             partition_spec_id: metadata.default_partition_spec_id(),
             sort_order_id: metadata.default_sort_order_id(),
             format_version: format_version_number(metadata.format_version()),
-        }
+        };
+        validate_table_binding_shape(&binding)?;
+        Ok(binding)
     }
 
     pub(super) fn has_same_append_target(&self, other: &Self) -> bool {
@@ -69,7 +78,21 @@ impl IcebergTableBindingV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for IcebergTableBindingV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IcebergTableBindingV1")
+            .field("base_snapshot_id", &self.base_snapshot_id)
+            .field("schema_id", &self.schema_id)
+            .field("partition_spec_id", &self.partition_spec_id)
+            .field("sort_order_id", &self.sort_order_id)
+            .field("format_version", &self.format_version)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct IcebergFileFingerprintV1 {
     pub(super) path: String,
     pub(super) metadata_sha256: String,
@@ -77,7 +100,18 @@ pub(super) struct IcebergFileFingerprintV1 {
     pub(super) bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl fmt::Debug for IcebergFileFingerprintV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IcebergFileFingerprintV1")
+            .field("records", &self.records)
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct IcebergCommitDescriptorV1 {
     pub(super) version: u8,
     pub(super) table: IcebergTableBindingV1,
@@ -92,6 +126,22 @@ pub(super) struct IcebergCommitDescriptorV1 {
     pub(super) record_count: u64,
     pub(super) file_bytes: u64,
     pub(super) input_bytes: u64,
+}
+
+impl fmt::Debug for IcebergCommitDescriptorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IcebergCommitDescriptorV1")
+            .field("version", &self.version)
+            .field("table", &self.table)
+            .field("epoch_id", &self.epoch_id)
+            .field("participant_id", &self.participant_id)
+            .field("file_count", &self.file_count)
+            .field("record_count", &self.record_count)
+            .field("file_bytes", &self.file_bytes)
+            .field("input_bytes", &self.input_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IcebergCommitDescriptorV1 {
@@ -126,7 +176,7 @@ impl IcebergCommitDescriptorV1 {
             output.data_files.iter().map(DataFile::file_size_in_bytes),
             "file bytes",
         )?;
-        let binding = IcebergTableBindingV1::from_table(table, config);
+        let binding = IcebergTableBindingV1::from_table(table, config)?;
         let data_files_avro = encode_data_files(table, &output.data_files, &files)?;
         let batch_fingerprint = participant_fingerprint(
             &binding,
@@ -168,6 +218,11 @@ impl IcebergCommitDescriptorV1 {
     }
 
     pub(super) fn decode(payload: &[u8]) -> Result<Self, ConnectorError> {
+        if payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg commit descriptor exceeds the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES}-byte limit"
+            )));
+        }
         let descriptor: Self = serde_json::from_slice(payload).map_err(|error| {
             ConnectorError::TransactionError(format!(
                 "[LDB-ICEBERG-DESCRIPTOR-JSON] invalid Iceberg commit descriptor ({:?} at line {} column {})",
@@ -182,13 +237,18 @@ impl IcebergCommitDescriptorV1 {
                 descriptor.version
             )));
         }
-        if descriptor.participant_id == 0
-            || descriptor.deployment_id.is_empty()
-            || descriptor.sink_id.is_empty()
-        {
+        validate_table_binding_shape(&descriptor.table)?;
+        if descriptor.participant_id == 0 {
             return Err(ConnectorError::TransactionError(
                 "Iceberg commit descriptor has an invalid runtime identity".into(),
             ));
+        }
+        validate_descriptor_identity("deployment identity", &descriptor.deployment_id)?;
+        validate_descriptor_identity("sink identity", &descriptor.sink_id)?;
+        if descriptor.files.len() > ICEBERG_MAX_FILES_PER_CHECKPOINT {
+            return Err(ConnectorError::TransactionError(format!(
+                "Iceberg commit descriptor exceeds the fixed {ICEBERG_MAX_FILES_PER_CHECKPOINT}-file limit"
+            )));
         }
         if descriptor.file_count != descriptor.files.len() as u64 {
             return Err(ConnectorError::TransactionError(
@@ -208,6 +268,19 @@ impl IcebergCommitDescriptorV1 {
                 descriptor.epoch_id,
             )?;
             validate_sha256(&file.metadata_sha256, "data-file metadata fingerprint")?;
+        }
+        if checked_untrusted_sum(
+            descriptor.files.iter().map(|file| file.records),
+            "envelope record count",
+        )? != descriptor.record_count
+            || checked_untrusted_sum(
+                descriptor.files.iter().map(|file| file.bytes),
+                "envelope file bytes",
+            )? != descriptor.file_bytes
+        {
+            return Err(ConnectorError::TransactionError(
+                "Iceberg commit descriptor aggregate counts do not match its envelope".into(),
+            ));
         }
         let mut paths = HashSet::with_capacity(descriptor.files.len());
         let mut previous = None;
@@ -319,6 +392,49 @@ impl IcebergCommitDescriptorV1 {
         }
         Ok(data_files)
     }
+}
+
+fn validate_table_binding_shape(binding: &IcebergTableBindingV1) -> Result<(), ConnectorError> {
+    validate_descriptor_identity("catalog implementation", &binding.catalog_implementation)?;
+    validate_sha256(&binding.catalog_identity, "catalog identity")?;
+    validate_descriptor_identity("table identifier", &binding.table_identifier)?;
+    validate_descriptor_identity("table ref", &binding.table_ref)?;
+    let table_uuid = uuid::Uuid::parse_str(&binding.table_uuid).map_err(|_| {
+        ConnectorError::TransactionError("Iceberg descriptor table UUID is not canonical".into())
+    })?;
+    if table_uuid.is_nil() || table_uuid.to_string() != binding.table_uuid {
+        return Err(ConnectorError::TransactionError(
+            "Iceberg descriptor table UUID is not canonical".into(),
+        ));
+    }
+    validate_descriptor_location("table location", &binding.table_location)?;
+    validate_descriptor_location("metadata location", &binding.metadata_location)?;
+    parse_format_version(binding.format_version)?;
+    Ok(())
+}
+
+fn validate_descriptor_identity(label: &str, value: &str) -> Result<(), ConnectorError> {
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || crate::security::value_contains_uri_secret(value, false)
+    {
+        return Err(ConnectorError::TransactionError(format!(
+            "Iceberg descriptor {label} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_descriptor_location(label: &str, value: &str) -> Result<(), ConnectorError> {
+    if value.is_empty()
+        || value.chars().any(char::is_control)
+        || crate::security::value_contains_uri_secret(value, false)
+    {
+        return Err(ConnectorError::TransactionError(format!(
+            "[LDB-ICEBERG-DESCRIPTOR-LOCATION] Iceberg descriptor {label} is absent or unsafe"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_data_file_record_count(encoded: &[u8], expected: usize) -> Result<(), ConnectorError> {
@@ -642,6 +758,17 @@ fn checked_sum(mut values: impl Iterator<Item = u64>, label: &str) -> Result<u64
     })
 }
 
+fn checked_untrusted_sum(
+    mut values: impl Iterator<Item = u64>,
+    label: &str,
+) -> Result<u64, ConnectorError> {
+    values.try_fold(0u64, |total, value| {
+        total.checked_add(value).ok_or_else(|| {
+            ConnectorError::TransactionError(format!("Iceberg descriptor {label} overflow"))
+        })
+    })
+}
+
 pub(super) fn format_version_number(version: FormatVersion) -> u8 {
     match version {
         FormatVersion::V1 => 1,
@@ -712,6 +839,37 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         canonicalize_data_files_avro(&generated, &fingerprints).unwrap()
+    }
+
+    fn descriptor() -> IcebergCommitDescriptorV1 {
+        IcebergCommitDescriptorV1 {
+            version: DESCRIPTOR_VERSION,
+            table: IcebergTableBindingV1 {
+                catalog_implementation: "rest".into(),
+                catalog_identity: "0".repeat(64),
+                table_uuid: "018f0f9d-7b2f-7a61-b72d-f4be1c7f43e1".into(),
+                table_identifier: "ns.table".into(),
+                table_location: "s3://warehouse/ns/table".into(),
+                table_ref: "main".into(),
+                base_snapshot_id: None,
+                metadata_location: "s3://warehouse/ns/table/metadata/v1.json".into(),
+                schema_id: 0,
+                partition_spec_id: 0,
+                sort_order_id: 0,
+                format_version: 2,
+            },
+            deployment_id: "deployment".into(),
+            sink_id: "sink".into(),
+            epoch_id: 1,
+            participant_id: 1,
+            batch_fingerprint: "0".repeat(64),
+            data_files_avro: String::new(),
+            files: Vec::new(),
+            file_count: 0,
+            record_count: 0,
+            file_bytes: 0,
+            input_bytes: 0,
+        }
     }
 
     #[test]
@@ -806,36 +964,121 @@ mod tests {
 
     #[test]
     fn future_descriptor_version_is_rejected() {
-        let descriptor = IcebergCommitDescriptorV1 {
-            version: 2,
-            table: IcebergTableBindingV1 {
-                catalog_implementation: "rest".into(),
-                catalog_identity: "catalog".into(),
-                table_uuid: "uuid".into(),
-                table_identifier: "ns.table".into(),
-                table_location: "s3://warehouse/ns/table".into(),
-                table_ref: "main".into(),
-                base_snapshot_id: None,
-                metadata_location: String::new(),
-                schema_id: 0,
-                partition_spec_id: 0,
-                sort_order_id: 0,
-                format_version: 2,
-            },
-            deployment_id: "deployment".into(),
-            sink_id: "sink".into(),
-            epoch_id: 1,
-            participant_id: 1,
-            batch_fingerprint: "fingerprint".into(),
-            data_files_avro: String::new(),
-            files: Vec::new(),
-            file_count: 0,
-            record_count: 0,
-            file_bytes: 0,
-            input_bytes: 0,
-        };
+        let mut descriptor = descriptor();
+        descriptor.version = DESCRIPTOR_VERSION + 1;
         let payload = serde_json::to_vec(&descriptor).unwrap();
         assert!(IcebergCommitDescriptorV1::decode(&payload).is_err());
+    }
+
+    #[test]
+    fn descriptor_binding_locations_are_redacted_and_fail_closed() {
+        let mut descriptor = descriptor();
+        descriptor.table.metadata_location =
+            "https://user:descriptor-secret@objects.test/metadata/v1.json".into();
+        let debug = format!("{descriptor:?}");
+        assert!(!debug.contains("descriptor-secret"));
+        assert!(!debug.contains("objects.test"));
+
+        let mut untrusted_debug = descriptor.clone();
+        untrusted_debug.table.catalog_implementation = "catalog-secret".into();
+        untrusted_debug.table.catalog_identity = "identity-secret".into();
+        untrusted_debug.table.table_uuid = "uuid-secret".into();
+        untrusted_debug.deployment_id = "deployment-secret".into();
+        untrusted_debug.sink_id = "sink-secret".into();
+        untrusted_debug.batch_fingerprint = "fingerprint-secret".into();
+        untrusted_debug.files.push(IcebergFileFingerprintV1 {
+            path: "https://user:file-secret@objects.test/data.parquet".into(),
+            metadata_sha256: "metadata-secret".into(),
+            records: 1,
+            bytes: 1,
+        });
+        let debug = format!("{untrusted_debug:?}");
+        for secret in [
+            "catalog-secret",
+            "identity-secret",
+            "uuid-secret",
+            "deployment-secret",
+            "sink-secret",
+            "fingerprint-secret",
+            "file-secret",
+            "metadata-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+
+        let payload = serde_json::to_vec(&descriptor).unwrap();
+        let error = IcebergCommitDescriptorV1::decode(&payload)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-LOCATION"));
+        assert!(!error.contains("descriptor-secret"));
+
+        descriptor.table.metadata_location.clear();
+        let payload = serde_json::to_vec(&descriptor).unwrap();
+        assert!(IcebergCommitDescriptorV1::decode(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("LDB-ICEBERG-DESCRIPTOR-LOCATION"));
+    }
+
+    #[test]
+    fn descriptor_intrinsic_limits_and_aggregates_fail_closed() {
+        let oversized = vec![b' '; MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1];
+        assert!(IcebergCommitDescriptorV1::decode(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("fixed"));
+
+        let mut too_many_files = descriptor();
+        too_many_files.files = vec![
+            IcebergFileFingerprintV1 {
+                path: "s3://warehouse/ns/table/data/file.parquet".into(),
+                metadata_sha256: "0".repeat(64),
+                records: 0,
+                bytes: 0,
+            };
+            ICEBERG_MAX_FILES_PER_CHECKPOINT + 1
+        ];
+        too_many_files.file_count = u64::try_from(too_many_files.files.len()).unwrap();
+        let payload = serde_json::to_vec(&too_many_files).unwrap();
+        assert!(IcebergCommitDescriptorV1::decode(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("file limit"));
+
+        let mut aggregate_mismatch = descriptor();
+        aggregate_mismatch.record_count = 1;
+        let payload = serde_json::to_vec(&aggregate_mismatch).unwrap();
+        assert!(IcebergCommitDescriptorV1::decode(&payload)
+            .unwrap_err()
+            .to_string()
+            .contains("aggregate counts"));
+
+        let mut overflowing = descriptor();
+        let prefix = super::super::file_finalizer::replay_safe_prefix(
+            &overflowing.deployment_id,
+            &overflowing.sink_id,
+            overflowing.participant_id,
+            overflowing.epoch_id,
+        );
+        overflowing.files = [u64::MAX, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, records)| IcebergFileFingerprintV1 {
+                path: format!(
+                    "s3://warehouse/ns/table/data/{prefix}-{ordinal:08}-{}.parquet",
+                    "0".repeat(64)
+                ),
+                metadata_sha256: "0".repeat(64),
+                records,
+                bytes: 0,
+            })
+            .collect();
+        overflowing.file_count = 2;
+        let payload = serde_json::to_vec(&overflowing).unwrap();
+        let error = IcebergCommitDescriptorV1::decode(&payload).unwrap_err();
+        assert!(matches!(error, ConnectorError::TransactionError(_)));
+        assert!(error.to_string().contains("overflow"));
     }
 
     #[test]
@@ -846,6 +1089,15 @@ mod tests {
             .to_string();
         assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-JSON"));
         assert!(!error.contains("descriptor-secret"));
+
+        let mut payload = serde_json::to_value(descriptor()).unwrap();
+        payload["table"]["unknown-secret-field"] =
+            serde_json::Value::String("unknown-secret-value".into());
+        let error = IcebergCommitDescriptorV1::decode(&serde_json::to_vec(&payload).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-DESCRIPTOR-JSON"));
+        assert!(!error.contains("unknown-secret"));
     }
 
     #[tokio::test]

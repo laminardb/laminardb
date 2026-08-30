@@ -560,7 +560,10 @@ fn prepare_publication(
         }
     }
     data_files.sort_by(|left, right| left.file_path().cmp(right.file_path()));
-    let binding = binding.unwrap_or_else(|| IcebergTableBindingV1::from_table(table, config));
+    let binding = match binding {
+        Some(binding) => binding,
+        None => IcebergTableBindingV1::from_table(table, config)?,
+    };
     let file_set_fingerprint = data_file_set_fingerprint(&data_files)?;
     Ok(PreparedPublication {
         binding,
