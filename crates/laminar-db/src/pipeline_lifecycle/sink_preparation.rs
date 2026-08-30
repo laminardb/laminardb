@@ -144,6 +144,7 @@ impl LaminarDB {
             SinkContract,
             bool, // admitted input is a changelog and must carry canonical weight
         )> = Vec::with_capacity(prepared_sinks.len());
+        let mut coordinator_sinks = Vec::with_capacity(prepared_sinks.len());
         for prepared in prepared_sinks {
             let PreparedSink {
                 name,
@@ -158,6 +159,7 @@ impl LaminarDB {
                 task_fence,
                 config: _,
             } = prepared;
+            let abort_cleaner = connector.coordinated_abort_cleaner();
             let terminal_tasks = task_fence.tracker();
             let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
@@ -180,6 +182,7 @@ impl LaminarDB {
                 debug_assert!(!owned.iter().any(|known| known.same_actor(&handle)));
                 owned.push(handle.clone());
             }
+            coordinator_sinks.push((name.clone(), handle.clone(), abort_cleaner));
             sinks.push((
                 name,
                 handle,
@@ -201,8 +204,8 @@ impl LaminarDB {
                         .filter(|source| source.assignment_scoped)
                         .map(|source| source.name.clone()),
                 );
-                for (name, handle, _, _, _, _) in &sinks {
-                    coord.register_sink(name.clone(), handle.clone());
+                for (name, handle, abort_cleaner) in coordinator_sinks {
+                    coord.register_sink_with_abort_cleaner(name, handle, abort_cleaner);
                 }
             }
         }

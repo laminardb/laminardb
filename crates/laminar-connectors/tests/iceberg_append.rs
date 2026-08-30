@@ -80,6 +80,17 @@ async fn open_coordinated_participant(table: &str, participant_id: u64) -> Icebe
     sink
 }
 
+async fn admit_and_begin_epoch(sink: &mut IcebergSink, epoch: u64) {
+    assert!(
+        sink.checkpoint_artifact_intent(epoch)
+            .await
+            .unwrap()
+            .is_some(),
+        "coordinated Iceberg epochs require durable artifact evidence"
+    );
+    sink.begin_epoch(epoch).await.unwrap();
+}
+
 fn commit_namespace() -> CoordinatedCommitNamespace {
     CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT_ID, SINK_ID).unwrap()
 }
@@ -278,7 +289,7 @@ async fn coordinated_checkpoint_restart_replay_soak() {
     for checkpoint_id in 1..=8 {
         let fencing_token = checkpoint_id + 100;
         let mut writer = open_coordinated_sink(&table).await;
-        writer.begin_epoch(checkpoint_id).await.unwrap();
+        admit_and_begin_epoch(&mut writer, checkpoint_id).await;
         writer
             .write_batch(
                 &RecordBatch::try_new(
@@ -345,7 +356,7 @@ async fn coordinated_empty_checkpoint_replay_is_one_fenced_snapshot() {
     );
 
     let mut writer = open_coordinated_sink(&table).await;
-    writer.begin_epoch(1).await.unwrap();
+    admit_and_begin_epoch(&mut writer, 1).await;
     assert!(writer.pre_commit(1).await.unwrap().is_none());
     writer
         .commit_aggregated(batch.clone(), commit_context())
@@ -383,8 +394,8 @@ async fn coordinated_multi_participant_checkpoint_is_one_snapshot() {
     open_sink(&table).await.close().await.unwrap();
     let mut first = open_coordinated_participant(&table, 1).await;
     let mut second = open_coordinated_participant(&table, 2).await;
-    first.begin_epoch(1).await.unwrap();
-    second.begin_epoch(1).await.unwrap();
+    admit_and_begin_epoch(&mut first, 1).await;
+    admit_and_begin_epoch(&mut second, 1).await;
     first
         .write_batch(
             &RecordBatch::try_new(schema(), vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap(),

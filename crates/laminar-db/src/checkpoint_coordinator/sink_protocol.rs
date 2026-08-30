@@ -13,14 +13,28 @@ use super::{
 const MAX_SINK_PHASE_ONE_CONCURRENCY: usize = 8;
 
 impl CheckpointCoordinator {
+    #[cfg(test)]
     pub(crate) fn register_sink(
         &mut self,
         name: impl Into<String>,
         handle: crate::sink_task::SinkTaskHandle,
     ) {
+        self.register_sink_with_abort_cleaner(name, handle, None);
+    }
+
+    pub(crate) fn register_sink_with_abort_cleaner(
+        &mut self,
+        name: impl Into<String>,
+        handle: crate::sink_task::SinkTaskHandle,
+        abort_cleaner: Option<
+            std::sync::Arc<dyn laminar_connectors::connector::CoordinatedAbortCleaner>,
+        >,
+    ) {
         self.sinks.push(RegisteredSink {
             name: name.into(),
             handle,
+            abort_cleaner,
+            abort_cleaner_retired: std::sync::atomic::AtomicBool::new(false),
         });
     }
 
@@ -130,11 +144,21 @@ impl CheckpointCoordinator {
         if !self.has_checkpoint_committable_sinks() {
             return Ok(());
         }
-        let attempt = self.reserve_sink_epoch_for_runtime_until(deadline).await?;
+        let inventory = self.reserve_sink_epoch_for_runtime_until(deadline).await?;
+        let attempt = inventory.attempt;
+        if let Err(error) = self
+            .persist_sink_artifact_intents_until(&inventory, deadline)
+            .await
+        {
+            self.allocator.mark_sink_epoch_in_doubt(attempt);
+            self.failure_requires_recovery = true;
+            return Err(error);
+        }
         let witness = match self.create_sink_witness_until(attempt, deadline).await {
             Ok(witness) => witness,
             Err(error) => {
-                self.allocator.clear_sink_epoch(attempt);
+                self.allocator.mark_sink_epoch_in_doubt(attempt);
+                self.failure_requires_recovery = true;
                 return Err(error);
             }
         };
@@ -283,10 +307,10 @@ impl CheckpointCoordinator {
                 failures.join("; ")
             )));
         }
-        self.clear_sink_witness_until(deadline).await?;
-        self.allocator.clear_sink_epoch(attempt);
+        self.allocator.mark_sink_epoch_in_doubt(attempt);
+        self.failure_requires_recovery = true;
         Err(DbError::Checkpoint(format!(
-            "sink epoch {} failed to open: {}",
+            "sink epoch {} failed to open and requires durable artifact settlement: {}",
             attempt.epoch,
             failures.join("; ")
         )))
@@ -405,7 +429,7 @@ impl CheckpointCoordinator {
         if self.cluster_controller.is_some() {
             return Ok(());
         }
-        let Some(store) = self.decision_store.as_ref() else {
+        let Some(store) = self.decision_store.clone() else {
             return Ok(());
         };
         let Some(witness) = tokio::time::timeout_at(deadline, store.sink_open_witness())
@@ -450,6 +474,7 @@ impl CheckpointCoordinator {
                     .await?;
             }
         }
+        self.clear_sink_artifact_intents(witness.attempt);
         tokio::time::timeout_at(deadline, store.clear_sink_open_witness(&witness))
             .await
             .map_err(|_| DbError::Checkpoint("sink-open witness cleanup timed out".into()))?

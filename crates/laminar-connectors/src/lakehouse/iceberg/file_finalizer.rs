@@ -16,6 +16,7 @@ use super::metrics::IcebergMetrics;
 const MAX_COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const CONTENT_HASH_BYTES: usize = 64;
 const FILE_ORDINAL_BYTES: usize = 8;
+pub(super) const REPLAY_SAFE_PREFIX_BYTES: usize = "ldb-".len() + CONTENT_HASH_BYTES;
 
 #[derive(Debug, Clone)]
 pub(super) struct ReplaySafeFileNameGenerator {

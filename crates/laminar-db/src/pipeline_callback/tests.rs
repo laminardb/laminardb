@@ -3201,6 +3201,7 @@ async fn callback_publishes_prepare_directly_before_checkpoint_work() {
         pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
         attempt: blocked_attempt,
         assignment_fence: Some(fence.clone()),
+        sink_artifact_intent_protocol: true,
     };
     let blocking_proof = leader.capture_leader_proof().unwrap();
     authority

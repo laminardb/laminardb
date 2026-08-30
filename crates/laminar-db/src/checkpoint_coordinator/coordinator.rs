@@ -54,6 +54,7 @@ impl CheckpointCoordinator {
             deployment_id: None,
             decision_store: None,
             active_sink_witness: None,
+            active_sink_artifact_intents: None,
             prepared: HashMap::new(),
             last_committed_manifest: None,
             last_committed_ref: None,

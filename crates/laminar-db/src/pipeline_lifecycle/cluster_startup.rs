@@ -3,6 +3,37 @@ use super::{Arc, ClusterStartupDisposition, StartupCheckpointArtifactAudit};
 use super::{DbError, LaminarDB, StartupAttempt};
 
 impl LaminarDB {
+    #[cfg(feature = "cluster")]
+    pub(super) fn should_defer_initial_sink_epoch_for_artifact_recovery(
+        &self,
+    ) -> Result<bool, DbError> {
+        if !self.is_cluster_runtime() {
+            return Ok(false);
+        }
+        let Some(StartupCheckpointArtifactAudit::Artifacts(audit_process)) =
+            *self.startup_checkpoint_artifact_audit.lock()
+        else {
+            return Ok(false);
+        };
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("cluster artifact recovery has no process authority".into())
+        })?;
+        let current_process = controller
+            .try_live_local_process_authority_identity()
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "cluster artifact recovery lost process authority: {error}"
+                ))
+            })?;
+        if current_process != audit_process || !self.cluster_intake_fenced() {
+            return Err(DbError::Checkpoint(
+                "cluster artifact recovery cannot defer sink admission without its exact fenced startup authority"
+                    .into(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Finish clustered startup after the exact assignment fence is available.
     ///
     /// Fresh nodes open intake only when no durable recovery round exists. A process that restored

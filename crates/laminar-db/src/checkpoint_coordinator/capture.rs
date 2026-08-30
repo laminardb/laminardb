@@ -2,27 +2,28 @@ use super::{
     checkpoint_descriptor_sha256, checkpoint_sha256, classify_channel_progress, BTreeMap,
     ByteRange, Bytes, CapturedStateFrame, CheckpointAttempt, CheckpointCoordinator,
     CheckpointManifest, CheckpointRequest, DbError, Digest, ManagedVnodeOperator,
-    ManagedVnodePlacement, NonZeroU32, PackedCheckpoint, PreparedSinkDescriptor,
-    ReferencedStateChunk, Sha256, StateChunkId, StateFrame, StateFrameKey,
-    PREPARED_SINK_DESCRIPTOR_VERSION,
+    ManagedVnodePlacement, NonZeroU32, PackedCheckpoint, PreparedSinkArtifactIntent,
+    PreparedSinkDescriptor, ReferencedStateChunk, Sha256, StateChunkId, StateFrame, StateFrameKey,
 };
 
-struct PackedStateFrames {
-    node_data: Vec<Bytes>,
-    object_length: u64,
-    frames: Vec<StateFrame>,
-    current_frame_chunks: Vec<(usize, usize)>,
-    referenced: BTreeMap<StateChunkId, (u64, String, u32)>,
+pub(super) struct PackedStateFrames {
+    pub(super) node_data: Vec<Bytes>,
+    pub(super) object_length: u64,
+    pub(super) frames: Vec<StateFrame>,
+    pub(super) current_frame_chunks: Vec<(usize, usize)>,
+    pub(super) referenced: BTreeMap<StateChunkId, (u64, String, u32)>,
 }
 
-struct PackedArtifact {
-    node_data: Vec<Bytes>,
-    object_length: u64,
-    frames: Vec<StateFrame>,
-    current_frame_chunks: Vec<(usize, usize)>,
-    referenced: BTreeMap<StateChunkId, (u64, String, u32)>,
-    prepared_sinks: Vec<PreparedSinkDescriptor>,
-    prepared_sink_chunks: Vec<(usize, usize)>,
+pub(super) struct PackedArtifact {
+    pub(super) node_data: Vec<Bytes>,
+    pub(super) object_length: u64,
+    pub(super) frames: Vec<StateFrame>,
+    pub(super) current_frame_chunks: Vec<(usize, usize)>,
+    pub(super) referenced: BTreeMap<StateChunkId, (u64, String, u32)>,
+    pub(super) sink_artifact_intents: Vec<PreparedSinkArtifactIntent>,
+    pub(super) sink_artifact_intent_chunks: Vec<(usize, usize)>,
+    pub(super) prepared_sinks: Vec<PreparedSinkDescriptor>,
+    pub(super) prepared_sink_chunks: Vec<(usize, usize)>,
 }
 
 struct DigestedArtifact {
@@ -31,6 +32,7 @@ struct DigestedArtifact {
     object_sha256: String,
     frames: Vec<StateFrame>,
     referenced: BTreeMap<StateChunkId, (u64, String, u32)>,
+    sink_artifact_intents: Vec<PreparedSinkArtifactIntent>,
     prepared_sinks: Vec<PreparedSinkDescriptor>,
 }
 
@@ -452,7 +454,14 @@ impl CheckpointCoordinator {
         self.validate_sink_payload_roster(&sink_payloads)?;
 
         let state = self.pack_state_frames(attempt, &mut request)?;
-        let artifact = Self::pack_sink_descriptors(state, &sink_payloads)?;
+        let empty_intents = BTreeMap::new();
+        let intents = if sink_payloads.is_empty() {
+            &empty_intents
+        } else {
+            self.active_sink_artifact_intents(attempt, sink_payloads.keys().cloned())?
+        };
+        let artifact =
+            super::sink_artifact_intents::pack_sink_artifacts(state, intents, &sink_payloads)?;
         if artifact.object_length > self.config.max_node_data_bytes {
             return Err(DbError::Checkpoint(format!(
                 "checkpoint node data is {} bytes; limit is {}",
@@ -585,59 +594,6 @@ impl CheckpointCoordinator {
         })
     }
 
-    fn pack_sink_descriptors(
-        state: PackedStateFrames,
-        sink_payloads: &BTreeMap<String, Option<Vec<u8>>>,
-    ) -> Result<PackedArtifact, DbError> {
-        let PackedStateFrames {
-            mut node_data,
-            mut object_length,
-            frames,
-            current_frame_chunks,
-            referenced,
-        } = state;
-        let mut prepared_sinks = Vec::with_capacity(sink_payloads.len());
-        let mut prepared_sink_chunks = Vec::new();
-        for (sink_name, payload) in sink_payloads {
-            let (range, digest) = match payload {
-                None => (None, checkpoint_descriptor_sha256(None)),
-                Some(payload) => {
-                    let length = u64::try_from(payload.len()).map_err(|_| {
-                        DbError::Checkpoint(format!(
-                            "sink '{sink_name}' descriptor length exceeds u64"
-                        ))
-                    })?;
-                    let range = ByteRange {
-                        offset: object_length,
-                        length,
-                    };
-                    object_length = range.end().ok_or_else(|| {
-                        DbError::Checkpoint("checkpoint node-data length overflow".into())
-                    })?;
-                    node_data.push(Bytes::copy_from_slice(payload));
-                    prepared_sink_chunks.push((prepared_sinks.len(), node_data.len() - 1));
-                    (Some(range), String::new())
-                }
-            };
-            prepared_sinks.push(PreparedSinkDescriptor {
-                sink_name: sink_name.clone(),
-                format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
-                payload: range,
-                sha256: digest,
-            });
-        }
-
-        Ok(PackedArtifact {
-            node_data,
-            object_length,
-            frames,
-            current_frame_chunks,
-            referenced,
-            prepared_sinks,
-            prepared_sink_chunks,
-        })
-    }
-
     async fn digest_artifact_until(
         artifact: PackedArtifact,
         deadline: tokio::time::Instant,
@@ -648,6 +604,8 @@ impl CheckpointCoordinator {
             mut frames,
             current_frame_chunks,
             referenced,
+            mut sink_artifact_intents,
+            sink_artifact_intent_chunks,
             mut prepared_sinks,
             prepared_sink_chunks,
         } = artifact;
@@ -670,13 +628,25 @@ impl CheckpointCoordinator {
                     )
                 })
                 .collect::<Vec<_>>();
+            let intent_digests = sink_artifact_intent_chunks
+                .into_iter()
+                .map(|(sink, chunk)| {
+                    (
+                        sink,
+                        laminar_core::checkpoint::checkpoint_artifact_intent_sha256(Some(
+                            &digest_chunks[chunk],
+                        )),
+                    )
+                })
+                .collect::<Vec<_>>();
             (
                 format!("{:x}", object_digest.finalize()),
                 frame_digests,
+                intent_digests,
                 sink_digests,
             )
         });
-        let (object_sha256, frame_digests, sink_digests) =
+        let (object_sha256, frame_digests, intent_digests, sink_digests) =
             tokio::time::timeout_at(deadline, digest_task)
                 .await
                 .map_err(|_| {
@@ -690,6 +660,9 @@ impl CheckpointCoordinator {
         for (frame, digest) in frame_digests {
             frames[frame].sha256 = digest;
         }
+        for (sink, digest) in intent_digests {
+            sink_artifact_intents[sink].sha256 = digest;
+        }
         for (sink, digest) in sink_digests {
             prepared_sinks[sink].sha256 = digest;
         }
@@ -700,6 +673,7 @@ impl CheckpointCoordinator {
             object_sha256,
             frames,
             referenced,
+            sink_artifact_intents,
             prepared_sinks,
         })
     }
@@ -716,6 +690,7 @@ impl CheckpointCoordinator {
             object_sha256,
             frames,
             referenced,
+            sink_artifact_intents,
             prepared_sinks,
         } = artifact;
         let mut manifest = CheckpointManifest::new_with_key_group_count(
@@ -750,6 +725,7 @@ impl CheckpointCoordinator {
         manifest.node_data.object_length = object_length;
         manifest.node_data.sha256 = object_sha256;
         manifest.state_frames = frames;
+        manifest.sink_artifact_intents = sink_artifact_intents;
         manifest.prepared_sinks = prepared_sinks;
         manifest.referenced_chunks = referenced
             .into_iter()

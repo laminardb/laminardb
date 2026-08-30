@@ -67,6 +67,7 @@ impl ObjectStoreCheckpointStore {
                 manifest.checkpoint_id,
             ),
             assignment_fence: manifest.assignment_fence.clone(),
+            sink_artifact_intent_protocol: !manifest.sink_artifact_intents.is_empty(),
         };
         let actual = checkpoint_artifact_identity_sha256(&inventory, chunk)?;
         if actual != expected_artifact_identity_sha256 {
@@ -112,8 +113,15 @@ impl ObjectStoreCheckpointStore {
                 .transpose()?;
             return Ok(ManifestAbortState::Sealed {
                 original_manifest,
+                sink_artifact_intent_protocol: seal.sink_artifact_intent_protocol,
+                open_sink_artifact_intents: seal.open_sink_artifact_intents,
                 sink_cleanup_complete: seal.sink_cleanup_complete,
             });
+        }
+        if let Some(record) =
+            Self::decode_artifact_intent_record(bytes, chunk, expected_artifact_identity_sha256)?
+        {
+            return Ok(ManifestAbortState::Intent(record));
         }
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
             return Err(CheckpointStoreError::Invalid(format!(

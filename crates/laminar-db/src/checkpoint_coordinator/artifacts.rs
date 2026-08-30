@@ -14,6 +14,8 @@ pub(super) enum AbortedSinkCleanup {
 
 struct SealedParticipantManifests {
     loaded: BTreeMap<u64, (CheckpointManifest, Bytes)>,
+    open_sink_artifact_intents:
+        BTreeMap<u64, Option<Vec<laminar_core::checkpoint::CheckpointSinkArtifactIntent>>>,
     sink_cleanup_complete: bool,
 }
 
@@ -35,6 +37,7 @@ impl CheckpointCoordinator {
             pipeline_identity: self.expected_pipeline_identity()?,
             attempt: require_canonical_attempt(attempt, "checkpoint artifact admission")?,
             assignment_fence,
+            sink_artifact_intent_protocol: self.has_checkpoint_committable_sinks(),
         };
         inventory.validate().map_err(DbError::Checkpoint)?;
         Ok(inventory)
@@ -192,7 +195,9 @@ impl CheckpointCoordinator {
                     .collect::<Vec<_>>();
                 self.cleanup_aborted_external_sinks_until(
                     inventory.attempt,
+                    &participant_ids,
                     &manifests,
+                    &sealed.open_sink_artifact_intents,
                     fencing_token,
                     deadline,
                 )
@@ -233,7 +238,13 @@ impl CheckpointCoordinator {
                 async move {
                     let artifact_identity = artifact_identity?;
                     let seal = tokio::time::timeout_at(deadline, async {
-                        store.seal_aborted_manifest(chunk, &artifact_identity).await
+                        store
+                            .seal_aborted_manifest(
+                                chunk,
+                                &artifact_identity,
+                                inventory.sink_artifact_intent_protocol,
+                            )
+                            .await
                     })
                     .await
                     .map_err(|_| {
@@ -247,10 +258,16 @@ impl CheckpointCoordinator {
             })
             .buffer_unordered(MAX_RETENTION_IO_CONCURRENCY);
         let mut loaded = BTreeMap::new();
+        let mut open_sink_artifact_intents = BTreeMap::new();
         let mut sink_cleanup_complete = true;
         while let Some(result) = manifest_seals.next().await {
             let (participant_id, seal) = result?;
             sink_cleanup_complete &= seal.sink_cleanup_complete;
+            open_sink_artifact_intents.insert(
+                participant_id,
+                seal.sink_artifact_intent_protocol
+                    .then_some(seal.open_sink_artifact_intents),
+            );
             if let Some((manifest, encoded)) = seal.original_manifest {
                 if manifest.deployment_id != inventory.deployment_id
                     || manifest.pipeline_identity != inventory.pipeline_identity
@@ -274,6 +291,7 @@ impl CheckpointCoordinator {
         }
         Ok(SealedParticipantManifests {
             loaded,
+            open_sink_artifact_intents,
             sink_cleanup_complete,
         })
     }

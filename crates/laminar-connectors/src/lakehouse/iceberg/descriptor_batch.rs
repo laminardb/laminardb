@@ -4,7 +4,10 @@ use std::collections::HashSet;
 
 use iceberg::spec::{DataContentType, DataFile};
 
-use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitPayload};
+use crate::connector::{
+    CoordinatedAbortDescriptor, CoordinatedAbortEntry, CoordinatedCommitNamespace,
+    CoordinatedCommitPayload,
+};
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{
     stable_catalog_identity, IcebergSinkConfig, ICEBERG_MAX_FILES_PER_CHECKPOINT,
@@ -24,6 +27,52 @@ pub(super) fn prepare_descriptor_files(
     entries: &[CoordinatedCommitPayload],
     table: &iceberg::table::Table,
 ) -> Result<PreparedDescriptorFiles, ConnectorError> {
+    prepare_descriptor_inputs(
+        config,
+        namespace,
+        entries.iter().map(|entry| DescriptorInput {
+            attempt: entry.attempt,
+            participant_id: entry.participant_id,
+            payload: entry.payload.as_deref(),
+        }),
+        table,
+    )
+}
+
+pub(super) fn prepare_aborted_descriptor_files(
+    config: &IcebergSinkConfig,
+    namespace: &CoordinatedCommitNamespace,
+    entries: &[CoordinatedAbortEntry],
+    table: &iceberg::table::Table,
+) -> Result<PreparedDescriptorFiles, ConnectorError> {
+    prepare_descriptor_inputs(
+        config,
+        namespace,
+        entries.iter().filter_map(|entry| match &entry.descriptor {
+            CoordinatedAbortDescriptor::Open => None,
+            CoordinatedAbortDescriptor::Prepared(payload) => Some(DescriptorInput {
+                attempt: entry.attempt,
+                participant_id: entry.participant_id,
+                payload: payload.as_deref(),
+            }),
+        }),
+        table,
+    )
+}
+
+#[derive(Clone, Copy)]
+struct DescriptorInput<'a> {
+    attempt: laminar_core::checkpoint::CheckpointAttempt,
+    participant_id: u64,
+    payload: Option<&'a [u8]>,
+}
+
+fn prepare_descriptor_inputs<'a>(
+    config: &IcebergSinkConfig,
+    namespace: &CoordinatedCommitNamespace,
+    entries: impl Iterator<Item = DescriptorInput<'a>>,
+    table: &iceberg::table::Table,
+) -> Result<PreparedDescriptorFiles, ConnectorError> {
     let mut binding: Option<IcebergTableBindingV1> = None;
     let mut data_files = Vec::new();
     let mut expected_paths = HashSet::new();
@@ -34,7 +83,7 @@ pub(super) fn prepare_descriptor_files(
         .max_files_per_checkpoint
         .min(ICEBERG_MAX_FILES_PER_CHECKPOINT);
     for entry in entries {
-        let Some(payload) = &entry.payload else {
+        let Some(payload) = entry.payload else {
             continue;
         };
         if payload.len() > descriptor_limit {
@@ -44,7 +93,7 @@ pub(super) fn prepare_descriptor_files(
             )));
         }
         let descriptor = IcebergCommitDescriptorV1::decode(payload)?;
-        validate_runtime_identity(&descriptor, namespace, entry)?;
+        validate_runtime_identity(&descriptor, namespace, entry.attempt, entry.participant_id)?;
         if descriptor.table.catalog_identity
             != stable_catalog_identity(&config.catalog, &config.storage)
         {
@@ -100,12 +149,13 @@ pub(super) fn prepare_descriptor_files(
 fn validate_runtime_identity(
     descriptor: &IcebergCommitDescriptorV1,
     namespace: &CoordinatedCommitNamespace,
-    entry: &CoordinatedCommitPayload,
+    attempt: laminar_core::checkpoint::CheckpointAttempt,
+    participant_id: u64,
 ) -> Result<(), ConnectorError> {
     if descriptor.deployment_id != namespace.deployment_id
         || descriptor.sink_id != namespace.sink_id
-        || descriptor.participant_id != entry.participant_id
-        || descriptor.epoch_id != entry.attempt.epoch
+        || descriptor.participant_id != participant_id
+        || descriptor.epoch_id != attempt.epoch
     {
         return Err(ConnectorError::TransactionError(
             "Iceberg descriptor runtime identity does not match its coordinated entry".into(),

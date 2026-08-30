@@ -5,7 +5,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     CheckpointArtifactAbortSeal, CheckpointStoreError, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
-    CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1, MAX_ABORT_SEAL_BYTES,
+    CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V2,
+    MAX_ABORT_SEAL_BYTES,
 };
 use crate::checkpoint::canonical_json_bytes;
 use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, StateChunkId};
@@ -14,9 +15,12 @@ use crate::state::KeyGroupCount;
 pub(super) enum ManifestAbortState {
     Sealed {
         original_manifest: Option<(CheckpointManifest, Bytes)>,
+        sink_artifact_intent_protocol: bool,
+        open_sink_artifact_intents: Vec<super::CheckpointSinkArtifactIntent>,
         sink_cleanup_complete: bool,
     },
     Manifest(CheckpointManifest, Bytes),
+    Intent(super::artifact_intent::CheckpointArtifactIntentRecord),
 }
 
 pub(super) fn normalize_prefix(prefix: &str) -> String {
@@ -69,15 +73,23 @@ pub(super) fn validate_abort_seal(
     validate_abort_seal_request(expected_chunk, expected_artifact_identity_sha256)?;
     if !matches!(
         seal.version,
-        CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1 | CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
+        CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1
+            | CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V2
+            | CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
     ) || seal.chunk != expected_chunk
         || seal.artifact_identity_sha256 != expected_artifact_identity_sha256
         || (seal.version == CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1 && seal.sink_cleanup_complete)
+        || (seal.version < CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION
+            && (seal.sink_artifact_intent_protocol || !seal.open_sink_artifact_intents.is_empty()))
+        || (!seal.sink_artifact_intent_protocol && !seal.open_sink_artifact_intents.is_empty())
     {
         return Err(CheckpointStoreError::Invalid(format!(
             "participant {} checkpoint {} has a different abort seal",
             expected_chunk.participant_id, expected_chunk.checkpoint_id
         )));
+    }
+    if !seal.open_sink_artifact_intents.is_empty() {
+        super::artifact_intent::validate_sink_intents(&seal.open_sink_artifact_intents)?;
     }
     Ok(())
 }

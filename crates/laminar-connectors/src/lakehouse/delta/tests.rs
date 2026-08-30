@@ -515,6 +515,15 @@ async fn test_multiple_write_batches_accumulate() {
 // Note: Epoch lifecycle with real I/O is tested in delta_io.rs integration tests.
 
 #[tokio::test]
+async fn coordinated_artifact_intent_does_not_authorize_delta_file_deletion() {
+    let mut config = test_config();
+    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    let mut sink = DeltaLakeSink::new(config, None);
+
+    assert_eq!(sink.checkpoint_artifact_intent(7).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn test_rollback_clears_buffer() {
     let mut config = test_config();
     config.max_buffer_records = 1000;

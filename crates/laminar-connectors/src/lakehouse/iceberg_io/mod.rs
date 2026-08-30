@@ -588,7 +588,12 @@ pub(crate) fn validate_loaded_table_locations(table: &Table) -> Result<(), Conne
 }
 
 pub(crate) fn effective_data_location(table: &Table) -> String {
-    let metadata = table.metadata();
+    effective_data_location_from_metadata(table.metadata())
+}
+
+pub(crate) fn effective_data_location_from_metadata(
+    metadata: &iceberg::spec::TableMetadata,
+) -> String {
     // COMPAT: this is the precedence used by Iceberg's DefaultLocationGenerator.
     metadata
         .properties()
@@ -602,7 +607,10 @@ pub(crate) fn effective_data_location(table: &Table) -> String {
         .unwrap_or_else(|| format!("{}/data", metadata.location()))
 }
 
-fn validate_credential_free_location(label: &str, location: &str) -> Result<(), ConnectorError> {
+pub(crate) fn validate_credential_free_location(
+    label: &str,
+    location: &str,
+) -> Result<(), ConnectorError> {
     if crate::security::value_contains_uri_secret(location, false) {
         return Err(ConnectorError::ReadError(format!(
             "[LDB-ICEBERG-CREDENTIAL-LOCATION] catalog {label} must not embed credentials"

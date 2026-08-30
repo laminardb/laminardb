@@ -118,6 +118,28 @@ pub struct CoordinatedCommitPayload {
     pub payload: Option<Vec<u8>>,
 }
 
+/// Whether an aborted participant reached durable phase-one preparation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordinatedAbortDescriptor {
+    /// The participant may have written files but did not durably prepare a descriptor.
+    Open,
+    /// The participant durably prepared its connector descriptor. `None` is an explicit empty cut.
+    Prepared(Option<Vec<u8>>),
+}
+
+/// One participant's durable cleanup evidence for an aborted attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatedAbortEntry {
+    /// Exact checkpoint attempt that admitted the participant.
+    pub attempt: laminar_core::checkpoint::CheckpointAttempt,
+    /// Stable nonzero runtime participant ID.
+    pub participant_id: u64,
+    /// Phase-one descriptor state retained by checkpoint persistence.
+    pub descriptor: CoordinatedAbortDescriptor,
+    /// Connector cleanup evidence persisted before `begin_epoch`, if the connector supplied it.
+    pub artifact_intent: Option<Vec<u8>>,
+}
+
 /// Exact batch submitted to a designated external-sink committer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatedCommitBatch {
@@ -144,8 +166,8 @@ pub struct CoordinatedAbortBatch {
     pub fencing_token: u64,
     /// Exact aborted checkpoint attempt.
     pub target: laminar_core::checkpoint::CheckpointAttempt,
-    /// Every durable participant marker for the aborted attempt.
-    pub entries: Vec<CoordinatedCommitPayload>,
+    /// Every admitted participant's durable cleanup evidence for the aborted attempt.
+    pub entries: Vec<CoordinatedAbortEntry>,
 }
 
 /// Runtime-owned deadline for one designated external publication.
@@ -352,16 +374,61 @@ impl CoordinatedAbortBatch {
         if self.fencing_token == 0 {
             return Err("coordinated abort fencing token must be non-zero".into());
         }
-        validate_prepared_entries(&self.namespace, self.target, &self.entries)?;
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.attempt != self.target)
-        {
-            return Err("coordinated abort entries must belong to its exact target attempt".into());
-        }
-        Ok(())
+        self.namespace
+            .validate()
+            .map_err(|error| error.to_string())?;
+        validate_abort_entries(self.target, &self.entries)
     }
+}
+
+fn validate_abort_entries(
+    target: laminar_core::checkpoint::CheckpointAttempt,
+    entries: &[CoordinatedAbortEntry],
+) -> Result<(), String> {
+    if !target.is_canonical() {
+        return Err("coordinated abort target must use one nonzero canonical checkpoint ID".into());
+    }
+    if entries.is_empty() || entries.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES {
+        return Err(format!(
+            "coordinated abort entry count must be in 1..={MAX_COORDINATED_COMMIT_BATCH_ENTRIES}"
+        ));
+    }
+    let mut previous_participant = None;
+    let mut total_payload_bytes = 0_usize;
+    for entry in entries {
+        if entry.participant_id == 0 || entry.attempt != target {
+            return Err(
+                "coordinated abort entries require nonzero participants at the exact target attempt"
+                    .into(),
+            );
+        }
+        if previous_participant.is_some_and(|previous| previous >= entry.participant_id) {
+            return Err(
+                "coordinated abort participants must be strictly ordered and unique".into(),
+            );
+        }
+        previous_participant = Some(entry.participant_id);
+        let descriptor = match &entry.descriptor {
+            CoordinatedAbortDescriptor::Open | CoordinatedAbortDescriptor::Prepared(None) => None,
+            CoordinatedAbortDescriptor::Prepared(Some(payload)) => Some(payload),
+        };
+        for payload in descriptor.into_iter().chain(entry.artifact_intent.as_ref()) {
+            if payload.len() > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
+                return Err(format!(
+                    "coordinated abort payload exceeds the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} byte limit"
+                ));
+            }
+            total_payload_bytes = total_payload_bytes
+                .checked_add(payload.len())
+                .ok_or_else(|| "coordinated abort payload byte count overflow".to_owned())?;
+            if total_payload_bytes > MAX_COORDINATED_COMMIT_BATCH_BYTES {
+                return Err(format!(
+                    "coordinated abort payloads exceed the fixed {MAX_COORDINATED_COMMIT_BATCH_BYTES} byte limit"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_prepared_entries(
@@ -433,6 +500,20 @@ fn validate_prepared_entries(
         return Err("coordinated batch target is not its final exact attempt".into());
     }
     Ok(())
+}
+
+/// Recovery-only cleanup capability detached from a participant writer.
+#[async_trait]
+pub trait CoordinatedAbortCleaner: Send + Sync {
+    /// Release exact durable participant artifacts after an authoritative Abort.
+    ///
+    /// The cleaner must remain usable after the participant writer is closed. Implementations
+    /// must be idempotent and retain any artifact whose publication status is ambiguous.
+    async fn cleanup_aborted(
+        &self,
+        batch: CoordinatedAbortBatch,
+        context: CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError>;
 }
 
 /// Leader-side commit for checkpoint-committable sinks.

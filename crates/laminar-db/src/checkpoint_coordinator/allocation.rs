@@ -194,6 +194,7 @@ impl EpochAllocator {
         }
     }
 
+    #[cfg(feature = "cluster")]
     pub(super) fn clear_sink_epoch(&self, attempt: CheckpointAttempt) {
         let mut reservation = self.sink_epoch_reservation.lock();
         if reservation.is_some_and(|current| current.attempt() == attempt) {

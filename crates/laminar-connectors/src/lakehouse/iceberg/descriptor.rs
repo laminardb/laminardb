@@ -394,7 +394,9 @@ impl IcebergCommitDescriptorV1 {
     }
 }
 
-fn validate_table_binding_shape(binding: &IcebergTableBindingV1) -> Result<(), ConnectorError> {
+pub(super) fn validate_table_binding_shape(
+    binding: &IcebergTableBindingV1,
+) -> Result<(), ConnectorError> {
     validate_descriptor_identity("catalog implementation", &binding.catalog_implementation)?;
     validate_sha256(&binding.catalog_identity, "catalog identity")?;
     validate_descriptor_identity("table identifier", &binding.table_identifier)?;
@@ -509,7 +511,8 @@ fn validate_descriptor_data_file(
                 .into(),
         ));
     }
-    let prefix = format!("{}/", effective_data_location(table));
+    let data_location = effective_data_location(table);
+    let prefix = format!("{}/", data_location.trim_end_matches('/'));
     let relative = file.file_path().strip_prefix(&prefix).ok_or_else(|| {
         ConnectorError::TransactionError(
             "[LDB-ICEBERG-DATA-FILE-LOCATION] coordinated data file is outside the table data location"

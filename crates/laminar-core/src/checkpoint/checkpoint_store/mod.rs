@@ -6,37 +6,44 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
-use sha2::{Digest, Sha256};
+use object_store::{ObjectStore, PutPayload};
 
 use crate::checkpoint::checkpoint_manifest::{
-    checkpoint_descriptor_sha256, ByteRange, CheckpointManifest, NodeDataObject,
-    PreparedSinkDescriptor, StateChunkId,
+    checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, ByteRange, CheckpointManifest,
+    PreparedSinkArtifactIntent, PreparedSinkDescriptor, StateChunkId,
 };
 use crate::checkpoint::{canonical_json_bytes, OutputSegmentRef};
 use crate::state::{KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID};
 
 mod abort_seal;
 mod artifact_identity;
+mod artifact_intent;
+mod artifact_payload;
 mod conditional_probe;
+mod object_store_io;
 mod subscription_segments;
 mod validation;
 
 pub use artifact_identity::checkpoint_artifact_identity_sha256;
+pub use artifact_intent::{
+    CheckpointSinkArtifactIntent, MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_AGGREGATE_BYTES,
+    MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_BYTES,
+};
 pub use conditional_probe::{
     probe_object_store_conditional_create, probe_object_store_conditional_update,
 };
 pub use subscription_segments::SubscriptionOrphanCleanup;
 pub use validation::validate_max_checkpoint_node_data_bytes;
 use validation::{
-    checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, missing_node_data,
-    normalize_prefix, sha256, validate_abort_seal_request, validate_node_data_layout,
-    ManifestAbortState,
+    checkpoint_artifact_abort_seal_bytes, ensure_manifest_valid, normalize_prefix, sha256,
+    validate_abort_seal_request, validate_node_data_layout, ManifestAbortState,
 };
 
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_ABORT_SEAL_BYTES: u64 = MAX_MANIFEST_BYTES + 64 * 1024;
-const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION: u32 = 2;
+const MAX_ABORT_SEAL_BYTES: u64 =
+    MAX_MANIFEST_BYTES + artifact_intent::MAX_CHECKPOINT_ARTIFACT_INTENT_RECORD_BYTES + 64 * 1024;
+const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION: u32 = 3;
+const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V2: u32 = 2;
 const CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1: u32 = 1;
 
 /// Default maximum size of one participant's checkpoint data object.
@@ -77,6 +84,10 @@ struct CheckpointArtifactAbortSeal {
     chunk: StateChunkId,
     original_manifest: Option<CheckpointManifest>,
     #[serde(default, skip_serializing_if = "is_false")]
+    sink_artifact_intent_protocol: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    open_sink_artifact_intents: Vec<CheckpointSinkArtifactIntent>,
+    #[serde(default, skip_serializing_if = "is_false")]
     sink_cleanup_complete: bool,
 }
 
@@ -89,6 +100,10 @@ const fn is_false(value: &bool) -> bool {
 pub struct CheckpointManifestAbortSeal {
     /// Original prepared manifest, when that participant completed persistence.
     pub original_manifest: Option<(CheckpointManifest, Bytes)>,
+    /// Whether absence of an intent proves this participant never entered `begin_epoch`.
+    pub sink_artifact_intent_protocol: bool,
+    /// Begin-time intents retained when phase one never produced a participant manifest.
+    pub open_sink_artifact_intents: Vec<CheckpointSinkArtifactIntent>,
     /// Whether exact connector cleanup completed before node data may be sealed.
     pub sink_cleanup_complete: bool,
 }
@@ -98,6 +113,14 @@ impl std::fmt::Debug for CheckpointManifestAbortSeal {
         formatter
             .debug_struct("CheckpointManifestAbortSeal")
             .field("has_original_manifest", &self.original_manifest.is_some())
+            .field(
+                "sink_artifact_intent_protocol",
+                &self.sink_artifact_intent_protocol,
+            )
+            .field(
+                "open_sink_artifact_intent_count",
+                &self.open_sink_artifact_intents.len(),
+            )
             .field("sink_cleanup_complete", &self.sink_cleanup_complete)
             .finish()
     }
@@ -127,12 +150,22 @@ pub trait CheckpointStore: Send + Sync {
         node_data: &[Bytes],
     ) -> Result<Bytes, CheckpointStoreError>;
 
-    /// Replace this exact aborted manifest path with a monotone seal. If a valid manifest was
-    /// already durable, preserve it inside the seal and return it with its canonical bytes.
+    /// Persist every committable sink's bounded cleanup intent before `begin_epoch`.
+    async fn save_sink_artifact_intents(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+        intents: Vec<CheckpointSinkArtifactIntent>,
+    ) -> Result<(), CheckpointStoreError>;
+
+    /// Replace this exact aborted manifest path with a monotone seal. The protocol flag must come
+    /// from the exact active artifact inventory. If a valid manifest was already durable,
+    /// preserve it inside the seal and return it with its canonical bytes.
     async fn seal_aborted_manifest(
         &self,
         chunk: StateChunkId,
         expected_artifact_identity_sha256: &str,
+        sink_artifact_intent_protocol: bool,
     ) -> Result<CheckpointManifestAbortSeal, CheckpointStoreError>;
 
     /// Mark exact prepared-sink cleanup complete on an already sealed manifest.
@@ -195,41 +228,34 @@ pub trait CheckpointStore: Send + Sync {
         manifest: &CheckpointManifest,
         descriptor: &PreparedSinkDescriptor,
     ) -> Result<Option<Bytes>, CheckpointStoreError> {
-        let Some(range) = descriptor.payload else {
-            let expected = checkpoint_descriptor_sha256(None);
-            if descriptor.sha256 != expected {
-                return Err(CheckpointStoreError::Invalid(format!(
-                    "prepared sink '{}' absence digest mismatch",
-                    descriptor.sink_name
-                )));
-            }
-            return Ok(None);
-        };
-        let mut payloads = self
-            .load_node_data_ranges(
-                manifest.node_data.chunk,
-                manifest.node_data.object_length,
-                &[range],
-            )
-            .await?
-            .ok_or_else(|| missing_node_data(manifest.node_data.chunk))?;
-        if payloads.len() != 1 {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "one descriptor range produced {} payloads",
-                payloads.len()
-            )));
-        }
-        let bytes = payloads
-            .pop()
-            .expect("one descriptor payload was validated");
-        let actual = checkpoint_descriptor_sha256(Some(&bytes));
-        if actual != descriptor.sha256 {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "prepared sink '{}' descriptor checksum mismatch",
-                descriptor.sink_name
-            )));
-        }
-        Ok(Some(bytes))
+        artifact_payload::load_optional(
+            self,
+            manifest,
+            &descriptor.sink_name,
+            descriptor.payload,
+            &descriptor.sha256,
+            checkpoint_descriptor_sha256,
+            "prepared sink descriptor",
+        )
+        .await
+    }
+
+    /// Read and verify one begin-time sink artifact intent.
+    async fn load_sink_artifact_intent(
+        &self,
+        manifest: &CheckpointManifest,
+        intent: &PreparedSinkArtifactIntent,
+    ) -> Result<Option<Bytes>, CheckpointStoreError> {
+        artifact_payload::load_optional(
+            self,
+            manifest,
+            &intent.sink_name,
+            intent.payload,
+            &intent.sha256,
+            checkpoint_artifact_intent_sha256,
+            "sink artifact intent",
+        )
+        .await
     }
 
     /// Create an immutable subscription segment, accepting an identical retry only.
@@ -277,284 +303,7 @@ pub struct ObjectStoreCheckpointStore {
     key_group_count: KeyGroupCount,
     participant_id: u64,
     max_node_data_bytes: u64,
-}
-
-impl ObjectStoreCheckpointStore {
-    /// Create a store beneath a deployment-relative prefix.
-    ///
-    /// Node namespaces are derived as `{prefix}/nodes/{participant_id}/`; callers must not include
-    /// a node id in `prefix`.
-    #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: &str) -> Self {
-        Self {
-            store,
-            prefix: normalize_prefix(prefix),
-            key_group_count: DEFAULT_KEY_GROUP_COUNT,
-            participant_id: LOCAL_NODE_ID.0,
-            max_node_data_bytes: DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
-        }
-    }
-
-    /// Bind the store to one nonzero node id.
-    #[must_use]
-    pub fn with_participant_id(mut self, participant_id: u64) -> Self {
-        self.participant_id = participant_id;
-        self
-    }
-
-    /// Set the exact vnode topology.
-    #[must_use]
-    pub fn with_key_group_count(mut self, key_group_count: KeyGroupCount) -> Self {
-        self.key_group_count = key_group_count;
-        self
-    }
-
-    /// Set the node-object byte limit.
-    ///
-    /// # Errors
-    /// Returns an error for zero or unrepresentable limits.
-    pub fn with_max_node_data_bytes(mut self, limit: u64) -> Result<Self, CheckpointStoreError> {
-        validate_max_checkpoint_node_data_bytes(limit)?;
-        self.max_node_data_bytes = limit;
-        Ok(self)
-    }
-
-    fn manifest_path(&self, chunk: StateChunkId) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}nodes/{}/checkpoints/{:020}/manifest.json",
-            self.prefix, chunk.participant_id, chunk.checkpoint_id
-        ))
-    }
-
-    fn node_data_path(&self, chunk: StateChunkId) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}nodes/{}/checkpoints/{:020}/node-data.bin",
-            self.prefix, chunk.participant_id, chunk.checkpoint_id
-        ))
-    }
-
-    async fn load_bounded_manifest_bytes(
-        &self,
-        chunk: StateChunkId,
-    ) -> Result<Option<Bytes>, CheckpointStoreError> {
-        let path = self.manifest_path(chunk);
-        let result = match self.store.get(&path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if result.meta.size > MAX_MANIFEST_BYTES {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "manifest is {} bytes, exceeding the {MAX_MANIFEST_BYTES}-byte limit",
-                result.meta.size
-            )));
-        }
-        let expected_size = result.meta.size;
-        let bytes = result.bytes().await?;
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_size {
-            return Err(CheckpointStoreError::Invalid(
-                "manifest length changed while being read".into(),
-            ));
-        }
-        Ok(Some(bytes))
-    }
-
-    fn decode_manifest(
-        &self,
-        chunk: StateChunkId,
-        bytes: &[u8],
-    ) -> Result<CheckpointManifest, CheckpointStoreError> {
-        let manifest: CheckpointManifest = serde_json::from_slice(bytes)?;
-        ensure_manifest_valid(
-            &manifest,
-            chunk.participant_id,
-            self.key_group_count,
-            self.max_node_data_bytes,
-        )?;
-        if manifest.checkpoint_id != chunk.checkpoint_id {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "manifest path for checkpoint {} contains checkpoint {}",
-                chunk.checkpoint_id, manifest.checkpoint_id
-            )));
-        }
-        Ok(manifest)
-    }
-
-    async fn load_bounded_manifest(
-        &self,
-        chunk: StateChunkId,
-    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        let Some(bytes) = self.load_bounded_manifest_bytes(chunk).await? else {
-            return Ok(None);
-        };
-        self.decode_manifest(chunk, &bytes).map(Some)
-    }
-
-    async fn overwrite(
-        &self,
-        path: &object_store::path::Path,
-        bytes: Bytes,
-    ) -> Result<(), CheckpointStoreError> {
-        self.store
-            .put_opts(
-                path,
-                PutPayload::from_bytes(bytes),
-                PutOptions {
-                    mode: PutMode::Overwrite,
-                    ..PutOptions::default()
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn create_immutable(
-        &self,
-        path: &object_store::path::Path,
-        payload: PutPayload,
-    ) -> Result<bool, CheckpointStoreError> {
-        let options = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        match self.store.put_opts(path, payload, options).await {
-            Ok(_) => Ok(true),
-            Err(
-                object_store::Error::AlreadyExists { .. }
-                | object_store::Error::Precondition { .. },
-            ) => Ok(false),
-            Err(
-                object_store::Error::NotImplemented { .. }
-                | object_store::Error::NotSupported { .. },
-            ) => Err(CheckpointStoreError::Invalid(format!(
-                "object store does not support conditional create for '{path}'"
-            ))),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn existing_node_data_matches(
-        &self,
-        object: &NodeDataObject,
-    ) -> Result<bool, CheckpointStoreError> {
-        use futures::TryStreamExt;
-
-        let path = self.node_data_path(object.chunk);
-        let meta = match self.store.head(&path).await {
-            Ok(meta) => meta,
-            Err(object_store::Error::NotFound { .. }) => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if meta.size != object.object_length || meta.size > self.max_node_data_bytes {
-            return Ok(false);
-        }
-        let result = self.store.get(&path).await?;
-        if result.meta.size != object.object_length {
-            return Ok(false);
-        }
-        let mut length = 0_u64;
-        let mut digest = Sha256::new();
-        let mut stream = result.into_stream();
-        while let Some(bytes) = stream.try_next().await? {
-            length = length
-                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                .ok_or_else(|| CheckpointStoreError::Invalid("node data length overflow".into()))?;
-            if length > object.object_length {
-                return Ok(false);
-            }
-            digest.update(bytes);
-        }
-        Ok(length == object.object_length && format!("{:x}", digest.finalize()) == object.sha256)
-    }
-
-    async fn delete_exact(
-        &self,
-        path: &object_store::path::Path,
-    ) -> Result<(), CheckpointStoreError> {
-        match self.store.delete(path).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn load_node_data_ranges_inner(
-        &self,
-        chunk: StateChunkId,
-        expected_object_length: u64,
-        ranges: &[ByteRange],
-    ) -> Result<Option<Vec<Bytes>>, CheckpointStoreError> {
-        let path = self.node_data_path(chunk);
-        let meta = match self.store.head(&path).await {
-            Ok(meta) => meta,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        if meta.size > self.max_node_data_bytes {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "node data object is {} bytes, exceeding the {}-byte limit",
-                meta.size, self.max_node_data_bytes
-            )));
-        }
-        if meta.size != expected_object_length {
-            return Err(CheckpointStoreError::Invalid(format!(
-                "node data object is {} bytes, expected {expected_object_length}",
-                meta.size
-            )));
-        }
-
-        let mut nonempty = Vec::new();
-        for range in ranges {
-            let Some(end) = range.end() else {
-                return Err(CheckpointStoreError::Invalid(
-                    "node data range overflows".into(),
-                ));
-            };
-            if end > meta.size {
-                return Err(CheckpointStoreError::Invalid(format!(
-                    "node data range {}..{end} exceeds {} bytes",
-                    range.offset, meta.size
-                )));
-            }
-            if range.length != 0 {
-                nonempty.push(range.offset..end);
-            }
-        }
-        let loaded = if nonempty.is_empty() {
-            Vec::new()
-        } else {
-            object_store::coalesce_ranges(
-                &nonempty,
-                |range| self.store.get_range(&path, range),
-                0, // non-adjacent reads must not pin unaccounted gap bytes
-            )
-            .await?
-        };
-        let mut loaded = loaded.into_iter();
-        let mut result = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            if range.length == 0 {
-                result.push(Bytes::new());
-            } else {
-                let bytes = loaded.next().ok_or_else(|| {
-                    CheckpointStoreError::Invalid(
-                        "object store returned too few range payloads".into(),
-                    )
-                })?;
-                if u64::try_from(bytes.len()).ok() != Some(range.length) {
-                    return Err(CheckpointStoreError::Invalid(
-                        "object store returned a range with the wrong length".into(),
-                    ));
-                }
-                result.push(bytes);
-            }
-        }
-        if loaded.next().is_some() {
-            return Err(CheckpointStoreError::Invalid(
-                "object store returned too many range payloads".into(),
-            ));
-        }
-        Ok(Some(result))
-    }
+    exclusive_writer: bool,
 }
 
 #[async_trait]
@@ -610,10 +359,14 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             .await?
         {
             match self
-                .load_bounded_manifest_bytes(manifest.node_data.chunk)
+                .load_manifest_or_abort_seal_bytes(manifest.node_data.chunk)
                 .await?
             {
                 Some(existing) if existing == encoded => {}
+                Some(existing)
+                    if self
+                        .promote_artifact_intent_to_manifest(manifest, encoded.clone(), &existing)
+                        .await? => {}
                 Some(_) => {
                     return Err(CheckpointStoreError::Invalid(format!(
                         "checkpoint {} manifest already exists with different immutable content",
@@ -631,10 +384,21 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         Ok(encoded)
     }
 
+    async fn save_sink_artifact_intents(
+        &self,
+        chunk: StateChunkId,
+        expected_artifact_identity_sha256: &str,
+        intents: Vec<CheckpointSinkArtifactIntent>,
+    ) -> Result<(), CheckpointStoreError> {
+        self.save_artifact_intent_record(chunk, expected_artifact_identity_sha256, intents)
+            .await
+    }
+
     async fn seal_aborted_manifest(
         &self,
         chunk: StateChunkId,
         expected_artifact_identity_sha256: &str,
+        sink_artifact_intent_protocol: bool,
     ) -> Result<CheckpointManifestAbortSeal, CheckpointStoreError> {
         validate_abort_seal_request(chunk, expected_artifact_identity_sha256)?;
         let empty_seal = CheckpointArtifactAbortSeal {
@@ -642,6 +406,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
             chunk,
             original_manifest: None,
+            sink_artifact_intent_protocol,
+            open_sink_artifact_intents: Vec::new(),
             sink_cleanup_complete: false,
         };
         let empty_seal_bytes = checkpoint_artifact_abort_seal_bytes(&empty_seal)?;
@@ -652,6 +418,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         {
             return Ok(CheckpointManifestAbortSeal {
                 original_manifest: None,
+                sink_artifact_intent_protocol,
+                open_sink_artifact_intents: Vec::new(),
                 sink_cleanup_complete: false,
             });
         }
@@ -672,23 +440,60 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         )? {
             ManifestAbortState::Sealed {
                 original_manifest,
+                sink_artifact_intent_protocol,
+                open_sink_artifact_intents,
                 sink_cleanup_complete,
             } => Ok(CheckpointManifestAbortSeal {
                 original_manifest,
+                sink_artifact_intent_protocol,
+                open_sink_artifact_intents,
                 sink_cleanup_complete,
             }),
             ManifestAbortState::Manifest(manifest, canonical) => {
+                let sink_artifact_intent_protocol = !manifest.sink_artifact_intents.is_empty();
                 let seal = CheckpointArtifactAbortSeal {
                     version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
                     artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
                     chunk,
                     original_manifest: Some(manifest.clone()),
+                    sink_artifact_intent_protocol,
+                    open_sink_artifact_intents: Vec::new(),
                     sink_cleanup_complete: false,
                 };
-                self.overwrite(&path, checkpoint_artifact_abort_seal_bytes(&seal)?)
-                    .await?;
+                self.replace_exact(
+                    &path,
+                    &current,
+                    checkpoint_artifact_abort_seal_bytes(&seal)?,
+                )
+                .await?;
                 Ok(CheckpointManifestAbortSeal {
                     original_manifest: Some((manifest, canonical)),
+                    sink_artifact_intent_protocol,
+                    open_sink_artifact_intents: Vec::new(),
+                    sink_cleanup_complete: false,
+                })
+            }
+            ManifestAbortState::Intent(record) => {
+                let open_sink_artifact_intents = record.sink_intents().to_vec();
+                let seal = CheckpointArtifactAbortSeal {
+                    version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
+                    artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
+                    chunk,
+                    original_manifest: None,
+                    sink_artifact_intent_protocol: true,
+                    open_sink_artifact_intents: open_sink_artifact_intents.clone(),
+                    sink_cleanup_complete: false,
+                };
+                self.replace_exact(
+                    &path,
+                    &current,
+                    checkpoint_artifact_abort_seal_bytes(&seal)?,
+                )
+                .await?;
+                Ok(CheckpointManifestAbortSeal {
+                    original_manifest: None,
+                    sink_artifact_intent_protocol: true,
+                    open_sink_artifact_intents,
                     sink_cleanup_complete: false,
                 })
             }
@@ -713,6 +518,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             })?;
         let ManifestAbortState::Sealed {
             original_manifest,
+            sink_artifact_intent_protocol,
+            open_sink_artifact_intents,
             sink_cleanup_complete,
         } = self.decode_manifest_abort_state(chunk, expected_artifact_identity_sha256, &current)?
         else {
@@ -724,6 +531,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         if sink_cleanup_complete {
             return Ok(CheckpointManifestAbortSeal {
                 original_manifest,
+                sink_artifact_intent_protocol,
+                open_sink_artifact_intents,
                 sink_cleanup_complete,
             });
         }
@@ -734,12 +543,20 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             original_manifest: original_manifest
                 .as_ref()
                 .map(|(manifest, _)| manifest.clone()),
+            sink_artifact_intent_protocol,
+            open_sink_artifact_intents: open_sink_artifact_intents.clone(),
             sink_cleanup_complete: true,
         };
-        self.overwrite(&path, checkpoint_artifact_abort_seal_bytes(&seal)?)
-            .await?;
+        self.replace_exact(
+            &path,
+            &current,
+            checkpoint_artifact_abort_seal_bytes(&seal)?,
+        )
+        .await?;
         Ok(CheckpointManifestAbortSeal {
             original_manifest,
+            sink_artifact_intent_protocol,
+            open_sink_artifact_intents,
             sink_cleanup_complete: true,
         })
     }
@@ -780,12 +597,20 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
                     chunk.participant_id, chunk.checkpoint_id
                 )));
             }
+            ManifestAbortState::Intent(..) => {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "participant {} checkpoint {} sink intent is not sealed",
+                    chunk.participant_id, chunk.checkpoint_id
+                )));
+            }
         }
         let seal = CheckpointArtifactAbortSeal {
             version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION,
             artifact_identity_sha256: expected_artifact_identity_sha256.to_owned(),
             chunk,
             original_manifest: None,
+            sink_artifact_intent_protocol: false,
+            open_sink_artifact_intents: Vec::new(),
             sink_cleanup_complete: false,
         };
         let encoded = checkpoint_artifact_abort_seal_bytes(&seal)?;

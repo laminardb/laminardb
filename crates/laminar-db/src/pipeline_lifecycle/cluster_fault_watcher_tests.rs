@@ -340,6 +340,7 @@ async fn clean_prestart_artifact_audit_does_not_fault_on_later_live_inventory() 
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -389,6 +390,7 @@ async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -454,6 +456,7 @@ async fn startup_fence_invalidates_prior_clean_artifact_audit() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -489,6 +492,7 @@ async fn mismatched_prestart_artifact_audit_falls_back_to_durable_inventory() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await

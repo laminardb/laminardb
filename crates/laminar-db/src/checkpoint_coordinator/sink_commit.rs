@@ -1,12 +1,13 @@
 use futures::{stream::FuturesOrdered, StreamExt};
 use laminar_connectors::connector::{
-    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitCursor,
-    CoordinatedCommitNamespace, CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
+    CoordinatedAbortBatch, CoordinatedAbortDescriptor, CoordinatedAbortEntry,
+    CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+    CoordinatedCommitPayload, MAX_COORDINATED_COMMIT_BATCH_BYTES,
     MAX_COORDINATED_COMMIT_BATCH_ENTRIES, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
 use laminar_core::checkpoint::{
-    CheckpointAttempt, CheckpointManifest, CheckpointStore, PipelineIdentity,
-    PreparedSinkDescriptor,
+    CheckpointAttempt, CheckpointManifest, CheckpointSinkArtifactIntent, CheckpointStore,
+    PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
 };
 
 use super::{CheckpointCoordinator, DbError, RegisteredSink};
@@ -57,11 +58,13 @@ impl CheckpointCoordinator {
     pub(super) async fn cleanup_aborted_external_sinks_until(
         &self,
         attempt: CheckpointAttempt,
+        participant_ids: &[u64],
         manifests: &[&CheckpointManifest],
+        open_intents: &std::collections::BTreeMap<u64, Option<Vec<CheckpointSinkArtifactIntent>>>,
         fencing_token: u64,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        if !self.has_checkpoint_committable_sinks() || manifests.is_empty() {
+        if !self.has_checkpoint_committable_sinks() {
             return Ok(());
         }
         if fencing_token == 0 {
@@ -80,7 +83,9 @@ impl CheckpointCoordinator {
             active.push_back(self.cleanup_aborted_external_sink_until(
                 sink,
                 attempt,
+                participant_ids,
                 manifests,
+                open_intents,
                 fencing_token,
                 &identity,
                 &deployment_id,
@@ -96,7 +101,9 @@ impl CheckpointCoordinator {
                 active.push_back(self.cleanup_aborted_external_sink_until(
                     sink,
                     attempt,
+                    participant_ids,
                     manifests,
+                    open_intents,
                     fencing_token,
                     &identity,
                     &deployment_id,
@@ -112,7 +119,9 @@ impl CheckpointCoordinator {
         &self,
         sink: &RegisteredSink,
         attempt: CheckpointAttempt,
+        participant_ids: &[u64],
         manifests: &[&CheckpointManifest],
+        open_intents: &std::collections::BTreeMap<u64, Option<Vec<CheckpointSinkArtifactIntent>>>,
         fencing_token: u64,
         identity: &PipelineIdentity,
         deployment_id: &str,
@@ -125,8 +134,36 @@ impl CheckpointCoordinator {
         )
         .map_err(|error| DbError::Checkpoint(error.to_string()))?;
         let entries = self
-            .load_external_sink_entries(sink, attempt, manifests, deadline)
+            .load_external_sink_abort_entries(
+                sink,
+                attempt,
+                participant_ids,
+                manifests,
+                open_intents,
+                deadline,
+            )
             .await?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let Some(cleaner) = sink.abort_cleaner.as_ref() else {
+            if entries.iter().any(|entry| entry.artifact_intent.is_some()) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-CHECKPOINT-ABORT-CLEANER-MISSING] sink '{}' persisted abort-cleanup evidence but exposed no detached cleaner",
+                    sink.name
+                )));
+            }
+            return Ok(());
+        };
+        if sink
+            .abort_cleaner_retired
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "sink '{}' abort cleaner was retired after an ambiguous recovery operation",
+                sink.name
+            )));
+        }
         let batch = CoordinatedAbortBatch {
             namespace,
             fencing_token,
@@ -136,15 +173,124 @@ impl CheckpointCoordinator {
         batch.validate_shape().map_err(|error| {
             DbError::Checkpoint(format!("sink '{}' abort cleanup batch: {error}", sink.name))
         })?;
-        sink.handle
-            .cleanup_aborted_until(batch, deadline)
-            .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
+        let mut cleanup = std::pin::pin!(cleaner.cleanup_aborted(
+            batch,
+            laminar_connectors::connector::CoordinatedCommitContext::new(deadline),
+        ));
+        #[cfg(feature = "cluster")]
+        let result = if let Some(controller) = self.cluster_controller.as_ref() {
+            tokio::select! {
+                biased;
+                () = controller.wait_for_process_lease_loss() => {
+                    sink.abort_cleaner_retired
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Err(DbError::Checkpoint(format!(
+                        "sink '{}' lost process authority during aborted artifact cleanup",
+                        sink.name
+                    )));
+                }
+                result = tokio::time::timeout_at(deadline, cleanup.as_mut()) => result,
+            }
+        } else {
+            tokio::time::timeout_at(deadline, cleanup.as_mut()).await
+        };
+        #[cfg(not(feature = "cluster"))]
+        let result = tokio::time::timeout_at(deadline, cleanup.as_mut()).await;
+
+        match result {
+            Err(_) => {
+                sink.abort_cleaner_retired
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Err(DbError::Checkpoint(format!(
+                    "sink '{}' aborted artifact cleanup exceeded its recovery deadline",
+                    sink.name
+                )))
+            }
+            Ok(Err(error)) => {
+                if error.is_outcome_unknown() {
+                    sink.abort_cleaner_retired
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(DbError::Checkpoint(format!(
                     "sink '{}' aborted artifact cleanup failed: {error}",
                     sink.name
-                ))
-            })
+                )))
+            }
+            Ok(Ok(())) => Ok(()),
+        }
+    }
+
+    pub(super) async fn load_external_sink_abort_entries(
+        &self,
+        sink: &RegisteredSink,
+        attempt: CheckpointAttempt,
+        participant_ids: &[u64],
+        manifests: &[&CheckpointManifest],
+        open_intents: &std::collections::BTreeMap<u64, Option<Vec<CheckpointSinkArtifactIntent>>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<CoordinatedAbortEntry>, DbError> {
+        if participant_ids.is_empty()
+            || participant_ids.len() > MAX_COORDINATED_COMMIT_BATCH_ENTRIES
+            || participant_ids.contains(&0)
+            || !participant_ids.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Err(DbError::Checkpoint(
+                "aborted sink cleanup participant roster is not canonical".into(),
+            ));
+        }
+        let manifest_count = manifests.len();
+        let manifests = manifests
+            .iter()
+            .map(|manifest| (manifest.participant_id, *manifest))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if manifests.len() != manifest_count
+            || manifests
+                .keys()
+                .any(|participant| participant_ids.binary_search(participant).is_err())
+            || !open_intents
+                .keys()
+                .copied()
+                .eq(participant_ids.iter().copied())
+        {
+            return Err(DbError::Checkpoint(
+                "aborted sink cleanup evidence does not match the participant roster".into(),
+            ));
+        }
+        validate_abort_payload_bounds(&sink.name, participant_ids, &manifests, open_intents)?;
+        let mut pending = participant_ids.iter().copied();
+        let mut active = FuturesOrdered::new();
+        for participant_id in pending
+            .by_ref()
+            .take(MAX_EXTERNAL_SINK_DESCRIPTOR_READ_CONCURRENCY)
+        {
+            active.push_back(load_external_sink_abort_entry(
+                self.store.as_ref(),
+                &sink.name,
+                attempt,
+                participant_id,
+                manifests.get(&participant_id).copied(),
+                open_intents.get(&participant_id),
+                deadline,
+            ));
+        }
+        let mut entries = Vec::with_capacity(participant_ids.len());
+        while let Some(entry) = active.next().await {
+            if let Some(entry) = entry? {
+                entries.push(entry);
+            }
+            if let Some(participant_id) = pending.next() {
+                active.push_back(load_external_sink_abort_entry(
+                    self.store.as_ref(),
+                    &sink.name,
+                    attempt,
+                    participant_id,
+                    manifests.get(&participant_id).copied(),
+                    open_intents.get(&participant_id),
+                    deadline,
+                ));
+            }
+        }
+        Ok(entries)
     }
 
     pub(super) async fn commit_external_sinks_until(
@@ -344,6 +490,182 @@ impl CheckpointCoordinator {
         entries.sort_unstable_by_key(|entry| entry.participant_id);
         Ok(entries)
     }
+}
+
+fn validate_abort_payload_bounds(
+    sink_name: &str,
+    participant_ids: &[u64],
+    manifests: &std::collections::BTreeMap<u64, &CheckpointManifest>,
+    open_intents: &std::collections::BTreeMap<u64, Option<Vec<CheckpointSinkArtifactIntent>>>,
+) -> Result<(), DbError> {
+    let per_entry_limit = u64::try_from(MAX_COORDINATED_COMMIT_PAYLOAD_BYTES)
+        .map_err(|_| DbError::Checkpoint("external sink payload limit exceeds u64".into()))?;
+    let aggregate_limit = u64::try_from(MAX_COORDINATED_COMMIT_BATCH_BYTES)
+        .map_err(|_| DbError::Checkpoint("external sink aggregate limit exceeds u64".into()))?;
+    let mut aggregate = 0_u64;
+    for participant_id in participant_ids {
+        let lengths = if let Some(manifest) = manifests.get(participant_id) {
+            let descriptor = find_prepared_sink_descriptor(manifest, sink_name)?;
+            let intent = find_prepared_sink_artifact_intent(manifest, sink_name);
+            [
+                descriptor.payload.map(|range| range.length),
+                intent.and_then(|intent| intent.payload.map(|range| range.length)),
+            ]
+        } else {
+            let protocol = open_intents.get(participant_id).ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aborted participant {participant_id} has no sealed artifact state"
+                ))
+            })?;
+            let intents = protocol.as_ref().ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "[LDB-CHECKPOINT-LEGACY-SINK-INTENT] aborted participant {participant_id} predates durable sink artifact admission"
+                ))
+            })?;
+            if intents.is_empty() {
+                [None, None]
+            } else {
+                let intent = intents
+                    .binary_search_by(|intent| intent.sink_name.as_str().cmp(sink_name))
+                    .ok()
+                    .map(|index| &intents[index])
+                    .ok_or_else(|| {
+                        DbError::Checkpoint(format!(
+                            "aborted participant {participant_id} has no artifact intent for sink '{sink_name}'"
+                        ))
+                    })?;
+                let intent_length = intent
+                    .payload
+                    .as_ref()
+                    .map(|payload| {
+                        u64::try_from(payload.len()).map_err(|_| {
+                            DbError::Checkpoint("external sink payload length exceeds u64".into())
+                        })
+                    })
+                    .transpose()?;
+                [None, intent_length]
+            }
+        };
+        for length in lengths.into_iter().flatten() {
+            if length > per_entry_limit {
+                return Err(DbError::Checkpoint(format!(
+                    "sink '{sink_name}' participant {participant_id} abort payload exceeds {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} bytes"
+                )));
+            }
+            aggregate = aggregate
+                .checked_add(length)
+                .ok_or_else(|| DbError::Checkpoint("external sink payload byte overflow".into()))?;
+            if aggregate > aggregate_limit {
+                return Err(DbError::Checkpoint(format!(
+                    "sink '{sink_name}' abort payloads exceed {MAX_COORDINATED_COMMIT_BATCH_BYTES} aggregate bytes"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn load_external_sink_abort_entry(
+    store: &dyn CheckpointStore,
+    sink_name: &str,
+    attempt: CheckpointAttempt,
+    participant_id: u64,
+    manifest: Option<&CheckpointManifest>,
+    open_intents: Option<&Option<Vec<CheckpointSinkArtifactIntent>>>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<CoordinatedAbortEntry>, DbError> {
+    let Some(manifest) = manifest else {
+        let intent_protocol = open_intents.ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "aborted participant {participant_id} has no sealed artifact state"
+            ))
+        })?;
+        let intents = intent_protocol.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "[LDB-CHECKPOINT-LEGACY-SINK-INTENT] aborted participant {participant_id} predates durable sink artifact admission"
+            ))
+        })?;
+        if intents.is_empty() {
+            return Ok(None);
+        }
+        let intent = intents
+            .binary_search_by(|intent| intent.sink_name.as_str().cmp(sink_name))
+            .ok()
+            .map(|index| &intents[index])
+            .ok_or_else(|| {
+                DbError::Checkpoint(format!(
+                    "aborted participant {participant_id} has no artifact intent for sink '{sink_name}'"
+                ))
+            })?;
+        return Ok(Some(CoordinatedAbortEntry {
+            attempt,
+            participant_id,
+            descriptor: CoordinatedAbortDescriptor::Open,
+            artifact_intent: intent.payload.clone(),
+        }));
+    };
+    let descriptor = find_prepared_sink_descriptor(manifest, sink_name)?;
+    let intent = find_prepared_sink_artifact_intent(manifest, sink_name);
+    let descriptor_payload = tokio::time::timeout_at(
+        deadline,
+        store.load_prepared_sink_descriptor(manifest, descriptor),
+    )
+    .await
+    .map_err(|_| {
+        DbError::Checkpoint(format!(
+            "sink '{sink_name}' descriptor read timed out for participant {participant_id}"
+        ))
+    })?
+    .map_err(DbError::from)?
+    .map(|bytes| bytes.to_vec());
+    let artifact_intent = match intent {
+        Some(intent) => {
+            tokio::time::timeout_at(deadline, store.load_sink_artifact_intent(manifest, intent))
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                "sink '{sink_name}' artifact intent read timed out for participant {participant_id}"
+            ))
+                })?
+                .map_err(DbError::from)?
+                .map(|bytes| bytes.to_vec())
+        }
+        None => None,
+    };
+    Ok(Some(CoordinatedAbortEntry {
+        attempt,
+        participant_id,
+        descriptor: CoordinatedAbortDescriptor::Prepared(descriptor_payload),
+        artifact_intent,
+    }))
+}
+
+fn find_prepared_sink_descriptor<'a>(
+    manifest: &'a CheckpointManifest,
+    sink_name: &str,
+) -> Result<&'a PreparedSinkDescriptor, DbError> {
+    manifest
+        .prepared_sinks
+        .binary_search_by(|descriptor| descriptor.sink_name.as_str().cmp(sink_name))
+        .ok()
+        .map(|index| &manifest.prepared_sinks[index])
+        .ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "participant {} has no prepared descriptor for sink '{sink_name}'",
+                manifest.participant_id
+            ))
+        })
+}
+
+fn find_prepared_sink_artifact_intent<'a>(
+    manifest: &'a CheckpointManifest,
+    sink_name: &str,
+) -> Option<&'a PreparedSinkArtifactIntent> {
+    manifest
+        .sink_artifact_intents
+        .binary_search_by(|intent| intent.sink_name.as_str().cmp(sink_name))
+        .ok()
+        .map(|index| &manifest.sink_artifact_intents[index])
 }
 
 async fn load_external_sink_entry(

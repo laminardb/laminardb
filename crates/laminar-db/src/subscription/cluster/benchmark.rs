@@ -280,6 +280,7 @@ impl BenchmarkFixture {
                     pipeline_identity: PipelineIdentity::empty(),
                     attempt,
                     assignment_fence: Some(self.assignment.clone()),
+                    sink_artifact_intent_protocol: true,
                 },
             )
             .await

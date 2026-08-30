@@ -13,7 +13,8 @@ pub use contracts::{
     SourceTopology,
 };
 pub use coordinated_commit::{
-    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitContext,
+    CoordinatedAbortBatch, CoordinatedAbortCleaner, CoordinatedAbortDescriptor,
+    CoordinatedAbortEntry, CoordinatedCommitBatch, CoordinatedCommitContext,
     CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitPayload,
     CoordinatedCommitter, MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
@@ -597,16 +598,26 @@ mod tests {
             namespace: commit.namespace,
             fencing_token: commit.fencing_token,
             target: commit.target,
-            entries: commit.entries,
+            entries: commit
+                .entries
+                .into_iter()
+                .map(|entry| CoordinatedAbortEntry {
+                    attempt: entry.attempt,
+                    participant_id: entry.participant_id,
+                    descriptor: CoordinatedAbortDescriptor::Prepared(entry.payload),
+                    artifact_intent: None,
+                })
+                .collect(),
         };
         batch.validate_shape().unwrap();
 
         batch.entries.insert(
             0,
-            CoordinatedCommitPayload {
+            CoordinatedAbortEntry {
                 attempt: CheckpointAttempt::canonical(101),
                 participant_id: 1,
-                payload: None,
+                descriptor: CoordinatedAbortDescriptor::Open,
+                artifact_intent: None,
             },
         );
         assert!(batch

@@ -28,7 +28,12 @@ impl LaminarDB {
             hydrate_reference_table_sources(table_sources, &self.table_store).await?
         };
 
-        {
+        #[cfg(feature = "cluster")]
+        let defer_initial_sink_epoch =
+            self.should_defer_initial_sink_epoch_for_artifact_recovery()?;
+        #[cfg(not(feature = "cluster"))]
+        let defer_initial_sink_epoch = false;
+        if !defer_initial_sink_epoch {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 // Recovery and Prepared-manifest reconciliation completed before epoch admission.

@@ -158,6 +158,7 @@ impl CheckpointCoordinator {
             self.verify_authoritative_follower_abort_until(attempt, deadline)
                 .await?;
         }
+        self.clear_sink_artifact_intents(attempt);
         self.allocator.advance_epoch_to(checked_successor_epoch(
             epoch,
             "closing a follower checkpoint",

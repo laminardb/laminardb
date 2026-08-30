@@ -1,20 +1,81 @@
 //! Fenced cleanup of exact files retained in aborted checkpoint descriptors.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::{stream, StreamExt};
 use iceberg::Catalog;
+use parking_lot::Mutex;
 
-use crate::connector::{CoordinatedAbortBatch, CoordinatedCommitContext};
+use crate::connector::{
+    CoordinatedAbortBatch, CoordinatedAbortCleaner, CoordinatedAbortDescriptor,
+    CoordinatedCommitContext,
+};
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::IcebergSinkConfig;
 
 use super::commit_cursor::cursor_record;
-use super::descriptor_batch::{prepare_descriptor_files, validate_table_incarnation};
+use super::descriptor_batch::{prepare_aborted_descriptor_files, validate_table_incarnation};
+use super::epoch_intent::IcebergEpochIntentV1;
+use super::file_finalizer::REPLAY_SAFE_PREFIX_BYTES;
 use super::metrics::IcebergMetrics;
-use super::publication::{load_table_until, SUMMARY_CHECKPOINT, SUMMARY_NAMESPACE};
+use super::publication::{
+    load_table_until, UnresolvedIcebergPublication, SUMMARY_CHECKPOINT, SUMMARY_NAMESPACE,
+};
 
 const DELETE_CONCURRENCY: usize = 8;
+
+pub(super) struct IcebergAbortCleaner {
+    catalog: Arc<dyn Catalog>,
+    config: IcebergSinkConfig,
+    metrics: IcebergMetrics,
+    unresolved_publication: Arc<Mutex<Option<UnresolvedIcebergPublication>>>,
+}
+
+impl IcebergAbortCleaner {
+    pub(super) fn new(
+        catalog: Arc<dyn Catalog>,
+        config: IcebergSinkConfig,
+        metrics: IcebergMetrics,
+        unresolved_publication: Arc<Mutex<Option<UnresolvedIcebergPublication>>>,
+    ) -> Self {
+        Self {
+            catalog,
+            config,
+            metrics,
+            unresolved_publication,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CoordinatedAbortCleaner for IcebergAbortCleaner {
+    async fn cleanup_aborted(
+        &self,
+        batch: CoordinatedAbortBatch,
+        context: CoordinatedCommitContext,
+    ) -> Result<(), ConnectorError> {
+        if self.unresolved_publication.lock().is_some() {
+            return Err(ConnectorError::outcome_unknown(
+                "[LDB-ICEBERG-ABORT-CLEANUP-OUTCOME-UNKNOWN] exact publication reconciliation is incomplete",
+                true,
+            ));
+        }
+        cleanup_aborted_files(&self.catalog, &self.config, &batch, context, &self.metrics).await
+    }
+}
+
+pub(super) fn ensure_no_unresolved_publication(
+    unresolved: &Mutex<Option<UnresolvedIcebergPublication>>,
+) -> Result<(), ConnectorError> {
+    if unresolved.lock().is_some() {
+        return Err(ConnectorError::InvalidState {
+            expected: "reconciliation of the exact ambiguous Iceberg publication".into(),
+            actual: "a prior coordinated publication remains unresolved".into(),
+        });
+    }
+    Ok(())
+}
 
 pub(super) async fn cleanup_aborted_files(
     catalog: &Arc<dyn Catalog>,
@@ -30,17 +91,120 @@ pub(super) async fn cleanup_aborted_files(
     })?;
     require_cleanup_budget(context.deadline())?;
     let table = load_table_until(catalog, config, context.deadline(), false).await?;
-    let prepared = prepare_descriptor_files(config, &batch.namespace, &batch.entries, &table)?;
+    let prepared =
+        prepare_aborted_descriptor_files(config, &batch.namespace, &batch.entries, &table)?;
     validate_table_incarnation(config, &prepared.binding, &table)?;
     reject_published_abort(&table, batch)?;
-    // RECOVERY: the durable Abort and current process/leader fence exclude publication for this
-    // attempt; deterministic names exclude every other attempt from owning these exact paths.
-    let paths = prepared
+    let roots = validate_attempt_roots(config, batch, &table, context.deadline()).await?;
+    let legacy_paths = prepared
         .data_files
         .into_iter()
-        .map(|file| file.file_path().to_owned())
+        .filter_map(|file| {
+            let path = file.file_path();
+            (!path_belongs_to_attempt_root(path, &roots)).then(|| path.to_owned())
+        })
         .collect::<Vec<_>>();
-    delete_exact_paths(table.file_io().clone(), paths, context.deadline(), metrics).await
+    delete_attempt_roots(
+        table.file_io().clone(),
+        roots.into_values().collect(),
+        context.deadline(),
+        metrics,
+    )
+    .await?;
+    delete_exact_paths(
+        table.file_io().clone(),
+        legacy_paths,
+        context.deadline(),
+        metrics,
+    )
+    .await
+}
+
+async fn validate_attempt_roots(
+    config: &IcebergSinkConfig,
+    batch: &CoordinatedAbortBatch,
+    table: &iceberg::table::Table,
+    deadline: tokio::time::Instant,
+) -> Result<HashMap<String, String>, ConnectorError> {
+    let mut roots = HashMap::with_capacity(batch.entries.len());
+    for entry in &batch.entries {
+        let Some(payload) = entry.artifact_intent.as_deref() else {
+            if matches!(entry.descriptor, CoordinatedAbortDescriptor::Open) {
+                return Err(ConnectorError::TransactionError(
+                    "[LDB-ICEBERG-EPOCH-INTENT-MISSING] aborted open Iceberg participant has no durable artifact intent"
+                        .into(),
+                ));
+            }
+            continue;
+        };
+        let intent = IcebergEpochIntentV1::decode(payload)?;
+        intent
+            .validate_cleanup(config, &batch.namespace, entry, table, deadline)
+            .await?;
+        if roots
+            .insert(
+                intent.namespace_prefix().to_owned(),
+                intent.attempt_root().to_owned(),
+            )
+            .is_some()
+        {
+            return Err(ConnectorError::TransactionError(
+                "Iceberg aborted participants repeat an artifact namespace".into(),
+            ));
+        }
+    }
+    Ok(roots)
+}
+
+fn path_belongs_to_attempt_root(path: &str, roots: &HashMap<String, String>) -> bool {
+    let Some(name) = path.rsplit('/').next() else {
+        return false;
+    };
+    let Some(prefix) = name.get(..REPLAY_SAFE_PREFIX_BYTES) else {
+        return false;
+    };
+    roots.get(prefix).is_some_and(|root| {
+        path.strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+async fn delete_attempt_roots(
+    file_io: iceberg::io::FileIO,
+    roots: Vec<String>,
+    deadline: tokio::time::Instant,
+    metrics: &IcebergMetrics,
+) -> Result<(), ConnectorError> {
+    let mut deletes = stream::iter(roots.into_iter().map(|root| {
+        let file_io = file_io.clone();
+        async move {
+            require_cleanup_budget(deadline).map_err(|error| error.to_string())?;
+            tokio::time::timeout_at(deadline, file_io.delete_prefix(root))
+                .await
+                .map_err(|_| "aborted artifact namespace delete timed out".to_owned())?
+                .map_err(|error| storage_error("delete aborted artifact namespace", &error))
+        }
+    }))
+    .buffer_unordered(DELETE_CONCURRENCY);
+    let mut failures = 0_u64;
+    let mut first_error = None;
+    while let Some(result) = deletes.next().await {
+        match result {
+            Ok(()) => metrics.artifact_delete_successes.inc(),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if failures == 0 {
+        return Ok(());
+    }
+    metrics.artifact_cleanup_failures.inc_by(failures);
+    Err(ConnectorError::WriteError(format!(
+        "[LDB-ICEBERG-DURABLE-ARTIFACT-CLEANUP] failed to delete {failures} exact aborted artifact namespaces ({})",
+        first_error.unwrap_or_else(|| "storage error".into())
+    )))
 }
 
 fn reject_published_abort(

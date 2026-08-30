@@ -58,12 +58,21 @@ impl EpochArtifactTracker {
 #[derive(Clone)]
 pub(super) struct InventoryLocationGenerator {
     inner: DefaultLocationGenerator,
+    attempt_root: Option<String>,
     artifacts: EpochArtifactTracker,
 }
 
 impl InventoryLocationGenerator {
-    pub(super) fn new(inner: DefaultLocationGenerator, artifacts: EpochArtifactTracker) -> Self {
-        Self { inner, artifacts }
+    pub(super) fn new(
+        inner: DefaultLocationGenerator,
+        attempt_root: Option<String>,
+        artifacts: EpochArtifactTracker,
+    ) -> Self {
+        Self {
+            inner,
+            attempt_root,
+            artifacts,
+        }
     }
 }
 
@@ -78,7 +87,15 @@ impl fmt::Debug for InventoryLocationGenerator {
 
 impl LocationGenerator for InventoryLocationGenerator {
     fn generate_location(&self, partition_key: Option<&PartitionKey>, file_name: &str) -> String {
-        let path = self.inner.generate_location(partition_key, file_name);
+        let path = match &self.attempt_root {
+            Some(root) => match partition_key {
+                Some(key) if !PartitionKey::is_effectively_none(Some(key)) => {
+                    format!("{root}/{}/{file_name}", key.to_path())
+                }
+                Some(_) | None => format!("{root}/{file_name}"),
+            },
+            None => self.inner.generate_location(partition_key, file_name),
+        };
         self.artifacts.record_generated(path.clone());
         path
     }
@@ -313,14 +330,7 @@ pub(super) async fn cleanup_prepared_epoch(
 
 impl IcebergSink {
     pub(super) fn ensure_no_unresolved_publication(&self) -> Result<(), ConnectorError> {
-        if self.unresolved_publication.lock().is_some() {
-            Err(ConnectorError::InvalidState {
-                expected: "reconciliation of the exact ambiguous Iceberg publication".into(),
-                actual: "a prior coordinated publication remains unresolved".into(),
-            })
-        } else {
-            Ok(())
-        }
+        super::aborted_cleanup::ensure_no_unresolved_publication(&self.unresolved_publication)
     }
 
     pub(super) async fn discard_active_epoch(&mut self) -> Result<(), ConnectorError> {

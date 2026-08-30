@@ -16,6 +16,8 @@ mod descriptor_batch;
 #[cfg(feature = "iceberg-core")]
 mod direct_publication;
 #[cfg(feature = "iceberg-core")]
+mod epoch_intent;
+#[cfg(feature = "iceberg-core")]
 mod epoch_writer;
 #[cfg(all(test, feature = "iceberg-core"))]
 mod fault_injection;
@@ -58,6 +60,8 @@ use artifact_inventory::{PreparedEpochArtifacts, PreparedEpochCleanup};
 #[cfg(feature = "iceberg-core")]
 use descriptor::IcebergCommitDescriptorV1;
 #[cfg(feature = "iceberg-core")]
+use epoch_intent::IcebergEpochIntentV1;
+#[cfg(feature = "iceberg-core")]
 use epoch_writer::{EpochIdentity, IcebergEpochWriter};
 #[cfg(feature = "iceberg-core")]
 use metrics::IcebergMetrics;
@@ -92,6 +96,8 @@ pub struct IcebergSink {
     active_epoch: Mutex<Option<IcebergEpochWriter>>,
     #[cfg(feature = "iceberg-core")]
     active_epoch_id: Option<u64>,
+    #[cfg(feature = "iceberg-core")]
+    admitted_epoch_intent: Option<IcebergEpochIntentV1>,
     #[cfg(feature = "iceberg-core")]
     prepared_epoch: Option<PreparedEpochArtifacts>,
     #[cfg(feature = "iceberg-core")]
@@ -131,6 +137,8 @@ impl IcebergSink {
             active_epoch: Mutex::new(None),
             #[cfg(feature = "iceberg-core")]
             active_epoch_id: None,
+            #[cfg(feature = "iceberg-core")]
+            admitted_epoch_intent: None,
             #[cfg(feature = "iceberg-core")]
             prepared_epoch: None,
             #[cfg(feature = "iceberg-core")]
@@ -223,6 +231,14 @@ impl IcebergSink {
             })?;
         let current = self.load_current_table().await?;
         validate_epoch_table_refresh(self.table()?, &current)?;
+        if self.is_coordinated() {
+            self.admitted_epoch_intent
+                .as_ref()
+                .ok_or_else(|| {
+                    ConnectorError::Internal("Iceberg active epoch lost its artifact intent".into())
+                })?
+                .validate_writer(&current, &self.config, &self.epoch_identity(epoch)?)?;
+        }
         self.table = Some(current);
         let writer = self.new_epoch_writer(epoch)?;
         *self.active_epoch.get_mut() = Some(writer);
@@ -514,6 +530,40 @@ impl SinkConnector for IcebergSink {
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()))
     }
 
+    async fn checkpoint_artifact_intent(
+        &mut self,
+        epoch: u64,
+    ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        #[cfg(feature = "iceberg-core")]
+        {
+            if !self.is_coordinated() {
+                return Ok(None);
+            }
+            self.ensure_no_unresolved_publication()?;
+            if self.active_epoch_id.is_some() || self.active_epoch.get_mut().is_some() {
+                return Err(ConnectorError::InvalidState {
+                    expected: "no active Iceberg epoch before artifact admission".into(),
+                    actual: "an Iceberg epoch is still active".into(),
+                });
+            }
+            let identity = self.epoch_identity(epoch)?;
+            if let Some(intent) = self.admitted_epoch_intent.as_ref() {
+                intent.validate_writer(self.table()?, &self.config, &identity)?;
+                return Ok(Some(intent.encode()?));
+            }
+            let intent = IcebergEpochIntentV1::capture(self.table()?, &self.config, &identity)?;
+            let payload = intent.encode()?;
+            self.admitted_epoch_intent = Some(intent);
+            return Ok(Some(payload));
+        }
+
+        #[cfg(not(feature = "iceberg-core"))]
+        {
+            let _ = epoch;
+            Ok(None)
+        }
+    }
+
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         #[cfg(not(feature = "iceberg-core"))]
         let _ = epoch;
@@ -529,6 +579,13 @@ impl SinkConnector for IcebergSink {
                     actual: "an epoch identity or writer is still active".into(),
                 });
             }
+            let intent = self.admitted_epoch_intent.as_ref().ok_or_else(|| {
+                ConnectorError::InvalidState {
+                    expected: format!("durable Iceberg artifact intent for epoch {epoch}"),
+                    actual: "artifact intent was not captured before begin_epoch".into(),
+                }
+            })?;
+            intent.validate_writer(self.table()?, &self.config, &self.epoch_identity(epoch)?)?;
             self.cleanup_prepared_epoch(PreparedEpochCleanup::Successor { next_epoch: epoch })
                 .await?;
             self.active_epoch_id = Some(epoch);
@@ -562,6 +619,7 @@ impl SinkConnector for IcebergSink {
             let writer = self.active_epoch.get_mut().take();
             self.active_epoch_id = None;
             let Some(writer) = writer else {
+                self.admitted_epoch_intent = None;
                 self.metrics
                     .pre_commit_duration
                     .observe(started.elapsed().as_secs_f64());
@@ -573,6 +631,7 @@ impl SinkConnector for IcebergSink {
                 &self.metrics,
             ));
             let output = writer.close().await?;
+            self.admitted_epoch_intent = None;
             self.metrics
                 .pre_commit_duration
                 .observe(started.elapsed().as_secs_f64());
@@ -642,6 +701,7 @@ impl SinkConnector for IcebergSink {
                     )));
                 }
             }
+            self.admitted_epoch_intent = None;
         }
         Ok(())
     }
@@ -682,6 +742,7 @@ impl SinkConnector for IcebergSink {
                 self.discard_active_epoch().await?;
                 self.cleanup_prepared_epoch(PreparedEpochCleanup::Close)
                     .await?;
+                self.admitted_epoch_intent = None;
             } else {
                 self.flush().await?;
             }
@@ -703,6 +764,26 @@ impl SinkConnector for IcebergSink {
     fn as_coordinated_committer(&self) -> Option<&dyn crate::connector::CoordinatedCommitter> {
         self.is_coordinated()
             .then_some(self as &dyn crate::connector::CoordinatedCommitter)
+    }
+
+    fn coordinated_abort_cleaner(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::CoordinatedAbortCleaner>> {
+        #[cfg(feature = "iceberg-core")]
+        {
+            if !self.is_coordinated() {
+                return None;
+            }
+            let catalog = self.catalog.as_ref()?.clone();
+            Some(Arc::new(aborted_cleanup::IcebergAbortCleaner::new(
+                catalog,
+                self.config.clone(),
+                self.metrics.clone(),
+                Arc::clone(&self.unresolved_publication),
+            )))
+        }
+        #[cfg(not(feature = "iceberg-core"))]
+        None
     }
 }
 

@@ -10,9 +10,10 @@ use tokio_stream::StreamExt;
 
 use crate::config::ConnectorState;
 use crate::connector::{
-    CoordinatedAbortBatch, CoordinatedCommitBatch, CoordinatedCommitContext,
-    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitPayload,
-    CoordinatedCommitter, DeliveryGuarantee, SinkConnector, SinkRuntimeContext,
+    CoordinatedAbortBatch, CoordinatedAbortDescriptor, CoordinatedAbortEntry,
+    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
+    CoordinatedCommitNamespace, CoordinatedCommitPayload, CoordinatedCommitter, DeliveryGuarantee,
+    SinkConnector, SinkRuntimeContext,
 };
 use crate::error::ConnectorError;
 
@@ -53,10 +54,26 @@ fn abort_batch(checkpoint_id: u64, descriptor: Vec<u8>) -> CoordinatedAbortBatch
         namespace: namespace(),
         fencing_token: 7,
         target,
-        entries: vec![CoordinatedCommitPayload {
+        entries: vec![CoordinatedAbortEntry {
             attempt: target,
             participant_id: 1,
-            payload: Some(descriptor),
+            descriptor: CoordinatedAbortDescriptor::Prepared(Some(descriptor)),
+            artifact_intent: None,
+        }],
+    }
+}
+
+fn open_abort_batch(checkpoint_id: u64, artifact_intent: Option<Vec<u8>>) -> CoordinatedAbortBatch {
+    let target = CheckpointAttempt::canonical(checkpoint_id);
+    CoordinatedAbortBatch {
+        namespace: namespace(),
+        fencing_token: 7,
+        target,
+        entries: vec![CoordinatedAbortEntry {
+            attempt: target,
+            participant_id: 1,
+            descriptor: CoordinatedAbortDescriptor::Open,
+            artifact_intent,
         }],
     }
 }
@@ -99,18 +116,38 @@ fn coordinated_sink(fixture: &TestTable, table: iceberg::table::Table) -> Iceber
     configured_sink(fixture, table, DeliveryGuarantee::ExactlyOnce)
 }
 
-async fn descriptor(sink: &mut IcebergSink, fixture: &TestTable, epoch: u64) -> Vec<u8> {
+async fn admit_epoch(sink: &mut IcebergSink, epoch: u64) -> Vec<u8> {
+    let intent = sink
+        .checkpoint_artifact_intent(epoch)
+        .await
+        .unwrap()
+        .expect("coordinated Iceberg epochs require cleanup intent");
     sink.begin_epoch(epoch).await.unwrap();
+    intent
+}
+
+async fn descriptor_with_intent(
+    sink: &mut IcebergSink,
+    fixture: &TestTable,
+    epoch: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let intent = admit_epoch(sink, epoch).await;
     sink.write_batch(&record_batch(
         &fixture.table,
         &[(1, Some("a")), (2, Some("b"))],
     ))
     .await
     .unwrap();
-    sink.pre_commit(epoch)
+    let descriptor = sink
+        .pre_commit(epoch)
         .await
         .unwrap()
-        .expect("non-empty epoch must produce a descriptor")
+        .expect("non-empty epoch must produce a descriptor");
+    (intent, descriptor)
+}
+
+async fn descriptor(sink: &mut IcebergSink, fixture: &TestTable, epoch: u64) -> Vec<u8> {
+    descriptor_with_intent(sink, fixture, epoch).await.1
 }
 
 async fn table_row_count(table: &iceberg::table::Table) -> usize {
@@ -148,11 +185,26 @@ fn commit_context() -> CoordinatedCommitContext {
 }
 
 #[tokio::test]
+async fn epoch_artifact_intent_is_deterministic_and_debug_redacted() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+
+    let first = sink.checkpoint_artifact_intent(1).await.unwrap().unwrap();
+    let replay = sink.checkpoint_artifact_intent(1).await.unwrap().unwrap();
+
+    assert_eq!(first, replay);
+    let intent = super::epoch_intent::IcebergEpochIntentV1::decode(&first).unwrap();
+    let debug = format!("{intent:?}");
+    assert!(debug.contains("epoch_id"));
+    assert!(!debug.contains(fixture.table.metadata().location()));
+}
+
+#[tokio::test]
 async fn empty_coordinated_epoch_does_not_open_a_writer() {
     let fixture = create_test_table(false).await;
     let mut sink = coordinated_sink(&fixture, fixture.table.clone());
 
-    sink.begin_epoch(1).await.unwrap();
+    let _ = admit_epoch(&mut sink, 1).await;
     assert_eq!(sink.active_epoch_id, Some(1));
     assert!(sink.active_epoch.get_mut().is_none());
     assert_eq!(sink.pre_commit(1).await.unwrap(), None);
@@ -230,7 +282,7 @@ async fn restarted_abort_cleanup_uses_the_durable_descriptor_and_is_idempotent()
 async fn abort_cleanup_never_deletes_a_file_with_published_checkpoint_evidence() {
     let fixture = create_test_table(false).await;
     let mut sink = coordinated_sink(&fixture, fixture.table.clone());
-    let payload = descriptor(&mut sink, &fixture, 1).await;
+    let (intent, payload) = descriptor_with_intent(&mut sink, &fixture, 1).await;
     let final_path = super::descriptor::IcebergCommitDescriptorV1::decode(&payload)
         .unwrap()
         .files[0]
@@ -241,7 +293,7 @@ async fn abort_cleanup_never_deletes_a_file_with_published_checkpoint_evidence()
         .unwrap();
 
     let error = sink
-        .cleanup_aborted(abort_batch(1, payload), commit_context())
+        .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
         .await
         .expect_err("published checkpoint evidence must fence cleanup");
 
@@ -276,7 +328,7 @@ async fn successor_epoch_cleans_staging_but_retains_committed_data_files() {
     assert!(fixture.table.file_io().exists(&staging_path).await.unwrap());
     assert!(fixture.table.file_io().exists(&final_path).await.unwrap());
 
-    sink.begin_epoch(2).await.unwrap();
+    let _ = admit_epoch(&mut sink, 2).await;
 
     assert!(sink.prepared_epoch.is_none());
     assert!(!fixture.table.file_io().exists(&staging_path).await.unwrap());
@@ -292,7 +344,7 @@ async fn successor_epoch_cleans_staging_but_retains_committed_data_files() {
 async fn close_deletes_final_files_when_precommit_never_issued_a_descriptor() {
     let fixture = create_test_table(false).await;
     let mut sink = coordinated_sink(&fixture, fixture.table.clone());
-    sink.begin_epoch(1).await.unwrap();
+    let _ = admit_epoch(&mut sink, 1).await;
     sink.write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
         .await
         .unwrap();
@@ -385,7 +437,7 @@ async fn table_replacement_fails_before_epoch_writer_creation() {
         .unwrap();
     assert_ne!(replacement.metadata().uuid(), stale_uuid);
 
-    sink.begin_epoch(1).await.unwrap();
+    let _ = admit_epoch(&mut sink, 1).await;
     let error = sink
         .write_batch(&record_batch(&stale, &[(1, Some("a"))]))
         .await
@@ -402,7 +454,7 @@ async fn strict_schema_change_fails_before_epoch_writer_creation() {
     let mut sink = coordinated_sink(&fixture, fixture.table.clone());
     add_optional_column(&fixture.table, &fixture).await;
 
-    sink.begin_epoch(1).await.unwrap();
+    let _ = admit_epoch(&mut sink, 1).await;
     let error = sink
         .write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
         .await
@@ -558,7 +610,7 @@ async fn precommit_fault_boundaries_leave_no_snapshot_and_restart_replays_safely
     ] {
         let fixture = create_test_table(false).await;
         let mut failed = coordinated_sink(&fixture, fixture.table.clone());
-        failed.begin_epoch(1).await.unwrap();
+        let _ = admit_epoch(&mut failed, 1).await;
         failed
             .write_batch(&record_batch(
                 &fixture.table,
@@ -586,6 +638,106 @@ async fn precommit_fault_boundaries_leave_no_snapshot_and_restart_replays_safely
         assert_eq!(table.metadata().snapshots().count(), 1, "point={point:?}");
         assert_eq!(table_row_count(&table).await, 2, "point={point:?}");
     }
+}
+
+#[tokio::test]
+async fn durable_intent_cleans_pre_descriptor_files_after_process_loss() {
+    for point in [
+        IcebergFaultPoint::BeforeFileClose,
+        IcebergFaultPoint::AfterFileClose,
+        IcebergFaultPoint::AfterDescriptor,
+    ] {
+        let fixture = create_test_table(false).await;
+        let mut failed = coordinated_sink(&fixture, fixture.table.clone());
+        let intent = admit_epoch(&mut failed, 1).await;
+        failed
+            .write_batch(&record_batch(
+                &fixture.table,
+                &[(1, Some("a")), (2, Some("b"))],
+            ))
+            .await
+            .unwrap();
+        scope([IcebergFault::first(point)], failed.pre_commit(1))
+            .await
+            .expect_err("fault must prevent descriptor durability");
+        let artifacts = failed.prepared_epoch.as_ref().unwrap().artifacts();
+        let paths = artifacts
+            .generated_paths()
+            .iter()
+            .chain(artifacts.created_final_paths())
+            .cloned()
+            .collect::<Vec<_>>();
+        let admitted = super::epoch_intent::IcebergEpochIntentV1::decode(&intent).unwrap();
+        assert!(!paths.is_empty());
+        assert!(paths.iter().all(|path| {
+            path.strip_prefix(admitted.attempt_root())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }));
+        let mut created = false;
+        for path in &paths {
+            created |= fixture.table.file_io().exists(path).await.unwrap();
+        }
+        if point != IcebergFaultPoint::BeforeFileClose {
+            assert!(
+                created,
+                "fault boundary {point:?} created no recoverable file"
+            );
+        }
+        drop(failed);
+
+        let restarted = coordinated_sink(&fixture, fixture.table.clone());
+        restarted
+            .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
+            .await
+            .unwrap();
+        for path in &paths {
+            assert!(!fixture.table.file_io().exists(path).await.unwrap());
+        }
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        assert_eq!(table.metadata().snapshots().count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn open_abort_without_durable_intent_fails_before_file_deletion() {
+    let fixture = create_test_table(false).await;
+    let mut failed = coordinated_sink(&fixture, fixture.table.clone());
+    let intent = admit_epoch(&mut failed, 1).await;
+    failed
+        .write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
+        .await
+        .unwrap();
+    scope(
+        [IcebergFault::first(IcebergFaultPoint::AfterFileClose)],
+        failed.pre_commit(1),
+    )
+    .await
+    .expect_err("fault must prevent descriptor durability");
+    let paths = failed
+        .prepared_epoch
+        .as_ref()
+        .unwrap()
+        .artifacts()
+        .created_final_paths()
+        .to_vec();
+    assert_eq!(paths.len(), 1);
+    drop(failed);
+
+    let restarted = coordinated_sink(&fixture, fixture.table.clone());
+    let error = restarted
+        .cleanup_aborted(open_abort_batch(1, None), commit_context())
+        .await
+        .expect_err("open cleanup without durable intent must fail closed");
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-EPOCH-INTENT-MISSING"));
+    assert!(fixture.table.file_io().exists(&paths[0]).await.unwrap());
+
+    restarted
+        .cleanup_aborted(open_abort_batch(1, Some(intent)), commit_context())
+        .await
+        .unwrap();
+    assert!(!fixture.table.file_io().exists(&paths[0]).await.unwrap());
 }
 
 #[tokio::test]
@@ -741,7 +893,7 @@ async fn unknown_publication_blocks_artifact_deletion_until_reconciled() {
             fencing_token: 7,
         })
     );
-    sink.begin_epoch(2).await.unwrap();
+    let _ = admit_epoch(&mut sink, 2).await;
     for path in &final_paths {
         assert!(fixture.table.file_io().exists(path).await.unwrap());
     }

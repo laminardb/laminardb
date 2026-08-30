@@ -58,17 +58,17 @@ of active source cursors, retained checkpoint recovery points, and unresolved ex
 No such cross-pipeline maintenance authority exists today. Connector-local expiration would risk
 removing replay or reconciliation state.
 
-While a checkpoint participant remains alive, it retains a bounded, exact in-memory inventory of
-staging paths and final files created by its current epoch. Before a descriptor is issued, Abort or
-close deletes only those exact owned paths. After descriptor issuance, a proven durable Abort does
-the same; a successor epoch or close removes staging paths but leaves potentially published final
-files intact. The checkpoint abort seal retains durable participant descriptors across process
-loss. Local recovery or the current cluster leader reconciles publication evidence, deletes only
-the exact descriptor paths, and durably marks cleanup before checkpoint node data can be sealed.
-An unresolved publication fences that cleanup. This lifecycle is not a table-wide orphan scan and
-does not infer reachability from object-store listings. Process loss before descriptor durability
-can still strand staging or finalized paths; reclaiming those requires the shared fenced
-maintenance authority described above.
+Before a coordinated checkpoint participant can begin writing, the checkpoint store durably binds
+a bounded, versioned artifact intent to its deterministic attempt root. The abort seal retains this
+intent across process loss even when no commit descriptor was produced. Recovery validates the
+catalog, table incarnation, historical table metadata, and publication evidence before deleting
+that exact root. After descriptor issuance it additionally validates the exact Iceberg data-file
+set. Cleanup completion is durable before checkpoint node data can be sealed, and an unresolved
+publication fences every delete. The intent is checkpoint protocol state, not private Iceberg
+metadata. This lifecycle is not a table-wide orphan scan and does not infer reachability from an
+unbounded object-store listing. An unresolved coordinated attempt created before durable artifact
+intent admission remains retained and blocks recovery when no prepared descriptor proves its exact
+files; upgrade recovery never guesses that such an attempt was artifact-free.
 
 The released API also lacks the transaction actions needed for data-file compaction, delete-file
 rewrites, manifest rewrites, and format-aware orphan cleanup. LaminarDB therefore starts no

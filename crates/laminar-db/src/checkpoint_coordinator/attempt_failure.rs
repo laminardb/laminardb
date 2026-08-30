@@ -169,6 +169,7 @@ impl CheckpointCoordinator {
             .await
         };
         artifact_cleanup?;
+        self.clear_sink_artifact_intents(attempt);
         self.clear_sink_witness_until(cleanup_deadline).await?;
         self.allocator.advance_epoch_to(checked_successor_epoch(
             attempt.epoch,

@@ -137,7 +137,7 @@ impl Node {
     fn dump_log(&self) {
         eprintln!("--- Iceberg cluster node{} log tail", self.id);
         if let Ok(log) = std::fs::read_to_string(&self.log_path) {
-            for line in log.lines().rev().take(60).collect::<Vec<_>>().iter().rev() {
+            for line in log.lines().rev().take(240).collect::<Vec<_>>().iter().rev() {
                 eprintln!("{line}");
             }
         }
@@ -289,6 +289,7 @@ async fn leader_restart_reconciles_one_iceberg_snapshot_per_checkpoint() {
     create_topic(&topic).await;
 
     let directory = tempfile::tempdir().expect("create Iceberg cluster test directory");
+    eprintln!("Iceberg cluster node logs: {}", directory.path().display());
     let ports = free_ports(NODE_COUNT * 2);
     let (http_ports, gossip_ports) = ports.split_at(NODE_COUNT);
     let fixture = ClusterFixture {
@@ -706,10 +707,10 @@ async fn wait_for_external_commit_gate(node: &mut Node) -> GateEvidence {
                 fencing_token: fields[3].parse().expect("gate fencing token"),
             };
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "leader did not reach the non-empty external sink commit gate"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            node.dump_log();
+            panic!("leader did not reach the non-empty external sink commit gate");
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -736,10 +737,12 @@ async fn wait_for_total_records(
                 return metadata;
             }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Iceberg table did not reach {expected} committed rows"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            for node in nodes.iter() {
+                node.dump_log();
+            }
+            panic!("Iceberg table did not reach {expected} committed rows");
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

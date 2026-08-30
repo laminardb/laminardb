@@ -18,6 +18,7 @@ use crate::error::ConnectorError;
 
 use super::super::iceberg_config::{IcebergSinkConfig, IcebergWriteDistributionMode};
 use super::artifact_inventory::{EpochArtifactTracker, EpochArtifacts, InventoryLocationGenerator};
+use super::epoch_intent::IcebergEpochIntentV1;
 use super::file_finalizer::{finalize_coordinated_files, ReplaySafeFileNameGenerator};
 use super::metrics::IcebergMetrics;
 
@@ -111,9 +112,18 @@ impl IcebergEpochWriter {
         let parquet_builder = ParquetWriterBuilder::new(properties, schema);
         let default_location = DefaultLocationGenerator::new(table.metadata())
             .map_err(|error| iceberg_write_error("resolve table data location", &error))?;
+        let coordinated =
+            config.delivery_guarantee == crate::connector::DeliveryGuarantee::ExactlyOnce;
+        let attempt_root = coordinated
+            .then(|| IcebergEpochIntentV1::capture(table, config, identity))
+            .transpose()?
+            .map(|intent| intent.attempt_root().to_owned());
         let artifact_tracker = EpochArtifactTracker::default();
-        let location_generator =
-            InventoryLocationGenerator::new(default_location, artifact_tracker.clone());
+        let location_generator = InventoryLocationGenerator::new(
+            default_location,
+            attempt_root,
+            artifact_tracker.clone(),
+        );
         let file_name_generator = ReplaySafeFileNameGenerator::with_artifacts(
             &identity.deployment_id,
             &identity.sink_id,
@@ -131,8 +141,7 @@ impl IcebergEpochWriter {
             file_name_generator,
             artifact_tracker,
             partition_spec_id,
-            coordinated: config.delivery_guarantee
-                == crate::connector::DeliveryGuarantee::ExactlyOnce,
+            coordinated,
             target_file_size_bytes: config.target_file_size_bytes,
             max_open_partitions: config.max_open_partitions,
             max_files: config.max_files_per_checkpoint,
@@ -1307,12 +1316,22 @@ mod tests {
     async fn high_partition_cardinality_stays_within_writer_and_file_bounds() {
         let fixture = create_test_table(true).await;
         let mut config = fixture.config;
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
         config.max_open_partitions = 4;
         config.max_files_per_checkpoint = 128;
+        let epoch_identity = identity(22);
+        let attempt_root = super::super::epoch_intent::IcebergEpochIntentV1::capture(
+            &fixture.table,
+            &config,
+            &epoch_identity,
+        )
+        .unwrap()
+        .attempt_root()
+        .to_owned();
         let mut writer = IcebergEpochWriter::new(
             &fixture.table,
             &config,
-            &identity(22),
+            &epoch_identity,
             IcebergMetrics::new(None),
         )
         .unwrap();
@@ -1337,5 +1356,10 @@ mod tests {
         let output = writer.close().await.unwrap();
         assert_eq!(output.data_files.len(), 128);
         assert_eq!(output.rows, 128);
+        assert!(output.data_files.iter().all(|file| {
+            file.file_path()
+                .strip_prefix(&attempt_root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        }));
     }
 }

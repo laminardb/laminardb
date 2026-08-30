@@ -873,6 +873,7 @@ async fn record_two_vnode_acquisition_checkpoint(
                 pipeline_identity: pipeline_identity.clone(),
                 attempt: CheckpointAttempt::canonical(1),
                 assignment_fence: Some(fence.clone()),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await

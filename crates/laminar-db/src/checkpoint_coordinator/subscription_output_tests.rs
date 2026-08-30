@@ -409,10 +409,10 @@ fn segment_preparation_rejects_stale_writer_authority() {
 #[tokio::test]
 async fn immutable_upload_ack_loss_retries_and_uncommitted_object_is_collectable() {
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let flaky = Arc::new(super::artifact_tests::CreateCommitThenIoStore {
+    let flaky = Arc::new(super::artifact_tests::CommitThenIoStore {
         inner,
-        lose_create_ack: std::sync::atomic::AtomicBool::new(true),
-        create_suffix: ".arrow",
+        lose_put_ack: std::sync::atomic::AtomicBool::new(true),
+        path_suffix: ".arrow",
         block_get: std::sync::atomic::AtomicBool::new(false),
         deny_list: std::sync::atomic::AtomicBool::new(false),
     });

@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::operation::process_authority_error;
 use arrow::array::RecordBatch;
 use crossfire::{mpsc, oneshot, SendTimeoutError};
-use laminar_connectors::connector::{CoordinatedAbortBatch, CoordinatedCommitBatch};
+use laminar_connectors::connector::CoordinatedCommitBatch;
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming::Producer;
 use tokio::time::Instant;
@@ -757,14 +757,14 @@ impl SinkTaskHandle {
         .await
     }
 
-    /// Release durable participant artifacts after an authoritative Abort.
-    pub async fn cleanup_aborted_until(
+    /// Capture pre-begin artifact recovery evidence under the caller's deadline.
+    pub async fn checkpoint_artifact_intent_until(
         &self,
-        batch: CoordinatedAbortBatch,
+        epoch: u64,
         deadline: Instant,
-    ) -> Result<(), ConnectorError> {
-        self.request_until("cleanup-aborted", deadline, |ack| {
-            SinkOperation::CleanupAborted { batch, ack }
+    ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        self.request_until("checkpoint-artifact-intent", deadline, |ack| {
+            SinkOperation::ArtifactIntent { epoch, ack }
         })
         .await
     }

@@ -1,5 +1,7 @@
 //! Sink lifecycle, write, flush, rollback, and coordinated-commit protocol.
 
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -8,7 +10,8 @@ use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
 use super::{
-    ConnectorCancellationPolicy, ConnectorTaskTracker, CoordinatedCommitter, SinkContract,
+    ConnectorCancellationPolicy, ConnectorTaskTracker, CoordinatedAbortCleaner,
+    CoordinatedCommitter, SinkContract,
 };
 
 /// Durable runtime identity bound to checkpoint-committable sink staging.
@@ -119,6 +122,19 @@ pub trait SinkConnector: Send {
         Ok(())
     }
 
+    /// Return bounded recovery evidence before the runtime allows this epoch to write.
+    ///
+    /// The checkpoint store persists the result before [`begin_epoch`](Self::begin_epoch). It
+    /// must contain no credentials and must deterministically identify only artifacts owned by
+    /// this runtime context and epoch. `None` means the connector has no cleanup payload; it does
+    /// not prove that the connector created no external artifacts.
+    async fn checkpoint_artifact_intent(
+        &mut self,
+        _epoch: u64,
+    ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        Ok(None)
+    }
+
     /// Flush + prepare, but do not finalize externally. The runtime persists
     /// the checkpoint decision before a designated committer finalizes the
     /// collected descriptors; on failure it calls `rollback_epoch`.
@@ -171,6 +187,15 @@ pub trait SinkConnector: Send {
     /// Leader-side committer for a checkpoint-committable contract; `None`
     /// for every weaker contract.
     fn as_coordinated_committer(&self) -> Option<&dyn CoordinatedCommitter> {
+        None
+    }
+
+    /// Detached cleanup authority retained by recovery after the participant writer closes.
+    ///
+    /// `None` means this connector has no artifacts that require immediate cleanup after an
+    /// authoritative Abort. Files intentionally delegated to a retention-safe maintenance policy
+    /// do not require a cleaner here.
+    fn coordinated_abort_cleaner(&self) -> Option<Arc<dyn CoordinatedAbortCleaner>> {
         None
     }
 }
