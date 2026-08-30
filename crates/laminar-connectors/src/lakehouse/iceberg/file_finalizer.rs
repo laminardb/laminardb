@@ -181,8 +181,8 @@ async fn finalize_file(
         .exists()
         .await
         .map_err(|error| file_error("inspect final data file", &error))?;
-    let final_matches = if final_exists {
-        file_matches(
+    if final_exists {
+        let final_matches = file_matches(
             file_io,
             &final_path,
             expected_bytes,
@@ -190,11 +190,14 @@ async fn finalize_file(
             metrics,
             &content_hash,
         )
-        .await?
+        .await?;
+        if !final_matches {
+            return Err(ConnectorError::WriteError(
+                "[LDB-ICEBERG-DATA-FILE-COLLISION] deterministic final data-file path contains different bytes"
+                    .into(),
+            ));
+        }
     } else {
-        false
-    };
-    if !final_matches {
         copy_file(
             file_io,
             staging_path,
@@ -516,16 +519,6 @@ mod tests {
         assert!(!file_io.exists(first_staging_path).await.unwrap());
         assert!(file_io.exists(first.file_path()).await.unwrap());
         assert!(!first.file_path().contains("-stage-"));
-        file_io
-            .new_output(first.file_path())
-            .unwrap()
-            .write(Bytes::from(vec![
-                b'x';
-                usize::try_from(first.file_size_in_bytes())
-                    .unwrap()
-            ]))
-            .await
-            .unwrap();
 
         let replay_names = names();
         let replay_staged = staged_file(&file_io, &replay_names, b"complete-parquet").await;
@@ -553,6 +546,64 @@ mod tests {
                 .unwrap(),
             Bytes::from_static(b"complete-parquet")
         );
+    }
+
+    #[tokio::test]
+    async fn mismatched_final_file_fails_without_overwrite_or_staging_cleanup() {
+        let file_io = FileIO::new_with_memory();
+        let metrics = IcebergMetrics::new(None);
+        let first_names = names();
+        let first_staged = staged_file(&file_io, &first_names, b"complete-parquet").await;
+        let first = finalize_coordinated_files(
+            &file_io,
+            &first_names,
+            0,
+            1024,
+            &metrics,
+            vec![first_staged],
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+        let conflicting = Bytes::from(vec![
+            b'x';
+            usize::try_from(first.file_size_in_bytes()).unwrap()
+        ]);
+        file_io
+            .new_output(first.file_path())
+            .unwrap()
+            .write(conflicting.clone())
+            .await
+            .unwrap();
+
+        let replay_names = names();
+        let replay_staged = staged_file(&file_io, &replay_names, b"complete-parquet").await;
+        let staging_path = replay_staged.file_path().to_string();
+        let error = finalize_coordinated_files(
+            &file_io,
+            &replay_names,
+            0,
+            1024,
+            &metrics,
+            vec![replay_staged],
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-DATA-FILE-COLLISION"));
+        assert_eq!(
+            file_io
+                .new_input(first.file_path())
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            conflicting
+        );
+        assert!(file_io.exists(staging_path).await.unwrap());
     }
 
     #[tokio::test]
