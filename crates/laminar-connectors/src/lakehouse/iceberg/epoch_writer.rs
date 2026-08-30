@@ -104,12 +104,7 @@ impl IcebergEpochWriter {
                 .map_err(|error| iceberg_write_error("create partition evaluator", &error))?,
             )
         };
-        let row_group_rows = approximate_row_group_rows(config);
-        let properties = WriterProperties::builder()
-            .set_compression(super::parquet_compression(&config.compression)?)
-            .set_max_row_group_row_count(Some(row_group_rows))
-            .set_write_batch_size(row_group_rows.min(8_192))
-            .build();
+        let properties = parquet_writer_properties(config)?;
         let parquet_builder = ParquetWriterBuilder::new(properties, schema);
         let location_generator = DefaultLocationGenerator::new(table.metadata())
             .map_err(|error| iceberg_write_error("resolve table data location", &error))?;
@@ -659,16 +654,32 @@ fn validate_split_batches(
     Ok(bytes)
 }
 
-fn approximate_row_group_rows(config: &IcebergSinkConfig) -> usize {
+fn parquet_writer_properties(
+    config: &IcebergSinkConfig,
+) -> Result<WriterProperties, ConnectorError> {
+    let row_group_bytes = bounded_row_group_bytes(config);
+    let row_group_rows = approximate_row_group_rows(config, row_group_bytes);
+    Ok(WriterProperties::builder()
+        .set_compression(super::parquet_compression(&config.compression)?)
+        .set_max_row_group_bytes(Some(row_group_bytes))
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .set_write_batch_size(row_group_rows.min(8_192))
+        .build())
+}
+
+fn bounded_row_group_bytes(config: &IcebergSinkConfig) -> usize {
     let per_writer_budget = config
         .max_buffer_bytes
         .checked_div(config.max_open_partitions)
         .unwrap_or(1)
         .max(1);
-    let row_group_bytes = config
+    config
         .parquet_row_group_size_bytes
         .min(config.target_file_size_bytes)
-        .min(per_writer_budget);
+        .min(per_writer_budget)
+}
+
+fn approximate_row_group_rows(config: &IcebergSinkConfig, row_group_bytes: usize) -> usize {
     config
         .max_buffer_rows
         .saturating_mul(row_group_bytes)
@@ -736,6 +747,20 @@ mod tests {
             )
             .generate_file_name()
         );
+    }
+
+    #[tokio::test]
+    async fn parquet_properties_enforce_the_per_writer_byte_budget() {
+        let mut config = create_test_table(false).await.config;
+        config.max_buffer_bytes = 8 * 1024 * 1024;
+        config.max_buffer_rows = 8_000;
+        config.max_open_partitions = 4;
+        config.parquet_row_group_size_bytes = 5 * 1024 * 1024;
+        config.target_file_size_bytes = 3 * 1024 * 1024;
+
+        let properties = parquet_writer_properties(&config).unwrap();
+        assert_eq!(properties.max_row_group_bytes(), Some(2 * 1024 * 1024));
+        assert_eq!(properties.max_row_group_row_count(), Some(2_000));
     }
 
     #[tokio::test]
