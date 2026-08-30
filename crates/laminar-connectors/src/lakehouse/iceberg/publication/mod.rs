@@ -293,7 +293,6 @@ async fn publish_with_retries(
             batch,
             &table,
             identity.commit_uuid,
-            attempt,
         )
         .await?;
         let commit_catalog = attempt_catalog.as_ref().unwrap_or(catalog);
@@ -469,11 +468,10 @@ async fn publication_catalog_for_attempt(
     batch: &CoordinatedCommitBatch,
     table: &iceberg::table::Table,
     logical_commit_uuid: uuid::Uuid,
-    attempt: usize,
 ) -> Result<Option<Arc<dyn Catalog>>, ConnectorError> {
     let idempotency_key = capabilities
         .idempotency_key_lifetime
-        .map(|_| deterministic_idempotency_key(batch, logical_commit_uuid, attempt))
+        .map(|_| deterministic_idempotency_key(batch, logical_commit_uuid))
         .transpose()?;
     build_publication_catalog(
         Arc::clone(catalog),
@@ -979,27 +977,28 @@ mod tests {
     }
 
     #[test]
-    fn rest_idempotency_key_is_stable_uuid_v7_per_attempt() {
+    fn rest_idempotency_key_is_stable_uuid_v7_for_the_logical_commit() {
         let batch = batch();
         let fingerprint = batch.exact_fingerprint();
         let logical = deterministic_commit_uuid(&batch, &fingerprint);
-        let first = deterministic_idempotency_key(&batch, logical, 0).unwrap();
+        let first = deterministic_idempotency_key(&batch, logical).unwrap();
         assert_eq!(
             first,
-            deterministic_idempotency_key(&batch, logical, 0).unwrap()
+            deterministic_idempotency_key(&batch, logical).unwrap()
         );
-        assert_eq!(first.to_string(), "018f0000-0000-734d-8ebb-59f7c2ea7b91");
+        assert_eq!(first.to_string(), "018f0000-0000-7bf4-981a-787a2ee3f5dd");
         assert_eq!(first.get_version_num(), 7);
         let deployment = uuid::Uuid::parse_str(&batch.namespace.deployment_id).unwrap();
         assert_eq!(&first.as_bytes()[..6], &deployment.as_bytes()[..6]);
         assert_ne!(
             first,
-            deterministic_idempotency_key(&batch, logical, 1).unwrap()
+            deterministic_idempotency_key(&batch, uuid::Uuid::from_u128(logical.as_u128() ^ 1))
+                .unwrap()
         );
 
         let mut invalid = batch;
         invalid.namespace.deployment_id = "d66e462a-6af7-4ad6-8c81-b1d053496502".into();
-        assert!(deterministic_idempotency_key(&invalid, logical, 0).is_err());
+        assert!(deterministic_idempotency_key(&invalid, logical).is_err());
     }
 
     #[tokio::test]

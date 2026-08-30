@@ -101,7 +101,6 @@ pub(super) fn deterministic_commit_uuid(
 pub(super) fn deterministic_idempotency_key(
     batch: &CoordinatedCommitBatch,
     logical_commit_uuid: uuid::Uuid,
-    attempt: usize,
 ) -> Result<uuid::Uuid, ConnectorError> {
     let deployment = uuid::Uuid::parse_str(&batch.namespace.deployment_id).map_err(|_| {
         ConnectorError::TransactionError(
@@ -114,9 +113,8 @@ pub(super) fn deterministic_idempotency_key(
         ));
     }
     let mut hash = Sha256::new();
-    hash.update(b"laminardb-iceberg-rest-idempotency-v1\0");
+    hash.update(b"laminardb-iceberg-rest-idempotency-v2\0");
     hash.update(logical_commit_uuid.as_bytes());
-    hash.update(canonical_usize_bytes(attempt)?);
     let digest = hash.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
