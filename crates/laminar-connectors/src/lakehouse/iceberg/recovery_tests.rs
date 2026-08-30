@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use iceberg::spec::{FormatVersion, PrimitiveType, Type};
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+use iceberg::TableCreation;
 use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
 use laminar_core::checkpoint::CheckpointAttempt;
 use tokio_stream::StreamExt;
@@ -13,7 +16,9 @@ use crate::connector::{
 };
 
 use super::fault_injection::{scope, IcebergFault, IcebergFaultPoint};
-use super::test_support::{batch as record_batch, create_test_table, table_ident, TestTable};
+use super::test_support::{
+    append_rows, batch as record_batch, create_test_table, table_ident, TestTable,
+};
 use super::IcebergSink;
 
 const DEPLOYMENT_ID: &str = "018f0000-0000-7000-8000-000000000001";
@@ -110,8 +115,144 @@ async fn table_row_count(table: &iceberg::table::Table) -> usize {
     rows
 }
 
+async fn add_optional_column(table: &iceberg::table::Table, fixture: &TestTable) {
+    let transaction = Transaction::new(table);
+    let transaction = transaction
+        .update_schema()
+        .add_column(AddColumn::optional(
+            "later",
+            Type::Primitive(PrimitiveType::String),
+        ))
+        .apply(transaction)
+        .unwrap();
+    transaction.commit(fixture.catalog.as_ref()).await.unwrap();
+}
+
 fn commit_context() -> CoordinatedCommitContext {
     CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10))
+}
+
+#[tokio::test]
+async fn empty_coordinated_epoch_does_not_open_a_writer() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+
+    sink.begin_epoch(1).await.unwrap();
+    assert_eq!(sink.active_epoch_id, Some(1));
+    assert!(sink.active_epoch.get_mut().is_none());
+    assert_eq!(sink.pre_commit(1).await.unwrap(), None);
+    assert!(sink.active_epoch_id.is_none());
+    assert!(sink.active_epoch.get_mut().is_none());
+}
+
+#[tokio::test]
+async fn first_write_refreshes_the_descriptor_base_snapshot() {
+    let fixture = create_test_table(false).await;
+    let stale = fixture.table.clone();
+    let (current, _) = append_rows(&fixture, &stale, 90, &[(90, Some("external"))]).await;
+    let mut sink = coordinated_sink(&fixture, stale);
+
+    let payload = descriptor(&mut sink, &fixture, 1).await;
+    let descriptor = super::descriptor::IcebergCommitDescriptorV1::decode(&payload).unwrap();
+    assert_eq!(
+        descriptor.table.base_snapshot_id,
+        current.metadata().current_snapshot_id()
+    );
+    assert_eq!(
+        descriptor.table.metadata_location,
+        current.metadata_location().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn table_replacement_fails_before_epoch_writer_creation() {
+    let fixture = create_test_table(false).await;
+    let stale = fixture.table.clone();
+    let stale_uuid = stale.metadata().uuid();
+    let mut sink = coordinated_sink(&fixture, stale.clone());
+    let ident = table_ident();
+    fixture.catalog.drop_table(&ident).await.unwrap();
+    let replacement = fixture
+        .catalog
+        .create_table(
+            &ident.namespace,
+            TableCreation::builder()
+                .name(ident.name)
+                .schema(stale.current_schema_ref().as_ref().clone())
+                .format_version(FormatVersion::V2)
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(replacement.metadata().uuid(), stale_uuid);
+
+    sink.begin_epoch(1).await.unwrap();
+    let error = sink
+        .write_batch(&record_batch(&stale, &[(1, Some("a"))]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("LDB-ICEBERG-TABLE-REPLACED"));
+    assert!(sink.active_epoch.get_mut().is_none());
+    assert_eq!(replacement.metadata().snapshots().count(), 0);
+    sink.rollback_epoch(1).await.unwrap();
+}
+
+#[tokio::test]
+async fn strict_schema_change_fails_before_epoch_writer_creation() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    add_optional_column(&fixture.table, &fixture).await;
+
+    sink.begin_epoch(1).await.unwrap();
+    let error = sink
+        .write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("LDB-ICEBERG-SCHEMA-CHANGED"));
+    assert!(sink.active_epoch.get_mut().is_none());
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 0);
+    sink.rollback_epoch(1).await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_flush_rejects_schema_change_without_creating_a_snapshot() {
+    let fixture = create_test_table(false).await;
+    let mut sink = configured_sink(
+        &fixture,
+        fixture.table.clone(),
+        DeliveryGuarantee::AtLeastOnce,
+    );
+    sink.write_batch(&record_batch(&fixture.table, &[(1, Some("a"))]))
+        .await
+        .unwrap();
+    add_optional_column(&fixture.table, &fixture).await;
+
+    let error = sink.flush().await.unwrap_err();
+    assert!(error.to_string().contains("LDB-ICEBERG-SCHEMA-CHANGED"));
+    assert!(sink.active_epoch.get_mut().is_none());
+    assert!(sink.active_epoch_id.is_none());
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 0);
+}
+
+#[tokio::test]
+async fn direct_flush_rebases_over_a_compatible_external_append() {
+    let fixture = create_test_table(false).await;
+    let mut sink = configured_sink(
+        &fixture,
+        fixture.table.clone(),
+        DeliveryGuarantee::AtLeastOnce,
+    );
+    sink.write_batch(&record_batch(&fixture.table, &[(1, Some("sink"))]))
+        .await
+        .unwrap();
+    let _ = append_rows(&fixture, &fixture.table, 90, &[(2, Some("external"))]).await;
+
+    sink.flush().await.unwrap();
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 2);
+    assert_eq!(table_row_count(&current).await, 2);
 }
 
 #[tokio::test]

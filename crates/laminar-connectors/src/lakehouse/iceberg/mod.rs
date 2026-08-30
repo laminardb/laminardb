@@ -177,6 +177,43 @@ impl IcebergSink {
     }
 
     #[cfg(feature = "iceberg-core")]
+    async fn load_current_table(&self) -> Result<iceberg::table::Table, ConnectorError> {
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open Iceberg sink".into(),
+                actual: "catalog is not initialized".into(),
+            })?;
+        super::iceberg_io::load_table_with_timeout(
+            catalog.as_ref(),
+            &self.config.catalog.namespace,
+            &self.config.catalog.table_name,
+            self.config.catalog.request_timeout,
+        )
+        .await
+    }
+
+    #[cfg(feature = "iceberg-core")]
+    async fn initialize_active_writer(&mut self) -> Result<(), ConnectorError> {
+        if self.active_epoch.get_mut().is_some() {
+            return Ok(());
+        }
+        let epoch = self
+            .active_epoch_id
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "an active Iceberg epoch".into(),
+                actual: "no epoch identity is active".into(),
+            })?;
+        let current = self.load_current_table().await?;
+        validate_epoch_table_refresh(self.table()?, &current)?;
+        self.table = Some(current);
+        let writer = self.new_epoch_writer(epoch)?;
+        *self.active_epoch.get_mut() = Some(writer);
+        Ok(())
+    }
+
+    #[cfg(feature = "iceberg-core")]
     fn align_batch_to_iceberg_schema(
         &self,
         batch: &RecordBatch,
@@ -192,23 +229,27 @@ impl IcebergSink {
 
     #[cfg(feature = "iceberg-core")]
     async fn publish_direct_epoch(&mut self) -> Result<(), ConnectorError> {
-        let Some(writer) = self.active_epoch.get_mut().take() else {
+        let writer = self.active_epoch.get_mut().take();
+        self.active_epoch_id = None;
+        let Some(writer) = writer else {
             return Ok(());
         };
-        self.active_epoch_id = None;
+        let writer_table = self.table()?.clone();
         let output = writer.close().await?;
         if output.data_files.is_empty() {
             return Ok(());
         }
+        let current = self.load_current_table().await?;
+        validate_direct_publication_table(&writer_table, &current)?;
         let catalog = self
             .catalog
-            .as_ref()
+            .clone()
             .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "open Iceberg sink".into(),
                 actual: "catalog is not initialized".into(),
             })?;
         let updated = super::iceberg_io::commit_data_files_append(
-            self.table()?,
+            &current,
             catalog.as_ref(),
             output.data_files,
         )
@@ -393,17 +434,19 @@ impl SinkConnector for IcebergSink {
             if self.schema.is_none() {
                 self.schema = Some(batch.schema());
             }
-            if self.active_epoch.get_mut().is_none() {
+            if self.active_epoch_id.is_none() {
                 if self.is_coordinated() {
                     return Err(ConnectorError::InvalidState {
                         expected: "begin_epoch before an exactly-once Iceberg write".into(),
                         actual: "no active epoch".into(),
                     });
                 }
-                self.direct_epoch = self.direct_epoch.saturating_add(1);
-                *self.active_epoch.get_mut() = Some(self.new_epoch_writer(self.direct_epoch)?);
+                self.direct_epoch = self.direct_epoch.checked_add(1).ok_or_else(|| {
+                    ConnectorError::WriteError("Iceberg direct epoch ID overflow".into())
+                })?;
                 self.active_epoch_id = Some(self.direct_epoch);
             }
+            self.initialize_active_writer().await?;
             let aligned = self.align_batch_to_iceberg_schema(batch)?;
             let bytes = aligned.get_array_memory_size();
             self.active_epoch
@@ -439,13 +482,12 @@ impl SinkConnector for IcebergSink {
                 return Ok(());
             }
             self.ensure_no_unresolved_publication()?;
-            if self.active_epoch.get_mut().is_some() {
+            if self.active_epoch_id.is_some() || self.active_epoch.get_mut().is_some() {
                 return Err(ConnectorError::InvalidState {
                     expected: "previous Iceberg epoch prepared or rolled back".into(),
-                    actual: "an epoch writer is still active".into(),
+                    actual: "an epoch identity or writer is still active".into(),
                 });
             }
-            *self.active_epoch.get_mut() = Some(self.new_epoch_writer(epoch)?);
             self.active_epoch_id = Some(epoch);
         }
         Ok(())
@@ -468,10 +510,14 @@ impl SinkConnector for IcebergSink {
                 });
             }
             let started = std::time::Instant::now();
-            let writer = self.active_epoch.get_mut().take().ok_or_else(|| {
-                ConnectorError::Internal("Iceberg active epoch has no writer".into())
-            })?;
+            let writer = self.active_epoch.get_mut().take();
             self.active_epoch_id = None;
+            let Some(writer) = writer else {
+                self.metrics
+                    .pre_commit_duration
+                    .observe(started.elapsed().as_secs_f64());
+                return Ok(None);
+            };
             let output = writer.close().await?;
             #[cfg(test)]
             fault_injection::fail_if(fault_injection::IcebergFaultPoint::AfterFileClose)?;
@@ -651,6 +697,49 @@ impl crate::connector::CoordinatedCommitter for IcebergSink {
         }
         Ok(cursor)
     }
+}
+
+#[cfg(feature = "iceberg-core")]
+fn validate_epoch_table_refresh(
+    expected: &iceberg::table::Table,
+    current: &iceberg::table::Table,
+) -> Result<(), ConnectorError> {
+    if expected.metadata().uuid() != current.metadata().uuid()
+        || expected.identifier() != current.identifier()
+        || expected.metadata().location() != current.metadata().location()
+    {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-TABLE-REPLACED] Iceberg table identity or location changed while the sink was running"
+                .into(),
+        ));
+    }
+    if expected.metadata().current_schema_id() != current.metadata().current_schema_id() {
+        return Err(ConnectorError::SchemaMismatch(
+            "[LDB-ICEBERG-SCHEMA-CHANGED] Iceberg schema changed while schema.evolution.mode=strict"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "iceberg-core")]
+fn validate_direct_publication_table(
+    writer_table: &iceberg::table::Table,
+    current: &iceberg::table::Table,
+) -> Result<(), ConnectorError> {
+    validate_epoch_table_refresh(writer_table, current)?;
+    let writer = writer_table.metadata();
+    let current = current.metadata();
+    if writer.default_partition_spec_id() != current.default_partition_spec_id()
+        || writer.default_sort_order_id() != current.default_sort_order_id()
+        || writer.format_version() != current.format_version()
+    {
+        return Err(ConnectorError::TransactionError(
+            "[LDB-ICEBERG-DIRECT-LAYOUT-CHANGED] Iceberg partition spec, sort order, or format version changed while a direct epoch was open"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "iceberg-core")]
