@@ -287,6 +287,12 @@ impl IcebergSink {
 #[async_trait]
 impl SinkConnector for IcebergSink {
     fn bind_runtime_context(&mut self, context: SinkRuntimeContext) -> Result<(), ConnectorError> {
+        if self.state != ConnectorState::Created {
+            return Err(ConnectorError::InvalidState {
+                expected: "created Iceberg sink before open".into(),
+                actual: self.state.to_string(),
+            });
+        }
         let deployment = uuid::Uuid::parse_str(&context.deployment_id).map_err(|_| {
             ConnectorError::ConfigurationError(
                 "Iceberg runtime deployment ID must be a canonical non-nil UUID".into(),
@@ -301,6 +307,15 @@ impl SinkConnector for IcebergSink {
                 "Iceberg runtime identity contains an invalid deployment, sink, or participant"
                     .into(),
             ));
+        }
+        if let Some(bound) = &self.runtime_context {
+            if bound == &context {
+                return Ok(());
+            }
+            return Err(ConnectorError::InvalidState {
+                expected: "the runtime identity already bound to this Iceberg sink".into(),
+                actual: "a different runtime identity".into(),
+            });
         }
         self.runtime_context = Some(context);
         Ok(())

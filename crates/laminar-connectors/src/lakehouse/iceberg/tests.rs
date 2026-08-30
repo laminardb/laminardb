@@ -139,7 +139,32 @@ fn runtime_identity_must_be_canonical_and_nonzero() {
         participant_id: 7,
     };
     sink.bind_runtime_context(valid.clone()).unwrap();
-    assert_eq!(sink.runtime_context, Some(valid));
+    sink.bind_runtime_context(valid.clone()).unwrap();
+    assert_eq!(sink.runtime_context, Some(valid.clone()));
+
+    let mut rebound = valid;
+    rebound.participant_id += 1;
+    assert!(matches!(
+        sink.bind_runtime_context(rebound),
+        Err(ConnectorError::InvalidState { .. })
+    ));
+}
+
+#[test]
+fn runtime_identity_cannot_change_after_open() {
+    let mut sink = IcebergSink::new(test_config(), None);
+    let context = SinkRuntimeContext {
+        deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
+        sink_id: "events".into(),
+        participant_id: 7,
+    };
+    sink.bind_runtime_context(context.clone()).unwrap();
+    sink.state = ConnectorState::Running;
+
+    assert!(matches!(
+        sink.bind_runtime_context(context),
+        Err(ConnectorError::InvalidState { .. })
+    ));
 }
 
 #[test]
