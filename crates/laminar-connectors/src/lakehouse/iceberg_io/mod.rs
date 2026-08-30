@@ -11,7 +11,6 @@ use std::sync::Arc;
 use arrow_array::RecordBatch;
 use futures_util::StreamExt;
 use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, TableIdent};
 #[cfg(any(
     feature = "iceberg-storage-s3",
@@ -77,6 +76,10 @@ impl AtomicTableRequirements {
         }
     }
 }
+
+mod append;
+pub use append::commit_data_files_append;
+pub(crate) use append::commit_generated_data_files_append;
 
 #[cfg(any(
     feature = "iceberg-storage-s3",
@@ -698,64 +701,6 @@ fn compat_scan_limit_error() -> ConnectorError {
 #[must_use]
 pub fn current_snapshot_id(table: &Table) -> Option<i64> {
     table.metadata().current_snapshot().map(|s| s.snapshot_id())
-}
-
-/// Append `data_files` in one Iceberg transaction.
-///
-/// # Errors
-/// Returns [`ConnectorError::OutcomeUnknown`] when the catalog does not acknowledge the commit.
-pub async fn commit_data_files_append(
-    table: &Table,
-    catalog: &dyn Catalog,
-    data_files: Vec<iceberg::spec::DataFile>,
-) -> Result<Table, ConnectorError> {
-    let tx = Transaction::new(table);
-    let tx = if data_files.is_empty() {
-        tx
-    } else {
-        tx.fast_append()
-            .add_data_files(data_files)
-            .apply(tx)
-            .map_err(|error| {
-                ConnectorError::TransactionError(format!(
-                    "apply Iceberg fast_append ({})",
-                    external_error_summary(&error)
-                ))
-            })?
-    };
-    tx.commit(catalog)
-        .await
-        .map_err(|error| iceberg_commit_error(&error))
-}
-
-fn iceberg_commit_error(error: &iceberg::Error) -> ConnectorError {
-    use iceberg::ErrorKind;
-
-    let kind = error.kind();
-    let retryable = error.retryable();
-    let summary = external_error_summary(error);
-    match kind {
-        ErrorKind::CatalogCommitConflicts => {
-            ConnectorError::WriteError(format!("Iceberg catalog commit conflict ({summary})"))
-        }
-        ErrorKind::PreconditionFailed
-        | ErrorKind::DataInvalid
-        | ErrorKind::NamespaceAlreadyExists
-        | ErrorKind::TableAlreadyExists
-        | ErrorKind::NamespaceNotFound
-        | ErrorKind::TableNotFound
-        | ErrorKind::FeatureUnsupported => {
-            ConnectorError::TransactionError(format!("Iceberg catalog rejected commit ({summary})"))
-        }
-        ErrorKind::Unexpected => ConnectorError::outcome_unknown(
-            format!("Iceberg catalog commit may have applied ({summary})"),
-            retryable,
-        ),
-        _ => ConnectorError::outcome_unknown(
-            format!("Iceberg catalog returned an unclassified commit failure ({summary})"),
-            retryable,
-        ),
-    }
 }
 
 /// Creates an Iceberg table (and namespace) if it does not already exist.

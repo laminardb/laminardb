@@ -76,6 +76,17 @@ impl ManifestReadLimits {
     }
 }
 
+pub(crate) async fn preflight_current_snapshot_manifest_list(
+    table: &Table,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(());
+    };
+    load_manifest_list(table, snapshot, ManifestReadLimits::fixed(), deadline).await?;
+    Ok(())
+}
+
 pub(crate) async fn preflight_snapshot(
     table: &Table,
     snapshot: &SnapshotRef,

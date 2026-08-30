@@ -248,10 +248,11 @@ impl IcebergSink {
                 expected: "open Iceberg sink".into(),
                 actual: "catalog is not initialized".into(),
             })?;
-        let updated = super::iceberg_io::commit_data_files_append(
+        let updated = super::iceberg_io::commit_generated_data_files_append(
             &current,
             catalog.as_ref(),
             output.data_files,
+            tokio::time::Instant::now() + self.config.storage.request_timeout,
         )
         .await?;
         self.table = Some(updated);

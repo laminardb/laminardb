@@ -628,6 +628,9 @@ async fn commit_once(
     let manifest_commit_uuid = uuid::Uuid::now_v7();
     let tx = tx
         .fast_append()
+        // Deterministic paths, ref-snapshot fencing, and exact cursor reconciliation replace the
+        // full-table scan; descriptor admission rejects duplicates within this append.
+        .with_check_duplicate(false)
         .set_commit_uuid(manifest_commit_uuid)
         .set_snapshot_properties(summary_properties(
             batch,

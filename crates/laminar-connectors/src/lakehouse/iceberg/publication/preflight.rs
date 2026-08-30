@@ -6,6 +6,7 @@ use iceberg::spec::DataFile;
 
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_io::external_error_summary;
+use crate::lakehouse::iceberg_scan::preflight_current_snapshot_manifest_list;
 
 const DATA_FILE_PREFLIGHT_CONCURRENCY: usize = 16;
 const PARQUET_HEADER_BYTES: u64 = 4;
@@ -23,6 +24,7 @@ pub(super) async fn validate_data_file_objects(
             "Iceberg coordinated publication deadline elapsed during data-file preflight".into(),
         ));
     }
+    preflight_current_snapshot_manifest_list(table, deadline).await?;
     for files in data_files.chunks(DATA_FILE_PREFLIGHT_CONCURRENCY) {
         futures_util::future::try_join_all(
             files

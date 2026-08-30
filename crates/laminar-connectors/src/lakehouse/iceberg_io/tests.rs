@@ -24,7 +24,7 @@ fn catalog_config(configure: impl FnOnce(&mut ConnectorConfig)) -> IcebergCatalo
 fn catalog_commit_failure_has_unknown_outcome() {
     let source =
         iceberg::Error::new(iceberg::ErrorKind::Unexpected, "response lost").with_retryable(true);
-    let error = iceberg_commit_error(&source);
+    let error = append::iceberg_commit_error(&source);
     assert!(error.is_outcome_unknown());
     assert!(error.is_transient());
     assert!(error.to_string().contains("may have applied"));
@@ -38,7 +38,7 @@ fn external_errors_do_not_expose_provider_messages() {
     )
     .with_retryable(true);
     let summary = external_error_summary(&source);
-    let commit = iceberg_commit_error(&source).to_string();
+    let commit = append::iceberg_commit_error(&source).to_string();
     for value in [summary, commit] {
         assert!(value.contains("Unexpected"));
         assert!(!value.contains("secret"));
@@ -81,7 +81,7 @@ fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
         iceberg::ErrorKind::CatalogCommitConflicts,
         "base metadata changed",
     );
-    let error = iceberg_commit_error(&source);
+    let error = append::iceberg_commit_error(&source);
     assert!(!error.is_outcome_unknown());
     assert!(error.is_transient());
 }
