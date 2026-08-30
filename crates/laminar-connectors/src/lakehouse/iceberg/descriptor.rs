@@ -764,7 +764,7 @@ mod tests {
             let mut writer = apache_avro::Writer::with_codec(
                 &schema,
                 &mut compressed,
-                apache_avro::Codec::Deflate(Default::default()),
+                apache_avro::Codec::Deflate(apache_avro::DeflateSettings::default()),
             );
             for value in values {
                 writer.append(value).unwrap();

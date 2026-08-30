@@ -60,13 +60,18 @@ pub(crate) struct BuiltCatalog {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AtomicTableRequirements {
+    #[cfg(feature = "iceberg-catalog-rest")]
     pub(crate) table_uuid: uuid::Uuid,
+    #[cfg(feature = "iceberg-catalog-rest")]
     pub(crate) schema_id: i32,
+    #[cfg(feature = "iceberg-catalog-rest")]
     pub(crate) partition_spec_id: i32,
+    #[cfg(feature = "iceberg-catalog-rest")]
     pub(crate) sort_order_id: i64,
 }
 
 impl AtomicTableRequirements {
+    #[cfg(feature = "iceberg-catalog-rest")]
     pub(crate) fn from_table(table: &Table) -> Self {
         Self {
             table_uuid: table.metadata().uuid(),
@@ -74,6 +79,11 @@ impl AtomicTableRequirements {
             partition_spec_id: table.metadata().default_partition_spec_id(),
             sort_order_id: table.metadata().default_sort_order_id(),
         }
+    }
+
+    #[cfg(not(feature = "iceberg-catalog-rest"))]
+    pub(crate) fn from_table(_table: &Table) -> Self {
+        Self {}
     }
 }
 
