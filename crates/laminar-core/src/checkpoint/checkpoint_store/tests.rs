@@ -190,6 +190,11 @@ async fn durable_sink_intent_promotes_to_the_exact_participant_manifest() {
         .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent.clone()])
         .await
         .unwrap();
+    assert_eq!(
+        store.load_manifest(manifest.checkpoint_id).await.unwrap(),
+        None,
+        "the intent is not a participant readiness marker"
+    );
     store
         .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent.clone()])
         .await

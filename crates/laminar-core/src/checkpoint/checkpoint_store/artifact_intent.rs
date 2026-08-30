@@ -171,18 +171,34 @@ fn artifact_intent_bytes(
 }
 
 impl ObjectStoreCheckpointStore {
+    pub(super) fn decode_pending_artifact_intent_record(
+        bytes: &Bytes,
+        chunk: StateChunkId,
+    ) -> Result<Option<CheckpointArtifactIntentRecord>, CheckpointStoreError> {
+        let Ok(record) = serde_json::from_slice::<CheckpointArtifactIntentRecord>(bytes) else {
+            return Ok(None);
+        };
+        validate_artifact_intent_record(&record, chunk, &record.artifact_identity_sha256)?;
+        if artifact_intent_bytes(&record)? != *bytes {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "participant {} checkpoint {} sink artifact intent is not canonical",
+                chunk.participant_id, chunk.checkpoint_id
+            )));
+        }
+        Ok(Some(record))
+    }
+
     pub(super) fn decode_artifact_intent_record(
         bytes: &Bytes,
         chunk: StateChunkId,
         expected_artifact_identity_sha256: &str,
     ) -> Result<Option<CheckpointArtifactIntentRecord>, CheckpointStoreError> {
-        let Ok(record) = serde_json::from_slice::<CheckpointArtifactIntentRecord>(bytes) else {
+        let Some(record) = Self::decode_pending_artifact_intent_record(bytes, chunk)? else {
             return Ok(None);
         };
-        validate_artifact_intent_record(&record, chunk, expected_artifact_identity_sha256)?;
-        if artifact_intent_bytes(&record)? != *bytes {
+        if record.artifact_identity_sha256 != expected_artifact_identity_sha256 {
             return Err(CheckpointStoreError::Invalid(format!(
-                "participant {} checkpoint {} sink artifact intent is not canonical",
+                "participant {} checkpoint {} has a different sink artifact intent",
                 chunk.participant_id, chunk.checkpoint_id
             )));
         }

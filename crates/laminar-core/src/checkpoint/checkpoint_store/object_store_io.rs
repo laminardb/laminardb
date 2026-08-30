@@ -131,7 +131,16 @@ impl ObjectStoreCheckpointStore {
         let Some(bytes) = self.load_bounded_manifest_bytes(chunk).await? else {
             return Ok(None);
         };
-        self.decode_manifest(chunk, &bytes).map(Some)
+        let manifest_error = match self.decode_manifest(chunk, &bytes) {
+            Ok(manifest) => return Ok(Some(manifest)),
+            Err(CheckpointStoreError::Serde(error)) => error,
+            Err(error) => return Err(error),
+        };
+        // A pre-begin intent owns this key until its conditional promotion; it is not readiness.
+        if Self::decode_pending_artifact_intent_record(&bytes, chunk)?.is_some() {
+            return Ok(None);
+        }
+        Err(CheckpointStoreError::Serde(manifest_error))
     }
 
     pub(super) async fn overwrite(
