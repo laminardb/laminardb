@@ -148,7 +148,7 @@ pub(super) async fn build_publication(
 
 fn http_client(config: &IcebergCatalogConfig) -> Result<delta_reqwest::Client, ConnectorError> {
     delta_reqwest::Client::builder()
-        .connect_timeout(config.request_timeout)
+        .connect_timeout(config.connect_timeout)
         .timeout(config.request_timeout)
         .build()
         .map_err(|_| {

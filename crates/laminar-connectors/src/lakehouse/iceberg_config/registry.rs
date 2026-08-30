@@ -180,6 +180,11 @@ fn common_config_keys() -> Vec<ConfigKeySpec> {
             "false",
         ),
         ConfigKeySpec::optional(
+            "catalog.connect_timeout",
+            "Catalog connection establishment bound",
+            "10s",
+        ),
+        ConfigKeySpec::optional(
             "catalog.request_timeout",
             "Bound for one catalog request",
             "30s",

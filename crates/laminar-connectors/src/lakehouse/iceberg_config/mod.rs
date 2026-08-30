@@ -93,6 +93,8 @@ pub struct IcebergCatalogConfig {
     pub oauth2_scope: Option<String>,
     /// Whether REST credential vending may be used.
     pub access_delegation: bool,
+    /// Bound for catalog connection establishment.
+    pub connect_timeout: Duration,
     /// Bound for an individual catalog request.
     pub request_timeout: Duration,
     /// End-to-end catalog commit bound.
@@ -126,6 +128,7 @@ impl fmt::Debug for IcebergCatalogConfig {
             )
             .field("oauth2_scope", &self.oauth2_scope)
             .field("access_delegation", &self.access_delegation)
+            .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
             .field("commit_timeout", &self.commit_timeout)
             .field("namespace", &self.namespace)
@@ -228,6 +231,11 @@ impl IcebergCatalogConfig {
             oauth2_client_id: optional_non_empty(config, "catalog.oauth2.client_id"),
             oauth2_scope: optional_non_empty(config, "catalog.oauth2.scope"),
             access_delegation: parse_bool(config, "catalog.access_delegation", false)?,
+            connect_timeout: parse_duration(
+                config,
+                "catalog.connect_timeout",
+                Duration::from_secs(10),
+            )?,
             request_timeout: parse_duration(
                 config,
                 "catalog.request_timeout",
@@ -574,6 +582,7 @@ impl IcebergSinkConfig {
             ));
         }
         for (name, value) in [
+            ("catalog.connect_timeout", self.catalog.connect_timeout),
             ("catalog.request_timeout", self.catalog.request_timeout),
             ("catalog.commit_timeout", self.catalog.commit_timeout),
             ("storage.request_timeout", self.storage.request_timeout),

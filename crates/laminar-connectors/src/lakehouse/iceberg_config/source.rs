@@ -135,6 +135,7 @@ impl IcebergSourceConfig {
         }
         for (name, value) in [
             ("poll.interval", self.poll_interval),
+            ("catalog.connect_timeout", self.catalog.connect_timeout),
             ("catalog.request_timeout", self.catalog.request_timeout),
             ("storage.request_timeout", self.storage.request_timeout),
             ("storage.connect_timeout", self.storage.connect_timeout),

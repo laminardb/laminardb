@@ -112,6 +112,11 @@ fn programmatic_zero_source_limit_fails_closed() {
     parsed.scan_concurrency = 0;
     let error = parsed.validate_read_limits().unwrap_err().to_string();
     assert!(error.contains("read.scan.concurrency"));
+
+    let mut parsed = IcebergSourceConfig::from_config(&table_definition_config()).unwrap();
+    parsed.catalog.connect_timeout = Duration::ZERO;
+    let error = parsed.validate_read_limits().unwrap_err().to_string();
+    assert!(error.contains("catalog.connect_timeout"));
 }
 
 #[test]
@@ -131,6 +136,21 @@ fn test_defaults() {
     let cfg = IcebergSinkConfig::from_config(&config).unwrap();
     assert_eq!(cfg.compression, "zstd");
     assert!(!cfg.auto_create);
+    assert_eq!(cfg.catalog.connect_timeout, Duration::from_secs(10));
+}
+
+#[test]
+fn catalog_connect_timeout_is_typed_and_validated() {
+    let mut config = table_definition_config();
+    config.set("catalog.connect_timeout", "250ms");
+    let parsed = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_eq!(parsed.catalog.connect_timeout, Duration::from_millis(250));
+
+    config.set("catalog.connect_timeout", "0s");
+    let error = IcebergSinkConfig::from_config(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("catalog.connect_timeout must be greater than zero"));
 }
 
 fn table_definition_config() -> ConnectorConfig {
@@ -235,6 +255,11 @@ fn programmatic_writer_limits_fail_closed() {
     parsed.max_descriptor_bytes = crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES + 1;
     let error = parsed.validate_writer_limits().unwrap_err().to_string();
     assert!(error.contains("max.descriptor.bytes must not exceed"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    parsed.catalog.connect_timeout = Duration::ZERO;
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("catalog.connect_timeout must be greater than zero"));
 
     let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
     parsed.storage.connect_timeout = Duration::ZERO;
