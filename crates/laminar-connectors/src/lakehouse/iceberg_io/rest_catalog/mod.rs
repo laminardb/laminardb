@@ -57,6 +57,7 @@ pub(super) async fn build(
     credential_refresh_failures: Option<prometheus::IntCounter>,
 ) -> Result<BuiltCatalog, ConnectorError> {
     super::super::iceberg::capabilities::validate_catalog_session(config)?;
+    validate_configured_uri(&config.catalog_uri)?;
     validate_storage_options(&config.warehouse, storage)?;
     let factory = storage_factory(&config.warehouse, storage)?;
     let properties = rest_properties(config, storage)?;
@@ -103,6 +104,7 @@ pub(super) async fn build_publication(
         ));
     }
     super::super::iceberg::capabilities::validate_catalog_session(config)?;
+    validate_configured_uri(&config.catalog_uri)?;
     validate_storage_options(&config.warehouse, storage)?;
     let properties = rest_properties(config, storage)?;
     validate_rest_properties(&properties)?;
@@ -223,10 +225,8 @@ async fn discover(
         .get("uri")
         .cloned()
         .unwrap_or_else(|| config.catalog_uri.clone());
-    if crate::security::value_contains_uri_secret(&effective_uri, false) {
-        return Err(ConnectorError::FeatureUnsupported(
-            "iceberg.catalog.rest.uri: server override embeds credential material".into(),
-        ));
+    if response.overrides.contains_key("uri") {
+        validate_server_uri(&effective_uri)?;
     }
     let mut effective_properties = response.defaults;
     effective_properties.extend(properties.clone());
@@ -242,6 +242,41 @@ async fn discover(
         },
         effective_uri,
         effective_properties,
+    })
+}
+
+fn validate_configured_uri(uri: &str) -> Result<(), ConnectorError> {
+    if crate::security::value_contains_uri_secret(uri, false) || !is_rest_base_uri(uri) {
+        return Err(ConnectorError::ConfigurationError(
+            "catalog.uri must be an absolute credential-free HTTP(S) base URL without a query or fragment"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_server_uri(uri: &str) -> Result<(), ConnectorError> {
+    if crate::security::value_contains_uri_secret(uri, false) {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.uri: server override embeds credential material".into(),
+        ));
+    }
+    if !is_rest_base_uri(uri) {
+        return Err(ConnectorError::FeatureUnsupported(
+            "iceberg.catalog.rest.uri: server override is not an absolute HTTP(S) base URL".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_rest_base_uri(uri: &str) -> bool {
+    delta_reqwest::Url::parse(uri).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
     })
 }
 
@@ -567,6 +602,83 @@ mod tests {
             assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
             assert!(!error.to_string().contains("server-secret"));
         }
+    }
+
+    #[test]
+    fn rest_base_uri_validation_is_redacted_and_fail_closed() {
+        for invalid in [
+            "catalog.test",
+            "file:///catalog",
+            "https://catalog.test?token=value",
+            "https://catalog.test/#fragment",
+        ] {
+            let error = validate_configured_uri(invalid).unwrap_err();
+            assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+            assert!(!error.to_string().contains(invalid));
+        }
+        let error = validate_server_uri("https://user:do-not-echo@catalog.test").unwrap_err();
+        assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert!(!error.to_string().contains("do-not-echo"));
+        assert!(is_rest_base_uri("https://catalog.test/api"));
+    }
+
+    #[tokio::test]
+    async fn invalid_configured_uri_fails_before_catalog_io() {
+        let mut raw = ConnectorConfig::new("iceberg");
+        raw.set("catalog.uri", "file:///catalog");
+        raw.set("catalog.warehouse", "warehouse");
+        raw.set("namespace", "test");
+        raw.set("table.name", "events");
+        let config = IcebergCatalogConfig::from_config(&raw).unwrap();
+        let storage = IcebergStorageConfig::from_config(&raw).unwrap();
+
+        let error = match build(&config, &storage, CatalogAccess::Read, None).await {
+            Ok(_) => panic!("invalid configured URI must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.to_string().contains("file:///catalog"));
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_invalid_server_uri_override() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .and(header("authorization", "Bearer catalog-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "defaults": {},
+                "overrides": {"uri": "file:///catalog"},
+                "endpoints": [LOAD_TABLE_ENDPOINT]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = catalog_config(&server.uri());
+        let storage = IcebergStorageConfig::from_config(&ConnectorConfig::new("iceberg")).unwrap();
+        let properties = rest_properties(&config, &storage).unwrap();
+        let client = http_client(&config).unwrap();
+        let authentication =
+            RestAuthentication::initialize(&config, client.clone(), &properties, None)
+                .await
+                .unwrap();
+
+        let error = match discover(
+            &config,
+            &client,
+            &properties,
+            CatalogAccess::Read,
+            &authentication,
+        )
+        .await
+        {
+            Ok(_) => panic!("invalid server URI override must fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert!(error.to_string().contains("iceberg.catalog.rest.uri"));
     }
 
     #[tokio::test]
