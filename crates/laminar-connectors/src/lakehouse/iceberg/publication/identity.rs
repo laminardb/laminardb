@@ -93,9 +93,7 @@ pub(super) fn deterministic_commit_uuid(
     let digest = hash.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x80;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    uuid::Uuid::from_bytes(bytes)
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
 }
 
 pub(super) fn deterministic_idempotency_key(
@@ -119,9 +117,10 @@ pub(super) fn deterministic_idempotency_key(
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     bytes[..6].copy_from_slice(&deployment.as_bytes()[..6]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(uuid::Uuid::from_bytes(bytes))
+    Ok(uuid::Builder::from_bytes(bytes)
+        .with_variant(uuid::Variant::RFC4122)
+        .with_version(uuid::Version::SortRand)
+        .into_uuid())
 }
 
 fn canonical_usize_bytes(value: usize) -> Result<[u8; 8], ConnectorError> {
