@@ -12,9 +12,9 @@ use crate::lakehouse::iceberg_config::IcebergSinkConfig;
 use crate::lakehouse::iceberg_scan::{load_manifest, load_manifest_list, ManifestReadLimits};
 
 use super::{
-    data_file_set_fingerprint, ensure_deadline, file_set_fingerprint, hex, load_table_until,
-    PreparedPublication, UnresolvedIcebergPublication, SUMMARY_BATCH_FINGERPRINT,
-    SUMMARY_CHECKPOINT, SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
+    data_file_set_fingerprint, ensure_deadline, hex, load_table_until, PreparedPublication,
+    UnresolvedIcebergPublication, SUMMARY_BATCH_FINGERPRINT, SUMMARY_CHECKPOINT,
+    SUMMARY_COMMIT_UUID, SUMMARY_FENCE, SUMMARY_FILE_SET, SUMMARY_NAMESPACE,
 };
 use crate::lakehouse::iceberg::commit_cursor::{cursor_record, CursorRecord};
 use crate::lakehouse::iceberg::metrics::IcebergMetrics;
@@ -102,15 +102,6 @@ pub(super) async fn reconcile_exact_publication(
         &prepared.file_set_fingerprint,
         commit_uuid,
     )?;
-    if prepared.data_files.is_empty() {
-        if record.cursor != expected_cursor {
-            return Err(ConnectorError::TransactionError(
-                "superseded empty Iceberg checkpoint cannot be proven from snapshot history".into(),
-            ));
-        }
-        return Ok(());
-    }
-
     let snapshot = find_exact_snapshot(
         table,
         &external_key,
@@ -169,9 +160,6 @@ async fn verify_cursor_record(
     record: &CursorRecord,
     deadline: tokio::time::Instant,
 ) -> Result<(), ConnectorError> {
-    if record.file_set_fingerprint == file_set_fingerprint(&[])? {
-        return Ok(());
-    }
     let commit_uuid = uuid::Uuid::parse_str(&record.commit_uuid).map_err(|_| {
         ConnectorError::TransactionError("Iceberg cursor commit UUID is malformed".into())
     })?;

@@ -98,6 +98,25 @@ fn commit_batch(
     )
 }
 
+fn empty_commit_batch(
+    checkpoint_id: u64,
+    expected_predecessor: CoordinatedCommitCursor,
+    fencing_token: u64,
+) -> CoordinatedCommitBatch {
+    let target = CheckpointAttempt::canonical(checkpoint_id);
+    CoordinatedCommitBatch {
+        namespace: commit_namespace(),
+        expected_predecessor,
+        fencing_token,
+        target,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: target,
+            participant_id: 1,
+            payload: None,
+        }],
+    }
+}
+
 fn commit_participant_batch(
     checkpoint_id: u64,
     expected_predecessor: CoordinatedCommitCursor,
@@ -308,6 +327,52 @@ async fn coordinated_checkpoint_restart_replay_soak() {
     let (snapshots, rows) = inspect(&table).await;
     assert_eq!(snapshots, 8);
     assert_eq!(rows, 16);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker: tests/docker/iceberg-compose.yml"]
+async fn coordinated_empty_checkpoint_replay_is_one_fenced_snapshot() {
+    require_catalog();
+    let table = format!("empty_{}", uuid::Uuid::new_v4().simple());
+    open_sink(&table).await.close().await.unwrap();
+    let batch = empty_commit_batch(
+        1,
+        CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        101,
+    );
+
+    let mut writer = open_coordinated_sink(&table).await;
+    writer.begin_epoch(1).await.unwrap();
+    assert!(writer.pre_commit(1).await.unwrap().is_none());
+    writer
+        .commit_aggregated(batch.clone(), commit_context())
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+
+    let mut restarted = open_coordinated_sink(&table).await;
+    restarted
+        .commit_aggregated(batch, commit_context())
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .committed_cursor(&commit_namespace())
+            .await
+            .unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 1,
+            fencing_token: 101,
+        })
+    );
+    restarted.close().await.unwrap();
+
+    let (snapshots, rows) = inspect(&table).await;
+    assert_eq!(snapshots, 1);
+    assert_eq!(rows, 0);
 }
 
 #[tokio::test]

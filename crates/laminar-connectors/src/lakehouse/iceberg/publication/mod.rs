@@ -623,24 +623,21 @@ async fn commit_once(
         .set(keys.file_set, prepared.file_set_fingerprint.clone())
         .set(keys.commit_uuid, logical_commit_uuid.to_string());
     let tx = properties.apply(tx)?;
-    let tx = if prepared.data_files.is_empty() {
-        tx
-    } else {
-        // RECOVERY: Iceberg uses this UUID in manifest paths, so every dispatch needs a
-        // distinct physical namespace. The replay-stable logical UUID stays in the commit state.
-        let manifest_commit_uuid = uuid::Uuid::now_v7();
-        tx.fast_append()
-            .set_commit_uuid(manifest_commit_uuid)
-            .set_snapshot_properties(summary_properties(
-                batch,
-                external_key,
-                exact_batch_fingerprint,
-                &prepared.file_set_fingerprint,
-                logical_commit_uuid,
-            ))
-            .add_data_files(prepared.data_files.clone())
-            .apply(tx)?
-    };
+    // RECOVERY: physical attempts need distinct manifest paths; the summary retains the stable
+    // logical UUID. Empty checkpoints still need a snapshot so the ref requirement fences leaders.
+    let manifest_commit_uuid = uuid::Uuid::now_v7();
+    let tx = tx
+        .fast_append()
+        .set_commit_uuid(manifest_commit_uuid)
+        .set_snapshot_properties(summary_properties(
+            batch,
+            external_key,
+            exact_batch_fingerprint,
+            &prepared.file_set_fingerprint,
+            logical_commit_uuid,
+        ))
+        .add_data_files(prepared.data_files.clone())
+        .apply(tx)?;
     #[cfg(test)]
     if super::fault_injection::hit(super::fault_injection::IcebergFaultPoint::BeforeCatalogCommit) {
         return Err(iceberg::Error::new(
@@ -1374,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_checkpoint_advances_table_metadata_without_snapshot() {
+    async fn empty_checkpoint_replay_creates_one_fenced_append_snapshot() {
         let fixture = create_test_table(false).await;
         let batch = commit_batch(
             1,
@@ -1384,19 +1381,23 @@ mod tests {
             },
             vec![(1, None)],
         );
-        publish_coordinated(
-            &fixture.catalog,
-            &NO_CATALOG_CAPABILITIES,
-            &CatalogSession::default(),
-            &fixture.config,
-            &batch,
-            CoordinatedCommitContext::new(tokio::time::Instant::now() + Duration::from_secs(10)),
-            &IcebergMetrics::new(None),
-        )
-        .await
-        .unwrap();
+        for _ in 0..2 {
+            publish_coordinated(
+                &fixture.catalog,
+                &NO_CATALOG_CAPABILITIES,
+                &CatalogSession::default(),
+                &fixture.config,
+                &batch,
+                CoordinatedCommitContext::new(
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                ),
+                &IcebergMetrics::new(None),
+            )
+            .await
+            .unwrap();
+        }
         let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
-        assert_eq!(table.metadata().snapshots().count(), 0);
+        assert_eq!(table.metadata().snapshots().count(), 1);
         assert_eq!(
             cursor_record(&table, &batch.namespace.external_key())
                 .unwrap()
@@ -1405,6 +1406,78 @@ mod tests {
                 .checkpoint_id,
             1
         );
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            snapshot.summary().operation,
+            iceberg::spec::Operation::Append
+        );
+        assert_eq!(
+            snapshot
+                .summary()
+                .additional_properties
+                .get(SUMMARY_NAMESPACE),
+            Some(&batch.namespace.external_key())
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_append_snapshot_fences_a_stale_committer() {
+        let fixture = create_test_table(false).await;
+        let stale = commit_batch(
+            1,
+            CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            vec![(1, None)],
+        );
+        let mut winner = stale.clone();
+        winner.fencing_token += 1;
+        let stale_prepared = prepare_publication(&fixture.config, &stale, &fixture.table).unwrap();
+        let winner_prepared =
+            prepare_publication(&fixture.config, &winner, &fixture.table).unwrap();
+
+        let winner_exact = winner.exact_fingerprint();
+        let winner_fingerprint = hex(&winner_exact);
+        let winner_uuid = deterministic_commit_uuid(&winner, &winner_exact);
+        commit_once(
+            fixture.catalog.as_ref(),
+            &fixture.table,
+            &winner,
+            &winner_prepared,
+            &winner.namespace.external_key(),
+            &winner_fingerprint,
+            winner_uuid,
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let stale_exact = stale.exact_fingerprint();
+        let stale_fingerprint = hex(&stale_exact);
+        let stale_uuid = deterministic_commit_uuid(&stale, &stale_exact);
+        let error = commit_once(
+            fixture.catalog.as_ref(),
+            &fixture.table,
+            &stale,
+            &stale_prepared,
+            &stale.namespace.external_key(),
+            &stale_fingerprint,
+            stale_uuid,
+            &AtomicBool::new(false),
+        )
+        .await
+        .expect_err("the old base snapshot must fence a delayed empty commit");
+        assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+
+        let table = fixture.catalog.load_table(&table_ident()).await.unwrap();
+        let cursor = cursor_record(&table, &winner.namespace.external_key())
+            .unwrap()
+            .unwrap()
+            .cursor;
+        assert_eq!(cursor.checkpoint_id, 1);
+        assert_eq!(cursor.fencing_token, winner.fencing_token);
+        assert_eq!(table.metadata().snapshots().count(), 1);
     }
 
     #[tokio::test]
