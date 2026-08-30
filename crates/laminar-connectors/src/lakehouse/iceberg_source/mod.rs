@@ -328,7 +328,6 @@ impl IcebergSource {
                 return Ok(());
             }
         }
-        self.last_poll_time = Some(Instant::now());
         let poll_started = Instant::now();
         let catalog = self
             .catalog
@@ -406,6 +405,7 @@ impl IcebergSource {
             }
         }
         self.table = Some(table);
+        self.last_poll_time = Some(Instant::now());
         self.metrics
             .poll_duration
             .observe(poll_started.elapsed().as_secs_f64());

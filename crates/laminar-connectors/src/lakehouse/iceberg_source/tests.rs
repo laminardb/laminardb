@@ -146,6 +146,33 @@ fn contracts_match_typed_read_modes() {
 }
 
 #[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn failed_append_refresh_can_retry_without_waiting_for_poll_interval() {
+    use std::time::Duration;
+
+    use crate::lakehouse::iceberg::test_support::create_test_table;
+
+    let fixture = create_test_table(false).await;
+    let mut config = test_source_config();
+    config.read_mode = IcebergReadMode::Append;
+    config.poll_interval = Duration::from_secs(3_600);
+    config.catalog.table_name = "missing".into();
+    let mut source = IcebergSource::new(config, None);
+    source.catalog = Some(Arc::clone(&fixture.catalog));
+
+    source
+        .refresh_append()
+        .await
+        .expect_err("missing table must fail the refresh");
+    assert!(source.last_poll_time.is_none());
+
+    source.config.catalog.table_name = "events".into();
+    source.refresh_append().await.unwrap();
+    assert!(source.last_poll_time.is_some());
+    assert!(source.table.is_some());
+}
+
+#[cfg(feature = "iceberg-core")]
 #[test]
 fn split_snapshot_batches_block_barriers_until_the_completed_cursor() {
     use arrow_array::Int64Array;
