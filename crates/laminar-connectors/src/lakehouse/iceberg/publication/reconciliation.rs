@@ -29,17 +29,24 @@ pub(in crate::lakehouse::iceberg) async fn read_committed_cursor(
     unresolved: Option<&UnresolvedIcebergPublication>,
 ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
     let started = std::time::Instant::now();
+    let external_key = namespace.external_key();
+    if unresolved.is_some_and(|pending| pending.external_key != external_key) {
+        return Err(ConnectorError::outcome_unknown(
+            "[LDB-ICEBERG-UNRESOLVED-NAMESPACE] the requested commit namespace does not own the unresolved Iceberg publication",
+            true,
+        ));
+    }
     let table = load_table_until(catalog, config, deadline, false).await?;
     #[cfg(test)]
     crate::lakehouse::iceberg::fault_injection::fail_outcome_unknown_if(
         crate::lakehouse::iceberg::fault_injection::IcebergFaultPoint::DuringCommittedCursor,
     )?;
-    let record = cursor_record(&table, &namespace.external_key())?;
+    let record = cursor_record(&table, &external_key)?;
     if let (Some(record), Some(unresolved)) = (&record, unresolved) {
-        validate_unresolved_record(namespace, record, unresolved)?;
+        validate_unresolved_record(record, unresolved)?;
     }
     if let Some(record) = &record {
-        verify_cursor_record(&table, &namespace.external_key(), record, deadline)
+        verify_cursor_record(&table, &external_key, record, deadline)
             .await
             .map_err(|error| {
                 ConnectorError::outcome_unknown(
@@ -61,15 +68,13 @@ pub(in crate::lakehouse::iceberg) async fn read_committed_cursor(
 }
 
 fn validate_unresolved_record(
-    namespace: &CoordinatedCommitNamespace,
     record: &CursorRecord,
     unresolved: &UnresolvedIcebergPublication,
 ) -> Result<(), ConnectorError> {
     let exact_fingerprint = hex(&unresolved.exact_batch_fingerprint);
-    if unresolved.external_key == namespace.external_key()
-        && (record.cursor != unresolved.target
-            || record.batch_fingerprint != exact_fingerprint
-            || record.file_set_fingerprint != unresolved.expected_file_set_fingerprint)
+    if record.cursor != unresolved.target
+        || record.batch_fingerprint != exact_fingerprint
+        || record.file_set_fingerprint != unresolved.expected_file_set_fingerprint
     {
         return Err(ConnectorError::outcome_unknown(
             "Iceberg cursor does not prove the exact unresolved publication and file set",

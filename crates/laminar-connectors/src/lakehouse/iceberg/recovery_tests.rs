@@ -474,6 +474,45 @@ async fn unknown_refresh_and_cursor_faults_block_until_exact_reconciliation() {
 }
 
 #[tokio::test]
+async fn unresolved_publication_rejects_a_foreign_namespace_before_catalog_io() {
+    let fixture = create_test_table(false).await;
+    let mut sink = coordinated_sink(&fixture, fixture.table.clone());
+    let batch = commit_batch(1, descriptor(&mut sink, &fixture, 1).await);
+    let pending = super::publication::unresolved_publication(&sink.config, &batch).unwrap();
+    *sink.unresolved_publication.lock() = Some(pending);
+    let foreign_namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        DEPLOYMENT_ID,
+        "foreign-sink",
+    )
+    .unwrap();
+
+    scope(
+        [IcebergFault::first(
+            IcebergFaultPoint::DuringMetadataRefresh,
+        )],
+        async {
+            let error = sink
+                .committed_cursor(&foreign_namespace)
+                .await
+                .expect_err("a foreign namespace must not inspect the unresolved publication");
+            assert!(error.is_outcome_unknown());
+            assert!(error
+                .to_string()
+                .contains("LDB-ICEBERG-UNRESOLVED-NAMESPACE"));
+
+            let error = sink
+                .committed_cursor(&namespace())
+                .await
+                .expect_err("the unconsumed catalog fault proves the first call did no I/O");
+            assert!(error.to_string().contains("metadata refresh failure"));
+        },
+    )
+    .await;
+    assert!(sink.unresolved_publication.lock().is_some());
+}
+
+#[tokio::test]
 async fn failed_post_commit_file_set_verification_retains_the_recovery_fence() {
     let fixture = create_test_table(false).await;
     let mut sink = coordinated_sink(&fixture, fixture.table.clone());
