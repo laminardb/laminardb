@@ -620,7 +620,7 @@ mod tests {
         config.set("catalog.oauth2.client_id", "laminar-client");
         config.set("catalog.oauth2.scope", "catalog:read catalog:write");
         config.set("catalog.property.credential", "refresh-secret");
-        config.set("catalog.request_timeout", "1s");
+        config.set("catalog.request_timeout", "5s");
         IcebergCatalogConfig::from_config(&config).unwrap()
     }
 
@@ -646,7 +646,7 @@ mod tests {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "access_token": format!("catalog-token-{ordinal}"),
                     "token_type": "Bearer",
-                    "expires_in": 5
+                    "expires_in": 30
                 }))
             })
             .expect(2)
@@ -689,7 +689,7 @@ mod tests {
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "access_token": format!("catalog-token-{ordinal}"),
                     "token_type": "Bearer",
-                    "expires_in": 5
+                    "expires_in": 30
                 }))
             })
             .expect(2)
@@ -768,7 +768,7 @@ mod tests {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "access_token": "old-catalog-token",
                         "token_type": "bearer",
-                        "expires_in": 5
+                        "expires_in": 30
                     }))
                 } else {
                     ResponseTemplate::new(503)

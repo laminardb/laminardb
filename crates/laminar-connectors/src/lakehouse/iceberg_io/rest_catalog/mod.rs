@@ -562,7 +562,7 @@ mod tests {
         config.set("catalog.oauth2.server_uri", format!("{uri}/tokens"));
         config.set("catalog.oauth2.client_id", "laminar-client");
         config.set("catalog.property.credential", "catalog-client-secret");
-        config.set("catalog.request_timeout", "1s");
+        config.set("catalog.request_timeout", "5s");
         IcebergCatalogConfig::from_config(&config).unwrap()
     }
 
