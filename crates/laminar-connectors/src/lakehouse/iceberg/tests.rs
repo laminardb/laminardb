@@ -30,6 +30,17 @@ fn new_sink_has_no_schema_or_active_epoch() {
     assert!(sink.active_epoch.get_mut().is_none());
 }
 
+#[tokio::test]
+async fn write_rejects_a_non_running_sink() {
+    let mut sink = IcebergSink::new(test_config(), None);
+    let batch = RecordBatch::new_empty(test_schema());
+
+    assert!(matches!(
+        sink.write_batch(&batch).await,
+        Err(ConnectorError::InvalidState { .. })
+    ));
+}
+
 #[test]
 fn append_contract_is_at_least_once_by_default() {
     let sink = IcebergSink::new(test_config(), None);

@@ -6,6 +6,8 @@ mod commit_cursor;
 #[cfg(feature = "iceberg-core")]
 mod descriptor;
 #[cfg(feature = "iceberg-core")]
+mod direct_publication;
+#[cfg(feature = "iceberg-core")]
 mod epoch_writer;
 #[cfg(all(test, feature = "iceberg-core"))]
 mod fault_injection;
@@ -235,12 +237,16 @@ impl IcebergSink {
             return Ok(());
         };
         let writer_table = self.table()?.clone();
-        let output = writer.close().await?;
+        let output = match writer.close().await {
+            Ok(output) => output,
+            Err(error) => {
+                self.state = ConnectorState::Failed;
+                return Err(error);
+            }
+        };
         if output.data_files.is_empty() {
             return Ok(());
         }
-        let current = self.load_current_table().await?;
-        validate_direct_publication_table(&writer_table, &current)?;
         let catalog = self
             .catalog
             .clone()
@@ -248,15 +254,26 @@ impl IcebergSink {
                 expected: "open Iceberg sink".into(),
                 actual: "catalog is not initialized".into(),
             })?;
-        let updated = super::iceberg_io::commit_generated_data_files_append(
-            &current,
-            catalog.as_ref(),
+        match direct_publication::publish_direct_append(
+            &self.config,
+            &catalog,
+            &self.catalog_capabilities,
+            &self.catalog_session,
+            &writer_table,
             output.data_files,
-            tokio::time::Instant::now() + self.config.storage.request_timeout,
+            &self.metrics,
         )
-        .await?;
-        self.table = Some(updated);
-        Ok(())
+        .await
+        {
+            Ok(updated) => {
+                self.table = Some(updated);
+                Ok(())
+            }
+            Err(error) => {
+                self.state = ConnectorState::Failed;
+                Err(error)
+            }
+        }
     }
 
     #[cfg(feature = "iceberg-core")]
@@ -442,6 +459,12 @@ impl SinkConnector for IcebergSink {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        if self.state != ConnectorState::Running {
+            return Err(ConnectorError::InvalidState {
+                expected: "running Iceberg sink".into(),
+                actual: self.state.to_string(),
+            });
+        }
         if batch.num_rows() == 0 {
             return Ok(WriteResult::new(0, 0));
         }
@@ -588,6 +611,12 @@ impl SinkConnector for IcebergSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
+        if self.state != ConnectorState::Running {
+            return Err(ConnectorError::InvalidState {
+                expected: "running Iceberg sink".into(),
+                actual: self.state.to_string(),
+            });
+        }
         #[cfg(feature = "iceberg-core")]
         {
             if self.is_coordinated() {

@@ -781,7 +781,7 @@ fn commit_deadline(
     (now + configured_timeout).min(outer_dispatch.max(now))
 }
 
-async fn jitter_before_retry(
+pub(super) async fn jitter_before_retry(
     deadline: tokio::time::Instant,
     attempt: usize,
 ) -> Result<(), ConnectorError> {

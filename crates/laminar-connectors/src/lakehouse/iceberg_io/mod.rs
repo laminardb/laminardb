@@ -79,7 +79,9 @@ impl AtomicTableRequirements {
 
 mod append;
 pub use append::commit_data_files_append;
-pub(crate) use append::commit_generated_data_files_append;
+pub(crate) use append::{
+    commit_generated_data_files_append, iceberg_commit_error, GeneratedAppendError,
+};
 
 #[cfg(any(
     feature = "iceberg-storage-s3",

@@ -89,7 +89,7 @@ impl IcebergMetrics {
             ),
             commit_retries: handle.counter(
                 "iceberg_sink_commit_retries_total",
-                "Iceberg coordinated publication retries",
+                "Iceberg publication retries",
             ),
             unknown_outcomes: handle.counter(
                 "iceberg_sink_unknown_outcomes_total",

@@ -14,6 +14,7 @@ use crate::connector::{
     CoordinatedCommitNamespace, CoordinatedCommitPayload, CoordinatedCommitter, DeliveryGuarantee,
     SinkConnector, SinkRuntimeContext,
 };
+use crate::error::ConnectorError;
 
 use super::fault_injection::{scope, IcebergFault, IcebergFaultPoint};
 use super::test_support::{
@@ -230,8 +231,14 @@ async fn direct_flush_rejects_schema_change_without_creating_a_snapshot() {
 
     let error = sink.flush().await.unwrap_err();
     assert!(error.to_string().contains("LDB-ICEBERG-SCHEMA-CHANGED"));
+    assert_eq!(sink.state, ConnectorState::Failed);
     assert!(sink.active_epoch.get_mut().is_none());
     assert!(sink.active_epoch_id.is_none());
+    assert!(matches!(
+        sink.write_batch(&record_batch(&fixture.table, &[(2, Some("b"))]))
+            .await,
+        Err(ConnectorError::InvalidState { .. })
+    ));
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(current.metadata().snapshots().count(), 0);
 }
@@ -253,6 +260,68 @@ async fn direct_flush_rebases_over_a_compatible_external_append() {
     let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
     assert_eq!(current.metadata().snapshots().count(), 2);
     assert_eq!(table_row_count(&current).await, 2);
+}
+
+#[tokio::test]
+async fn direct_flush_retries_a_definite_catalog_conflict() {
+    let fixture = create_test_table(false).await;
+    let mut sink = configured_sink(
+        &fixture,
+        fixture.table.clone(),
+        DeliveryGuarantee::AtLeastOnce,
+    );
+    sink.write_batch(&record_batch(&fixture.table, &[(1, Some("sink"))]))
+        .await
+        .unwrap();
+
+    scope(
+        [IcebergFault::first(
+            IcebergFaultPoint::CatalogCommitConflict,
+        )],
+        sink.flush(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(sink.state, ConnectorState::Running);
+    assert_eq!(sink.metrics.commit_conflicts.get(), 1);
+    assert_eq!(sink.metrics.commit_retries.get(), 1);
+    assert_eq!(sink.metrics.unknown_outcomes.get(), 0);
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 1);
+    assert_eq!(table_row_count(&current).await, 1);
+}
+
+#[tokio::test]
+async fn direct_response_loss_is_not_retried_or_allowed_to_advance() {
+    let fixture = create_test_table(false).await;
+    let mut sink = configured_sink(
+        &fixture,
+        fixture.table.clone(),
+        DeliveryGuarantee::AtLeastOnce,
+    );
+    sink.write_batch(&record_batch(&fixture.table, &[(1, Some("sink"))]))
+        .await
+        .unwrap();
+
+    let error = scope(
+        [IcebergFault::first(IcebergFaultPoint::AfterCatalogCommit)],
+        sink.flush(),
+    )
+    .await
+    .expect_err("response loss after dispatch must retain an unknown outcome");
+    assert!(error.is_outcome_unknown());
+    assert_eq!(sink.state, ConnectorState::Failed);
+    assert_eq!(sink.metrics.commit_retries.get(), 0);
+    assert_eq!(sink.metrics.unknown_outcomes.get(), 1);
+    assert!(matches!(
+        sink.flush().await,
+        Err(ConnectorError::InvalidState { .. })
+    ));
+
+    let current = fixture.catalog.load_table(&table_ident()).await.unwrap();
+    assert_eq!(current.metadata().snapshots().count(), 1);
+    assert_eq!(table_row_count(&current).await, 1);
 }
 
 #[tokio::test]

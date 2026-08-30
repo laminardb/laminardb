@@ -10,6 +10,7 @@ pub(super) enum IcebergFaultPoint {
     AfterFileClose,
     AfterDescriptor,
     BeforeCatalogCommit,
+    CatalogCommitConflict,
     AfterCatalogCommit,
     DuringMetadataRefresh,
     DuringManifestReconciliation,
