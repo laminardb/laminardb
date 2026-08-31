@@ -41,7 +41,8 @@ pub(crate) use table_definition::{
 const MIB: usize = 1024 * 1024;
 const MAX_ICEBERG_IO_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const ICEBERG_MAX_FILES_PER_CHECKPOINT: usize = 4_096;
-const MAX_CONFIG_LIST_BYTES: usize = MIB;
+const MAX_CONFIG_COLLECTION_BYTES: usize = MIB;
+const MAX_CONFIG_PROPERTY_ENTRIES: usize = 256;
 
 pub(crate) fn validate_io_timeout(name: &str, value: Duration) -> Result<(), ConnectorError> {
     if value.is_zero() {
@@ -236,6 +237,7 @@ impl IcebergCatalogConfig {
             }
         }
         let properties = config.properties_with_prefix("catalog.property.");
+        validate_property_map_bounds("catalog.property.*", &properties)?;
         let auth_type = parse_catalog_auth_type(config, &properties)?;
 
         let oauth2_server_uri = optional_non_empty(config, "catalog.oauth2.server_uri");
@@ -364,6 +366,8 @@ impl IcebergStorageConfig {
                 "storage.endpoint must not embed credentials".into(),
             ));
         }
+        let properties = config.properties_with_prefix("storage.property.");
+        validate_property_map_bounds("storage.property.*", &properties)?;
 
         Ok(Self {
             storage_type,
@@ -382,7 +386,7 @@ impl IcebergStorageConfig {
             )?,
             encryption,
             kms_key,
-            properties: config.properties_with_prefix("storage.property."),
+            properties,
         })
     }
 }
@@ -585,6 +589,8 @@ impl IcebergSinkConfig {
     }
 
     pub(crate) fn validate_writer_limits(&self) -> Result<(), ConnectorError> {
+        validate_property_map_bounds("catalog.property.*", &self.catalog.properties)?;
+        validate_property_map_bounds("storage.property.*", &self.storage.properties)?;
         for (name, value) in [
             ("target.file.size.bytes", self.target_file_size_bytes),
             (
@@ -791,9 +797,9 @@ fn parse_comma_list(
     max_entries: usize,
 ) -> Result<Vec<String>, ConnectorError> {
     let value = value.unwrap_or_default();
-    if value.len() > MAX_CONFIG_LIST_BYTES {
+    if value.len() > MAX_CONFIG_COLLECTION_BYTES {
         return Err(ConnectorError::ConfigurationError(format!(
-            "{key} is {} bytes; the limit is {MAX_CONFIG_LIST_BYTES}",
+            "{key} is {} bytes; the limit is {MAX_CONFIG_COLLECTION_BYTES}",
             value.len()
         )));
     }
@@ -810,6 +816,35 @@ fn parse_comma_list(
         )));
     }
     Ok(values)
+}
+
+fn validate_property_map_bounds(
+    name: &str,
+    properties: &HashMap<String, String>,
+) -> Result<(), ConnectorError> {
+    if properties.len() > MAX_CONFIG_PROPERTY_ENTRIES {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "[LDB-ICEBERG-CONFIG-PROPERTY-LIMIT] {name} contains {} entries; the limit is {MAX_CONFIG_PROPERTY_ENTRIES}",
+            properties.len()
+        )));
+    }
+    let bytes = properties.iter().try_fold(0_usize, |total, (key, value)| {
+        total.checked_add(key.len())?.checked_add(value.len())
+    });
+    if bytes.is_none_or(|bytes| bytes > MAX_CONFIG_COLLECTION_BYTES) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "[LDB-ICEBERG-CONFIG-PROPERTY-LIMIT] {name} exceeds the {MAX_CONFIG_COLLECTION_BYTES}-byte limit"
+        )));
+    }
+    if properties
+        .keys()
+        .any(|key| key.is_empty() || key.trim() != key)
+    {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{name} contains an empty or whitespace-padded property name"
+        )));
+    }
+    Ok(())
 }
 
 /// Validates an Arrow pipeline schema against an Iceberg-derived Arrow schema.

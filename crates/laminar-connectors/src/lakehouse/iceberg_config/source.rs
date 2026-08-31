@@ -6,7 +6,8 @@ use crate::error::ConnectorError;
 use super::{
     optional_alias, optional_non_empty, parse_comma_list, parse_duration_value, parse_nonzero,
     parse_nonzero_value, parse_optional_alias, parse_or_default, validate_io_timeout,
-    IcebergCatalogConfig, IcebergReadBootstrap, IcebergReadMode, IcebergStorageConfig, MIB,
+    validate_property_map_bounds, IcebergCatalogConfig, IcebergReadBootstrap, IcebergReadMode,
+    IcebergStorageConfig, MIB,
 };
 
 const MAX_SCAN_CHANNEL_CAPACITY: usize = 64;
@@ -118,6 +119,8 @@ impl IcebergSourceConfig {
     ///
     /// Returns a configuration error when a resource or timeout bound is zero.
     pub fn validate_read_limits(&self) -> Result<(), ConnectorError> {
+        validate_property_map_bounds("catalog.property.*", &self.catalog.properties)?;
+        validate_property_map_bounds("storage.property.*", &self.storage.properties)?;
         for (name, value) in [
             ("read.max.snapshots.per.poll", self.max_snapshots_per_poll),
             ("read.max.planned.files", self.max_planned_files),

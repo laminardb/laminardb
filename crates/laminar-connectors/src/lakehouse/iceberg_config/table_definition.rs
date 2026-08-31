@@ -7,12 +7,13 @@ use serde::Deserialize;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
+use super::validate_property_map_bounds;
+
 pub(crate) const TARGET_FILE_SIZE_PROPERTY: &str = "write.target-file-size-bytes";
 pub(crate) const PARQUET_ROW_GROUP_SIZE_PROPERTY: &str = "write.parquet.row-group-size-bytes";
 pub(crate) const PARQUET_COMPRESSION_PROPERTY: &str = "write.parquet.compression-codec";
 const MAX_TABLE_DEFINITION_FIELDS: usize = 128;
 const MAX_TABLE_DEFINITION_BYTES: usize = 1024 * 1024;
-const MAX_INITIAL_TABLE_PROPERTIES: usize = 256;
 
 /// Iceberg partition or sort transform used for table creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -236,28 +237,7 @@ pub(crate) fn validate_table_definition(
 pub(crate) fn validate_persisted_properties(
     properties: &HashMap<String, String>,
 ) -> Result<(), ConnectorError> {
-    if properties.len() > MAX_INITIAL_TABLE_PROPERTIES {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "table.property.* contains {} entries; the limit is {MAX_INITIAL_TABLE_PROPERTIES}",
-            properties.len()
-        )));
-    }
-    let aggregate_bytes = properties.iter().try_fold(0_usize, |total, (key, value)| {
-        total.checked_add(key.len())?.checked_add(value.len())
-    });
-    if aggregate_bytes.is_none_or(|bytes| bytes > MAX_TABLE_DEFINITION_BYTES) {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "table.property.* exceeds the {MAX_TABLE_DEFINITION_BYTES}-byte limit"
-        )));
-    }
-    if let Some(key) = properties
-        .keys()
-        .find(|key| key.is_empty() || key.trim() != *key)
-    {
-        return Err(ConnectorError::ConfigurationError(format!(
-            "table.property.{key} has an empty or whitespace-padded property name"
-        )));
-    }
+    validate_property_map_bounds("table.property.*", properties)?;
     if let Some(key) = properties.keys().find(|key| {
         matches!(
             key.as_str(),

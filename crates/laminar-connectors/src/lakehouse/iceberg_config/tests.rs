@@ -127,6 +127,14 @@ fn programmatic_zero_source_limit_fails_closed() {
     parsed.catalog.connect_timeout = Duration::ZERO;
     let error = parsed.validate_read_limits().unwrap_err().to_string();
     assert!(error.contains("catalog.connect_timeout"));
+
+    let mut parsed = IcebergSourceConfig::from_config(&table_definition_config()).unwrap();
+    parsed
+        .storage
+        .properties
+        .insert(String::new(), "value".into());
+    let error = parsed.validate_read_limits().unwrap_err().to_string();
+    assert!(error.contains("empty or whitespace-padded property name"));
 }
 
 #[test]
@@ -342,6 +350,16 @@ fn programmatic_writer_limits_fail_closed() {
     parsed.storage.connect_timeout = Duration::ZERO;
     let error = parsed.validate_writer_limits().unwrap_err().to_string();
     assert!(error.contains("storage.connect_timeout must be greater than zero"));
+
+    let mut parsed = IcebergSinkConfig::from_config(&table_definition_config()).unwrap();
+    for index in 0..=MAX_CONFIG_PROPERTY_ENTRIES {
+        parsed
+            .catalog
+            .properties
+            .insert(format!("option-{index}"), "value".into());
+    }
+    let error = parsed.validate_writer_limits().unwrap_err().to_string();
+    assert!(error.contains("LDB-ICEBERG-CONFIG-PROPERTY-LIMIT"));
 }
 
 #[test]
@@ -366,6 +384,32 @@ fn configured_writer_limits_fail_during_parsing() {
             .unwrap_err()
             .to_string();
         assert!(error.contains(key), "got: {error}");
+    }
+}
+
+#[test]
+fn iceberg_property_maps_are_bounded() {
+    for prefix in ["catalog.property", "storage.property", "table.property"] {
+        let mut entries = table_definition_config();
+        for index in 0..=MAX_CONFIG_PROPERTY_ENTRIES {
+            entries.set(format!("{prefix}.option-{index}"), "value");
+        }
+        let error = IcebergSinkConfig::from_config(&entries)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-CONFIG-PROPERTY-LIMIT"));
+        assert!(error.contains("contains 257 entries"));
+
+        let mut bytes = table_definition_config();
+        bytes.set(
+            format!("{prefix}.option"),
+            "x".repeat(MAX_CONFIG_COLLECTION_BYTES),
+        );
+        let error = IcebergSinkConfig::from_config(&bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("LDB-ICEBERG-CONFIG-PROPERTY-LIMIT"));
+        assert!(error.contains("byte limit"));
     }
 }
 
