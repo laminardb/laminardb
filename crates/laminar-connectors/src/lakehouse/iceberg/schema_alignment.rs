@@ -467,11 +467,43 @@ fn nested_array_error(target: &FieldRef, error: &arrow_schema::ArrowError) -> Co
     ))
 }
 
+pub(super) fn validate_identifier_fields(
+    configured: &[String],
+    schema: &iceberg::spec::Schema,
+) -> Result<(), ConnectorError> {
+    if configured.is_empty() {
+        return Ok(());
+    }
+    let mut expected = HashSet::with_capacity(configured.len());
+    for name in configured {
+        let field_id = schema.field_id_by_name(name).ok_or_else(|| {
+            ConnectorError::SchemaMismatch(format!(
+                "[LDB-ICEBERG-IDENTIFIER-FIELDS] configured identifier field '{name}' is absent from the table schema"
+            ))
+        })?;
+        if !expected.insert(field_id) {
+            return Err(ConnectorError::ConfigurationError(
+                "[LDB-ICEBERG-IDENTIFIER-FIELDS] configured identifier fields are not distinct"
+                    .into(),
+            ));
+        }
+    }
+    let actual = schema.identifier_field_ids().collect::<HashSet<_>>();
+    if expected != actual {
+        return Err(ConnectorError::SchemaMismatch(
+            "[LDB-ICEBERG-IDENTIFIER-FIELDS] configured identifier fields do not match the table schema"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::types::Int32Type;
     use arrow_array::{Int32Array, Int64Array, StringArray};
     use arrow_schema::{Field, Schema};
+    use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 
     use super::*;
 
@@ -480,6 +512,34 @@ mod tests {
             Field::new(name, data_type, nullable)
                 .with_metadata(HashMap::from([(FIELD_ID.to_string(), id.to_string())])),
         )
+    }
+
+    fn identifier_schema(ids: Vec<i32>) -> IcebergSchema {
+        IcebergSchema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::required(2, "tenant", Type::Primitive(PrimitiveType::String)).into(),
+            ])
+            .with_identifier_field_ids(ids)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn configured_identifier_fields_match_the_table_by_field_id() {
+        let schema = identifier_schema(vec![1, 2]);
+        validate_identifier_fields(&[], &schema).unwrap();
+        validate_identifier_fields(&["tenant".into(), "id".into()], &schema).unwrap();
+
+        for configured in [
+            vec!["id".into()],
+            vec!["missing".into()],
+            vec!["id".into(), "id".into()],
+        ] {
+            let error = validate_identifier_fields(&configured, &schema)
+                .expect_err("mismatched identifier fields must fail before writing");
+            assert!(error.to_string().contains("LDB-ICEBERG-IDENTIFIER-FIELDS"));
+        }
     }
 
     #[test]

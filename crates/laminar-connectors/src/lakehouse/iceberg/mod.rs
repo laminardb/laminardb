@@ -445,6 +445,10 @@ impl SinkConnector for IcebergSink {
                 self.config.catalog.request_timeout,
             )
             .await?;
+            schema_alignment::validate_identifier_fields(
+                &self.config.identifier_fields,
+                table.current_schema_ref().as_ref(),
+            )?;
             let table_schema = Arc::new(
                 iceberg::arrow::schema_to_arrow_schema(&table.current_schema_ref()).map_err(
                     |error| {
