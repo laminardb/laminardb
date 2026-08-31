@@ -7,11 +7,11 @@ use crate::lakehouse::iceberg_config::{
 };
 
 const MOR_MISSING_ACTIONS: &str =
-    "iceberg.write.merge-on-read: iceberg-rust 0.10.1 has no public atomic RowDelta action or position-delete writer";
+    "[LDB-ICEBERG-MOR-UNSUPPORTED] iceberg.write.merge-on-read: iceberg-rust 0.10.1 has no public atomic RowDelta action or position-delete writer";
 const COW_MISSING_ACTIONS: &str =
-    "iceberg.write.copy-on-write: iceberg-rust 0.10.1 has no public atomic RewriteFiles, OverwriteFiles, ReplacePartitions, or DeleteFiles action";
+    "[LDB-ICEBERG-COW-UNSUPPORTED] iceberg.write.copy-on-write: iceberg-rust 0.10.1 has no public atomic RewriteFiles, OverwriteFiles, ReplacePartitions, or DeleteFiles action";
 const CHANGELOG_MISSING_RECONCILIATION: &str =
-    "iceberg.read.changelog: iceberg-rust 0.10.1 does not expose complete scan-side delete reconciliation and identifier semantics";
+    "[LDB-ICEBERG-CHANGELOG-UNSUPPORTED] iceberg.read.changelog: iceberg-rust 0.10.1 does not expose complete scan-side delete reconciliation and identifier semantics";
 
 pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorError> {
     match config.write_mode {
@@ -121,13 +121,17 @@ mod tests {
 
     #[test]
     fn mutation_modes_fail_closed() {
-        for mode in ["merge-on-read", "copy-on-write"] {
+        for (mode, code) in [
+            ("merge-on-read", "LDB-ICEBERG-MOR-UNSUPPORTED"),
+            ("copy-on-write", "LDB-ICEBERG-COW-UNSUPPORTED"),
+        ] {
             let mut config = connector_config();
             config.set("write.mode", mode);
             let error = validate_sink(&IcebergSinkConfig::from_config(&config).unwrap())
                 .expect_err("unsupported mutation mode must be rejected");
             assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
             assert!(error.to_string().contains(mode));
+            assert!(error.to_string().contains(code));
         }
     }
 
@@ -138,6 +142,9 @@ mod tests {
         let error = validate_source(&IcebergSourceConfig::from_config(&config).unwrap())
             .expect_err("unsupported changelog must be rejected");
         assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-CHANGELOG-UNSUPPORTED"));
     }
 
     #[test]
