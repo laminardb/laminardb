@@ -81,6 +81,9 @@ impl LaminarDB {
     /// rebuild the still-gated data plane for `Start`.
     #[cfg(feature = "cluster")]
     pub(crate) async fn start_for_coordinated_recovery(self: &Arc<Self>) -> Result<(), DbError> {
+        self.ensure_terminal_halt_allows_start(PipelineLifecycleAuthority::CoordinatedRecovery)?;
+        // RECOVERY: a durable Start is published only after cluster-wide artifact settlement.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         self.start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
             .await
     }
