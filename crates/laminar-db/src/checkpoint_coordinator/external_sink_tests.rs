@@ -290,6 +290,11 @@ struct PhaseOneProbeSink {
     schema: SchemaRef,
 }
 
+struct AtLeastOncePhaseProbeSink {
+    flushes: Arc<AtomicUsize>,
+    schema: SchemaRef,
+}
+
 struct ArtifactIntentOrderSink {
     objects: Arc<dyn object_store::ObjectStore>,
     manifest_path: object_store::path::Path,
@@ -391,6 +396,49 @@ impl SinkConnector for PhaseOneProbeSink {
                 "injected rollback failure".into(),
             ));
         }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
+#[async_trait::async_trait]
+impl SinkConnector for AtLeastOncePhaseProbeSink {
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
+        Ok(WriteResult::new(0, 0))
+    }
+
+    async fn begin_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        Err(ConnectorError::Internal(
+            "durable at-least-once sink entered begin-epoch".into(),
+        ))
+    }
+
+    async fn pre_commit(&mut self, _epoch: u64) -> Result<Option<Vec<u8>>, ConnectorError> {
+        Err(ConnectorError::Internal(
+            "durable at-least-once sink entered pre-commit".into(),
+        ))
+    }
+
+    async fn flush(&mut self) -> Result<(), ConnectorError> {
+        self.flushes.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -551,6 +599,57 @@ async fn sink_artifact_intent_is_durable_before_connector_begin() {
 
     assert_eq!(begins.load(Ordering::Acquire), 1);
     handle.rollback_epoch(1).await.unwrap();
+    handle.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_at_least_once_sink_stays_out_of_coordinated_protocol() {
+    let store = ObjectStoreCheckpointStore::new(
+        Arc::new(InMemory::new()),
+        "at-least-once-coordinator-regression",
+    );
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    let flushes = Arc::new(AtomicUsize::new(0));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "sink".into(),
+        sink_id: Arc::from("sink"),
+        connector: Box::new(AtLeastOncePhaseProbeSink {
+            flushes: Arc::clone(&flushes),
+            schema: Arc::new(Schema::empty()),
+        }),
+        contract: SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            SinkTopology::Singleton,
+            SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    });
+    coordinator.register_sink("sink", handle.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+    coordinator.begin_initial_epoch().await.unwrap();
+    let descriptors = coordinator
+        .pre_commit_sinks_until(1, deadline)
+        .await
+        .unwrap();
+    coordinator
+        .commit_external_sinks_until(CheckpointAttempt::canonical(1), &[], 0, 0, deadline)
+        .await
+        .unwrap();
+
+    assert!(descriptors.is_empty());
+    assert_eq!(flushes.load(Ordering::Acquire), 1);
     handle.close().await.unwrap();
 }
 
