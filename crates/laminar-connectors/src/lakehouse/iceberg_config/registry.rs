@@ -133,12 +133,12 @@ pub(crate) fn source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "read.channel.capacity",
-            "Bounded scan-to-ingestion channel capacity",
+            "Bounded scan-to-ingestion channel capacity (maximum 64)",
             "2",
         ),
         ConfigKeySpec::optional(
             "read.scan.concurrency",
-            "Maximum concurrent manifest and data-file reads",
+            "Maximum concurrent manifest and data-file reads (maximum 64)",
             "4",
         ),
     ]);
@@ -181,17 +181,17 @@ fn common_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "catalog.connect_timeout",
-            "Catalog connection establishment bound",
+            "Catalog connection establishment bound (maximum 86400s)",
             "10s",
         ),
         ConfigKeySpec::optional(
             "catalog.request_timeout",
-            "Bound for one catalog request",
+            "Bound for one catalog request (maximum 86400s)",
             "30s",
         ),
         ConfigKeySpec::optional(
             "catalog.commit_timeout",
-            "End-to-end catalog commit bound",
+            "End-to-end catalog commit bound (maximum 86400s)",
             "120s",
         ),
         ConfigKeySpec::optional("storage.type", "Storage backend: s3, gcs, azure, or fs", ""),
@@ -204,12 +204,12 @@ fn common_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional(
             "storage.request_timeout",
-            "Bound for one storage request",
+            "Bound for one storage request (maximum 86400s)",
             "30s",
         ),
         ConfigKeySpec::optional(
             "storage.connect_timeout",
-            "Storage connection establishment bound",
+            "Storage connection establishment bound (maximum 86400s)",
             "10s",
         ),
         ConfigKeySpec::optional(

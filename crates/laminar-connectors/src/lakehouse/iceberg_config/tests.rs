@@ -120,6 +120,73 @@ fn programmatic_zero_source_limit_fails_closed() {
 }
 
 #[test]
+fn source_channel_and_concurrency_limits_fail_before_io() {
+    let mut maximum = table_definition_config();
+    maximum.set("read.channel.capacity", "64");
+    maximum.set("read.scan.concurrency", "64");
+    IcebergSourceConfig::from_config(&maximum).unwrap();
+
+    for (key, value, code) in [
+        ("read.channel.capacity", "65", "SCAN-CHANNEL-LIMIT"),
+        ("read.scan.concurrency", "65", "SCAN-CONCURRENCY-LIMIT"),
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, value);
+        let error = IcebergSourceConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(code), "got: {error}");
+        assert!(error.contains(key), "got: {error}");
+    }
+}
+
+#[test]
+fn io_timeout_limits_fail_before_io() {
+    let mut maximum = table_definition_config();
+    for key in [
+        "catalog.connect_timeout",
+        "catalog.request_timeout",
+        "catalog.commit_timeout",
+        "storage.request_timeout",
+        "storage.connect_timeout",
+    ] {
+        maximum.set(key, "86400s");
+    }
+    IcebergSinkConfig::from_config(&maximum).unwrap();
+
+    for key in [
+        "catalog.connect_timeout",
+        "catalog.request_timeout",
+        "catalog.commit_timeout",
+        "storage.request_timeout",
+        "storage.connect_timeout",
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, "86401s");
+        let error = IcebergSinkConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IO-TIMEOUT-LIMIT"), "got: {error}");
+        assert!(error.contains(key), "got: {error}");
+    }
+
+    for key in [
+        "catalog.connect_timeout",
+        "catalog.request_timeout",
+        "storage.request_timeout",
+        "storage.connect_timeout",
+    ] {
+        let mut config = table_definition_config();
+        config.set(key, "86401s");
+        let error = IcebergSourceConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("IO-TIMEOUT-LIMIT"), "got: {error}");
+        assert!(error.contains(key), "got: {error}");
+    }
+}
+
+#[test]
 fn test_missing_required_field() {
     let config = ConnectorConfig::new("iceberg");
     assert!(IcebergSinkConfig::from_config(&config).is_err());

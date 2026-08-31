@@ -21,7 +21,9 @@ use laminar_core::lookup::source::{
 };
 use laminar_core::lookup::KeyAligner;
 
-use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
+use crate::lakehouse::iceberg_config::{
+    validate_io_timeout, IcebergCatalogConfig, IcebergStorageConfig,
+};
 use crate::lakehouse::iceberg_scan::{
     connector_scan_error, plan_files, preflight_snapshot, ManifestReadLimits,
     DEFAULT_MAX_PLANNED_FILES,
@@ -218,15 +220,13 @@ fn validate_lookup_config(config: &IcebergLookupSourceConfig) -> Result<(), Look
         }
     }
     for (name, timeout) in [
+        ("catalog.connect_timeout", config.catalog.connect_timeout),
         ("catalog.request_timeout", config.catalog.request_timeout),
         ("storage.request_timeout", config.storage.request_timeout),
         ("storage.connect_timeout", config.storage.connect_timeout),
     ] {
-        if timeout.is_zero() {
-            return Err(LookupError::Internal(format!(
-                "Iceberg lookup {name} must be greater than zero"
-            )));
-        }
+        validate_io_timeout(name, timeout)
+            .map_err(|error| LookupError::Internal(error.to_string()))?;
     }
     Ok(())
 }
@@ -379,7 +379,11 @@ impl LookupSource for IcebergLookupSource {
                 connector_scan_error("build Iceberg lookup scan", &error).to_string(),
             )
         })?;
-        let deadline = tokio::time::Instant::now() + self.storage_request_timeout;
+        let deadline = crate::lakehouse::iceberg_io::checked_deadline(
+            self.storage_request_timeout,
+            "storage.request_timeout",
+        )
+        .map_err(|error| LookupError::Query(error.to_string()))?;
         preflight_snapshot(&table, snapshot, ManifestReadLimits::fixed(), deadline)
             .await
             .map_err(|error| LookupError::Query(error.to_string()))?;

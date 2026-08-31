@@ -71,7 +71,10 @@ impl CoordinatedCommitter for IcebergSink {
                 expected: "open Iceberg sink".into(),
                 actual: "catalog is not initialized".into(),
             })?;
-        let deadline = tokio::time::Instant::now() + self.config.catalog.request_timeout;
+        let deadline = crate::lakehouse::iceberg_io::checked_deadline(
+            self.config.catalog.request_timeout,
+            "catalog.request_timeout",
+        )?;
         let pending = self.unresolved_publication.lock().clone();
         let cursor = publication::read_committed_cursor(
             catalog,

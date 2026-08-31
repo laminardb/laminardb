@@ -355,7 +355,10 @@ impl IcebergSource {
         if let Some(cursor) = self.cursor.as_ref() {
             cursor.validate_binding(&self.config, &table)?;
             let planning_started = Instant::now();
-            let deadline = tokio::time::Instant::now() + self.config.storage.request_timeout;
+            let deadline = super::iceberg_io::checked_deadline(
+                self.config.storage.request_timeout,
+                "storage.request_timeout",
+            )?;
             let plans = tokio::time::timeout_at(
                 deadline,
                 append_lineage::plan_appends(&table, cursor, &self.config, deadline),

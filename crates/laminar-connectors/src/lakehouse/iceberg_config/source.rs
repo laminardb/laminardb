@@ -5,9 +5,12 @@ use crate::error::ConnectorError;
 
 use super::{
     optional_alias, optional_non_empty, parse_comma_list, parse_duration_value, parse_nonzero,
-    parse_nonzero_value, parse_optional_alias, parse_or_default, IcebergCatalogConfig,
-    IcebergReadBootstrap, IcebergReadMode, IcebergStorageConfig, MIB,
+    parse_nonzero_value, parse_optional_alias, parse_or_default, validate_io_timeout,
+    IcebergCatalogConfig, IcebergReadBootstrap, IcebergReadMode, IcebergStorageConfig, MIB,
 };
+
+const MAX_SCAN_CHANNEL_CAPACITY: usize = 64;
+const MAX_SCAN_CONCURRENCY: usize = 64;
 
 /// Configuration for bounded snapshot and append reads.
 #[derive(Debug, Clone)]
@@ -133,18 +136,28 @@ impl IcebergSourceConfig {
                 )));
             }
         }
+        if self.poll_interval.is_zero() {
+            return Err(ConnectorError::ConfigurationError(
+                "poll.interval must be greater than zero".into(),
+            ));
+        }
         for (name, value) in [
-            ("poll.interval", self.poll_interval),
             ("catalog.connect_timeout", self.catalog.connect_timeout),
             ("catalog.request_timeout", self.catalog.request_timeout),
             ("storage.request_timeout", self.storage.request_timeout),
             ("storage.connect_timeout", self.storage.connect_timeout),
         ] {
-            if value.is_zero() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "{name} must be greater than zero"
-                )));
-            }
+            validate_io_timeout(name, value)?;
+        }
+        if self.scan_channel_capacity > MAX_SCAN_CHANNEL_CAPACITY {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "[LDB-ICEBERG-SCAN-CHANNEL-LIMIT] read.channel.capacity must not exceed {MAX_SCAN_CHANNEL_CAPACITY}"
+            )));
+        }
+        if self.scan_concurrency > MAX_SCAN_CONCURRENCY {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "[LDB-ICEBERG-SCAN-CONCURRENCY-LIMIT] read.scan.concurrency must not exceed {MAX_SCAN_CONCURRENCY}"
+            )));
         }
         if self.table_ref.is_empty() {
             return Err(ConnectorError::ConfigurationError(

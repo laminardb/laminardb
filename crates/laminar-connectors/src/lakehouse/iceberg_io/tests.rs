@@ -1,6 +1,14 @@
 use super::*;
 use crate::config::ConnectorConfig;
 
+#[test]
+fn deadline_overflow_is_a_typed_error() {
+    let error = checked_deadline(std::time::Duration::MAX, "storage.request_timeout")
+        .expect_err("an impossible deadline must not panic");
+    assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+    assert!(error.to_string().contains("DEADLINE-OVERFLOW"));
+}
+
 fn storage_config(storage_type: Option<&str>) -> IcebergStorageConfig {
     let mut config = ConnectorConfig::new("iceberg");
     if let Some(storage_type) = storage_type {

@@ -40,8 +40,24 @@ pub(crate) use table_definition::{
 };
 
 const MIB: usize = 1024 * 1024;
+const MAX_ICEBERG_IO_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 pub(crate) const ICEBERG_MAX_FILES_PER_CHECKPOINT: usize = 4_096;
 const MAX_CONFIG_LIST_BYTES: usize = MIB;
+
+pub(crate) fn validate_io_timeout(name: &str, value: Duration) -> Result<(), ConnectorError> {
+    if value.is_zero() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    if value > MAX_ICEBERG_IO_TIMEOUT {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "[LDB-ICEBERG-IO-TIMEOUT-LIMIT] {name} must not exceed {}s",
+            MAX_ICEBERG_IO_TIMEOUT.as_secs()
+        )));
+    }
+    Ok(())
+}
 
 #[cfg(feature = "iceberg-core")]
 pub(crate) fn stable_catalog_identity(
@@ -629,11 +645,7 @@ impl IcebergSinkConfig {
             ("storage.request_timeout", self.storage.request_timeout),
             ("storage.connect_timeout", self.storage.connect_timeout),
         ] {
-            if value.is_zero() {
-                return Err(ConnectorError::ConfigurationError(format!(
-                    "{name} must be greater than zero"
-                )));
-            }
+            validate_io_timeout(name, value)?;
         }
         if self.max_files_per_checkpoint > ICEBERG_MAX_FILES_PER_CHECKPOINT {
             return Err(ConnectorError::ConfigurationError(format!(

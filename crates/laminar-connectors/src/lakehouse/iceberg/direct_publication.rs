@@ -8,9 +8,9 @@ use iceberg::{Catalog, ErrorKind};
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::IcebergSinkConfig;
 use crate::lakehouse::iceberg_io::{
-    build_publication_catalog, commit_generated_data_files_append, external_error_summary,
-    iceberg_commit_error, AtomicTableRequirements, CatalogCapabilities, CatalogSession,
-    GeneratedAppendError, SingleDispatchCatalog,
+    build_publication_catalog, checked_deadline, commit_generated_data_files_append,
+    external_error_summary, iceberg_commit_error, AtomicTableRequirements, CatalogCapabilities,
+    CatalogSession, GeneratedAppendError, SingleDispatchCatalog,
 };
 
 use super::publication::jitter_before_retry;
@@ -33,7 +33,7 @@ pub(super) async fn publish_direct_append(
     data_files: Vec<DataFile>,
     metrics: &IcebergMetrics,
 ) -> Result<Table, ConnectorError> {
-    let deadline = tokio::time::Instant::now() + config.catalog.commit_timeout;
+    let deadline = checked_deadline(config.catalog.commit_timeout, "catalog.commit_timeout")?;
     let mut current = load_current_table(config, catalog, deadline).await?;
 
     for attempt in 0..MAX_DIRECT_APPEND_ATTEMPTS {

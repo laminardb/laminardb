@@ -229,7 +229,8 @@ async fn full_snapshot_tasks(
     metadata_limits: ManifestReadLimits,
     request_timeout: std::time::Duration,
 ) -> Result<FileScanTaskStream, ConnectorError> {
-    let planning_deadline = tokio::time::Instant::now() + request_timeout;
+    let planning_deadline =
+        crate::lakehouse::iceberg_io::checked_deadline(request_timeout, "storage.request_timeout")?;
     preflight_snapshot(table, snapshot, metadata_limits, planning_deadline).await?;
     let mut builder = table
         .scan()

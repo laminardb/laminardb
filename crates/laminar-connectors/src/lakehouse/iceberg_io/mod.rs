@@ -35,6 +35,19 @@ const COMPAT_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const WRITE_DATA_PATH_PROPERTY: &str = "write.data.path";
 const WRITE_FOLDER_STORAGE_PATH_PROPERTY: &str = "write.folder-storage.path";
 
+pub(crate) fn checked_deadline(
+    timeout: std::time::Duration,
+    setting: &str,
+) -> Result<tokio::time::Instant, ConnectorError> {
+    tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "[LDB-ICEBERG-DEADLINE-OVERFLOW] {setting} exceeds the platform clock range"
+            ))
+        })
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CatalogAccess {
     Read,

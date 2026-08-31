@@ -150,7 +150,10 @@ impl IcebergReferenceTableSource {
         let scan = builder
             .build()
             .map_err(|error| connector_scan_error("build Iceberg reference scan", &error))?;
-        let deadline = tokio::time::Instant::now() + self.config.storage.request_timeout;
+        let deadline = super::iceberg_io::checked_deadline(
+            self.config.storage.request_timeout,
+            "storage.request_timeout",
+        )?;
         preflight_snapshot(
             &table,
             &snapshot,

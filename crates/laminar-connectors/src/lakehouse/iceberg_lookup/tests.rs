@@ -85,6 +85,11 @@ fn invalid_lookup_config_fails_before_catalog_io() {
     let mut config = lookup_config();
     config.storage.request_timeout = std::time::Duration::ZERO;
     assert!(validate_lookup_config(&config).is_err());
+
+    let mut config = lookup_config();
+    config.storage.request_timeout = std::time::Duration::from_secs(86_401);
+    let error = validate_lookup_config(&config).unwrap_err().to_string();
+    assert!(error.contains("IO-TIMEOUT-LIMIT"));
 }
 
 #[tokio::test]
