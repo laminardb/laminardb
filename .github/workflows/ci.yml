@@ -286,6 +286,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: iceberg-integration
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Start Iceberg REST, MinIO, and Redpanda
         run: |
           docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
