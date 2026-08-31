@@ -41,13 +41,15 @@ fn stable_catalog_identity_is_platform_canonical_and_ignores_rotated_secrets() {
     config.set("storage.type", "s3");
     config.set("storage.endpoint", "https://objects.example");
     config.set("storage.region", "eu-west-2");
+    config.set("storage.path_style", "true");
+    config.set("catalog.property.header.X-Tenant", "tenant-a");
     config.set("storage.property.secret-access-key", "first-storage-secret");
 
     let first = IcebergSinkConfig::from_config(&config).unwrap();
     let identity = stable_catalog_identity(&first.catalog, &first.storage);
     assert_eq!(
         identity,
-        "682af55fe1359d4824fbe34beb29aadf02f2b11da497cd3df1468132ad78cdc4"
+        "8203bf933d19b129984fbebc43b55bf866147507935136d0041bde6956c7142b"
     );
 
     config.set("catalog.property.token", "rotated-secret");
@@ -66,6 +68,14 @@ fn stable_catalog_identity_is_platform_canonical_and_ignores_rotated_secrets() {
     assert_ne!(
         identity,
         stable_catalog_identity(&different.catalog, &different.storage)
+    );
+
+    config.set("storage.region", "eu-west-2");
+    config.set("catalog.property.header.X-Tenant", "tenant-b");
+    let rerouted = IcebergSinkConfig::from_config(&config).unwrap();
+    assert_ne!(
+        identity,
+        stable_catalog_identity(&rerouted.catalog, &rerouted.storage)
     );
 }
 

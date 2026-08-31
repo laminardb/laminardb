@@ -1,6 +1,8 @@
 //! Typed Apache Iceberg connector configuration.
 #![allow(clippy::disallowed_types)] // cold path: connector configuration
 
+#[cfg(feature = "iceberg-core")]
+mod identity;
 mod modes;
 mod registry;
 mod source;
@@ -8,17 +10,14 @@ mod table_definition;
 
 use std::collections::HashMap;
 use std::fmt;
-#[cfg(feature = "iceberg-core")]
-use std::fmt::Write;
 use std::time::Duration;
-
-#[cfg(feature = "iceberg-core")]
-use sha2::{Digest, Sha256};
 
 use crate::config::ConnectorConfig;
 use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 
+#[cfg(feature = "iceberg-core")]
+pub(crate) use identity::stable_catalog_identity;
 pub use modes::{
     IcebergCatalogAuthType, IcebergCatalogType, IcebergReadBootstrap, IcebergReadMode,
     IcebergSchemaEvolutionMode, IcebergStorageEncryption, IcebergStorageType,
@@ -57,35 +56,6 @@ pub(crate) fn validate_io_timeout(name: &str, value: Duration) -> Result<(), Con
         )));
     }
     Ok(())
-}
-
-#[cfg(feature = "iceberg-core")]
-pub(crate) fn stable_catalog_identity(
-    catalog: &IcebergCatalogConfig,
-    storage: &IcebergStorageConfig,
-) -> String {
-    let mut hasher = Sha256::new();
-    for value in [
-        catalog.catalog_type.to_string(),
-        catalog.catalog_uri.clone(),
-        catalog.warehouse.clone(),
-        catalog.prefix.clone().unwrap_or_default(),
-        catalog.auth_type.to_string(),
-        storage
-            .storage_type
-            .map(|storage| storage.to_string())
-            .unwrap_or_default(),
-        storage.endpoint.clone().unwrap_or_default(),
-        storage.region.clone().unwrap_or_default(),
-    ] {
-        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    let mut encoded = String::with_capacity(64);
-    for byte in hasher.finalize() {
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
 }
 
 /// Catalog connection settings shared by Iceberg sources and sinks.
