@@ -3046,6 +3046,16 @@ fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
             "cluster exactly-once",
         ),
         ("catalog.access_delegation", "true", "access-delegation"),
+        (
+            "catalog.property.s3.remote-signing-enabled",
+            "true",
+            "REMOTE-SIGNING",
+        ),
+        (
+            "storage.property.header.X-Iceberg-Access-Delegation",
+            "vended-credentials",
+            "access-delegation",
+        ),
     ] {
         let mut config = ConnectorConfig::new("iceberg");
         config.set("catalog.uri", "http://catalog.invalid");

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::lakehouse::iceberg_config::{
@@ -12,6 +14,7 @@ const COW_MISSING_ACTIONS: &str =
     "[LDB-ICEBERG-COW-UNSUPPORTED] iceberg.write.copy-on-write: iceberg-rust 0.10.1 has no public atomic RewriteFiles, OverwriteFiles, ReplacePartitions, or DeleteFiles action";
 const CHANGELOG_MISSING_RECONCILIATION: &str =
     "[LDB-ICEBERG-CHANGELOG-UNSUPPORTED] iceberg.read.changelog: iceberg-rust 0.10.1 does not expose complete scan-side delete reconciliation and identifier semantics";
+pub(crate) const REST_REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
 
 pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorError> {
     match config.write_mode {
@@ -41,6 +44,9 @@ pub(crate) fn validate_sink(config: &IcebergSinkConfig) -> Result<(), ConnectorE
         ));
     }
     validate_catalog_session(&config.catalog)?;
+    if config.catalog.catalog_type == IcebergCatalogType::Rest {
+        validate_rest_properties(&config.storage.properties)?;
+    }
     Ok(())
 }
 
@@ -48,14 +54,14 @@ pub(crate) fn cluster_exact_append_certified(config: &IcebergSinkConfig) -> bool
     cfg!(all(
         feature = "iceberg-catalog-rest",
         feature = "iceberg-storage-s3"
-    )) && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+    )) && validate_sink(config).is_ok()
+        && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
         && config.write_mode == IcebergWriteMode::Append
         && config.catalog.catalog_type == IcebergCatalogType::Rest
         && matches!(
             config.catalog.auth_type,
             IcebergCatalogAuthType::None | IcebergCatalogAuthType::Bearer
         )
-        && !config.catalog.access_delegation
         && matches!(
             config.storage.storage_type,
             None | Some(IcebergStorageType::S3)
@@ -78,6 +84,9 @@ pub(crate) fn validate_source(config: &IcebergSourceConfig) -> Result<(), Connec
         ));
     }
     validate_catalog_session(&config.catalog)?;
+    if config.catalog.catalog_type == IcebergCatalogType::Rest {
+        validate_rest_properties(&config.storage.properties)?;
+    }
     Ok(())
 }
 
@@ -87,6 +96,7 @@ pub(crate) fn validate_catalog_session(
     if catalog.catalog_type != IcebergCatalogType::Rest {
         return Ok(());
     }
+    validate_rest_properties(&catalog.properties)?;
     if catalog.auth_type == IcebergCatalogAuthType::Bearer
         && catalog.properties.get("token").is_none_or(String::is_empty)
     {
@@ -99,6 +109,42 @@ pub(crate) fn validate_catalog_session(
             "iceberg.catalog.rest.access-delegation: iceberg-rust 0.10.1 does not provide refreshable vended credentials or remote signing"
                 .into(),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_rest_properties(
+    properties: &HashMap<String, String>,
+) -> Result<(), ConnectorError> {
+    for (key, value) in properties {
+        let normalized = key.to_ascii_lowercase();
+        if normalized == REST_REMOTE_SIGNING_ENABLED && value.eq_ignore_ascii_case("true") {
+            return Err(ConnectorError::FeatureUnsupported(
+                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.10.1 OpenDAL storage does not support REST remote signing"
+                    .into(),
+            ));
+        }
+        if normalized == "disable-header-redaction" && value.eq_ignore_ascii_case("true") {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg REST disable-header-redaction=true is prohibited".into(),
+            ));
+        }
+        if normalized == "header.idempotency-key" {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg REST Idempotency-Key header is managed by coordinated publication".into(),
+            ));
+        }
+        if normalized == "header.authorization" {
+            return Err(ConnectorError::ConfigurationError(
+                "Iceberg REST Authorization header must use catalog.auth.type instead".into(),
+            ));
+        }
+        if normalized == "header.x-iceberg-access-delegation" {
+            return Err(ConnectorError::FeatureUnsupported(
+                "iceberg.catalog.rest.access-delegation: custom delegation headers are unsupported"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -164,6 +210,49 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_rest_properties_fail_before_catalog_io() {
+        for (key, value, expected) in [
+            (
+                "catalog.property.s3.remote-signing-enabled",
+                "true",
+                "LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED",
+            ),
+            (
+                "storage.property.s3.remote-signing-enabled",
+                "true",
+                "LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED",
+            ),
+            (
+                "catalog.property.header.X-Iceberg-Access-Delegation",
+                "vended-credentials",
+                "access-delegation",
+            ),
+            (
+                "storage.property.header.X-Iceberg-Access-Delegation",
+                "vended-credentials",
+                "access-delegation",
+            ),
+        ] {
+            let mut config = connector_config();
+            config.set(key, value);
+            let sink_error = validate_sink(&IcebergSinkConfig::from_config(&config).unwrap())
+                .expect_err("unsupported REST property must reject the sink");
+            let source_error = validate_source(&IcebergSourceConfig::from_config(&config).unwrap())
+                .expect_err("unsupported REST property must reject the source");
+            assert!(matches!(sink_error, ConnectorError::FeatureUnsupported(_)));
+            assert!(matches!(
+                source_error,
+                ConnectorError::FeatureUnsupported(_)
+            ));
+            assert!(sink_error.to_string().contains(expected), "{sink_error}");
+            assert!(
+                source_error.to_string().contains(expected),
+                "{source_error}"
+            );
+        }
+    }
+
+    #[test]
     fn cluster_exact_certification_is_rest_s3_only() {
         let mut config = connector_config();
         config.set("catalog.warehouse", "s3://warehouse/root");
@@ -184,6 +273,11 @@ mod tests {
             ("catalog.warehouse", "file:///tmp/warehouse"),
             ("catalog.auth.type", "oauth2"),
             ("catalog.access_delegation", "true"),
+            ("catalog.property.s3.remote-signing-enabled", "true"),
+            (
+                "storage.property.header.X-Iceberg-Access-Delegation",
+                "vended-credentials",
+            ),
         ] {
             let mut rejected = config.clone();
             rejected.set(key, value);

@@ -9,6 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::error::ConnectorError;
+use crate::lakehouse::iceberg::capabilities::{validate_catalog_session, validate_rest_properties};
 use crate::lakehouse::iceberg_config::{IcebergCatalogConfig, IcebergStorageConfig};
 
 use super::{
@@ -56,7 +57,7 @@ pub(super) async fn build(
     access: CatalogAccess,
     credential_refresh_failures: Option<prometheus::IntCounter>,
 ) -> Result<BuiltCatalog, ConnectorError> {
-    super::super::iceberg::capabilities::validate_catalog_session(config)?;
+    validate_catalog_session(config)?;
     validate_configured_uri(&config.catalog_uri)?;
     validate_storage_options(&config.warehouse, storage)?;
     let properties = rest_properties(config, storage)?;
@@ -103,7 +104,7 @@ pub(super) async fn build_publication(
             "Iceberg REST idempotency key is not UUIDv7".into(),
         ));
     }
-    super::super::iceberg::capabilities::validate_catalog_session(config)?;
+    validate_catalog_session(config)?;
     validate_configured_uri(&config.catalog_uri)?;
     validate_storage_options(&config.warehouse, storage)?;
     let properties = rest_properties(config, storage)?;
@@ -354,35 +355,6 @@ async fn read_bounded_json<T: DeserializeOwned>(
             "Iceberg REST /v1/config returned an invalid configuration document".into(),
         )
     })
-}
-
-fn validate_rest_properties(properties: &HashMap<String, String>) -> Result<(), ConnectorError> {
-    for (key, value) in properties {
-        let normalized = key.to_ascii_lowercase();
-        if normalized == "disable-header-redaction" && value.eq_ignore_ascii_case("true") {
-            return Err(ConnectorError::ConfigurationError(
-                "catalog.property.disable-header-redaction=true is prohibited".into(),
-            ));
-        }
-        if normalized == "header.idempotency-key" {
-            return Err(ConnectorError::ConfigurationError(
-                "catalog.property.header.Idempotency-Key is managed by coordinated publication"
-                    .into(),
-            ));
-        }
-        if normalized == "header.authorization" {
-            return Err(ConnectorError::ConfigurationError(
-                "catalog.property.header.Authorization must use catalog.auth.type instead".into(),
-            ));
-        }
-        if normalized == "header.x-iceberg-access-delegation" {
-            return Err(ConnectorError::FeatureUnsupported(
-                "iceberg.catalog.rest.access-delegation: custom delegation headers are unsupported"
-                    .into(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_server_properties(properties: &HashMap<String, String>) -> Result<(), ConnectorError> {

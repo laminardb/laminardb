@@ -23,6 +23,8 @@ use iceberg::{Error, ErrorKind, Result};
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde::{Deserialize, Serialize};
 
+use super::super::iceberg::capabilities::REST_REMOTE_SIGNING_ENABLED;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct BoundedStorageFactory {
     inner: OpenDalStorageFactory,
@@ -32,7 +34,6 @@ pub(super) struct BoundedStorageFactory {
     locally_configured_sensitive: Vec<String>,
 }
 
-const REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
 const STORAGE_SENSITIVE_PROPERTIES: &[&str] = &[
     S3_ACCESS_KEY_ID,
     S3_SECRET_ACCESS_KEY,
@@ -59,7 +60,7 @@ pub(super) fn is_sensitive_storage_property(property: &str) -> bool {
 }
 
 pub(super) fn requests_remote_signing(property: &str, value: &str) -> bool {
-    property == REMOTE_SIGNING_ENABLED && value.eq_ignore_ascii_case("true")
+    property == REST_REMOTE_SIGNING_ENABLED && value.eq_ignore_ascii_case("true")
 }
 
 impl BoundedStorageFactory {
@@ -490,7 +491,7 @@ mod tests {
             &std::collections::HashMap::new(),
         );
         let error = factory
-            .build(&StorageConfig::new().with_prop(REMOTE_SIGNING_ENABLED, "true"))
+            .build(&StorageConfig::new().with_prop(REST_REMOTE_SIGNING_ENABLED, "true"))
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
         assert!(error
