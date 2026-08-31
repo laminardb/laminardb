@@ -462,6 +462,56 @@ fn catalog_auth_rejects_empty_secret_material() {
 }
 
 #[test]
+fn explicit_no_auth_rejects_upstream_credential_properties_without_leaking_them() {
+    for (property, secret) in [
+        ("token", "do-not-leak-token"),
+        ("credential", "do-not-leak-credential"),
+    ] {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "https://catalog.test");
+        config.set("catalog.warehouse", "s3://bucket/warehouse");
+        config.set("namespace", "prod");
+        config.set("table.name", "events");
+        config.set("catalog.auth.type", "none");
+        config.set(format!("catalog.property.{property}"), secret);
+
+        let error = IcebergCatalogConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains("catalog.auth.type=none"));
+        assert!(!error.to_string().contains(secret));
+    }
+}
+
+#[test]
+fn oauth_options_require_oauth_authentication() {
+    for (option, value) in [
+        ("catalog.oauth2.server_uri", "https://identity.test/token"),
+        ("catalog.oauth2.client_id", "laminar-client"),
+        ("catalog.oauth2.scope", "catalog:read"),
+        (
+            "catalog.property.oauth2-server-uri",
+            "https://identity.test/token",
+        ),
+        ("catalog.property.scope", "catalog:read"),
+        ("catalog.property.audience", "catalog"),
+        ("catalog.property.resource", "warehouse"),
+    ] {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "https://catalog.test");
+        config.set("catalog.warehouse", "s3://bucket/warehouse");
+        config.set("namespace", "prod");
+        config.set("table.name", "events");
+        config.set("catalog.auth.type", "bearer");
+        config.set("catalog.property.token", "resolved-secret");
+        config.set(option, value);
+
+        let error = IcebergCatalogConfig::from_config(&config).unwrap_err();
+        assert!(error.to_string().contains(option), "{error}");
+        assert!(error.to_string().contains("catalog.auth.type=oauth2"));
+        assert!(!error.to_string().contains("resolved-secret"));
+    }
+}
+
+#[test]
 fn oauth_typed_client_configuration_is_preserved() {
     let mut config = ConnectorConfig::new("iceberg");
     config.set("catalog.uri", "https://catalog.test");

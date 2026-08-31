@@ -138,6 +138,83 @@ impl fmt::Debug for IcebergCatalogConfig {
     }
 }
 
+fn parse_catalog_auth_type(
+    config: &ConnectorConfig,
+    properties: &HashMap<String, String>,
+) -> Result<IcebergCatalogAuthType, ConnectorError> {
+    let auth_type = match config.get("catalog.auth.type") {
+        Some(value) => value.parse().map_err(ConnectorError::ConfigurationError)?,
+        None if properties.contains_key("token") => IcebergCatalogAuthType::Bearer,
+        None if properties.contains_key("credential") => IcebergCatalogAuthType::OAuth2,
+        None => IcebergCatalogAuthType::None,
+    };
+    match auth_type {
+        IcebergCatalogAuthType::None
+            if properties.contains_key("token") || properties.contains_key("credential") =>
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.auth.type=none cannot configure catalog.property.token or catalog.property.credential"
+                    .into(),
+            ));
+        }
+        IcebergCatalogAuthType::Bearer if properties.get("token").is_none_or(String::is_empty) => {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.auth.type=bearer requires a non-empty catalog.property.token".into(),
+            ));
+        }
+        IcebergCatalogAuthType::Bearer if properties.contains_key("credential") => {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.auth.type=bearer cannot also configure catalog.property.credential".into(),
+            ));
+        }
+        IcebergCatalogAuthType::OAuth2
+            if properties.get("credential").is_none_or(String::is_empty) =>
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.auth.type=oauth2 requires a non-empty resolved catalog.property.credential"
+                    .into(),
+            ));
+        }
+        IcebergCatalogAuthType::OAuth2 if properties.contains_key("token") => {
+            return Err(ConnectorError::ConfigurationError(
+                "catalog.auth.type=oauth2 cannot also configure catalog.property.token".into(),
+            ));
+        }
+        IcebergCatalogAuthType::None
+        | IcebergCatalogAuthType::Bearer
+        | IcebergCatalogAuthType::OAuth2 => {}
+    }
+
+    if auth_type != IcebergCatalogAuthType::OAuth2 {
+        let typed_option = [
+            "catalog.oauth2.server_uri",
+            "catalog.oauth2.client_id",
+            "catalog.oauth2.scope",
+        ]
+        .into_iter()
+        .find(|key| {
+            config
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        let legacy_option = ["oauth2-server-uri", "scope", "audience", "resource"]
+            .into_iter()
+            .find(|key| properties.contains_key(*key));
+        if let Some(option) = typed_option {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "{option} requires catalog.auth.type=oauth2"
+            )));
+        }
+        if let Some(option) = legacy_option {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "catalog.property.{option} requires catalog.auth.type=oauth2"
+            )));
+        }
+    }
+
+    Ok(auth_type)
+}
+
 impl IcebergCatalogConfig {
     /// Parses catalog settings from resolved connector configuration.
     ///
@@ -173,43 +250,7 @@ impl IcebergCatalogConfig {
             }
         }
         let properties = config.properties_with_prefix("catalog.property.");
-        let auth_type = match config.get("catalog.auth.type") {
-            Some(value) => value.parse().map_err(ConnectorError::ConfigurationError)?,
-            None if properties.contains_key("token") => IcebergCatalogAuthType::Bearer,
-            None if properties.contains_key("credential") => IcebergCatalogAuthType::OAuth2,
-            None => IcebergCatalogAuthType::None,
-        };
-        match auth_type {
-            IcebergCatalogAuthType::Bearer
-                if properties.get("token").is_none_or(String::is_empty) =>
-            {
-                return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=bearer requires a non-empty catalog.property.token".into(),
-                ));
-            }
-            IcebergCatalogAuthType::Bearer if properties.contains_key("credential") => {
-                return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=bearer cannot also configure catalog.property.credential"
-                        .into(),
-                ));
-            }
-            IcebergCatalogAuthType::OAuth2
-                if properties.get("credential").is_none_or(String::is_empty) =>
-            {
-                return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=oauth2 requires a non-empty resolved catalog.property.credential"
-                        .into(),
-                ));
-            }
-            IcebergCatalogAuthType::OAuth2 if properties.contains_key("token") => {
-                return Err(ConnectorError::ConfigurationError(
-                    "catalog.auth.type=oauth2 cannot also configure catalog.property.token".into(),
-                ));
-            }
-            IcebergCatalogAuthType::None
-            | IcebergCatalogAuthType::Bearer
-            | IcebergCatalogAuthType::OAuth2 => {}
-        }
+        let auth_type = parse_catalog_auth_type(config, &properties)?;
 
         let oauth2_server_uri = optional_non_empty(config, "catalog.oauth2.server_uri");
         if oauth2_server_uri
