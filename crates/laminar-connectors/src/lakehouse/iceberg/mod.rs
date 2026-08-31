@@ -333,6 +333,12 @@ impl SinkConnector for IcebergSink {
                 "Iceberg runtime deployment ID must be a canonical non-nil UUID".into(),
             )
         })?;
+        if self.is_coordinated() && deployment.get_version_num() != 7 {
+            return Err(ConnectorError::ConfigurationError(
+                "[LDB-ICEBERG-RUNTIME-DEPLOYMENT-VERSION] exactly-once Iceberg requires a UUIDv7 deployment identity"
+                    .into(),
+            ));
+        }
         if deployment.is_nil()
             || deployment.to_string() != context.deployment_id
             || context.sink_id.is_empty()
@@ -828,21 +834,6 @@ fn validate_direct_publication_table(
         ));
     }
     Ok(())
-}
-
-#[cfg(feature = "iceberg-core")]
-fn parquet_compression(name: &str) -> Result<parquet::basic::Compression, ConnectorError> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "snappy" => Ok(parquet::basic::Compression::SNAPPY),
-        "none" | "uncompressed" => Ok(parquet::basic::Compression::UNCOMPRESSED),
-        "lz4" => Ok(parquet::basic::Compression::LZ4),
-        "zstd" => Ok(parquet::basic::Compression::ZSTD(
-            parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
-        )),
-        other => Err(ConnectorError::ConfigurationError(format!(
-            "unsupported parquet.compression '{other}'"
-        ))),
-    }
 }
 
 #[cfg(test)]

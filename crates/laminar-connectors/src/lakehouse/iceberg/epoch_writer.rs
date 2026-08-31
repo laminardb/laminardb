@@ -721,7 +721,7 @@ fn parquet_writer_properties(
     let row_group_bytes = bounded_row_group_bytes(config);
     let row_group_rows = approximate_row_group_rows(config, row_group_bytes);
     Ok(WriterProperties::builder()
-        .set_compression(super::parquet_compression(&config.compression)?)
+        .set_compression(parquet_compression(&config.compression)?)
         .set_max_row_group_bytes(Some(row_group_bytes))
         .set_max_row_group_row_count(Some(row_group_rows))
         .set_write_batch_size(row_group_rows.min(8_192))
@@ -754,6 +754,20 @@ fn iceberg_write_error(context: &str, error: &iceberg::Error) -> ConnectorError 
         "Iceberg {context} ({})",
         crate::lakehouse::iceberg_io::external_error_summary(error)
     ))
+}
+
+fn parquet_compression(name: &str) -> Result<parquet::basic::Compression, ConnectorError> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "snappy" => Ok(parquet::basic::Compression::SNAPPY),
+        "none" | "uncompressed" => Ok(parquet::basic::Compression::UNCOMPRESSED),
+        "lz4" => Ok(parquet::basic::Compression::LZ4),
+        "zstd" => Ok(parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
+        )),
+        other => Err(ConnectorError::ConfigurationError(format!(
+            "unsupported parquet.compression '{other}'"
+        ))),
+    }
 }
 
 #[cfg(test)]

@@ -145,14 +145,28 @@ fn cluster_exact_contract_fails_closed_outside_rest_s3() {
 }
 
 #[test]
-fn runtime_identity_must_be_canonical_and_nonzero() {
-    let mut sink = IcebergSink::new(test_config(), None);
+fn runtime_identity_requires_uuid_v7_and_nonzero() {
+    let mut config = test_config();
+    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    let mut sink = IcebergSink::new(config, None);
     let invalid = SinkRuntimeContext {
         deployment_id: "not-a-uuid".into(),
         sink_id: "events".into(),
         participant_id: 1,
     };
     assert!(sink.bind_runtime_context(invalid).is_err());
+
+    let unsupported_version = SinkRuntimeContext {
+        deployment_id: "11111111-1111-4111-8111-111111111111".into(),
+        sink_id: "events".into(),
+        participant_id: 1,
+    };
+    let error = sink
+        .bind_runtime_context(unsupported_version)
+        .expect_err("UUIDv4 must fail before an exactly-once epoch can write");
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-RUNTIME-DEPLOYMENT-VERSION"));
 
     let valid = SinkRuntimeContext {
         deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
