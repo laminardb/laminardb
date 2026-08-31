@@ -304,6 +304,25 @@ mod tests {
             ))
         );
 
+        let mut storage_credentials = config.clone();
+        storage_credentials.set("storage.endpoint", "https://objects.invalid");
+        storage_credentials.set("storage.region", "us-east-1");
+        storage_credentials.set("storage.path_style", "true");
+        storage_credentials.set("storage.property.s3.access-key-id", "local-access-key");
+        storage_credentials.set(
+            "storage.property.s3.secret-access-key",
+            "resolved-storage-secret",
+        );
+        assert_eq!(
+            cluster_exact_append_certified(
+                &IcebergSinkConfig::from_config(&storage_credentials).unwrap()
+            ),
+            cfg!(all(
+                feature = "iceberg-catalog-rest",
+                feature = "iceberg-storage-s3"
+            ))
+        );
+
         for (key, value) in [
             ("catalog.type", "glue"),
             ("storage.type", "gcs"),
@@ -317,6 +336,10 @@ mod tests {
             ),
             ("catalog.property.header.X-Api-Key", "resolved-secret"),
             ("catalog.property.header.Cookie", "session=resolved-secret"),
+            (
+                "catalog.property.s3.secret-access-key",
+                "resolved-storage-secret",
+            ),
             (
                 "catalog.property.header.X-Tenant",
                 "https://user:resolved-secret@catalog.invalid",

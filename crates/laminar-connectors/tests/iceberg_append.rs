@@ -40,11 +40,11 @@ fn config(table: &str) -> ConnectorConfig {
     config.set("namespace", "laminar_test");
     config.set("table.name", table);
     config.set("auto.create", "true");
-    config.set("catalog.property.s3.endpoint", "http://localhost:9000");
-    config.set("catalog.property.s3.access-key-id", "minioadmin");
-    config.set("catalog.property.s3.secret-access-key", "minioadmin");
-    config.set("catalog.property.s3.region", "us-east-1");
-    config.set("catalog.property.s3.path-style-access", "true");
+    config.set("storage.endpoint", "http://localhost:9000");
+    config.set("storage.region", "us-east-1");
+    config.set("storage.path_style", "true");
+    config.set("storage.property.s3.access-key-id", "minioadmin");
+    config.set("storage.property.s3.secret-access-key", "minioadmin");
     config.set("_arrow_schema", encode_arrow_schema_ipc(&schema()));
     config
 }

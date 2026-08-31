@@ -3009,6 +3009,14 @@ fn rest_s3_iceberg_is_cluster_exact_admitted_before_io() {
     config.set("catalog.uri", "http://catalog.invalid");
     config.set("catalog.warehouse", "s3://warehouse/root");
     config.set("storage.type", "s3");
+    config.set("storage.endpoint", "http://objects.invalid");
+    config.set("storage.region", "us-east-1");
+    config.set("storage.path_style", "true");
+    config.set("storage.property.s3.access-key-id", "local-access-key");
+    config.set(
+        "storage.property.s3.secret-access-key",
+        "resolved-storage-secret",
+    );
     config.set("namespace", "production");
     config.set("table.name", "events");
     config.set("delivery.guarantee", "exactly-once");

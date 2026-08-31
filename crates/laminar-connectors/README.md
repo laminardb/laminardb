@@ -51,7 +51,7 @@ backpressures rather than dropping rows.
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
 
-Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix.
+Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix. Data-storage credentials for cluster exactly-once belong under `storage.property.*`; secret-bearing `catalog.property.*` values are treated as uncertified catalog authentication.
 
 ### Upsert sinks and changelog collapse
 

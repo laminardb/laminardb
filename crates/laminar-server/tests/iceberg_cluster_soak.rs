@@ -225,7 +225,7 @@ impl ClusterProfile {
     fn iceberg_storage_toml(&self) -> String {
         match self.kind {
             ClusterProfileKind::Minio => format!(
-                "\"catalog.property.s3.endpoint\" = \"{MINIO_S3_ENDPOINT}\"\n\"catalog.property.s3.access-key-id\" = \"{MINIO_S3_ACCESS_KEY}\"\n\"catalog.property.s3.secret-access-key\" = \"$${{{S3_SECRET_ENV}}}\"\n\"catalog.property.s3.region\" = \"{}\"\n\"catalog.property.s3.path-style-access\" = \"true\"\n",
+                "\"storage.endpoint\" = \"{MINIO_S3_ENDPOINT}\"\n\"storage.region\" = \"{}\"\n\"storage.path_style\" = \"true\"\n\"storage.property.s3.access-key-id\" = \"{MINIO_S3_ACCESS_KEY}\"\n\"storage.property.s3.secret-access-key\" = \"$${{{S3_SECRET_ENV}}}\"\n",
                 self.s3_region
             ),
             ClusterProfileKind::Aws => format!("\"storage.region\" = \"{}\"\n", self.s3_region),
@@ -1364,6 +1364,12 @@ mod profile_tests {
         assert!(profile
             .checkpoint_storage_toml()
             .contains("${ICEBERG_CLUSTER_S3_SECRET_KEY}"));
+        let storage = profile.iceberg_storage_toml();
+        assert!(!storage.contains("catalog.property"));
+        assert!(storage.contains(
+            "\"storage.property.s3.secret-access-key\" = \"$${ICEBERG_CLUSTER_S3_SECRET_KEY}\""
+        ));
+        assert!(!storage.contains("\"storage.property.s3.secret-access-key\" = \"minioadmin\""));
         assert!(!format!("{profile:?}").contains(MINIO_S3_SECRET_KEY));
     }
 
