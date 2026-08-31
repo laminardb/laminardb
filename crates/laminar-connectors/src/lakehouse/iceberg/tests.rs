@@ -12,7 +12,7 @@ fn test_schema() -> SchemaRef {
 fn test_connector_config() -> ConnectorConfig {
     let mut config = ConnectorConfig::new("iceberg");
     config.set("catalog.uri", "http://localhost:8181");
-    config.set("warehouse", "s3://test/wh");
+    config.set("catalog.warehouse", "s3://test/wh");
     config.set("namespace", "test");
     config.set("table.name", "events");
     config
@@ -206,7 +206,7 @@ fn runtime_identity_cannot_change_after_open() {
 fn local_storage_contract_is_singleton() {
     let sink = IcebergSink::new(test_config(), None);
     let mut config = test_connector_config();
-    config.set("warehouse", "file:///tmp/iceberg");
+    config.set("catalog.warehouse", "file:///tmp/iceberg");
     config.set("storage.type", "fs");
     assert_eq!(
         sink.contract(&config).unwrap().topology,

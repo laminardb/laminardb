@@ -66,7 +66,7 @@ impl IcebergSourceConfig {
                 "read.bootstrap is only valid when read.mode=append".into(),
             ));
         }
-        let poll_interval = match optional_alias(config, "poll.interval", "poll.interval.ms") {
+        let poll_interval = match optional_alias(config, "poll.interval", "poll.interval.ms")? {
             Some(value) if config.get("poll.interval").is_some() => {
                 parse_duration_value("poll.interval", value)?
             }
@@ -87,7 +87,7 @@ impl IcebergSourceConfig {
             snapshot_id: parse_optional_alias(config, "start.snapshot.id", "snapshot.id")?,
             table_ref: config.get("table.ref").unwrap_or("main").trim().to_string(),
             select_columns: parse_comma_list(
-                optional_alias(config, "projection", "select.columns"),
+                optional_alias(config, "projection", "select.columns")?,
                 "projection",
                 1_024,
             )?,

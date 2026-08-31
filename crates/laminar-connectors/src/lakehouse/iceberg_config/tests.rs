@@ -441,6 +441,38 @@ fn legacy_and_typed_option_aliases_match() {
 }
 
 #[test]
+fn canonical_and_legacy_aliases_cannot_both_be_set() {
+    for (canonical, legacy) in [
+        ("catalog.warehouse", "warehouse"),
+        ("parquet.compression", "compression"),
+        ("target.file.size.bytes", "target.file.size"),
+    ] {
+        let mut config = table_definition_config();
+        config.set(canonical, "1");
+        config.set(legacy, "2");
+        let message = IcebergSinkConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(canonical), "{message}");
+        assert!(message.contains(legacy), "{message}");
+    }
+    for (canonical, legacy) in [
+        ("poll.interval", "poll.interval.ms"),
+        ("start.snapshot.id", "snapshot.id"),
+        ("projection", "select.columns"),
+    ] {
+        let mut config = table_definition_config();
+        config.set(canonical, "1");
+        config.set(legacy, "2");
+        let message = IcebergSourceConfig::from_config(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains(canonical), "{message}");
+        assert!(message.contains(legacy), "{message}");
+    }
+}
+
+#[test]
 fn debug_redacts_catalog_and_storage_values() {
     let mut config = ConnectorConfig::new("iceberg");
     config.set("catalog.uri", "https://catalog.test");

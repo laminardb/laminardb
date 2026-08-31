@@ -517,7 +517,7 @@ impl IcebergSinkConfig {
             .parse()
             .map_err(ConnectorError::ConfigurationError)?;
         let compression = parse_parquet_compression(
-            optional_alias(config, "parquet.compression", "compression").unwrap_or("zstd"),
+            optional_alias(config, "parquet.compression", "compression")?.unwrap_or("zstd"),
         )?;
         let target_file_size_bytes = parse_nonzero_alias(
             config,
@@ -715,7 +715,7 @@ fn parse_nonzero_alias(
     alias: &str,
     default: usize,
 ) -> Result<usize, ConnectorError> {
-    optional_alias(config, key, alias).map_or(Ok(default), |value| parse_nonzero_value(key, value))
+    optional_alias(config, key, alias)?.map_or(Ok(default), |value| parse_nonzero_value(key, value))
 }
 
 fn parse_nonzero_value(key: &str, value: &str) -> Result<usize, ConnectorError> {
@@ -775,8 +775,18 @@ fn optional_non_empty(config: &ConnectorConfig, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn optional_alias<'a>(config: &'a ConnectorConfig, key: &str, alias: &str) -> Option<&'a str> {
-    config.get(key).or_else(|| config.get(alias))
+fn optional_alias<'a>(
+    config: &'a ConnectorConfig,
+    key: &str,
+    alias: &str,
+) -> Result<Option<&'a str>, ConnectorError> {
+    match (config.get(key), config.get(alias)) {
+        (Some(_), Some(_)) => Err(ConnectorError::ConfigurationError(format!(
+            "{key} and its legacy alias {alias} cannot both be set"
+        ))),
+        (value @ Some(_), None) | (None, value @ Some(_)) => Ok(value),
+        (None, None) => Ok(None),
+    }
 }
 
 fn required_alias<'a>(
@@ -784,7 +794,7 @@ fn required_alias<'a>(
     key: &str,
     alias: &str,
 ) -> Result<&'a str, ConnectorError> {
-    optional_alias(config, key, alias).ok_or_else(|| ConnectorError::missing_config(key))
+    optional_alias(config, key, alias)?.ok_or_else(|| ConnectorError::missing_config(key))
 }
 
 fn parse_optional_alias<T>(
@@ -796,7 +806,7 @@ where
     T: std::str::FromStr,
     T::Err: fmt::Display,
 {
-    optional_alias(config, key, alias)
+    optional_alias(config, key, alias)?
         .map(|value| {
             value.parse().map_err(|error| {
                 ConnectorError::ConfigurationError(format!("invalid {key}: {error}"))
