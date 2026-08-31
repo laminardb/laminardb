@@ -62,11 +62,36 @@ pub(crate) fn cluster_exact_append_certified(config: &IcebergSinkConfig) -> bool
             config.catalog.auth_type,
             IcebergCatalogAuthType::None | IcebergCatalogAuthType::Bearer
         )
+        && cluster_catalog_auth_certified(&config.catalog)
         && matches!(
             config.storage.storage_type,
             None | Some(IcebergStorageType::S3)
         )
         && direct_s3_warehouse(&config.catalog.warehouse)
+}
+
+fn cluster_catalog_auth_certified(catalog: &IcebergCatalogConfig) -> bool {
+    catalog.properties.iter().all(|(key, value)| {
+        let typed_bearer = catalog.auth_type == IcebergCatalogAuthType::Bearer
+            && key.eq_ignore_ascii_case("token");
+        typed_bearer
+            || !(crate::security::is_secret_option_key(key)
+                || is_sensitive_auth_header(key)
+                || crate::security::value_contains_uri_secret(value, false))
+    })
+}
+
+fn is_sensitive_auth_header(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "header.authorization"
+            | "header.proxy-authorization"
+            | "header.cookie"
+            | "header.set-cookie"
+    ) || key
+        .strip_prefix("header.")
+        .is_some_and(|name| name.starts_with("x-auth"))
 }
 
 fn direct_s3_warehouse(warehouse: &str) -> bool {
@@ -267,6 +292,18 @@ mod tests {
             ))
         );
 
+        let mut tenant_routing = config.clone();
+        tenant_routing.set("catalog.property.header.X-Tenant", "tenant-a");
+        assert_eq!(
+            cluster_exact_append_certified(
+                &IcebergSinkConfig::from_config(&tenant_routing).unwrap()
+            ),
+            cfg!(all(
+                feature = "iceberg-catalog-rest",
+                feature = "iceberg-storage-s3"
+            ))
+        );
+
         for (key, value) in [
             ("catalog.type", "glue"),
             ("storage.type", "gcs"),
@@ -277,6 +314,12 @@ mod tests {
             (
                 "storage.property.header.X-Iceberg-Access-Delegation",
                 "vended-credentials",
+            ),
+            ("catalog.property.header.X-Api-Key", "resolved-secret"),
+            ("catalog.property.header.Cookie", "session=resolved-secret"),
+            (
+                "catalog.property.header.X-Tenant",
+                "https://user:resolved-secret@catalog.invalid",
             ),
         ] {
             let mut rejected = config.clone();

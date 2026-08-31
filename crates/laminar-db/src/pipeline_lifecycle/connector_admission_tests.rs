@@ -3056,6 +3056,11 @@ fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
             "vended-credentials",
             "access-delegation",
         ),
+        (
+            "catalog.property.header.X-Api-Key",
+            "resolved-secret",
+            "cluster exactly-once",
+        ),
     ] {
         let mut config = ConnectorConfig::new("iceberg");
         config.set("catalog.uri", "http://catalog.invalid");
