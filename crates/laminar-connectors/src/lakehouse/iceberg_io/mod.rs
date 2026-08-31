@@ -137,6 +137,7 @@ mod table_creation;
 fn storage_factory(
     warehouse: &str,
     config: &IcebergStorageConfig,
+    configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     let storage_type = config
         .storage_type
@@ -149,10 +150,10 @@ fn storage_factory(
         })?;
 
     match storage_type {
-        IcebergStorageType::S3 => s3_storage_factory(config),
-        IcebergStorageType::Gcs => gcs_storage_factory(config),
-        IcebergStorageType::Azure => azure_storage_factory(config),
-        IcebergStorageType::Fs => fs_storage_factory(config),
+        IcebergStorageType::S3 => s3_storage_factory(config, configured_properties),
+        IcebergStorageType::Gcs => gcs_storage_factory(config, configured_properties),
+        IcebergStorageType::Azure => azure_storage_factory(config, configured_properties),
+        IcebergStorageType::Fs => fs_storage_factory(config, configured_properties),
     }
 }
 
@@ -179,6 +180,7 @@ fn infer_storage_type(warehouse: &str) -> Option<IcebergStorageType> {
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
 fn s3_storage_factory(
     storage: &IcebergStorageConfig,
+    configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
         OpenDalStorageFactory::S3 {
@@ -186,6 +188,7 @@ fn s3_storage_factory(
         },
         storage.connect_timeout,
         storage.request_timeout,
+        configured_properties,
     )))
 }
 
@@ -193,6 +196,7 @@ fn s3_storage_factory(
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn s3_storage_factory(
     _storage: &IcebergStorageConfig,
+    _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("s3", "iceberg-storage-s3"))
 }
@@ -202,11 +206,13 @@ fn s3_storage_factory(
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
 fn gcs_storage_factory(
     storage: &IcebergStorageConfig,
+    configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
         OpenDalStorageFactory::Gcs,
         storage.connect_timeout,
         storage.request_timeout,
+        configured_properties,
     )))
 }
 
@@ -214,6 +220,7 @@ fn gcs_storage_factory(
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn gcs_storage_factory(
     _storage: &IcebergStorageConfig,
+    _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("gcs", "iceberg-storage-gcs"))
 }
@@ -223,11 +230,13 @@ fn gcs_storage_factory(
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
 fn azure_storage_factory(
     storage: &IcebergStorageConfig,
+    configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
         OpenDalStorageFactory::Azdls,
         storage.connect_timeout,
         storage.request_timeout,
+        configured_properties,
     )))
 }
 
@@ -235,6 +244,7 @@ fn azure_storage_factory(
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn azure_storage_factory(
     _storage: &IcebergStorageConfig,
+    _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("azure", "iceberg-storage-azure"))
 }
@@ -244,11 +254,13 @@ fn azure_storage_factory(
 #[allow(clippy::unnecessary_wraps)] // Matches the fail-closed feature-disabled signature.
 fn fs_storage_factory(
     storage: &IcebergStorageConfig,
+    configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
         OpenDalStorageFactory::Fs,
         storage.connect_timeout,
         storage.request_timeout,
+        configured_properties,
     )))
 }
 
@@ -256,6 +268,7 @@ fn fs_storage_factory(
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn fs_storage_factory(
     _storage: &IcebergStorageConfig,
+    _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Err(missing_storage_feature("fs", "iceberg-storage-fs"))
 }
@@ -513,7 +526,8 @@ fn apply_storage_properties(
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the table cannot be loaded.
+/// Returns `ConnectorError::ReadError` if the table cannot be loaded, or
+/// `ConnectorError::FeatureUnsupported` when loading requires an unavailable capability.
 pub async fn load_table(
     catalog: &dyn Catalog,
     namespace: &str,
@@ -532,7 +546,8 @@ pub async fn load_table(
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the table cannot be loaded before the deadline.
+/// Returns `ConnectorError::ReadError` if the table cannot be loaded before the deadline, or
+/// `ConnectorError::FeatureUnsupported` when loading requires an unavailable capability.
 pub async fn load_table_with_timeout(
     catalog: &dyn Catalog,
     namespace: &str,
@@ -551,14 +566,22 @@ pub async fn load_table_with_timeout(
                 "[LDB-ICEBERG-CATALOG-TIMEOUT] load table '{table_name}' exceeded {timeout:?}"
             ))
         })?
-        .map_err(|error| {
-            ConnectorError::ReadError(format!(
-                "[LDB-ICEBERG-CATALOG-LOAD] load table '{table_name}' failed ({})",
-                error.kind()
-            ))
-        })?;
+        .map_err(|error| catalog_load_error(table_name, &error))?;
     validate_loaded_table_locations(&table)?;
     Ok(table)
+}
+
+fn catalog_load_error(table_name: &str, error: &iceberg::Error) -> ConnectorError {
+    if error.kind() == iceberg::ErrorKind::FeatureUnsupported {
+        return ConnectorError::FeatureUnsupported(
+            "[LDB-ICEBERG-TABLE-LOAD-UNSUPPORTED] Iceberg table load requires a catalog or storage capability unavailable in this build"
+                .into(),
+        );
+    }
+    ConnectorError::ReadError(format!(
+        "[LDB-ICEBERG-CATALOG-LOAD] load table '{table_name}' failed ({})",
+        error.kind()
+    ))
 }
 
 pub(crate) fn validate_loaded_table_locations(table: &Table) -> Result<(), ConnectorError> {

@@ -1,5 +1,7 @@
 //! Timeout enforcement around the released `OpenDAL` Iceberg storage factory.
 
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
@@ -12,7 +14,10 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use iceberg::io::{
     FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
-    StorageFactory,
+    StorageFactory, ADLS_ACCOUNT_KEY, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
+    ADLS_CONNECTION_STRING, ADLS_SAS_TOKEN, ADLS_TENANT_ID, GCS_CREDENTIALS_JSON, GCS_TOKEN,
+    S3_ACCESS_KEY_ID, S3_ASSUME_ROLE_ARN, S3_ASSUME_ROLE_EXTERNAL_ID, S3_ASSUME_ROLE_SESSION_NAME,
+    S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN, S3_SSE_KEY, S3_SSE_MD5,
 };
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_storage_opendal::OpenDalStorageFactory;
@@ -23,6 +28,38 @@ pub(super) struct BoundedStorageFactory {
     inner: OpenDalStorageFactory,
     connect_timeout: Duration,
     request_timeout: Duration,
+    #[serde(default)]
+    locally_configured_sensitive: Vec<String>,
+}
+
+const REMOTE_SIGNING_ENABLED: &str = "s3.remote-signing-enabled";
+const STORAGE_SENSITIVE_PROPERTIES: &[&str] = &[
+    S3_ACCESS_KEY_ID,
+    S3_SECRET_ACCESS_KEY,
+    S3_SESSION_TOKEN,
+    S3_ASSUME_ROLE_ARN,
+    S3_ASSUME_ROLE_EXTERNAL_ID,
+    S3_ASSUME_ROLE_SESSION_NAME,
+    S3_SSE_KEY,
+    S3_SSE_MD5,
+    GCS_CREDENTIALS_JSON,
+    GCS_TOKEN,
+    ADLS_CONNECTION_STRING,
+    ADLS_ACCOUNT_KEY,
+    ADLS_SAS_TOKEN,
+    ADLS_TENANT_ID,
+    ADLS_CLIENT_ID,
+    ADLS_CLIENT_SECRET,
+    ADLS_AUTHORITY_HOST,
+];
+
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+pub(super) fn is_sensitive_storage_property(property: &str) -> bool {
+    STORAGE_SENSITIVE_PROPERTIES.contains(&property)
+}
+
+pub(super) fn requests_remote_signing(property: &str, value: &str) -> bool {
+    property == REMOTE_SIGNING_ENABLED && value.eq_ignore_ascii_case("true")
 }
 
 impl BoundedStorageFactory {
@@ -31,18 +68,58 @@ impl BoundedStorageFactory {
         inner: OpenDalStorageFactory,
         connect_timeout: Duration,
         request_timeout: Duration,
+        configured_properties: &HashMap<String, String>,
     ) -> Self {
+        let mut locally_configured_sensitive = configured_properties
+            .keys()
+            .filter(|key| is_sensitive_storage_property(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        locally_configured_sensitive.sort_unstable();
         Self {
             inner,
             connect_timeout,
             request_timeout,
+            locally_configured_sensitive,
         }
+    }
+
+    fn validate_config(&self, config: &StorageConfig) -> Result<()> {
+        if config
+            .props()
+            .iter()
+            .any(|(property, value)| requests_remote_signing(property, value))
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] iceberg-rust 0.10.1 OpenDAL storage does not support REST remote signing",
+            ));
+        }
+        if STORAGE_SENSITIVE_PROPERTIES.iter().any(|property| {
+            config
+                .props()
+                .get(*property)
+                .is_some_and(|_| !self.was_configured_locally(property))
+        }) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "[LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED] REST table configuration supplies storage access or encryption material that was not configured locally",
+            ));
+        }
+        Ok(())
+    }
+
+    fn was_configured_locally(&self, property: &str) -> bool {
+        self.locally_configured_sensitive
+            .iter()
+            .any(|configured| configured == property)
     }
 }
 
 #[typetag::serde(name = "laminardb-bounded-opendal-factory-v1")]
 impl StorageFactory for BoundedStorageFactory {
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        self.validate_config(config)?;
         Ok(Arc::new(BoundedStorage {
             factory: self.inner.clone(),
             config: config.clone(),
@@ -351,6 +428,7 @@ mod tests {
             test_factory(),
             Duration::from_secs(1),
             Duration::from_secs(2),
+            &std::collections::HashMap::new(),
         );
         let storage = factory
             .build(&StorageConfig::new().with_prop("secret-access-key", "inline-secret"))
@@ -358,6 +436,66 @@ mod tests {
         let debug = format!("{storage:?}");
         assert!(debug.contains("secret-access-key"));
         assert!(!debug.contains("inline-secret"));
+    }
+
+    #[test]
+    fn server_vended_credentials_fail_before_storage_initialization() {
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &std::collections::HashMap::new(),
+        );
+        let error = factory
+            .build(&StorageConfig::new().with_prop(S3_SESSION_TOKEN, "server-secret"))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED"));
+        assert!(!error.to_string().contains("server-secret"));
+    }
+
+    #[test]
+    fn local_credentials_remain_usable_after_rest_config_merge() {
+        let properties = std::collections::HashMap::from([
+            (S3_ACCESS_KEY_ID.to_string(), "local-id".to_string()),
+            (S3_SECRET_ACCESS_KEY.to_string(), "local-secret".to_string()),
+        ]);
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &properties,
+        );
+        let debug = format!("{factory:?}");
+        let serialized = serde_json::to_string(&factory).unwrap();
+        assert!(!debug.contains("local-secret"));
+        assert!(!serialized.contains("local-secret"));
+        factory
+            .build(
+                &StorageConfig::new()
+                    .with_prop(S3_ACCESS_KEY_ID, "local-id")
+                    .with_prop(S3_SECRET_ACCESS_KEY, "local-secret"),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_signing_fails_closed() {
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &std::collections::HashMap::new(),
+        );
+        let error = factory
+            .build(&StorageConfig::new().with_prop(REMOTE_SIGNING_ENABLED, "true"))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported);
+        assert!(error
+            .to_string()
+            .contains("LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED"));
     }
 
     fn test_factory() -> OpenDalStorageFactory {

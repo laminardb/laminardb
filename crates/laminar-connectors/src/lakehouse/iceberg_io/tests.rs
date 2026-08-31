@@ -9,6 +9,13 @@ fn storage_config(storage_type: Option<&str>) -> IcebergStorageConfig {
     IcebergStorageConfig::from_config(&config).unwrap()
 }
 
+fn unconfigured_storage_factory(
+    warehouse: &str,
+    config: &IcebergStorageConfig,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    storage_factory(warehouse, config, &HashMap::new())
+}
+
 #[cfg(feature = "iceberg-catalog-rest")]
 fn catalog_config(configure: impl FnOnce(&mut ConnectorConfig)) -> IcebergCatalogConfig {
     let mut config = ConnectorConfig::new("iceberg");
@@ -47,6 +54,20 @@ fn external_errors_do_not_expose_provider_messages() {
 }
 
 #[test]
+fn unsupported_table_loads_keep_a_stable_capability_error() {
+    let source = iceberg::Error::new(
+        iceberg::ErrorKind::FeatureUnsupported,
+        "provider response contains secret material",
+    );
+    let error = catalog_load_error("events", &source);
+    assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-TABLE-LOAD-UNSUPPORTED"));
+    assert!(!error.to_string().contains("secret material"));
+}
+
+#[test]
 fn credential_bearing_catalog_locations_are_rejected_without_echoing() {
     for location in [
         "https://user:location-secret@objects.test/table",
@@ -63,7 +84,7 @@ fn credential_bearing_catalog_locations_are_rejected_without_echoing() {
 #[test]
 #[cfg(feature = "iceberg-storage-s3")]
 fn unknown_warehouse_scheme_is_not_echoed() {
-    let error = storage_factory(
+    let error = unconfigured_storage_factory(
         "https://catalog-user:do-not-echo@warehouse.test/root?token=do-not-echo",
         &storage_config(None),
     )
@@ -88,35 +109,35 @@ fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
 #[test]
 #[cfg(feature = "iceberg-storage-s3")]
 fn test_storage_factory_infers_s3_from_warehouse_url() {
-    let f = storage_factory("s3://bucket/warehouse", &storage_config(None)).unwrap();
+    let f = unconfigured_storage_factory("s3://bucket/warehouse", &storage_config(None)).unwrap();
     assert!(format!("{f:?}").contains("S3"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-s3")]
 fn test_storage_factory_infers_s3a_from_warehouse_url() {
-    let f = storage_factory("s3a://bucket/warehouse", &storage_config(None)).unwrap();
+    let f = unconfigured_storage_factory("s3a://bucket/warehouse", &storage_config(None)).unwrap();
     assert!(format!("{f:?}").contains("S3"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-fs")]
 fn test_storage_factory_infers_fs_from_file_url() {
-    let f = storage_factory("file:///tmp/warehouse", &storage_config(None)).unwrap();
+    let f = unconfigured_storage_factory("file:///tmp/warehouse", &storage_config(None)).unwrap();
     assert!(format!("{f:?}").contains("Fs"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-gcs")]
 fn test_storage_factory_infers_gcs_from_gs_url() {
-    let f = storage_factory("gs://bucket/warehouse", &storage_config(None)).unwrap();
+    let f = unconfigured_storage_factory("gs://bucket/warehouse", &storage_config(None)).unwrap();
     assert!(format!("{f:?}").contains("Gcs"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-azure")]
 fn test_storage_factory_infers_azure_from_abfss_url() {
-    let f = storage_factory(
+    let f = unconfigured_storage_factory(
         "abfss://container@account.dfs.core.windows.net/warehouse",
         &storage_config(None),
     )
@@ -157,7 +178,8 @@ fn unavailable_storage_factories_fail_closed() {
         if enabled {
             continue;
         }
-        let error = storage_factory(warehouse, &storage_config(Some(storage_type))).unwrap_err();
+        let error = unconfigured_storage_factory(warehouse, &storage_config(Some(storage_type)))
+            .unwrap_err();
         assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
         assert!(error.to_string().contains(storage_type));
     }
@@ -167,7 +189,7 @@ fn unavailable_storage_factories_fail_closed() {
 fn test_storage_factory_bare_path_requires_explicit_storage_type() {
     // Trimmed `/` and `./` inference: REST catalogs use logical names
     // and we don't want a silent default to local fs.
-    let err = storage_factory("/tmp/warehouse", &storage_config(None))
+    let err = unconfigured_storage_factory("/tmp/warehouse", &storage_config(None))
         .unwrap_err()
         .to_string();
     assert!(err.contains("LDB-5100"), "got: {err}");
@@ -177,13 +199,13 @@ fn test_storage_factory_bare_path_requires_explicit_storage_type() {
 #[cfg(feature = "iceberg-storage-s3")]
 fn test_storage_factory_explicit_overrides_inference() {
     // Lakekeeper-style: warehouse is a name, storage backend is S3.
-    let f = storage_factory("demo", &storage_config(Some("s3"))).unwrap();
+    let f = unconfigured_storage_factory("demo", &storage_config(Some("s3"))).unwrap();
     assert!(format!("{f:?}").contains("S3"));
 }
 
 #[test]
 fn test_storage_factory_unknown_warehouse_without_storage_type_errors() {
-    let err = storage_factory("demo", &storage_config(None))
+    let err = unconfigured_storage_factory("demo", &storage_config(None))
         .unwrap_err()
         .to_string();
     assert!(err.contains("LDB-5100"), "got: {err}");

@@ -59,9 +59,9 @@ pub(super) async fn build(
     super::super::iceberg::capabilities::validate_catalog_session(config)?;
     validate_configured_uri(&config.catalog_uri)?;
     validate_storage_options(&config.warehouse, storage)?;
-    let factory = storage_factory(&config.warehouse, storage)?;
     let properties = rest_properties(config, storage)?;
     validate_rest_properties(&properties)?;
+    let factory = storage_factory(&config.warehouse, storage, &properties)?;
     let client = http_client(config)?;
     let authentication = RestAuthentication::initialize(
         config,
@@ -388,6 +388,30 @@ fn validate_rest_properties(properties: &HashMap<String, String>) -> Result<(), 
 fn validate_server_properties(properties: &HashMap<String, String>) -> Result<(), ConnectorError> {
     for (key, value) in properties {
         let normalized = key.to_ascii_lowercase();
+        #[cfg(any(
+            feature = "iceberg-storage-s3",
+            feature = "iceberg-storage-gcs",
+            feature = "iceberg-storage-azure",
+            feature = "iceberg-storage-fs"
+        ))]
+        if super::bounded_storage::requests_remote_signing(&normalized, value) {
+            return Err(ConnectorError::FeatureUnsupported(
+                "[LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED] Iceberg REST server configuration enables unsupported remote signing"
+                    .into(),
+            ));
+        }
+        #[cfg(any(
+            feature = "iceberg-storage-s3",
+            feature = "iceberg-storage-gcs",
+            feature = "iceberg-storage-azure",
+            feature = "iceberg-storage-fs"
+        ))]
+        if super::bounded_storage::is_sensitive_storage_property(&normalized) {
+            return Err(ConnectorError::FeatureUnsupported(
+                "[LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED] Iceberg REST server configuration supplies storage access or encryption material"
+                    .into(),
+            ));
+        }
         if normalized == "disable-header-redaction" && value.eq_ignore_ascii_case("true") {
             return Err(ConnectorError::FeatureUnsupported(
                 "iceberg.catalog.rest.header-redaction: server configuration attempts to disable credential redaction"
@@ -600,6 +624,44 @@ mod tests {
             let properties = HashMap::from([(property.into(), "server-secret".into())]);
             let error = validate_server_properties(&properties).unwrap_err();
             assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+            assert!(!error.to_string().contains("server-secret"));
+        }
+    }
+
+    #[cfg(any(
+        feature = "iceberg-storage-s3",
+        feature = "iceberg-storage-gcs",
+        feature = "iceberg-storage-azure",
+        feature = "iceberg-storage-fs"
+    ))]
+    #[test]
+    fn server_configuration_cannot_supply_storage_credentials_or_signing() {
+        for (property, value, code) in [
+            (
+                "s3.session-token",
+                "server-secret",
+                "LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED",
+            ),
+            (
+                "gcs.oauth2.token",
+                "server-secret",
+                "LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED",
+            ),
+            (
+                "adls.sas-token",
+                "server-secret",
+                "LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED",
+            ),
+            (
+                "s3.remote-signing-enabled",
+                "true",
+                "LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED",
+            ),
+        ] {
+            let properties = HashMap::from([(property.into(), value.into())]);
+            let error = validate_server_properties(&properties).unwrap_err();
+            assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+            assert!(error.to_string().contains(code));
             assert!(!error.to_string().contains("server-secret"));
         }
     }
