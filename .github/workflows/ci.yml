@@ -246,9 +246,32 @@ jobs:
           # Core features
           cargo check -p laminar-core --no-default-features
           cargo check -p laminar-core --no-default-features --features cluster
+          cargo check -p laminar-core --no-default-features --features aws
+          cargo check -p laminar-core --no-default-features --features azure
+          cargo check -p laminar-core --no-default-features --features gcs
 
           # DB features
           cargo check -p laminar-db --no-default-features --features cluster
+          cargo check -p laminar-db --no-default-features --features checkpoint-aws
+          cargo check -p laminar-db --no-default-features --features checkpoint-azure
+          cargo check -p laminar-db --no-default-features --features checkpoint-gcs
+          cargo check -p laminar-db --no-default-features --features delta-lake-s3
+          cargo check -p laminar-db --no-default-features --features delta-lake-azure
+          cargo check -p laminar-db --no-default-features --features delta-lake-gcs
+          cargo check -p laminar-db --no-default-features --features iceberg
+          cargo check -p laminar-db --no-default-features --features iceberg-azure
+          cargo check -p laminar-db --no-default-features --features iceberg-gcs
+
+          # Server provider pass-through features
+          cargo check -p laminar-server --no-default-features --features checkpoint-aws
+          cargo check -p laminar-server --no-default-features --features checkpoint-azure
+          cargo check -p laminar-server --no-default-features --features checkpoint-gcs
+          cargo check -p laminar-server --no-default-features --features delta-lake-s3
+          cargo check -p laminar-server --no-default-features --features delta-lake-azure
+          cargo check -p laminar-server --no-default-features --features delta-lake-gcs
+          cargo check -p laminar-server --no-default-features --features iceberg
+          cargo check -p laminar-server --no-default-features --features iceberg-azure
+          cargo check -p laminar-server --no-default-features --features iceberg-gcs
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features
@@ -257,6 +280,9 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features postgres-sink
           cargo check -p laminar-connectors --no-default-features --features mongodb-cdc
           cargo check -p laminar-connectors --no-default-features --features files
+          cargo check -p laminar-connectors --no-default-features --features delta-lake-s3
+          cargo check -p laminar-connectors --no-default-features --features delta-lake-azure
+          cargo check -p laminar-connectors --no-default-features --features delta-lake-gcs
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
           # Iceberg catalog and storage isolation
@@ -272,6 +298,8 @@ jobs:
           cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-azure
           cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-fs
           cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-gcs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-azure
           cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
           cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
           cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"

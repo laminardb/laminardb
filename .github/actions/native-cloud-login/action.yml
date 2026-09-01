@@ -1,0 +1,68 @@
+name: Native cloud OIDC login
+description: Authenticate one protected native-cloud job without long-lived cloud keys
+inputs:
+  provider:
+    description: aws, azure, or gcs
+    required: true
+  aws-role-arn:
+    description: AWS role trusted for GitHub OIDC
+    required: false
+  aws-region:
+    description: AWS region containing the test bucket
+    required: false
+  azure-client-id:
+    description: Azure federated application client ID
+    required: false
+  azure-tenant-id:
+    description: Azure tenant ID
+    required: false
+  azure-subscription-id:
+    description: Azure subscription ID
+    required: false
+  gcp-workload-identity-provider:
+    description: GCP Workload Identity Provider resource name
+    required: false
+  gcp-service-account:
+    description: GCP service account used through federation
+    required: false
+  gcp-project-id:
+    description: GCP project ID
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to AWS with OIDC
+      if: inputs.provider == 'aws'
+      uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: laminardb-native-${{ github.run_id }}
+    - name: Record AWS authentication category
+      if: inputs.provider == 'aws'
+      shell: bash
+      run: echo "LAMINAR_NATIVE_AUTH_SOURCE=web-identity" >> "$GITHUB_ENV"
+    - name: Authenticate to Azure with OIDC
+      if: inputs.provider == 'azure'
+      uses: Azure/login@93381592711f247e165c389ebb30b596c84cdc48 # v3.0.0
+      with:
+        client-id: ${{ inputs.azure-client-id }}
+        tenant-id: ${{ inputs.azure-tenant-id }}
+        subscription-id: ${{ inputs.azure-subscription-id }}
+    - name: Record Azure authentication category
+      if: inputs.provider == 'azure'
+      shell: bash
+      run: echo "LAMINAR_NATIVE_AUTH_SOURCE=azure-cli" >> "$GITHUB_ENV"
+    - name: Authenticate to Google Cloud with Workload Identity Federation
+      if: inputs.provider == 'gcs'
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        workload_identity_provider: ${{ inputs.gcp-workload-identity-provider }}
+        service_account: ${{ inputs.gcp-service-account }}
+        project_id: ${{ inputs.gcp-project-id }}
+        create_credentials_file: true
+        export_environment_variables: true
+    - name: Record GCS authentication category
+      if: inputs.provider == 'gcs'
+      shell: bash
+      run: echo "LAMINAR_NATIVE_AUTH_SOURCE=workload-identity" >> "$GITHUB_ENV"
