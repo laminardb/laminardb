@@ -18,10 +18,10 @@ use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 use object_store::memory::InMemory;
 
+use super::retention::{delete_retired_data, live_chunk_inventory};
 use super::subscription_output::{
     cluster_subscription_retention_horizon, encode_node_subscription_output, retention_caps,
 };
-use super::{delete_retired_data, live_chunk_inventory};
 use crate::error::DbError;
 use crate::subscription::cluster::{
     ClusterSubscriptionOutputState, OutputWriterAuthority, PreparedNodeSubscriptionOutput,
@@ -70,6 +70,16 @@ fn certificate(retention_bytes: u64) -> OutputDistributionCertificate {
         query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
         pipeline_identity: PipelineIdentity::empty(),
     }
+}
+
+fn tail_only_certificate() -> OutputDistributionCertificate {
+    let mut certificate = certificate(0);
+    certificate.stream_id = "tail_positions".into();
+    certificate.stream_generation =
+        StreamGeneration::from_digest(SubscriptionDigest::from_bytes([9; 32]));
+    certificate.final_operator_id = "stream:tail_positions".into();
+    certificate.query_fingerprint = SubscriptionDigest::from_bytes([8; 32]);
+    certificate
 }
 
 fn prepared_output(
@@ -190,6 +200,32 @@ fn manifest(
     manifest
 }
 
+fn mixed_retention_manifest(
+    deployment_id: &str,
+    epoch: u64,
+    retention_bytes: u64,
+    encoded_length: u64,
+) -> CheckpointManifest {
+    let mut manifest = manifest(deployment_id, epoch, retention_bytes, encoded_length);
+    let certificate = tail_only_certificate();
+    let output = manifest.subscription_output.as_mut().unwrap();
+    output.streams.push(NodeSubscriptionStreamManifest {
+        distribution_certificate: certificate.clone(),
+        ranges: vec![NodePartitionRange {
+            partition: OutputPartitionId::new(0),
+            first_sequence: PartitionSequence::new(epoch - 1),
+            through_sequence: PartitionSequence::new(epoch),
+        }],
+        segments: vec![segment(
+            epoch,
+            certificate.stream_generation,
+            encoded_length,
+        )],
+    });
+    output.seal(&[0]).unwrap();
+    manifest
+}
+
 fn index(
     manifest: &CheckpointManifest,
     predecessor: Option<CommittedCheckpointRef>,
@@ -226,6 +262,36 @@ async fn history(retention_bytes: u64) -> HistoryFixture {
     let mut latest = None;
     for epoch in 1..=4 {
         let manifest = manifest(&deployment_id, epoch, retention_bytes, 10);
+        store
+            .save_checkpoint(&manifest, &[Bytes::new()])
+            .await
+            .unwrap();
+        let checkpoint = index(&manifest, predecessor);
+        predecessor = Some(
+            decisions
+                .create_committed_checkpoint(&checkpoint)
+                .await
+                .unwrap(),
+        );
+        latest = Some(checkpoint);
+    }
+    HistoryFixture {
+        store,
+        decisions,
+        latest: latest.unwrap(),
+    }
+}
+
+async fn mixed_retention_history(retention_bytes: u64) -> HistoryFixture {
+    let objects = Arc::new(InMemory::new());
+    let store = ObjectStoreCheckpointStore::new(objects.clone(), "mixed-history")
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let decisions = CheckpointDecisionStore::new(objects);
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    let mut predecessor = None;
+    let mut latest = None;
+    for epoch in 1..=4 {
+        let manifest = mixed_retention_manifest(&deployment_id, epoch, retention_bytes, 10);
         store
             .save_checkpoint(&manifest, &[Bytes::new()])
             .await
@@ -288,6 +354,20 @@ async fn zero_history_cap_keeps_only_the_current_tail_boundary() {
     assert_eq!(horizon.epoch, 4);
 }
 
+#[tokio::test]
+async fn tail_only_stream_does_not_disable_another_streams_retained_history() {
+    let fixture = mixed_retention_history(25).await;
+    let horizon = cluster_subscription_retention_horizon(
+        &fixture.store,
+        &fixture.decisions,
+        &fixture.latest,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(horizon.epoch, 3);
+}
+
 #[test]
 fn mixed_retention_roster_preserves_the_zero_cap() {
     let tail_only = certificate(0);
@@ -329,10 +409,10 @@ fn segment_preparation_rejects_stale_writer_authority() {
 #[tokio::test]
 async fn immutable_upload_ack_loss_retries_and_uncommitted_object_is_collectable() {
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let flaky = Arc::new(super::artifact_tests::CreateCommitThenIoStore {
+    let flaky = Arc::new(super::artifact_tests::CommitThenIoStore {
         inner,
-        lose_create_ack: std::sync::atomic::AtomicBool::new(true),
-        create_suffix: ".arrow",
+        lose_put_ack: std::sync::atomic::AtomicBool::new(true),
+        path_suffix: ".arrow",
         block_get: std::sync::atomic::AtomicBool::new(false),
         deny_list: std::sync::atomic::AtomicBool::new(false),
     });

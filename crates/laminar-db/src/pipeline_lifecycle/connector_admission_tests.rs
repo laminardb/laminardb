@@ -2998,6 +2998,105 @@ fn complete_exact_protocol_is_admitted_without_opening() {
     assert!(!opened.load(Ordering::SeqCst));
 }
 
+#[cfg(all(feature = "cluster", feature = "iceberg"))]
+#[test]
+fn rest_s3_iceberg_is_cluster_exact_admitted_before_io() {
+    use laminar_connectors::lakehouse::iceberg::IcebergSink;
+    use laminar_connectors::lakehouse::iceberg_config::IcebergSinkConfig;
+
+    let mut config = ConnectorConfig::new("iceberg");
+    config.set("catalog.type", "rest");
+    config.set("catalog.uri", "http://catalog.invalid");
+    config.set("catalog.warehouse", "s3://warehouse/root");
+    config.set("storage.type", "s3");
+    config.set("storage.endpoint", "http://objects.invalid");
+    config.set("storage.region", "us-east-1");
+    config.set("storage.path_style", "true");
+    config.set("storage.property.s3.access-key-id", "local-access-key");
+    config.set(
+        "storage.property.s3.secret-access-key",
+        "resolved-storage-secret",
+    );
+    config.set("namespace", "production");
+    config.set("table.name", "events");
+    config.set("delivery.guarantee", "exactly-once");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&config).unwrap(), None);
+
+    let (contract, _) = admit_sink(
+        &sink,
+        SinkAdmissionContext {
+            config: &config,
+            name: "iceberg_out",
+            input: "events",
+            delivery: DeliveryGuarantee::ExactlyOnce,
+            runtime: RuntimeMode::Cluster,
+            carries_changelog: false,
+            checkpointing_enabled: true,
+            checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
+        },
+    )
+    .expect("certified REST/S3 Iceberg append must pass cluster admission");
+    assert!(contract.is_cluster_exact_delivery_certified());
+}
+
+#[cfg(all(feature = "cluster", feature = "iceberg"))]
+#[test]
+fn uncertified_or_unsupported_iceberg_targets_fail_before_io() {
+    use laminar_connectors::lakehouse::iceberg::IcebergSink;
+    use laminar_connectors::lakehouse::iceberg_config::IcebergSinkConfig;
+
+    for (key, value, expected_reason) in [
+        ("catalog.type", "glue", "cluster exactly-once"),
+        ("storage.type", "fs", "cluster exactly-once"),
+        (
+            "catalog.warehouse",
+            "file:///tmp/warehouse",
+            "cluster exactly-once",
+        ),
+        ("catalog.access_delegation", "true", "access-delegation"),
+        (
+            "catalog.property.s3.remote-signing-enabled",
+            "true",
+            "REMOTE-SIGNING",
+        ),
+        (
+            "storage.property.header.X-Iceberg-Access-Delegation",
+            "vended-credentials",
+            "access-delegation",
+        ),
+        (
+            "catalog.property.header.X-Api-Key",
+            "resolved-secret",
+            "cluster exactly-once",
+        ),
+    ] {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "http://catalog.invalid");
+        config.set("catalog.warehouse", "s3://warehouse/root");
+        config.set("storage.type", "s3");
+        config.set("namespace", "production");
+        config.set("table.name", "events");
+        config.set("delivery.guarantee", "exactly-once");
+        config.set(key, value);
+        let sink = IcebergSink::new(IcebergSinkConfig::from_config(&config).unwrap(), None);
+        let error = admit_sink(
+            &sink,
+            SinkAdmissionContext {
+                config: &config,
+                name: "iceberg_out",
+                input: "events",
+                delivery: DeliveryGuarantee::ExactlyOnce,
+                runtime: RuntimeMode::Cluster,
+                carries_changelog: false,
+                checkpointing_enabled: true,
+                checkpoint_storage_scope: CheckpointStorageScope::ClusterShared,
+            },
+        )
+        .expect_err("uncertified Iceberg target must fail before connector open");
+        assert!(error.to_string().contains(expected_reason), "{error}");
+    }
+}
+
 #[test]
 fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
     let opened = Arc::new(AtomicBool::new(false));

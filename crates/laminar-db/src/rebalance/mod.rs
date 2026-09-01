@@ -4201,6 +4201,7 @@ pub(crate) async fn admit_cluster_checkpoint_artifacts_for_test(
         pipeline_identity: index.pipeline_identity.clone(),
         attempt: CheckpointAttempt::new(index.epoch, index.checkpoint_id),
         assignment_fence: index.assignment_fence.clone(),
+        sink_artifact_intent_protocol: true,
     };
     assert_eq!(
         authority

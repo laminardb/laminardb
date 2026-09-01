@@ -54,6 +54,7 @@ async fn local_artifact_inventory(
         pipeline_identity: PipelineIdentity::empty(),
         attempt: CheckpointAttempt::canonical(checkpoint_id),
         assignment_fence: None,
+        sink_artifact_intent_protocol: true,
     }
 }
 

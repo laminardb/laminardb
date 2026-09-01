@@ -1,14 +1,16 @@
 use super::*;
+use object_store::{ObjectStoreExt, PutMode, PutOptions};
 use std::num::NonZeroU32;
 
 use crate::checkpoint::checkpoint_manifest::{
-    checkpoint_sha256, PreparedSinkDescriptor, ReferencedStateChunk, StateFrameKey,
-    PREPARED_SINK_DESCRIPTOR_VERSION,
+    checkpoint_artifact_intent_sha256, checkpoint_sha256, PreparedSinkArtifactIntent,
+    PreparedSinkDescriptor, ReferencedStateChunk, StateFrameKey, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 use crate::checkpoint::{
     OutputPartitionId, OutputSegmentRef, PartitionSequence, StateFrame, StreamGeneration,
     SubscriptionDigest, SubscriptionProtocolVersion,
 };
+use crate::checkpoint_decision::CheckpointArtifactInventory;
 
 fn manifest_with_payload(payload: &[u8]) -> CheckpointManifest {
     let one = KeyGroupCount::try_from(1_u16).unwrap();
@@ -44,6 +46,40 @@ fn manifest_with_payload(payload: &[u8]) -> CheckpointManifest {
 fn store(backing: Arc<dyn ObjectStore>) -> ObjectStoreCheckpointStore {
     ObjectStoreCheckpointStore::new(backing, "test")
         .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
+}
+
+fn artifact_inventory(manifest: &CheckpointManifest) -> CheckpointArtifactInventory {
+    CheckpointArtifactInventory {
+        deployment_id: manifest.deployment_id.clone(),
+        pipeline_identity: manifest.pipeline_identity.clone(),
+        attempt: crate::checkpoint::CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+        assignment_fence: manifest.assignment_fence.clone(),
+        sink_artifact_intent_protocol: !manifest.sink_artifact_intents.is_empty(),
+    }
+}
+
+fn manifest_with_intent(intent: &[u8], descriptor: &[u8]) -> (CheckpointManifest, Bytes) {
+    let mut payload = b"bc".to_vec();
+    payload.extend_from_slice(intent);
+    payload.extend_from_slice(descriptor);
+    let payload = Bytes::from(payload);
+    let mut manifest = manifest_with_payload(&payload);
+    let intent_length = u64::try_from(intent.len()).unwrap();
+    manifest.sink_artifact_intents = vec![PreparedSinkArtifactIntent {
+        sink_name: "sink".into(),
+        format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+        payload: Some(ByteRange {
+            offset: 2,
+            length: intent_length,
+        }),
+        sha256: checkpoint_artifact_intent_sha256(Some(intent)),
+    }];
+    manifest.prepared_sinks[0].payload = Some(ByteRange {
+        offset: 2 + intent_length,
+        length: u64::try_from(descriptor.len()).unwrap(),
+    });
+    manifest.prepared_sinks[0].sha256 = checkpoint_descriptor_sha256(Some(descriptor));
+    (manifest, payload)
 }
 
 #[test]
@@ -139,6 +175,138 @@ async fn explicit_empty_descriptor_is_range_read_without_collapsing_to_absence()
 }
 
 #[tokio::test]
+async fn durable_sink_intent_promotes_to_the_exact_participant_manifest() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let secret = b"artifact-secret-root";
+    let (manifest, payload) = manifest_with_intent(secret, b"descriptor");
+    let inventory = artifact_inventory(&manifest);
+    let identity =
+        checkpoint_artifact_identity_sha256(&inventory, manifest.node_data.chunk).unwrap();
+    let intent =
+        CheckpointSinkArtifactIntent::try_new("sink".into(), Some(secret.to_vec())).unwrap();
+
+    store
+        .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.load_manifest(manifest.checkpoint_id).await.unwrap(),
+        None,
+        "the intent is not a participant readiness marker"
+    );
+    store
+        .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent.clone()])
+        .await
+        .unwrap();
+    let conflict =
+        CheckpointSinkArtifactIntent::try_new("sink".into(), Some(b"different-root".to_vec()))
+            .unwrap();
+    assert!(store
+        .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![conflict])
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("different durable artifact state"));
+
+    store
+        .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+        .await
+        .unwrap();
+    let restored = store
+        .load_manifest(manifest.checkpoint_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored, manifest);
+    assert_eq!(
+        store
+            .load_sink_artifact_intent(&restored, &restored.sink_artifact_intents[0])
+            .await
+            .unwrap(),
+        Some(Bytes::copy_from_slice(secret))
+    );
+    let debug = format!("{intent:?}");
+    assert!(debug.contains("payload_bytes"));
+    assert!(!debug.contains("artifact-secret"));
+}
+
+#[tokio::test]
+async fn local_checkpoint_store_conditionally_promotes_sink_intent() {
+    let directory = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap());
+    let store = store(backing).with_exclusive_writer();
+    let intent_payload = b"local-artifact-root";
+    let (manifest, payload) = manifest_with_intent(intent_payload, b"descriptor");
+    let identity = checkpoint_artifact_identity_sha256(
+        &artifact_inventory(&manifest),
+        manifest.node_data.chunk,
+    )
+    .unwrap();
+    let intent =
+        CheckpointSinkArtifactIntent::try_new("sink".into(), Some(intent_payload.to_vec()))
+            .unwrap();
+
+    store
+        .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent])
+        .await
+        .unwrap();
+    store
+        .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.load_manifest(manifest.checkpoint_id).await.unwrap(),
+        Some(manifest)
+    );
+}
+
+#[tokio::test]
+async fn abort_seal_retains_open_sink_intent_without_a_manifest() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(backing);
+    let manifest = manifest_with_payload(b"bcdef");
+    let inventory = artifact_inventory(&manifest);
+    let identity =
+        checkpoint_artifact_identity_sha256(&inventory, manifest.node_data.chunk).unwrap();
+    let intent = CheckpointSinkArtifactIntent::try_new(
+        "sink".into(),
+        Some(b"artifact-secret-root".to_vec()),
+    )
+    .unwrap();
+    store
+        .save_sink_artifact_intents(manifest.node_data.chunk, &identity, vec![intent.clone()])
+        .await
+        .unwrap();
+
+    let sealed = store
+        .seal_aborted_manifest(
+            manifest.node_data.chunk,
+            &identity,
+            inventory.sink_artifact_intent_protocol,
+        )
+        .await
+        .unwrap();
+    assert!(sealed.original_manifest.is_none());
+    assert!(sealed.sink_artifact_intent_protocol);
+    assert_eq!(sealed.open_sink_artifact_intents, vec![intent]);
+    assert!(!sealed.sink_cleanup_complete);
+    assert!(!format!("{sealed:?}").contains("artifact-secret"));
+    let completed = store
+        .complete_aborted_sink_cleanup(manifest.node_data.chunk, &identity)
+        .await
+        .unwrap();
+    assert!(completed.sink_cleanup_complete);
+    assert_eq!(completed.open_sink_artifact_intents.len(), 1);
+    store
+        .seal_aborted_node_data(manifest.node_data.chunk, &identity)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn immutable_manifest_and_node_conflicts_fail_closed() {
     let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let store = store(backing);
@@ -174,6 +342,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
         pipeline_identity: manifest.pipeline_identity.clone(),
         attempt: crate::checkpoint::CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
         assignment_fence: manifest.assignment_fence.clone(),
+        sink_artifact_intent_protocol: false,
     };
     let chunk = manifest.node_data.chunk;
     let identity = checkpoint_artifact_identity_sha256(&inventory, chunk).unwrap();
@@ -186,7 +355,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     let wrong_identity = checkpoint_sha256(b"different artifact identity");
     assert!(matches!(
         store
-            .seal_aborted_manifest(chunk, &wrong_identity)
+            .seal_aborted_manifest(chunk, &wrong_identity, false)
             .await,
         Err(CheckpointStoreError::Invalid(message)) if message.contains("different artifact identity")
     ));
@@ -195,18 +364,49 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
         Some(manifest.clone())
     );
 
-    let expected = Some((manifest.clone(), canonical.clone()));
+    let expected = CheckpointManifestAbortSeal {
+        original_manifest: Some((manifest.clone(), canonical.clone())),
+        sink_artifact_intent_protocol: false,
+        open_sink_artifact_intents: Vec::new(),
+        sink_cleanup_complete: false,
+    };
     assert_eq!(
-        store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
+        store
+            .seal_aborted_manifest(chunk, &identity, false)
+            .await
+            .unwrap(),
         expected
+    );
+    let completed = CheckpointManifestAbortSeal {
+        original_manifest: expected.original_manifest.clone(),
+        sink_artifact_intent_protocol: false,
+        open_sink_artifact_intents: Vec::new(),
+        sink_cleanup_complete: true,
+    };
+    assert_eq!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap(),
+        completed
+    );
+    assert_eq!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap(),
+        completed
     );
     store
         .seal_aborted_node_data(chunk, &identity)
         .await
         .unwrap();
     assert_eq!(
-        store.seal_aborted_manifest(chunk, &identity).await.unwrap(),
-        expected
+        store
+            .seal_aborted_manifest(chunk, &identity, false)
+            .await
+            .unwrap(),
+        completed
     );
     store
         .seal_aborted_node_data(chunk, &identity)
@@ -226,6 +426,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     assert_eq!(manifest_seal.artifact_identity_sha256, identity);
     assert_eq!(manifest_seal.chunk, chunk);
     assert_eq!(manifest_seal.original_manifest, Some(manifest));
+    assert!(manifest_seal.sink_cleanup_complete);
     let node_seal: CheckpointArtifactAbortSeal = serde_json::from_slice(
         &backing
             .get(&store.node_data_path(chunk))
@@ -237,6 +438,7 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
     )
     .unwrap();
     assert_eq!(node_seal.original_manifest, None);
+    assert!(!node_seal.sink_cleanup_complete);
 
     for path in [store.manifest_path(chunk), store.node_data_path(chunk)] {
         assert!(matches!(
@@ -257,18 +459,32 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
 
     let mut missing_inventory = inventory;
     missing_inventory.attempt = crate::checkpoint::CheckpointAttempt::new(8, 8);
+    missing_inventory.sink_artifact_intent_protocol = true;
     let missing_chunk = StateChunkId {
         participant_id: chunk.participant_id,
         checkpoint_id: 8,
     };
     let missing_identity =
         checkpoint_artifact_identity_sha256(&missing_inventory, missing_chunk).unwrap();
+    let missing = CheckpointManifestAbortSeal {
+        original_manifest: None,
+        sink_artifact_intent_protocol: true,
+        open_sink_artifact_intents: Vec::new(),
+        sink_cleanup_complete: false,
+    };
     assert_eq!(
         store
-            .seal_aborted_manifest(missing_chunk, &missing_identity)
+            .seal_aborted_manifest(missing_chunk, &missing_identity, true)
             .await
             .unwrap(),
-        None
+        missing
+    );
+    assert!(
+        store
+            .complete_aborted_sink_cleanup(missing_chunk, &missing_identity)
+            .await
+            .unwrap()
+            .sink_cleanup_complete
     );
     store
         .seal_aborted_node_data(missing_chunk, &missing_identity)
@@ -276,11 +492,96 @@ async fn abort_seals_preserve_manifest_and_block_late_creates() {
         .unwrap();
     assert_eq!(
         store
-            .seal_aborted_manifest(missing_chunk, &missing_identity)
+            .seal_aborted_manifest(missing_chunk, &missing_identity, true)
             .await
             .unwrap(),
-        None
+        CheckpointManifestAbortSeal {
+            original_manifest: None,
+            sink_artifact_intent_protocol: true,
+            open_sink_artifact_intents: Vec::new(),
+            sink_cleanup_complete: true,
+        }
     );
+}
+
+#[tokio::test]
+async fn legacy_abort_seal_requires_cleanup_before_node_data_sealing() {
+    let backing: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store = store(Arc::clone(&backing));
+    let payload = Bytes::from_static(b"bcdef");
+    let manifest = manifest_with_payload(&payload);
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: manifest.deployment_id.clone(),
+        pipeline_identity: manifest.pipeline_identity.clone(),
+        attempt: crate::checkpoint::CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+        assignment_fence: manifest.assignment_fence.clone(),
+        sink_artifact_intent_protocol: false,
+    };
+    let chunk = manifest.node_data.chunk;
+    let identity = checkpoint_artifact_identity_sha256(&inventory, chunk).unwrap();
+    let canonical = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+    store
+        .save_checkpoint(&manifest, std::slice::from_ref(&payload))
+        .await
+        .unwrap();
+
+    let legacy = CheckpointArtifactAbortSeal {
+        version: CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION_V1,
+        artifact_identity_sha256: identity.clone(),
+        chunk,
+        original_manifest: Some(manifest.clone()),
+        sink_artifact_intent_protocol: false,
+        open_sink_artifact_intents: Vec::new(),
+        sink_cleanup_complete: false,
+    };
+    backing
+        .put(
+            &store.manifest_path(chunk),
+            PutPayload::from_bytes(checkpoint_artifact_abort_seal_bytes(&legacy).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("sink cleanup is incomplete"));
+    assert_eq!(
+        store
+            .seal_aborted_manifest(chunk, &identity, false)
+            .await
+            .unwrap(),
+        CheckpointManifestAbortSeal {
+            original_manifest: Some((manifest, canonical)),
+            sink_artifact_intent_protocol: false,
+            open_sink_artifact_intents: Vec::new(),
+            sink_cleanup_complete: false,
+        }
+    );
+    assert!(
+        store
+            .complete_aborted_sink_cleanup(chunk, &identity)
+            .await
+            .unwrap()
+            .sink_cleanup_complete
+    );
+    store
+        .seal_aborted_node_data(chunk, &identity)
+        .await
+        .unwrap();
+    let upgraded: CheckpointArtifactAbortSeal = serde_json::from_slice(
+        &backing
+            .get(&store.manifest_path(chunk))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(upgraded.version, CHECKPOINT_ARTIFACT_ABORT_SEAL_VERSION);
+    assert!(upgraded.sink_cleanup_complete);
 }
 
 #[tokio::test]

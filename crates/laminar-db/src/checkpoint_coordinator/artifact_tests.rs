@@ -1,7 +1,21 @@
+#[cfg(feature = "cluster")]
+use std::time::Instant;
+
+#[cfg(feature = "cluster")]
+use super::recovery::recovery_sink_fence;
+use super::retention::{
+    delete_retired_data, load_cleanup_target, load_protected_checkpoint, run_gc_request,
+    GcAuthority, GcRequest,
+};
 use super::*;
 use laminar_core::checkpoint::ObjectStoreCheckpointStore;
 #[cfg(feature = "cluster")]
-use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+use laminar_core::checkpoint::PREPARED_SINK_DESCRIPTOR_VERSION;
+#[cfg(feature = "cluster")]
+use laminar_core::checkpoint::{
+    checkpoint_artifact_intent_sha256, CheckpointAssignmentFence, CheckpointParticipant,
+    CheckpointSinkArtifactIntent,
+};
 use laminar_core::checkpoint_decision::{
     CheckpointDecisionStore, CheckpointRetentionState, CheckpointRetentionUpdateResult,
 };
@@ -14,52 +28,54 @@ use laminar_core::cluster::control::{
 use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
 use laminar_core::state::KeyGroupCount;
 use object_store::memory::InMemory;
+#[cfg(feature = "cluster")]
+use object_store::ObjectStoreExt;
 
 #[cfg(feature = "cluster")]
-pub(super) struct CreateCommitThenIoStore {
+pub(super) struct CommitThenIoStore {
     pub(super) inner: Arc<dyn object_store::ObjectStore>,
-    pub(super) lose_create_ack: std::sync::atomic::AtomicBool,
-    pub(super) create_suffix: &'static str,
+    pub(super) lose_put_ack: std::sync::atomic::AtomicBool,
+    pub(super) path_suffix: &'static str,
     pub(super) block_get: std::sync::atomic::AtomicBool,
     pub(super) deny_list: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "cluster")]
-impl std::fmt::Debug for CreateCommitThenIoStore {
+impl std::fmt::Debug for CommitThenIoStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("CreateCommitThenIoStore")
+            .debug_struct("CommitThenIoStore")
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(feature = "cluster")]
-impl std::fmt::Display for CreateCommitThenIoStore {
+impl std::fmt::Display for CommitThenIoStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("CreateCommitThenIoStore")
+        formatter.write_str("CommitThenIoStore")
     }
 }
 
 #[cfg(feature = "cluster")]
 #[async_trait::async_trait]
-impl object_store::ObjectStore for CreateCommitThenIoStore {
+impl object_store::ObjectStore for CommitThenIoStore {
     async fn put_opts(
         &self,
         location: &object_store::path::Path,
         payload: object_store::PutPayload,
         options: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
-        let lose_ack = location.to_string().ends_with(self.create_suffix)
-            && matches!(&options.mode, object_store::PutMode::Create)
-            && self
-                .lose_create_ack
-                .swap(false, std::sync::atomic::Ordering::AcqRel);
+        let eligible = location.to_string().ends_with(self.path_suffix);
         let result = self.inner.put_opts(location, payload, options).await?;
-        if lose_ack {
+        if eligible
+            && self
+                .lose_put_ack
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             return Err(object_store::Error::Generic {
-                store: "CreateCommitThenIoStore",
+                store: "CommitThenIoStore",
                 source: Box::new(std::io::Error::other(
-                    "injected manifest acknowledgement loss after create",
+                    "injected manifest acknowledgement loss after conditional put",
                 )),
             });
         }
@@ -102,7 +118,7 @@ impl object_store::ObjectStore for CreateCommitThenIoStore {
         if self.deny_list.load(std::sync::atomic::Ordering::Acquire) {
             return Box::pin(futures::stream::once(async {
                 Err(object_store::Error::Generic {
-                    store: "CreateCommitThenIoStore",
+                    store: "CommitThenIoStore",
                     source: Box::new(std::io::Error::other("object listing is forbidden")),
                 })
             }));
@@ -132,6 +148,159 @@ struct AmbiguousFollowerSink {
     rollbacks: Arc<std::sync::atomic::AtomicU64>,
     schema: arrow::datatypes::SchemaRef,
     expected_admission: Option<(Arc<LeaderLeaseStore>, CheckpointAttempt, LeaderProof)>,
+    expected_intent: Option<(Arc<dyn object_store::ObjectStore>, object_store::path::Path)>,
+}
+
+#[cfg(feature = "cluster")]
+struct ClusterAbortCleanupSink {
+    cleanups: Arc<std::sync::atomic::AtomicU64>,
+    expected_fencing_token: u64,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for ClusterAbortCleanupSink {
+    fn cancellation_policy(&self) -> laminar_connectors::connector::ConnectorCancellationPolicy {
+        laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe
+    }
+
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+
+    fn as_coordinated_committer(
+        &self,
+    ) -> Option<&dyn laminar_connectors::connector::CoordinatedCommitter> {
+        Some(self)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::CoordinatedCommitter for ClusterAbortCleanupSink {
+    async fn commit_aggregated(
+        &self,
+        _batch: laminar_connectors::connector::CoordinatedCommitBatch,
+        _context: laminar_connectors::connector::CoordinatedCommitContext,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Err(laminar_connectors::error::ConnectorError::InvalidState {
+            expected: "abort cleanup only".into(),
+            actual: "external publication".into(),
+        })
+    }
+
+    async fn committed_cursor(
+        &self,
+        _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
+    ) -> Result<
+        Option<laminar_connectors::connector::CoordinatedCommitCursor>,
+        laminar_connectors::error::ConnectorError,
+    > {
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_connectors::connector::CoordinatedAbortCleaner for ClusterAbortCleanupSink {
+    async fn cleanup_aborted(
+        &self,
+        batch: laminar_connectors::connector::CoordinatedAbortBatch,
+        _context: laminar_connectors::connector::CoordinatedCommitContext,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        batch
+            .validate_shape()
+            .map_err(laminar_connectors::error::ConnectorError::TransactionError)?;
+        if batch.fencing_token != self.expected_fencing_token
+            || batch.entries.len() != 2
+            || batch.entries.iter().any(|entry| {
+                !matches!(
+                    &entry.descriptor,
+                    laminar_connectors::connector::CoordinatedAbortDescriptor::Prepared(None)
+                ) || entry.artifact_intent.is_some()
+            })
+        {
+            return Err(laminar_connectors::error::ConnectorError::InvalidState {
+                expected: "current leader fence and two empty participant markers".into(),
+                actual: format!(
+                    "fence {}, {} participant markers",
+                    batch.fencing_token,
+                    batch.entries.len()
+                ),
+            });
+        }
+        self.cleanups
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn register_cluster_cleanup_probe(
+    coordinator: &mut CheckpointCoordinator,
+    cleanups: Arc<std::sync::atomic::AtomicU64>,
+    expected_fencing_token: u64,
+) -> (
+    crate::sink_task::SinkTaskHandle,
+    laminar_core::streaming::channel::AsyncConsumer<crate::sink_task::SinkEvent>,
+) {
+    let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let schema = Arc::new(arrow::datatypes::Schema::empty());
+    let abort_cleaner: Arc<dyn laminar_connectors::connector::CoordinatedAbortCleaner> =
+        Arc::new(ClusterAbortCleanupSink {
+            cleanups: Arc::clone(&cleanups),
+            expected_fencing_token,
+            schema: Arc::clone(&schema),
+        });
+    let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "probe".into(),
+        sink_id: Arc::from("probe"),
+        connector: Box::new(ClusterAbortCleanupSink {
+            cleanups,
+            expected_fencing_token,
+            schema,
+        }),
+        contract: laminar_connectors::connector::SinkContract::new(
+            laminar_connectors::connector::SinkConsistency::CheckpointCommittable,
+            laminar_connectors::connector::SinkTopology::MultiWriter,
+            laminar_connectors::connector::SinkInputMode::AppendOnly,
+        ),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        process_authority: None,
+    });
+    coordinator.register_sink_with_abort_cleaner("probe", handle.clone(), Some(abort_cleaner));
+    (handle, event_rx)
 }
 
 #[cfg(feature = "cluster")]
@@ -159,6 +328,39 @@ impl laminar_connectors::connector::SinkConnector for AmbiguousFollowerSink {
         &mut self,
         epoch: u64,
     ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        if let Some((objects, path)) = &self.expected_intent {
+            let bytes = objects
+                .get(path)
+                .await
+                .map_err(|_| {
+                    laminar_connectors::error::ConnectorError::ConnectionFailed(
+                        "durable sink artifact intent read failed".into(),
+                    )
+                })?
+                .bytes()
+                .await
+                .map_err(|_| {
+                    laminar_connectors::error::ConnectorError::ConnectionFailed(
+                        "durable sink artifact intent body read failed".into(),
+                    )
+                })?;
+            let record: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                laminar_connectors::error::ConnectorError::TransactionError(
+                    "durable sink artifact intent is invalid".into(),
+                )
+            })?;
+            let admitted = record["sink_intents"].as_array().is_some_and(|intents| {
+                intents.len() == 1
+                    && intents[0]["sink_name"] == "probe"
+                    && intents[0]["payload"].is_null()
+            });
+            if !admitted {
+                return Err(laminar_connectors::error::ConnectorError::InvalidState {
+                    expected: "durable current-protocol sink artifact intent before begin".into(),
+                    actual: "missing or different intent envelope".into(),
+                });
+            }
+        }
         let Some((authority, expected_attempt, expected_proof)) = &self.expected_admission else {
             return Ok(());
         };
@@ -291,13 +493,14 @@ async fn save_cluster_manifests(
     deployment_id: &str,
     fence: &CheckpointAssignmentFence,
     key_groups: KeyGroupCount,
+    prepared_sink: Option<&str>,
 ) -> Vec<(CheckpointManifest, Bytes)> {
     let mut manifests = Vec::with_capacity(2);
     for (participant_id, vnode) in [(1, 0), (2, 1)] {
         let store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), prefix)
             .with_key_group_count(key_groups)
             .with_participant_id(participant_id);
-        let (manifest, payload) = cluster_manifest(
+        let (mut manifest, payload) = cluster_manifest(
             checkpoint_id,
             participant_id,
             vnode,
@@ -305,6 +508,40 @@ async fn save_cluster_manifests(
             fence,
             key_groups,
         );
+        if let Some(sink_name) = prepared_sink {
+            manifest.sink_names = vec![sink_name.into()];
+            manifest
+                .sink_artifact_intents
+                .push(PreparedSinkArtifactIntent {
+                    sink_name: sink_name.into(),
+                    format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+                    payload: None,
+                    sha256: checkpoint_artifact_intent_sha256(None),
+                });
+            manifest.prepared_sinks.push(PreparedSinkDescriptor {
+                sink_name: sink_name.into(),
+                format_version: PREPARED_SINK_DESCRIPTOR_VERSION,
+                payload: None,
+                sha256: checkpoint_descriptor_sha256(None),
+            });
+            let inventory = CheckpointArtifactInventory {
+                deployment_id: deployment_id.into(),
+                pipeline_identity: manifest.pipeline_identity.clone(),
+                attempt: CheckpointAttempt::canonical(checkpoint_id),
+                assignment_fence: Some(fence.clone()),
+                sink_artifact_intent_protocol: true,
+            };
+            let identity =
+                checkpoint_artifact_identity_sha256(&inventory, manifest.node_data.chunk).unwrap();
+            store
+                .save_sink_artifact_intents(
+                    manifest.node_data.chunk,
+                    &identity,
+                    vec![CheckpointSinkArtifactIntent::try_new(sink_name.into(), None).unwrap()],
+                )
+                .await
+                .unwrap();
+        }
         let encoded = store
             .save_checkpoint(&manifest, std::slice::from_ref(&payload))
             .await
@@ -346,6 +583,7 @@ async fn admit_local_artifacts(
             pipeline_identity,
             attempt: CheckpointAttempt::canonical(checkpoint_id),
             assignment_fence: None,
+            sink_artifact_intent_protocol: true,
         })
         .await
         .unwrap();
@@ -637,6 +875,79 @@ async fn coordinator_with_store(
     (coordinator, decisions, deployment_id)
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn committed_index_binds_sorted_participants_predecessor_and_assignment_fence() {
+    let key_groups = KeyGroupCount::try_from(2_u16).unwrap();
+    let deployment_id = uuid::Uuid::from_u128(1).to_string();
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        9,
+        &[1, 2],
+        vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(1),
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: uuid::Uuid::from_u128(2),
+            },
+        ],
+    )
+    .unwrap();
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "index-bindings")
+        .with_key_group_count(key_groups)
+        .with_participant_id(1);
+    let mut coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    coordinator
+        .bind_pipeline_identity(PipelineIdentity::empty())
+        .unwrap();
+    coordinator
+        .bind_deployment_id(deployment_id.clone())
+        .unwrap();
+
+    let manifests = [(1, 0), (2, 1)]
+        .into_iter()
+        .map(|(participant_id, vnode)| {
+            let (manifest, _) =
+                cluster_manifest(2, participant_id, vnode, &deployment_id, &fence, key_groups);
+            let encoded = Bytes::from(checkpoint_manifest_bytes(&manifest).unwrap());
+            (manifest, encoded)
+        })
+        .collect::<Vec<_>>();
+    let predecessor = CommittedCheckpointRef {
+        epoch: 1,
+        checkpoint_id: 1,
+        sha256: checkpoint_sha256(b"predecessor"),
+        len: 1,
+    };
+
+    let index = coordinator
+        .build_committed_index(
+            CheckpointAttempt::canonical(2),
+            CheckpointScope::Cluster,
+            Some(fence.clone()),
+            Some(predecessor.clone()),
+            &BTreeMap::new(),
+            &manifests,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        index
+            .participants
+            .iter()
+            .map(|participant| participant.participant_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(index.predecessor, Some(predecessor));
+    assert_eq!(index.assignment_fence, Some(fence));
+    index.validate().unwrap();
+}
+
 #[tokio::test]
 async fn initial_committed_index_derives_an_empty_inventory_source_cut_from_its_marker() {
     let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -879,6 +1190,11 @@ async fn recovery_aborts_and_seals_unresolved_candidate_index() {
 
     let (mut restarted, _, _) = coordinator_with_store(objects).await;
     assert_eq!(restarted.recover().await.unwrap().unwrap().epoch(), 1);
+    assert_eq!(
+        restarted.allocator.peek_epoch(),
+        2,
+        "recovery must restore the allocator to the committed successor epoch"
+    );
     assert!(decisions
         .load_committed_checkpoint(&candidate)
         .await
@@ -977,10 +1293,10 @@ async fn commit_winner_prevents_prepared_artifact_sealing() {
 #[tokio::test(start_paused = true)]
 async fn follower_assignment_authority_validation_is_bounded_by_attempt_deadline() {
     let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let blocked = Arc::new(CreateCommitThenIoStore {
+    let blocked = Arc::new(CommitThenIoStore {
         inner,
-        lose_create_ack: std::sync::atomic::AtomicBool::new(false),
-        create_suffix: "/manifest.json",
+        lose_put_ack: std::sync::atomic::AtomicBool::new(false),
+        path_suffix: "/manifest.json",
         block_get: std::sync::atomic::AtomicBool::new(false),
         deny_list: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1134,6 +1450,12 @@ async fn cluster_leader_durably_admits_sink_epoch_before_opening_local_gate() {
             CheckpointAttempt::canonical(1),
             proof.clone(),
         )),
+        expected_intent: Some((
+            Arc::clone(&objects),
+            object_store::path::Path::from(
+                "leader-sink-epoch/nodes/1/checkpoints/00000000000000000001/manifest.json",
+            ),
+        )),
     };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
@@ -1240,6 +1562,7 @@ async fn cluster_ownerless_worker_keeps_initial_exact_sink_epoch_closed() {
         rollbacks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         schema: Arc::new(arrow::datatypes::Schema::empty()),
         expected_admission: None,
+        expected_intent: None,
     };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
@@ -1325,10 +1648,10 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
     };
 
     let objects: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let flaky = Arc::new(CreateCommitThenIoStore {
+    let flaky = Arc::new(CommitThenIoStore {
         inner: Arc::clone(&objects),
-        lose_create_ack: std::sync::atomic::AtomicBool::new(false),
-        create_suffix: "/manifest.json",
+        lose_put_ack: std::sync::atomic::AtomicBool::new(false),
+        path_suffix: "/manifest.json",
         block_get: std::sync::atomic::AtomicBool::new(false),
         deny_list: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1414,6 +1737,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         rollbacks: Arc::clone(&rollbacks),
         schema: Arc::new(arrow::datatypes::Schema::empty()),
         expected_admission: None,
+        expected_intent: None,
     };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
         crate::sink_task::SinkEvent,
@@ -1463,7 +1787,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         .unwrap();
 
     flaky
-        .lose_create_ack
+        .lose_put_ack
         .store(true, std::sync::atomic::Ordering::Release);
     let outcome = coordinator
         .follower_prepare_acked_until(
@@ -1562,6 +1886,7 @@ async fn follower_manifest_ack_loss_preserves_prepared_sink_until_authoritative_
         pipeline_identity: PipelineIdentity::empty(),
         attempt: CheckpointAttempt::canonical(8),
         assignment_fence: Some(fence),
+        sink_artifact_intent_protocol: true,
     };
     authority
         .begin_cluster_checkpoint_artifacts(&proof, successor.clone())
@@ -1647,6 +1972,12 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         .bind_pipeline_identity(PipelineIdentity::empty())
         .unwrap();
     coordinator.set_cluster_controller(Arc::clone(&controller));
+    let cleanup_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (cleanup_handle, _cleanup_events) = register_cluster_cleanup_probe(
+        &mut coordinator,
+        Arc::clone(&cleanup_calls),
+        proof.fencing_token,
+    );
 
     let nonportable_request = CheckpointRequest {
         assignment_fence: Some(fence.clone()),
@@ -1668,6 +1999,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         pipeline_identity: PipelineIdentity::empty(),
         attempt: predecessor_attempt,
         assignment_fence: Some(fence.clone()),
+        sink_artifact_intent_protocol: true,
     };
     authority
         .begin_cluster_checkpoint_artifacts(&proof, predecessor_inventory)
@@ -1680,6 +2012,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         &deployment_id,
         &fence,
         key_groups,
+        Some("probe"),
     )
     .await;
     let mut nonportable_manifests = predecessor_manifests.clone();
@@ -1748,6 +2081,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         pipeline_identity: PipelineIdentity::empty(),
         attempt,
         assignment_fence: Some(fence.clone()),
+        sink_artifact_intent_protocol: true,
     };
     authority
         .begin_cluster_checkpoint_artifacts(&proof, inventory.clone())
@@ -1760,6 +2094,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         &deployment_id,
         &fence,
         key_groups,
+        Some("probe"),
     )
     .await;
     let candidate_index = coordinator
@@ -1808,6 +2143,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
     assert!(coordinator.failure_requires_recovery);
     assert_eq!(coordinator.local_watermark, CheckpointWatermark::Active(42));
     assert_eq!(coordinator.allocator.peek_epoch(), allocator_epoch);
+    assert_eq!(cleanup_calls.load(std::sync::atomic::Ordering::Acquire), 0);
 
     let first_chunk = manifests[0].0.node_data.chunk;
     let first_identity = checkpoint_artifact_identity_sha256(&inventory, first_chunk).unwrap();
@@ -1815,10 +2151,17 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         .with_key_group_count(key_groups)
         .with_participant_id(1);
     assert!(sealer
-        .seal_aborted_manifest(first_chunk, &first_identity)
+        .seal_aborted_manifest(
+            first_chunk,
+            &first_identity,
+            inventory.sink_artifact_intent_protocol,
+        )
         .await
         .unwrap()
+        .original_manifest
         .is_some());
+
+    cleanup_handle.close().await.unwrap();
 
     assert!(coordinator
         .settle_cluster_checkpoint_artifacts_until(
@@ -1827,6 +2170,7 @@ async fn cluster_settlement_resumes_exact_seals_and_rejects_a_genesis_fork() {
         )
         .await
         .unwrap());
+    assert_eq!(cleanup_calls.load(std::sync::atomic::Ordering::Acquire), 1);
     assert!(authority
         .cluster_checkpoint_artifacts()
         .await

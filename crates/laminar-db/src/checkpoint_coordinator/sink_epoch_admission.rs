@@ -171,6 +171,7 @@ impl CheckpointCoordinator {
         publication: super::SinkEpochPublication,
     ) -> Result<(), DbError> {
         external_commit?;
+        self.clear_sink_artifact_intents(CheckpointAttempt::new(index.epoch, index.checkpoint_id));
         self.schedule_retention(index.clone(), leader_proof);
         self.clear_sink_witness_until(deadline).await?;
         if self.has_checkpoint_committable_sinks() && !terminal_handoff {
@@ -182,7 +183,7 @@ impl CheckpointCoordinator {
     pub(super) async fn reserve_sink_epoch_for_runtime_until(
         &mut self,
         deadline: tokio::time::Instant,
-    ) -> Result<CheckpointAttempt, DbError> {
+    ) -> Result<laminar_core::checkpoint_decision::CheckpointArtifactInventory, DbError> {
         #[cfg(feature = "cluster")]
         if self.cluster_controller.is_some() {
             return match self.reserve_cluster_sink_epoch_until(deadline).await {
@@ -193,7 +194,17 @@ impl CheckpointCoordinator {
                 }
             };
         }
-        self.allocator.reserve_sink_epoch_until(deadline).await
+        let attempt = self.allocator.reserve_sink_epoch_until(deadline).await?;
+        let inventory = self.checkpoint_artifact_inventory(attempt, None)?;
+        if let Err(error) = self
+            .begin_checkpoint_artifacts_until(attempt, None, None, deadline)
+            .await
+        {
+            self.allocator.mark_sink_epoch_in_doubt(attempt);
+            self.failure_requires_recovery = true;
+            return Err(error);
+        }
+        Ok(inventory)
     }
 
     #[cfg(feature = "cluster")]
@@ -221,7 +232,7 @@ impl CheckpointCoordinator {
         inventory: CheckpointArtifactInventory,
         proof: LeaderProof,
         deadline: tokio::time::Instant,
-    ) -> Result<CheckpointAttempt, DbError> {
+    ) -> Result<CheckpointArtifactInventory, DbError> {
         self.validate_checkpoint_artifact_inventory(&inventory)?;
         let fence = inventory.assignment_fence.as_ref().ok_or_else(|| {
             DbError::Checkpoint("cluster sink epoch admission has no assignment fence".into())
@@ -246,7 +257,7 @@ impl CheckpointCoordinator {
         self.allocator
             .reserve_certified_sink_epoch_until(inventory.attempt, deadline)
             .await?;
-        Ok(inventory.attempt)
+        Ok(inventory)
     }
 
     #[cfg(feature = "cluster")]
@@ -254,7 +265,7 @@ impl CheckpointCoordinator {
         &self,
         proof: LeaderProof,
         deadline: tokio::time::Instant,
-    ) -> Result<CheckpointAttempt, DbError> {
+    ) -> Result<CheckpointArtifactInventory, DbError> {
         let controller = self.cluster_controller.as_ref().ok_or_else(|| {
             DbError::Checkpoint("cluster sink epoch admission has no cluster controller".into())
         })?;
@@ -296,14 +307,14 @@ impl CheckpointCoordinator {
                 "cluster sink epoch leader authority changed after durable admission".into(),
             ));
         }
-        Ok(attempt)
+        self.checkpoint_artifact_inventory(attempt, Some(fence))
     }
 
     #[cfg(feature = "cluster")]
     async fn reserve_cluster_sink_epoch_until(
         &self,
         deadline: tokio::time::Instant,
-    ) -> Result<CheckpointAttempt, DbError> {
+    ) -> Result<CheckpointArtifactInventory, DbError> {
         let controller = self.cluster_controller.as_ref().ok_or_else(|| {
             DbError::Checkpoint("cluster sink epoch reservation has no cluster controller".into())
         })?;

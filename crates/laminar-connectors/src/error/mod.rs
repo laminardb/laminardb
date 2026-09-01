@@ -34,6 +34,10 @@ pub enum ConnectorError {
     #[error("configuration error: {0}")]
     ConfigurationError(String),
 
+    /// A requested connector capability is intentionally unavailable.
+    #[error("feature unsupported: {0}")]
+    FeatureUnsupported(String),
+
     /// Error reading data from a source.
     #[error("read error: {0}")]
     ReadError(String),
@@ -155,6 +159,7 @@ impl ConnectorError {
             | Self::ConnectionFailed(_) => true,
 
             Self::ConfigurationError(_)
+            | Self::FeatureUnsupported(_)
             | Self::FactoryAlreadyRegistered { .. }
             | Self::RegistryFrozen { .. }
             | Self::SchemaMismatch(_)

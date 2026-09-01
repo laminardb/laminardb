@@ -757,6 +757,18 @@ impl SinkTaskHandle {
         .await
     }
 
+    /// Capture pre-begin artifact recovery evidence under the caller's deadline.
+    pub async fn checkpoint_artifact_intent_until(
+        &self,
+        epoch: u64,
+        deadline: Instant,
+    ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        self.request_until("checkpoint-artifact-intent", deadline, |ack| {
+            SinkOperation::ArtifactIntent { epoch, ack }
+        })
+        .await
+    }
+
     /// Highest exact checkpoint and authority committed in the external namespace.
     pub async fn committed_cursor(
         &self,

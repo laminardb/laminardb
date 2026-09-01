@@ -974,6 +974,38 @@ fn projected_batch_for_key(operator: &SqlQueryOperator, key: &str, value: i64) -
 }
 
 #[cfg(feature = "cluster")]
+fn attach_test_subscription_certificate(operator: &mut SqlQueryOperator) {
+    use laminar_core::checkpoint::{
+        ChangelogMode, OutputDistribution, OutputDistributionCertificate, PipelineIdentity,
+        StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
+        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+    };
+
+    operator
+        .attach_subscription_certificate(Arc::new(OutputDistributionCertificate {
+            version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
+            protocol_version: SubscriptionProtocolVersion::CURRENT,
+            stream_id: "sum".into(),
+            catalog_generation: 1,
+            stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes(
+                [1; 32],
+            )),
+            final_operator_id: "stream:sum".into(),
+            distribution: OutputDistribution::VnodePartitioned {
+                key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
+                partition_abi: laminar_core::state::PARTITIONING_ABI_VERSION,
+                vnode_count: 8,
+            },
+            schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
+            changelog_mode: ChangelogMode::FullPartitionSnapshot,
+            history_retention_bytes: 0,
+            query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
+            pipeline_identity: PipelineIdentity::empty(),
+        }))
+        .unwrap();
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn checkpointed_remote_frontiers_compare_in_receiver_domain() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
@@ -1296,13 +1328,7 @@ async fn pending_send_drains_remote_sum_before_publishing_local_cut() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn pending_certified_emission_defers_the_next_remote_event() {
-    use laminar_core::checkpoint::{
-        ChangelogMode, OutputDistribution, OutputDistributionCertificate, PipelineIdentity,
-        StreamGeneration, SubscriptionDigest, SubscriptionProtocolVersion,
-        OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
-    };
-
+async fn ready_pending_send_waits_for_certified_remote_publication() {
     let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
     let (context, _) = context_and_batch();
     let mut operator = SqlQueryOperator::new_with_key_groups(
@@ -1315,28 +1341,108 @@ async fn pending_certified_emission_defers_the_next_remote_event() {
     );
     operator.initialize_managed_state().await.unwrap();
     operator.attach_cluster_shuffle(scope.clone());
-    operator
-        .attach_subscription_certificate(Arc::new(OutputDistributionCertificate {
-            version: OUTPUT_DISTRIBUTION_CERTIFICATE_VERSION,
-            protocol_version: SubscriptionProtocolVersion::CURRENT,
-            stream_id: "sum".into(),
-            catalog_generation: 1,
-            stream_generation: StreamGeneration::from_digest(SubscriptionDigest::from_bytes(
-                [1; 32],
-            )),
-            final_operator_id: "stream:sum".into(),
-            distribution: OutputDistribution::VnodePartitioned {
-                key_expressions_fingerprint: SubscriptionDigest::from_bytes([2; 32]),
-                partition_abi: laminar_core::state::PARTITIONING_ABI_VERSION,
-                vnode_count: 8,
-            },
-            schema_fingerprint: SubscriptionDigest::from_bytes([3; 32]),
-            changelog_mode: ChangelogMode::FullPartitionSnapshot,
-            history_retention_bytes: 0,
-            query_fingerprint: SubscriptionDigest::from_bytes([4; 32]),
-            pipeline_identity: PipelineIdentity::empty(),
-        }))
+    attach_test_subscription_certificate(&mut operator);
+
+    let (key, local) = projected_batch_for_vnode(&operator, 0, 8);
+    let remote = projected_batch_for_key(&operator, &key, 34);
+    let (_, outbound_batch) = projected_batch_for_vnode(&operator, 1, 1);
+    let frontier = InputFrontier {
+        watermark: Some(100),
+        idle: false,
+    };
+    let assignment = scope.registry.versioned_snapshot();
+    let plan = operator
+        .plan_cluster_batches(
+            vec![local, outbound_batch],
+            frontier,
+            &scope,
+            &assignment,
+            &[2],
+        )
         .unwrap();
+    let accounted_bytes = operator.cluster_input_plan_bytes(&plan).unwrap();
+    let AggClusterInputPlan {
+        local_batches,
+        outbound,
+        local_frontier,
+        effective_frontier: _,
+    } = plan;
+    drop(outbound);
+    let (completion_tx, completion) = tokio::sync::oneshot::channel();
+    completion_tx.send((Ok(()), None)).unwrap();
+    operator.pending_cluster_input = Some(PendingAggClusterInput {
+        local_batches,
+        outbound: None,
+        local_frontier,
+        send: Some(tokio::spawn(async {})),
+        completion: Some(completion),
+        accounted_bytes,
+    });
+    let version = assignment.version();
+    let recovery = scope.receiver.recovery_gen();
+    operator
+        .stage_checkpointed_shuffle(
+            "sum",
+            crate::operator::RetainedBatch::restored_channel(
+                remote,
+                2,
+                version,
+                recovery,
+                Arc::from([0_u32]),
+            ),
+            i64::MIN,
+        )
+        .unwrap();
+    operator
+        .stage_checkpointed_shuffle_frontier("sum", 2, frontier, version, recovery)
+        .unwrap();
+
+    let remote_output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    let remote_total = remote_output[0]
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(remote_total.value(0), 34);
+    assert!(operator.pending_cluster_input.is_some());
+    assert_eq!(operator.queued_remote_events, 1);
+
+    operator.publish_prepared_subscription_output();
+    let local_output = operator
+        .process_cluster(&[Vec::new()], InputFrontier::default())
+        .await
+        .unwrap();
+    let local_total = local_output[0]
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(local_total.value(0), 42);
+    assert!(operator.pending_cluster_input.is_none());
+    assert_eq!(operator.queued_remote_events, 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn pending_certified_emission_defers_the_next_remote_event() {
+    let scope = cluster_scope([1, 2, 1, 1, 1, 1, 1, 1]).await;
+    let (context, _) = context_and_batch();
+    let mut operator = SqlQueryOperator::new_with_key_groups(
+        "sum",
+        "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+        context,
+        None,
+        false,
+        KeyGroupCount::try_from(8_u16).unwrap(),
+    );
+    operator.initialize_managed_state().await.unwrap();
+    operator.attach_cluster_shuffle(scope.clone());
+    attach_test_subscription_certificate(&mut operator);
 
     let (key, first) = projected_batch_for_vnode(&operator, 0, 10);
     let second = projected_batch_for_key(&operator, &key, 20);

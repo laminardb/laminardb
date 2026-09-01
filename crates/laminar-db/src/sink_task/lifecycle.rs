@@ -332,6 +332,12 @@ pub(super) fn reject_unstarted_sink_operation(
         SinkOperation::BeginEpoch { ack, .. } => {
             ack.send(Err(process_authority_error(&inner.name, "begin-epoch")));
         }
+        SinkOperation::ArtifactIntent { ack, .. } => {
+            ack.send(Err(process_authority_error(
+                &inner.name,
+                "checkpoint artifact intent",
+            )));
+        }
         SinkOperation::Flush { ack } => {
             ack.send(Err(process_authority_error(&inner.name, "flush")));
         }

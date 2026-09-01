@@ -98,6 +98,11 @@ pub(super) async fn handle_sink_command(
             .await;
             retire = finish_command(ack, result, operation_retired, actor_state);
         }
+        SinkOperation::ArtifactIntent { epoch, ack } => {
+            let (result, operation_retired) =
+                checkpoint_artifact_intent(inner, epoch, deadline).await;
+            retire = finish_command(ack, result, operation_retired, actor_state);
+        }
         SinkOperation::CommittedCursor { namespace, ack } => {
             let cancellation_policy = inner.sink.cancellation_policy();
             let committer = inner.sink.as_coordinated_committer();
@@ -307,6 +312,23 @@ pub(super) async fn commit_aggregated_sink(
             false,
         ),
     }
+}
+
+async fn checkpoint_artifact_intent(
+    inner: &mut SinkTaskInner,
+    epoch: u64,
+    deadline: Instant,
+) -> (Result<Option<Vec<u8>>, ConnectorError>, bool) {
+    bounded_connector_operation(
+        &inner.name,
+        "checkpoint artifact intent",
+        deadline,
+        inner.sink.cancellation_policy(),
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
+        || inner.sink.checkpoint_artifact_intent(epoch),
+    )
+    .await
 }
 
 pub(super) async fn committed_cursor(

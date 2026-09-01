@@ -515,6 +515,15 @@ async fn test_multiple_write_batches_accumulate() {
 // Note: Epoch lifecycle with real I/O is tested in delta_io.rs integration tests.
 
 #[tokio::test]
+async fn coordinated_artifact_intent_does_not_authorize_delta_file_deletion() {
+    let mut config = test_config();
+    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    let mut sink = DeltaLakeSink::new(config, None);
+
+    assert_eq!(sink.checkpoint_artifact_intent(7).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn test_rollback_clears_buffer() {
     let mut config = test_config();
     config.max_buffer_records = 1000;
@@ -1020,6 +1029,25 @@ fn exactly_once_is_coordinated_append_only() {
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
     let sink = DeltaLakeSink::new(cfg, None);
     assert!(sink.contract(&ConnectorConfig::new("delta-lake")).is_err());
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_cursor_rejects_a_mutated_namespace_before_table_io() {
+    use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitter};
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+
+    let sink = DeltaLakeSink::new(coordinated_config("unused"), None);
+    let mut namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "events",
+    )
+    .unwrap();
+    namespace.deployment_id = "not-a-uuid".into();
+
+    let error = sink.committed_cursor(&namespace).await.unwrap_err();
+    assert!(matches!(error, ConnectorError::ConfigurationError(_)));
 }
 
 #[cfg(feature = "delta-lake")]

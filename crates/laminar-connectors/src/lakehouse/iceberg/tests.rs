@@ -1,21 +1,18 @@
-use super::*;
-use arrow_array::Int64Array;
-use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_schema::{DataType, Field, Schema};
+
+use super::*;
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
 }
 
-fn test_batch(n: usize) -> RecordBatch {
-    let ids: Vec<i64> = (0..n as i64).collect();
-    RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
-}
-
 fn test_connector_config() -> ConnectorConfig {
     let mut config = ConnectorConfig::new("iceberg");
     config.set("catalog.uri", "http://localhost:8181");
-    config.set("warehouse", "s3://test/wh");
+    config.set("catalog.warehouse", "s3://test/wh");
     config.set("namespace", "test");
     config.set("table.name", "events");
     config
@@ -26,56 +23,224 @@ fn test_config() -> IcebergSinkConfig {
 }
 
 #[test]
-fn test_new_sink() {
-    let sink = IcebergSink::new(test_config(), None);
+fn new_sink_has_no_schema_or_active_epoch() {
+    let mut sink = IcebergSink::new(test_config(), None);
     assert!(sink.schema.is_none());
-    assert_eq!(sink.buffered_rows, 0);
+    #[cfg(feature = "iceberg-core")]
+    assert!(sink.active_epoch.get_mut().is_none());
 }
 
 #[tokio::test]
-async fn test_write_buffers_batches() {
+async fn write_rejects_a_non_running_sink() {
     let mut sink = IcebergSink::new(test_config(), None);
+    let batch = RecordBatch::new_empty(test_schema());
 
-    let result = sink.write_batch(&test_batch(100)).await.unwrap();
-    assert_eq!(result.records_written, 100);
-    assert_eq!(sink.buffered_rows, 100);
-    assert_eq!(sink.buffer.len(), 1);
-
-    let result = sink.write_batch(&test_batch(50)).await.unwrap();
-    assert_eq!(result.records_written, 50);
-    assert_eq!(sink.buffered_rows, 150);
-    assert_eq!(sink.buffer.len(), 2);
+    assert!(matches!(
+        sink.write_batch(&batch).await,
+        Err(ConnectorError::InvalidState { .. })
+    ));
 }
 
 #[test]
-fn test_contract() {
+fn append_contract_is_at_least_once_by_default() {
     let sink = IcebergSink::new(test_config(), None);
     let contract = sink.contract(&test_connector_config()).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
     assert_eq!(contract.topology, SinkTopology::MultiWriter);
     assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
     assert!(sink.as_coordinated_committer().is_none());
-    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(300));
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(120));
 }
 
 #[test]
-fn test_contract_uses_singleton_for_wired_local_storage() {
+fn commit_timeout_is_not_capped_by_the_per_request_timeout() {
+    let mut connector = test_connector_config();
+    connector.set("catalog.commit_timeout", "75s");
+    connector.set("storage.request_timeout", "2s");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(75));
+}
+
+#[cfg(feature = "iceberg-core")]
+#[test]
+fn exactly_once_append_exposes_checkpoint_committer() {
+    let mut connector = test_connector_config();
+    connector.set("delivery.guarantee", "exactly-once");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+    let contract = sink.contract(&connector).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
+    assert!(sink.as_coordinated_committer().is_some());
+    assert_eq!(
+        contract.is_cluster_exact_delivery_certified(),
+        cfg!(all(
+            feature = "iceberg-catalog-rest",
+            feature = "iceberg-storage-s3"
+        ))
+    );
+}
+
+#[cfg(not(feature = "iceberg-core"))]
+#[tokio::test]
+async fn append_without_iceberg_core_fails_before_catalog_io() {
+    let mut sink = IcebergSink::new(test_config(), None);
+
+    let error = sink
+        .open(&test_connector_config())
+        .await
+        .expect_err("a build without iceberg-core must fail before catalog access");
+
+    assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+    assert_eq!(sink.state, ConnectorState::Failed);
+    assert!(sink.as_coordinated_committer().is_none());
+}
+
+#[cfg(feature = "iceberg-core")]
+#[tokio::test]
+async fn committed_cursor_rejects_a_mutated_namespace_before_catalog_io() {
+    use crate::connector::{CoordinatedCommitNamespace, CoordinatedCommitter};
+    use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
+
+    let sink = IcebergSink::new(test_config(), None);
+    let mut namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "events",
+    )
+    .unwrap();
+    namespace.deployment_id = "not-a-uuid".into();
+
+    let error = sink.committed_cursor(&namespace).await.unwrap_err();
+    assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+}
+
+#[test]
+fn cluster_exact_contract_fails_closed_outside_rest_s3() {
+    for (key, value) in [
+        ("catalog.type", "glue"),
+        ("storage.type", "fs"),
+        ("catalog.warehouse", "file:///tmp/iceberg"),
+    ] {
+        let mut connector = test_connector_config();
+        connector.set("delivery.guarantee", "exactly-once");
+        connector.set(key, value);
+        let sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+        assert!(
+            !sink
+                .contract(&connector)
+                .unwrap()
+                .is_cluster_exact_delivery_certified(),
+            "{key}={value} must remain fail closed"
+        );
+    }
+
+    let mut delegated = test_connector_config();
+    delegated.set("delivery.guarantee", "exactly-once");
+    delegated.set("catalog.access_delegation", "true");
+    let sink = IcebergSink::new(IcebergSinkConfig::from_config(&delegated).unwrap(), None);
+    assert!(matches!(
+        sink.contract(&delegated),
+        Err(ConnectorError::FeatureUnsupported(_))
+    ));
+}
+
+#[test]
+fn runtime_identity_requires_uuid_v7_and_nonzero() {
+    let mut config = test_config();
+    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    let mut sink = IcebergSink::new(config, None);
+    let invalid = SinkRuntimeContext {
+        deployment_id: "not-a-uuid".into(),
+        sink_id: "events".into(),
+        participant_id: 1,
+    };
+    assert!(sink.bind_runtime_context(invalid).is_err());
+
+    let unsupported_version = SinkRuntimeContext {
+        deployment_id: "11111111-1111-4111-8111-111111111111".into(),
+        sink_id: "events".into(),
+        participant_id: 1,
+    };
+    let error = sink
+        .bind_runtime_context(unsupported_version)
+        .expect_err("UUIDv4 must fail before an exactly-once epoch can write");
+    assert!(error
+        .to_string()
+        .contains("LDB-ICEBERG-RUNTIME-DEPLOYMENT-VERSION"));
+
+    let valid = SinkRuntimeContext {
+        deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
+        sink_id: "events".into(),
+        participant_id: 7,
+    };
+    sink.bind_runtime_context(valid.clone()).unwrap();
+    sink.bind_runtime_context(valid.clone()).unwrap();
+    assert_eq!(sink.runtime_context, Some(valid.clone()));
+
+    let mut rebound = valid;
+    rebound.participant_id += 1;
+    assert!(matches!(
+        sink.bind_runtime_context(rebound),
+        Err(ConnectorError::InvalidState { .. })
+    ));
+}
+
+#[test]
+fn runtime_identity_cannot_change_after_open() {
+    let mut sink = IcebergSink::new(test_config(), None);
+    let context = SinkRuntimeContext {
+        deployment_id: "018f0000-0000-7000-8000-000000000001".into(),
+        sink_id: "events".into(),
+        participant_id: 7,
+    };
+    sink.bind_runtime_context(context.clone()).unwrap();
+    sink.state = ConnectorState::Running;
+
+    assert!(matches!(
+        sink.bind_runtime_context(context),
+        Err(ConnectorError::InvalidState { .. })
+    ));
+}
+
+#[test]
+fn local_storage_contract_is_singleton() {
     let sink = IcebergSink::new(test_config(), None);
     let mut config = test_connector_config();
-    config.set("warehouse", "file:///tmp/iceberg");
+    config.set("catalog.warehouse", "file:///tmp/iceberg");
     config.set("storage.type", "fs");
+    assert_eq!(
+        sink.contract(&config).unwrap().topology,
+        SinkTopology::Singleton
+    );
+}
 
-    let contract = sink.contract(&config).unwrap();
-    assert_eq!(contract.topology, SinkTopology::Singleton);
+#[tokio::test]
+async fn unsupported_mutation_modes_reject_before_file_creation() {
+    for mode in ["merge-on-read", "copy-on-write"] {
+        let directory = tempfile::tempdir().unwrap();
+        let warehouse = format!(
+            "file:///{}",
+            directory.path().display().to_string().replace('\\', "/")
+        );
+        let mut connector = test_connector_config();
+        connector.set("catalog.warehouse", warehouse);
+        connector.set("storage.type", "fs");
+        connector.set("write.mode", mode);
+        let mut sink = IcebergSink::new(IcebergSinkConfig::from_config(&connector).unwrap(), None);
+
+        let error = sink
+            .open(&connector)
+            .await
+            .expect_err("unsupported mutation mode must fail before catalog or file I/O");
+        assert!(matches!(error, ConnectorError::FeatureUnsupported(_)));
+        assert_eq!(sink.state, ConnectorState::Created);
+        #[cfg(feature = "iceberg-core")]
+        assert!(sink.active_epoch.get_mut().is_none());
+        assert!(directory.path().read_dir().unwrap().next().is_none());
+    }
 }
 
 #[test]
-fn test_contract_uses_multi_writer_for_named_s3_warehouse() {
-    let sink = IcebergSink::new(test_config(), None);
-    let mut config = test_connector_config();
-    config.set("warehouse", "production");
-    config.set("storage.type", "s3");
-
-    let contract = sink.contract(&config).unwrap();
-    assert_eq!(contract.topology, SinkTopology::MultiWriter);
+fn schema_helper_remains_available_for_open_tests() {
+    assert_eq!(test_schema().fields().len(), 1);
 }

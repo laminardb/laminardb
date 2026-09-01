@@ -96,7 +96,9 @@ macro_rules! window_udf {
 window_udf!(
     /// `tumble(ts, interval [, offset])` — start of the non-overlapping
     /// window containing `ts`. Returns `Timestamp(Microsecond, None)`.
-    TumbleWindowStart, "tumble", 2..=3,
+    TumbleWindowStart,
+    "tumble",
+    2..=3,
     |args| {
         let interval_ms = positive_interval(&args[1], "tumble", "interval")?;
         let offset_ms = optional_offset(&args, 2)?;
@@ -107,7 +109,9 @@ window_udf!(
 window_udf!(
     /// `tumble_end(ts, interval [, offset])` — exclusive upper bound of
     /// the tumble window containing `ts` (i.e. `tumble(...) + interval`).
-    TumbleWindowEnd, "tumble_end", 2..=3,
+    TumbleWindowEnd,
+    "tumble_end",
+    2..=3,
     |args| {
         let interval_ms = positive_interval(&args[1], "tumble_end", "interval")?;
         let offset_ms = optional_offset(&args, 2)?;
@@ -121,19 +125,25 @@ window_udf!(
     /// `hop(ts, slide, size [, offset])` — earliest sliding window
     /// (size `size`, sliding by `slide`) that contains `ts`. Full
     /// multi-window assignment is handled by Ring 0.
-    HopWindowStart, "hop", 3..=4,
+    HopWindowStart,
+    "hop",
+    3..=4,
     |args| {
         let slide_ms = positive_interval(&args[1], "hop", "slide")?;
         let size_ms = positive_interval(&args[2], "hop", "size")?;
         let offset_ms = optional_offset(&args, 3)?;
-        into_us_columnar(&args[0], |ts| hop_start_ms(ts, slide_ms, size_ms, offset_ms))
+        into_us_columnar(&args[0], |ts| {
+            hop_start_ms(ts, slide_ms, size_ms, offset_ms)
+        })
     }
 );
 
 window_udf!(
     /// `hop_end(ts, slide, size [, offset])` — end of the earliest
     /// sliding window containing `ts` (i.e. `hop(...) + size`).
-    HopWindowEnd, "hop_end", 3..=4,
+    HopWindowEnd,
+    "hop_end",
+    3..=4,
     |args| {
         let slide_ms = positive_interval(&args[1], "hop_end", "slide")?;
         let size_ms = positive_interval(&args[2], "hop_end", "size")?;
@@ -149,7 +159,9 @@ window_udf!(
     /// microsecond resolution. Real session start/end are data-dependent
     /// and computed by Ring 0; this UDF exists so `GROUP BY session(ts,
     /// gap)` parses. There is no `session_end` UDF for the same reason.
-    SessionWindowStart, "session", 2..=2,
+    SessionWindowStart,
+    "session",
+    2..=2,
     |args| into_us_columnar(&args[0], |ts| ts)
 );
 
@@ -157,7 +169,9 @@ window_udf!(
     /// `cumulate(ts, step, size)` — epoch start (size-aligned bucket)
     /// containing `ts`. Per-step cumulating boundaries (which depend on
     /// data) are exposed by Ring 0.
-    CumulateWindowStart, "cumulate", 3..=3,
+    CumulateWindowStart,
+    "cumulate",
+    3..=3,
     |args| {
         let (_step_ms, size_ms) = cumulate_intervals(&args, "cumulate")?;
         into_us_columnar(&args[0], |ts| tumble_start_ms(ts, size_ms, 0))
@@ -167,7 +181,9 @@ window_udf!(
 window_udf!(
     /// `cumulate_end(ts, step, size)` — exclusive upper bound of the
     /// epoch (size-aligned bucket) containing `ts`.
-    CumulateWindowEnd, "cumulate_end", 3..=3,
+    CumulateWindowEnd,
+    "cumulate_end",
+    3..=3,
     |args| {
         let (_step_ms, size_ms) = cumulate_intervals(&args, "cumulate_end")?;
         into_us_columnar(&args[0], |ts| {

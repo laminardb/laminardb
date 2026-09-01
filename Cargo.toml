@@ -34,6 +34,7 @@ async-trait = "0.1"
 trait-variant = "0.1"
 indexmap = "2"
 serde = { version = "1.0", features = ["derive"] }
+typetag = "0.2"
 serde_json = "1.0"
 rkyv = { version = "0.8", features = ["std", "alloc", "bytecheck"] }
 bytes = "1.11"
@@ -42,6 +43,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 url = "2"
 
 # Allocators
@@ -127,7 +129,8 @@ delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-featur
 # Apache Iceberg
 iceberg = "=0.10.1"
 iceberg-catalog-rest = "=0.10.1"
-iceberg-storage-opendal = "=0.10.1"
+iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
+apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)
 chitchat = "0.10"

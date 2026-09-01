@@ -2208,18 +2208,14 @@ impl SqlQueryOperator {
         inputs: &[Vec<RecordBatch>],
         frontier: InputFrontier,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let scope = self.active_cluster_scope();
-        let (config, assignment, peers) = match scope {
+        let (config, assignment, peers) = match self.active_cluster_scope() {
             Ok(scope) => scope,
             Err(error) if self.pending_cluster_input.is_some() => {
                 return Err(self.outbound_finalize_error(error));
             }
             Err(error) => return Err(error),
         };
-        let has_input = inputs
-            .iter()
-            .flat_map(|batches| batches.iter())
-            .any(|batch| batch.num_rows() != 0);
+        let has_input = inputs.iter().flatten().any(|batch| batch.num_rows() != 0);
         let mut output = Vec::new();
         let mut drained_remote = false;
         if self.prepared_aggregate_emission.is_some() {
@@ -2234,6 +2230,11 @@ impl SqlQueryOperator {
             }
             output.extend(self.drain_remote_event(&assignment, &config)?);
             drained_remote = true;
+        }
+        // A certified emission must reach its publication owner before another state mutation can
+        // prepare the next sequence.
+        if self.prepared_aggregate_emission.is_some() {
+            return Ok(output);
         }
         let completion = self.finish_pending_cluster_input().map_err(|error| {
             if drained_remote {

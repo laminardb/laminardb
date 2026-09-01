@@ -1,7 +1,10 @@
+use std::time::Instant;
+
+use laminar_core::checkpoint::CheckpointAttemptRelation;
+
 use super::{
-    checked_successor_epoch, require_canonical_attempt, CheckpointAttempt,
-    CheckpointAttemptRelation, CheckpointCoordinator, CheckpointPhase, DbError, Instant,
-    SinkEpochPublication,
+    checked_successor_epoch, require_canonical_attempt, CheckpointAttempt, CheckpointCoordinator,
+    CheckpointPhase, DbError, SinkEpochPublication,
 };
 
 impl CheckpointCoordinator {
@@ -155,6 +158,7 @@ impl CheckpointCoordinator {
             self.verify_authoritative_follower_abort_until(attempt, deadline)
                 .await?;
         }
+        self.clear_sink_artifact_intents(attempt);
         self.allocator.advance_epoch_to(checked_successor_epoch(
             epoch,
             "closing a follower checkpoint",

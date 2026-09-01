@@ -13,15 +13,16 @@ pub use contracts::{
     SourceTopology,
 };
 pub use coordinated_commit::{
-    CoordinatedCommitBatch, CoordinatedCommitContext, CoordinatedCommitCursor,
-    CoordinatedCommitNamespace, CoordinatedCommitPayload, CoordinatedCommitter,
-    MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
+    CoordinatedAbortBatch, CoordinatedAbortCleaner, CoordinatedAbortDescriptor,
+    CoordinatedAbortEntry, CoordinatedCommitBatch, CoordinatedCommitContext,
+    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitPayload,
+    CoordinatedCommitter, MAX_COORDINATED_COMMIT_BATCH_BYTES, MAX_COORDINATED_COMMIT_BATCH_ENTRIES,
     MAX_COORDINATED_COMMIT_PAYLOAD_BYTES,
 };
-pub use sink::{SinkConnector, WriteResult};
+pub use sink::{SinkConnector, SinkRuntimeContext, WriteResult};
 pub use source::{
-    SourceConnector, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition,
-    SourceStart,
+    SourceCheckpointUnavailablePolicy, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
+    SourceDrainResolution, SourcePosition, SourceStart,
 };
 pub use source_batch::{
     schema_with_source_mutations_and_row_positions, schema_with_source_row_positions,
@@ -451,6 +452,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.external_key(), same.external_key());
+        assert_eq!(
+            first.external_key(),
+            "ldb-c3-ab2cbc74e7e5dc7bbbde532272f6e7998fba65710e88151f4d1dd24e97fa0b56"
+        );
         assert_ne!(first.external_key(), other.external_key());
         assert_ne!(first.external_key(), other_deployment.external_key());
         assert_eq!(first.external_key().len(), "ldb-c3-".len() + 64);
@@ -472,6 +477,11 @@ mod tests {
             sha256: "NOT-A-DIGEST".into(),
         };
         assert!(CoordinatedCommitNamespace::try_new(malformed, DEPLOYMENT, "orders").is_err());
+        let future_version = PipelineIdentity {
+            canonical_version: PIPELINE_IDENTITY_VERSION + 1,
+            sha256: PipelineIdentity::empty().sha256,
+        };
+        assert!(CoordinatedCommitNamespace::try_new(future_version, DEPLOYMENT, "orders").is_err());
         assert!(
             CoordinatedCommitNamespace::try_new(PipelineIdentity::empty(), DEPLOYMENT, "").is_err()
         );
@@ -511,6 +521,14 @@ mod tests {
         };
         let expected = batch.exact_fingerprint();
         assert_eq!(expected, batch.clone().exact_fingerprint());
+        assert_eq!(
+            expected,
+            [
+                0x58, 0x5e, 0xa2, 0xf8, 0xdf, 0x8c, 0xd0, 0x3a, 0xca, 0x01, 0xed, 0x95, 0x7e, 0xe6,
+                0xc1, 0xf0, 0x36, 0x41, 0x28, 0xbd, 0xd6, 0xe1, 0xb6, 0xfa, 0x21, 0xbe, 0xf7, 0x4f,
+                0x97, 0xf7, 0xa5, 0xc4,
+            ]
+        );
 
         let mut variants = Vec::new();
         let mut variant = batch.clone();
@@ -572,6 +590,49 @@ mod tests {
     }
 
     #[test]
+    fn coordinated_abort_batch_accepts_only_one_exact_attempt() {
+        use laminar_core::checkpoint::CheckpointAttempt;
+
+        let commit = valid_coordinated_batch();
+        let mut batch = CoordinatedAbortBatch {
+            namespace: commit.namespace,
+            fencing_token: commit.fencing_token,
+            target: commit.target,
+            entries: commit
+                .entries
+                .into_iter()
+                .map(|entry| CoordinatedAbortEntry {
+                    attempt: entry.attempt,
+                    participant_id: entry.participant_id,
+                    descriptor: CoordinatedAbortDescriptor::Prepared(entry.payload),
+                    artifact_intent: None,
+                })
+                .collect(),
+        };
+        batch.validate_shape().unwrap();
+
+        batch.entries.insert(
+            0,
+            CoordinatedAbortEntry {
+                attempt: CheckpointAttempt::canonical(101),
+                participant_id: 1,
+                descriptor: CoordinatedAbortDescriptor::Open,
+                artifact_intent: None,
+            },
+        );
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("exact target attempt"));
+        batch.entries.remove(0);
+        batch.fencing_token = 0;
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("fencing token"));
+    }
+
+    #[test]
     fn coordinated_batch_rejects_noncanonical_target_before_other_shape_checks() {
         use laminar_core::checkpoint::CheckpointAttempt;
 
@@ -587,6 +648,17 @@ mod tests {
                 "unexpected validation error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn coordinated_batch_rejects_a_mutated_namespace() {
+        let mut batch = valid_coordinated_batch();
+        batch.namespace.sink_id.clear();
+
+        assert!(batch
+            .validate_shape()
+            .unwrap_err()
+            .contains("sink id cannot be empty"));
     }
 
     #[test]

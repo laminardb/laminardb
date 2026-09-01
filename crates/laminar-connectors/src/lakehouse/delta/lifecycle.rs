@@ -270,6 +270,15 @@ impl SinkConnector for DeltaLakeSink {
             .unwrap_or_else(|| Arc::new(arrow_schema::Schema::empty()))
     }
 
+    async fn checkpoint_artifact_intent(
+        &mut self,
+        _epoch: u64,
+    ) -> Result<Option<Vec<u8>>, ConnectorError> {
+        // Delta retains unpublished files for retention-safe vacuum because a cancelled catalog
+        // commit may still publish them. Abort cleanup therefore has no exact deletion payload.
+        Ok(None)
+    }
+
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         #[cfg(feature = "delta-lake")]
         {
@@ -493,6 +502,12 @@ impl SinkConnector for DeltaLakeSink {
         self.is_coordinated()
             .then_some(self as &dyn crate::connector::CoordinatedCommitter)
     }
+
+    fn coordinated_abort_cleaner(
+        &self,
+    ) -> Option<Arc<dyn crate::connector::CoordinatedAbortCleaner>> {
+        None
+    }
 }
 
 #[cfg(feature = "delta-lake")]
@@ -598,6 +613,7 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
         &self,
         namespace: &crate::connector::CoordinatedCommitNamespace,
     ) -> Result<Option<crate::connector::CoordinatedCommitCursor>, ConnectorError> {
+        namespace.validate()?;
         let external_key = namespace.external_key();
         let deadline = self.operation_deadline();
         // RECOVERY: both operations are metadata reads. Retrying typed transient failures cannot
