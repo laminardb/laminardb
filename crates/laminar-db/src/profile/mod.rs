@@ -23,6 +23,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use laminar_core::storage_location::{StorageLocation, StorageProvider};
+
 use crate::config::LaminarConfig;
 
 /// Deployment profile — determines which subsystems are activated.
@@ -60,16 +62,12 @@ impl Profile {
             return Self::Cluster;
         }
         if let Some(url) = &config.object_store_url {
-            if url.starts_with("s3://")
-                || url.starts_with("gs://")
-                || url.starts_with("az://")
-                || url.starts_with("abfs://")
-                || url.starts_with("abfss://")
-            {
-                return Self::Durable;
-            }
-            if url.starts_with("file://") {
-                return Self::Embedded;
+            if let Ok(location) = StorageLocation::parse(url) {
+                return if location.provider == StorageProvider::Local {
+                    Self::Embedded
+                } else {
+                    Self::Durable
+                };
             }
         }
         if config.storage_dir.is_some()

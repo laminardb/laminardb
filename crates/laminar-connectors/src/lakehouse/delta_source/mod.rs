@@ -207,12 +207,6 @@ impl SourceConnector for DeltaSource {
         self.config.validate()?;
         self.state = ConnectorState::Initializing;
 
-        info!(
-            table_path = %self.config.table_path,
-            starting_version = ?self.config.starting_version,
-            "opening Delta Lake source connector"
-        );
-
         #[cfg(feature = "delta-lake")]
         {
             use super::delta_io;
@@ -227,9 +221,17 @@ impl SourceConnector for DeltaSource {
                 &stable_options,
             )
             .await?;
-            let resolved_options =
-                crate::storage::StorageCredentialResolver::resolve(&resolved_path, &stable_options)
-                    .options;
+            let resolved_storage =
+                crate::storage::StorageCredentialResolver::resolve(&resolved_path, &stable_options);
+            info!(
+                operation_class = "connector-open",
+                storage_provider = %resolved_storage.provider,
+                storage_endpoint_class = %resolved_storage.endpoint_class(),
+                storage_auth_source = %resolved_storage.auth_source,
+                starting_version = ?self.config.starting_version,
+                "opening Delta Lake source connector"
+            );
+            let resolved_options = resolved_storage.options;
 
             let table =
                 delta_io::open_or_create_table(&resolved_path, resolved_options, None).await?;
@@ -247,7 +249,6 @@ impl SourceConnector for DeltaSource {
             self.stable_storage_options = stable_options;
 
             info!(
-                table_path = %self.config.table_path,
                 table_version,
                 current_version = self.current_version,
                 "Delta Lake source: resolved starting version"
@@ -474,7 +475,6 @@ impl SourceConnector for DeltaSource {
         self.state = ConnectorState::Closed;
 
         info!(
-            table_path = %self.config.table_path,
             current_version = self.current_version,
             records_read = self.records_read,
             "Delta Lake source connector closed"
@@ -488,7 +488,7 @@ impl std::fmt::Debug for DeltaSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaSource")
             .field("state", &self.state)
-            .field("table_path", &self.config.table_path)
+            .field("table_path", &"<configured>")
             .field("current_version", &self.current_version)
             .field("pending_batches", &self.pending_batches.len())
             .field("records_read", &self.records_read)

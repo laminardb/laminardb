@@ -56,10 +56,9 @@ pub async fn register_delta_table(
 ) -> Result<(), ConnectorError> {
     use super::delta_io;
 
-    info!(
-        name,
-        table_uri, "registering Delta Lake table as TableProvider"
-    );
+    // The URI is deliberately excluded: validation below rejects signed queries, but this log
+    // occurs before validation and must never publish one.
+    info!(name, "registering Delta Lake table as TableProvider");
 
     // Open the existing table.
     let table = delta_io::open_or_create_table(table_uri, storage_options, None).await?;
@@ -86,7 +85,7 @@ pub async fn register_delta_table(
         ConnectorError::Internal(format!("failed to register Delta table '{name}': {e}"))
     })?;
 
-    info!(name, table_uri, "Delta Lake table registered successfully");
+    info!(name, "Delta Lake table registered successfully");
 
     Ok(())
 }

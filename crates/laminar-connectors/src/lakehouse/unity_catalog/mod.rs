@@ -14,12 +14,62 @@ use tracing::info;
 
 use crate::error::ConnectorError;
 
+const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Builds a shared `reqwest::Client` with a 30-second timeout.
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("failed to build reqwest client")
+}
+
+fn request_error(error: &reqwest::Error) -> ConnectorError {
+    let class = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "transport"
+    };
+    ConnectorError::ConnectionFailed(format!(
+        "Unity Catalog REST request failed ({class}); verify the configured workspace endpoint"
+    ))
+}
+
+async fn response_reports_already_exists(
+    mut response: reqwest::Response,
+) -> Result<bool, ConnectorError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        ConnectorError::ConnectionFailed(
+            "Unity Catalog error response body could not be read".into(),
+        )
+    })? {
+        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            ConnectorError::ConnectionFailed("Unity Catalog error response size overflow".into())
+        })?;
+        if next_len > MAX_ERROR_RESPONSE_BYTES {
+            return Err(ConnectorError::ConnectionFailed(format!(
+                "Unity Catalog error response exceeds the {MAX_ERROR_RESPONSE_BYTES}-byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body
+        .windows(b"ALREADY_EXISTS".len())
+        .any(|window| window == b"ALREADY_EXISTS"))
+}
+
+fn storage_provider_name(location: &str) -> &'static str {
+    laminar_core::storage_location::StorageProvider::detect_uri(location)
+        .map_or("unknown", |provider| provider.name())
 }
 
 /// Converts an Arrow `SchemaRef` into Unity Catalog `ColumnInfo` JSON objects.
@@ -119,7 +169,7 @@ pub(crate) async fn create_uc_table(
         catalog = catalog_name,
         schema = schema_name,
         table = table_name,
-        storage_location,
+        storage_provider = storage_provider_name(storage_location),
         "creating external Delta table in Unity Catalog"
     );
 
@@ -130,9 +180,7 @@ pub(crate) async fn create_uc_table(
         .json(&body)
         .send()
         .await
-        .map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("Unity Catalog REST request failed: {e}"))
-        })?;
+        .map_err(|error| request_error(&error))?;
 
     let status = resp.status();
     if status.is_success() {
@@ -156,11 +204,8 @@ pub(crate) async fn create_uc_table(
         return Ok(());
     }
 
-    // Read body for error details.
-    let error_body = resp.text().await.unwrap_or_default();
-
     // Already-exists can also come as 400 with ALREADY_EXISTS error code.
-    if error_body.contains("ALREADY_EXISTS") {
+    if status.as_u16() == 400 && response_reports_already_exists(resp).await? {
         info!(
             catalog = catalog_name,
             schema = schema_name,
@@ -173,12 +218,12 @@ pub(crate) async fn create_uc_table(
     if status.as_u16() == 401 || status.as_u16() == 403 {
         // Non-transient — credentials are wrong, retry won't help.
         return Err(ConnectorError::ConfigurationError(format!(
-            "Unity Catalog auth failed (HTTP {status}): {error_body}"
+            "Unity Catalog auth failed (HTTP {status}); verify the configured access token"
         )));
     }
 
     Err(ConnectorError::ConnectionFailed(format!(
-        "Unity Catalog create table failed (HTTP {status}): {error_body}"
+        "Unity Catalog create table failed (HTTP {status})"
     )))
 }
 
@@ -205,23 +250,19 @@ pub(crate) async fn get_table_storage_location(
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("Unity Catalog REST request failed: {e}"))
-        })?;
+        .map_err(|error| request_error(&error))?;
 
     let status = resp.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
         // Non-transient — credentials are wrong, retry won't help.
-        let body = resp.text().await.unwrap_or_default();
         return Err(ConnectorError::ConfigurationError(format!(
-            "Unity Catalog auth failed (HTTP {status}): {body}"
+            "Unity Catalog auth failed (HTTP {status}); verify the configured access token"
         )));
     }
 
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
         return Err(ConnectorError::ConnectionFailed(format!(
-            "Unity Catalog get table failed (HTTP {status}): {body}"
+            "Unity Catalog get table failed (HTTP {status})"
         )));
     }
 
@@ -240,7 +281,7 @@ pub(crate) async fn get_table_storage_location(
 
     info!(
         table = full_table_name,
-        storage_location = %location,
+        storage_provider = storage_provider_name(&location),
         "resolved storage location from Unity Catalog"
     );
 

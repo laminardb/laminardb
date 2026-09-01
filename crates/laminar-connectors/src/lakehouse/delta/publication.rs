@@ -25,9 +25,9 @@ pub(super) fn classify_delta_attempt_error(
     use super::super::delta_io::DeltaWriteAttemptError;
 
     if error.is_definite_optimistic_conflict() {
-        return ConnectorError::WriteError(format!(
-            "Delta optimistic commit collision did not publish: {error}"
-        ));
+        return ConnectorError::WriteError(
+            "Delta optimistic commit collision did not publish".into(),
+        );
     }
 
     match error {
@@ -39,9 +39,7 @@ pub(super) fn classify_delta_attempt_error(
             // into retries merely because their message says "conflict".
             let retryable = super::super::delta_io::delta_error_has_retryable_transport(&error);
             ConnectorError::outcome_unknown(
-                format!(
-                    "Delta write was dispatched but its catalog commit outcome is not known: {error}"
-                ),
+                "Delta write was dispatched but its catalog commit outcome is not known",
                 retryable,
             )
         }

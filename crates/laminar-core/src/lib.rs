@@ -45,6 +45,10 @@ pub mod serialization;
 pub mod shuffle;
 /// Partition-key encoding and virtual-node routing.
 pub mod state;
+/// Non-secret object-store credential-source classification.
+pub mod storage_auth;
+/// Provider-neutral object-store locations and consumer-specific URL adapters.
+pub mod storage_location;
 pub mod streaming;
 pub mod time;
 

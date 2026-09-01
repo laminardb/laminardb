@@ -12,7 +12,7 @@ fn checkpoint_config_rejects_relative_file_urls() {
     let Err(error) = result else {
         panic!("relative checkpoint URL was admitted");
     };
-    assert!(error.to_string().contains("remote host"), "{error}");
+    assert!(error.to_string().contains("absolute local path"), "{error}");
 }
 
 #[test]

@@ -93,7 +93,7 @@ use storage_preflight::{
     is_certified_coordinated_log_store, validate_coordinated_storage_preflight_with_env,
 };
 #[cfg(all(feature = "delta-lake", test))]
-use table::path_to_url;
+use table::{adapt_delta_location, apply_url_derived_options, path_to_url};
 
 #[cfg(feature = "delta-lake")]
 use std::collections::{BTreeMap, HashMap, HashSet};

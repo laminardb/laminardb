@@ -252,6 +252,25 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(!untyped.is_transient());
 }
 
+#[test]
+fn delta_storage_errors_do_not_echo_signed_request_urls() {
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let signed = "https://account.blob.example/table?sig=do-not-disclose";
+    let error = deltalake::DeltaTableError::ObjectStore {
+        source: deltalake::ObjectStoreError::Generic {
+            store: "Azure",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, signed),
+            )),
+        },
+    };
+    let metadata = classify_delta_metadata_error("read cursor", &error).to_string();
+    assert!(!metadata.contains("do-not-disclose"), "{metadata}");
+    assert!(!metadata.contains("account.blob.example"), "{metadata}");
+}
+
 #[tokio::test]
 async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
     use object_store::aws::AmazonS3Builder;
@@ -816,6 +835,45 @@ fn test_path_to_url_azure() {
 fn test_path_to_url_gcs() {
     let url = path_to_url("gs://my-bucket/path/to/table").unwrap();
     assert_eq!(url.scheme(), "gs");
+
+    let alias = path_to_url("GCS://my-bucket/path/to/table").unwrap();
+    assert_eq!(alias.scheme(), "gs");
+}
+
+#[test]
+fn delta_azure_adapter_preserves_qualified_authority_as_options() {
+    let adapted =
+        adapt_delta_location("wasbs://container@account.blob.core.chinacloudapi.cn/path/to/table")
+            .unwrap();
+    assert_eq!(adapted.url, "az://container/path/to/table");
+    let mut options = HashMap::new();
+    apply_url_derived_options(&mut options, &adapted).unwrap();
+    assert_eq!(options["azure_storage_account_name"], "account");
+    assert_eq!(options["azure_container_name"], "container");
+    assert_eq!(
+        options["azure_endpoint"],
+        "https://account.blob.core.chinacloudapi.cn"
+    );
+}
+
+#[test]
+fn delta_azure_adapter_rejects_conflicting_authority_options() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([(
+        "azure_storage_account_name".to_string(),
+        "different".to_string(),
+    )]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("conflicts"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
+fn delta_path_rejects_signed_queries_without_echoing_them() {
+    let error = path_to_url("gs://bucket/table?X-Goog-Signature=secret-value").unwrap_err();
+    assert!(!error.to_string().contains("secret-value"));
 }
 
 // ── End-to-end tests for new functionality ──

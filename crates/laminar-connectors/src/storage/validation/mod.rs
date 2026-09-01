@@ -6,7 +6,7 @@
 //! the fallback environment variable.
 
 use super::provider::StorageProvider;
-use super::resolver::ResolvedStorageOptions;
+use super::resolver::{AuthSource, ResolvedStorageOptions};
 
 /// Result of cloud configuration validation.
 #[derive(Debug, Clone)]
@@ -67,7 +67,7 @@ impl CloudConfigValidator {
     /// or default credential providers.
     #[must_use]
     pub fn validate(resolved: &ResolvedStorageOptions) -> CloudValidationResult {
-        match resolved.provider {
+        let mut result = match resolved.provider {
             StorageProvider::AwsS3 => Self::validate_s3(resolved),
             StorageProvider::AzureAdls => Self::validate_azure(resolved),
             StorageProvider::Gcs => Self::validate_gcs(resolved),
@@ -75,28 +75,27 @@ impl CloudConfigValidator {
                 errors: Vec::new(),
                 warnings: Vec::new(),
             },
-        }
+        };
+        validate_endpoint_options(resolved, &mut result.errors);
+        result
     }
 
     fn validate_s3(resolved: &ResolvedStorageOptions) -> CloudValidationResult {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
 
-        // Region is required (no instance metadata fallback for region in object_store).
-        if !resolved.options.contains_key("aws_region") {
-            errors.push(CloudValidationError {
+        if !has_any(resolved, &["aws_region", "aws_default_region", "region"]) {
+            warnings.push(CloudValidationWarning {
                 key: "aws_region".into(),
-                env_var: Some("AWS_REGION".into()),
-                message: "S3 paths require 'storage.aws_region' in config \
-                          or AWS_REGION environment variable"
+                message: "No explicit AWS region is configured; the downstream AWS region chain remains active"
                     .into(),
             });
         }
 
         // If access key is provided, secret key must also be provided.
-        if resolved.options.contains_key("aws_access_key_id")
-            && !resolved.options.contains_key("aws_secret_access_key")
-        {
+        let access_key = has_any(resolved, &["aws_access_key_id", "access_key_id"]);
+        let secret_key = has_any(resolved, &["aws_secret_access_key", "secret_access_key"]);
+        if access_key && !secret_key {
             errors.push(CloudValidationError {
                 key: "aws_secret_access_key".into(),
                 env_var: Some("AWS_SECRET_ACCESS_KEY".into()),
@@ -107,9 +106,7 @@ impl CloudConfigValidator {
         }
 
         // If secret key is provided, access key must also be provided.
-        if resolved.options.contains_key("aws_secret_access_key")
-            && !resolved.options.contains_key("aws_access_key_id")
-        {
+        if secret_key && !access_key {
             errors.push(CloudValidationError {
                 key: "aws_access_key_id".into(),
                 env_var: Some("AWS_ACCESS_KEY_ID".into()),
@@ -119,16 +116,25 @@ impl CloudConfigValidator {
             });
         }
 
-        // Warn if no credentials at all (may use IAM role / instance profile).
-        if !resolved.has_credentials() {
-            warnings.push(CloudValidationWarning {
-                key: "aws_access_key_id".into(),
-                message: "No AWS credentials found in config or environment. \
-                          Will fall back to instance metadata (IAM role). \
-                          Set 'storage.aws_access_key_id' / \
-                          'storage.aws_secret_access_key' or AWS_ACCESS_KEY_ID / \
-                          AWS_SECRET_ACCESS_KEY if needed."
-                    .into(),
+        let web_identity = has_any(
+            resolved,
+            &["aws_web_identity_token_file", "web_identity_token_file"],
+        );
+        let role = has_any(resolved, &["aws_role_arn", "role_arn"]);
+        if web_identity != role {
+            let key = if web_identity {
+                "aws_role_arn"
+            } else {
+                "aws_web_identity_token_file"
+            };
+            errors.push(CloudValidationError {
+                key: key.into(),
+                env_var: Some(if web_identity {
+                    "AWS_ROLE_ARN".into()
+                } else {
+                    "AWS_WEB_IDENTITY_TOKEN_FILE".into()
+                }),
+                message: format!("AWS web identity configuration is missing '{key}'"),
             });
         }
 
@@ -137,10 +143,13 @@ impl CloudConfigValidator {
 
     fn validate_azure(resolved: &ResolvedStorageOptions) -> CloudValidationResult {
         let mut errors = Vec::new();
-        let mut warnings = Vec::new();
+        let warnings = Vec::new();
 
         // Account name is always required for Azure.
-        if !resolved.options.contains_key("azure_storage_account_name") {
+        if !has_any(
+            resolved,
+            &["azure_storage_account_name", "azure_account_name"],
+        ) {
             errors.push(CloudValidationError {
                 key: "azure_storage_account_name".into(),
                 env_var: Some("AZURE_STORAGE_ACCOUNT_NAME".into()),
@@ -150,44 +159,172 @@ impl CloudConfigValidator {
             });
         }
 
-        // Warn if no credentials (may use Managed Identity).
-        if !resolved.has_credentials() {
-            warnings.push(CloudValidationWarning {
-                key: "azure_storage_account_key".into(),
-                message: "No Azure credentials found in config or environment. \
-                          Will fall back to Managed Identity. \
-                          Set 'storage.azure_storage_account_key' / \
-                          AZURE_STORAGE_ACCOUNT_KEY, or \
-                          'storage.azure_storage_sas_token' / \
-                          AZURE_STORAGE_SAS_TOKEN if needed."
-                    .into(),
-            });
+        let client_secret = has_any(
+            resolved,
+            &[
+                "azure_storage_client_secret",
+                "azure_client_secret",
+                "client_secret",
+            ],
+        );
+        let client_id = has_any(
+            resolved,
+            &["azure_storage_client_id", "azure_client_id", "client_id"],
+        );
+        let tenant_id = has_any(
+            resolved,
+            &["azure_storage_tenant_id", "azure_tenant_id", "tenant_id"],
+        );
+        if client_secret && !client_id {
+            errors.push(missing_field(
+                "azure_storage_client_id",
+                "AZURE_CLIENT_ID",
+                "Azure client-secret authentication",
+            ));
+        }
+        if client_secret && !tenant_id {
+            errors.push(missing_field(
+                "azure_storage_tenant_id",
+                "AZURE_TENANT_ID",
+                "Azure client-secret authentication",
+            ));
+        }
+        if resolved.auth_source == AuthSource::WorkloadIdentity {
+            if !client_id {
+                errors.push(missing_field(
+                    "azure_storage_client_id",
+                    "AZURE_CLIENT_ID",
+                    "Azure workload identity",
+                ));
+            }
+            if !tenant_id {
+                errors.push(missing_field(
+                    "azure_storage_tenant_id",
+                    "AZURE_TENANT_ID",
+                    "Azure workload identity",
+                ));
+            }
         }
 
         CloudValidationResult { errors, warnings }
     }
 
     fn validate_gcs(resolved: &ResolvedStorageOptions) -> CloudValidationResult {
-        let mut warnings = Vec::new();
-
-        // GCS credentials are warning-only (Application Default Credentials / Workload Identity).
-        if !resolved.has_credentials() {
-            warnings.push(CloudValidationWarning {
-                key: "google_service_account_path".into(),
-                message: "No GCS credentials found in config or environment. \
-                          Will fall back to Application Default Credentials / \
-                          Workload Identity. Set \
-                          'storage.google_service_account_path' / \
-                          GOOGLE_APPLICATION_CREDENTIALS if needed."
+        let mut errors = Vec::new();
+        if has_any(resolved, &["gcs.token", "google_token"]) {
+            errors.push(CloudValidationError {
+                key: "gcs.token".into(),
+                env_var: None,
+                message: "the pinned Delta/object_store GCS backend does not accept a direct access token; configure a service-account path/key or supported Application Default Credentials"
                     .into(),
             });
         }
-
         CloudValidationResult {
-            errors: Vec::new(),
-            warnings,
+            errors,
+            warnings: Vec::new(),
         }
     }
+}
+
+fn has_any(resolved: &ResolvedStorageOptions, keys: &[&str]) -> bool {
+    resolved.options.iter().any(|(candidate, value)| {
+        keys.iter().any(|key| candidate.eq_ignore_ascii_case(key)) && !value.trim().is_empty()
+    }) || resolved
+        .env_resolved_keys
+        .iter()
+        .any(|candidate| keys.iter().any(|key| candidate.eq_ignore_ascii_case(key)))
+}
+
+fn missing_field(key: &str, env_var: &str, context: &str) -> CloudValidationError {
+    CloudValidationError {
+        key: key.into(),
+        env_var: Some(env_var.into()),
+        message: format!("{context} is missing '{key}'"),
+    }
+}
+
+fn validate_endpoint_options(
+    resolved: &ResolvedStorageOptions,
+    errors: &mut Vec<CloudValidationError>,
+) {
+    let endpoints = resolved.options.iter().filter(|(key, value)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "aws_endpoint"
+                | "aws_endpoint_url"
+                | "aws_endpoint_url_s3"
+                | "azure_storage_endpoint"
+                | "azure_endpoint"
+                | "google_base_url"
+                | "base_url"
+        ) && !value.trim().is_empty()
+    });
+    if resolved.provider != StorageProvider::Local
+        && resolved.auth_source == AuthSource::Anonymous
+        && !resolved.endpoint_override_configured
+    {
+        errors.push(CloudValidationError {
+            key: "storage.endpoint".into(),
+            env_var: None,
+            message:
+                "anonymous object-store access requires an explicit compatibility or test endpoint"
+                    .into(),
+        });
+    }
+    for (key, value) in endpoints {
+        let parsed = match url::Url::parse(value) {
+            Ok(parsed)
+                if matches!(parsed.scheme(), "http" | "https")
+                    && parsed.host_str().is_some()
+                    && parsed.username().is_empty()
+                    && parsed.password().is_none()
+                    && parsed.query().is_none()
+                    && parsed.fragment().is_none() =>
+            {
+                parsed
+            }
+            _ => {
+                errors.push(CloudValidationError {
+                    key: key.clone(),
+                    env_var: None,
+                    message: format!(
+                        "storage endpoint option '{key}' must be an HTTP(S) URL without credentials, query parameters, or fragments"
+                    ),
+                });
+                continue;
+            }
+        };
+        if parsed.scheme() == "http"
+            && !has_true(
+                resolved,
+                &[
+                    "aws_allow_http",
+                    "allow_http",
+                    "google_allow_http",
+                    "azure_storage_use_emulator",
+                    "use_emulator",
+                ],
+            )
+        {
+            errors.push(CloudValidationError {
+                key: "allow_http".into(),
+                env_var: None,
+                message:
+                    "an HTTP object-store endpoint requires an explicit allow-http or emulator option"
+                        .into(),
+            });
+        }
+    }
+}
+
+fn has_true(resolved: &ResolvedStorageOptions, keys: &[&str]) -> bool {
+    resolved.options.iter().any(|(candidate, value)| {
+        keys.iter().any(|key| candidate.eq_ignore_ascii_case(key))
+            && value.trim().eq_ignore_ascii_case("true")
+    }) || resolved
+        .env_resolved_keys
+        .iter()
+        .any(|candidate| keys.iter().any(|key| candidate.eq_ignore_ascii_case(key)))
 }
 
 #[cfg(test)]

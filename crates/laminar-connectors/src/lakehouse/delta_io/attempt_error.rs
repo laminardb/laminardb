@@ -152,9 +152,11 @@ pub(crate) fn classify_delta_metadata_error(
     error: &deltalake::DeltaTableError,
 ) -> ConnectorError {
     if delta_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
-        ConnectorError::ReadError(format!("{context}: {error}"))
+        ConnectorError::ReadError(format!(
+            "{context}: retryable Delta metadata transport failure"
+        ))
     } else {
-        ConnectorError::TransactionError(format!("{context}: {error}"))
+        ConnectorError::TransactionError(format!("{context}: non-retryable Delta metadata failure"))
     }
 }
 
@@ -164,9 +166,13 @@ pub(crate) fn classify_delta_object_store_metadata_error(
     error: &deltalake::ObjectStoreError,
 ) -> ConnectorError {
     if object_store_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
-        ConnectorError::ReadError(format!("{context}: {error}"))
+        ConnectorError::ReadError(format!(
+            "{context}: retryable object-store metadata transport failure"
+        ))
     } else {
-        ConnectorError::TransactionError(format!("{context}: {error}"))
+        ConnectorError::TransactionError(format!(
+            "{context}: non-retryable object-store metadata failure"
+        ))
     }
 }
 

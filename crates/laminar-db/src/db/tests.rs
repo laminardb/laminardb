@@ -5469,7 +5469,11 @@ async fn test_connector_registry_accessor() {
         + usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-cdc"))
         + usize::from(cfg!(feature = "delta-lake"))
-        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        )))
         + usize::from(cfg!(feature = "websocket"))
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))
@@ -5478,7 +5482,11 @@ async fn test_connector_registry_accessor() {
     let expected_sinks = usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-sink"))
         + usize::from(cfg!(feature = "delta-lake"))
-        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        )))
         + usize::from(cfg!(feature = "websocket"))
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))

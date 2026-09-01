@@ -3,6 +3,8 @@
 #[cfg(feature = "delta-lake-glue")]
 use super::info;
 use super::{ConnectorError, HashMap};
+#[cfg(feature = "delta-lake-glue")]
+use laminar_core::storage_location::StorageProvider;
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
@@ -37,21 +39,24 @@ pub async fn resolve_catalog_options(
             })?;
             let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
                 .await
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to init Glue catalog: {e}"))
+                .map_err(|_| {
+                    ConnectorError::ConnectionFailed(
+                        "failed to initialize Glue catalog using the downstream AWS credential chain"
+                            .into(),
+                    )
                 })?;
             let resolved = glue
                 .get_table_storage_location(catalog_name.map(String::from), database, table_path)
                 .await
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!(
-                        "Glue catalog lookup failed for '{database}.{table_path}': {e}"
-                    ))
+                .map_err(|_| {
+                    ConnectorError::ConnectionFailed(
+                        "Glue catalog lookup failed for the configured table".into(),
+                    )
                 })?;
             info!(
                 glue_database = database,
-                table = table_path,
-                resolved_path = %resolved,
+                storage_provider =
+                    StorageProvider::detect_uri(&resolved).map_or("unknown", StorageProvider::name),
                 "resolved table path via Glue catalog"
             );
             Ok((resolved, base_storage_options.clone()))

@@ -58,10 +58,6 @@ fn test_detect_wasbs_scheme() {
         StorageProvider::detect("wasbs://container@account.blob.core.windows.net/path"),
         StorageProvider::AzureAdls
     );
-    assert_eq!(
-        StorageProvider::canonical_uri("wasbs://container@account.blob.core.windows.net/path"),
-        "az://container@account.blob.core.windows.net/path"
-    );
 }
 
 // ── GCS detection ──

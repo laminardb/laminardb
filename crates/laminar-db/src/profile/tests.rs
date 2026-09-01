@@ -186,6 +186,45 @@ fn test_from_config_durable_abfss() {
 }
 
 #[test]
+fn shared_storage_parser_drives_durable_profile_aliases() {
+    for location in [
+        "S3A://bucket/prefix",
+        "GCS://bucket/prefix",
+        "wasb://container@account.blob.core.windows.net/prefix",
+        "WASBS://container@account.blob.core.windows.net/prefix",
+    ] {
+        let config = LaminarConfig {
+            object_store_url: Some(location.to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(
+            Profile::from_config(&config, false),
+            Profile::Durable,
+            "{location}"
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unsupported_object_store_url_is_not_treated_as_durable() {
+    for location in [
+        "file://relative/checkpoints",
+        "https://example.invalid/checkpoints",
+        "s3n://bucket/checkpoints",
+    ] {
+        let config = LaminarConfig {
+            object_store_url: Some(location.to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(
+            Profile::from_config(&config, false),
+            Profile::BareMetal,
+            "{location}"
+        );
+    }
+}
+
+#[test]
 fn test_from_config_cluster() {
     let config = LaminarConfig::default();
     assert_eq!(Profile::from_config(&config, true), Profile::Cluster);

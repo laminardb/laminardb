@@ -227,7 +227,8 @@ impl SourceConnector for FileSource {
         }
 
         let (config, position, _) = request.into_parts();
-        let src_config = FileSourceConfig::from_connector_config(&config)?;
+        let mut src_config = FileSourceConfig::from_connector_config(&config)?;
+        src_config.normalise_local_path()?;
 
         // Decode and validate the durable manifest before discovery can observe a
         // single path. A corrupt engine checkpoint is fatal: starting from an empty
@@ -270,15 +271,6 @@ impl SourceConnector for FileSource {
                 (manifest, progress)
             }
         };
-
-        // The file source is local-only; reject unsupported paths before
-        // discovery or reads can start.
-        if is_cloud_url(&src_config.path) {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "cloud paths are not supported by the 'files' source: {}",
-                src_config.path
-            )));
-        }
 
         // Resolve format (explicit or auto-detect from path).
         let format = match src_config.format {
@@ -630,14 +622,6 @@ fn build_decoder_and_schema(
     }
 }
 
-fn is_cloud_url(path: &str) -> bool {
-    const CLOUD_SCHEMES: &[&str] = &["s3", "s3a", "s3n", "gs", "gcs", "az", "abfs", "abfss"];
-    let Some((scheme, _)) = path.split_once("://") else {
-        return false;
-    };
-    CLOUD_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -650,8 +634,8 @@ async fn read_file_bytes(
 ) -> Result<Vec<u8>, ConnectorError> {
     // Cloud paths are rejected at `start()`; this path is local-only.
     debug_assert!(
-        !is_cloud_url(path),
-        "cloud paths must be rejected at start()"
+        !path.contains("://"),
+        "file URLs must be normalized at startup"
     );
     let read_path = path.to_owned();
     let error_path = read_path.clone();
