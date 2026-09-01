@@ -37,7 +37,7 @@ impl LaminarDB {
                 let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
                 config.set("_arrow_schema".to_string(), schema_str);
             }
-            let sink = self
+            let mut sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry)
                 .map_err(|e| {
@@ -54,22 +54,10 @@ impl LaminarDB {
             );
 
             let carries_changelog = changelog_carrying.contains(&reg.input);
-            #[cfg(feature = "cluster")]
-            let injected_shared_store = self.cluster_checkpoint_object_store().is_some();
-            #[cfg(not(feature = "cluster"))]
-            let injected_shared_store = false;
-            let checkpoint_storage_scope = if self.config.checkpoint.is_none() {
-                CheckpointStorageScope::Volatile
-            } else if injected_shared_store {
-                CheckpointStorageScope::ClusterShared
-            } else {
-                self.config.object_store_url.as_deref().map_or(
-                    CheckpointStorageScope::NodeDurable,
-                    CheckpointStorageScope::for_url,
-                )
-            };
-            let (contract, configured_timeout) = admit_sink(
-                sink.as_ref(),
+            let checkpoint_storage_scope = sink_checkpoint_storage_scope(self);
+            let (contract, configured_timeout) = admit_and_bind_sink(
+                self,
+                sink.as_mut(),
                 SinkAdmissionContext {
                     config: &config,
                     name,
@@ -80,7 +68,8 @@ impl LaminarDB {
                     checkpointing_enabled,
                     checkpoint_storage_scope,
                 },
-            )?;
+            )
+            .await?;
             let write_timeout = configured_timeout.map_or(
                 sink.suggested_write_timeout(),
                 std::time::Duration::from_millis,
@@ -155,6 +144,7 @@ impl LaminarDB {
             SinkContract,
             bool, // admitted input is a changelog and must carry canonical weight
         )> = Vec::with_capacity(prepared_sinks.len());
+        let mut coordinator_sinks = Vec::with_capacity(prepared_sinks.len());
         for prepared in prepared_sinks {
             let PreparedSink {
                 name,
@@ -169,6 +159,7 @@ impl LaminarDB {
                 task_fence,
                 config: _,
             } = prepared;
+            let abort_cleaner = connector.coordinated_abort_cleaner();
             let terminal_tasks = task_fence.tracker();
             let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
@@ -191,6 +182,7 @@ impl LaminarDB {
                 debug_assert!(!owned.iter().any(|known| known.same_actor(&handle)));
                 owned.push(handle.clone());
             }
+            coordinator_sinks.push((name.clone(), handle.clone(), abort_cleaner));
             sinks.push((
                 name,
                 handle,
@@ -212,8 +204,8 @@ impl LaminarDB {
                         .filter(|source| source.assignment_scoped)
                         .map(|source| source.name.clone()),
                 );
-                for (name, handle, _, _, _, _) in &sinks {
-                    coord.register_sink(name.clone(), handle.clone());
+                for (name, handle, abort_cleaner) in coordinator_sinks {
+                    coord.register_sink_with_abort_cleaner(name, handle, abort_cleaner);
                 }
             }
         }
@@ -236,4 +228,54 @@ impl LaminarDB {
             callback_controller,
         })
     }
+}
+
+fn sink_checkpoint_storage_scope(database: &LaminarDB) -> CheckpointStorageScope {
+    #[cfg(feature = "cluster")]
+    let injected_shared_store = database.cluster_checkpoint_object_store().is_some();
+    #[cfg(not(feature = "cluster"))]
+    let injected_shared_store = false;
+    if database.config.checkpoint.is_none() {
+        CheckpointStorageScope::Volatile
+    } else if injected_shared_store {
+        CheckpointStorageScope::ClusterShared
+    } else {
+        database.config.object_store_url.as_deref().map_or(
+            CheckpointStorageScope::NodeDurable,
+            CheckpointStorageScope::for_url,
+        )
+    }
+}
+
+async fn admit_and_bind_sink(
+    database: &LaminarDB,
+    sink: &mut dyn laminar_connectors::connector::SinkConnector,
+    context: SinkAdmissionContext<'_>,
+) -> Result<(SinkContract, Option<u64>), DbError> {
+    let name = context.name;
+    let admitted = admit_sink(sink, context)?;
+    let (contract, _) = admitted;
+    if !contract.is_checkpoint_committable() {
+        return Ok(admitted);
+    }
+    let runtime_context = {
+        let coordinator = database.coordinator.lock().await;
+        let coordinator = coordinator.as_ref().ok_or_else(|| {
+            DbError::Connector(format!(
+                "sink '{name}' requires checkpoint coordination but no coordinator exists"
+            ))
+        })?;
+        laminar_connectors::connector::SinkRuntimeContext {
+            deployment_id: coordinator.bound_deployment_id()?.to_owned(),
+            sink_id: name.to_string(),
+            participant_id: coordinator.participant_id(),
+        }
+    };
+    sink.bind_runtime_context(runtime_context)
+        .map_err(|error| {
+            DbError::Connector(format!(
+                "Cannot bind checkpoint identity for sink '{name}': {error}"
+            ))
+        })?;
+    Ok(admitted)
 }

@@ -259,6 +259,55 @@ jobs:
           cargo check -p laminar-connectors --no-default-features --features files
           cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
+          # Iceberg catalog and storage isolation
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-core
+          cargo clippy -p laminar-connectors --all-targets --no-default-features --features iceberg-core -- -D warnings
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-rest
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-glue
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-hms
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-s3tables
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-sql
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-s3
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-gcs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-azure
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-fs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
+
+  iceberg-integration:
+    name: Iceberg REST, S3, and cluster recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: iceberg-integration
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Start Iceberg REST, MinIO, and Redpanda
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml up -d --wait redpanda
+      - name: Run Iceberg append integration tests
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
+      - name: Run Iceberg cluster recovery test
+        run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka,iceberg" --test iceberg_cluster_soak -- --ignored --exact --test-threads=1 --nocapture
+      - name: Capture service logs after failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml logs --no-color
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml logs --no-color redpanda
+      - name: Stop Iceberg REST, MinIO, and Redpanda
+        if: always()
+        run: |
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml down -v
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml down -v
+
   dependency-generations:
     name: Analytical Dependency Generations
     runs-on: ubuntu-latest
@@ -431,7 +480,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, dependency-generations, msrv, docs, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -442,6 +491,7 @@ jobs:
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
              [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
+             [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
              [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \

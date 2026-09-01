@@ -3,12 +3,13 @@
 use super::{
     acknowledge_latest_source_commit, poll_source_once, prepare_encoded_source_batch,
     run_source_operation, send_source_msg, source_operation_deadline_error, spawn_source_actor,
-    take_assignment_bound_batch_cursor, try_source_checkpoint, wait_source_barrier_release,
-    wait_source_idle, Arc, AtomicBool, CheckpointBarrierInjector, OwnedSourceTasks, PipelineConfig,
+    take_batch_cursor, try_source_checkpoint, wait_source_barrier_release, wait_source_idle, Arc,
+    AtomicBool, CheckpointBarrierInjector, OwnedSourceTasks, PipelineConfig,
     PreparedSourceGeneration, RecordBatch, SourceBarrierSignal, SourceBatchCursor,
-    SourceCheckpoint, SourceConnectorLifecycle, SourceFault, SourceHandle, SourceInputMode,
-    SourceMsg, SourceMsgTx, SourceOperationOutcome, SourcePollOutcome, SourceTaskExitGuard,
-    SourceTaskLease, TrackedSourceRegistration, SHUTDOWN_DRAIN_BUDGET,
+    SourceCheckpoint, SourceCheckpointUnavailablePolicy, SourceConnectorLifecycle, SourceFault,
+    SourceHandle, SourceInputMode, SourceMsg, SourceMsgTx, SourceOperationOutcome,
+    SourcePollOutcome, SourceTaskExitGuard, SourceTaskLease, TrackedSourceRegistration,
+    SHUTDOWN_DRAIN_BUDGET,
 };
 #[cfg(feature = "cluster")]
 use super::{
@@ -71,6 +72,7 @@ impl SourceActorSpawner<'_> {
         let src_name = src.name.clone();
         let recovery_cursor = contract.supports_replay();
         let assignment_scoped = src.assignment_scoped;
+        let policy = src.connector.checkpoint_unavailable_policy();
         let cancellation_policy = src.connector.cancellation_policy();
         let mut connector = src.connector;
 
@@ -516,6 +518,13 @@ impl SourceActorSpawner<'_> {
                                 {
                                     break;
                                 }
+                                continue;
+                            }
+                            Ok(None)
+                                if policy
+                                    == SourceCheckpointUnavailablePolicy::PollToReplayBoundary =>
+                            {
+                                pending_barrier = Some(barrier);
                             }
                             Ok(None) => {
                                 pending_barrier = Some(barrier);
@@ -538,6 +547,7 @@ impl SourceActorSpawner<'_> {
                                 {
                                     break;
                                 }
+                                continue;
                             }
                             Err(error) => {
                                 lifecycle.fault_data_plane();
@@ -548,7 +558,6 @@ impl SourceActorSpawner<'_> {
                                 break;
                             }
                         }
-                        continue;
                     }
                 }
 
@@ -723,18 +732,12 @@ impl SourceActorSpawner<'_> {
                 }
 
                 match poll_result {
-                    Ok(Some(mut source_batch)) => {
-                        let bound_checkpoint = match take_assignment_bound_batch_cursor(
-                            &mut source_batch,
-                            assignment_scoped,
-                        ) {
+                    Ok(Some(mut input)) => {
+                        let cursor = take_batch_cursor(&mut input, assignment_scoped, policy);
+                        let bound_checkpoint = match cursor {
                             Ok(checkpoint) => checkpoint,
                             Err(error) => {
-                                lifecycle.fault_data_plane();
-                                let _ = task_fault_tx.send(SourceFault {
-                                    source: Arc::from(src_name.as_str()),
-                                    error: error.to_string(),
-                                });
+                                lifecycle.report_fault(&task_fault_tx, &src_name, &error);
                                 break;
                             }
                         };
@@ -746,7 +749,7 @@ impl SourceActorSpawner<'_> {
                             &primary_key,
                             &primary_key_indices,
                             contract.row_positions,
-                            source_batch,
+                            input,
                         ) {
                             Ok(batch) => batch,
                             Err(error) => {
@@ -1051,18 +1054,12 @@ impl SourceActorSpawner<'_> {
                         break;
                     }
                     match poll_result {
-                        Some(Ok(Some(mut source_batch))) => {
-                            let bound_checkpoint = match take_assignment_bound_batch_cursor(
-                                &mut source_batch,
-                                assignment_scoped,
-                            ) {
+                        Some(Ok(Some(mut input))) => {
+                            let cursor = take_batch_cursor(&mut input, assignment_scoped, policy);
+                            let bound_checkpoint = match cursor {
                                 Ok(checkpoint) => checkpoint,
                                 Err(error) => {
-                                    lifecycle.fault_data_plane();
-                                    let _ = task_fault_tx.send(SourceFault {
-                                        source: Arc::from(src_name.as_str()),
-                                        error: error.to_string(),
-                                    });
+                                    lifecycle.report_fault(&task_fault_tx, &src_name, &error);
                                     break;
                                 }
                             };
@@ -1074,7 +1071,7 @@ impl SourceActorSpawner<'_> {
                                 &primary_key,
                                 &primary_key_indices,
                                 contract.row_positions,
-                                source_batch,
+                                input,
                             ) {
                                 Ok(batch) => batch,
                                 Err(error) => {

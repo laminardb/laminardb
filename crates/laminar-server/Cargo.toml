@@ -24,6 +24,11 @@ name = "cluster_soak"
 path = "tests/cluster_soak.rs"
 required-features = ["cluster"]
 
+[[test]]
+name = "iceberg_cluster_soak"
+path = "tests/iceberg_cluster_soak.rs"
+required-features = ["cluster", "aws", "kafka", "iceberg"]
+
 [dependencies]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
@@ -138,6 +143,7 @@ mimalloc = { workspace = true, optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
+parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"

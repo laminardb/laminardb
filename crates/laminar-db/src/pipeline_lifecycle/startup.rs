@@ -6,6 +6,25 @@ use super::{
 #[cfg(feature = "cluster")]
 use super::{report_cluster_terminal_halt, retire_cluster_compute_generation};
 
+fn checkpoint_store(
+    backing: Arc<dyn object_store::ObjectStore>,
+    max_node_data_bytes: u64,
+    key_group_count: laminar_core::state::KeyGroupCount,
+    participant_id: u64,
+    exclusive_writer: bool,
+) -> Result<Box<dyn laminar_core::checkpoint::CheckpointStore>, DbError> {
+    let store = laminar_core::checkpoint::ObjectStoreCheckpointStore::new(backing, "")
+        .with_max_node_data_bytes(max_node_data_bytes)?
+        .with_key_group_count(key_group_count)
+        .with_participant_id(participant_id);
+    let store = if exclusive_writer {
+        store.with_exclusive_writer()
+    } else {
+        store
+    };
+    Ok(Box::new(store))
+}
+
 impl LaminarDB {
     /// Publish `Running` only if the compute watcher did not fault during startup.
     ///
@@ -62,6 +81,9 @@ impl LaminarDB {
     /// rebuild the still-gated data plane for `Start`.
     #[cfg(feature = "cluster")]
     pub(crate) async fn start_for_coordinated_recovery(self: &Arc<Self>) -> Result<(), DbError> {
+        self.ensure_terminal_halt_allows_start(PipelineLifecycleAuthority::CoordinatedRecovery)?;
+        // RECOVERY: a durable Start is published only after cluster-wide artifact settlement.
+        *self.startup_checkpoint_artifact_audit.lock() = None;
         self.start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
             .await
     }
@@ -705,15 +727,13 @@ impl LaminarDB {
                     "checkpoint object store does not provide required conditional writes: {error}"
                 ))
             })?;
-            let store: Box<dyn laminar_core::checkpoint::CheckpointStore> = Box::new(
-                laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
-                    Arc::clone(&checkpoint_backing),
-                    "",
-                )
-                .with_max_node_data_bytes(max_node_data_bytes)?
-                .with_key_group_count(key_group_count)
-                .with_participant_id(participant_id),
-            );
+            let store = checkpoint_store(
+                Arc::clone(&checkpoint_backing),
+                max_node_data_bytes,
+                key_group_count,
+                participant_id,
+                uses_local_checkpoint_store,
+            )?;
             let decision_backing = (!uses_local_checkpoint_store).then_some(checkpoint_backing);
 
             let defaults = CkpConfig::default();

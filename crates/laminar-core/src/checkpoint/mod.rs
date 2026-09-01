@@ -41,15 +41,17 @@ pub use barrier::{
 };
 
 pub use checkpoint_manifest::{
-    checkpoint_descriptor_sha256, checkpoint_sha256, ByteRange, ChannelProgress,
-    CheckpointManifest, ConnectorCheckpoint, NodeDataObject, PipelineIdentity,
-    PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame, StateFrameKey,
-    PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
+    checkpoint_artifact_intent_sha256, checkpoint_descriptor_sha256, checkpoint_sha256, ByteRange,
+    ChannelProgress, CheckpointManifest, ConnectorCheckpoint, NodeDataObject, PipelineIdentity,
+    PreparedSinkArtifactIntent, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId,
+    StateFrame, StateFrameKey, PIPELINE_IDENTITY_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
 };
 pub use checkpoint_store::{
     checkpoint_artifact_identity_sha256, checkpoint_manifest_bytes,
-    probe_object_store_conditional_create, probe_object_store_conditional_update, CheckpointStore,
+    probe_object_store_conditional_create, probe_object_store_conditional_update,
+    CheckpointManifestAbortSeal, CheckpointSinkArtifactIntent, CheckpointStore,
     CheckpointStoreError, ObjectStoreCheckpointStore,
+    MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_AGGREGATE_BYTES, MAX_CHECKPOINT_SINK_ARTIFACT_INTENT_BYTES,
 };
 pub use committed_checkpoint::{
     canonical_json_bytes, canonical_json_sha256, CheckpointScope, CheckpointWatermark,

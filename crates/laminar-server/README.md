@@ -325,6 +325,44 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,stats_print:true laminardb 
 
 The stats are written to stderr on process exit and confirm the active configuration.
 
+## Iceberg cluster certification soak
+
+The ignored `iceberg_cluster_soak` test runs three LaminarDB processes and proves that a leader
+failure after Iceberg publication does not create a second snapshot or duplicate rows. Its default
+profile uses the repository's Kafka, Iceberg REST, and MinIO containers.
+
+Set `ICEBERG_CLUSTER_PROFILE=aws` to run the same fault sequence against an external HTTPS REST
+catalog and real S3. The external profile requires:
+
+- `ICEBERG_CLUSTER_CATALOG_URI`
+- `ICEBERG_CLUSTER_S3_BUCKET`
+- `ICEBERG_CLUSTER_S3_REGION`
+- `ICEBERG_CLUSTER_VISIBILITY_SLO_MS`
+
+`ICEBERG_CLUSTER_S3_PREFIX`, `ICEBERG_CLUSTER_KAFKA_BROKERS`, and
+`ICEBERG_CLUSTER_RECOVERY_TIMEOUT_MS` are optional. For bearer authentication, also set
+`ICEBERG_CLUSTER_CATALOG_AUTH_TYPE=bearer` and
+`ICEBERG_CLUSTER_CATALOG_BEARER_TOKEN`. AWS credentials come from the standard provider
+environment, including temporary, web-identity, and container credentials; do not put them in the
+test configuration. The catalog must be allowed to create a namespace and table beneath
+`s3://$ICEBERG_CLUSTER_S3_BUCKET/$ICEBERG_CLUSTER_S3_PREFIX/wh`; the prefix defaults to
+`laminardb-iceberg-certification`. Its configured base URI must directly expose the standard
+`/v1` routes; this independent test oracle does not apply a server-advertised prefix override.
+
+```bash
+cargo test --profile soak -p laminar-server --no-default-features \
+  --features "cluster,aws,kafka,iceberg" \
+  --test iceberg_cluster_soak \
+  leader_restart_reconciles_one_iceberg_snapshot_per_checkpoint \
+  -- --ignored --exact --test-threads=1 --nocapture
+```
+
+The AWS profile fails closed when the catalog is not HTTPS, the resource scope is malformed, the
+visibility bound is absent, either configured bound exceeds ten minutes, or an AWS endpoint
+override would redirect the run away from real S3. It prints operation visibility in milliseconds
+and retains its uniquely named namespace and objects for failure investigation and operator-managed
+cleanup.
+
 ## Deployment
 
 See [deploy/README.md](../../deploy/README.md) for binary downloads, Docker, and Helm chart instructions.

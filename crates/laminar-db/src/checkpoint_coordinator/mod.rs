@@ -21,6 +21,7 @@ mod protocol;
 mod recovery;
 mod request;
 mod retention;
+mod sink_artifact_intents;
 mod sink_commit;
 pub(crate) mod sink_epoch_admission;
 mod sink_protocol;
@@ -48,8 +49,8 @@ use laminar_core::checkpoint::{
     classify_channel_progress, ByteRange, ChannelProgress, CheckpointAttempt, CheckpointManifest,
     CheckpointScope, CheckpointStore, CheckpointWatermark, CommittedCheckpointIndex,
     CommittedCheckpointRef, CommittedParticipantRef, ConnectorCheckpoint, LeaderProof,
-    PipelineIdentity, PreparedSinkDescriptor, ReferencedStateChunk, StateChunkId, StateFrame,
-    StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION, PREPARED_SINK_DESCRIPTOR_VERSION,
+    PipelineIdentity, PreparedSinkArtifactIntent, PreparedSinkDescriptor, ReferencedStateChunk,
+    StateChunkId, StateFrame, StateFrameKey, COMMITTED_CHECKPOINT_INDEX_VERSION,
 };
 use laminar_core::checkpoint_decision::{
     CheckpointArtifactInventory, CheckpointArtifactInventoryUpdateResult,
@@ -69,6 +70,8 @@ const REFERENCED_CHUNK_REBASE_THRESHOLD: usize = 64;
 pub(crate) struct RegisteredSink {
     name: String,
     handle: crate::sink_task::SinkTaskHandle,
+    abort_cleaner: Option<Arc<dyn laminar_connectors::connector::CoordinatedAbortCleaner>>,
+    abort_cleaner_retired: std::sync::atomic::AtomicBool,
 }
 
 struct PackedCheckpoint {
@@ -166,6 +169,11 @@ mod subscription_output_tests;
 #[cfg(all(test, feature = "cluster"))]
 mod handoff_tests;
 
+struct ActiveSinkArtifactIntents {
+    attempt: CheckpointAttempt,
+    by_sink: BTreeMap<String, Option<Vec<u8>>>,
+}
+
 pub struct CheckpointCoordinator {
     config: CheckpointConfig,
     store: Arc<dyn CheckpointStore>,
@@ -179,6 +187,7 @@ pub struct CheckpointCoordinator {
     deployment_id: Option<String>,
     decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
     active_sink_witness: Option<laminar_core::checkpoint_decision::CheckpointSinkOpenWitness>,
+    active_sink_artifact_intents: Option<ActiveSinkArtifactIntents>,
     prepared: HashMap<CheckpointAttempt, (Arc<CheckpointManifest>, Bytes)>,
     last_committed_manifest: Option<Arc<CheckpointManifest>>,
     last_committed_ref: Option<CommittedCheckpointRef>,

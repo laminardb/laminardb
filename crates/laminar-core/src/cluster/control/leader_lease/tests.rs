@@ -469,6 +469,7 @@ async fn checkpoint_artifact_inventory(
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
         attempt: crate::checkpoint::CheckpointAttempt::canonical(checkpoint_id),
         assignment_fence: Some(fence.clone()),
+        sink_artifact_intent_protocol: true,
     }
 }
 
@@ -4819,6 +4820,7 @@ async fn delayed_artifact_admission_cannot_reopen_a_durable_abort() {
         pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
         attempt: crate::checkpoint::CheckpointAttempt::canonical(1),
         assignment_fence: Some(fence.clone()),
+        sink_artifact_intent_protocol: true,
     };
 
     let delayed_store = Arc::clone(&store);

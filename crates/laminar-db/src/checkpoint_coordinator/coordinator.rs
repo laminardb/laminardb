@@ -54,6 +54,7 @@ impl CheckpointCoordinator {
             deployment_id: None,
             decision_store: None,
             active_sink_witness: None,
+            active_sink_artifact_intents: None,
             prepared: HashMap::new(),
             last_committed_manifest: None,
             last_committed_ref: None,
@@ -150,7 +151,6 @@ impl CheckpointCoordinator {
         })
     }
 
-    #[cfg(feature = "cluster")]
     pub(crate) fn bound_deployment_id(&self) -> Result<&str, DbError> {
         self.expected_deployment_id()
     }
@@ -163,7 +163,6 @@ impl CheckpointCoordinator {
         self.cluster_controller = Some(controller);
     }
 
-    #[cfg(feature = "cluster")]
     #[must_use]
     pub(crate) fn participant_id(&self) -> u64 {
         self.store.participant_id()

@@ -148,8 +148,10 @@ runtimes own all configured vnodes in process; clusters distribute the same topo
 
 > [!IMPORTANT]
 > Cluster exactly-once is admitted only for exact-certified sources and a cluster-certified,
-> checkpoint-committable sink. The current admitted path is Kafka input to direct S3/S3A
-> append-mode Delta Lake. Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
+> checkpoint-committable sink. Current admitted compositions use Kafka input with either direct
+> S3/S3A append-mode Delta Lake or coordinated append-mode Iceberg through a REST catalog and
+> direct S3/S3A storage. Iceberg catalog authentication is limited to none or a static bearer token.
+> Kafka output remains at-least-once. Other exact combinations fail closed with `[LDB-5035]`
 > before connector I/O.
 > The accepted state design is authoritative in-memory `FxHashMap` state per vnode with
 > object-store-only checkpoint durability. The strict three-node cluster at-least-once fault profile
@@ -390,7 +392,7 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
 | Delta Lake | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
-| Iceberg | `iceberg` | REST catalog polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
+| Iceberg | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog mode fails closed | ✅ |
 | Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
 | Postgres Lookup | `postgres-cdc` | Connector name `postgres`; external table enrichment | ✅ |
 
@@ -402,12 +404,13 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
 | MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | ✅ |
 | Delta Lake | `delta-lake` | Coordinated append supports local exact delivery; cluster exact admission is limited to direct S3/S3A. Azure/GCS targets remain cluster at-least-once pending native fault soaks | ✅ |
-| Iceberg | `iceberg` | REST catalog append, durable at-least-once; exactly-once is rejected because no checkpoint-bound catalog cursor is implemented | ✅ |
+| Iceberg | `iceberg` | Bounded rolling append writers; coordinated local exactly-once and REST + direct S3/S3A cluster exactly-once append; MOR/COW fail closed | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
 
-Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs.
+Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs. Iceberg's umbrella feature includes REST, S3, and local filesystem support; GCS and ADLS are isolated as `iceberg-storage-gcs` and `iceberg-storage-azure`. Glue, HMS, S3 Tables, and SQL Iceberg catalog selections currently return explicit unsupported-capability errors.
+Iceberg REST authentication supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication until the OAuth2 path has a cluster recovery fault matrix. Data-storage credentials for cluster exactly-once use `storage.property.*`; secret-bearing `catalog.property.*` values remain uncertified catalog authentication.
 
 ### Connector Example
 
@@ -525,7 +528,10 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
 | `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
-| `iceberg` | Apache Iceberg source and sink |
+| `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-catalog-rest` | Iceberg REST catalog implementation |
+| `iceberg-catalog-glue` / `iceberg-catalog-hms` / `iceberg-catalog-s3tables` / `iceberg-catalog-sql` | Typed catalog capability selections; unsupported by the resolved released APIs |
+| `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source (AutoLoader) and sink (rolling Parquet/CSV/JSON) |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |

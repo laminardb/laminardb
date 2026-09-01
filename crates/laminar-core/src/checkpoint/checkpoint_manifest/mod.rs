@@ -13,6 +13,11 @@ use crate::state::{
     KeyGroupCount, DEFAULT_KEY_GROUP_COUNT, LOCAL_NODE_ID, PARTITIONING_ABI_VERSION,
 };
 
+mod sink_artifacts;
+pub use sink_artifacts::{
+    checkpoint_artifact_intent_sha256, PreparedSinkArtifactIntent, PreparedSinkDescriptor,
+};
+
 /// Current checkpoint manifest format. Every other version is rejected.
 pub const CHECKPOINT_MANIFEST_VERSION: u32 = 10;
 
@@ -57,7 +62,7 @@ impl PipelineIdentity {
 
     /// Whether this identity uses the current canonical version and digest encoding.
     #[must_use]
-    pub(crate) fn is_canonical(&self) -> bool {
+    pub fn is_canonical(&self) -> bool {
         self.validation_error().is_none()
     }
 }
@@ -140,20 +145,6 @@ pub struct StateFrame {
     pub sha256: String,
 }
 
-/// Opaque phase-one sink descriptor stored in the current node data object.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedSinkDescriptor {
-    /// Stable registered sink name.
-    pub sink_name: String,
-    /// Runtime descriptor-envelope version.
-    pub format_version: u16,
-    /// `None` and an explicit empty range have different connector semantics.
-    pub payload: Option<ByteRange>,
-    /// Presence-domain-separated SHA-256 of the optional payload.
-    pub sha256: String,
-}
-
 /// Watermark and idleness state for one stable input channel.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -233,6 +224,9 @@ pub struct CheckpointManifest {
     pub state_frames: Vec<StateFrame>,
     /// Canonically ordered phase-one sink descriptor inventory.
     pub prepared_sinks: Vec<PreparedSinkDescriptor>,
+    /// Canonically ordered recovery intents captured before sink epoch begin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sink_artifact_intents: Vec<PreparedSinkArtifactIntent>,
     /// Canonically ordered older objects retained by `state_frames`.
     pub referenced_chunks: Vec<ReferencedStateChunk>,
     /// Participant-local subscription output ranges and immutable segment references.
@@ -301,6 +295,7 @@ impl CheckpointManifest {
             },
             state_frames: Vec::new(),
             prepared_sinks: Vec::new(),
+            sink_artifact_intents: Vec::new(),
             referenced_chunks: Vec::new(),
             subscription_output: None,
         }
@@ -557,52 +552,7 @@ impl CheckpointManifest {
             }
         }
 
-        if !self
-            .prepared_sinks
-            .windows(2)
-            .all(|pair| pair[0].sink_name < pair[1].sink_name)
-        {
-            error("prepared_sinks must be strictly ordered by sink_name".into());
-        }
-        for sink in &self.prepared_sinks {
-            if sink.sink_name.is_empty() {
-                error("prepared sink name must not be empty".into());
-            }
-            if self.sink_names.binary_search(&sink.sink_name).is_err() {
-                error(format!(
-                    "prepared sink '{}' is not in sink_names",
-                    sink.sink_name
-                ));
-            }
-            if sink.format_version != PREPARED_SINK_DESCRIPTOR_VERSION {
-                error(format!(
-                    "prepared sink '{}' format_version must be {PREPARED_SINK_DESCRIPTOR_VERSION}",
-                    sink.sink_name,
-                ));
-            }
-            if !is_sha256(&sink.sha256) {
-                error(format!(
-                    "prepared sink '{}' digest must be lowercase SHA-256",
-                    sink.sink_name
-                ));
-            }
-            match sink.payload {
-                Some(range) => {
-                    validate_range(
-                        range,
-                        Some(self.node_data.object_length),
-                        "prepared sink payload",
-                        &mut error,
-                    );
-                    current_ranges.push((range, format!("prepared sink '{}'", sink.sink_name)));
-                }
-                None if sink.sha256 != checkpoint_descriptor_sha256(None) => error(format!(
-                    "prepared sink '{}' without a payload has the wrong domain-separated digest",
-                    sink.sink_name
-                )),
-                None => {}
-            }
-        }
+        sink_artifacts::validate_sink_artifacts(self, &mut current_ranges, &mut error);
 
         let mut expected_offset = 0_u64;
         for (range, owner) in current_ranges {

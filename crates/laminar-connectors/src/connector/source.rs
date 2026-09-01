@@ -15,6 +15,18 @@ use super::{
     SourceContract,
 };
 
+/// Intake behavior when a source temporarily has no exact checkpoint cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceCheckpointUnavailablePolicy {
+    /// Hold intake until control-plane reconciliation makes the cursor available.
+    HoldIntake,
+    /// Poll at most one batch before retrying a retained barrier.
+    ///
+    /// Sources using this policy must bind every returned batch to its exact
+    /// current cursor and stop at the first completed replay-unit boundary.
+    PollToReplayBoundary,
+}
+
 /// Atomic startup position for a source connector.
 ///
 /// A resume request carries both the durable checkpoint attempt and the
@@ -202,6 +214,15 @@ pub trait SourceConnector: Send {
     /// ownership/configuration state.
     fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
         Ok(Some(self.checkpoint()))
+    }
+
+    /// Choose how the runtime progresses after [`Self::try_checkpoint`] returns `Ok(None)`.
+    ///
+    /// The default holds intake because polling across an unreconciled
+    /// control-plane cursor could move data past the retained barrier.
+    /// The result must remain stable after the connector starts.
+    fn checkpoint_unavailable_policy(&self) -> SourceCheckpointUnavailablePolicy {
+        SourceCheckpointUnavailablePolicy::HoldIntake
     }
 
     /// Whether this source's data-plane cursor is reconciled with the current

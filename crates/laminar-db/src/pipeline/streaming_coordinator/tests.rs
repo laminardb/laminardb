@@ -4788,7 +4788,9 @@ struct TrackedStartupSource {
 struct BarrierRetrySourceState {
     allow_capture: AtomicBool,
     block_checkpoint_ready: AtomicBool,
+    complete_replay_on_poll: AtomicBool,
     emit_batch: AtomicBool,
+    poll_to_replay_boundary: AtomicBool,
     assignment_version: AtomicU64,
     capture_attempts: AtomicU64,
     successful_captures: AtomicU64,
@@ -6487,10 +6489,23 @@ impl laminar_connectors::connector::SourceConnector for BarrierRetrySource {
             )]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
                 .unwrap();
-            Ok(Some(SourceBatch::new(batch)))
-        } else {
-            Ok(None)
+            let batch = SourceBatch::new(batch);
+            return Ok(Some(
+                if self.state.poll_to_replay_boundary.load(Ordering::Acquire) {
+                    batch.with_checkpoint(SourceCheckpoint::new())
+                } else {
+                    batch
+                },
+            ));
         }
+        if self
+            .state
+            .complete_replay_on_poll
+            .swap(false, Ordering::AcqRel)
+        {
+            self.state.allow_capture.store(true, Ordering::Release);
+        }
+        Ok(None)
     }
 
     fn schema(&self) -> Arc<Schema> {
@@ -6520,6 +6535,16 @@ impl laminar_connectors::connector::SourceConnector for BarrierRetrySource {
             checkpoint.bind_assignment_version(version);
         }
         Ok(Some(checkpoint))
+    }
+
+    fn checkpoint_unavailable_policy(
+        &self,
+    ) -> laminar_connectors::connector::SourceCheckpointUnavailablePolicy {
+        if self.state.poll_to_replay_boundary.load(Ordering::Acquire) {
+            laminar_connectors::connector::SourceCheckpointUnavailablePolicy::PollToReplayBoundary
+        } else {
+            laminar_connectors::connector::SourceCheckpointUnavailablePolicy::HoldIntake
+        }
     }
 
     fn checkpoint_ready(&self) -> Result<bool, ConnectorError> {
@@ -7513,6 +7538,73 @@ async fn claimed_barrier_is_retained_while_source_cursor_is_unreconciled() {
     assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
 }
 
+#[tokio::test]
+async fn retained_barrier_polls_only_to_an_inflight_replay_boundary() {
+    let state = Arc::new(BarrierRetrySourceState::default());
+    state.emit_batch.store(true, Ordering::Release);
+    state.poll_to_replay_boundary.store(true, Ordering::Release);
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let source = SourceRegistration {
+        name: "replay-boundary".into(),
+        connector: Box::new(BarrierRetrySource {
+            state: Arc::clone(&state),
+        }),
+        config: laminar_connectors::config::ConnectorConfig::new("replay-boundary"),
+        assignment_scoped: false,
+        position: SourcePosition::Initial,
+    };
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+    let coordinator = StreamingCoordinator::new(
+        &StreamingCoordinatorRuntime::new(),
+        vec![source],
+        PipelineConfig {
+            fallback_poll_interval: Duration::from_millis(1),
+            checkpoint_schedule: CheckpointSchedule::Disabled,
+            ..PipelineConfig::default()
+        },
+        Arc::clone(&shutdown),
+        control_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+    let injector = coordinator.source_handles[0].barrier_injector.clone();
+    let callback = MockCallback::new();
+    let written_rows = Arc::clone(&callback.written_rows);
+    let (ready_tx, ready_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
+    let run = tokio::spawn(async move { coordinator.run_with_ready(callback, ready_tx).await });
+    ready_rx.await.unwrap().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while written_rows.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the replay unit's first batch was not delivered");
+    assert!(injector.trigger(CheckpointBarrier::new(77, 77)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.capture_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source did not retain the barrier at the replay boundary");
+    let polls_at_barrier = state.polls.load(Ordering::SeqCst);
+    state.complete_replay_on_poll.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.successful_captures.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained barrier did not drain to the replay boundary");
+    assert!(state.polls.load(Ordering::SeqCst) > polls_at_barrier);
+
+    shutdown.notify_one();
+    assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
+}
+
 #[test]
 fn source_checkpoint_scope_is_validated_before_publication() {
     let state = Arc::new(BarrierRetrySourceState::default());
@@ -7541,9 +7633,43 @@ fn source_checkpoint_scope_is_validated_before_publication() {
 }
 
 #[test]
-fn assignment_scoped_batch_uses_its_bound_cursor_and_missing_fails_closed() {
+fn bound_batch_cursors_validate_local_and_assignment_scope() {
+    let mut unbound = SourceBatch::new(RecordBatch::new_empty(test_source_schema()));
+    assert!(take_batch_cursor(
+        &mut unbound,
+        false,
+        SourceCheckpointUnavailablePolicy::HoldIntake,
+    )
+    .unwrap()
+    .is_none());
+    let error = take_batch_cursor(
+        &mut unbound,
+        false,
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("without an exact checkpoint"));
+
+    let local = SourceCheckpoint::new();
+    let mut local_batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()))
+        .with_checkpoint(local.clone());
+    match take_batch_cursor(
+        &mut local_batch,
+        false,
+        SourceCheckpointUnavailablePolicy::PollToReplayBoundary,
+    )
+    .unwrap()
+    {
+        Some(SourceBatchCursor::Complete(checkpoint)) => assert_eq!(checkpoint, local),
+        _ => panic!("expected a complete local cursor"),
+    }
+
     let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()));
-    let error = match take_assignment_bound_batch_cursor(&mut batch, true) {
+    let error = match take_batch_cursor(
+        &mut batch,
+        true,
+        SourceCheckpointUnavailablePolicy::HoldIntake,
+    ) {
         Err(error) => error,
         Ok(_) => panic!("missing assignment cursor was accepted"),
     };
@@ -7559,7 +7685,13 @@ fn assignment_scoped_batch_uses_its_bound_cursor_and_missing_fails_closed() {
     let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()))
         .with_checkpoint(expected.clone());
 
-    match take_assignment_bound_batch_cursor(&mut batch, true).unwrap() {
+    match take_batch_cursor(
+        &mut batch,
+        true,
+        SourceCheckpointUnavailablePolicy::HoldIntake,
+    )
+    .unwrap()
+    {
         Some(SourceBatchCursor::Complete(checkpoint)) => {
             assert_eq!(checkpoint, expected);
         }
@@ -7575,7 +7707,13 @@ fn assignment_scoped_batch_uses_its_bound_cursor_and_missing_fails_closed() {
     .unwrap();
     let mut batch = SourceBatch::new(RecordBatch::new_empty(test_source_schema()))
         .with_checkpoint_delta(delta.clone());
-    match take_assignment_bound_batch_cursor(&mut batch, true).unwrap() {
+    match take_batch_cursor(
+        &mut batch,
+        true,
+        SourceCheckpointUnavailablePolicy::HoldIntake,
+    )
+    .unwrap()
+    {
         Some(SourceBatchCursor::Incremental(actual)) => assert_eq!(actual, delta),
         _ => panic!("expected an incremental assignment cursor"),
     }

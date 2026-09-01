@@ -447,6 +447,13 @@ pub struct CheckpointArtifactInventory {
     pub attempt: CheckpointAttempt,
     /// Exact cluster assignment, absent for local checkpoints.
     pub assignment_fence: Option<CheckpointAssignmentFence>,
+    /// Whether this attempt durably admits sink artifact intents before connector begin.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sink_artifact_intent_protocol: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CheckpointArtifactInventory {

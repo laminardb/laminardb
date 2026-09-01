@@ -2446,6 +2446,7 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         pipeline_identity: recovery_index.pipeline_identity,
         attempt,
         assignment_fence: Some(current.assignment_fence().unwrap()),
+        sink_artifact_intent_protocol: true,
     };
     authority
         .begin_cluster_checkpoint_artifacts(

@@ -96,6 +96,10 @@ pub(crate) enum SinkOperation {
         epoch: u64,
         ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
+    ArtifactIntent {
+        epoch: u64,
+        ack: oneshot::TxOneshot<Result<Option<Vec<u8>>, ConnectorError>>,
+    },
     /// Flush buffered rows without transaction semantics — used to durably land an
     /// at-least-once sink's buffer at checkpoint (CP-5).
     Flush {

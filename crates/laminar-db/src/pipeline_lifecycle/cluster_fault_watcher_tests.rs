@@ -340,6 +340,7 @@ async fn clean_prestart_artifact_audit_does_not_fault_on_later_live_inventory() 
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -389,6 +390,7 @@ async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -428,6 +430,30 @@ async fn unresolved_checkpoint_artifacts_request_startup_recovery() {
     assert!(!controller.read_fault_reports().await.unwrap().is_empty());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn coordinated_restart_consumes_startup_artifact_deferral() {
+    let (db, controller, _kv, _members, _round, _manifest_store, _proof, _deployment_id) =
+        startup_db().await;
+    let process = controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
+    *db.startup_checkpoint_artifact_audit.lock() =
+        Some(StartupCheckpointArtifactAudit::Artifacts(process));
+    assert!(db
+        .should_defer_initial_sink_epoch_for_artifact_recovery()
+        .unwrap());
+
+    db.fence_coordinated_recovery_lifecycle();
+    db.start_for_coordinated_recovery().await.unwrap();
+
+    assert_eq!(*db.startup_checkpoint_artifact_audit.lock(), None);
+    assert!(!db
+        .should_defer_initial_sink_epoch_for_artifact_recovery()
+        .unwrap());
+    db.release_coordinated_recovery_lifecycle();
+    db.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn startup_fence_invalidates_prior_clean_artifact_audit() {
     let (db, controller, _kv, _members, round, _manifest_store, proof, deployment_id) =
@@ -454,6 +480,7 @@ async fn startup_fence_invalidates_prior_clean_artifact_audit() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await
@@ -489,6 +516,7 @@ async fn mismatched_prestart_artifact_audit_falls_back_to_durable_inventory() {
                 pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
                 attempt: laminar_core::checkpoint::CheckpointAttempt::canonical(1),
                 assignment_fence: Some(round.assignment_fence),
+                sink_artifact_intent_protocol: true,
             },
         )
         .await

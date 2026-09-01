@@ -174,10 +174,30 @@ fn test_iceberg_sink_config_keys() {
         .map(|k| k.key.as_str())
         .collect();
     assert!(required.contains(&"catalog.uri"));
-    assert!(required.contains(&"warehouse"));
     assert!(required.contains(&"namespace"));
     assert!(required.contains(&"table.name"));
-    assert_eq!(required.len(), 4);
+    assert_eq!(required.len(), 3);
+
+    let optional: Vec<&str> = keys
+        .iter()
+        .filter(|key| !key.required)
+        .map(|key| key.key.as_str())
+        .collect();
+    for expected in [
+        "warehouse",
+        "catalog.warehouse",
+        "write.mode",
+        "target.file.size.bytes",
+        "parquet.row.group.size.bytes",
+        "max.buffer.bytes",
+        "max.open.partitions",
+        "max.descriptor.bytes",
+        "write.distribution.mode",
+        "schema.evolution.mode",
+        "storage.encryption",
+    ] {
+        assert!(optional.contains(&expected), "missing {expected}");
+    }
 }
 
 #[test]
@@ -189,10 +209,31 @@ fn test_iceberg_source_config_keys() {
         .map(|k| k.key.as_str())
         .collect();
     assert!(required.contains(&"catalog.uri"));
-    assert!(required.contains(&"warehouse"));
     assert!(required.contains(&"namespace"));
     assert!(required.contains(&"table.name"));
-    assert_eq!(required.len(), 4);
+    assert_eq!(required.len(), 3);
+
+    let optional: Vec<&str> = keys
+        .iter()
+        .filter(|key| !key.required)
+        .map(|key| key.key.as_str())
+        .collect();
+    for expected in [
+        "warehouse",
+        "catalog.warehouse",
+        "read.mode",
+        "read.bootstrap",
+        "start.snapshot.id",
+        "table.ref",
+        "poll.interval",
+        "projection",
+        "filter",
+        "read.max.manifest.list.bytes",
+        "read.max.manifest.bytes",
+        "read.max.manifests.per.snapshot",
+    ] {
+        assert!(optional.contains(&expected), "missing {expected}");
+    }
 }
 
 #[test]

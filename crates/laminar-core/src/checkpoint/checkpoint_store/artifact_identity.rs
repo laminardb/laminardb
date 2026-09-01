@@ -6,7 +6,8 @@ use crate::state::LOCAL_NODE_ID;
 
 use super::CheckpointStoreError;
 
-const CHECKPOINT_ARTIFACT_IDENTITY_VERSION: u32 = 1;
+const CHECKPOINT_ARTIFACT_IDENTITY_VERSION: u32 = 2;
+const CHECKPOINT_ARTIFACT_IDENTITY_VERSION_V1: u32 = 1;
 
 #[derive(serde::Serialize)]
 struct CheckpointArtifactIdentityPayload<'a> {
@@ -47,7 +48,11 @@ pub fn checkpoint_artifact_identity_sha256(
         Some(_) | None => {}
     }
     canonical_json_sha256(&CheckpointArtifactIdentityPayload {
-        version: CHECKPOINT_ARTIFACT_IDENTITY_VERSION,
+        version: if inventory.sink_artifact_intent_protocol {
+            CHECKPOINT_ARTIFACT_IDENTITY_VERSION
+        } else {
+            CHECKPOINT_ARTIFACT_IDENTITY_VERSION_V1
+        },
         inventory,
         chunk,
     })
