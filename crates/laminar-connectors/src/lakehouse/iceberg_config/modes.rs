@@ -147,7 +147,7 @@ string_enum! {
         /// Google Cloud Storage.
         Gcs => ["gcs", "gs"],
         /// Azure Data Lake Storage Gen2.
-        Azure => ["azure", "azdls", "abfs", "abfss"],
+        Azure => ["azure", "azdls", "adls", "blob", "abfs", "abfss", "wasb", "wasbs"],
         /// Local filesystem storage.
         Fs => ["fs", "file", "filesystem"]
     }

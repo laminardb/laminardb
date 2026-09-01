@@ -118,28 +118,28 @@ fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
 #[cfg(feature = "iceberg-storage-s3")]
 fn test_storage_factory_infers_s3_from_warehouse_url() {
     let f = unconfigured_storage_factory("s3://bucket/warehouse", &storage_config(None)).unwrap();
-    assert!(format!("{f:?}").contains("S3"));
+    assert!(format!("{f:?}").contains("OpenDalResolvingStorageFactory"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-s3")]
 fn test_storage_factory_infers_s3a_from_warehouse_url() {
     let f = unconfigured_storage_factory("s3a://bucket/warehouse", &storage_config(None)).unwrap();
-    assert!(format!("{f:?}").contains("S3"));
+    assert!(format!("{f:?}").contains("OpenDalResolvingStorageFactory"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-fs")]
 fn test_storage_factory_infers_fs_from_file_url() {
     let f = unconfigured_storage_factory("file:///tmp/warehouse", &storage_config(None)).unwrap();
-    assert!(format!("{f:?}").contains("Fs"));
+    assert!(format!("{f:?}").contains("OpenDalResolvingStorageFactory"));
 }
 
 #[test]
 #[cfg(feature = "iceberg-storage-gcs")]
 fn test_storage_factory_infers_gcs_from_gs_url() {
     let f = unconfigured_storage_factory("gs://bucket/warehouse", &storage_config(None)).unwrap();
-    assert!(format!("{f:?}").contains("Gcs"));
+    assert!(format!("{f:?}").contains("OpenDalResolvingStorageFactory"));
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn test_storage_factory_infers_azure_from_abfss_url() {
         &storage_config(None),
     )
     .unwrap();
-    assert!(format!("{f:?}").contains("Azdls"));
+    assert!(format!("{f:?}").contains("OpenDalResolvingStorageFactory"));
 }
 
 #[cfg(any(
@@ -208,7 +208,7 @@ fn test_storage_factory_bare_path_requires_explicit_storage_type() {
 fn test_storage_factory_explicit_overrides_inference() {
     // Lakekeeper-style: warehouse is a name, storage backend is S3.
     let f = unconfigured_storage_factory("demo", &storage_config(Some("s3"))).unwrap();
-    assert!(format!("{f:?}").contains("S3"));
+    assert!(format!("{f:?}").contains("BoundedStorageFactory"));
 }
 
 #[test]

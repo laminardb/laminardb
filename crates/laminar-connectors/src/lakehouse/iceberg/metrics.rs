@@ -1,8 +1,24 @@
 //! Low-cardinality Iceberg connector metrics.
 
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
+use tracing::info;
 
+use crate::lakehouse::iceberg_config::IcebergSinkConfig;
 use crate::prom::reg_or_local;
+
+pub(super) fn trace_sink_connected(config: &IcebergSinkConfig, namespace: &str, table: &str) {
+    info!(
+        operation_class = "connector-open",
+        storage_provider = %config.storage.diagnostic_provider(&config.catalog.warehouse),
+        storage_endpoint_class = %config.storage.diagnostic_endpoint_class(&config.catalog.warehouse),
+        storage_auth_source = %config.storage.diagnostic_auth_source(&config.catalog.warehouse),
+        request_timeout_ms = config.storage.request_timeout.as_millis(),
+        success = true,
+        namespace,
+        table,
+        "Iceberg sink connected"
+    );
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct IcebergMetrics {

@@ -20,18 +20,28 @@ use iceberg::io::{
     S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN, S3_SSE_KEY, S3_SSE_MD5,
 };
 use iceberg::{Error, ErrorKind, Result};
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::super::iceberg::capabilities::REST_REMOTE_SIGNING_ENABLED;
+use crate::storage::{StorageConsumer, StorageLocation};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+const MAX_DELETE_STREAM_OBJECTS: usize = 100_000;
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BoundedStorageFactory {
-    inner: OpenDalStorageFactory,
+    inner: OpenDalResolvingStorageFactory,
     connect_timeout: Duration,
     request_timeout: Duration,
     #[serde(default)]
-    locally_configured_sensitive: Vec<String>,
+    locally_configured_sensitive: Vec<SensitivePropertyFingerprint>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SensitivePropertyFingerprint {
+    property: String,
+    digest: [u8; 32],
 }
 
 const STORAGE_SENSITIVE_PROPERTIES: &[&str] = &[
@@ -66,17 +76,21 @@ pub(super) fn requests_remote_signing(property: &str, value: &str) -> bool {
 impl BoundedStorageFactory {
     #[cfg(any(test, feature = "iceberg-catalog-rest"))]
     pub(super) fn new(
-        inner: OpenDalStorageFactory,
+        inner: OpenDalResolvingStorageFactory,
         connect_timeout: Duration,
         request_timeout: Duration,
         configured_properties: &HashMap<String, String>,
     ) -> Self {
         let mut locally_configured_sensitive = configured_properties
-            .keys()
-            .filter(|key| is_sensitive_storage_property(key))
-            .cloned()
+            .iter()
+            .filter(|(key, _)| is_sensitive_storage_property(key))
+            .map(|(property, value)| SensitivePropertyFingerprint {
+                property: property.clone(),
+                digest: sensitive_property_digest(property, value),
+            })
             .collect::<Vec<_>>();
-        locally_configured_sensitive.sort_unstable();
+        locally_configured_sensitive
+            .sort_unstable_by(|left, right| left.property.cmp(&right.property));
         Self {
             inner,
             connect_timeout,
@@ -100,7 +114,7 @@ impl BoundedStorageFactory {
             config
                 .props()
                 .get(*property)
-                .is_some_and(|_| !self.was_configured_locally(property))
+                .is_some_and(|value| !self.was_configured_locally(property, value))
         }) {
             return Err(Error::new(
                 ErrorKind::FeatureUnsupported,
@@ -110,11 +124,37 @@ impl BoundedStorageFactory {
         Ok(())
     }
 
-    fn was_configured_locally(&self, property: &str) -> bool {
+    fn was_configured_locally(&self, property: &str, value: &str) -> bool {
+        let digest = sensitive_property_digest(property, value);
         self.locally_configured_sensitive
             .iter()
-            .any(|configured| configured == property)
+            .any(|configured| configured.property == property && configured.digest == digest)
     }
+}
+
+impl fmt::Debug for BoundedStorageFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let property_keys = self
+            .locally_configured_sensitive
+            .iter()
+            .map(|configured| configured.property.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("BoundedStorageFactory")
+            .field("inner", &self.inner)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("locally_configured_sensitive_keys", &property_keys)
+            .finish()
+    }
+}
+
+fn sensitive_property_digest(property: &str, value: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(property.len().to_le_bytes());
+    digest.update(property.as_bytes());
+    digest.update(value.as_bytes());
+    digest.finalize().into()
 }
 
 #[typetag::serde(name = "laminardb-bounded-opendal-factory-v1")]
@@ -134,7 +174,7 @@ impl StorageFactory for BoundedStorageFactory {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct BoundedStorage {
-    factory: OpenDalStorageFactory,
+    factory: OpenDalResolvingStorageFactory,
     config: StorageConfig,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -208,25 +248,44 @@ impl BoundedStorage {
             .run(future, self.initial_timeout(), self.request_timeout)
             .await
     }
+
+    fn canonical_path(path: &str) -> Result<String> {
+        if cfg!(test) && path.starts_with("memory://") {
+            return Ok(path.to_string());
+        }
+        StorageLocation::parse(path)
+            .and_then(|location| location.adapt(StorageConsumer::Iceberg))
+            .map(|adapted| adapted.url)
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("invalid Iceberg storage location: {error}"),
+                )
+            })
+    }
 }
 
 #[async_trait]
 #[typetag::serde(name = "laminardb-bounded-opendal-storage-v1")]
 impl Storage for BoundedStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
-        self.initial(self.storage()?.exists(path)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.exists(&path)).await
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
-        self.initial(self.storage()?.metadata(path)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.metadata(&path)).await
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
-        self.initial(self.storage()?.read(path)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.read(&path)).await
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
-        let reader = self.initial(self.storage()?.reader(path)).await?;
+        let path = Self::canonical_path(path)?;
+        let reader = self.initial(self.storage()?.reader(&path)).await?;
         Ok(Box::new(BoundedFileRead {
             inner: reader,
             initial_timeout: self.initial_timeout(),
@@ -237,11 +296,13 @@ impl Storage for BoundedStorage {
     }
 
     async fn write(&self, path: &str, bytes: Bytes) -> Result<()> {
-        self.initial(self.storage()?.write(path, bytes)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.write(&path, bytes)).await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
-        let writer = self.initial(self.storage()?.writer(path)).await?;
+        let path = Self::canonical_path(path)?;
+        let writer = self.initial(self.storage()?.writer(&path)).await?;
         Ok(Box::new(BoundedFileWrite {
             inner: writer,
             initial_timeout: self.initial_timeout(),
@@ -251,23 +312,42 @@ impl Storage for BoundedStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
-        self.initial(self.storage()?.delete(path)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.delete(&path)).await
     }
 
     async fn delete_prefix(&self, path: &str) -> Result<()> {
-        self.initial(self.storage()?.delete_prefix(path)).await
+        let path = Self::canonical_path(path)?;
+        self.initial(self.storage()?.delete_prefix(&path)).await
     }
 
-    async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
-        self.initial(self.storage()?.delete_stream(paths)).await
+    async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
+        let mut deleted = 0_usize;
+        while let Some(path) = futures_util::StreamExt::next(&mut paths).await {
+            if deleted == MAX_DELETE_STREAM_OBJECTS {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Iceberg delete stream exceeded its object safety bound",
+                ));
+            }
+            self.delete(&path).await?;
+            deleted += 1;
+        }
+        Ok(())
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
-        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        Ok(InputFile::new(
+            Arc::new(self.clone()),
+            Self::canonical_path(path)?,
+        ))
     }
 
     fn new_output(&self, path: &str) -> Result<OutputFile> {
-        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        Ok(OutputFile::new(
+            Arc::new(self.clone()),
+            Self::canonical_path(path)?,
+        ))
     }
 }
 
@@ -483,6 +563,27 @@ mod tests {
     }
 
     #[test]
+    fn rest_table_config_cannot_replace_a_local_credential_value() {
+        let properties = std::collections::HashMap::from([(
+            S3_SESSION_TOKEN.to_string(),
+            "local-session-token".to_string(),
+        )]);
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &properties,
+        );
+        let error = factory
+            .build(&StorageConfig::new().with_prop(S3_SESSION_TOKEN, "server-session-token"))
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED"));
+        assert!(!diagnostic.contains("local-session-token"));
+        assert!(!diagnostic.contains("server-session-token"));
+    }
+
+    #[test]
     fn remote_signing_fails_closed() {
         let factory = BoundedStorageFactory::new(
             test_factory(),
@@ -499,33 +600,26 @@ mod tests {
             .contains("LDB-ICEBERG-REMOTE-SIGNING-UNSUPPORTED"));
     }
 
-    fn test_factory() -> OpenDalStorageFactory {
-        #[cfg(feature = "iceberg-storage-fs")]
-        {
-            return OpenDalStorageFactory::Fs;
-        }
-        #[cfg(all(not(feature = "iceberg-storage-fs"), feature = "iceberg-storage-s3"))]
-        {
-            return OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
-            };
-        }
-        #[cfg(all(
-            not(feature = "iceberg-storage-fs"),
-            not(feature = "iceberg-storage-s3"),
-            feature = "iceberg-storage-gcs"
-        ))]
-        {
-            return OpenDalStorageFactory::Gcs;
-        }
-        #[cfg(all(
-            not(feature = "iceberg-storage-fs"),
-            not(feature = "iceberg-storage-s3"),
-            not(feature = "iceberg-storage-gcs"),
-            feature = "iceberg-storage-azure"
-        ))]
-        {
-            OpenDalStorageFactory::Azdls
-        }
+    #[test]
+    fn catalog_returned_paths_use_the_shared_provider_rules() {
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &std::collections::HashMap::new(),
+        );
+        let storage = factory.build(&StorageConfig::new()).unwrap();
+        let gcs = storage.new_input("gcs://bucket/path/data.parquet").unwrap();
+        assert_eq!(gcs.location(), "gs://bucket/path/data.parquet");
+
+        let error = storage
+            .new_input("s3n://bucket/path/data.parquet")
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported storage URL scheme"));
+        assert!(!error.to_string().contains("bucket/path"));
+    }
+
+    fn test_factory() -> OpenDalResolvingStorageFactory {
+        OpenDalResolvingStorageFactory::new()
     }
 }

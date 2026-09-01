@@ -19,7 +19,7 @@ use iceberg::{Catalog, TableIdent};
     feature = "iceberg-storage-fs"
 ))]
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
-use iceberg_storage_opendal::OpenDalStorageFactory;
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 
 #[cfg(feature = "iceberg-catalog-rest")]
 use super::iceberg_config::IcebergStorageEncryption;
@@ -27,6 +27,8 @@ use super::iceberg_config::IcebergStorageEncryption;
 use super::iceberg_config::IcebergStorageType;
 use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType, IcebergStorageConfig};
 use crate::error::ConnectorError;
+#[cfg(any(test, feature = "iceberg-catalog-rest"))]
+use crate::storage::{StorageLocation, StorageProvider};
 
 const COMPAT_SCAN_MAX_BATCHES: usize = 65_536;
 const COMPAT_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -143,9 +145,9 @@ pub(crate) fn external_error_summary(error: &iceberg::Error) -> String {
 
 mod table_creation;
 
-/// Selects the `OpenDalStorageFactory` for the table-data URLs the catalog
-/// will return. Explicit `storage.type` wins; otherwise inferred from the
-/// `s3://` / `s3a://` / `file://` warehouse URL.
+/// Selects storage capabilities for the table-data URLs the catalog returns.
+/// The resolving factory dispatches on each returned URL, while the configured
+/// type keeps feature-disabled failures deterministic before catalog I/O.
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn storage_factory(
     warehouse: &str,
@@ -172,19 +174,11 @@ fn storage_factory(
 
 #[cfg(any(test, feature = "iceberg-catalog-rest"))]
 fn infer_storage_type(warehouse: &str) -> Option<IcebergStorageType> {
-    if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
-        Some(IcebergStorageType::S3)
-    } else if warehouse.starts_with("gs://") || warehouse.starts_with("gcs://") {
-        Some(IcebergStorageType::Gcs)
-    } else if ["abfs://", "abfss://", "wasb://", "wasbs://"]
-        .iter()
-        .any(|prefix| warehouse.starts_with(prefix))
-    {
-        Some(IcebergStorageType::Azure)
-    } else if warehouse.starts_with("file://") {
-        Some(IcebergStorageType::Fs)
-    } else {
-        None
+    match StorageLocation::parse(warehouse).ok()?.provider {
+        StorageProvider::AwsS3 => Some(IcebergStorageType::S3),
+        StorageProvider::Gcs => Some(IcebergStorageType::Gcs),
+        StorageProvider::AzureAdls => Some(IcebergStorageType::Azure),
+        StorageProvider::Local => Some(IcebergStorageType::Fs),
     }
 }
 
@@ -196,9 +190,7 @@ fn s3_storage_factory(
     configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
-        OpenDalStorageFactory::S3 {
-            customized_credential_load: None,
-        },
+        OpenDalResolvingStorageFactory::new(),
         storage.connect_timeout,
         storage.request_timeout,
         configured_properties,
@@ -211,7 +203,7 @@ fn s3_storage_factory(
     _storage: &IcebergStorageConfig,
     _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Err(missing_storage_feature("s3", "iceberg-storage-s3"))
+    Err(missing_storage_feature("s3", "iceberg"))
 }
 
 #[cfg(feature = "iceberg-storage-gcs")]
@@ -222,7 +214,7 @@ fn gcs_storage_factory(
     configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
-        OpenDalStorageFactory::Gcs,
+        OpenDalResolvingStorageFactory::new(),
         storage.connect_timeout,
         storage.request_timeout,
         configured_properties,
@@ -235,7 +227,7 @@ fn gcs_storage_factory(
     _storage: &IcebergStorageConfig,
     _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Err(missing_storage_feature("gcs", "iceberg-storage-gcs"))
+    Err(missing_storage_feature("gcs", "iceberg-gcs"))
 }
 
 #[cfg(feature = "iceberg-storage-azure")]
@@ -246,7 +238,7 @@ fn azure_storage_factory(
     configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
-        OpenDalStorageFactory::Azdls,
+        OpenDalResolvingStorageFactory::new(),
         storage.connect_timeout,
         storage.request_timeout,
         configured_properties,
@@ -259,7 +251,7 @@ fn azure_storage_factory(
     _storage: &IcebergStorageConfig,
     _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Err(missing_storage_feature("azure", "iceberg-storage-azure"))
+    Err(missing_storage_feature("azure", "iceberg-azure"))
 }
 
 #[cfg(feature = "iceberg-storage-fs")]
@@ -270,7 +262,7 @@ fn fs_storage_factory(
     configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
     Ok(Arc::new(BoundedStorageFactory::new(
-        OpenDalStorageFactory::Fs,
+        OpenDalResolvingStorageFactory::new(),
         storage.connect_timeout,
         storage.request_timeout,
         configured_properties,

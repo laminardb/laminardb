@@ -567,6 +567,12 @@ impl SourceConnector for IcebergSource {
             }
             self.state = ConnectorState::Running;
             info!(
+                operation_class = "connector-open",
+                storage_provider = %self.config.storage.diagnostic_provider(&self.config.catalog.warehouse),
+                storage_endpoint_class = %self.config.storage.diagnostic_endpoint_class(&self.config.catalog.warehouse),
+                storage_auth_source = %self.config.storage.diagnostic_auth_source(&self.config.catalog.warehouse),
+                request_timeout_ms = self.config.storage.request_timeout.as_millis(),
+                success = true,
                 table = self.config.catalog.table_name,
                 namespace = self.config.catalog.namespace,
                 mode = %self.config.read_mode,
