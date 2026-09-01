@@ -1,13 +1,10 @@
 replicaCount: 1
 
 laminardb:
-  mode: embedded
+  mode: single
   logLevel: info
 
 persistence:
-  state:
-    enabled: true
-    size: 1Gi
   checkpoints:
     enabled: true
     size: 5Gi

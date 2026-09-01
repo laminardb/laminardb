@@ -1,0 +1,58 @@
+//! Write mode configuration for the `MongoDB` sink connector.
+//!
+//! Defines [`WriteMode`] which determines how incoming `RecordBatch` rows
+//! are translated into `MongoDB` write operations.
+
+use crate::error::ConnectorError;
+
+/// Write operation mode for the `MongoDB` sink.
+///
+/// Determines how incoming `RecordBatch` rows are translated into
+/// `MongoDB` write operations.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum WriteMode {
+    /// Append-only inserts using `insertOne` / `insertMany`.
+    #[default]
+    Insert,
+
+    /// Upsert by caller-supplied key fields. Uses `replaceOne` with
+    /// `upsert: true`, keyed by the specified fields.
+    Upsert {
+        /// Fields used to match existing documents for upsert.
+        key_fields: Vec<String>,
+    },
+
+    /// Routes operations based on the incoming event's `operationType`.
+    ///
+    /// Only valid for `LaminarEvent<MongoDbChangeEvent>` (CDC fan-out
+    /// replication). Maps operations as follows:
+    ///
+    /// - `insert` → idempotent `replaceOne(..., upsert: true)` by document key
+    /// - `update` → `updateOne` using `$set`/`$unset` from `updateDescription`
+    /// - `replace` → `replaceOne` with `upsert: true`
+    /// - `delete` → `deleteOne` using `documentKey._id`
+    /// - lifecycle and expanded events → rejected because a fixed destination cannot replay them
+    CdcReplay,
+}
+
+/// Validates that a write mode is compatible with time series collections.
+///
+/// Time series collections only accept `Insert`. Any other mode returns
+/// an error.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ConfigurationError` if the mode is not `Insert`.
+pub fn validate_timeseries_write_mode(mode: &WriteMode) -> Result<(), ConnectorError> {
+    if matches!(mode, WriteMode::Insert) {
+        Ok(())
+    } else {
+        Err(ConnectorError::ConfigurationError(format!(
+            "time series collections only support Insert write mode, got: {mode:?}"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests;

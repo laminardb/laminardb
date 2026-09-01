@@ -1,6 +1,4 @@
 //! FFI writer functions.
-//!
-//! Provides `extern "C"` wrappers for data ingestion operations.
 
 use std::ffi::{c_char, CStr};
 
@@ -20,7 +18,6 @@ pub struct LaminarWriter {
 }
 
 impl LaminarWriter {
-    /// Create from Writer.
     fn new(writer: Writer) -> Self {
         Self {
             inner: Some(writer),
@@ -30,21 +27,10 @@ impl LaminarWriter {
 
 /// Create a writer for a source.
 ///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `source_name` - Null-terminated source name
-/// * `out` - Pointer to receive writer handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `source_name` must be a valid null-terminated UTF-8 string
-/// * `out` must be a valid pointer
+/// `conn`, `source_name`, and `out` must be valid non-null pointers;
+/// `source_name` must be null-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_writer_create(
     conn: *mut LaminarConnection,
@@ -57,18 +43,15 @@ pub unsafe extern "C" fn laminar_writer_create(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: source_name is non-null (checked above)
     let Ok(name_str) = (unsafe { CStr::from_ptr(source_name) }).to_str() else {
         return LAMINAR_ERR_INVALID_UTF8;
     };
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.writer(name_str) {
         Ok(writer) => {
             let handle = Box::new(LaminarWriter::new(writer));
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -80,21 +63,11 @@ pub unsafe extern "C" fn laminar_writer_create(
     }
 }
 
-/// Write a record batch to the source.
-///
-/// # Arguments
-///
-/// * `writer` - Writer handle
-/// * `batch` - Record batch to write (ownership is transferred)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Write a record batch to the source. Ownership of `batch` is transferred.
 ///
 /// # Safety
 ///
-/// * `writer` must be a valid writer handle
-/// * `batch` must be a valid record batch handle (will be consumed)
+/// `writer` must be a valid writer handle; `batch` must be a valid non-null handle (consumed).
 #[no_mangle]
 pub unsafe extern "C" fn laminar_writer_write(
     writer: *mut LaminarWriter,
@@ -106,11 +79,9 @@ pub unsafe extern "C" fn laminar_writer_write(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: batch is non-null (checked above), take ownership
     let batch_box = unsafe { Box::from_raw(batch) };
     let record_batch = batch_box.into_inner();
 
-    // SAFETY: writer is non-null (checked above)
     let writer_ref = unsafe { &mut (*writer).inner };
 
     if let Some(w) = writer_ref.as_mut() {
@@ -130,14 +101,6 @@ pub unsafe extern "C" fn laminar_writer_write(
 
 /// Flush buffered data.
 ///
-/// # Arguments
-///
-/// * `writer` - Writer handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
 /// `writer` must be a valid writer handle.
@@ -149,7 +112,6 @@ pub unsafe extern "C" fn laminar_writer_flush(writer: *mut LaminarWriter) -> i32
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: writer is non-null (checked above)
     let writer_ref = unsafe { &mut (*writer).inner };
 
     if let Some(w) = writer_ref.as_mut() {
@@ -167,18 +129,7 @@ pub unsafe extern "C" fn laminar_writer_flush(writer: *mut LaminarWriter) -> i32
     }
 }
 
-/// Close the writer and release resources.
-///
-/// After calling this, the writer handle can still be freed with `laminar_writer_free`,
-/// but no more writes are allowed.
-///
-/// # Arguments
-///
-/// * `writer` - Writer handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Close the writer. The handle may still be freed with `laminar_writer_free` afterward.
 ///
 /// # Safety
 ///
@@ -191,7 +142,6 @@ pub unsafe extern "C" fn laminar_writer_close(writer: *mut LaminarWriter) -> i32
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: writer is non-null (checked above)
     let writer_ref = unsafe { &mut (*writer).inner };
 
     match writer_ref.take() {
@@ -203,18 +153,11 @@ pub unsafe extern "C" fn laminar_writer_close(writer: *mut LaminarWriter) -> i32
                 code
             }
         },
-        None => {
-            // Already closed, that's fine
-            LAMINAR_OK
-        }
+        None => LAMINAR_OK,
     }
 }
 
 /// Free a writer handle.
-///
-/// # Arguments
-///
-/// * `writer` - Writer handle to free
 ///
 /// # Safety
 ///
@@ -222,7 +165,6 @@ pub unsafe extern "C" fn laminar_writer_close(writer: *mut LaminarWriter) -> i32
 #[no_mangle]
 pub unsafe extern "C" fn laminar_writer_free(writer: *mut LaminarWriter) {
     if !writer.is_null() {
-        // SAFETY: writer is non-null and was allocated by Box
         drop(unsafe { Box::from_raw(writer) });
     }
 }

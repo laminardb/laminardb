@@ -48,12 +48,45 @@ laminardb.toml
 data/
 checkpoints/
 wal/
-/tools
+/tools/*
+!/tools/check_analytical_dependencies.py
+!/tools/independent-soak-contract/
+!/tools/kafka-transaction-probe/
+!/tools/readability-check/
+/tools/readability-check/Cargo.lock
+/tools/readability-check/target/
 
-# Private configs (symlinked from private repo)
+# Private configs and engineering context (linked from laminardb-claude-context)
 CLAUDE.md
+AGENTS.md
 .claude/
-docs/features/
-docs/research/
-docs/audits/
+docs/architecture/
 docs/adr/
+.desloppify/
+/examples/microstructure/target
+/examples/microstructure/Cargo.lock
+
+# Private internal docs (formerly a git submodule; kept local-only, untracked)
+/private/
+
+# Python artifacts (example clients)
+__pycache__/
+*.pyc
+/models
+.handoff.json
+agent_handoff.json
+.agent-rules.md
+agent_rules.md
+.subtask3-report.md
+/target_new
+
+# Machine-local cargo config (linker overrides etc.)
+/.cargo/config.toml
+
+# Vendored library packages use the workspace lockfile.
+/vendor/*/Cargo.lock
+/examples/binance-ws/target
+/examples/binance-ws/target/debug
+/examples/binance-ws/target
+/examples/binance-ws/target
+/examples/demo/target

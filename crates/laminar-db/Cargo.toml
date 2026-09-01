@@ -10,15 +10,26 @@ documentation = "https://laminardb.io/api/laminar_db"
 description = "Unified database facade for LaminarDB"
 
 [features]
-default = []
+default = [
+    "kafka",
+    "postgres-cdc",
+    "postgres-sink",
+    "delta-lake-all",
+    "websocket",
+    "mongodb-cdc",
+    "iceberg",
+    "parquet-lookup",
+    "files",
+    "otel",
+    "nats",
+]
 api = []  # FFI-friendly API module for language bindings
 ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
-kafka = ["laminar-connectors/kafka"]
+kafka = ["laminar-connectors/kafka", "dep:rdkafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]
 websocket = ["laminar-connectors/websocket"]
-mysql-cdc = ["laminar-connectors/mysql-cdc"]
 mongodb-cdc = ["laminar-connectors/mongodb-cdc"]
 iceberg = ["laminar-connectors/iceberg"]
 delta-lake-s3 = ["laminar-connectors/delta-lake-s3"]
@@ -29,17 +40,33 @@ delta-lake-glue = ["laminar-connectors/delta-lake-glue"]
 delta-lake-all = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue"]
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
-delta = ["laminar-core/delta"]
-io-uring = ["laminar-core/io-uring"]
-aws = ["laminar-storage/aws"]
-gcs = ["laminar-storage/gcs"]
-azure = ["laminar-storage/azure"]
+otel = ["laminar-connectors/otel"]
+nats = ["laminar-connectors/nats"]
+cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
+# Non-default visibility for Criterion targets that exercise private cluster data-plane paths.
+benchmark-internals = ["cluster"]
+aws = ["laminar-core/aws"]
+gcs = ["laminar-core/gcs"]
+azure = ["laminar-core/azure"]
+remote = ["dep:reqwest", "dep:governor"]
+local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.18.10" }
-laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.30.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.30.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false }
+
+# AI Inference Dependencies (Consolidated from laminar-ai)
+quick_cache = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+governor = { version = "0.8", optional = true }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = [
+    "tokio",
+    "rustls-tls",
+], optional = true }
 
 # Arrow
 arrow = { workspace = true }
@@ -51,26 +78,35 @@ arrow-schema = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
-
-# Arena allocator
-bumpalo = { workspace = true }
+datafusion-functions-aggregate-common = { workspace = true }
+datafusion-optimizer = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+# rkyv for operator checkpoint state. Hot-path structs (GroupCheckpoint,
+# JoinStateCheckpoint, etc.) carry Arrow IPC `Vec<u8>` blobs — serde_json
+# encoded each byte as a JSON decimal (3-4× size + per-byte format cost).
+# rkyv walks bytes raw and produces aligned archives; matches existing
+# convention (laminar-core uses it for NodeId, NodeInfo).
+rkyv = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # SQL parser (for AST type references)
 sqlparser = { workspace = true }
 
 # Async
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
+trait-variant = { workspace = true }
+indexmap = { workspace = true }
 futures = { workspace = true }
+crossfire = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
@@ -81,18 +117,48 @@ rustc-hash = { workspace = true }
 # Small-vec optimization for graph routing tables
 smallvec = { workspace = true }
 
-# Fast DoS-resistant hash map (for group-by keys from user SQL)
-ahash = { workspace = true }
-
 # Observability
 tracing = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
+
+# Zero-copy byte buffers used by checkpoint payloads.
+bytes = { workspace = true }
+
+uuid = { workspace = true }
+
+# Provider-neutral checkpoint data and decision metadata.
+object_store = { workspace = true }
+
+# Kafka producer/admin client used by `kafka_docker_scenarios.rs`.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10", features = ["testing"] }
+# Crypto-sentiment E2E: wiremock backs the Anthropic provider over HTTP (hyper,
+# no openssl); the `remote` feature exposes the real AnthropicProvider so the
+# test drives the actual HTTP path (request build, 500/retry, response parse).
+wiremock = "0.6"
+laminar-derive = { path = "../laminar-derive", version = "0.30.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
+bytes = { workspace = true }
+tracing-subscriber = { workspace = true }
+proptest = { workspace = true }
+# WebSocket stub server for the Bluesky e2e test (used only by the
+# websocket-gated test; no TLS so non-websocket dev builds stay openssl-free).
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3" }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# S3-compatible object store client used by the MinIO-backed integration
+# test. Workspace feature set + aws for the AmazonS3 builder.
+object_store = { workspace = true, features = ["aws"] }
 
 [[bench]]
 name = "recovery_bench"
@@ -101,3 +167,17 @@ harness = false
 [[bench]]
 name = "stream_executor_bench"
 harness = false
+
+[[bench]]
+name = "hot_path_micro"
+harness = false
+
+[[bench]]
+name = "cluster_subscription_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[test]]
+name = "kafka_docker_scenarios"
+path = "tests/kafka_docker_scenarios.rs"
+required-features = ["kafka"]

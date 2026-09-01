@@ -1,0 +1,13 @@
+name = "laminardb-chatbot"
+main = "worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Workers AI — for embedding queries at runtime (free tier)
+[ai]
+binding = "AI"
+
+# Vectorize — vector index (free: 5M vectors, 1M queries/month)
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "laminardb-docs"

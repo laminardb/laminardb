@@ -3,6 +3,11 @@
 # since the buffer lives in thread-local storage, not on the call stack.
 array-size-threshold = 131072
 
+# The default 16 KiB limit encourages per-await boxing in 16-33 KiB pipeline
+# and cluster-control futures. Avoid those extra allocations and review
+# composed future state when it exceeds 64 KiB.
+future-size-threshold = 65536
+
 # Prevent accidental use of std HashMap/HashSet on hot paths.
 #
 # Use `rustc_hash::FxHashMap` / `FxHashSet` for internal integer/string keys,

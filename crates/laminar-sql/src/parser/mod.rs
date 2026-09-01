@@ -7,10 +7,9 @@
 pub mod aggregation_parser;
 pub mod analytic_parser;
 mod continuous_query_parser;
+mod declare_parser;
 pub(crate) mod dialect;
 mod emit_parser;
-/// INTERVAL arithmetic rewriter for BIGINT timestamp columns
-pub mod interval_rewriter;
 pub mod join_parser;
 mod late_data_parser;
 /// Parser for CREATE/DROP LOOKUP TABLE DDL statements
@@ -19,14 +18,15 @@ pub mod order_analyzer;
 mod sink_parser;
 mod source_parser;
 mod statements;
+mod subscribe_parser;
 mod tokenizer;
 mod window_rewriter;
 
 pub use lookup_table::CreateLookupTableStatement;
 pub use statements::{
     AlterSourceOperation, CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy,
-    FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, WatermarkDef,
-    WindowFunction,
+    FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, SubscribeStatement,
+    WatermarkDef, WindowFunction,
 };
 pub use window_rewriter::WindowRewriter;
 
@@ -65,7 +65,6 @@ impl StreamingParser {
     /// # Errors
     ///
     /// Returns `ParserError` if the SQL syntax is invalid.
-    #[allow(clippy::too_many_lines)]
     pub fn parse_sql(sql: &str) -> Result<Vec<StreamingStatement>, sqlparser::parser::ParserError> {
         let sql_trimmed = sql.trim();
         if sql_trimmed.is_empty() {
@@ -76,159 +75,98 @@ impl StreamingParser {
 
         let dialect = LaminarDialect::default();
 
-        // Tokenize to detect statement type (with location for better errors)
         let tokens = sqlparser::tokenizer::Tokenizer::new(&dialect, sql_trimmed)
             .tokenize_with_location()
             .map_err(|e| {
                 sqlparser::parser::ParserError::ParserError(format!("Tokenization error: {e}"))
             })?;
+        let kind = detect_streaming_ddl(&tokens);
+        if kind == StreamingDdlKind::None {
+            return parse_standard_or_temporal_sql(&dialect, sql_trimmed, &tokens);
+        }
 
-        // Route based on token-level detection
-        match detect_streaming_ddl(&tokens) {
-            StreamingDdlKind::CreateSource { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let source = source_parser::parse_create_source(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![StreamingStatement::CreateSource(Box::new(source))])
-            }
-            StreamingDdlKind::CreateSink { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let sink = sink_parser::parse_create_sink(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![StreamingStatement::CreateSink(Box::new(sink))])
-            }
+        let mut parser =
+            sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+        let statement = match kind {
+            StreamingDdlKind::CreateSource { .. } => StreamingStatement::CreateSource(Box::new(
+                source_parser::parse_create_source(&mut parser)
+                    .map_err(parse_error_to_parser_error)?,
+            )),
+            StreamingDdlKind::CreateSink { .. } => StreamingStatement::CreateSink(Box::new(
+                sink_parser::parse_create_sink(&mut parser).map_err(parse_error_to_parser_error)?,
+            )),
             StreamingDdlKind::CreateContinuousQuery { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = continuous_query_parser::parse_continuous_query(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                continuous_query_parser::parse_continuous_query(&mut parser)
+                    .map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::DropSource { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_drop_source(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_drop_source(&mut parser).map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::DropSink { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_drop_sink(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_drop_sink(&mut parser).map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::DropMaterializedView { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_drop_materialized_view(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_drop_materialized_view(&mut parser).map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::ShowSources => {
-                Ok(vec![StreamingStatement::Show(ShowCommand::Sources)])
+            StreamingDdlKind::ShowSources => StreamingStatement::Show(ShowCommand::Sources),
+            StreamingDdlKind::ShowSinks => StreamingStatement::Show(ShowCommand::Sinks),
+            StreamingDdlKind::ShowQueries => StreamingStatement::Show(ShowCommand::Queries),
+            StreamingDdlKind::ShowMaterializedViews => {
+                StreamingStatement::Show(ShowCommand::MaterializedViews)
             }
-            StreamingDdlKind::ShowSinks => Ok(vec![StreamingStatement::Show(ShowCommand::Sinks)]),
-            StreamingDdlKind::ShowQueries => {
-                Ok(vec![StreamingStatement::Show(ShowCommand::Queries)])
-            }
-            StreamingDdlKind::ShowMaterializedViews => Ok(vec![StreamingStatement::Show(
-                ShowCommand::MaterializedViews,
-            )]),
             StreamingDdlKind::DescribeSource => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_describe(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_describe(&mut parser).map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::ExplainStreaming => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt =
-                    parse_explain(&mut parser, sql_trimmed).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_explain(&mut parser, sql_trimmed).map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::CreateMaterializedView { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_create_materialized_view(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_create_materialized_view(&mut parser, sql_trimmed)
+                    .map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::CreateStream { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_create_stream(&mut parser, sql_trimmed)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
-            }
+            StreamingDdlKind::CreateStream { .. } => parse_create_stream(&mut parser, sql_trimmed)
+                .map_err(parse_error_to_parser_error)?,
             StreamingDdlKind::DropStream { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_drop_stream(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_drop_stream(&mut parser).map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::ShowStreams => {
-                Ok(vec![StreamingStatement::Show(ShowCommand::Streams)])
-            }
-            StreamingDdlKind::ShowTables => Ok(vec![StreamingStatement::Show(ShowCommand::Tables)]),
+            StreamingDdlKind::ShowStreams => StreamingStatement::Show(ShowCommand::Streams),
+            StreamingDdlKind::ShowTables => StreamingStatement::Show(ShowCommand::Tables),
             StreamingDdlKind::CreateLookupTable { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let lt = lookup_table::parse_create_lookup_table(&mut parser)
-                    .map_err(parse_error_to_parser_error)?;
-                Ok(vec![StreamingStatement::CreateLookupTable(Box::new(lt))])
+                StreamingStatement::CreateLookupTable(Box::new(
+                    lookup_table::parse_create_lookup_table(&mut parser)
+                        .map_err(parse_error_to_parser_error)?,
+                ))
             }
             StreamingDdlKind::DropLookupTable { .. } => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
                 let (name, if_exists) = lookup_table::parse_drop_lookup_table(&mut parser)
                     .map_err(parse_error_to_parser_error)?;
-                Ok(vec![StreamingStatement::DropLookupTable {
-                    name,
-                    if_exists,
-                }])
+                StreamingStatement::DropLookupTable { name, if_exists }
             }
             StreamingDdlKind::AlterSource => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_alter_source(&mut parser).map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::ShowCheckpointStatus => Ok(vec![StreamingStatement::Show(
-                ShowCommand::CheckpointStatus,
-            )]),
+            StreamingDdlKind::ShowCheckpointStatus => {
+                StreamingStatement::Show(ShowCommand::CheckpointStatus)
+            }
             StreamingDdlKind::ShowCreateSource => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt =
-                    parse_show_create_source(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_show_create_source(&mut parser).map_err(parse_error_to_parser_error)?
             }
             StreamingDdlKind::ShowCreateSink => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt =
-                    parse_show_create_sink(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_show_create_sink(&mut parser).map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::Checkpoint => Ok(vec![StreamingStatement::Checkpoint]),
+            StreamingDdlKind::Checkpoint => StreamingStatement::Checkpoint,
+            StreamingDdlKind::Subscribe => StreamingStatement::Subscribe(Box::new(
+                subscribe_parser::parse_subscribe(&mut parser)
+                    .map_err(parse_error_to_parser_error)?,
+            )),
+            StreamingDdlKind::DeclareCursor => declare_parser::parse_declare_cursor(&mut parser)
+                .map_err(parse_error_to_parser_error)?,
             StreamingDdlKind::RestoreCheckpoint => {
-                let mut parser =
-                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt =
-                    parse_restore_checkpoint(&mut parser).map_err(parse_error_to_parser_error)?;
-                Ok(vec![stmt])
+                parse_restore_checkpoint(&mut parser).map_err(parse_error_to_parser_error)?
             }
-            StreamingDdlKind::None => {
-                // Standard SQL - check for INSERT INTO and convert
-                let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql_trimmed)?;
-                Ok(statements
-                    .into_iter()
-                    .map(convert_standard_statement)
-                    .collect())
-            }
-        }
+            StreamingDdlKind::None => unreachable!("handled before parser construction"),
+        };
+        Ok(vec![statement])
     }
 
     /// Check if an expression contains a window function.
@@ -264,6 +202,27 @@ impl StreamingParser {
     pub fn parse_late_data_clause(sql: &str) -> Result<Option<LateDataClause>, ParseError> {
         late_data_parser::parse_late_data_clause_from_sql(sql)
     }
+}
+
+fn parse_standard_or_temporal_sql(
+    dialect: &LaminarDialect,
+    sql: &str,
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> Result<Vec<StreamingStatement>, sqlparser::parser::ParserError> {
+    if let Some(parsed) =
+        join_parser::parse_temporal_probe_query(tokens).map_err(parse_error_to_parser_error)?
+    {
+        return Ok(vec![StreamingStatement::TemporalProbeQuery {
+            statement: Box::new(parsed.statement),
+            analysis: Box::new(parsed.analysis),
+        }]);
+    }
+
+    let statements = sqlparser::parser::Parser::parse_sql(dialect, sql)?;
+    Ok(statements
+        .into_iter()
+        .map(convert_standard_statement)
+        .collect())
 }
 
 /// Convert `ParseError` to `ParserError` for backward compatibility.
@@ -329,7 +288,7 @@ fn convert_standard_statement(stmt: sqlparser::ast::Statement) -> StreamingState
             // Try to extract VALUES rows from source query
             if let Some(ref source) = insert.source {
                 if let sqlparser::ast::SetExpr::Values(ref values) = *source.body {
-                    let rows: Vec<Vec<sqlparser::ast::Expr>> = values.rows.clone();
+                    let rows = values.rows.clone();
                     return StreamingStatement::InsertInto {
                         table_name,
                         columns,
@@ -443,7 +402,7 @@ fn parse_drop_materialized_view(
 /// Returns `ParseError` if the statement syntax is invalid.
 fn parse_create_stream(
     parser: &mut sqlparser::parser::Parser,
-    _original_sql: &str,
+    original_sql: &str,
 ) -> Result<StreamingStatement, ParseError> {
     parser
         .expect_keyword(sqlparser::keywords::Keyword::CREATE)
@@ -470,26 +429,44 @@ fn parse_create_stream(
         .expect_keyword(sqlparser::keywords::Keyword::AS)
         .map_err(ParseError::SqlParseError)?;
 
-    // Collect remaining tokens and split at EMIT boundary
+    // Collect remaining tokens, then peel off the optional trailing
+    // `WITH (...)` before splitting query / EMIT.
     let remaining = collect_remaining_tokens(parser);
-    let (query_tokens, emit_tokens) = split_at_emit(&remaining);
+    let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
+    let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
+    let raw_query_sql = query_body_sql(
+        original_sql,
+        &query_tokens,
+        &emit_tokens,
+        with_tokens.as_deref(),
+    );
 
     let stream_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let (query_stmt, normalized_temporal_sql) = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        (
+            StreamingStatement::TemporalProbeQuery {
+                statement: Box::new(parsed.statement),
+                analysis: Box::new(parsed.analysis),
+            },
+            Some(parsed.normalized_sql),
+        )
     } else {
         let mut query_parser = sqlparser::parser::Parser::new(&stream_dialect)
             .with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        (
+            StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query))),
+            None,
+        )
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -499,12 +476,124 @@ fn parse_create_stream(
         emit_parser::parse_emit_clause(&mut emit_parser)?
     };
 
+    let retention_bytes = match with_tokens {
+        None => None,
+        Some(tokens) => {
+            let mut with_parser =
+                sqlparser::parser::Parser::new(&stream_dialect).with_tokens_with_locations(tokens);
+            let opts = tokenizer::parse_with_options(&mut with_parser)?;
+            extract_retention_bytes(&opts)?
+        }
+    };
+
     Ok(StreamingStatement::CreateStream {
         name,
         query: Box::new(query_stmt),
         emit_clause,
         or_replace,
         if_not_exists,
+        query_sql,
+        retention_bytes,
+    })
+}
+
+/// Split off a trailing `WITH (` at depth 0. CTE-style `WITH ident AS (...)`
+/// is ignored because it's followed by an identifier, not `(`.
+fn split_off_trailing_with(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> (
+    Vec<sqlparser::tokenizer::TokenWithSpan>,
+    Option<Vec<sqlparser::tokenizer::TokenWithSpan>>,
+) {
+    use sqlparser::tokenizer::Token;
+    let mut depth: i32 = 0;
+    let mut last_with_idx: Option<usize> = None;
+    for (i, t) in tokens.iter().enumerate() {
+        match &t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Word(w) if depth == 0 && w.value.eq_ignore_ascii_case("WITH") => {
+                if matches!(tokens.get(i + 1).map(|t| &t.token), Some(Token::LParen)) {
+                    last_with_idx = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    match last_with_idx {
+        None => (tokens.to_vec(), None),
+        Some(i) => {
+            let mut head = tokens[..i].to_vec();
+            head.push(sqlparser::tokenizer::TokenWithSpan {
+                token: Token::EOF,
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            let tail = tokens[i..].to_vec();
+            (head, Some(tail))
+        }
+    }
+}
+
+/// Unknown keys are rejected so typos surface immediately.
+fn extract_retention_bytes(
+    opts: &std::collections::HashMap<String, String>,
+) -> Result<Option<u64>, ParseError> {
+    for key in opts.keys() {
+        if !key.eq_ignore_ascii_case("retain_history") {
+            return Err(ParseError::StreamingError(format!(
+                "unknown CREATE STREAM option '{key}' (expected RETAIN_HISTORY)"
+            )));
+        }
+    }
+    match opts
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retain_history"))
+    {
+        None => Ok(None),
+        Some((_, v)) => {
+            let bytes = lookup_table::ByteSize::parse(v)?;
+            Ok(Some(bytes.as_bytes()))
+        }
+    }
+}
+
+/// Slice `original_sql` from the first query token to whichever trailing
+/// clause comes next (`EMIT` or `WITH`), or end of input if neither is
+/// present. Preserves custom streaming syntax that sqlparser's AST would
+/// drop. Falls back to joining token text if spans are empty.
+pub(super) fn query_body_sql(
+    original_sql: &str,
+    query_tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    emit_tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    with_tokens: Option<&[sqlparser::tokenizer::TokenWithSpan]>,
+) -> String {
+    use sqlparser::tokenizer::Token;
+
+    let from_spans = || -> Option<String> {
+        let first = query_tokens
+            .iter()
+            .find(|t| !matches!(t.token, Token::EOF))?;
+        let start = location_to_byte_offset(original_sql, first.span.start)?;
+        let trailer_starts = [emit_tokens.first(), with_tokens.and_then(|t| t.first())]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| location_to_byte_offset(original_sql, t.span.start));
+        let end = trailer_starts.min().unwrap_or(original_sql.len());
+        let slice = original_sql.get(start..end)?;
+        Some(
+            slice
+                .trim_end_matches(|c: char| c.is_whitespace() || c == ';')
+                .to_string(),
+        )
+    };
+
+    from_spans().unwrap_or_else(|| {
+        query_tokens
+            .iter()
+            .take_while(|t| !matches!(t.token, Token::EOF))
+            .map(|t| t.token.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     })
 }
 
@@ -738,6 +827,7 @@ fn parse_explain(
 /// Returns `ParseError` if the statement syntax is invalid.
 fn parse_create_materialized_view(
     parser: &mut sqlparser::parser::Parser,
+    original_sql: &str,
 ) -> Result<StreamingStatement, ParseError> {
     parser
         .expect_keyword(sqlparser::keywords::Keyword::CREATE)
@@ -772,23 +862,34 @@ fn parse_create_materialized_view(
     // Collect remaining tokens and split at EMIT boundary (same strategy as continuous query)
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
+    let raw_query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
 
     let mv_dialect = LaminarDialect::default();
 
-    let query = if query_tokens.is_empty() {
+    let (query_stmt, normalized_temporal_sql) = if query_tokens.is_empty() {
         return Err(ParseError::StreamingError(
             "Expected SELECT query after AS".to_string(),
         ));
+    } else if let Some(parsed) = join_parser::parse_temporal_probe_query(&query_tokens)? {
+        (
+            StreamingStatement::TemporalProbeQuery {
+                statement: Box::new(parsed.statement),
+                analysis: Box::new(parsed.analysis),
+            },
+            Some(parsed.normalized_sql),
+        )
     } else {
         let mut query_parser =
             sqlparser::parser::Parser::new(&mv_dialect).with_tokens_with_locations(query_tokens);
-        query_parser
+        let query = query_parser
             .parse_query()
-            .map_err(ParseError::SqlParseError)?
+            .map_err(ParseError::SqlParseError)?;
+        (
+            StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query))),
+            None,
+        )
     };
-
-    let query_stmt =
-        StreamingStatement::Standard(Box::new(sqlparser::ast::Statement::Query(query)));
+    let query_sql = normalized_temporal_sql.unwrap_or(raw_query_sql);
 
     let emit_clause = if emit_tokens.is_empty() {
         None
@@ -804,7 +905,28 @@ fn parse_create_materialized_view(
         emit_clause,
         or_replace,
         if_not_exists,
+        query_sql,
     })
+}
+
+/// Byte offset in `sql` for a sqlparser `Location` (1-indexed line/column).
+fn location_to_byte_offset(sql: &str, loc: sqlparser::tokenizer::Location) -> Option<usize> {
+    if loc.line == 0 {
+        return None;
+    }
+    let (mut line, mut col) = (1u64, 1u64);
+    for (idx, ch) in sql.char_indices() {
+        if line == loc.line && col == loc.column {
+            return Some(idx);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line == loc.line && col == loc.column).then_some(sql.len())
 }
 
 /// Collect all remaining tokens from the parser into a Vec.
@@ -878,581 +1000,4 @@ pub enum ParseError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper to parse SQL and return the first statement.
-    fn parse_one(sql: &str) -> StreamingStatement {
-        let stmts = StreamingParser::parse_sql(sql).unwrap();
-        assert_eq!(stmts.len(), 1, "Expected exactly 1 statement");
-        stmts.into_iter().next().unwrap()
-    }
-
-    #[test]
-    fn test_parse_drop_source() {
-        let stmt = parse_one("DROP SOURCE events");
-        match stmt {
-            StreamingStatement::DropSource {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "events");
-                assert!(!if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_source_if_exists() {
-        let stmt = parse_one("DROP SOURCE IF EXISTS events");
-        match stmt {
-            StreamingStatement::DropSource {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "events");
-                assert!(if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_source_cascade() {
-        let stmt = parse_one("DROP SOURCE IF EXISTS events CASCADE");
-        match stmt {
-            StreamingStatement::DropSource {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "events");
-                assert!(if_exists);
-                assert!(cascade);
-            }
-            _ => panic!("Expected DropSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_sink() {
-        let stmt = parse_one("DROP SINK output");
-        match stmt {
-            StreamingStatement::DropSink {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "output");
-                assert!(!if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropSink, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_sink_if_exists() {
-        let stmt = parse_one("DROP SINK IF EXISTS output");
-        match stmt {
-            StreamingStatement::DropSink {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "output");
-                assert!(if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropSink, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_sink_cascade() {
-        let stmt = parse_one("DROP SINK output CASCADE");
-        match stmt {
-            StreamingStatement::DropSink {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "output");
-                assert!(!if_exists);
-                assert!(cascade);
-            }
-            _ => panic!("Expected DropSink, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_materialized_view() {
-        let stmt = parse_one("DROP MATERIALIZED VIEW live_stats");
-        match stmt {
-            StreamingStatement::DropMaterializedView {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert!(!if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_materialized_view_if_exists_cascade() {
-        let stmt = parse_one("DROP MATERIALIZED VIEW IF EXISTS live_stats CASCADE");
-        match stmt {
-            StreamingStatement::DropMaterializedView {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert!(if_exists);
-                assert!(cascade);
-            }
-            _ => panic!("Expected DropMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_show_sources() {
-        let stmt = parse_one("SHOW SOURCES");
-        assert!(matches!(
-            stmt,
-            StreamingStatement::Show(ShowCommand::Sources)
-        ));
-    }
-
-    #[test]
-    fn test_parse_show_sinks() {
-        let stmt = parse_one("SHOW SINKS");
-        assert!(matches!(stmt, StreamingStatement::Show(ShowCommand::Sinks)));
-    }
-
-    #[test]
-    fn test_parse_show_queries() {
-        let stmt = parse_one("SHOW QUERIES");
-        assert!(matches!(
-            stmt,
-            StreamingStatement::Show(ShowCommand::Queries)
-        ));
-    }
-
-    #[test]
-    fn test_parse_show_materialized_views() {
-        let stmt = parse_one("SHOW MATERIALIZED VIEWS");
-        assert!(matches!(
-            stmt,
-            StreamingStatement::Show(ShowCommand::MaterializedViews)
-        ));
-    }
-
-    #[test]
-    fn test_parse_describe() {
-        let stmt = parse_one("DESCRIBE events");
-        match stmt {
-            StreamingStatement::Describe { name, extended } => {
-                assert_eq!(name.to_string(), "events");
-                assert!(!extended);
-            }
-            _ => panic!("Expected Describe, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_describe_extended() {
-        let stmt = parse_one("DESCRIBE EXTENDED my_schema.events");
-        match stmt {
-            StreamingStatement::Describe { name, extended } => {
-                assert_eq!(name.to_string(), "my_schema.events");
-                assert!(extended);
-            }
-            _ => panic!("Expected Describe, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_explain_select() {
-        let stmt = parse_one("EXPLAIN SELECT * FROM events");
-        match stmt {
-            StreamingStatement::Explain {
-                statement, analyze, ..
-            } => {
-                assert!(matches!(*statement, StreamingStatement::Standard(_)));
-                assert!(!analyze);
-            }
-            _ => panic!("Expected Explain, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_explain_create_source() {
-        let stmt = parse_one("EXPLAIN CREATE SOURCE events (id BIGINT)");
-        match stmt {
-            StreamingStatement::Explain { statement, .. } => {
-                assert!(matches!(*statement, StreamingStatement::CreateSource(_)));
-            }
-            _ => panic!("Expected Explain wrapping CreateSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_explain_analyze_select() {
-        let stmt = parse_one("EXPLAIN ANALYZE SELECT * FROM events");
-        match stmt {
-            StreamingStatement::Explain {
-                statement, analyze, ..
-            } => {
-                assert!(matches!(*statement, StreamingStatement::Standard(_)));
-                assert!(analyze, "Expected analyze=true for EXPLAIN ANALYZE");
-            }
-            _ => panic!("Expected Explain, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_materialized_view() {
-        let stmt = parse_one("CREATE MATERIALIZED VIEW live_stats AS SELECT COUNT(*) FROM events");
-        match stmt {
-            StreamingStatement::CreateMaterializedView {
-                name,
-                emit_clause,
-                or_replace,
-                if_not_exists,
-                ..
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert!(emit_clause.is_none());
-                assert!(!or_replace);
-                assert!(!if_not_exists);
-            }
-            _ => panic!("Expected CreateMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_materialized_view_with_emit() {
-        let stmt = parse_one(
-            "CREATE MATERIALIZED VIEW live_stats AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE",
-        );
-        match stmt {
-            StreamingStatement::CreateMaterializedView {
-                name, emit_clause, ..
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
-            }
-            _ => panic!("Expected CreateMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_or_replace_materialized_view() {
-        let stmt = parse_one(
-            "CREATE OR REPLACE MATERIALIZED VIEW live_stats AS SELECT COUNT(*) FROM events",
-        );
-        match stmt {
-            StreamingStatement::CreateMaterializedView {
-                name,
-                or_replace,
-                if_not_exists,
-                ..
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert!(or_replace);
-                assert!(!if_not_exists);
-            }
-            _ => panic!("Expected CreateMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_materialized_view_if_not_exists() {
-        let stmt = parse_one(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS live_stats AS SELECT COUNT(*) FROM events",
-        );
-        match stmt {
-            StreamingStatement::CreateMaterializedView {
-                name,
-                or_replace,
-                if_not_exists,
-                ..
-            } => {
-                assert_eq!(name.to_string(), "live_stats");
-                assert!(!or_replace);
-                assert!(if_not_exists);
-            }
-            _ => panic!("Expected CreateMaterializedView, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_insert_into() {
-        let stmt = parse_one("INSERT INTO events (id, name) VALUES (1, 'test')");
-        match stmt {
-            StreamingStatement::InsertInto {
-                table_name,
-                columns,
-                values,
-            } => {
-                assert_eq!(table_name.to_string(), "events");
-                assert_eq!(columns.len(), 2);
-                assert_eq!(columns[0].to_string(), "id");
-                assert_eq!(columns[1].to_string(), "name");
-                assert_eq!(values.len(), 1);
-                assert_eq!(values[0].len(), 2);
-            }
-            _ => panic!("Expected InsertInto, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_insert_into_multiple_rows() {
-        let stmt = parse_one("INSERT INTO events VALUES (1, 'a'), (2, 'b'), (3, 'c')");
-        match stmt {
-            StreamingStatement::InsertInto {
-                table_name,
-                columns,
-                values,
-            } => {
-                assert_eq!(table_name.to_string(), "events");
-                assert!(columns.is_empty());
-                assert_eq!(values.len(), 3);
-            }
-            _ => panic!("Expected InsertInto, got {stmt:?}"),
-        }
-    }
-
-    // ── CREATE STREAM tests ─────────────────────────────
-
-    #[test]
-    fn test_parse_create_stream() {
-        let stmt = parse_one(
-            "CREATE STREAM session_activity AS SELECT session_id, COUNT(*) as cnt FROM clicks GROUP BY session_id",
-        );
-        match stmt {
-            StreamingStatement::CreateStream {
-                name,
-                or_replace,
-                if_not_exists,
-                emit_clause,
-                ..
-            } => {
-                assert_eq!(name.to_string(), "session_activity");
-                assert!(!or_replace);
-                assert!(!if_not_exists);
-                assert!(emit_clause.is_none());
-            }
-            _ => panic!("Expected CreateStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_or_replace_stream() {
-        let stmt = parse_one("CREATE OR REPLACE STREAM metrics AS SELECT AVG(value) FROM events");
-        match stmt {
-            StreamingStatement::CreateStream { or_replace, .. } => {
-                assert!(or_replace);
-            }
-            _ => panic!("Expected CreateStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_stream_if_not_exists() {
-        let stmt = parse_one("CREATE STREAM IF NOT EXISTS counts AS SELECT COUNT(*) FROM events");
-        match stmt {
-            StreamingStatement::CreateStream { if_not_exists, .. } => {
-                assert!(if_not_exists);
-            }
-            _ => panic!("Expected CreateStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_create_stream_with_emit() {
-        let stmt =
-            parse_one("CREATE STREAM windowed AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE");
-        match stmt {
-            StreamingStatement::CreateStream { emit_clause, .. } => {
-                assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
-            }
-            _ => panic!("Expected CreateStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_stream() {
-        let stmt = parse_one("DROP STREAM my_stream");
-        match stmt {
-            StreamingStatement::DropStream {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "my_stream");
-                assert!(!if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_stream_if_exists() {
-        let stmt = parse_one("DROP STREAM IF EXISTS my_stream");
-        match stmt {
-            StreamingStatement::DropStream {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "my_stream");
-                assert!(if_exists);
-                assert!(!cascade);
-            }
-            _ => panic!("Expected DropStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_stream_cascade() {
-        let stmt = parse_one("DROP STREAM my_stream CASCADE");
-        match stmt {
-            StreamingStatement::DropStream {
-                name,
-                if_exists,
-                cascade,
-            } => {
-                assert_eq!(name.to_string(), "my_stream");
-                assert!(!if_exists);
-                assert!(cascade);
-            }
-            _ => panic!("Expected DropStream, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_show_streams() {
-        let stmt = parse_one("SHOW STREAMS");
-        assert!(matches!(
-            stmt,
-            StreamingStatement::Show(ShowCommand::Streams)
-        ));
-    }
-
-    #[test]
-    fn test_parse_alter_source_add_column() {
-        let stmt = parse_one("ALTER SOURCE events ADD COLUMN new_col INT");
-        match stmt {
-            StreamingStatement::AlterSource { name, operation } => {
-                assert_eq!(name.to_string(), "events");
-                match operation {
-                    statements::AlterSourceOperation::AddColumn { column_def } => {
-                        assert_eq!(column_def.name.value, "new_col");
-                        assert_eq!(column_def.data_type, sqlparser::ast::DataType::Int(None));
-                    }
-                    statements::AlterSourceOperation::SetProperties { .. } => {
-                        panic!("Expected AddColumn")
-                    }
-                }
-            }
-            _ => panic!("Expected AlterSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_alter_source_set_properties() {
-        let stmt = parse_one("ALTER SOURCE events SET ('batch.size' = '1000', 'timeout' = '5s')");
-        match stmt {
-            StreamingStatement::AlterSource { name, operation } => {
-                assert_eq!(name.to_string(), "events");
-                match operation {
-                    statements::AlterSourceOperation::SetProperties { properties } => {
-                        assert_eq!(properties.get("batch.size"), Some(&"1000".to_string()));
-                        assert_eq!(properties.get("timeout"), Some(&"5s".to_string()));
-                    }
-                    statements::AlterSourceOperation::AddColumn { .. } => {
-                        panic!("Expected SetProperties")
-                    }
-                }
-            }
-            _ => panic!("Expected AlterSource, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_checkpoint() {
-        let stmt = parse_one("CHECKPOINT");
-        assert!(
-            matches!(stmt, StreamingStatement::Checkpoint),
-            "Expected Checkpoint, got {stmt:?}"
-        );
-    }
-
-    #[test]
-    fn test_parse_show_checkpoint_status() {
-        let stmt = parse_one("SHOW CHECKPOINT STATUS");
-        assert!(
-            matches!(
-                stmt,
-                StreamingStatement::Show(ShowCommand::CheckpointStatus)
-            ),
-            "Expected Show(CheckpointStatus), got {stmt:?}"
-        );
-    }
-
-    #[test]
-    fn test_parse_restore_checkpoint() {
-        let stmt = parse_one("RESTORE FROM CHECKPOINT 42");
-        match stmt {
-            StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
-                assert_eq!(checkpoint_id, 42);
-            }
-            _ => panic!("Expected RestoreCheckpoint, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_restore_checkpoint_large_id() {
-        let stmt = parse_one("RESTORE FROM CHECKPOINT 123456");
-        match stmt {
-            StreamingStatement::RestoreCheckpoint { checkpoint_id } => {
-                assert_eq!(checkpoint_id, 123_456);
-            }
-            _ => panic!("Expected RestoreCheckpoint, got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_show_create_source() {
-        let stmt = parse_one("SHOW CREATE SOURCE events");
-        match stmt {
-            StreamingStatement::Show(ShowCommand::CreateSource { name }) => {
-                assert_eq!(name.to_string(), "events");
-            }
-            _ => panic!("Expected Show(CreateSource), got {stmt:?}"),
-        }
-    }
-
-    #[test]
-    fn test_parse_show_create_sink() {
-        let stmt = parse_one("SHOW CREATE SINK output");
-        match stmt {
-            StreamingStatement::Show(ShowCommand::CreateSink { name }) => {
-                assert_eq!(name.to_string(), "output");
-            }
-            _ => panic!("Expected Show(CreateSink), got {stmt:?}"),
-        }
-    }
-}
+mod tests;

@@ -1,17 +1,11 @@
-//! SQL utility functions for multi-statement parsing and config variable substitution.
+//! SQL parsing utilities: statement splitting and config variable substitution.
 #![allow(clippy::disallowed_types)] // cold path
-
-use std::collections::HashMap;
 
 use sqlparser::dialect::GenericDialect;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::error::DbError;
 
-/// Build a byte-offset index for each line in `sql`.
-///
-/// Returns a `Vec` where entry `i` is the byte offset of the start of
-/// 1-based line `i+1`. Line 1 always starts at byte 0.
 fn build_line_starts(sql: &str) -> Vec<usize> {
     let mut starts = vec![0usize];
     for (i, b) in sql.bytes().enumerate() {
@@ -22,17 +16,11 @@ fn build_line_starts(sql: &str) -> Vec<usize> {
     starts
 }
 
-/// Convert a 1-based `(line, column)` from sqlparser's `Location` to a byte
-/// offset in `sql`.
-///
-/// sqlparser's `column` counts *characters* (via `Peekable<Chars>`), not
-/// bytes, so we walk with `char_indices()` for multi-byte correctness.
+// sqlparser's column counts characters, not bytes — walk with char_indices for multi-byte safety.
 fn location_to_byte_offset(sql: &str, line_starts: &[usize], line: u64, column: u64) -> usize {
     let line_idx = usize::try_from(line).unwrap_or(1).saturating_sub(1);
     let line_start = line_starts.get(line_idx).copied().unwrap_or(0);
-    let col_chars = usize::try_from(column).unwrap_or(1).saturating_sub(1); // 1-based → 0-based
-
-    // Walk `col_chars` characters from `line_start` to find the byte offset.
+    let col_chars = usize::try_from(column).unwrap_or(1).saturating_sub(1);
     sql[line_start..]
         .char_indices()
         .nth(col_chars)
@@ -41,13 +29,11 @@ fn location_to_byte_offset(sql: &str, line_starts: &[usize], line: u64, column: 
 
 /// Split a SQL string into individual statements on unquoted semicolons.
 ///
-/// Uses the sqlparser tokenizer to correctly handle quoted strings,
-/// single-line comments (`--`), and block comments (`/* ... */`).
-/// Empty statements (whitespace/comments only) are skipped.
+/// Uses the sqlparser tokenizer to handle quoted strings, line comments, and block comments.
+/// Empty statements are skipped.
 pub fn split_statements(sql: &str) -> Vec<&str> {
     let dialect = GenericDialect {};
-    // On tokenizer failure, return the whole string as one statement
-    // so that the downstream parser can produce a proper error.
+    // On tokenizer failure, return the whole string so the parser can emit the real error.
     let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() else {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
@@ -84,7 +70,6 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
         }
     }
 
-    // Trailing segment (no semicolon)
     if has_significant {
         let stmt = sql[seg_start..].trim();
         if !stmt.is_empty() {
@@ -95,68 +80,57 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     statements
 }
 
-/// Resolve `${VAR_NAME}` placeholders in a SQL string with values from the given map.
+/// Substitute `${VAR}` / `${VAR:-default}` placeholders via `lookup`; an unset
+/// name with no default is an error. (`$1`/`$$` don't match `${`.)
 ///
 /// # Errors
 ///
-/// Returns `DbError::InvalidOperation` if a referenced variable is not found
-/// and `strict` is true. In permissive mode (strict=false), unresolved
-/// variables are left as-is.
-pub fn resolve_config_vars(
+/// Returns `DbError::InvalidOperation` for an unresolved `${VAR}`.
+pub fn substitute_vars(
     sql: &str,
-    vars: &HashMap<String, String>,
-    strict: bool,
+    lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<String, DbError> {
-    let mut result = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
-            // Found ${
-            let start = i;
-            i += 2; // skip ${
-            let var_start = i;
-
-            // Find closing }
-            while i < len && bytes[i] != b'}' {
-                i += 1;
-            }
-
-            if i < len {
-                let var_name = &sql[var_start..i];
-                i += 1; // skip }
-
-                if let Some(value) = vars.get(var_name) {
-                    result.push_str(value);
-                } else if strict {
-                    return Err(DbError::InvalidOperation(format!(
-                        "Unresolved config variable: ${{{var_name}}}"
-                    )));
-                } else {
-                    // Permissive: leave as-is
-                    result.push_str(&sql[start..i]);
-                }
-            } else {
-                // No closing }, copy literal
-                result.push_str(&sql[start..]);
-            }
-        } else {
-            result.push(sql[i..].chars().next().unwrap());
-            i += sql[i..].chars().next().unwrap().len_utf8();
-        }
+    if !sql.contains("${") {
+        return Ok(sql.to_string());
     }
 
-    Ok(result)
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            let start = i;
+            i += 2;
+            let inner_start = i;
+            while i < bytes.len() && bytes[i] != b'}' {
+                i += 1;
+            }
+            if i == bytes.len() {
+                out.push_str(&sql[start..]); // unterminated — leave verbatim
+                break;
+            }
+            let (name, default) = sql[inner_start..i]
+                .split_once(":-")
+                .map_or((&sql[inner_start..i], None), |(n, d)| (n, Some(d)));
+            i += 1; // consume '}'
+            let value = lookup(name)
+                .or_else(|| default.map(str::to_string))
+                .ok_or_else(|| {
+                    DbError::InvalidOperation(format!("Unresolved variable: ${{{name}}}"))
+                })?;
+            out.push_str(&value);
+        } else {
+            let ch = sql[i..].chars().next().expect("char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok(out)
 }
-
-// -- SQL value extraction helpers ----------------------------------------
 
 /// Extract a string representation from a SQL expression.
 ///
-/// Handles literals, quoted strings, numbers, booleans, NULL, and
-/// unary minus (negative numbers).
+/// Handles literals, quoted strings, numbers, booleans, NULL, and unary minus.
 pub fn expr_to_string(expr: Option<&sqlparser::ast::Expr>) -> Option<String> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -177,7 +151,7 @@ pub fn expr_to_string(expr: Option<&sqlparser::ast::Expr>) -> Option<String> {
     }
 }
 
-/// Extract an `i64` from a SQL expression.
+/// Extract an `i64` from a SQL number literal or negated literal.
 pub fn expr_to_i64(expr: Option<&sqlparser::ast::Expr>) -> Option<i64> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -195,7 +169,7 @@ pub fn expr_to_i64(expr: Option<&sqlparser::ast::Expr>) -> Option<i64> {
     }
 }
 
-/// Extract an `f64` from a SQL expression.
+/// Extract an `f64` from a SQL number literal or negated literal.
 pub fn expr_to_f64(expr: Option<&sqlparser::ast::Expr>) -> Option<f64> {
     use sqlparser::ast::{Expr, UnaryOperator, Value};
 
@@ -213,7 +187,7 @@ pub fn expr_to_f64(expr: Option<&sqlparser::ast::Expr>) -> Option<f64> {
     }
 }
 
-/// Extract a `bool` from a SQL expression.
+/// Extract a `bool` from a SQL boolean literal.
 pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
     use sqlparser::ast::{Expr, Value};
 
@@ -227,16 +201,92 @@ pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
     }
 }
 
+/// Narrow `i64` SQL literals to a smaller signed Arrow type, erroring on overflow.
+fn narrow_i64_col<N: TryFrom<i64>>(
+    values: &[Vec<sqlparser::ast::Expr>],
+    col_idx: usize,
+    field: &arrow::datatypes::Field,
+    sql_ty: &str,
+) -> Result<Vec<Option<N>>, DbError> {
+    values
+        .iter()
+        .map(|row| {
+            expr_to_i64(row.get(col_idx))
+                .map(|v| {
+                    N::try_from(v).map_err(|_| {
+                        DbError::InsertError(format!(
+                            "literal {v} out of range for {sql_ty} column '{}'",
+                            field.name()
+                        ))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
+fn is_null_literal(expr: &sqlparser::ast::Expr) -> bool {
+    matches!(
+        expr,
+        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Null,
+            ..
+        })
+    )
+}
+
+fn validate_insert_literal(
+    expr: &sqlparser::ast::Expr,
+    field: &arrow::datatypes::Field,
+) -> Result<(), DbError> {
+    use arrow::datatypes::DataType;
+
+    if is_null_literal(expr) {
+        return if field.is_nullable() {
+            Ok(())
+        } else {
+            Err(DbError::InsertError(format!(
+                "column '{}' does not accept NULL",
+                field.name()
+            )))
+        };
+    }
+
+    let valid = match field.data_type() {
+        DataType::Boolean => expr_to_bool(Some(expr)).is_some(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            expr_to_i64(Some(expr)).is_some()
+        }
+        DataType::Float32 | DataType::Float64 => {
+            expr_to_f64(Some(expr)).is_some_and(f64::is_finite)
+        }
+        DataType::Utf8 => expr_to_string(Some(expr)).is_some(),
+        unsupported => {
+            return Err(DbError::InsertError(format!(
+                "INSERT VALUES does not support {unsupported} column '{}'",
+                field.name()
+            )));
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::InsertError(format!(
+            "literal {expr} is invalid for {} column '{}'",
+            field.data_type(),
+            field.name()
+        )))
+    }
+}
+
 /// Convert SQL `VALUES (...)` rows into an Arrow `RecordBatch`.
 ///
-/// Each inner `Vec<Expr>` is one row. Columns are matched positionally
-/// against the provided `schema`.
+/// Columns are matched positionally against `schema`.
 ///
 /// # Errors
 ///
-/// Returns `DbError::InsertError` if the batch cannot be constructed
-/// (e.g. column count mismatch).
-#[allow(clippy::cast_possible_truncation)] // SQL literal values converted to Arrow numeric types
+/// Returns `DbError::InsertError` if the batch cannot be constructed.
+#[allow(clippy::cast_possible_truncation)] // SQL float literals widened to Arrow f32
 pub fn sql_values_to_record_batch(
     schema: &arrow::datatypes::SchemaRef,
     values: &[Vec<sqlparser::ast::Expr>],
@@ -246,6 +296,20 @@ pub fn sql_values_to_record_batch(
         Int8Array, RecordBatch, StringArray,
     };
     use arrow::datatypes::DataType;
+
+    for (row_index, row) in values.iter().enumerate() {
+        if row.len() != schema.fields().len() {
+            return Err(DbError::InsertError(format!(
+                "VALUES row {} has {} expressions but the target schema has {} columns",
+                row_index + 1,
+                row.len(),
+                schema.fields().len()
+            )));
+        }
+        for (expr, field) in row.iter().zip(schema.fields()) {
+            validate_insert_literal(expr, field)?;
+        }
+    }
 
     let mut columns: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
@@ -259,25 +323,19 @@ pub fn sql_values_to_record_batch(
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Int8 => {
-                let arr: Int8Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i8))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int8Array::from(narrow_i64_col::<i8>(
+                    values, col_idx, field, "INT8",
+                )?)));
             }
             DataType::Int16 => {
-                let arr: Int16Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i16))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int16Array::from(
+                    narrow_i64_col::<i16>(values, col_idx, field, "INT16")?,
+                )));
             }
             DataType::Int32 => {
-                let arr: Int32Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i32))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int32Array::from(
+                    narrow_i64_col::<i32>(values, col_idx, field, "INT32")?,
+                )));
             }
             DataType::Int64 => {
                 let arr: Int64Array = values
@@ -287,10 +345,25 @@ pub fn sql_values_to_record_batch(
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Float32 => {
-                let arr: Float32Array = values
+                let vals = values
                     .iter()
-                    .map(|row| expr_to_f64(row.get(col_idx)).map(|v| v as f32))
-                    .collect();
+                    .map(|row| {
+                        expr_to_f64(row.get(col_idx))
+                            .map(|value| {
+                                let narrowed = value as f32;
+                                if narrowed.is_finite() {
+                                    Ok(narrowed)
+                                } else {
+                                    Err(DbError::InsertError(format!(
+                                        "literal {value} out of range for FLOAT column '{}'",
+                                        field.name()
+                                    )))
+                                }
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let arr = Float32Array::from(vals);
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Float64 => {
@@ -300,8 +373,7 @@ pub fn sql_values_to_record_batch(
                     .collect();
                 columns.push(std::sync::Arc::new(arr));
             }
-            _ => {
-                // For Utf8 and any other type, convert to string
+            DataType::Utf8 => {
                 let strs: Vec<Option<String>> = values
                     .iter()
                     .map(|row| expr_to_string(row.get(col_idx)))
@@ -309,18 +381,26 @@ pub fn sql_values_to_record_batch(
                 let arr: StringArray = strs.iter().map(|s| s.as_deref()).collect();
                 columns.push(std::sync::Arc::new(arr));
             }
+            unsupported => unreachable!("validated unsupported INSERT type {unsupported}"),
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| DbError::InsertError(format!("Failed to create RecordBatch: {e}")))
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| DbError::InsertError(format!("Failed to create RecordBatch: {e}")))?;
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if !field.is_nullable() && column.null_count() != 0 {
+            return Err(DbError::InsertError(format!(
+                "column '{}' does not accept NULL",
+                field.name()
+            )));
+        }
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── split_statements tests ──────────────────────────────────────
 
     #[test]
     fn test_single_statement() {
@@ -395,55 +475,106 @@ mod tests {
         assert!(stmts.is_empty());
     }
 
-    // ── resolve_config_vars tests ───────────────────────────────────
-
     #[test]
-    fn test_basic_substitution() {
-        let mut vars = HashMap::new();
-        vars.insert("KAFKA_BROKERS".to_string(), "localhost:9092".to_string());
-        let result =
-            resolve_config_vars("'bootstrap.servers' = '${KAFKA_BROKERS}'", &vars, true).unwrap();
-        assert_eq!(result, "'bootstrap.servers' = 'localhost:9092'");
+    fn int8_literal_out_of_range_is_an_error_not_a_silent_wrap() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let lit = |s: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(s)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, true)]));
+
+        // In range → Ok.
+        assert!(sql_values_to_record_batch(&schema, &[vec![lit("42")]]).is_ok());
+
+        // Out of i8 range → hard error (previously silently wrapped to 159i8).
+        let err = sql_values_to_record_batch(&schema, &[vec![lit("99999")]]).unwrap_err();
+        assert!(matches!(err, DbError::InsertError(_)));
     }
 
     #[test]
-    fn test_multiple_vars() {
-        let mut vars = HashMap::new();
-        vars.insert("HOST".to_string(), "localhost".to_string());
-        vars.insert("PORT".to_string(), "9092".to_string());
-        let result = resolve_config_vars("${HOST}:${PORT}", &vars, true).unwrap();
-        assert_eq!(result, "localhost:9092");
+    fn insert_values_require_exact_arity_and_valid_literals() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let lit = |sql: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+
+        for row in [vec![lit("1")], vec![lit("1"), lit("'ok'"), lit("2")]] {
+            let error = sql_values_to_record_batch(&schema, &[row]).unwrap_err();
+            assert!(matches!(error, DbError::InsertError(_)));
+        }
+
+        for row in [
+            vec![lit("NULL"), lit("'ok'")],
+            vec![lit("'not-an-integer'"), lit("'ok'")],
+            vec![lit("1 + 1"), lit("'ok'")],
+        ] {
+            let error = sql_values_to_record_batch(&schema, &[row]).unwrap_err();
+            assert!(matches!(error, DbError::InsertError(_)));
+        }
+
+        let batch = sql_values_to_record_batch(&schema, &[vec![lit("1"), lit("NULL")]]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
     }
 
     #[test]
-    fn test_missing_var_strict() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${MISSING}", &vars, true);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unresolved config variable"));
+    fn float32_overflow_is_rejected() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let value = Parser::new(&GenericDialect {})
+            .try_with_sql("3.5e38")
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float32,
+            false,
+        )]));
+        let error = sql_values_to_record_batch(&schema, &[vec![value]]).unwrap_err();
+        assert!(matches!(error, DbError::InsertError(_)));
     }
 
     #[test]
-    fn test_missing_var_permissive() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${MISSING}", &vars, false).unwrap();
-        assert_eq!(result, "${MISSING}");
+    fn substitute_resolves_named_and_default() {
+        let out = substitute_vars(
+            "brokers='${KAFKA_BROKERS}' group='${GROUP:-default-grp}'",
+            |n| (n == "KAFKA_BROKERS").then(|| "localhost:9092".to_string()),
+        )
+        .unwrap();
+        assert_eq!(out, "brokers='localhost:9092' group='default-grp'");
     }
 
     #[test]
-    fn test_no_vars_in_sql() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("SELECT 1", &vars, true).unwrap();
-        assert_eq!(result, "SELECT 1");
+    fn substitute_unresolved_without_default_is_error() {
+        let err = substitute_vars("${MISSING}", |_| None).unwrap_err();
+        assert!(err.to_string().contains("Unresolved variable"));
     }
 
     #[test]
-    fn test_unclosed_var() {
-        let vars = HashMap::new();
-        let result = resolve_config_vars("${UNCLOSED", &vars, false).unwrap();
-        assert_eq!(result, "${UNCLOSED");
+    fn substitute_ignores_non_placeholder_dollars() {
+        // `$1` params and `$$` quoting must pass through untouched.
+        let sql = "SELECT * FROM t WHERE id = $1 AND tag = $$x$$";
+        assert_eq!(substitute_vars(sql, |_| None).unwrap(), sql);
     }
 }

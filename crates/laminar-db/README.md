@@ -1,10 +1,6 @@
 # laminar-db
 
-Unified database facade for LaminarDB.
-
-## Overview
-
-`LaminarDB` lives here -- the main entry point that wires together the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry.
+Unified database facade for LaminarDB. The main entry point that wires the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry.
 
 ## Key Types
 
@@ -14,67 +10,21 @@ Unified database facade for LaminarDB.
 - **`QueryHandle`** -- Handle to a running streaming query with schema and subscription access.
 - **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
-- **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
+- **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump.
+- **`CheckpointCoordinator`** -- Seals source/operator state, records the exact durable decision, and hands coordinated external publication to the designated committer.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
-- **`Profile`** -- Deployment profile (InMemory, Durable, Delta).
+- **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Cluster`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
-- **`DbError`** -- Structured error type with `code()` returning stable `LDB-NNNN` codes and `is_transient()` for retry logic.
-
-## Usage
-
-```rust
-use laminar_db::LaminarDB;
-
-let db = LaminarDB::open()?;
-
-// Create a source
-db.execute("CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, ts BIGINT
-)").await?;
-
-// Create a continuous query
-db.execute("CREATE STREAM avg_price AS
-    SELECT symbol, AVG(price) AS avg
-    FROM trades
-    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
-").await?;
-
-// Push data
-let source = db.source_untyped("trades")?;
-
-// Start the pipeline
-db.start().await?;
-
-// Shutdown
-db.shutdown().await?;
-```
-
-### Using the Builder
-
-```rust
-let db = LaminarDB::builder()
-    .config_var("KAFKA_BROKERS", "localhost:9092")
-    .buffer_size(131_072)
-    .storage_dir("./data")
-    .profile(Profile::Durable)
-    .register_udf(my_scalar_udf)
-    .register_udaf(my_aggregate_udf)
-    .register_connector(|registry| {
-        registry.register_source("my-source", info, factory);
-    })
-    .build()
-    .await?;
-```
+- **`DbError`** -- Structured error type with stable `LDB-NNNN` codes.
 
 ## Architecture
 
-This crate sits at the top of the dependency graph, integrating all other LaminarDB crates:
+This crate sits at the top of the dependency graph, integrating other LaminarDB crates:
 
 ```
 laminar-db
-  |-- laminar-core        (Ring 0 engine)
+  |-- laminar-core        (operators, streaming channels, checkpoint barriers, storage)
   |-- laminar-sql         (SQL parsing + DataFusion)
-  |-- laminar-storage     (WAL + checkpointing)
   |-- laminar-connectors  (external connectors)
 ```
 
@@ -83,31 +33,27 @@ laminar-db
 | Flag | Purpose |
 |------|---------|
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
-| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface |
-| `jit` | Cranelift JIT compilation (forwards to laminar-core) |
+| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source |
+| `postgres-cdc` | PostgreSQL CDC source (also builds the standalone `postgres` lookup connector) |
 | `postgres-sink` | PostgreSQL sink |
+| `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake sink and source |
-| `durable` | Object-store checkpoint profiles |
+| `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
+| `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
+| `delta-lake-all` | All Delta Lake storage backends and catalogs |
+| `iceberg` | Apache Iceberg source and sink |
 | `websocket` | WebSocket source and sink connectors |
-| `mysql-cdc` | MySQL CDC source via binlog |
-| `delta` | Full distributed mode (Durable + gRPC + gossip + Raft) |
-
-## Internal Architecture
-
-### Ring 0 SQL Operator Routing
-
-The `core_window_state` module routes tumbling, hopping, and session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path. Detection is lazy on the first EOWC (Emit On Window Close) cycle, and non-qualifying queries fall through to `IncrementalEowcState` or raw-batch processing.
-
-### EOWC Incremental Accumulators
-
-The `eowc_state` module provides incremental per-window accumulators that maintain running aggregation state. This avoids re-scanning all records when a window closes, instead using the pre-computed accumulator values.
+| `files` | File source (AutoLoader) and sink (rolling files) |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
+| `otel` | OpenTelemetry OTLP/gRPC source |
+| `cluster` | Distributed mode with gRPC control plane, vnode state, and gossip/static discovery; ALO plus capability-gated EO. |
+| `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |
 
 ## Related Crates
 
-- [`laminar-core`](../laminar-core) -- Ring 0 engine (operators, state, streaming)
+- [`laminar-core`](../laminar-core) -- Operators, streaming channels, window assigners, checkpoint barriers, storage
 - [`laminar-sql`](../laminar-sql) -- SQL parser and DataFusion integration
-- [`laminar-storage`](../laminar-storage) -- WAL and checkpointing
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-derive`](../laminar-derive) -- Derive macros for typed data handling
+

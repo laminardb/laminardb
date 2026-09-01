@@ -1,6 +1,4 @@
-//! SHOW and DESCRIBE command builders for `LaminarDB`.
-//!
-//! Reopens `impl LaminarDB` to keep the main `db.rs` focused on dispatch.
+//! SHOW and DESCRIBE command builders; reopens `impl LaminarDB` to keep `db.rs` focused.
 
 use std::sync::Arc;
 
@@ -11,28 +9,32 @@ use crate::db::LaminarDB;
 use crate::error::DbError;
 
 impl LaminarDB {
-    /// Build a SHOW CHECKPOINT STATUS metadata result.
-    pub(crate) fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
-        let store = self.checkpoint_store();
-        let (latest, list) = match &store {
-            Some(s) => (s.load_latest().ok().flatten(), s.list().unwrap_or_default()),
-            None => (None, vec![]),
-        };
-
-        // Build single-row result with checkpoint metadata.
-        let (cp_id, epoch, ts_ms, sources, sinks, is_inc, total_checkpoints) =
-            if let Some(ref m) = latest {
-                (
-                    m.checkpoint_id,
-                    m.epoch,
-                    m.timestamp_ms,
-                    m.source_names.join(", "),
-                    m.sink_names.join(", "),
-                    m.is_incremental,
-                    list.len() as u64,
+    /// Build a SHOW CHECKPOINT STATUS metadata result. Public so the server's
+    /// `GET /api/v1/cluster/checkpoints` endpoint can surface it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be assembled.
+    pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
+        let coordinator = self.coordinator.lock().await;
+        let (cp_id, epoch, ts_ms, sources, sinks, completed_this_runtime) =
+            if let Some(coordinator) = coordinator.as_ref() {
+                let completed = coordinator.stats().completed;
+                coordinator.last_committed_manifest().map_or_else(
+                    || (0, 0, 0, String::new(), String::new(), completed),
+                    |manifest| {
+                        (
+                            manifest.checkpoint_id,
+                            manifest.epoch,
+                            manifest.timestamp_ms,
+                            manifest.source_names.join(", "),
+                            manifest.sink_names.join(", "),
+                            completed,
+                        )
+                    },
                 )
             } else {
-                (0, 0, 0, String::new(), String::new(), false, 0)
+                (0, 0, 0, String::new(), String::new(), 0)
             };
 
         let schema = Arc::new(Schema::new(vec![
@@ -41,8 +43,7 @@ impl LaminarDB {
             Field::new("timestamp_ms", DataType::UInt64, false),
             Field::new("sources", DataType::Utf8, false),
             Field::new("sinks", DataType::Utf8, false),
-            Field::new("is_incremental", DataType::Boolean, false),
-            Field::new("total_checkpoints", DataType::UInt64, false),
+            Field::new("completed_this_runtime", DataType::UInt64, false),
         ]));
 
         RecordBatch::try_new(
@@ -53,8 +54,7 @@ impl LaminarDB {
                 Arc::new(UInt64Array::from(vec![ts_ms])),
                 Arc::new(StringArray::from(vec![sources.as_str()])),
                 Arc::new(StringArray::from(vec![sinks.as_str()])),
-                Arc::new(BooleanArray::from(vec![is_inc])),
-                Arc::new(UInt64Array::from(vec![total_checkpoints])),
+                Arc::new(UInt64Array::from(vec![completed_this_runtime])),
             ],
         )
         .map_err(|e| DbError::Checkpoint(format!("failed to build checkpoint status batch: {e}")))
@@ -67,9 +67,10 @@ impl LaminarDB {
         let mut sqls = Vec::new();
         let mut states = Vec::new();
         for view in registry.views() {
-            names.push(view.name.clone());
-            sqls.push(view.sql.clone());
-            states.push(format!("{:?}", view.state));
+            let info = crate::handle::MaterializedViewInfo::from(view);
+            names.push(info.name);
+            sqls.push(info.sql);
+            states.push(info.state);
         }
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
         let sqls_ref: Vec<&str> = sqls.iter().map(String::as_str).collect();
@@ -144,7 +145,6 @@ impl LaminarDB {
 
         for s in &sinks {
             names.push(s.name.as_str());
-            // Input comes from catalog (always registered), connector metadata from ConnectorManager
             let catalog_input = self.catalog.get_sink_input(&s.name);
             if let Some(reg) = regs.get(&s.name) {
                 inputs.push(Some(reg.input.clone()));
@@ -317,13 +317,10 @@ impl LaminarDB {
 
     /// Build a DESCRIBE result.
     pub(crate) fn build_describe(&self, name: &str) -> Result<RecordBatch, DbError> {
-        // Try sources first
         let schema = if let Some(s) = self.catalog.describe_source(name) {
             s
-        // Then reference/dimension tables
         } else if let Some(s) = self.table_store.read().table_schema(name) {
             s
-        // Then materialized views
         } else if let Some(s) = self
             .mv_registry
             .lock()
@@ -331,12 +328,10 @@ impl LaminarDB {
             .map(|mv| mv.schema.clone())
         {
             s
-        // Then check sinks (no schema, but confirm existence)
         } else if self.catalog.list_sinks().contains(&name.to_string()) {
             return Err(DbError::InvalidOperation(
                 "DESCRIBE is not supported for sinks. Use SHOW SINKS for details.".to_string(),
             ));
-        // Then streams (no stored schema yet)
         } else if self.catalog.list_streams().contains(&name.to_string()) {
             return Err(DbError::InvalidOperation(format!(
                 "Stream '{name}' exists but schema is only available after pipeline start"

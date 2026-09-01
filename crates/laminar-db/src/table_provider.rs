@@ -1,12 +1,5 @@
-//! Live `DataFusion` table providers for `TableStore` and streaming sources.
-//!
-//! [`ReferenceTableProvider`] reads directly from the `TableStore` on each
-//! `scan()` call, so queries always see the latest data without re-registration.
-//!
-//! [`SourceSnapshotProvider`] serves point-in-time snapshots of buffered
-//! source data, enabling `SELECT * FROM source` on streaming sources.
+//! `DataFusion` table providers for `TableStore`, streaming sources, and materialized views.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -18,12 +11,10 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::catalog::SourceEntry;
+use crate::mv_store::MvStore;
 use crate::table_store::TableStore;
 
-/// A `DataFusion` table provider that reads live data from `TableStore`.
-///
-/// Registered once at CREATE TABLE time and never needs re-registration —
-/// each `scan()` fetches the current snapshot from the backing store.
+/// Live `DataFusion` table provider over `TableStore`; each `scan()` sees the current snapshot.
 pub(crate) struct ReferenceTableProvider {
     table_name: String,
     schema: SchemaRef,
@@ -31,7 +22,6 @@ pub(crate) struct ReferenceTableProvider {
 }
 
 impl ReferenceTableProvider {
-    /// Create a new provider for the given table.
     pub fn new(
         table_name: String,
         schema: SchemaRef,
@@ -47,7 +37,7 @@ impl ReferenceTableProvider {
 
 #[async_trait]
 impl TableProvider for ReferenceTableProvider {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -70,6 +60,7 @@ impl TableProvider for ReferenceTableProvider {
             .table_store
             .read()
             .to_record_batch(&self.table_name)
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
         let schema = batch.schema();
@@ -93,25 +84,14 @@ impl std::fmt::Debug for ReferenceTableProvider {
     }
 }
 
-/// A `DataFusion` table provider that serves point-in-time snapshots of a
-/// streaming source's buffered data.
-///
-/// Registered at `CREATE SOURCE` time. Each `scan()` reads the current
-/// snapshot from `SourceEntry::snapshot()` and distributes batches
-/// round-robin across `num_partitions` partitions to enable parallel
-/// query execution.
+/// Point-in-time snapshot provider for a streaming source's buffered data.
 pub(crate) struct SourceSnapshotProvider {
     source_entry: Arc<SourceEntry>,
     num_partitions: usize,
 }
 
 impl SourceSnapshotProvider {
-    /// Create a new provider backed by the given source entry.
-    ///
-    /// # Arguments
-    ///
-    /// * `source_entry` - The source entry to snapshot
-    /// * `num_partitions` - Number of partitions for parallel scans (clamped to 1..=256)
+    /// `num_partitions` is clamped to `1..=256`.
     pub fn new(source_entry: Arc<SourceEntry>, num_partitions: usize) -> Self {
         Self {
             source_entry,
@@ -122,7 +102,7 @@ impl SourceSnapshotProvider {
 
 #[async_trait]
 impl TableProvider for SourceSnapshotProvider {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -144,12 +124,9 @@ impl TableProvider for SourceSnapshotProvider {
         let batches = self.source_entry.snapshot();
         let schema = self.source_entry.schema.clone();
         let data = if batches.is_empty() {
-            // Produce the right number of (empty) partitions
             (0..self.num_partitions).map(|_| Vec::new()).collect()
         } else {
-            // Distribute batches round-robin across partitions.
-            // Assumes roughly uniform batch sizes; skew is acceptable
-            // for ad-hoc snapshot queries (not on the streaming hot path).
+            // Round-robin distribution; skew is fine for ad-hoc snapshot queries.
             let mut partitions: Vec<Vec<_>> =
                 (0..self.num_partitions).map(|_| Vec::new()).collect();
             for (i, batch) in batches.into_iter().enumerate() {
@@ -167,6 +144,77 @@ impl std::fmt::Debug for SourceSnapshotProvider {
         f.debug_struct("SourceSnapshotProvider")
             .field("source", &self.source_entry.name)
             .field("num_partitions", &self.num_partitions)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `DataFusion` table provider for materialized view results.
+pub(crate) struct MvTableProvider {
+    mv_name: String,
+    schema: SchemaRef,
+    mv_store: Arc<parking_lot::RwLock<MvStore>>,
+}
+
+impl MvTableProvider {
+    pub fn new(
+        mv_name: String,
+        schema: SchemaRef,
+        mv_store: Arc<parking_lot::RwLock<MvStore>>,
+    ) -> Self {
+        Self {
+            mv_name,
+            schema,
+            mv_store,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for MvTableProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
+        let batch = self
+            .mv_store
+            .read()
+            .to_record_batch(&self.mv_name)
+            .map_err(|e| DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name)))?
+            .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
+
+        let schema = batch.schema();
+        let data = if batch.num_rows() > 0 {
+            vec![vec![batch]]
+        } else {
+            vec![vec![]]
+        };
+
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, data)?;
+        mem_table.scan(state, projection, filters, limit).await
+    }
+}
+
+impl std::fmt::Debug for MvTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvTableProvider")
+            .field("mv_name", &self.mv_name)
+            .field("schema", &self.schema)
             .finish_non_exhaustive()
     }
 }

@@ -3,42 +3,36 @@
 
 CREATE SINK ohlc_output FROM ohlc_bars
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'ohlc-bars',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'ohlc-bars'
+) FORMAT JSON;
 
 CREATE SINK volume_output FROM volume_metrics
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'volume-metrics',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'volume-metrics'
+) FORMAT JSON;
 
 CREATE SINK anomaly_output FROM anomaly_alerts
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'anomaly-alerts',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'anomaly-alerts'
+) FORMAT JSON;
 
 CREATE SINK imbalance_output FROM book_imbalance
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'book-imbalance',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'book-imbalance'
+) FORMAT JSON;
 
 CREATE SINK spread_output FROM spread_metrics
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'spread-metrics',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'spread-metrics'
+) FORMAT JSON;
 
 CREATE SINK depth_output FROM depth_metrics
 INTO KAFKA (
-    brokers = '${KAFKA_BROKERS}',
-    topic = 'depth-metrics',
-    format = 'json'
-);
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
+    topic = 'depth-metrics'
+) FORMAT JSON;

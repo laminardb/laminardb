@@ -5,38 +5,26 @@
 
 /// Analytic window function operator configuration builder
 pub mod analytic_translator;
-/// DAG EXPLAIN formatter
-pub mod dag_planner;
-/// HAVING clause filter configuration
-pub mod having_translator;
 mod join_translator;
 /// ORDER BY operator configuration builder
 pub mod order_translator;
 /// Streaming DDL (CREATE SOURCE/SINK) translator
 pub mod streaming_ddl;
-/// Temporal probe join configuration
-pub mod temporal_probe;
 mod window_translator;
 
 pub use crate::parser::order_analyzer::RankType;
+pub use crate::temporal::{TemporalJoinKind, TemporalProbeSchedule};
 pub use analytic_translator::{
     AnalyticFunctionConfig, AnalyticWindowConfig, WindowFrameConfig, WindowFrameFunctionConfig,
 };
-pub use dag_planner::{format_dag_explain, DagExplainOutput};
-pub use having_translator::HavingFilterConfig;
 pub use join_translator::{
-    AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
-    LookupJoinType, StreamJoinConfig, StreamJoinType, TemporalJoinTranslatorConfig,
-};
-pub use laminar_core::streaming::config::{
-    BackpressureStrategy as StreamingBackpressure, WaitStrategy as StreamingWaitStrategy,
+    JoinOperatorConfig, LookupJoinConfig, LookupJoinType, StreamJoinConfig,
+    TemporalJoinTranslatorConfig,
 };
 pub use order_translator::{
     OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig, WindowLocalSortConfig,
 };
 pub use streaming_ddl::{
-    sql_type_to_arrow, ColumnDefinition, SinkDefinition, SourceConfigOptions, SourceDefinition,
-    WatermarkSpec,
+    sql_type_to_arrow, ColumnDefinition, SourceConfigOptions, SourceDefinition, WatermarkSpec,
 };
-pub use temporal_probe::{parse_interval_to_ms, ProbeOffsetSpec, TemporalProbeConfig};
 pub use window_translator::{WindowOperatorConfig, WindowType};

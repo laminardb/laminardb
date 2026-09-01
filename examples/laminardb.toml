@@ -1,24 +1,17 @@
-# LaminarDB Server Configuration — Embedded Mode (single node, in-process)
+# LaminarDB standalone single-node server configuration
 #
 # Start with:
 #   cargo run -p laminar-server -- --config examples/laminardb.toml
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
-metrics_bind = "127.0.0.1:9090"
-workers = 0           # auto-detect CPU count
-log_level = "info"
-
-[state]
-backend = "memory"
-path = "./data/state"
+delivery = "at_least_once"
 
 [checkpoint]
+# Provider-neutral object_store URL: file://, s3:// (including R2/MinIO), gs://, or az://.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "10s"
-mode = "aligned"
-snapshot_strategy = "full"
 
 # ── Sources ─────────────────────────────────────────────────────────────
 
@@ -93,7 +86,6 @@ EMIT AFTER WATERMARK
 name = "vwap_to_kafka"
 pipeline = "vwap_1m"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 "bootstrap.servers" = "${KAFKA_BROKERS:-localhost:9092}"
 topic = "vwap_results"

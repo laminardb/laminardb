@@ -23,41 +23,9 @@ use super::source::{SortColumn, StreamSource};
 /// Default channel capacity for the stream source.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
-/// A streaming source that receives data through a channel.
-///
-/// This is the primary integration point between `LaminarDB`'s push-based
-/// Reactor and `DataFusion`'s pull-based query execution. Data is pushed
-/// into the source via `BridgeSender`, and `DataFusion` pulls it through
-/// the stream.
-///
-/// # Important Usage Pattern
-///
-/// The sender must be taken (not cloned) to ensure proper channel closure:
-///
-/// ```rust,ignore
-/// // Create the source and take the sender
-/// let source = ChannelStreamSource::new(schema);
-/// let sender = source.take_sender().expect("sender available");
-///
-/// // Register with `DataFusion`
-/// let provider = StreamingTableProvider::new("events", Arc::new(source));
-/// ctx.register_table("events", Arc::new(provider))?;
-///
-/// // Push data from Reactor
-/// sender.send(batch).await?;
-///
-/// // IMPORTANT: Drop the sender to close the channel before querying
-/// drop(sender);
-///
-/// // Execute query
-/// let df = ctx.sql("SELECT * FROM events").await?;
-/// let results = df.collect().await?;
-/// ```
-///
-/// # Thread Safety
-///
-/// The source is thread-safe and can be shared across threads. The sender
-/// can be cloned after being taken to allow multiple producers.
+/// Bridges LaminarDB's push-based Reactor and DataFusion's pull-based
+/// query execution. The sender is `take`-once (not cloned) so dropping
+/// it closes the channel and lets the query terminate.
 pub struct ChannelStreamSource {
     /// Schema of the data
     schema: SchemaRef,
@@ -73,21 +41,12 @@ pub struct ChannelStreamSource {
 
 impl ChannelStreamSource {
     /// Creates a new channel stream source with default capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
         Self::with_capacity(schema, DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Creates a new channel stream source with specified capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
-    /// * `capacity` - Maximum number of batches that can be buffered
+    /// Creates a new channel stream source with the given channel capacity.
     #[must_use]
     pub fn with_capacity(schema: SchemaRef, capacity: usize) -> Self {
         let bridge = StreamBridge::new(Arc::clone(&schema), capacity);
@@ -102,13 +61,8 @@ impl ChannelStreamSource {
     }
 
     /// Declares that this source produces data in the given sort order.
-    ///
     /// When set, `DataFusion` can elide `SortExec` for ORDER BY queries
     /// that match the declared ordering.
-    ///
-    /// # Arguments
-    ///
-    /// * `ordering` - The columns that the output is sorted by
     #[must_use]
     pub fn with_ordering(mut self, ordering: Vec<SortColumn>) -> Self {
         self.ordering = Some(ordering);

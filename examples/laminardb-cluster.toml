@@ -1,0 +1,67 @@
+# LaminarDB Server Configuration — Cluster Mode (multi-node distributed)
+#
+# Each node in the cluster runs with its own copy of this config file,
+# with a unique node_id.
+#
+# Start with:
+#   laminardb --config laminardb-cluster.toml
+
+node_id = "star-1"
+
+[server]
+mode = "cluster"
+bind = "0.0.0.0:8080"
+delivery = "at_least_once"
+key_groups = 256
+
+[checkpoint]
+url = "s3://laminardb-checkpoints/prod"
+interval = "30s"
+
+[discovery]
+strategy = "static"
+seeds = [
+    "star-1.laminardb.svc:7946",
+    "star-2.laminardb.svc:7946",
+    "star-3.laminardb.svc:7946",
+]
+gossip_port = 7946
+# Optional barrier/shuffle mTLS. Uncomment all four fields together.
+# Protect Chitchat gossip separately at the network layer.
+# cluster_tls_cert = "${LAMINAR_CLUSTER_TLS_CERT}"
+# cluster_tls_key = "${LAMINAR_CLUSTER_TLS_KEY}"
+# cluster_tls_client_ca = "${LAMINAR_CLUSTER_TLS_CLIENT_CA}"
+# cluster_tls_server_name = "${LAMINAR_CLUSTER_TLS_SERVER_NAME}"
+
+# ── Sources ─────────────────────────────────────────────────────────────
+
+[[source]]
+name = "orders"
+connector = "kafka"
+format = "avro"
+[source.properties]
+"bootstrap.servers" = "${KAFKA_BROKERS}"
+topic = "orders"
+"group.id" = "laminardb-orders"
+"schema.registry.url" = "${SCHEMA_REGISTRY_URL}"
+
+# ── Pipelines ───────────────────────────────────────────────────────────
+
+[[pipeline]]
+name = "order_enrichment"
+sql = """
+SELECT o.*, c.name AS customer_name, c.tier
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+"""
+parallelism = 8
+
+# ── Sinks ───────────────────────────────────────────────────────────────
+
+[[sink]]
+name = "enriched_orders"
+pipeline = "order_enrichment"
+connector = "kafka"
+[sink.properties]
+"bootstrap.servers" = "${KAFKA_BROKERS}"
+topic = "enriched_orders"

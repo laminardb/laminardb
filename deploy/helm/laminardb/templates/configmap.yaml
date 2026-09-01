@@ -1,3 +1,10 @@
+{{- $checkpointUrl := .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" -}}
+{{- if and (eq .Values.laminardb.mode "cluster") (eq .Values.laminardb.delivery "best_effort") -}}
+{{- fail "cluster mode requires laminardb.delivery=at_least_once or exactly_once" -}}
+{{- end -}}
+{{- if and (ne .Values.laminardb.delivery "best_effort") (hasPrefix "file://" $checkpointUrl) (not .Values.persistence.checkpoints.enabled) -}}
+{{- fail "at_least_once/exactly_once with a file:// checkpoint URL requires persistence.checkpoints.enabled=true" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -9,41 +16,69 @@ data:
     {{- if .Values.laminardb.configOverride }}
     {{ .Values.laminardb.configOverride | nindent 4 }}
     {{- else }}
-    {{- if eq .Values.laminardb.mode "delta" }}
-    node_id = "{{ default "$(HOSTNAME)" .Values.laminardb.delta.nodeId }}"
+    {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
+    {{- $cluster := .Values.laminardb.cluster | default dict }}
+    {{- if $isCluster }}
+    node_id = "{{ default "${HOSTNAME}" $cluster.nodeId }}"
     {{- end }}
 
     [server]
-    mode = "{{ .Values.laminardb.mode }}"
+    mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
+    delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
-    workers = {{ .Values.laminardb.workers }}
-    log_level = "{{ .Values.laminardb.logLevel }}"
+    key_groups = {{ .Values.laminardb.keyGroups }}
+    {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
+    # Resolved from the pod env at config load; the token never enters the ConfigMap.
+    console_token = "${LAMINAR_CONSOLE_TOKEN}"
+    {{- end }}
+    {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
+    console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
+    {{- end }}
+    {{- if .Values.laminardb.pgwire.enabled }}
+    {{- $pg := .Values.laminardb.pgwire }}
+    pgwire_bind = "{{ $pg.bind }}"
+    pgwire_allow_remote = {{ $pg.allowRemote }}
+    pgwire_max_connections = {{ $pg.maxConnections }}
+    pgwire_max_auth_failures_per_min = {{ $pg.maxAuthFailuresPerMin }}
+    pgwire_tls_min_version = "{{ $pg.tls.minVersion }}"
+    {{- if $pg.tls.existingSecret }}
+    pgwire_tls_cert = "/etc/laminardb/pgwire-tls/tls.crt"
+    pgwire_tls_key = "/etc/laminardb/pgwire-tls/tls.key"
+    {{- if $pg.tls.mtls }}
+    pgwire_tls_client_ca = "/etc/laminardb/pgwire-tls/ca.crt"
+    {{- end }}
+    {{- end }}
+    {{- with $pg.users }}
 
-    [state]
-    backend = "{{ .Values.laminardb.state.backend }}"
-    path = "{{ .Values.laminardb.state.path }}"
-    max_size_bytes = {{ .Values.laminardb.state.maxSizeBytes }}
-
-    [checkpoint]
-    url = "{{ .Values.laminardb.checkpoint.url }}"
-    interval = "{{ .Values.laminardb.checkpoint.interval }}"
-    mode = "{{ .Values.laminardb.checkpoint.mode }}"
-    snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"
-
-    {{- if eq .Values.laminardb.mode "delta" }}
-
-    [discovery]
-    strategy = "{{ .Values.laminardb.delta.discovery.strategy }}"
-    gossip_port = {{ .Values.laminardb.delta.discovery.gossipPort }}
-    {{- if .Values.laminardb.delta.discovery.seeds }}
-    seeds = [{{ range $i, $s := .Values.laminardb.delta.discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    [server.pgwire_users]
+    {{- range $user, $env := . }}
+    {{ $user }} = {{ printf "${%s}" $env | quote }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
-    [coordination]
-    strategy = "{{ .Values.laminardb.delta.coordination.strategy }}"
-    raft_port = {{ .Values.laminardb.delta.coordination.raftPort }}
-    election_timeout = "{{ .Values.laminardb.delta.coordination.electionTimeout }}"
-    heartbeat_interval = "{{ .Values.laminardb.delta.coordination.heartbeatInterval }}"
+    [checkpoint]
+    url = "{{ $checkpointUrl }}"
+    interval = "{{ .Values.laminardb.checkpoint.interval }}"
+    timeout = "{{ .Values.laminardb.checkpoint.timeout }}"
+
+    {{- if $isCluster }}
+
+    [discovery]
+    {{- $discovery := $cluster.discovery | default dict }}
+    {{- $gossipPort := $discovery.gossipPort | default 7946 }}
+    {{- $podDomain := printf "%s.%s.svc.%s" (include "laminardb.headlessServiceName" .) .Release.Namespace (.Values.clusterDomain | default "cluster.local") }}
+    strategy = "{{ $discovery.strategy | default "gossip" }}"
+    gossip_port = {{ $gossipPort }}
+    # Peers must reach this node by its per-pod headless-service DNS name; the
+    # bare pod hostname the server would otherwise advertise is not resolvable.
+    advertise_host = "{{ $discovery.advertiseHost | default (printf "${HOSTNAME}.%s" $podDomain) }}"
+    {{- if $discovery.seeds }}
+    seeds = [{{ range $i, $s := $discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    {{- else }}
+    # Generated from replicaCount: every node lists the full cluster (self included).
+    seeds = [{{ range $i := until (int .Values.replicaCount) }}{{ if $i }}, {{ end }}"{{ include "laminardb.fullname" $ }}-{{ $i }}.{{ $podDomain }}:{{ $gossipPort }}"{{ end }}]
+    {{- end }}
     {{- end }}
 
     {{- range .Values.sources }}
@@ -57,7 +92,7 @@ data:
     {{- if .properties }}
     [source.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- range .schema }}
@@ -88,7 +123,7 @@ data:
     {{- if .properties }}
     [lookup.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}
@@ -111,13 +146,10 @@ data:
     name = "{{ .name }}"
     pipeline = "{{ .pipeline }}"
     connector = "{{ .connector }}"
-    {{- if .delivery }}
-    delivery = "{{ .delivery }}"
-    {{- end }}
     {{- if .properties }}
     [sink.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

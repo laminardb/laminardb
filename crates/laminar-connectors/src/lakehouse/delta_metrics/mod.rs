@@ -1,0 +1,165 @@
+//! Prometheus-backed Delta Lake sink metrics.
+
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
+
+use super::metrics::LakehouseSinkMetrics;
+use crate::prom::reg_or_local;
+
+/// Prometheus-backed counters/gauges for Delta Lake sink connector statistics.
+#[derive(Debug, Clone)]
+pub struct DeltaLakeSinkMetrics {
+    /// Common metrics (rows flushed, bytes written, commits, etc.).
+    pub common: LakehouseSinkMetrics,
+
+    /// Total MERGE operations (upsert mode).
+    pub merge_operations: IntCounter,
+
+    /// Last Delta Lake table version committed.
+    pub last_delta_version: IntGauge,
+
+    /// End-to-end flush duration histogram (concat → write → checkpoint).
+    /// Buckets cover 5ms up to ~160s (0.005 * 2^15).
+    pub flush_duration: Histogram,
+
+    /// Total changelog rows entering collapse (pre-dedup, per upsert flush).
+    pub collapse_rows_in: IntCounter,
+
+    /// Total upsert rows emitted by collapse (`_op = U`).
+    pub collapse_upserts_out: IntCounter,
+
+    /// Total delete rows emitted by collapse (`_op = D`).
+    pub collapse_deletes_out: IntCounter,
+
+    /// Changelog-collapse duration histogram (per upsert flush).
+    /// Buckets cover 100µs up to ~3.3s (0.0001 * 2^15).
+    pub collapse_duration: Histogram,
+}
+
+impl DeltaLakeSinkMetrics {
+    /// Creates a new metrics instance with all counters at zero.
+    #[must_use]
+    #[allow(clippy::missing_panics_doc)]
+    pub fn new(registry: Option<&Registry>) -> Self {
+        let mut local = None;
+        let handle = reg_or_local(registry, &mut local);
+
+        let flush_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "delta_sink_flush_duration_seconds",
+                "End-to-end Delta Lake flush duration (pre-concat → write → checkpoint)",
+            )
+            .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
+        )
+        .unwrap();
+        // Best-effort registration (matches `kafka/metrics.rs` pattern):
+        // `AlreadyReg` is benign on re-init; surface anything else so a
+        // dropped histogram doesn't disappear silently.
+        if let Err(e) = handle.registry().register(Box::new(flush_duration.clone())) {
+            tracing::warn!(
+                metric = "delta_sink_flush_duration_seconds",
+                error = %e,
+                "failed to register delta lake flush_duration histogram"
+            );
+        }
+
+        let collapse_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "delta_sink_collapse_duration_seconds",
+                "Changelog collapse duration per upsert flush (Z-set/CDC dedup)",
+            )
+            .buckets(prometheus::exponential_buckets(0.0001, 2.0, 16).unwrap()),
+        )
+        .unwrap();
+        if let Err(e) = handle
+            .registry()
+            .register(Box::new(collapse_duration.clone()))
+        {
+            tracing::warn!(
+                metric = "delta_sink_collapse_duration_seconds",
+                error = %e,
+                "failed to register delta lake collapse_duration histogram"
+            );
+        }
+
+        Self {
+            common: LakehouseSinkMetrics::new(registry),
+            merge_operations: handle.counter(
+                "delta_sink_merge_operations_total",
+                "Total MERGE operations (upsert)",
+            ),
+            last_delta_version: handle.gauge(
+                "delta_sink_last_version",
+                "Last committed Delta table version",
+            ),
+            flush_duration,
+            collapse_rows_in: handle.counter(
+                "delta_sink_collapse_rows_in_total",
+                "Changelog rows entering collapse (pre-dedup)",
+            ),
+            collapse_upserts_out: handle.counter(
+                "delta_sink_collapse_upserts_out_total",
+                "Upsert rows emitted by collapse (_op = U)",
+            ),
+            collapse_deletes_out: handle.counter(
+                "delta_sink_collapse_deletes_out_total",
+                "Delete rows emitted by collapse (_op = D)",
+            ),
+            collapse_duration,
+        }
+    }
+
+    /// Records a successful flush of `records` rows totaling `bytes`.
+    pub fn record_flush(&self, records: u64, bytes: u64) {
+        self.common.record_flush(records, bytes);
+    }
+
+    /// Records a successful epoch commit.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn record_commit(&self, delta_version: u64) {
+        self.common.record_commit();
+        self.last_delta_version.set(delta_version as i64);
+    }
+
+    /// Records a write or I/O error.
+    pub fn record_error(&self) {
+        self.common.record_error();
+    }
+
+    /// Records an epoch rollback.
+    pub fn record_rollback(&self) {
+        self.common.record_rollback();
+    }
+
+    /// Records a MERGE operation (upsert mode).
+    pub fn record_merge(&self) {
+        self.merge_operations.inc();
+    }
+
+    /// Records changelog DELETE operations.
+    pub fn record_deletes(&self, count: u64) {
+        self.common.record_deletes(count);
+    }
+
+    /// Records a completed flush duration (seconds).
+    pub fn observe_flush_duration(&self, seconds: f64) {
+        self.flush_duration.observe(seconds);
+    }
+
+    /// Records one changelog-collapse pass: `rows_in` rows folded down to
+    /// `upserts_out` upserts and `deletes_out` deletes in `seconds`.
+    pub fn observe_collapse(&self, rows_in: u64, upserts_out: u64, deletes_out: u64, seconds: f64) {
+        self.collapse_rows_in.inc_by(rows_in);
+        self.collapse_upserts_out.inc_by(upserts_out);
+        self.collapse_deletes_out.inc_by(deletes_out);
+        self.collapse_duration.observe(seconds);
+    }
+}
+
+impl Default for DeltaLakeSinkMetrics {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+#[cfg(test)]
+mod tests;

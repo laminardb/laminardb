@@ -7,10 +7,9 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, Padding, Paragraph, Sparkline};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, Padding, Paragraph};
 
 use crate::history::RingBuf;
-use crate::latency::LatencyTracker;
 use crate::types::{
     Burst, DepthLevel, MicroCandle, Momentum, Signal, Spread, Vwap, LABELS, SYMBOLS,
 };
@@ -45,7 +44,6 @@ pub struct DashState {
     pub price_history: HashMap<String, RingBuf<f64>>,
     pub depth_bids: Vec<DepthLevel>,
     pub depth_asks: Vec<DepthLevel>,
-    pub latency_history: RingBuf<u64>,
     pub start: Instant,
     pub total_events: u64,
     pub total_emitted: u64,
@@ -54,7 +52,6 @@ pub struct DashState {
     pub source_count: usize,
     pub stream_count: usize,
     pub pipeline_watermark: i64,
-    pub latency: LatencyTracker,
 }
 
 impl DashState {
@@ -69,7 +66,6 @@ impl DashState {
             price_history: HashMap::new(),
             depth_bids: Vec::new(),
             depth_asks: Vec::new(),
-            latency_history: RingBuf::new(120),
             start: Instant::now(),
             total_events: 0,
             total_emitted: 0,
@@ -78,7 +74,6 @@ impl DashState {
             source_count: 0,
             stream_count: 0,
             pipeline_watermark: 0,
-            latency: LatencyTracker::new(),
         }
     }
 }
@@ -106,7 +101,7 @@ pub fn render(frame: &mut ratatui::Frame, s: &DashState) {
     .split(rows[0]);
 
     let bottom = Layout::horizontal([
-        Constraint::Length(24), // latency
+        Constraint::Length(24), // pipeline
         Constraint::Min(16),    // momentum
         Constraint::Length(18), // signals
         Constraint::Length(20), // bursts
@@ -117,7 +112,7 @@ pub fn render(frame: &mut ratatui::Frame, s: &DashState) {
     draw_price_chart(frame, top[1], s);
     draw_depth(frame, top[2], s);
 
-    draw_latency(frame, bottom[0], s);
+    draw_pipeline(frame, bottom[0], s);
     draw_momentum(frame, bottom[1], s);
     draw_signals(frame, bottom[2], s);
     draw_bursts(frame, bottom[3], s);
@@ -149,11 +144,6 @@ fn draw_banner(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
         Span::styled(
             format!("{}/s", fmt_int(s.throughput as u64)),
             Style::default().fg(GREEN),
-        ),
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!("p50 {}", fmt_latency(s.latency.p50())),
-            Style::default().fg(CYAN),
         ),
         Span::styled("  ", Style::default()),
         Span::styled(uptime, Style::default().fg(TEXT_MUT)),
@@ -417,32 +407,9 @@ fn draw_depth(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
     frame.render_widget(paragraph, area);
 }
 
-// ── Latency (left column, bottom) ──────────────────────────────
+// ── Pipeline (left column, bottom) ─────────────────────────────
 
-fn draw_latency(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
-    let chunks = Layout::vertical([
-        Constraint::Length(3), // sparkline
-        Constraint::Min(3),    // stats
-    ])
-    .split(area);
-
-    let lat_data: Vec<u64> = s.latency_history.as_slice().iter().copied().collect();
-    let sparkline = Sparkline::default()
-        .data(&lat_data)
-        .style(Style::default().fg(CYAN))
-        .block(
-            Block::default()
-                .title(Line::from(Span::styled(
-                    " LATENCY ",
-                    Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-                )))
-                .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
-                .border_style(Style::default().fg(BORDER))
-                .padding(Padding::horizontal(1)),
-        );
-    frame.render_widget(sparkline, chunks[0]);
-
-    let lat = &s.latency;
+fn draw_pipeline(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
     let wm_lag = if s.pipeline_watermark != i64::MIN && s.pipeline_watermark > 0 {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -455,18 +422,6 @@ fn draw_latency(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
     };
 
     let lines = vec![
-        Line::from(vec![
-            Span::styled("p50 ", Style::default().fg(TEXT_MUT)),
-            Span::styled(fmt_latency(lat.p50()), Style::default().fg(CYAN)),
-        ]),
-        Line::from(vec![
-            Span::styled("p99 ", Style::default().fg(TEXT_MUT)),
-            Span::styled(fmt_latency(lat.p99()), Style::default().fg(AMBER)),
-        ]),
-        Line::from(vec![
-            Span::styled("max ", Style::default().fg(TEXT_MUT)),
-            Span::styled(fmt_latency(lat.max()), Style::default().fg(ROSE)),
-        ]),
         Line::from(vec![
             Span::styled("tpt ", Style::default().fg(TEXT_MUT)),
             Span::styled(
@@ -486,11 +441,15 @@ fn draw_latency(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
 
     let stats = Paragraph::new(lines).block(
         Block::default()
-            .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+            .title(Line::from(Span::styled(
+                " PIPELINE ",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(BORDER))
             .padding(Padding::horizontal(1)),
     );
-    frame.render_widget(stats, chunks[1]);
+    frame.render_widget(stats, area);
 }
 
 // ── Momentum heatmap (center, bottom) ──────────────────────────
@@ -703,18 +662,6 @@ fn fmt_int(v: u64) -> String {
         .map(|c| std::str::from_utf8(c).unwrap())
         .collect::<Vec<_>>()
         .join(",")
-}
-
-fn fmt_latency(ns: u64) -> String {
-    if ns < 1_000 {
-        format!("{ns}ns")
-    } else if ns < 1_000_000 {
-        format!("{:.1}us", ns as f64 / 1_000.0)
-    } else if ns < 1_000_000_000 {
-        format!("{:.1}ms", ns as f64 / 1_000_000.0)
-    } else {
-        format!("{:.2}s", ns as f64 / 1_000_000_000.0)
-    }
 }
 
 fn fmt_duration(d: Duration) -> String {

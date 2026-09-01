@@ -1,6 +1,6 @@
 # SQL Dialect Reference
 
-> Practical guide to LaminarDB's SQL dialect — gotchas, working patterns, and tested examples.
+> Practical guide to LaminarDB's SQL dialect: gotchas, working patterns, tested examples.
 
 LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL engine. While most standard SQL works, streaming-specific operations have differences from other streaming databases (Flink SQL, ksqlDB, etc.). This reference documents patterns that are **confirmed working** in LaminarDB embedded mode.
 
@@ -10,9 +10,9 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 | What you might try | What actually works | Notes |
 |---|---|---|
-| `TUMBLE_START(ts, ...)` | `CAST(tumble(ts, ...) AS BIGINT)` | DataFusion doesn't have `TUMBLE_START()` |
+| `TUMBLE_START(ts, ...)` | `tumble(ts, ...)` | Returns `Timestamp(Millisecond)` directly |
 | `FIRST(price)` / `LAST(price)` | `first_value(price)` / `last_value(price)` | DataFusion aggregate function names |
-| `ts - INTERVAL '10' SECOND` (on BIGINT) | `ts - 10000` | INTERVAL only works on TIMESTAMP types |
+| `ts - INTERVAL '10' SECOND` | `ts - INTERVAL '10' SECOND` | Native on `TIMESTAMP` columns since v0.20.1 |
 | `CASE WHEN ... THEN vol ELSE 0` | `CASE WHEN ... THEN vol ELSE CAST(0 AS BIGINT)` | ELSE branch must match column type |
 | `SHOW TABLES` | `SHOW SOURCES` / `SHOW STREAMS` | LaminarDB uses source/stream terminology |
 | `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion 52 built-ins |
@@ -22,7 +22,9 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 ## Sources
 
-Create data sources using `CREATE SOURCE`. All timestamp columns should be BIGINT (milliseconds since epoch) and annotated with `#[event_time]` in Rust structs.
+Create data sources using `CREATE SOURCE`. Event-time columns must be
+declared as `TIMESTAMP`. LaminarDB uses Arrow `Timestamp(_)` internally
+at any precision and rescales to milliseconds via the Arrow cast kernel.
 
 ```sql
 CREATE SOURCE trades (
@@ -32,9 +34,16 @@ CREATE SOURCE trades (
     price      DOUBLE NOT NULL,
     volume     BIGINT NOT NULL,
     order_ref  VARCHAR NOT NULL,
-    ts         BIGINT NOT NULL
+    ts         TIMESTAMP NOT NULL,
+    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 )
 ```
+
+Note: `TIMESTAMP` in DDL maps to `Timestamp(Microsecond, None)` on the
+Arrow side. Connectors that produce their own schemas (OTel, Kafka+Avro,
+CDC) may use a different precision (nanosecond for OTel's
+`_laminar_received_at`, millisecond for CDC's `_ts_ms`); all precisions
+compose correctly with `INTERVAL` arithmetic and window functions.
 
 **Rust side:**
 ```rust
@@ -47,7 +56,7 @@ pub struct Trade {
     pub volume: i64,
     pub order_ref: String,
     #[event_time]
-    pub ts: i64,
+    pub ts: i64,  // epoch microseconds; the record macro handles the Arrow mapping
 }
 ```
 
@@ -62,7 +71,7 @@ Non-overlapping windows of fixed size. Every event belongs to exactly one window
 ```sql
 CREATE STREAM ohlc AS
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '5' SECOND) AS BIGINT) AS window_start,
+       tumble(ts, INTERVAL '5' SECOND) AS window_start,
        first_value(price) AS open,
        MAX(price) AS high,
        MIN(price) AS low,
@@ -78,15 +87,15 @@ GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND)
 ```sql
 -- Tumble with 8-hour offset (align to UTC+8 day boundaries)
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR) AS BIGINT) AS window_start,
+       tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR) AS window_start,
        COUNT(*) AS trade_count
 FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)
 ```
 
 **Key points:**
-- Use lowercase `tumble()` (not `TUMBLE()` — both work, but lowercase is canonical)
-- Extract window start with `CAST(tumble(...) AS BIGINT)` — there is no `TUMBLE_START()` function
+- Use lowercase `tumble()`. `TUMBLE()` also works, but lowercase is canonical.
+- `tumble()` returns `Timestamp(Millisecond)` directly. There is no `TUMBLE_START()` function.
 - Optional third argument for timezone offset alignment
 - Window closes when watermark passes window end
 
@@ -107,7 +116,7 @@ GROUP BY symbol, HOP(ts, INTERVAL '2' SECOND, INTERVAL '10' SECOND)
 **Key points:**
 - First interval = slide, second interval = window size
 - Each event appears in `size / slide` windows (here: 10/2 = 5)
-- More output rows than TUMBLE — plan downstream capacity accordingly
+- More output rows than TUMBLE. Plan downstream capacity accordingly.
 
 ### SESSION (Gap-based windows)
 
@@ -133,65 +142,103 @@ GROUP BY account_id, SESSION(ts, INTERVAL '2' SECOND)
 
 ## Joins
 
-### INNER JOIN (Time-bounded)
+Local and cluster joins use the same vnode state, checkpoint, recovery, and rebalance lifecycle
+under at-least-once and exactly-once delivery. The bounded path supports `INNER`, `LEFT`, `RIGHT`,
+`FULL`, `LEFT SEMI`, `RIGHT SEMI`, `LEFT ANTI`, and `RIGHT ANTI` for append-only inputs and for the
+certified mutable-source route described below.
+
+### Bounded event-time join
 
 Join two sources within a time window. Both sources must have compatible timestamps.
 
 ```sql
 CREATE STREAM suspicious_match AS
-SELECT t.symbol,
+SELECT t.symbol AS symbol,
        t.price AS trade_price,
-       t.volume,
-       o.order_id,
-       o.account_id,
-       o.side,
+       t.volume AS volume,
+       o.order_id AS order_id,
+       o.account_id AS account_id,
+       o.side AS side,
        o.price AS order_price,
        t.price - o.price AS price_diff
 FROM trades t
 INNER JOIN orders o
-ON t.symbol = o.symbol
-AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000
+ON t.tenant_id = o.tenant_id
+AND t.symbol = o.symbol
+AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
 ```
 
 **Key points:**
-- Use numeric arithmetic for BIGINT timestamps: `t.ts - 10000` (not `INTERVAL '10' SECOND`)
-- Both sources need watermarks advanced for the join to emit
-- Column aliases (`AS trade_price`) are required when both sources have columns with the same name
 
-### ASOF JOIN
+- Both inputs must be direct sources with watermarks on `TIMESTAMP NOT NULL` event-time columns.
+  Append-only pairs use the ordinary path. If either connector is mutable, both connectors must
+  expose ordered deterministic row positions and a replayable recovery contract.
+- Append-only bounded intervals retain live hot-add support in a running local checkpoint-disabled
+  pipeline; their post-projection is initialized before the first cycle can route or retain input.
+  Mutable bounded intervals and consumers of their changelog are fixed startup topology and must be
+  created while stopped.
+- A keyed-upsert input needs an explicit primary key containing every equality key and its
+  event-time column. A full-changelog input needs one exact trailing non-null `BIGINT __weight`;
+  append-only and keyed-upsert source schemas cannot declare that column.
+- A mutable source may feed only its admitted bounded joins. Mutable joins do not admit pushed-down
+  source predicates, volatile projection/filter functions, or explicit references/aliases for the
+  engine-owned `__weight` column. Their output is a full changelog, so every downstream projection
+  preserves the trailing weight and external sinks must declare full-changelog support.
+- In local and single-node recoverable runtime, a changelog may enrich against a static reference
+  table whose snapshot is checkpointed. Process-local `INSERT INTO` is available only when local
+  checkpointing is disabled; recoverable deployments load reference data before intake and restore
+  the checkpointed image. Cluster execution rejects this enrichment until every participant and
+  future owner can bind the same snapshot identity. This ensures a later retraction joins the same
+  dimension values as its original insertion.
+- Equality keys may contain one or more ordered `VARCHAR`/`BIGINT` columns. Types must match at each
+  position; SQL `NULL` keys do not match.
+- The directional predicate is `right.ts BETWEEN left.ts AND left.ts + positive_finite_bound`.
+- Every projected expression needs an explicit alias, including columns whose names are unique;
+  every projected or filtered column must also use its left/right input qualifier. Nested
+  projection/filter subqueries are not supported by the flattened pair projection.
+- Outer and anti unmatched rows become final only when the opposite input watermark closes their
+  possible match interval.
+- Cross, unbounded, general non-equality, intermediate-input, and multi-way joins fail closed on
+  this bounded stream-stream path. `FOR SYSTEM_TIME AS OF` and `TEMPORAL PROBE JOIN` use the
+  separate managed vnode-keyed temporal path for one direct `INNER` or `LEFT` join in single-node
+  and cluster mode. `ASOF JOIN` is not an alias; use `FOR SYSTEM_TIME AS OF`.
 
-Match each row from the left source with the closest preceding row from the right source.
+To aggregate rows from any of the eight kinds, name the join output and create a separate keyed
+aggregate stage:
 
 ```sql
-CREATE STREAM enriched AS
-SELECT t.symbol,
-       t.price,
-       r.reference_price
+CREATE STREAM matched AS
+SELECT t.account_id AS account_id, t.volume AS volume
 FROM trades t
-ASOF JOIN reference r
-ON t.symbol = r.symbol AND t.ts >= r.ts
+INNER JOIN orders o
+ON t.account_id = o.account_id
+AND o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND;
+
+CREATE STREAM matched_totals AS
+SELECT account_id, SUM(volume) AS total_volume, COUNT(*) AS match_count
+FROM matched
+GROUP BY account_id;
 ```
 
-**Key points:**
-- Right source must have events preceding left source events
-- Useful for enrichment (e.g., matching trades to latest reference data)
+Fusing the join and `GROUP BY` in one statement is unsupported. A cycle that would exceed 262,144
+output rows or 64 MiB causes a terminal controlled failure; operators cannot resume or spill that
+fanout.
 
-### ASOF NEAREST
-
-Match each row with the closest row by absolute time difference (forward or backward):
+### Temporal ASOF join
 
 ```sql
-SELECT t.symbol,
-       t.price,
-       r.reference_price
+CREATE STREAM valued_trades AS
+SELECT t.trade_id AS trade_id, q.price AS quote_price
 FROM trades t
-ASOF JOIN reference r
-ON t.symbol = r.symbol AND MATCH_CONDITION(NEAREST(t.ts, r.ts))
+LEFT JOIN quotes FOR SYSTEM_TIME AS OF t.ts AS q
+  ON t.symbol = q.symbol;
 ```
 
-**Key points:**
-- Matches by minimum absolute time difference, not just preceding events
-- Useful when reference data may arrive slightly before or after the trade
+This direct two-input path supports `INNER` and `LEFT`. The left source must be append-only; the
+right source must declare its equality keys as a primary key and may be append-only or keyed-upsert.
+Both event-time columns require watermarks. A result becomes final only after the right watermark
+passes its probe time. Configure `server.temporal_join_idle_history_retention` to bound version
+history when an input idles. The same rules apply in single-node and cluster mode.
 
 ---
 
@@ -213,7 +260,7 @@ FROM trades
 GROUP BY account_id, symbol, TUMBLE(ts, INTERVAL '5' SECOND)
 ```
 
-**Key point:** The `ELSE` branch must match the column type. Use `CAST(0 AS BIGINT)` when summing BIGINT columns — `ELSE 0` alone produces INT32, causing a type mismatch.
+**Key point:** The `ELSE` branch must match the column type. Use `CAST(0 AS BIGINT)` when summing BIGINT columns. `ELSE 0` alone produces INT32, causing a type mismatch.
 
 ### Computed columns
 
@@ -227,16 +274,37 @@ FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND)
 ```
 
-### Available aggregate functions
+### Managed aggregate functions
+
+The non-windowed managed path used by named join outputs in local and cluster mode supports these
+non-`DISTINCT` aggregates:
 
 | Function | Notes |
 |----------|-------|
-| `COUNT(*)` | Row count |
+| `COUNT(*)` / `COUNT(col)` | Row/non-null count |
 | `SUM(col)` | Sum (respects type) |
 | `AVG(col)` | Average (returns DOUBLE) |
 | `MIN(col)` / `MAX(col)` | Min/max |
-| `first_value(col)` | First value in window (NOT `FIRST()`) |
-| `last_value(col)` | Last value in window (NOT `LAST()`) |
+
+`first_value` and `last_value` are available on supported local window paths, not on the distributed
+named-aggregate path. `DISTINCT` aggregates and `MIN`/`MAX` over changelog inputs remain rejected
+because bounded retractable extrema state is not supported. Mutable bounded-join output can feed
+`COUNT`, `SUM`, and `AVG` aggregate stages or a full-changelog sink; append-only join output keeps
+the ordinary row stream.
+
+### Streaming UDFs
+
+| Function | Returns | Use |
+|----------|---------|-----|
+| `tumble(ts, size)` | `Timestamp(Millisecond)` (window start) | `GROUP BY tumble(...)` |
+| `tumble(ts, size, offset)` | `Timestamp(Millisecond)` | Timezone-aligned window boundaries |
+| `tumble_end(ts, size)` | `Timestamp(Millisecond)` | Explicit window-end column in `SELECT` |
+| `hop(ts, slide, size)` / `slide(ts, size, slide)` | `Timestamp(Millisecond)` | Sliding / hopping windows |
+| `hop_end(ts, slide, size)` | `Timestamp(Millisecond)` | Window end for hop |
+| `session(ts, gap)` | `Timestamp(Millisecond)` | Session windows |
+| `cumulate(ts, step, max_size)` | `Timestamp(Millisecond)` | Cumulating windows (parsed; pipeline support pending) |
+| `cumulate_end(ts, step, max_size)` | `Timestamp(Millisecond)` | Cumulating window end |
+| `proctime()` | `Timestamp(Millisecond)` | Processing-time stamp at evaluation |
 
 ---
 
@@ -247,6 +315,12 @@ After creating a stream, create a sink and subscribe to get results in Rust:
 ```sql
 CREATE SINK ohlc_sink FROM ohlc
 ```
+
+Sink input must be a named source or stream; inline `CREATE SINK ... FROM (SELECT ...)` queries are
+rejected until they have a named graph node and the same schema/changelog admission. A stream that
+carries `__weight` requires a sink whose connector contract supports full changelogs; the runtime
+passes positive and negative weights through unchanged and fails closed if the weight is missing or
+malformed.
 
 ```rust
 // FromRow struct fields must match SELECT column order exactly
@@ -268,7 +342,85 @@ while let Some(rows) = sub.poll() {
 }
 ```
 
-**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter — only position.
+**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
+
+### Cluster SQL boundary
+
+Cluster `CREATE STREAM` admits projection/filter pipelines, supported non-windowed keyed aggregates,
+the eight bounded join kinds described above, and managed direct-source `TUMBLE`, `HOP`, and
+`SESSION` aggregates. Cluster windows require a watermark on the event-time column and `EMIT ON
+WINDOW CLOSE` or `EMIT FINAL`. A named join output may feed a separate keyed aggregate stream;
+fused join-and-aggregate and windowed-join statements remain rejected.
+
+Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
+retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
+the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. The
+cluster admission path rejects unsupported state before connector I/O.
+
+### SUBSCRIBE over the Postgres wire protocol
+
+When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
+
+```sql
+SUBSCRIBE <name> [AS OF EPOCH <n>] [WHERE <predicate>]
+```
+
+- `<name>` may be a materialized view or a resolved named stream. A bare source is not subscribable.
+- The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. Named streams whose output schema is not resolved reject `WHERE`.
+- The query stays open until the client disconnects. Local runtimes preserve their existing delivery behaviour; cluster data becomes visible only after a complete cluster checkpoint commits.
+- Cluster `SUBSCRIBE` is supported only for named, non-windowed managed keyed aggregate streams whose planner certificate binds the aggregate grouping to stable vnode ownership. Stateless streams, raw join output, windowed aggregates, materialized views, and uncertified plans fail before subscription backend I/O.
+- Every cluster server is a gateway over the same shared committed history; clients do not need to locate current vnode owners.
+- Cluster ordering is strict and contiguous within each vnode output partition. Fair gateway merging defines no order between partitions and does not imply arrival, event-time, SQL-sort, or global total order.
+- Partition sequences describe committed source-log frames. A `WHERE` predicate can remove every row from a frame, so optional frame metadata observed by a filtered client can have non-adjacent partition sequences without indicating that a matching row was skipped.
+
+#### Reconnect without gaps: `RETAIN HISTORY` + `AS OF EPOCH`
+
+Create the stream with bounded history:
+
+```sql
+CREATE STREAM positions AS
+  SELECT account_id, SUM(pnl) AS total_pnl
+  FROM raw_trades
+  GROUP BY account_id
+  WITH ('retain_history' = '64mb');
+```
+
+Local runtimes keep the suffix in their existing byte-bounded registry. For the supported cluster
+aggregate scope, history is a byte-bounded suffix of verified immutable Arrow segments referenced
+by authoritative committed checkpoint indexes in shared object storage. Object listing is never
+commit authority.
+
+WebSocket consumers receive `progress` frames containing `epoch` and `checkpoint_id`. Pgwire adds
+`__laminar_kind`, `__laminar_epoch`, and `__laminar_checkpoint_id` control columns without changing
+the user data schema. Cluster progress is emitted only after the complete participant roster and
+partition-frontier vector commit. Durably record a marker after processing its preceding data, then
+resume from the exclusive frontier of that checkpoint:
+
+```sql
+SUBSCRIBE positions AS OF EPOCH 42;
+```
+
+If epoch `42` was not committed, was pruned, belongs to another generation of the named stream, or
+references missing/corrupt history, the server returns a structured terminal error rather than
+skipping rows. `AS OF EPOCH` is checkpoint-granular durable replay, not acknowledgement storage for
+a named consumer. A disconnect after processing part of the next checkpoint interval can therefore
+cause that interval to be delivered again.
+
+A bare `SUBSCRIBE positions` attaches at the current committed tail: rows committed before attachment
+are excluded, and rows exposed by later committed checkpoints are delivered.
+
+#### Cursored consumption: `DECLARE` / `FETCH` / `CLOSE`
+
+For libpq clients that drive flow control via `\set FETCH_COUNT n` (psql, JDBC with `setFetchSize`):
+
+```sql
+DECLARE c CURSOR FOR SUBSCRIBE positions WHERE total_pnl > 0;
+FETCH FORWARD 100 FROM c;
+FETCH FORWARD 100 FROM c;
+CLOSE c;
+```
+
+The cursor is forward-only, lives for the duration of the connection, and shares the same `WHERE` and `AS OF EPOCH` semantics as bare `SUBSCRIBE`.
 
 ---
 
@@ -285,7 +437,7 @@ source.watermark(current_ts + 10_000);  // 10s ahead covers HOP(10s) windows
 - Advance watermark on **all** sources (both sides of a join)
 - Watermark should be at least `current_ts + largest_window_size`
 - HOP(10s) needs watermark 10s ahead; SESSION(2s) needs 2s past last event
-- LaminarDB processes in 100ms micro-batch ticks — results appear after next tick
+- LaminarDB processes in 100ms micro-batch ticks. Results appear after the next tick.
 
 ---
 
@@ -321,14 +473,27 @@ EXPLAIN ANALYZE SELECT symbol, COUNT(*) FROM trades GROUP BY symbol;
 
 ## Common Gotchas
 
-### 1. BIGINT timestamps + INTERVAL don't mix
+### 1. Event-time columns must be `TIMESTAMP`, not `BIGINT`
+
+The event-time path requires a non-null Arrow `Timestamp(_)` column.
+Declare `ts TIMESTAMP NOT NULL` (at any precision your connector emits);
+numeric and nullable event-time columns fail during admission.
 
 ```sql
--- FAILS: INTERVAL on BIGINT column
-WHERE o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
+CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP NOT NULL,
+                      WATERMARK FOR ts AS ts - INTERVAL '5' SECOND);
 
--- WORKS: numeric arithmetic (BIGINT milliseconds)
-WHERE o.ts BETWEEN t.ts - 10000 AND t.ts + 10000
+-- Join predicates on Timestamp columns compose with INTERVAL:
+WHERE o.ts BETWEEN t.ts AND t.ts + INTERVAL '10' SECOND
+```
+
+If you need an `i64` millis derived column for downstream consumption
+(e.g. a dashboard that wants a plain number), cast the Timestamp and
+divide by the precision factor:
+
+```sql
+CAST(ts AS BIGINT) / 1000   -- Timestamp(Microsecond) → epoch millis
+CAST(ts AS BIGINT) / 1000000 -- Timestamp(Nanosecond) → epoch millis
 ```
 
 ### 2. Type mismatch in CASE WHEN
@@ -348,7 +513,7 @@ SUM(CASE WHEN side = 'buy' THEN volume ELSE CAST(0 AS BIGINT) END)
 SELECT TUMBLE_START(ts, INTERVAL '5' SECOND), FIRST(price), LAST(price)
 
 -- WORKS
-SELECT CAST(tumble(ts, INTERVAL '5' SECOND) AS BIGINT), first_value(price), last_value(price)
+SELECT tumble(ts, INTERVAL '5' SECOND), first_value(price), last_value(price)
 ```
 
 ### 4. FromRow field ordering
@@ -356,7 +521,7 @@ SELECT CAST(tumble(ts, INTERVAL '5' SECOND) AS BIGINT), first_value(price), last
 ```rust
 // SQL: SELECT symbol, SUM(volume) AS total, AVG(price) AS avg_price
 
-// WRONG — field names don't matter, ORDER matters
+// WRONG: field names don't matter, ORDER matters
 #[derive(FromRow)]
 pub struct Bad {
     pub avg_price: f64,  // This gets the 1st column (symbol), not avg_price!
@@ -364,7 +529,7 @@ pub struct Bad {
     pub total: i64,
 }
 
-// CORRECT — matches SELECT column order
+// CORRECT: matches SELECT column order
 #[derive(FromRow)]
 pub struct Good {
     pub symbol: String,    // 1st column
@@ -373,16 +538,19 @@ pub struct Good {
 }
 ```
 
-### 5. Both sources need watermarks for joins
+### 5. Both sources must advance watermarks for bounded joins
 
 ```rust
-// WRONG — join will never emit because orders watermark isn't advancing
+// WRONG for state finality: unmatched rows cannot finalize and old state cannot be evicted
 trade_source.watermark(ts + 10_000);
 
-// CORRECT — advance both
+// CORRECT: advance both
 trade_source.watermark(ts + 10_000);
 order_source.watermark(ts + 10_000);
 ```
+
+An inner match can emit before either watermark advances. Both sources must still define and
+advance watermarks for bounded state cleanup and for outer or anti unmatched-row finalization.
 
 ---
 
@@ -397,8 +565,7 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 | TUMBLE + computed columns | MAX(price) - MIN(price) |
 | HOP + aggregates | Rolling volume baselines |
 | SESSION + aggregates | Burst detection |
-| INNER JOIN + time window | Trade-order correlation |
-| ASOF JOIN | Reference data enrichment |
+| All bounded join kinds + time window | Inner, outer, semi, and anti correlation |
 | Cascading materialized views | Stream A -> Stream B -> Stream C |
 | 5+ concurrent streams, 2 sources | Single LaminarDB instance, sub-ms latency |
 | Multiple GROUP BY columns | account_id + symbol + window |
@@ -406,20 +573,34 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 | SHOW CREATE SOURCE/SINK | DDL reconstruction |
 | EXPLAIN ANALYZE | Query plan with execution metrics |
 | TUMBLE with offset | Timezone-aligned window boundaries |
-| ASOF NEAREST | Bidirectional closest-match joins |
 
 ---
 
 ## Type Mapping
 
-| SQL Type | Rust Type | Notes |
-|----------|-----------|-------|
-| `VARCHAR` | `String` | |
-| `BIGINT` | `i64` | Use for timestamps, volumes, counts |
-| `DOUBLE` | `f64` | Use for prices, averages |
-| `INT` / `INTEGER` | `i32` | Avoid mixing with BIGINT in CASE WHEN |
-| `BOOLEAN` | `bool` | |
+| SQL Type | Arrow Type | Rust Type | Notes |
+|----------|------------|-----------|-------|
+| `VARCHAR` | `Utf8` | `String` | |
+| `BIGINT` | `Int64` | `i64` | Use for volumes, counts; **not** event-time columns |
+| `TIMESTAMP` | `Timestamp(Microsecond)` | `i64` µs | Declared in DDL |
+| `DOUBLE` | `Float64` | `f64` | Use for prices, averages |
+| `INT` / `INTEGER` | `Int32` | `i32` | Avoid mixing with BIGINT in CASE WHEN |
+| `BOOLEAN` | `Boolean` | `bool` | |
+
+Connector-produced schemas may use other `Timestamp(_)` precisions:
+
+| Column | Precision | Source |
+|--------|-----------|--------|
+| `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
+| `_ts_ms` | `Timestamp(Millisecond)` | Postgres CDC |
+| `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
+| `_wall_time_ms` | `Timestamp(Millisecond)` | MongoDB CDC |
+| `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
+
+Despite the `_ms` / `_ns` suffixes in some historical names, these are
+real Arrow `Timestamp` columns, not `Int64`. `INTERVAL` arithmetic and
+window functions compose correctly against any precision.
 
 ---
 
-*This reference is based on LaminarDB v0.18.x with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome -- please open an issue or PR.*
+*Tracks LaminarDB 0.22 on DataFusion 52.x / Arrow 57.x. Corrections welcome: open an issue or PR.*

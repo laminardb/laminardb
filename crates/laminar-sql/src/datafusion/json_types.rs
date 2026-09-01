@@ -1,30 +1,10 @@
 //! JSONB type system for JSON UDF evaluation.
 //!
 //! Minimal JSONB binary access types used by the JSON scalar UDFs.
-//! These mirror `laminar-connectors` JSONB tags but live in
-//! `laminar-sql` to keep the SQL layer self-contained.
+//! Type tags are imported from the canonical definition in `laminar-core`.
 
-/// JSONB binary format type tags.
-///
-/// Must be kept in sync with `laminar_connectors::schema::json::jsonb::tags`.
-pub mod tags {
-    /// Null value.
-    pub const NULL: u8 = 0x00;
-    /// Boolean false.
-    pub const BOOL_FALSE: u8 = 0x01;
-    /// Boolean true.
-    pub const BOOL_TRUE: u8 = 0x02;
-    /// Int64 (8 bytes little-endian).
-    pub const INT64: u8 = 0x03;
-    /// Float64 (8 bytes IEEE 754 little-endian).
-    pub const FLOAT64: u8 = 0x04;
-    /// String (4-byte LE length + UTF-8 bytes).
-    pub const STRING: u8 = 0x05;
-    /// Array (4-byte count + offset table + elements).
-    pub const ARRAY: u8 = 0x06;
-    /// Object (4-byte count + offset table + key/value data).
-    pub const OBJECT: u8 = 0x07;
-}
+/// Re-export canonical JSONB binary format type tags from `laminar-core`.
+pub use laminar_core::serialization::jsonb_tags as tags;
 
 /// Returns the PostgreSQL-compatible type name for the outermost JSONB value.
 ///

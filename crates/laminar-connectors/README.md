@@ -1,10 +1,6 @@
 # laminar-connectors
 
-External system connectors for LaminarDB -- Kafka, CDC, MongoDB, WebSocket, Delta Lake, and files.
-
-## Overview
-
-Source and sink connectors for external systems. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
+External system connectors for LaminarDB. Exactly-once admission requires an exact-certified source and a checkpoint-committable sink with coordinated external publication.
 
 ## Connectors
 
@@ -12,26 +8,66 @@ Source and sink connectors for external systems. Each connector implements the `
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | rdkafka consumer groups, Schema Registry | Implemented |
-| PostgreSQL CDC | `postgres-cdc` | pgoutput logical replication | Implemented |
-| MySQL CDC | `mysql-cdc` | Binlog decoding, GTID position tracking | Implemented |
-| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | Implemented |
+| Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
+| PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | Implemented |
+| MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | Implemented |
+| NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
+| OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| WebSocket Server | `websocket` | tokio-tungstenite listener | Implemented |
-| Delta Lake Source | `delta-lake` | Version polling via deltalake crate | Implemented |
-| File Auto-Loader | `files` | Directory watch, glob pattern discovery | Implemented |
+| Delta Lake Source | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
+| Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
+| File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
+
+### On-demand lookup sources (partial cache mode)
+
+`CREATE LOOKUP TABLE ... WITH ('strategy' = 'on-demand', 'cache.memory' = '64mb')`
+caches the hot working set in a byte-bounded RAM cache and fetches misses on demand —
+the only model that addresses dimension tables larger than memory. Each backend
+batches all missed keys of a probe into one pushed-down, key-filtered fetch
+(`pk IN (...)` / `= ANY($1)` / `$in`) and realigns results to the input order.
+
+| Backend | Feature Flag | Miss fetch | Notes |
+|---------|-------------|-----------|-------|
+| Delta Lake | `delta-lake` | `WHERE pk IN (...)` (file/partition pruning) | Warns if not clustered on the key |
+| Iceberg | `iceberg` | Native scan `with_filter(pk IN ...)` (manifest pruning) | Reloads snapshot per fetch |
+| PostgreSQL | `postgres-cdc` | Pooled (`deadpool`) `WHERE pk = ANY($1)` | Single-column key; server-auth TLS via `ssl.mode` + optional `ssl.ca.cert.path` |
+| MongoDB | `mongodb-cdc` | `find({ pk: { $in: [...] } })` | Projects documents into the declared schema |
+
+Misses run off the compute thread (the lookup-enrich operator is async-decoupled),
+results are byte-bounded with optional TTL (`cache.ttl`), and a source error
+backpressures rather than dropping rows.
 
 ### Sink Connectors
 
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
-| Kafka | `kafka` | rdkafka transactions | Implemented |
-| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional | Implemented |
-| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | Implemented |
-| Delta Lake | `delta-lake` | Epoch-aligned Parquet commits | Implemented |
+| Kafka | `kafka` | Durable broker-acknowledged at-least-once; no transactional commit | Implemented |
+| NATS | `nats` | JetStream durable at-least-once after stream validation; Core is ephemeral | Implemented |
+| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, durable at-least-once | Implemented |
+| MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | Implemented |
+| Delta Lake | `delta-lake` | Coordinated append; cluster EO is certified only for direct S3/S3A | Implemented |
+| Iceberg | `iceberg` | Rolling append writer; direct ALO, coordinated local EO, and REST + direct S3/S3A cluster EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
+
+Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix. Data-storage credentials for cluster exactly-once belong under `storage.property.*`; secret-bearing `catalog.property.*` values are treated as uncertified catalog authentication.
+
+### Upsert sinks and changelog collapse
+
+An upsert sink (`write.mode = 'upsert'`) holds the current per-key state of its
+table. Its source changelog (a Z-set `__weight` column from an aggregating MV,
+or an `_op` column from CDC) can carry many events per key in one epoch, so the
+sink collapses each epoch to one row per merge key before the MERGE — keeping it
+cardinality-safe and stripping the `__weight`/`_op`/`_ts_ms` metadata from the
+table. The collapse (`changelog` module) backs Delta upsert today and is
+sink-agnostic by design, for future reuse by an Iceberg MOR sink. Two
+requirements:
+
+- **`merge.key.columns` must be unique over the sink's input** — collapse errors
+  loudly if two live rows share a key, rather than dropping data.
+- **Partition or Z-order the table by the merge key** for copy-on-write MERGE
+  performance (each commit then rewrites only the touched files).
 
 ## Key Modules
 
@@ -41,15 +77,15 @@ Source and sink connectors for external systems. Each connector implements the `
 | `config` | `ConnectorConfig`, `ConfigKeySpec`, `ConnectorInfo`, `ConnectorState` |
 | `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
 | `kafka` | Kafka source/sink, Avro serde, schema registry, partitioner, backpressure |
-| `postgres` | PostgreSQL sink (COPY BINARY, upsert, exactly-once) |
-| `cdc/postgres` | PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
-| `cdc/mysql` | MySQL CDC source (binlog decoder, GTID, Z-set changelog) |
-| `mongodb` | MongoDB CDC source (change streams, resume tokens) and sink (ordered/unordered writes) |
-| `websocket` | WebSocket source/sink (client, server, fan-out, backpressure, reconnect) |
-| `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog) |
+| `postgres` | PostgreSQL durable at-least-once sink (COPY BINARY, upsert/changelog) |
+| `cdc/postgres` | Resume-only PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
+| `mongodb` | Replayable change-stream source and durable at-least-once majority-journaled sink |
+| `otel` | OpenTelemetry OTLP/gRPC receiver for traces, metrics, and logs (tonic server) |
+| `websocket` | WebSocket client source and client/server sinks (fan-out, backpressure, reconnect) |
+| `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog, recovery, schema evolution) and Apache Iceberg source and sink (REST catalog) |
 | `files` | File source (auto-loader, glob, watch) and sink (rolling, CSV/JSON/Parquet) |
 | `lookup` | Lookup table support: PostgreSQL and Parquet reference tables |
-| `reference` | Reference table source trait and refresh modes |
+| `reference` | Finite startup snapshots for reference tables |
 | `storage` | Cloud storage: provider detection, credential resolver, config validation, secret masking |
 | `serde` | Format implementations: JSON, CSV, raw, Debezium, Avro |
 | `schema` | Schema framework: inference, resolution, evolution, decoders (JSON/CSV/Avro/Parquet) |
@@ -59,7 +95,7 @@ Source and sink connectors for external systems. Each connector implements the `
 
 | Sub-module | Description |
 |------------|-------------|
-| `schema::traits` | `SchemaProvider`, `SchemaInferable`, `SchemaRegistryAware`, `SchemaEvolvable` traits |
+| `schema::traits` | Format codec traits and schema inference/evolution types |
 | `schema::resolver` | Schema resolution and merge engine |
 | `schema::inference` | Format inference registry |
 | `schema::json` | JSON format decoder with type inference |
@@ -74,20 +110,24 @@ Source and sink connectors for external systems. Each connector implements the `
 | Flag | Purpose |
 |------|---------|
 | `kafka` | rdkafka, Avro serde, schema registry (reqwest) |
-| `postgres-cdc` | PostgreSQL CDC via pgwire-replication |
+| `postgres-cdc` | PostgreSQL CDC via pgwire-replication (also builds the standalone `postgres` lookup source) |
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
-| `mysql-cdc` | MySQL CDC via mysql_async (rustls, no OpenSSL) |
-| `mongodb-cdc` | MongoDB CDC source/sink via mongodb crate |
+| `mongodb-cdc` | MongoDB CDC source and sink via mongodb crate |
+| `nats` | NATS Core and JetStream source/sink via async-nats |
+| `changelog-collapse` | Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pulled in by `delta-lake`) |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
 | `delta-lake-s3` | S3 storage backend for Delta Lake |
 | `delta-lake-azure` | Azure storage backend for Delta Lake |
 | `delta-lake-gcs` | GCS storage backend for Delta Lake |
 | `delta-lake-unity` | Databricks Unity catalog for Delta Lake |
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
-| `parquet-lookup` | Parquet file lookup source |
+| `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-catalog-rest` | REST catalog; other typed catalog features currently fail with an explicit capability error |
+| `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
+| `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
 | `files` | File source (auto-loader) and sink (rolling files) |
-| `kafka-discovery` | Kafka-based discovery for delta mode |
 
 ## Custom Connectors
 
@@ -104,6 +144,5 @@ registry.register_source("my-source", info, factory_fn);
 
 ## Related Crates
 
-- [`laminar-core`](../laminar-core) -- Streaming channels and sink abstractions
-- [`laminar-storage`](../laminar-storage) -- Checkpoint manifest types
+- [`laminar-core`](../laminar-core) -- Streaming channels, sink abstractions, and checkpoint manifest types
 - [`laminar-db`](../laminar-db) -- Connector manager and checkpoint coordinator

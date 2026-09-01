@@ -1,0 +1,99 @@
+name: CodeQL
+
+# Advanced CodeQL setup for Rust.
+#
+# Why this replaces GitHub's *default* setup:
+#   The Rust extractor analyses with `build-mode: none`, but during extraction
+#   it still runs Cargo build scripts and expands proc-macros, and it enables
+#   ALL cargo features by default. On the bare default-setup runner those
+#   builds fail for every crate that needs a codegen tool or native toolchain,
+#   so their call targets never resolve -- which is what produced the
+#   "Low Rust analysis quality" warning (call-target resolution under the 50%
+#   threshold). In particular, without these tools:
+#     * crates/laminar-core/build.rs invokes `protoc` (tonic/prost) when the
+#       `cluster` feature is on -- it is, under all-features -- to generate the
+#       cross-node gRPC stubs. With no protoc, none of that generated code (nor
+#       any call into it) is extracted.
+#     * openssl-sys / aws-lc-sys / rdkafka-sys / libudev-backed crates need
+#       cmake, pkg-config, libssl, libsasl2, etc. to build.
+#   Installing the same system dependencies CI already uses lets the extractor
+#   build the workspace and resolve the calls.
+#
+# NOTE: an advanced workflow and GitHub's default CodeQL setup are mutually
+# exclusive. After this lands, switch the repo from "Default" to "Advanced" in
+# Settings -> Code security -> CodeQL analysis, or this workflow is ignored.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1" # Mondays 03:27 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # The extractor builds the whole workspace with all features; cap parallel
+  # compiler jobs so it doesn't OOM the 7 GB runner (matches CI).
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  analyze:
+    name: Analyze (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      security-events: write # upload SARIF results
+      contents: read
+      actions: read # read workflow run status (private repos / scheduled)
+
+    steps:
+      - uses: actions/checkout@v6
+
+      # The all-features dependency graph (datafusion, deltalake, aws-lc,
+      # rdkafka, onnx, ...) is large; free disk + add swap so extraction does
+      # not run out of space or RAM. Mirrors the heavy CI jobs.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - name: Set swap space
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Load-bearing: see the header comment. protoc + the native build
+      # toolchain are what let the extractor resolve generated/native call
+      # targets and clear the analysis-quality threshold.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:rust"

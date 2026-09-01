@@ -1,0 +1,212 @@
+//! NATS source and sink — `core` (non-durable, at-most-once) or
+//! `jetstream` (default; replayable, durable at-least-once with optional
+//! bounded `Nats-Msg-Id` broker deduplication).
+
+pub mod config;
+pub mod metrics;
+mod setup;
+pub mod sink;
+pub mod source;
+
+pub use metrics::{NatsSinkMetrics, NatsSourceMetrics};
+pub use sink::NatsSink;
+pub use source::NatsSource;
+
+use std::sync::Arc;
+
+use arrow_schema::Schema;
+
+use crate::config::{ConfigKeySpec, ConnectorInfo};
+use crate::registry::ConnectorRegistry;
+
+/// Registers the NATS source connector.
+///
+/// # Errors
+///
+/// Returns an error if the source is already registered or the registry is frozen.
+pub fn register_nats_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
+    let info = ConnectorInfo {
+        name: "nats".to_string(),
+        display_name: "NATS Source".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: true,
+        is_sink: false,
+        config_keys: source_config_keys(),
+    };
+    registry.register_source(
+        "nats",
+        info,
+        Arc::new(|registry| {
+            Ok(Box::new(NatsSource::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
+        }),
+    )
+}
+
+/// Registers the NATS sink connector.
+///
+/// # Errors
+///
+/// Returns an error if the sink is already registered or the registry is frozen.
+pub fn register_nats_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
+    let info = ConnectorInfo {
+        name: "nats".to_string(),
+        display_name: "NATS Sink".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: false,
+        is_sink: true,
+        config_keys: sink_config_keys(),
+    };
+    registry.register_sink(
+        "nats",
+        info,
+        Arc::new(|_config, registry| {
+            Ok(Box::new(NatsSink::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
+        }),
+    )
+}
+
+fn auth_and_tls_keys() -> Vec<ConfigKeySpec> {
+    use ConfigKeySpec as K;
+    vec![
+        K::optional("auth.mode", "none | user_pass | token | creds_file", "none"),
+        K::optional("user", "Username (auth.mode=user_pass)", ""),
+        K::optional("password", "Password (auth.mode=user_pass)", ""),
+        K::optional("token", "Bearer token (auth.mode=token)", ""),
+        K::optional(
+            "creds.file",
+            "Path to a NATS credentials file (auth.mode=creds_file)",
+            "",
+        ),
+        K::optional("tls.enabled", "Require TLS on the connection", "false"),
+        K::optional(
+            "tls.ca.location",
+            "PEM CA certificate for server verification",
+            "",
+        ),
+        K::optional(
+            "tls.cert.location",
+            "Client certificate for mutual TLS (pairs with tls.key.location)",
+            "",
+        ),
+        K::optional("tls.key.location", "Client private key for mutual TLS", ""),
+    ]
+}
+
+fn source_config_keys() -> Vec<ConfigKeySpec> {
+    use ConfigKeySpec as K;
+    let mut keys = vec![
+        K::required("servers", "NATS server URLs, comma-separated"),
+        K::optional("mode", "core | jetstream", "jetstream"),
+        // JetStream
+        K::optional(
+            "stream",
+            "JetStream stream name (required in jetstream mode)",
+            "",
+        ),
+        K::optional(
+            "consumer",
+            "Durable consumer name (required in jetstream mode)",
+            "",
+        ),
+        K::optional("subject", "Single subject or wildcard (e.g., orders.>)", ""),
+        K::optional(
+            "subject.filters",
+            "Comma-separated filter subjects (JS 2.10+)",
+            "",
+        ),
+        K::optional(
+            "deliver.policy",
+            "all | new | by_start_sequence | by_start_time",
+            "all",
+        ),
+        K::optional(
+            "start.sequence",
+            "Stream sequence for by_start_sequence",
+            "",
+        ),
+        K::optional("start.time", "RFC3339 timestamp for by_start_time", ""),
+        K::optional("ack.policy", "explicit | none", "explicit"),
+        K::optional(
+            "ack.wait.ms",
+            "Per-message ack wait in milliseconds",
+            "60000",
+        ),
+        K::optional(
+            "max.deliver",
+            "Max delivery attempts before poison action",
+            "5",
+        ),
+        K::optional(
+            "max.ack.pending",
+            "Max unacked messages (server-side flow control)",
+            "10000",
+        ),
+        K::optional("fetch.batch", "Messages per pull fetch", "500"),
+        K::optional("fetch.max.wait.ms", "Max wait per fetch", "500"),
+        K::optional(
+            "lag.poll.interval.ms",
+            "Interval between consumer.info() polls for the lag gauge (0 disables)",
+            "10000",
+        ),
+        K::optional(
+            "queue.group",
+            "Queue group for load balancing (core mode only)",
+            "",
+        ),
+        K::optional("format", "json | csv | raw", "json"),
+    ];
+    keys.extend(auth_and_tls_keys());
+    keys
+}
+
+fn sink_config_keys() -> Vec<ConfigKeySpec> {
+    use ConfigKeySpec as K;
+    let mut keys = vec![
+        K::required("servers", "NATS server URLs, comma-separated"),
+        K::optional("mode", "core | jetstream", "jetstream"),
+        K::optional(
+            "stream",
+            "Required JetStream target; validated and sent as Nats-Expected-Stream",
+            "",
+        ),
+        K::optional("subject", "Literal subject for every row", ""),
+        K::optional(
+            "subject.column",
+            "Column name whose value is the subject",
+            "",
+        ),
+        K::optional(
+            "dedup.id.column",
+            "Unique row column used as Nats-Msg-Id for bounded broker deduplication",
+            "",
+        ),
+        K::optional(
+            "min.duplicate.window.ms",
+            "Minimum stream duplicate_window accepted when deduplication is enabled",
+            "120000",
+        ),
+        K::optional("max.pending", "Max outstanding PubAck futures", "4096"),
+        K::optional("ack.timeout.ms", "Per-publish ack timeout", "30000"),
+        K::optional("format", "json | csv | raw", "json"),
+        K::optional(
+            "header.columns",
+            "Comma-separated columns projected to NATS headers",
+            "",
+        ),
+    ];
+    keys.extend(auth_and_tls_keys());
+    keys
+}
+
+#[cfg(test)]
+mod tests;

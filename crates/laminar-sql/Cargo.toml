@@ -9,16 +9,21 @@ homepage.workspace = true
 documentation = "https://laminardb.io/api/laminar_sql"
 description = "SQL layer for LaminarDB with streaming extensions"
 
+[features]
+default = []
+cluster = ["laminar-core/cluster"]
+
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.30.0" }
 
 # DataFusion for SQL processing
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
-datafusion-sql = { workspace = true }
 datafusion-optimizer = { workspace = true }
+# DataFusion's Expr -> SQL unparser, reused for distributed-scan filter pushdown.
+datafusion-sql = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }
@@ -30,12 +35,12 @@ sqlparser = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Async
 tokio = { workspace = true }
 async-trait = { workspace = true }
-futures = "0.3"
+futures = { workspace = true }
+crossfire = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
@@ -50,6 +55,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

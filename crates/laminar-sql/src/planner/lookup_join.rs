@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::Result;
 use datafusion::logical_expr::logical_plan::LogicalPlan;
 use datafusion::logical_expr::{Extension, Join, TableScan, UserDefinedLogicalNodeCore};
 use datafusion_common::tree_node::Transformed;
@@ -96,16 +96,23 @@ impl OptimizerRule for LookupJoinRewriteRule {
             .on
             .iter()
             .map(|(left_expr, right_expr)| {
-                if lookup_is_right {
-                    JoinKeyPair {
-                        stream_expr: left_expr.clone(),
-                        lookup_column: right_expr.to_string(),
-                    }
+                let lookup_expr = if lookup_is_right {
+                    right_expr
                 } else {
-                    JoinKeyPair {
-                        stream_expr: right_expr.clone(),
-                        lookup_column: left_expr.to_string(),
-                    }
+                    left_expr
+                };
+                let stream_expr = if lookup_is_right {
+                    left_expr
+                } else {
+                    right_expr
+                };
+                let lookup_column = match lookup_expr {
+                    datafusion::logical_expr::Expr::Column(col) => col.name.clone(),
+                    other => other.to_string(),
+                };
+                JoinKeyPair {
+                    stream_expr: stream_expr.clone(),
+                    lookup_column,
                 }
             })
             .collect();
@@ -131,16 +138,7 @@ impl OptimizerRule for LookupJoinRewriteRule {
 
         // Build output schema from stream + lookup
         let stream_schema = stream_plan.schema();
-        let merged_fields: Vec<_> = stream_schema
-            .fields()
-            .iter()
-            .chain(lookup_schema.fields().iter())
-            .cloned()
-            .collect();
-        let output_schema = Arc::new(DFSchema::from_unqualified_fields(
-            merged_fields.into(),
-            HashMap::new(),
-        )?);
+        let output_schema = Arc::new(stream_schema.join(lookup_schema.as_ref())?);
 
         let metadata = LookupTableMetadata {
             connector: info.properties.connector.to_string(),
@@ -260,26 +258,10 @@ fn scan_table_name(plan: &LogicalPlan) -> Option<String> {
     scan_table_name_and_alias(plan).map(|(name, _)| name)
 }
 
-/// Display helpers for connector/strategy/pushdown types.
-impl fmt::Display for crate::parser::lookup_table::ConnectorType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PostgresCdc => write!(f, "postgres-cdc"),
-            Self::MysqlCdc => write!(f, "mysql-cdc"),
-            Self::Redis => write!(f, "redis"),
-            Self::S3Parquet => write!(f, "s3-parquet"),
-            Self::DeltaLake => write!(f, "delta-lake"),
-            Self::Static => write!(f, "static"),
-            Self::Custom(s) => write!(f, "{s}"),
-        }
-    }
-}
-
 impl fmt::Display for crate::parser::lookup_table::LookupStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Replicated => write!(f, "replicated"),
-            Self::Partitioned => write!(f, "partitioned"),
             Self::OnDemand => write!(f, "on-demand"),
         }
     }
@@ -300,7 +282,7 @@ mod tests {
     use super::*;
     use crate::datafusion::create_session_context;
     use crate::parser::lookup_table::{
-        ByteSize, ConnectorType, LookupStrategy, LookupTableProperties, PushdownMode,
+        LookupConnector, LookupStrategy, LookupTableProperties, PushdownMode,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::prelude::SessionContext;
@@ -320,11 +302,9 @@ mod tests {
             ],
             primary_key: vec!["id".to_string()],
             properties: LookupTableProperties {
-                connector: ConnectorType::PostgresCdc,
-                connection: Some("postgresql://localhost/db".to_string()),
+                connector: LookupConnector::External("catalog-source".into()),
                 strategy: LookupStrategy::Replicated,
-                cache_memory: Some(ByteSize(512 * 1024 * 1024)),
-                cache_disk: None,
+                cache_memory: None,
                 cache_ttl: None,
                 pushdown_mode: PushdownMode::Auto,
             },
@@ -440,11 +420,10 @@ mod tests {
     }
 
     #[test]
-    fn test_fmt_display_connector_type() {
-        assert_eq!(ConnectorType::PostgresCdc.to_string(), "postgres-cdc");
-        assert_eq!(ConnectorType::Redis.to_string(), "redis");
+    fn test_fmt_display_lookup_connector() {
+        assert_eq!(LookupConnector::Static.to_string(), "static");
         assert_eq!(
-            ConnectorType::Custom("my-conn".into()).to_string(),
+            LookupConnector::External("my-conn".into()).to_string(),
             "my-conn"
         );
     }

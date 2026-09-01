@@ -20,7 +20,7 @@ Available platforms:
 
 ```bash
 # Download and extract (Linux x86_64 example)
-curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz
+curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.20.2.tar.gz
 tar xzf laminardb-server-x86_64-unknown-linux-gnu-v*.tar.gz
 
 # Verify checksums
@@ -56,8 +56,8 @@ curl http://localhost:8080/health
 
 Available tags:
 - `latest` - latest build from `main`
-- `0.18.12` - specific version
-- `0.18` - latest patch for minor version
+- `0.20.2` - specific version
+- `0.20` - latest patch for minor version
 - `sha-abc1234` - specific commit
 
 Multi-arch support: `linux/amd64` and `linux/arm64`.
@@ -74,17 +74,31 @@ See the root `docker-compose.yml` for a full example with Kafka and PostgreSQL.
 
 ## 3. Helm (Kubernetes)
 
-### Install from GHCR OCI registry
+### Option A: Install from the LaminarDB Helm repository (Cloud/Internet Connected)
 
 ```bash
-helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
-  --set image.tag=0.18.12
+helm repo add laminardb https://laminardb.io/charts
+helm repo update
+helm install my-laminardb laminardb/laminardb
 ```
 
-### Quick start (standalone embedded mode)
+### Option B: Install from Local Files / Local Tarball (Best for On-Prem / Air-Gapped / Custom AKS)
+
+If your environment restricts accessing external OCI registries:
 
 ```bash
-helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
+# 1. Clone the repository locally, then run install from the folder:
+helm install my-laminardb deploy/helm/laminardb
+
+# 2. Or package the chart into a tarball to ship it to air-gapped clusters:
+helm package deploy/helm/laminardb
+helm install my-laminardb laminardb-*.tgz
+```
+
+### Quick start (standalone single-node mode)
+
+```bash
+helm install my-laminardb deploy/helm/laminardb \
   -f deploy/helm/laminardb/ci/standalone-values.yaml
 ```
 
@@ -109,16 +123,16 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 
 | Section | Description |
 |---------|-------------|
-| `laminardb.mode` | `embedded` (single node) or `delta` (multi-node cluster) |
+| `laminardb.mode` | `single` (standalone) or `cluster` (multi-node) |
 | `laminardb.checkpoint` | Checkpoint interval, storage URL, strategy |
 | `sources` / `sinks` / `pipelines` | Streaming pipeline definitions (rendered to TOML) |
-| `persistence` | PVC sizes for state and checkpoints |
+| `persistence` | Optional local checkpoint PVC settings |
 | `serviceMonitor` | Prometheus Operator integration |
 
 ### CI test values
 
 - `ci/standalone-values.yaml` - minimal single-node deployment
-- `ci/constellation-values.yaml` - 3-node delta-mode cluster
+- `ci/cluster-values.yaml` - 3-node cluster-mode setup
 - `ci/full-values.yaml` - all features enabled (ingress, monitoring, network policy)
 
 ---
@@ -130,10 +144,10 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 | CI | `ci.yml` | push, PR | Format, clippy, test, MSRV, feature matrix |
 | Release | `release.yml` | `v*` tags | Build binaries, create GitHub Release, publish to crates.io |
 | Docker | `docker.yml` | push to main, `v*` tags, PR | Multi-arch Docker images to GHCR + Docker Hub |
-| Helm Publish | `helm-publish.yml` | push to main (helm changes) | Lint and publish Helm chart to GHCR OCI |
+| Helm Lint | `helm-lint.yml` | push/PR (helm changes) | Lint & validate the Helm chart |
 | Benchmarks | `bench.yml` | push to main | Run and track performance benchmarks |
 | Coverage | `coverage.yml` | push, PR | Code coverage with Codecov |
-| Docs | `docs.yml` | push to main (docs/code changes) | Build and deploy API docs to GitHub Pages |
+| Docs | `docs.yml` | push to main (docs/code/helm changes) | Build & deploy the site, API docs, and Helm chart repo (`/charts`) to GitHub Pages |
 | Dependencies | `deps.yml` | weekly (Sunday) | Check for outdated deps, auto-create update PR |
 
 ## Required GitHub Secrets

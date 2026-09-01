@@ -7,98 +7,105 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://laminardb.io/api/laminar_core"
-description = "Core streaming engine for LaminarDB - reactor, operators, and state management"
+description = "Core streaming engine for LaminarDB - operators, checkpoint barriers, and streaming primitives"
 
 [features]
 default = []
-# Enable io_uring support (Linux 5.10+ only)
-io-uring = ["dep:io-uring"]
-# Enable hwlocality for enhanced NUMA topology discovery
-hwloc = ["dep:hwlocality"]
-# Enable distributed delta mode (multi-node) — heavy deps, server-only
-delta = [
-    "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
+# Distributed cluster coordination.
+cluster = [
+    "dep:chitchat", "dep:tokio-util", "dep:anyhow",
+    "dep:tonic", "dep:tonic-prost", "dep:prost",
+    "dep:tokio-rustls",
+    "dep:gethostname",
 ]
+aws = ["object_store/aws"]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
+
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
 ahash = { workspace = true }
-papaya = { workspace = true }
-xorf = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
-foyer = { workspace = true }
+quick_cache = { workspace = true }
+object_store = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"
-memmap2 = { workspace = true }
-bumpalo = { workspace = true }
-uuid = { workspace = true }
 smallvec = { workspace = true }
-arrayvec = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+rand = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
+arrow-row = { workspace = true }
 chrono = { workspace = true }
-
-# Integrity
-crc32c = "0.6"
+url = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Serialization for state (rkyv for zero-copy, serde for compatibility)
 rkyv = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Async for Ring 1 communication
+# Async support for operators and streaming channels
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
 
-# SQL parsing (for filter compilation)
-sqlparser = { workspace = true }
 
-
-# Delta (optional, multi-node distributed mode — server-only)
+# Cluster (optional, multi-node distributed mode — server-only)
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-xxhash-rust = { workspace = true, optional = true }
+# anyhow is needed for the chitchat Transport trait impls in the
+# testing module; activated by the cluster feature.
+anyhow = { workspace = true, optional = true }
+gethostname = { workspace = true, optional = true }
+# futures is needed for the object_store::ObjectStore impl on
+# FaultyObjectStore (BoxStream type).
+futures = { workspace = true }
+
+# gRPC transport for cross-node shuffle + barrier sync (cluster).
+# The generated client/server stubs are compiled only under that feature;
+# `tonic-prost` supplies the ProstCodec the generated code instantiates.
+# `tls-aws-lc` matches the pgwire side's rustls provider, so one process never
+# installs two crypto providers; used for cluster control-plane mTLS.
+tonic = { version = "0.14", optional = true, features = ["tls-aws-lc"] }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs"] }
 
 # Observability
 tracing = { workspace = true }
 
-# Thread-per-core
-num_cpus = "1.17"
+crossfire = { workspace = true }
 
-# NUMA topology (optional, enhanced detection)
-hwlocality = { version = "1.0.0-alpha.8", optional = true }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
 
-# Platform-specific dependencies
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
-io-uring = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+[build-dependencies]
+# Generates the gRPC client/server stubs from proto/*.proto. Build-dependencies
+# can't be feature-gated, so this is always present, but the codegen in build.rs
+# runs only when CARGO_FEATURE_CLUSTER_UNSTABLE is set — a default build needs
+# no protoc and skips generation entirely.
+tonic-prost-build = "0.14"
+# Vendored protoc so codegen doesn't depend on the host's protoc version (old
+# distro protoc predates proto3 `optional` and rejects barrier.proto).
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = { workspace = true }
-rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-
-[[bench]]
-name = "state_bench"
-harness = false
+# Mint a throwaway CA + node cert for the control-plane mTLS integration test.
+rcgen = "0.13"
 
 [[bench]]
 name = "window_bench"
@@ -113,25 +120,14 @@ name = "streaming_bench"
 harness = false
 
 [[bench]]
-name = "dag_bench"
-harness = false
-
-[[bench]]
-name = "dag_stress"
-harness = false
-
-[[bench]]
-name = "subscription_bench"
-harness = false
-
-[[bench]]
 name = "cache_bench"
-harness = false
-
-[[bench]]
-name = "checkpoint_bench"
 harness = false
 
 [[bench]]
 name = "lookup_join_bench"
 harness = false
+
+[[bench]]
+name = "shuffle_bench"
+harness = false
+required-features = ["cluster"]

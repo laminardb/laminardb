@@ -1,0 +1,52 @@
+name: Helm Chart Lint
+
+# Validates the Helm chart. Publishing is handled by docs.yml, which packages
+# the chart into the GitHub Pages site as a classic Helm repo served at
+# https://laminardb.io/charts (see deploy/README.md).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/helm/**"
+  pull_request:
+    paths:
+      - "deploy/helm/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2
+
+      - name: Lint with chart-testing
+        run: ct lint --config deploy/helm/ct.yaml --charts deploy/helm/laminardb
+
+      - name: Lint chart (strict)
+        run: helm lint deploy/helm/laminardb --strict
+
+      - name: Template with default values
+        run: helm template laminardb deploy/helm/laminardb
+
+      - name: Template with standalone values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/standalone-values.yaml
+
+      - name: Template with cluster values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/cluster-values.yaml
+
+      - name: Template with full values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/full-values.yaml

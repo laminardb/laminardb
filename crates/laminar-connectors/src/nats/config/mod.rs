@@ -1,0 +1,646 @@
+//! NATS source and sink configuration.
+
+use std::str::FromStr;
+use std::time::Duration;
+
+use async_nats::HeaderName;
+
+use crate::config::ConnectorConfig;
+use crate::error::ConnectorError;
+use crate::serde::Format;
+
+/// Keep retained acknowledgement futures below async-nats' internal publish
+/// window and put a fixed ceiling on connector memory.
+pub(super) const MAX_PENDING_PUBLISH_ACKS: usize = 4_096;
+
+/// A connector operation must always have a finite client-side bound. This is
+/// deliberately an implementation ceiling rather than another deployment knob.
+pub(super) const MAX_NATS_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+const NATS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const NATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// NATS connector mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Plain NATS pub/sub. No durability, no replay, at-most-once.
+    Core,
+    /// `JetStream` with durable pull consumers.
+    #[default]
+    JetStream,
+}
+
+str_enum!(fromstr Mode, lowercase, ConnectorError, "invalid nats mode",
+    Core => "core";
+    JetStream => "jetstream"
+);
+
+/// `JetStream` consumer ack policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AckPolicy {
+    /// Each message acked individually.
+    #[default]
+    Explicit,
+    /// No ack required.
+    None,
+}
+
+str_enum!(fromstr AckPolicy, lowercase, ConnectorError, "invalid ack.policy",
+    Explicit => "explicit";
+    None => "none"
+);
+
+/// `JetStream` consumer delivery policy — where to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeliverPolicy {
+    /// Every message retained by the stream.
+    #[default]
+    All,
+    /// Only messages published after consumer creation.
+    New,
+    /// Start from a user-supplied stream sequence.
+    ByStartSequence,
+    /// Start from a user-supplied timestamp.
+    ByStartTime,
+}
+
+str_enum!(fromstr DeliverPolicy, lowercase, ConnectorError, "invalid deliver.policy",
+    All => "all";
+    New => "new";
+    ByStartSequence => "by_start_sequence";
+    ByStartTime => "by_start_time"
+);
+
+/// Where the sink gets the subject to publish to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectSpec {
+    /// A single literal subject used for every row.
+    Literal(String),
+    /// Per-row: read the named column and use its string value.
+    Column(String),
+}
+
+/// NATS user-authentication mode. Custom `Debug` redacts secrets
+/// because the parent config structs derive `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum AuthMode {
+    #[default]
+    None,
+    UserPass {
+        user: String,
+        password: String,
+    },
+    Token(String),
+    CredsFile(String),
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::UserPass { user, .. } => f
+                .debug_struct("UserPass")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            Self::CredsFile(path) => f.debug_tuple("CredsFile").field(path).finish(),
+        }
+    }
+}
+
+/// TLS transport configuration.
+#[derive(Debug, Clone, Default)]
+#[allow(missing_docs)]
+pub struct TlsConfig {
+    pub enabled: bool,
+    pub ca_location: Option<String>,
+    pub cert_location: Option<String>,
+    pub key_location: Option<String>,
+}
+
+/// NATS source configuration.
+#[derive(Debug, Clone)]
+#[allow(missing_docs)] // one-line `///` per field noises up the config struct
+pub struct NatsSourceConfig {
+    pub servers: Vec<String>,
+    pub mode: Mode,
+    pub auth: AuthMode,
+    pub tls: TlsConfig,
+
+    // JetStream
+    pub stream: Option<String>,
+    pub subject: Option<String>,
+    pub subject_filters: Vec<String>,
+    pub consumer: Option<String>,
+    pub deliver_policy: DeliverPolicy,
+    pub start_sequence: Option<u64>,
+    pub start_time: Option<String>, // RFC3339; parsed against the NATS client's time type in open()
+    pub ack_policy: AckPolicy,
+    pub ack_wait: Duration,
+    pub max_deliver: i64,
+    pub max_ack_pending: i64,
+    pub fetch_batch: usize,
+    pub fetch_max_wait: Duration,
+    /// Interval between `consumer.info()` polls that feed the
+    /// `nats_source_consumer_lag` gauge. Zero disables the poll.
+    pub lag_poll_interval: Duration,
+
+    // Core
+    pub queue_group: Option<String>,
+
+    pub format: Format,
+}
+
+impl NatsSourceConfig {
+    /// # Errors
+    ///
+    /// `ConfigurationError` on any parse or validation failure.
+    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let servers = parse_servers(config)?;
+        let mode = parse_or_default::<Mode>(config, "mode")?;
+        let auth = parse_auth(config)?;
+        let tls = parse_tls(config)?;
+
+        let stream = config.get("stream").map(str::to_string);
+        let subject = config.get("subject").map(str::to_string);
+        let subject_filters = config
+            .get("subject.filters")
+            .map(split_csv)
+            .unwrap_or_default();
+        let consumer = config.get("consumer").map(str::to_string);
+        let deliver_policy = parse_or_default::<DeliverPolicy>(config, "deliver.policy")?;
+        let start_sequence = parse_opt_u64(config, "start.sequence")?;
+        let start_time = config.get("start.time").map(str::to_string);
+        let ack_policy = parse_or_default::<AckPolicy>(config, "ack.policy")?;
+        let ack_wait = require_positive_duration(config, "ack.wait.ms", Duration::from_secs(60))?;
+        let max_deliver = require_positive_or_unlimited_i64(config, "max.deliver", 5)?;
+        let max_ack_pending = require_positive_or_unlimited_i64(config, "max.ack.pending", 10_000)?;
+        let fetch_batch = require_positive_usize(config, "fetch.batch", 500)?;
+        let fetch_max_wait =
+            require_positive_duration(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
+        let lag_poll_interval =
+            parse_duration_ms(config, "lag.poll.interval.ms", Duration::from_secs(10))?;
+        let queue_group = config.get("queue.group").map(str::to_string);
+        let format = parse_format(config)?;
+
+        let cfg = Self {
+            servers,
+            mode,
+            auth,
+            tls,
+            stream,
+            subject,
+            subject_filters,
+            consumer,
+            deliver_policy,
+            start_sequence,
+            start_time,
+            ack_policy,
+            ack_wait,
+            max_deliver,
+            max_ack_pending,
+            fetch_batch,
+            fetch_max_wait,
+            lag_poll_interval,
+            queue_group,
+            format,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        match self.mode {
+            Mode::JetStream => {
+                if self.stream.is_none() {
+                    return Err(cfg_err(
+                        "[LDB-5040] jetstream mode requires 'stream' to be set",
+                    ));
+                }
+                if self.consumer.is_none() {
+                    return Err(cfg_err(
+                        "[LDB-5041] jetstream mode requires 'consumer' (durable name) — \
+                         ephemeral consumers are not supported",
+                    ));
+                }
+                if self.subject.is_none() && self.subject_filters.is_empty() {
+                    return Err(cfg_err(
+                        "[LDB-5042] jetstream mode requires 'subject' or 'subject.filters' \
+                         — the consumer must have at least one filter",
+                    ));
+                }
+                if matches!(self.deliver_policy, DeliverPolicy::ByStartSequence)
+                    && self.start_sequence.is_none()
+                {
+                    return Err(cfg_err(
+                        "[LDB-5043] deliver.policy=by_start_sequence requires 'start.sequence'",
+                    ));
+                }
+                if matches!(self.deliver_policy, DeliverPolicy::ByStartTime)
+                    && self.start_time.is_none()
+                {
+                    return Err(cfg_err(
+                        "[LDB-5044] deliver.policy=by_start_time requires 'start.time'",
+                    ));
+                }
+            }
+            Mode::Core => {
+                if self.subject.is_none() {
+                    return Err(cfg_err(
+                        "[LDB-5045] core mode requires 'subject' (JetStream stream config \
+                         does not apply)",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// NATS sink configuration.
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub struct NatsSinkConfig {
+    pub servers: Vec<String>,
+    pub mode: Mode,
+    pub auth: AuthMode,
+    pub tls: TlsConfig,
+    pub stream: Option<String>,
+    pub subject: SubjectSpec,
+    pub dedup_id_column: Option<String>,
+    /// Stream's `duplicate_window` must be at least this long when bounded
+    /// `Nats-Msg-Id` deduplication is enabled.
+    pub min_duplicate_window: Duration,
+    pub max_pending: usize,
+    pub ack_timeout: Duration,
+    pub format: Format,
+    pub header_columns: Vec<HeaderName>,
+}
+
+impl NatsSinkConfig {
+    /// # Errors
+    ///
+    /// `ConfigurationError` on any parse or validation failure.
+    pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
+        let servers = parse_servers(config)?;
+        let mode = parse_or_default::<Mode>(config, "mode")?;
+        let auth = parse_auth(config)?;
+        let tls = parse_tls(config)?;
+
+        let subject = match (config.get("subject"), config.get("subject.column")) {
+            (Some(s), None) => SubjectSpec::Literal(s.to_string()),
+            (None, Some(col)) => SubjectSpec::Column(col.to_string()),
+            (Some(_), Some(_)) => {
+                return Err(cfg_err(
+                    "[LDB-5050] set 'subject' OR 'subject.column', not both",
+                ));
+            }
+            (None, None) => {
+                return Err(cfg_err(
+                    "[LDB-5051] 'subject' or 'subject.column' is required",
+                ));
+            }
+        };
+
+        let dedup_id_column = config.get("dedup.id.column").map(str::to_string);
+
+        let cfg = Self {
+            servers,
+            mode,
+            auth,
+            tls,
+            stream: config
+                .get("stream")
+                .map(str::trim)
+                .filter(|stream| !stream.is_empty())
+                .map(str::to_string),
+            subject,
+            dedup_id_column,
+            min_duplicate_window: require_positive_duration(
+                config,
+                "min.duplicate.window.ms",
+                Duration::from_secs(120),
+            )?,
+            max_pending: require_positive_usize(config, "max.pending", MAX_PENDING_PUBLISH_ACKS)?,
+            ack_timeout: require_positive_duration(
+                config,
+                "ack.timeout.ms",
+                Duration::from_secs(30),
+            )?,
+            format: parse_format(config)?,
+            header_columns: config
+                .get("header.columns")
+                .map(split_csv)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|name| {
+                    if !name
+                        .bytes()
+                        .all(|byte| (33..=126).contains(&byte) && byte != b':')
+                    {
+                        return Err(cfg_err(&format!(
+                            "[LDB-5066] header.columns entry '{name}' is not a valid ASCII NATS header name"
+                        )));
+                    }
+                    HeaderName::from_str(&name).map_err(|error| {
+                        cfg_err(&format!(
+                            "[LDB-5066] header.columns entry '{name}' is not a valid NATS header name: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if self.max_pending > MAX_PENDING_PUBLISH_ACKS {
+            return Err(cfg_err(&format!(
+                "max.pending must be <= {MAX_PENDING_PUBLISH_ACKS}"
+            )));
+        }
+        if self.ack_timeout > MAX_NATS_IO_TIMEOUT {
+            return Err(cfg_err(&format!(
+                "ack.timeout.ms must be <= {}",
+                MAX_NATS_IO_TIMEOUT.as_millis()
+            )));
+        }
+        if self.mode == Mode::Core && self.dedup_id_column.is_some() {
+            return Err(cfg_err(
+                "[LDB-5053] 'dedup.id.column' requires mode=jetstream because core NATS has no \
+                 server-side Nats-Msg-Id deduplication",
+            ));
+        }
+        if self.dedup_id_column.is_some() && self.stream.is_none() {
+            return Err(cfg_err(
+                "[LDB-5055] 'dedup.id.column' requires 'stream' so the sink can validate its \
+                 duplicate_window at startup",
+            ));
+        }
+        for h in &self.header_columns {
+            if is_reserved_header(h.as_ref()) {
+                return Err(cfg_err(&format!(
+                    "[LDB-5065] header.columns entry '{h}' collides with a reserved NATS \
+                     header (Nats-Msg-Id / Nats-Expected-Stream); rename the column",
+                )));
+            }
+        }
+        match self.mode {
+            Mode::JetStream if self.stream.is_none() => {
+                return Err(cfg_err(
+                    "[LDB-5071] mode=jetstream requires an explicit 'stream' so durable storage, \
+                     replica count, and publish routing can be validated",
+                ));
+            }
+            Mode::Core if self.stream.is_some() => {
+                return Err(cfg_err(
+                    "[LDB-5071] 'stream' is valid only in mode=jetstream; remove it for core NATS",
+                ));
+            }
+            Mode::Core | Mode::JetStream => {}
+        }
+        Ok(())
+    }
+}
+
+/// Header names the sink manages itself; a user header with the same
+/// name would otherwise silently clobber bounded dedup or stream fencing.
+fn is_reserved_header(name: &str) -> bool {
+    const RESERVED: &[&str] = &["Nats-Msg-Id", "Nats-Expected-Stream"];
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
+}
+
+// ── helpers ──
+
+fn cfg_err(msg: &str) -> ConnectorError {
+    ConnectorError::ConfigurationError(msg.to_string())
+}
+
+fn parse_servers(config: &ConnectorConfig) -> Result<Vec<String>, ConnectorError> {
+    let raw = config.require("servers")?;
+    let servers: Vec<String> = split_csv(raw);
+    if servers.is_empty() {
+        return Err(cfg_err("[LDB-5030] 'servers' must not be empty"));
+    }
+    Ok(servers)
+}
+
+fn split_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_or_default<T: std::str::FromStr + Default>(
+    config: &ConnectorConfig,
+    key: &str,
+) -> Result<T, ConnectorError>
+where
+    T::Err: std::fmt::Display,
+{
+    match config.get(key) {
+        Some(s) => s
+            .parse()
+            .map_err(|e: T::Err| cfg_err(&format!("invalid {key}: {e}"))),
+        None => Ok(T::default()),
+    }
+}
+
+fn parse_format(config: &ConnectorConfig) -> Result<Format, ConnectorError> {
+    match config.get("format") {
+        Some(s) => Format::parse(s).map_err(|e| cfg_err(&e.to_string())),
+        None => Ok(Format::Json),
+    }
+}
+
+fn parse_bool(config: &ConnectorConfig, key: &str, default: bool) -> Result<bool, ConnectorError> {
+    match config.get(key) {
+        Some(s) => s
+            .parse::<bool>()
+            .map_err(|_| cfg_err(&format!("{key} must be 'true' or 'false', got '{s}'"))),
+        None => Ok(default),
+    }
+}
+
+fn parse_opt_u64(config: &ConnectorConfig, key: &str) -> Result<Option<u64>, ConnectorError> {
+    config.get(key).map(|s| parse_int(key, s)).transpose()
+}
+
+fn parse_i64(config: &ConnectorConfig, key: &str, default: i64) -> Result<i64, ConnectorError> {
+    config.get(key).map_or(Ok(default), |s| parse_int(key, s))
+}
+
+fn parse_usize(
+    config: &ConnectorConfig,
+    key: &str,
+    default: usize,
+) -> Result<usize, ConnectorError> {
+    config.get(key).map_or(Ok(default), |s| parse_int(key, s))
+}
+
+fn require_positive_duration(
+    config: &ConnectorConfig,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, ConnectorError> {
+    let v = parse_duration_ms(config, key, default)?;
+    if v.is_zero() {
+        return Err(cfg_err(&format!("{key} must be > 0")));
+    }
+    Ok(v)
+}
+
+fn require_positive_usize(
+    config: &ConnectorConfig,
+    key: &str,
+    default: usize,
+) -> Result<usize, ConnectorError> {
+    let v = parse_usize(config, key, default)?;
+    if v == 0 {
+        return Err(cfg_err(&format!("{key} must be > 0")));
+    }
+    Ok(v)
+}
+
+/// NATS allows `-1` for "unlimited" in `max_deliver` / `max_ack_pending`.
+/// Reject 0 (undefined) and negative values other than -1.
+fn require_positive_or_unlimited_i64(
+    config: &ConnectorConfig,
+    key: &str,
+    default: i64,
+) -> Result<i64, ConnectorError> {
+    let v = parse_i64(config, key, default)?;
+    if v == 0 || v < -1 {
+        return Err(cfg_err(&format!("{key} must be > 0, or -1 for unlimited")));
+    }
+    Ok(v)
+}
+
+fn parse_duration_ms(
+    config: &ConnectorConfig,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, ConnectorError> {
+    config.get(key).map_or(Ok(default), |s| {
+        parse_int::<u64>(key, s).map(Duration::from_millis)
+    })
+}
+
+fn parse_int<T: std::str::FromStr>(key: &str, raw: &str) -> Result<T, ConnectorError> {
+    raw.parse::<T>()
+        .map_err(|_| cfg_err(&format!("{key} must be an integer, got '{raw}'")))
+}
+
+fn parse_auth(config: &ConnectorConfig) -> Result<AuthMode, ConnectorError> {
+    let mode = config.get("auth.mode").unwrap_or("none");
+    match mode {
+        "none" | "" => {
+            if config.get("user").is_some()
+                || config.get("password").is_some()
+                || config.get("token").is_some()
+                || config.get("creds.file").is_some()
+            {
+                return Err(cfg_err(
+                    "[LDB-5063] credentials set but auth.mode=none; \
+                     set auth.mode explicitly or remove the credentials",
+                ));
+            }
+            Ok(AuthMode::None)
+        }
+        "user_pass" => {
+            let user = config
+                .get("user")
+                .ok_or_else(|| cfg_err("[LDB-5060] auth.mode=user_pass requires 'user'"))?
+                .to_string();
+            let password = config
+                .get("password")
+                .ok_or_else(|| cfg_err("[LDB-5060] auth.mode=user_pass requires 'password'"))?
+                .to_string();
+            Ok(AuthMode::UserPass { user, password })
+        }
+        "token" => {
+            let token = config
+                .get("token")
+                .ok_or_else(|| cfg_err("[LDB-5061] auth.mode=token requires 'token'"))?
+                .to_string();
+            Ok(AuthMode::Token(token))
+        }
+        "creds_file" => {
+            let path = config
+                .get("creds.file")
+                .ok_or_else(|| cfg_err("[LDB-5064] auth.mode=creds_file requires 'creds.file'"))?
+                .to_string();
+            Ok(AuthMode::CredsFile(path))
+        }
+        other => Err(cfg_err(&format!(
+            "invalid auth.mode '{other}'; expected none | user_pass | token | creds_file"
+        ))),
+    }
+}
+
+fn parse_tls(config: &ConnectorConfig) -> Result<TlsConfig, ConnectorError> {
+    let cert_location = config.get("tls.cert.location").map(str::to_string);
+    let key_location = config.get("tls.key.location").map(str::to_string);
+    if cert_location.is_some() != key_location.is_some() {
+        return Err(cfg_err(
+            "[LDB-5062] tls.cert.location and tls.key.location must both be set \
+             (mutual-TLS client cert) or both be unset",
+        ));
+    }
+    Ok(TlsConfig {
+        enabled: parse_bool(config, "tls.enabled", false)?,
+        ca_location: config.get("tls.ca.location").map(str::to_string),
+        cert_location,
+        key_location,
+    })
+}
+
+/// Build `ConnectOptions` from parsed auth + TLS. Shared between
+/// source and sink.
+///
+/// # Errors
+///
+/// Returns `ConnectorError` if the creds file can't be read or parsed.
+pub(super) fn build_connect_options(
+    auth: &AuthMode,
+    tls: &TlsConfig,
+) -> Result<async_nats::ConnectOptions, ConnectorError> {
+    let mut opts = async_nats::ConnectOptions::new();
+    match auth {
+        AuthMode::None => {}
+        AuthMode::UserPass { user, password } => {
+            opts = opts.user_and_password(user.clone(), password.clone());
+        }
+        AuthMode::Token(token) => {
+            opts = opts.token(token.clone());
+        }
+        AuthMode::CredsFile(path) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| cfg_err(&format!("creds.file '{path}': {e}")))?;
+            opts = async_nats::ConnectOptions::with_credentials(&contents)
+                .map_err(|e| cfg_err(&format!("creds.file '{path}' invalid: {e}")))?;
+        }
+    }
+    let tls_touched = tls.enabled || tls.ca_location.is_some() || tls.cert_location.is_some();
+    if tls_touched {
+        opts = opts.require_tls(true);
+    }
+    if let Some(ca) = &tls.ca_location {
+        opts = opts.add_root_certificates(ca.into());
+    }
+    if let (Some(cert), Some(key)) = (&tls.cert_location, &tls.key_location) {
+        opts = opts.add_client_certificate(cert.into(), key.into());
+    }
+    Ok(opts
+        .connection_timeout(NATS_CONNECTION_TIMEOUT)
+        .request_timeout(Some(NATS_REQUEST_TIMEOUT)))
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_types)]
+mod tests;

@@ -1,32 +1,26 @@
 replicaCount: 3
 
 laminardb:
-  mode: delta
+  mode: cluster
+  delivery: at_least_once
   logLevel: debug
-  workers: 4
-  state:
-    backend: mmap
-    maxSizeBytes: 10737418240
   checkpoint:
     interval: "30s"
-    mode: aligned
-    snapshotStrategy: incremental
-  delta:
+    timeout: "120s"
+    url: "s3://laminardb-ci/checkpoints"
+  cluster:
     discovery:
-      strategy: dns
+      strategy: gossip
       gossipPort: 7946
-    coordination:
-      strategy: raft
-      raftPort: 7947
 
 sources:
   - name: trades
     connector: kafka
     format: json
     properties:
-      brokers: "kafka:9092"
+      bootstrap.servers: "kafka:9092"
       topic: raw-trades
-      group_id: laminardb-trades
+      group.id: laminardb-trades
     schema:
       - name: symbol
         type: VARCHAR
@@ -53,15 +47,11 @@ sinks:
   - name: output
     pipeline: trade-volumes
     connector: kafka
-    delivery: at_least_once
     properties:
-      brokers: "kafka:9092"
+      bootstrap.servers: "kafka:9092"
       topic: trade-volumes
 
 persistence:
-  state:
-    enabled: true
-    size: 50Gi
   checkpoints:
     enabled: true
     size: 100Gi

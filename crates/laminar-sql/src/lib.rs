@@ -1,35 +1,10 @@
-//! # `LaminarDB` SQL
-//!
-//! SQL interface for `LaminarDB` with streaming extensions.
-//!
-//! This crate provides:
-//! - SQL parsing with streaming extensions (windows, watermarks, EMIT)
-//! - Query planning and optimization via `DataFusion`
-//! - Streaming-aware physical operators
-//! - SQL-to-operator translation
-//!
-//! ## Streaming SQL Extensions
-//!
-//! ```sql
-//! -- Tumbling window with EMIT
-//! SELECT
-//!   window_start,
-//!   COUNT(*) as event_count
-//! FROM events
-//! GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE)
-//! EMIT AFTER WATERMARK;
-//!
-//! -- Stream-to-stream join
-//! SELECT *
-//! FROM orders o
-//! JOIN order_items i
-//!   ON o.order_id = i.order_id
-//!   AND i.event_time BETWEEN o.event_time AND o.event_time + INTERVAL '1' HOUR;
-//! ```
+//! LaminarDB SQL parser, planner, and DataFusion integration.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)] // Parser and planner entry points keep grammar state and operands explicit.
 #![allow(clippy::disallowed_types)] // cold path: SQL parsing and query planning only
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::uninlined_format_args)]
@@ -38,6 +13,7 @@ pub mod datafusion;
 pub mod error;
 pub mod parser;
 pub mod planner;
+pub mod temporal;
 pub mod translator;
 
 // Re-export key types
@@ -51,7 +27,7 @@ pub use datafusion::execute::execute_streaming_sql;
 pub use datafusion::{
     base_session_config, create_session_context, create_streaming_context_with_validator,
     register_streaming_functions, register_streaming_functions_with_watermark, DdlResult,
-    QueryResult, StreamingSqlResult, WatermarkDynamicFilter,
+    QueryResult, StreamingSqlResult,
 };
 
 /// Result type for SQL operations

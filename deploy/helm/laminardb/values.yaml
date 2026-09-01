@@ -1,5 +1,12 @@
-# -- Number of replicas (use 1 for embedded, >1 for delta/constellation)
+# -- Number of replicas (use 1 for single-node, >1 for cluster mode)
 replicaCount: 1
+
+# -- StatefulSet pod launch ordering: "Parallel" or "OrderedReady".
+# -- Immutable on a live StatefulSet (delete with --cascade=orphan to change).
+podManagementPolicy: Parallel
+
+# -- Kubernetes cluster DNS domain, used to build per-pod discovery addresses.
+clusterDomain: cluster.local
 
 image:
   # -- Docker image repository
@@ -16,69 +23,93 @@ nameOverride: ""
 # -- Override the full release name
 fullnameOverride: ""
 
+# -- Image for the `helm test` connection-check hook (override for air-gapped registries).
+testConnection:
+  image:
+    repository: busybox
+    tag: "1.36"
+
 # -- LaminarDB server configuration
 laminardb:
-  # -- Server mode: "embedded" (single-node) or "delta" (multi-node constellation)
-  mode: embedded
+  # -- Server mode: "single" (standalone) or "cluster" (multi-node clustering)
+  mode: single
+  # -- Pipeline-wide delivery contract. Durable modes require a persistent checkpoint URL.
+  delivery: best_effort
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
   # -- HTTP API bind address
   httpBind: "0.0.0.0:8080"
-  # -- Number of worker threads (0 = auto-detect)
-  workers: 0
-  # -- Prometheus metrics endpoint
-  metrics:
-    enabled: true
-    bind: "0.0.0.0:8080"
-
-  # -- State storage configuration
-  state:
-    # -- Backend type: "memory" or "mmap"
-    backend: mmap
-    # -- Path for persistent state
-    path: /var/lib/laminardb/state
-    # -- Maximum state size in bytes (0 = unlimited)
-    maxSizeBytes: 0
+  # -- Stable key groups used by every deployment tier
+  keyGroups: 256
 
   # -- Checkpoint configuration
   checkpoint:
-    # -- Enable checkpointing
-    enabled: true
     # -- Checkpoint interval (Go/humantime duration)
     interval: "30s"
-    # -- Checkpoint storage URL (file:// or s3://)
-    url: "file:///var/lib/laminardb/checkpoints"
-    # -- Checkpoint mode: "aligned" or "unaligned"
-    mode: aligned
-    # -- Snapshot strategy: "full", "incremental", or "fork_cow"
-    snapshotStrategy: full
+    # -- One end-to-end checkpoint attempt deadline
+    timeout: "120s"
+    # -- Checkpoint storage URL. Use an object store (s3://, gs://, az://) for durable
+    # checkpoints; empty falls back to a local path (non-durable unless checkpoints PVC enabled).
+    url: ""
+
+  # -- PostgreSQL wire protocol (SUBSCRIBE + queries via psql/JDBC/psycopg).
+  pgwire:
+    # -- Enable the pgwire listener and expose its port.
+    enabled: false
+    # -- Bind address. Non-loopback requires allowRemote: true.
+    bind: "0.0.0.0:5432"
+    # -- Required to bind on a non-loopback address (always true in K8s).
+    allowRemote: true
+    # -- MD5 auth users, mapping username -> env var holding the pre-hashed
+    # -- "md5<hex>" password. Supply the env vars from a Secret via extraEnv /
+    # -- extraEnvFrom; only the env reference (not the hash) enters the ConfigMap.
+    users: {}
+    #   alice: PGWIRE_ALICE   # then set PGWIRE_ALICE=md5<hex> from a Secret
+    # -- Concurrent session cap.
+    maxConnections: 256
+    # -- Per-IP auth failures per 60s window (0 disables).
+    maxAuthFailuresPerMin: 10
+    tls:
+      # -- Secret with tls.crt + tls.key (+ ca.crt when mtls). Empty = no TLS.
+      existingSecret: ""
+      # -- Require client certs chained to the Secret's ca.crt (mTLS).
+      mtls: false
+      # -- Minimum TLS version: "1.2" or "1.3".
+      minVersion: "1.2"
+
+  # -- Bearer token for the control-plane (console) HTTP API, read from an
+  # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
+  consoleToken:
+    existingSecret: ""
+    secretKey: "token"
+
+  # -- CORS allow-list of console origins, e.g. ["https://console.example.com"].
+  # -- Empty falls back to the permissive legacy policy (dev only).
+  consoleCorsAllowedOrigins: []
+
+  # -- Hot-reload config on file change. Off in K8s: config changes already roll pods
+  # (checksum/config annotation) and the watcher spams reloads on ConfigMap mounts.
+  configWatch: false
 
   # -- Custom laminardb.toml configuration (overrides all above).
   # -- If set, this raw TOML string is used as the config file directly.
   configOverride: ""
 
-  # -- Delta mode settings (only when mode=delta)
-  delta:
+  # -- Cluster settings (only when mode=cluster)
+  cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
     discovery:
-      # -- Discovery strategy: "dns", "gossip", or "static"
-      strategy: dns
-      # -- DNS name for discovery (auto-set to headless service if empty)
-      dnsName: ""
+      # -- Discovery strategy: "gossip" (recommended) or "static"
+      strategy: gossip
       # -- Gossip port
       gossipPort: 7946
-      # -- Seed nodes for static discovery
+      # -- Seed nodes. Empty = generated from replicaCount as
+      # -- <fullname>-N.<headless>.<namespace>.svc.cluster.local:<gossipPort>
       seeds: []
-    coordination:
-      # -- Coordination strategy (only "raft" supported)
-      strategy: raft
-      # -- Raft port
-      raftPort: 7947
-      # -- Raft election timeout
-      electionTimeout: "1500ms"
-      # -- Raft heartbeat interval
-      heartbeatInterval: "300ms"
+      # -- Host peers use to reach this node. Empty = the pod's headless-service
+      # -- DNS name (override only for non-standard network setups)
+      advertiseHost: ""
 
 # -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
 # -- Each entry needs: name, sql, and optionally parallelism
@@ -98,9 +129,9 @@ sources: []
 #   connector: kafka
 #   format: json
 #   properties:
-#     brokers: "kafka:9092"
+#     bootstrap.servers: "kafka:9092"
 #     topic: raw-trades
-#     group_id: laminardb-trades
+#     group.id: laminardb-trades
 #   schema:
 #     - name: symbol
 #       type: VARCHAR
@@ -127,9 +158,8 @@ sinks: []
 # - name: output
 #   pipeline: trade-volumes
 #   connector: kafka
-#   delivery: at_least_once
 #   properties:
-#     brokers: "kafka:9092"
+#     bootstrap.servers: "kafka:9092"
 #     topic: trade-volumes
 
 serviceAccount:
@@ -167,20 +197,16 @@ service:
   type: ClusterIP
   # -- HTTP API port
   httpPort: 8080
-  # -- PostgreSQL wire protocol port (future)
+  # -- PostgreSQL wire protocol port (exposed when laminardb.pgwire.enabled)
   pgPort: 5432
-  # -- Enable PostgreSQL wire protocol port
-  pgEnabled: false
-  # -- Gossip port for delta mode discovery
+  # -- Gossip port for cluster mode discovery
   gossipPort: 7946
-  # -- Raft port for delta mode coordination
-  raftPort: 7947
   # -- Service annotations
   annotations: {}
 
-# -- Headless service for delta mode DNS discovery
+# -- Headless service for cluster mode DNS discovery
 headlessService:
-  # -- Enable headless service (auto-enabled when mode=delta)
+  # -- Enable headless service (auto-enabled when mode=cluster)
   enabled: false
 
 # -- Ingress configuration (for HTTP API)
@@ -205,24 +231,13 @@ resources: {}
 #   cpu: "2"
 #   memory: 4Gi
 
-# -- Persistence for state and checkpoints
+# -- Local checkpoint persistence. Prefer an object-store checkpoint URL in production.
 persistence:
-  state:
-    # -- Enable persistent state storage
-    enabled: true
-    # -- Storage class (empty = default)
-    storageClass: ""
-    # -- Access modes
-    accessModes: [ReadWriteOnce]
-    # -- Volume size
-    size: 10Gi
-    # -- Use emptyDir instead of PVC (volatile)
-    useEmptyDir: false
-    # -- emptyDir medium (set to "Memory" for tmpfs)
-    emptyDirMedium: ""
   checkpoints:
-    # -- Enable persistent checkpoint storage
-    enabled: true
+    # -- Provision a dedicated checkpoints PVC. Off by default — prefer an object
+    # store (laminardb.checkpoint.url); the local fallback path then uses a
+    # volatile emptyDir.
+    enabled: false
     # -- Storage class (empty = default)
     storageClass: ""
     # -- Access modes
@@ -237,11 +252,15 @@ tolerations: []
 # -- Affinity rules
 affinity: {}
 
+# -- Shutdown grace period. Cluster mode drains owned vnodes on SIGTERM (<=30s);
+# -- keep this above that so Kubernetes does not SIGKILL mid-drain.
+terminationGracePeriodSeconds: 60
+
 # -- For thread-per-core: request guaranteed CPU.
 # -- Set to true to use Guaranteed QoS class (requests == limits).
 guaranteedQoS: false
 
-# -- Topology spread constraints (useful for delta mode)
+# -- Topology spread constraints (useful for cluster mode)
 topologySpreadConstraints: []
 
 # -- Pod disruption budget
@@ -250,7 +269,7 @@ podDisruptionBudget:
   minAvailable: 1
   # maxUnavailable: 1
 
-# -- Autoscaling (mainly for delta mode)
+# -- Autoscaling (mainly for cluster mode)
 autoscaling:
   enabled: false
   minReplicas: 1
@@ -305,6 +324,13 @@ initContainers: []
 extraEnv: []
 # - name: RUST_LOG
 #   value: "laminardb=debug"
+
+# -- Extra environment variables source (e.g. from ConfigMaps or Secrets)
+extraEnvFrom: []
+# - secretRef:
+#     name: laminardb-secrets
+# - configMapRef:
+#     name: laminardb-config
 
 # -- Extra volumes
 extraVolumes: []

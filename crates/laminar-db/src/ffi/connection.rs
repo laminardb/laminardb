@@ -1,6 +1,4 @@
 //! FFI connection functions.
-//!
-//! Provides `extern "C"` wrappers for database connection operations.
 
 use std::ffi::{c_char, CStr};
 use std::ptr;
@@ -13,25 +11,13 @@ use super::error::{
 };
 use super::query::{LaminarQueryResult, LaminarQueryStream};
 
-/// Opaque connection handle for FFI.
-///
-/// This wraps a `Connection` for C callers. Create with `laminar_open()`,
-/// free with `laminar_close()`.
+/// Opaque connection handle. Create with `laminar_open`, free with `laminar_close`.
 #[repr(C)]
 pub struct LaminarConnection {
     pub(crate) inner: Connection,
 }
 
 /// Open a new database connection.
-///
-/// # Arguments
-///
-/// * `out` - Pointer to receive the connection handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code. On error, call `laminar_last_error()`
-/// for details.
 ///
 /// # Safety
 ///
@@ -47,7 +33,6 @@ pub unsafe extern "C" fn laminar_open(out: *mut *mut LaminarConnection) -> i32 {
     match Connection::open() {
         Ok(conn) => {
             let handle = Box::new(LaminarConnection { inner: conn });
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -59,22 +44,11 @@ pub unsafe extern "C" fn laminar_open(out: *mut *mut LaminarConnection) -> i32 {
     }
 }
 
-/// Close a database connection.
-///
-/// This frees the connection and all associated resources. The connection
-/// handle becomes invalid after this call.
-///
-/// # Arguments
-///
-/// * `conn` - Connection handle to close
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Close a database connection and free all associated resources.
 ///
 /// # Safety
 ///
-/// `conn` must be a valid handle from `laminar_open()` that has not been closed.
+/// `conn` must be a valid handle from `laminar_open` that has not been closed.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_close(conn: *mut LaminarConnection) -> i32 {
     clear_last_error();
@@ -83,7 +57,6 @@ pub unsafe extern "C" fn laminar_close(conn: *mut LaminarConnection) -> i32 {
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: conn is non-null and was created by laminar_open
     let handle = unsafe { Box::from_raw(conn) };
     match handle.inner.close() {
         Ok(()) => LAMINAR_OK,
@@ -95,26 +68,12 @@ pub unsafe extern "C" fn laminar_close(conn: *mut LaminarConnection) -> i32 {
     }
 }
 
-/// Execute a SQL statement.
-///
-/// For DDL statements (CREATE, DROP), `out` may be NULL. For queries,
-/// `out` receives a `LaminarQueryResult` handle.
-///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `sql` - Null-terminated SQL string
-/// * `out` - Optional pointer to receive query result (may be NULL for DDL)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Execute a SQL statement. For DDL, `out` may be NULL.
 ///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `sql` must be a valid null-terminated UTF-8 string
-/// * If `out` is non-null, it must be a valid pointer
+/// `conn` and `sql` must be valid non-null pointers; `sql` must be null-terminated UTF-8;
+/// if `out` is non-null it must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_execute(
     conn: *mut LaminarConnection,
@@ -127,49 +86,40 @@ pub unsafe extern "C" fn laminar_execute(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: sql is non-null (checked above)
     let Ok(sql_str) = (unsafe { CStr::from_ptr(sql) }).to_str() else {
         return LAMINAR_ERR_INVALID_UTF8;
     };
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.execute(sql_str) {
         Ok(result) => {
             use crate::api::ExecuteResult;
             match result {
-                ExecuteResult::Query(stream) => {
-                    // Collect to materialized result
-                    match stream.collect() {
-                        Ok(query_result) => {
-                            if !out.is_null() {
-                                let handle = Box::new(LaminarQueryResult::new(query_result));
-                                // SAFETY: out is non-null (checked)
-                                unsafe { *out = Box::into_raw(handle) };
-                            }
-                            LAMINAR_OK
+                ExecuteResult::Query(stream) => match stream.collect() {
+                    Ok(query_result) => {
+                        if !out.is_null() {
+                            let handle = Box::new(LaminarQueryResult::new(query_result));
+                            unsafe { *out = Box::into_raw(handle) };
                         }
-                        Err(e) => {
-                            let code = e.code();
-                            set_last_error(e);
-                            code
-                        }
+                        LAMINAR_OK
                     }
-                }
+                    Err(e) => {
+                        let code = e.code();
+                        set_last_error(e);
+                        code
+                    }
+                },
                 ExecuteResult::Metadata(batch) => {
                     if !out.is_null() {
                         let query_result = crate::api::QueryResult::from_batch(batch);
                         let handle = Box::new(LaminarQueryResult::new(query_result));
-                        // SAFETY: out is non-null (checked)
                         unsafe { *out = Box::into_raw(handle) };
                     }
                     LAMINAR_OK
                 }
                 ExecuteResult::Ddl(_) | ExecuteResult::RowsAffected(_) => {
-                    // DDL or DML - no result to return
                     if !out.is_null() {
-                        // SAFETY: out is non-null
                         unsafe { *out = ptr::null_mut() };
                     }
                     LAMINAR_OK
@@ -184,25 +134,11 @@ pub unsafe extern "C" fn laminar_execute(
     }
 }
 
-/// Execute a query and get materialized results.
-///
-/// This executes the SQL and waits for all results before returning.
-///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `sql` - Null-terminated SQL string
-/// * `out` - Pointer to receive query result
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Execute a query and collect all results into memory.
 ///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `sql` must be a valid null-terminated UTF-8 string
-/// * `out` must be a valid pointer
+/// `conn`, `sql`, and `out` must be valid non-null pointers; `sql` must be null-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_query(
     conn: *mut LaminarConnection,
@@ -215,18 +151,15 @@ pub unsafe extern "C" fn laminar_query(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: sql is non-null (checked above)
     let Ok(sql_str) = (unsafe { CStr::from_ptr(sql) }).to_str() else {
         return LAMINAR_ERR_INVALID_UTF8;
     };
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.query(sql_str) {
         Ok(result) => {
             let handle = Box::new(LaminarQueryResult::new(result));
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -240,23 +173,9 @@ pub unsafe extern "C" fn laminar_query(
 
 /// Execute a query with streaming results.
 ///
-/// Returns a stream handle for incremental result retrieval.
-///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `sql` - Null-terminated SQL string
-/// * `out` - Pointer to receive query stream
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `sql` must be a valid null-terminated UTF-8 string
-/// * `out` must be a valid pointer
+/// `conn`, `sql`, and `out` must be valid non-null pointers; `sql` must be null-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_query_stream(
     conn: *mut LaminarConnection,
@@ -269,18 +188,15 @@ pub unsafe extern "C" fn laminar_query_stream(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: sql is non-null (checked above)
     let Ok(sql_str) = (unsafe { CStr::from_ptr(sql) }).to_str() else {
         return LAMINAR_ERR_INVALID_UTF8;
     };
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.query_stream(sql_str) {
         Ok(stream) => {
             let handle = Box::new(LaminarQueryStream::new(stream));
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -294,14 +210,6 @@ pub unsafe extern "C" fn laminar_query_stream(
 
 /// Start the streaming pipeline.
 ///
-/// # Arguments
-///
-/// * `conn` - Database connection
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
 /// `conn` must be a valid connection handle.
@@ -313,7 +221,6 @@ pub unsafe extern "C" fn laminar_start(conn: *mut LaminarConnection) -> i32 {
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.start() {
@@ -328,19 +235,9 @@ pub unsafe extern "C" fn laminar_start(conn: *mut LaminarConnection) -> i32 {
 
 /// Check if the connection is closed.
 ///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `out` - Pointer to receive result (true if closed)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `out` must be a valid pointer
+/// `conn` and `out` must be valid non-null pointers.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_is_closed(conn: *mut LaminarConnection, out: *mut bool) -> i32 {
     clear_last_error();
@@ -349,7 +246,6 @@ pub unsafe extern "C" fn laminar_is_closed(conn: *mut LaminarConnection, out: *m
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: conn and out are non-null (checked above)
     unsafe {
         *out = (*conn).inner.is_closed();
     }

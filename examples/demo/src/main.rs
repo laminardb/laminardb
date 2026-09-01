@@ -25,7 +25,7 @@
 //! - Event counters: `total_events_ingested`, `total_events_emitted`
 //! - Cycle metrics: `total_cycles`, `last_cycle_duration_ns`
 //! - Pipeline watermark: `pipeline_watermark`
-//! - Source/stream backpressure: `db.source_metrics()`, `db.stream_metrics()`
+//! - Source backpressure and per-stream emitted rows: `db.source_metrics()`, `db.stream_metrics()`
 //! - System stats (CPU/memory) use `sysinfo` directly.
 
 #![allow(clippy::disallowed_types)]
@@ -45,8 +45,8 @@ use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::LaminarDB;
 
 use laminardb_demo::app::App;
-use laminardb_demo::asof_merge;
 use laminardb_demo::generator::MarketGenerator;
+use laminardb_demo::latest_tick;
 use laminardb_demo::system_stats::StatsCollector;
 use laminardb_demo::tui;
 use laminardb_demo::types::{
@@ -77,14 +77,16 @@ struct Subscriptions {
 }
 
 impl Subscriptions {
-    fn from_db(db: &LaminarDB) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn from_db(db: &LaminarDB) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            ohlc: db.subscribe::<OhlcBar>("ohlc_bars")?,
-            volume: db.subscribe::<VolumeMetrics>("volume_metrics")?,
-            spread: db.subscribe::<SpreadMetrics>("spread_metrics")?,
-            anomaly: db.subscribe::<AnomalyAlert>("anomaly_alerts")?,
-            imbalance: db.subscribe::<BookImbalanceMetrics>("book_imbalance")?,
-            depth: db.subscribe::<DepthMetrics>("depth_metrics")?,
+            ohlc: db.subscribe::<OhlcBar>("ohlc_bars").await?,
+            volume: db.subscribe::<VolumeMetrics>("volume_metrics").await?,
+            spread: db.subscribe::<SpreadMetrics>("spread_metrics").await?,
+            anomaly: db.subscribe::<AnomalyAlert>("anomaly_alerts").await?,
+            imbalance: db
+                .subscribe::<BookImbalanceMetrics>("book_imbalance")
+                .await?,
+            depth: db.subscribe::<DepthMetrics>("depth_metrics").await?,
         })
     }
 }
@@ -115,10 +117,10 @@ impl PipelineDataSource for EmbeddedDataSource {
         let orders = self.generator.generate_orders(5, ts);
         let book_updates = self.generator.generate_book_updates(ts);
 
-        // Buffer raw ticks for ASOF matching
-        app.ingest_ticks_for_asof(&ticks);
+        // Buffer raw ticks for latest-value enrichment.
+        app.ingest_ticks(&ticks);
 
-        // Run ASOF merge: enrich orders with latest market data
+        // Enrich orders with the latest market data available at their timestamp.
         let order_tuples: Vec<_> = orders
             .iter()
             .map(|o| {
@@ -132,7 +134,7 @@ impl PipelineDataSource for EmbeddedDataSource {
                 )
             })
             .collect();
-        let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
+        let enriched = latest_tick::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
         app.ingest_enriched_orders(enriched);
 
         // Apply book updates to in-memory L2 book
@@ -180,12 +182,12 @@ impl PipelineDataSource for KafkaDataSource {
             .map(|b| b.to_order_book_update())
             .collect();
 
-        app.ingest_ticks_for_asof(&app_ticks);
+        app.ingest_ticks(&app_ticks);
         app.apply_book_updates(&app_book);
         app.total_ticks += ticks.len() as u64;
         app.total_orders += orders.len() as u64;
 
-        // ASOF merge: enrich orders with latest market data
+        // Enrich orders with the latest market data available at their timestamp.
         let order_tuples: Vec<_> = orders
             .iter()
             .map(|o| {
@@ -199,7 +201,7 @@ impl PipelineDataSource for KafkaDataSource {
                 )
             })
             .collect();
-        let enriched = asof_merge::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
+        let enriched = latest_tick::merge_orders_with_ticks(&order_tuples, &app.tick_buffer);
         app.ingest_enriched_orders(enriched);
         app.cleanup_tick_buffer(ts);
 
@@ -258,7 +260,6 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
             interval_ms: Some(30_000),
-            max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
         .build()
@@ -274,7 +275,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     let tick_source = db.source::<MarketTick>("market_ticks")?;
     let order_source = db.source::<OrderEvent>("order_events")?;
     let book_source = db.source::<OrderBookUpdate>("book_updates")?;
-    let subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db).await?;
 
     let mut generator = MarketGenerator::new();
     let mut app = App::new();
@@ -301,7 +302,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         book_source,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
+    let result = run_with_tui(&mut app, &mut data_source, &mut subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -331,7 +332,6 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .checkpoint(StreamCheckpointConfig {
             data_dir: Some(ckpt_dir),
             interval_ms: Some(30_000),
-            max_retained: Some(5),
             ..StreamCheckpointConfig::default()
         })
         .build()
@@ -372,7 +372,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // -- Subscribe and setup app state --
-    let subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db).await?;
 
     let mut app = App::new();
     app.set_topology(db.pipeline_topology());
@@ -383,7 +383,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|b| b.to_order_book_update())
         .collect();
-    app.ingest_ticks_for_asof(&app_ticks);
+    app.ingest_ticks(&app_ticks);
     app.apply_book_updates(&app_book);
     app.total_ticks += tick_count as u64;
     app.total_orders += order_count as u64;
@@ -394,7 +394,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         producer,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
+    let result = run_with_tui(&mut app, &mut data_source, &mut subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -407,7 +407,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_with_tui<D: PipelineDataSource>(
     app: &mut App,
     data_source: &mut D,
-    subs: &Subscriptions,
+    subs: &mut Subscriptions,
     db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
@@ -449,7 +449,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
     app: &mut App,
     stats_collector: &mut StatsCollector,
     data_source: &mut D,
-    subs: &Subscriptions,
+    subs: &mut Subscriptions,
     db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -497,7 +497,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
 
         if !app.paused {
             data_source.push_cycle(app).await?;
-            drain_subscriptions(app, subs);
+            drain_subscriptions(app, subs)?;
         }
     }
 
@@ -505,41 +505,45 @@ async fn run_tui_loop<D: PipelineDataSource>(
 }
 
 /// Poll all subscription channels and merge results into app state.
-fn drain_subscriptions(app: &mut App, subs: &Subscriptions) {
+fn drain_subscriptions(
+    app: &mut App,
+    subs: &mut Subscriptions,
+) -> Result<(), laminar_db::SubscriptionError> {
     for _ in 0..64 {
-        match subs.ohlc.poll() {
+        match subs.ohlc.poll()? {
             Some(rows) => app.ingest_ohlc(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.volume.poll() {
+        match subs.volume.poll()? {
             Some(rows) => app.ingest_volume(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.spread.poll() {
+        match subs.spread.poll()? {
             Some(rows) => app.ingest_spread(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.anomaly.poll() {
+        match subs.anomaly.poll()? {
             Some(rows) => app.ingest_anomaly(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.imbalance.poll() {
+        match subs.imbalance.poll()? {
             Some(rows) => app.ingest_book_imbalance(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.depth.poll() {
+        match subs.depth.poll()? {
             Some(rows) => app.ingest_depth_metrics(rows),
             None => break,
         }
     }
+    Ok(())
 }

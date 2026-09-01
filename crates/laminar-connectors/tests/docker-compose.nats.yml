@@ -1,0 +1,38 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # `nats-server --help` would just prove the binary is present.
+      # Probe the client port so health reflects readiness to accept
+      # connections. `nc` is provided by BusyBox in nats:2.10-alpine.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  # Secured NATS with user/password. Started only with the `secure`
+  # profile: `docker compose -f docker-compose.nats.yml --profile secure up`.
+  nats-secure:
+    image: nats:2.10-alpine
+    command:
+      ["-js", "-sd", "/data", "-m", "8223", "--user", "alice", "--pass", "wonderland"]
+    ports:
+      - "4223:4222"
+    volumes:
+      - nats-secure-data:/data
+    profiles: ["secure"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+volumes:
+  nats-data:
+  nats-secure-data:

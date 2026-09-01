@@ -1,4 +1,4 @@
-# LaminarDB Server Demo — Embedded Mode with Kafka
+# LaminarDB standalone single-node server demo with Kafka
 #
 # Runs 3 Kafka sources → 4 SQL pipelines → 4 Kafka sinks.
 # Pair with the demo producer for synthetic market data:
@@ -9,21 +9,13 @@
 #   cargo run -p laminar-server --features kafka -- --config examples/server-demo/laminardb.toml
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:9000"
-metrics_bind = "127.0.0.1:9090"
-workers = 0
-log_level = "info"
-
-[state]
-backend = "memory"
-path = "./data/state"
+delivery = "at_least_once"
 
 [checkpoint]
 url = "file:///tmp/laminardb-server-demo/checkpoints"
 interval = "10s"
-mode = "aligned"
-snapshot_strategy = "full"
 
 # ── Sources ─────────────────────────────────────────────────────────────
 
@@ -32,10 +24,10 @@ name = "market_ticks"
 connector = "kafka"
 format = "json"
 [source.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "market-ticks"
-group_id = "laminardb-server-demo-ticks"
-start_offset = "latest"
+"group.id" = "laminardb-server-demo-ticks"
+"startup.mode" = "latest"
 "kafka.session.timeout.ms" = "6000"
 [[source.schema]]
 name = "symbol"
@@ -74,10 +66,10 @@ name = "order_events"
 connector = "kafka"
 format = "json"
 [source.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "order-events"
-group_id = "laminardb-server-demo-orders"
-start_offset = "latest"
+"group.id" = "laminardb-server-demo-orders"
+"startup.mode" = "latest"
 "kafka.session.timeout.ms" = "6000"
 [[source.schema]]
 name = "order_id"
@@ -112,10 +104,10 @@ name = "book_updates"
 connector = "kafka"
 format = "json"
 [source.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "book-updates"
-group_id = "laminardb-server-demo-book"
-start_offset = "latest"
+"group.id" = "laminardb-server-demo-book"
+"startup.mode" = "latest"
 "kafka.session.timeout.ms" = "6000"
 [[source.schema]]
 name = "symbol"
@@ -220,9 +212,8 @@ EMIT AFTER WATERMARK
 name = "ohlc_sink"
 pipeline = "ohlc_bars"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "ohlc-bars"
 "key.column" = "symbol"
 
@@ -230,9 +221,8 @@ topic = "ohlc-bars"
 name = "volume_sink"
 pipeline = "volume_metrics"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "volume-metrics"
 "key.column" = "symbol"
 
@@ -240,9 +230,8 @@ topic = "volume-metrics"
 name = "vwap_sink"
 pipeline = "vwap"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "vwap-results"
 "key.column" = "symbol"
 
@@ -250,8 +239,7 @@ topic = "vwap-results"
 name = "anomaly_sink"
 pipeline = "anomaly_alerts"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
-brokers = "${KAFKA_BROKERS:-localhost:19092}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:19092}"
 topic = "anomaly-alerts"
 "key.column" = "symbol"

@@ -1,0 +1,835 @@
+//! Watermark generators and multi-source tracking.
+
+use std::time::{Duration, Instant};
+
+use super::Watermark;
+
+/// Trait for generating watermarks from event timestamps.
+///
+/// Implementations track observed timestamps and produce watermarks that indicate
+/// event-time progress. The watermark is an assertion that no events with timestamps
+/// earlier than the watermark are expected.
+pub trait WatermarkGenerator: Send {
+    /// Process an event timestamp and potentially emit a new watermark.
+    ///
+    /// Called for each event processed. Returns `Some(watermark)` if the watermark
+    /// should advance, `None` otherwise.
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark>;
+
+    /// Called periodically to emit watermarks based on wall-clock time.
+    ///
+    /// Useful for generating watermarks even when no events are arriving.
+    fn on_periodic(&mut self) -> Option<Watermark>;
+
+    /// Returns the current watermark value without advancing it.
+    fn current_watermark(&self) -> i64;
+
+    /// Advances the watermark to at least the given timestamp from an external source.
+    ///
+    /// Called when the source provides an explicit watermark (e.g., `Source::watermark()`).
+    /// Returns `Some(Watermark)` if the watermark advanced, `None` if the timestamp
+    /// was not higher than the current watermark.
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
+
+    /// Replaces the generator's watermark with an exact recovered value.
+    ///
+    /// Unlike [`Self::advance_watermark`], this may move the watermark
+    /// backwards. It is exclusively for restoring a committed checkpoint
+    /// while source intake and computation are fenced. Calling it while the
+    /// pipeline is running can make already-finalized event-time state visible
+    /// again and is therefore incorrect.
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64);
+
+    /// Whether the watermark is processing-time based (wall clock), rather than
+    /// derived from the event-time column. Such a watermark lives in a different
+    /// time domain than the event timestamps, so comparing the two to drop "late"
+    /// rows would discard every event — callers skip source-side late-filtering
+    /// when this is `true`. Defaults to `false` (event-time generators).
+    fn is_processing_time(&self) -> bool {
+        false
+    }
+}
+
+/// Default `max_future_skew_ms`: 5 min.
+pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// `true` if `timestamp` is more than `skew_ms` beyond wall-clock now.
+/// `skew_ms <= 0` or an unset system clock disables the guard.
+#[inline]
+fn is_grossly_future(timestamp: i64, skew_ms: i64) -> bool {
+    if skew_ms <= 0 {
+        return false;
+    }
+    let now = super::now_unix_millis();
+    now > 0 && timestamp > now.saturating_add(skew_ms)
+}
+
+/// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
+/// ignores timestamps far beyond wall clock for advancement.
+pub struct BoundedOutOfOrdernessGenerator {
+    max_out_of_orderness: i64,
+    current_max_timestamp: i64,
+    current_watermark: i64,
+    /// `0` (or negative) disables the guard (unbounded — legacy behaviour).
+    max_future_skew_ms: i64,
+}
+
+impl BoundedOutOfOrdernessGenerator {
+    /// Creates a new generator with the specified maximum out-of-orderness.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_out_of_orderness` - Maximum allowed lateness in milliseconds
+    #[must_use]
+    pub fn new(max_out_of_orderness: i64) -> Self {
+        Self {
+            max_out_of_orderness,
+            current_max_timestamp: i64::MIN,
+            current_watermark: i64::MIN,
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
+        }
+    }
+
+    /// Sets the future-skew ceiling; `<= 0` disables the guard.
+    #[must_use]
+    pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
+        self.max_future_skew_ms = skew_ms;
+        self
+    }
+
+    /// Creates a new generator from a `Duration`.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Duration.as_millis() fits i64 for practical values
+    pub fn from_duration(max_out_of_orderness: Duration) -> Self {
+        Self::new(max_out_of_orderness.as_millis() as i64)
+    }
+
+    /// Returns the maximum out-of-orderness in milliseconds.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> i64 {
+        self.max_out_of_orderness
+    }
+}
+
+impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
+    #[inline]
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
+        if timestamp > self.current_max_timestamp {
+            self.current_max_timestamp = timestamp;
+            let new_watermark = timestamp.saturating_sub(self.max_out_of_orderness);
+            if new_watermark > self.current_watermark {
+                self.current_watermark = new_watermark;
+                return Some(Watermark::new(new_watermark));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        // Bounded out-of-orderness doesn't emit periodic watermarks
+        None
+    }
+
+    #[inline]
+    fn current_watermark(&self) -> i64 {
+        self.current_watermark
+    }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            // Maintain invariant: current_max_timestamp >= current_watermark + max_out_of_orderness
+            let min_max = timestamp.saturating_add(self.max_out_of_orderness);
+            if min_max > self.current_max_timestamp {
+                self.current_max_timestamp = min_max;
+            }
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+        // `on_event` only considers timestamps above this baseline. Restoring
+        // it along with the watermark prevents pre-recovery observations from
+        // suppressing valid replay after a backwards restore.
+        self.current_max_timestamp = timestamp.saturating_add(self.max_out_of_orderness);
+    }
+}
+
+/// Watermark generator for strictly ascending timestamps; the watermark
+/// equals the current timestamp.
+#[derive(Debug)]
+pub struct AscendingTimestampsGenerator {
+    current_watermark: i64,
+    /// `0` ⇒ disabled.
+    max_future_skew_ms: i64,
+}
+
+impl Default for AscendingTimestampsGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AscendingTimestampsGenerator {
+    /// Creates a new ascending timestamps generator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            current_watermark: i64::MIN,
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
+        }
+    }
+
+    /// Override the future-skew ceiling (`0` disables).
+    #[must_use]
+    pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
+        self.max_future_skew_ms = skew_ms;
+        self
+    }
+}
+
+impl WatermarkGenerator for AscendingTimestampsGenerator {
+    #[inline]
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        None
+    }
+
+    #[inline]
+    fn current_watermark(&self) -> i64 {
+        self.current_watermark
+    }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+    }
+}
+
+/// Wraps another generator and emits watermarks at fixed wall-clock
+/// intervals so idle sources don't stall time-based windows.
+pub struct PeriodicGenerator<G: WatermarkGenerator> {
+    inner: G,
+    period: Duration,
+    last_emit_time: Instant,
+    last_emitted_watermark: i64,
+}
+
+impl<G: WatermarkGenerator> PeriodicGenerator<G> {
+    /// Creates a new periodic generator wrapping another generator.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` - The underlying watermark generator
+    /// * `period` - How often to emit watermarks (wall-clock time)
+    #[must_use]
+    pub fn new(inner: G, period: Duration) -> Self {
+        Self {
+            inner,
+            period,
+            last_emit_time: Instant::now(),
+            last_emitted_watermark: i64::MIN,
+        }
+    }
+
+    /// Returns a reference to the inner generator.
+    #[must_use]
+    pub fn inner(&self) -> &G {
+        &self.inner
+    }
+
+    /// Returns a mutable reference to the inner generator.
+    pub fn inner_mut(&mut self) -> &mut G {
+        &mut self.inner
+    }
+}
+
+impl<G: WatermarkGenerator> WatermarkGenerator for PeriodicGenerator<G> {
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        let wm = self.inner.on_event(timestamp);
+        if let Some(ref w) = wm {
+            self.last_emitted_watermark = w.timestamp();
+            self.last_emit_time = Instant::now();
+        }
+        wm
+    }
+
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        // Check if enough wall-clock time has passed
+        if self.last_emit_time.elapsed() >= self.period {
+            let current = self.inner.current_watermark();
+            if current > self.last_emitted_watermark {
+                self.last_emitted_watermark = current;
+                self.last_emit_time = Instant::now();
+                return Some(Watermark::new(current));
+            }
+            self.last_emit_time = Instant::now();
+        }
+        None
+    }
+
+    fn current_watermark(&self) -> i64 {
+        self.inner.current_watermark()
+    }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        let wm = self.inner.advance_watermark(timestamp);
+        if let Some(ref w) = wm {
+            self.last_emitted_watermark = w.timestamp();
+            self.last_emit_time = Instant::now();
+        }
+        wm
+    }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.inner.restore_watermark_for_recovery(timestamp);
+        self.last_emitted_watermark = timestamp;
+        self.last_emit_time = Instant::now();
+    }
+
+    fn is_processing_time(&self) -> bool {
+        self.inner.is_processing_time()
+    }
+}
+
+/// Punctuated watermark generator that emits based on special events.
+///
+/// Uses a predicate function to identify watermark-carrying events. When the
+/// predicate returns `Some(watermark)`, that watermark is emitted.
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::{PunctuatedGenerator, WatermarkGenerator, Watermark};
+///
+/// // Emit watermark on every 1000ms boundary
+/// let mut gen = PunctuatedGenerator::new(|ts| {
+///     if ts % 1000 == 0 {
+///         Some(Watermark::new(ts))
+///     } else {
+///         None
+///     }
+/// });
+///
+/// assert_eq!(gen.on_event(999), None);
+/// assert_eq!(gen.on_event(1000), Some(Watermark::new(1000)));
+/// ```
+pub struct PunctuatedGenerator<F>
+where
+    F: Fn(i64) -> Option<Watermark> + Send,
+{
+    predicate: F,
+    current_watermark: i64,
+}
+
+impl<F> PunctuatedGenerator<F>
+where
+    F: Fn(i64) -> Option<Watermark> + Send,
+{
+    /// Creates a new punctuated generator with the given predicate.
+    ///
+    /// # Arguments
+    ///
+    /// * `predicate` - Function that returns `Some(Watermark)` for watermark events
+    #[must_use]
+    pub fn new(predicate: F) -> Self {
+        Self {
+            predicate,
+            current_watermark: i64::MIN,
+        }
+    }
+}
+
+impl<F> WatermarkGenerator for PunctuatedGenerator<F>
+where
+    F: Fn(i64) -> Option<Watermark> + Send,
+{
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        if let Some(wm) = (self.predicate)(timestamp) {
+            if wm.timestamp() > self.current_watermark {
+                self.current_watermark = wm.timestamp();
+                return Some(wm);
+            }
+        }
+        None
+    }
+
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        None
+    }
+
+    fn current_watermark(&self) -> i64 {
+        self.current_watermark
+    }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+    }
+}
+
+/// A recovered tracker snapshot did not match the tracker's source topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "watermark recovery source count mismatch: expected {expected}, got {watermarks} watermarks and {idle_statuses} idle statuses"
+)]
+pub struct WatermarkRestoreError {
+    expected: usize,
+    watermarks: usize,
+    idle_statuses: usize,
+}
+
+/// Tracks watermarks across multiple input sources.
+///
+/// For operators with multiple inputs (e.g., joins, unions), the combined
+/// watermark is the minimum across all sources. This ensures no late events
+/// from any source are missed.
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::{WatermarkTracker, Watermark};
+///
+/// let mut tracker = WatermarkTracker::new(3); // 3 sources
+///
+/// // Source 0 advances to 1000
+/// let wm = tracker.update_source(0, 1000);
+/// assert_eq!(wm, None); // Other sources still at MIN
+///
+/// // Source 1 advances to 2000
+/// tracker.update_source(1, 2000);
+///
+/// // Source 2 advances to 500
+/// let wm = tracker.update_source(2, 500);
+/// assert_eq!(wm, Some(Watermark::new(500))); // Min of all sources
+/// ```
+#[derive(Debug)]
+pub struct WatermarkTracker {
+    /// Watermark for each source
+    source_watermarks: Vec<i64>,
+    /// Combined minimum watermark
+    combined_watermark: i64,
+    /// Idle status for each source
+    idle_sources: Vec<bool>,
+    /// Last activity time for each source
+    last_activity: Vec<Instant>,
+    /// Per-source idle timeout; `None` ⇒ that source never auto-idles
+    /// (the default — idleness is opt-in, like Flink `withIdleness`).
+    idle_timeout: Vec<Option<Duration>>,
+}
+
+impl WatermarkTracker {
+    /// Creates a tracker with idleness **disabled** for all sources
+    /// (strict correctness; configure per source via
+    /// [`Self::set_idle_timeout`]).
+    #[must_use]
+    pub fn new(num_sources: usize) -> Self {
+        Self {
+            source_watermarks: vec![i64::MIN; num_sources],
+            combined_watermark: i64::MIN,
+            idle_sources: vec![false; num_sources],
+            last_activity: vec![Instant::now(); num_sources],
+            idle_timeout: vec![None; num_sources],
+        }
+    }
+
+    /// Creates a tracker with the same idle timeout for every source.
+    #[must_use]
+    pub fn with_idle_timeout(num_sources: usize, idle_timeout: Duration) -> Self {
+        Self {
+            source_watermarks: vec![i64::MIN; num_sources],
+            combined_watermark: i64::MIN,
+            idle_sources: vec![false; num_sources],
+            last_activity: vec![Instant::now(); num_sources],
+            idle_timeout: vec![Some(idle_timeout); num_sources],
+        }
+    }
+
+    /// Sets (or clears, with `None`) the idle timeout for one source.
+    pub fn set_idle_timeout(&mut self, source_id: usize, timeout: Option<Duration>) {
+        if let Some(slot) = self.idle_timeout.get_mut(source_id) {
+            *slot = timeout;
+        }
+    }
+
+    /// Updates the watermark for a specific source.
+    ///
+    /// Returns `Some(Watermark)` if the combined watermark advances.
+    pub fn update_source(&mut self, source_id: usize, watermark: i64) -> Option<Watermark> {
+        if source_id >= self.source_watermarks.len() {
+            return None;
+        }
+
+        let was_idle = self.idle_sources[source_id];
+        // Mark source as active
+        self.idle_sources[source_id] = false;
+        self.last_activity[source_id] = Instant::now();
+
+        // Update source watermark
+        if watermark > self.source_watermarks[source_id] {
+            self.source_watermarks[source_id] = watermark;
+            self.update_combined()
+        } else if was_idle {
+            self.update_combined()
+        } else {
+            None
+        }
+    }
+
+    /// Marks a source as idle, excluding it from watermark calculation.
+    ///
+    /// Idle sources don't hold back the combined watermark.
+    pub fn mark_idle(&mut self, source_id: usize) -> Option<Watermark> {
+        if source_id >= self.idle_sources.len() {
+            return None;
+        }
+
+        self.idle_sources[source_id] = true;
+        self.update_combined()
+    }
+
+    /// Checks for sources that have been idle longer than the timeout.
+    ///
+    /// Should be called periodically to detect stalled sources.
+    pub fn check_idle_sources(&mut self) -> Option<Watermark> {
+        let mut any_marked = false;
+        for i in 0..self.idle_sources.len() {
+            let Some(timeout) = self.idle_timeout[i] else {
+                continue; // idleness disabled for this source
+            };
+            if !self.idle_sources[i] && self.last_activity[i].elapsed() >= timeout {
+                self.idle_sources[i] = true;
+                any_marked = true;
+            }
+        }
+        if any_marked {
+            self.update_combined()
+        } else {
+            None
+        }
+    }
+
+    /// Replaces all watermark state from a committed recovery snapshot.
+    ///
+    /// This is the only tracker operation allowed to lower source or combined
+    /// watermarks. The caller must hold the intake/compute recovery fence so no
+    /// events, idle transitions, or watermark reads race with the replacement.
+    /// Configured idle timeouts are preserved and activity timers restart at
+    /// the instant of restoration.
+    ///
+    /// `None` represents a source or combined frontier that has not been
+    /// initialized. `combined_watermark` is installed exactly rather than
+    /// recomputed because a committed cluster frontier may intentionally lag
+    /// this tracker's local source frontiers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WatermarkRestoreError`] when either input does not contain
+    /// exactly one entry for every tracked source. No state is changed on
+    /// error.
+    pub fn restore_for_recovery(
+        &mut self,
+        source_watermarks: &[Option<i64>],
+        idle_sources: &[bool],
+        combined_watermark: Option<i64>,
+    ) -> Result<(), WatermarkRestoreError> {
+        let expected = self.source_watermarks.len();
+        if source_watermarks.len() != expected || idle_sources.len() != expected {
+            return Err(WatermarkRestoreError {
+                expected,
+                watermarks: source_watermarks.len(),
+                idle_statuses: idle_sources.len(),
+            });
+        }
+
+        for (target, recovered) in self
+            .source_watermarks
+            .iter_mut()
+            .zip(source_watermarks.iter())
+        {
+            *target = recovered.unwrap_or(i64::MIN);
+        }
+        self.idle_sources.copy_from_slice(idle_sources);
+        self.combined_watermark = combined_watermark.unwrap_or(i64::MIN);
+        let restored_at = Instant::now();
+        self.last_activity.fill(restored_at);
+        Ok(())
+    }
+
+    /// Returns the current combined watermark.
+    #[must_use]
+    pub fn current_watermark(&self) -> Option<Watermark> {
+        if self.combined_watermark == i64::MIN {
+            None
+        } else {
+            Some(Watermark::new(self.combined_watermark))
+        }
+    }
+
+    /// Returns the watermark for a specific source.
+    #[must_use]
+    pub fn source_watermark(&self, source_id: usize) -> Option<i64> {
+        self.source_watermarks.get(source_id).copied()
+    }
+
+    /// Returns whether a source is marked as idle.
+    #[must_use]
+    pub fn is_idle(&self, source_id: usize) -> bool {
+        self.idle_sources.get(source_id).copied().unwrap_or(false)
+    }
+
+    /// Returns the number of sources being tracked.
+    #[must_use]
+    pub fn num_sources(&self) -> usize {
+        self.source_watermarks.len()
+    }
+
+    /// Returns the number of active (non-idle) sources.
+    #[must_use]
+    pub fn active_source_count(&self) -> usize {
+        self.idle_sources.iter().filter(|&&idle| !idle).count()
+    }
+
+    /// Updates the combined watermark based on all active sources.
+    fn update_combined(&mut self) -> Option<Watermark> {
+        // Calculate minimum across active sources only
+        let mut min_watermark = i64::MAX;
+        let mut has_active = false;
+
+        for (i, &wm) in self.source_watermarks.iter().enumerate() {
+            if !self.idle_sources[i] {
+                has_active = true;
+                min_watermark = min_watermark.min(wm);
+            }
+        }
+
+        // If all sources are idle, use the max watermark
+        if !has_active {
+            min_watermark = self
+                .source_watermarks
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(i64::MIN);
+        }
+
+        if min_watermark > self.combined_watermark && min_watermark != i64::MAX {
+            self.combined_watermark = min_watermark;
+            Some(Watermark::new(min_watermark))
+        } else {
+            None
+        }
+    }
+}
+
+/// Watermark generator for sources with embedded watermarks.
+///
+/// Some sources provide a durable upstream event-time frontier directly.
+/// This generator tracks both event timestamps and explicit watermarks.
+pub struct SourceProvidedGenerator {
+    /// Last watermark from the source
+    source_watermark: i64,
+    /// Fallback generator for when source doesn't provide watermarks
+    fallback: BoundedOutOfOrdernessGenerator,
+    /// Whether to use source watermarks when available
+    prefer_source: bool,
+}
+
+impl SourceProvidedGenerator {
+    /// Creates a new source-provided generator.
+    ///
+    /// # Arguments
+    ///
+    /// * `fallback_lateness` - Lateness for fallback bounded generator
+    /// * `prefer_source` - If true, source watermarks take precedence
+    #[must_use]
+    pub fn new(fallback_lateness: i64, prefer_source: bool) -> Self {
+        Self {
+            source_watermark: i64::MIN,
+            fallback: BoundedOutOfOrdernessGenerator::new(fallback_lateness),
+            prefer_source,
+        }
+    }
+
+    /// Updates the watermark from the source.
+    ///
+    /// Call this when the source provides an explicit watermark.
+    pub fn on_source_watermark(&mut self, watermark: i64) -> Option<Watermark> {
+        if watermark > self.source_watermark {
+            self.source_watermark = watermark;
+            if self.prefer_source || watermark > self.fallback.current_watermark() {
+                return Some(Watermark::new(watermark));
+            }
+        }
+        None
+    }
+}
+
+impl WatermarkGenerator for SourceProvidedGenerator {
+    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        let fallback_wm = self.fallback.on_event(timestamp);
+
+        if self.prefer_source {
+            // Only emit if source watermark allows and it's an advancement
+            if self.source_watermark > i64::MIN {
+                return None; // Wait for source watermark
+            }
+        }
+
+        fallback_wm
+    }
+
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        None
+    }
+
+    fn current_watermark(&self) -> i64 {
+        if self.prefer_source && self.source_watermark > i64::MIN {
+            self.source_watermark
+        } else {
+            self.fallback.current_watermark().max(self.source_watermark)
+        }
+    }
+
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        self.on_source_watermark(timestamp)
+    }
+
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.source_watermark = timestamp;
+        self.fallback.restore_watermark_for_recovery(timestamp);
+    }
+}
+
+/// Processing-time watermark generator.
+///
+/// Ignores event timestamps entirely and advances the watermark based on
+/// wall-clock time. Use with `PROCTIME()` sources where events are processed
+/// in arrival order without event-time semantics.
+///
+/// - [`on_event`](WatermarkGenerator::on_event) returns `None` (event timestamps are ignored)
+/// - [`on_periodic`](WatermarkGenerator::on_periodic) returns `Some(Watermark::new(now_millis()))`
+///
+/// # Example
+///
+/// ```rust
+/// use laminar_core::time::{ProcessingTimeGenerator, WatermarkGenerator};
+///
+/// let mut gen = ProcessingTimeGenerator::new();
+/// // on_event ignores the timestamp
+/// assert_eq!(gen.on_event(1000), None);
+/// // on_periodic returns wall-clock time
+/// let wm = gen.on_periodic();
+/// assert!(wm.is_some());
+/// ```
+pub struct ProcessingTimeGenerator {
+    current_watermark: i64,
+}
+
+impl ProcessingTimeGenerator {
+    /// Creates a new processing-time watermark generator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            current_watermark: i64::MIN,
+        }
+    }
+}
+
+impl Default for ProcessingTimeGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WatermarkGenerator for ProcessingTimeGenerator {
+    #[inline]
+    fn on_event(&mut self, _timestamp: i64) -> Option<Watermark> {
+        // Processing-time mode ignores event timestamps
+        None
+    }
+
+    #[inline]
+    fn on_periodic(&mut self) -> Option<Watermark> {
+        let now = super::now_unix_millis();
+        if now > self.current_watermark {
+            self.current_watermark = now;
+            Some(Watermark::new(now))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn current_watermark(&self) -> i64 {
+        self.current_watermark
+    }
+
+    #[inline]
+    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if timestamp > self.current_watermark {
+            self.current_watermark = timestamp;
+            Some(Watermark::new(timestamp))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn restore_watermark_for_recovery(&mut self, timestamp: i64) {
+        self.current_watermark = timestamp;
+    }
+
+    #[inline]
+    fn is_processing_time(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests;

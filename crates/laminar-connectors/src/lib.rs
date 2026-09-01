@@ -1,32 +1,11 @@
-//! # `LaminarDB` Connectors
-//!
-//! External system connectors and the Connector SDK for streaming data
-//! in and out of `LaminarDB`.
-//!
-//! ## Connector SDK
-//!
-//! The SDK provides traits and utilities for building connectors:
-//!
-//! - [`connector`] - Core traits (`SourceConnector`, `SinkConnector`)
-//! - [`serde`] - Serialization framework (JSON, CSV, Debezium)
-//! - [`registry`] - Factory pattern for connector instantiation
-//! - `testing` - Mock connectors and test utilities (feature-gated)
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Ring 0: Hot Path
-//!   Source<T>::push_arrow() <-- deserialized RecordBatch
-//!   Subscription::poll()   --> RecordBatch for serialization
-//!
-//! Ring 1: Connectors
-//!   SourceConnector(poll) -> Serde(deser) -> push_arrow
-//!   SinkConnector(write)  <- Serde(ser)   <- subscription(poll)
-//! ```
+//! `LaminarDB` connector framework.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// Connector protocols keep explicit inputs and contiguous state transitions.
 // Connectors are Ring 1 (cold path): std HashMap/HashSet are acceptable
 // throughout config, registry, schema, checkpoint, and CDC modules.
 #![allow(clippy::disallowed_types)]
@@ -60,17 +39,22 @@ mod macros;
 /// Connector configuration types.
 pub mod config;
 
+/// Secret classification and durable connector-identity sanitization.
+pub mod security;
+
 /// Core connector traits (`SourceConnector`, `SinkConnector`).
 pub mod connector;
+pub mod generator;
 
 /// Connector checkpoint types.
 pub mod checkpoint;
 
-/// Connector health status types.
-pub mod health;
+/// Reconnect/backoff helper shared across source connectors.
+pub mod retry;
 
-/// Connector metrics types.
-pub mod metrics;
+/// Shared Prometheus registry/counter helpers used by per-connector
+/// metric structs.
+pub mod prom;
 
 /// Record serialization and deserialization framework.
 pub mod serde;
@@ -91,23 +75,22 @@ pub mod testing;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-/// Change Data Capture connectors for databases.
-pub mod cdc;
-
-/// PostgreSQL sink connector.
-#[cfg(feature = "postgres-sink")]
+/// PostgreSQL connector-specific configuration and implementations.
+#[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
 pub mod postgres;
-
-/// Lookup table support for enrichment joins.
-pub mod lookup;
 
 /// Lakehouse connectors (Delta Lake, Iceberg).
 pub mod lakehouse;
 
+/// Sink-agnostic changelog collapse for upsert sinks (Z-set / CDC → key-unique
+/// `_op` batch). Pulled in by upsert-capable sink features (e.g. `delta-lake`).
+#[cfg(feature = "changelog-collapse")]
+pub mod changelog;
+
 /// Cloud storage infrastructure (credential resolution, validation, secret masking).
 pub mod storage;
 
-/// Reference table source trait and refresh modes.
+/// Finite startup snapshot sources for reference tables.
 pub mod reference;
 
 /// WebSocket source and sink connectors.
@@ -117,6 +100,14 @@ pub mod websocket;
 /// MongoDB CDC source and sink connectors.
 #[cfg(feature = "mongodb-cdc")]
 pub mod mongodb;
+
+/// OpenTelemetry OTLP/gRPC source connector.
+#[cfg(feature = "otel")]
+pub mod otel;
+
+/// NATS core and JetStream source and sink connectors.
+#[cfg(feature = "nats")]
+pub mod nats;
 
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]

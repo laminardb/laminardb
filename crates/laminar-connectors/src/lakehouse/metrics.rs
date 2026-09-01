@@ -1,109 +1,101 @@
 //! Common metrics for Lakehouse sink connectors.
 //!
-//! Provides shared atomic counters for tracking statistics across different
-//! table formats (Delta Lake, Iceberg, Hudi, Paimon).
+//! Provides shared prometheus-backed counters for tracking statistics across
+//! different table formats (Delta Lake, Iceberg, Hudi, Paimon).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use prometheus::{IntCounter, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
-/// Atomic counters for Lakehouse sink connector statistics.
-#[derive(Debug)]
+/// Prometheus-backed counters for Lakehouse sink connector statistics.
+#[derive(Debug, Clone)]
 pub struct LakehouseSinkMetrics {
     /// Total rows flushed to storage (Parquet/ORC/etc.).
-    pub rows_flushed: AtomicU64,
+    pub rows_flushed: IntCounter,
 
     /// Total bytes written to storage.
-    pub bytes_written: AtomicU64,
+    pub bytes_written: IntCounter,
 
     /// Total number of flush operations.
-    pub flush_count: AtomicU64,
+    pub flush_count: IntCounter,
 
     /// Total number of commits (transactions/snapshots).
-    pub commits: AtomicU64,
+    pub commits: IntCounter,
 
     /// Total errors encountered.
-    pub errors_total: AtomicU64,
+    pub errors_total: IntCounter,
 
     /// Total epochs rolled back.
-    pub epochs_rolled_back: AtomicU64,
+    pub epochs_rolled_back: IntCounter,
 
     /// Total changelog DELETE operations processed.
-    pub changelog_deletes: AtomicU64,
+    pub changelog_deletes: IntCounter,
 }
 
 impl LakehouseSinkMetrics {
     /// Creates a new metrics instance with all counters at zero.
     #[must_use]
-    pub fn new() -> Self {
+    #[allow(clippy::missing_panics_doc)]
+    pub fn new(registry: Option<&Registry>) -> Self {
+        let mut local = None;
+        let reg = reg_or_local(registry, &mut local);
+
         Self {
-            rows_flushed: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-            flush_count: AtomicU64::new(0),
-            commits: AtomicU64::new(0),
-            errors_total: AtomicU64::new(0),
-            epochs_rolled_back: AtomicU64::new(0),
-            changelog_deletes: AtomicU64::new(0),
+            rows_flushed: reg.counter(
+                "lakehouse_sink_rows_flushed_total",
+                "Total rows flushed to storage",
+            ),
+            bytes_written: reg.counter(
+                "lakehouse_sink_bytes_written_total",
+                "Total bytes written to storage",
+            ),
+            flush_count: reg.counter("lakehouse_sink_flush_count_total", "Total flush operations"),
+            commits: reg.counter(
+                "lakehouse_sink_commits_total",
+                "Total commits (transactions/snapshots)",
+            ),
+            errors_total: reg.counter("lakehouse_sink_errors_total", "Total lakehouse sink errors"),
+            epochs_rolled_back: reg.counter(
+                "lakehouse_sink_epochs_rolled_back_total",
+                "Total epochs rolled back",
+            ),
+            changelog_deletes: reg.counter(
+                "lakehouse_sink_changelog_deletes_total",
+                "Total changelog DELETE operations",
+            ),
         }
     }
 
     /// Records a successful flush of `records` rows totaling `bytes`.
     pub fn record_flush(&self, records: u64, bytes: u64) {
-        self.rows_flushed.fetch_add(records, Ordering::Relaxed);
-        self.bytes_written.fetch_add(bytes, Ordering::Relaxed);
-        self.flush_count.fetch_add(1, Ordering::Relaxed);
+        self.rows_flushed.inc_by(records);
+        self.bytes_written.inc_by(bytes);
+        self.flush_count.inc();
     }
 
     /// Records a successful commit (transaction/snapshot).
     pub fn record_commit(&self) {
-        self.commits.fetch_add(1, Ordering::Relaxed);
+        self.commits.inc();
     }
 
     /// Records a write or I/O error.
     pub fn record_error(&self) {
-        self.errors_total.fetch_add(1, Ordering::Relaxed);
+        self.errors_total.inc();
     }
 
     /// Records an epoch rollback.
     pub fn record_rollback(&self) {
-        self.epochs_rolled_back.fetch_add(1, Ordering::Relaxed);
+        self.epochs_rolled_back.inc();
     }
 
     /// Records changelog DELETE operations processed.
     pub fn record_deletes(&self, count: u64) {
-        self.changelog_deletes.fetch_add(count, Ordering::Relaxed);
-    }
-
-    /// Populates standard `ConnectorMetrics` fields and adds common custom metrics with a prefix.
-    ///
-    /// The `prefix` is used for custom metrics keys, e.g., `"{prefix}.flush_count"`.
-    #[allow(clippy::cast_precision_loss)]
-    pub fn populate_metrics(&self, metrics: &mut ConnectorMetrics, prefix: &str) {
-        metrics.records_total = self.rows_flushed.load(Ordering::Relaxed);
-        metrics.bytes_total = self.bytes_written.load(Ordering::Relaxed);
-        metrics.errors_total = self.errors_total.load(Ordering::Relaxed);
-
-        metrics.add_custom(
-            format!("{prefix}.flush_count"),
-            self.flush_count.load(Ordering::Relaxed) as f64,
-        );
-        metrics.add_custom(
-            format!("{prefix}.commits"),
-            self.commits.load(Ordering::Relaxed) as f64,
-        );
-        metrics.add_custom(
-            format!("{prefix}.epochs_rolled_back"),
-            self.epochs_rolled_back.load(Ordering::Relaxed) as f64,
-        );
-        metrics.add_custom(
-            format!("{prefix}.changelog_deletes"),
-            self.changelog_deletes.load(Ordering::Relaxed) as f64,
-        );
+        self.changelog_deletes.inc_by(count);
     }
 }
 
 impl Default for LakehouseSinkMetrics {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }

@@ -2,22 +2,23 @@
 members = [
     "crates/laminar-core",
     "crates/laminar-sql",
-    "crates/laminar-storage",
     "crates/laminar-connectors",
     "crates/laminar-server",
     "crates/laminar-derive",
     "crates/laminar-db",
 ]
 exclude = [
-    "examples/*",
+    "tools/*",
+    "vendor/pgwire",
+    "vendor/pgwire-replication",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.18.12"
+version = "0.30.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/laminardb/laminardb"
 homepage = "https://laminardb.io"
@@ -28,9 +29,12 @@ categories = ["database", "embedded", "data-structures"]
 
 [workspace.dependencies]
 # Core dependencies
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 async-trait = "0.1"
+trait-variant = "0.1"
+indexmap = "2"
 serde = { version = "1.0", features = ["derive"] }
+typetag = "0.2"
 serde_json = "1.0"
 rkyv = { version = "0.8", features = ["std", "alloc", "bytecheck"] }
 bytes = "1.11"
@@ -39,47 +43,60 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+url = "2"
 
 # Allocators
-tikv-jemallocator = "0.6"  # jemalloc for reduced fragmentation in Ring 1/2 (Unix)
+tikv-jemallocator = { version = "0.6", features = [
+    "unprefixed_malloc_on_supported_platforms",
+    "background_threads",
+    "profiling",
+] }  # jemalloc: unprefixed interposes libc malloc for C deps (librdkafka, OpenSSL, glibc)
 mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows MSVC
 
 # Performance-critical
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
-bumpalo = "3.20"  # Arena allocator
-uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
+uuid = { version = "1.23", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
-ahash = "0.8"  # Fast hashing for state stores
-papaya = "0.2"  # Lock-free concurrent HashMap
-foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
+ahash = "0.8"  # Fast hashing for auxiliary caches and indexes
+quick_cache = "0.6"  # Lightweight in-memory cache (S3-FIFO eviction, pure Rust, see ADR-006)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 lz4_flex = "0.12"  # Pure Rust LZ4 compression (fastest decompression for recovery)
-zstd = "0.13"  # Zstd compression for archival storage tiers (warm/cold)
-backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
+zstd = "0.13"  # Zstd compression for checkpoint artifacts
 regex = "1.12"
 humantime-serde = "1.1"
 notify = "8"
 globset = "0.4"
 
-# DataFusion and Arrow - using latest versions
-arrow = { version = "57.2", default-features = true }
-arrow-array = "57.2"
-arrow-schema = "57.2"
-arrow-cast = "57.2"
-arrow-ipc = "57.2"
-arrow-select = "57.2"
-datafusion = "52.3"
-datafusion-common = "52.0"
-datafusion-expr = "52.0"
-datafusion-sql = "52.0"
-datafusion-optimizer = "52.0"
-sqlparser = "0.59"
+# Arrow row encoding participates in the partitioning ABI. Upgrade these exact
+# pins only with an ABI version bump and updated golden vectors.
+arrow = { version = "=58.4.0", default-features = true }
+arrow-array = "=58.4.0"
+arrow-avro = "=58.4.0"
+arrow-schema = "=58.4.0"
+arrow-cast = "=58.4.0"
+arrow-csv = "=58.4.0"
+arrow-ipc = { version = "=58.4.0", features = ["lz4"] }
+arrow-json = "=58.4.0"
+arrow-row = "=58.4.0"
+arrow-select = "=58.4.0"
+parquet = { version = "=58.4.0", default-features = false }
+datafusion = "=53.1.0"
+datafusion-common = "=53.1.0"
+datafusion-expr = "=53.1.0"
+datafusion-functions-aggregate-common = "=53.1.0"
+datafusion-sql = "=53.1.0"
+datafusion-optimizer = "=53.1.0"
+# `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used
+# to collect referenced columns for lookup projection pushdown.
+sqlparser = { version = "=0.61.0", features = ["visitor"] }
 
 # Async
 tokio-stream = "0.1"
 futures = "0.3"
+crossfire = "3"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }
@@ -87,10 +104,7 @@ arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
-io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
-
-# Probabilistic data structures
-xorf = "0.12"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Encoding
 base64 = "0.22"
@@ -98,27 +112,52 @@ base64 = "0.22"
 # Randomness
 rand = "0.10"
 
-# Apache Iceberg
-iceberg = "0.9.0"
-iceberg-catalog-rest = "0.9.0"
-iceberg-storage-opendal = "0.9.0"
+# Constant-time comparison (token validation)
+subtle = "2.6"
 
-# Constellation (distributed mode)
+# Metrics
+prometheus = { version = "0.14", features = ["process"] }
+
+# Object store (S3/GCS/Azure/local filesystem) — shared across crates.
+object_store = "=0.13.2"
+
+# Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
+deltalake = { version = "=0.32.4", default-features = false }
+deltalake-catalog-glue = { version = "=0.16.0", default-features = false }
+delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
+
+# Apache Iceberg
+iceberg = "=0.10.1"
+iceberg-catalog-rest = "=0.10.1"
+iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
+apache-avro = "=0.21.0"
+
+# Cluster (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
+# bump and updated golden vectors.
+xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.10"
+proptest = "1.11"
 tempfile = "3.27"
 
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 opt-level = 3
 debug = false
+strip = "debuginfo"
 
 [profile.bench]
 inherits = "release"
-debug = true
+debug = false
+strip = "debuginfo"
+
+# Optimized real-process fault tests retain the test-only checkpoint gate.
+[profile.soak]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

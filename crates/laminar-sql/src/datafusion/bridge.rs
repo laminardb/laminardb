@@ -1,22 +1,5 @@
-//! Channel-based push-to-pull bridge for `DataFusion` integration
-//!
-//! This module provides the `StreamBridge` which connects `LaminarDB`'s
-//! push-based event processing model (where the Reactor pushes events)
-//! with `DataFusion`'s pull-based query execution (where consumers pull
-//! `RecordBatch` instances).
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────┐         ┌──────────────────┐
-//! │  `LaminarDB`      │         │   `DataFusion`     │
-//! │  Reactor (push) │──send──▶│  Query (pull)    │
-//! │                 │         │                  │
-//! └─────────────────┘         └──────────────────┘
-//!         │                           ▲
-//!         │                           │
-//!         └───────── channel ─────────┘
-//! ```
+//! Bridges `LaminarDB`'s push-based reactor with `DataFusion`'s pull-based
+//! query execution via a crossfire mpsc channel wrapped as a `RecordBatchStream`.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -24,54 +7,29 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use crossfire::stream::AsyncStream;
+use crossfire::{mpsc, AsyncRx, MAsyncTx, TrySendError};
 use datafusion::physical_plan::RecordBatchStream;
 use datafusion_common::DataFusionError;
 use futures::Stream;
-use tokio::sync::mpsc;
 
 /// Default channel capacity for the bridge.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
-/// A bridge that connects push-based data producers with pull-based consumers.
-///
-/// The bridge creates a channel pair: a sender for pushing `RecordBatch`
-/// instances from the producer side, and a stream for pulling batches
-/// from the consumer side.
-///
-/// # Usage
-///
-/// ```rust,ignore
-/// let schema = Arc::new(Schema::new(vec![...]));
-/// let bridge = StreamBridge::new(schema, 100);
-/// let sender = bridge.sender();
-///
-/// // Producer side (`LaminarDB` Reactor)
-/// sender.send(batch).await?;
-///
-/// // Consumer side (`DataFusion` query)
-/// let stream = bridge.into_stream();
-/// while let Some(batch) = stream.next().await { ... }
-/// ```
+/// Push-to-pull bridge carrying `RecordBatch` results from the reactor
+/// into a `DataFusion` query execution plan.
 #[derive(Debug)]
 pub struct StreamBridge {
-    /// Schema of the record batches flowing through the bridge
     schema: SchemaRef,
-    /// Sender side of the channel
     sender: BridgeSender,
-    /// Receiver side of the channel
-    receiver: Option<mpsc::Receiver<Result<RecordBatch, DataFusionError>>>,
+    receiver: Option<AsyncRx<mpsc::Array<Result<RecordBatch, DataFusionError>>>>,
 }
 
 impl StreamBridge {
     /// Creates a new bridge with the given schema and channel capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of `RecordBatch` instances that will flow through
-    /// * `capacity` - Maximum number of batches that can be buffered
     #[must_use]
     pub fn new(schema: SchemaRef, capacity: usize) -> Self {
-        let (tx, rx) = mpsc::channel(capacity);
+        let (tx, rx) = mpsc::bounded_async::<Result<RecordBatch, DataFusionError>>(capacity);
         Self {
             schema,
             sender: BridgeSender { tx },
@@ -111,7 +69,11 @@ impl StreamBridge {
     pub fn into_stream(mut self) -> BridgeStream {
         BridgeStream {
             schema: self.schema,
-            receiver: self.receiver.take().expect("receiver already taken"),
+            receiver: self
+                .receiver
+                .take()
+                .expect("receiver already taken")
+                .into_stream(),
         }
     }
 
@@ -122,7 +84,7 @@ impl StreamBridge {
     pub fn take_stream(&mut self) -> Option<BridgeStream> {
         self.receiver.take().map(|receiver| BridgeStream {
             schema: Arc::clone(&self.schema),
-            receiver,
+            receiver: receiver.into_stream(),
         })
     }
 }
@@ -132,7 +94,7 @@ impl StreamBridge {
 /// Multiple producers can share senders by cloning this type.
 #[derive(Debug, Clone)]
 pub struct BridgeSender {
-    tx: mpsc::Sender<Result<RecordBatch, DataFusionError>>,
+    tx: MAsyncTx<mpsc::Array<Result<RecordBatch, DataFusionError>>>,
 }
 
 impl BridgeSender {
@@ -169,15 +131,15 @@ impl BridgeSender {
     /// Returns an error if the channel is full or the receiver is dropped.
     pub fn try_send(&self, batch: RecordBatch) -> Result<(), BridgeTrySendError> {
         self.tx.try_send(Ok(batch)).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => BridgeTrySendError::Full,
-            mpsc::error::TrySendError::Closed(_) => BridgeTrySendError::ReceiverDropped,
+            TrySendError::Full(_) => BridgeTrySendError::Full,
+            TrySendError::Disconnected(_) => BridgeTrySendError::ReceiverDropped,
         })
     }
 
     /// Returns true if the receiver has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.tx.is_closed()
+        self.tx.is_disconnected()
     }
 }
 
@@ -187,7 +149,7 @@ impl BridgeSender {
 /// so it can be used directly in `DataFusion` query execution.
 pub struct BridgeStream {
     schema: SchemaRef,
-    receiver: mpsc::Receiver<Result<RecordBatch, DataFusionError>>,
+    receiver: AsyncStream<mpsc::Array<Result<RecordBatch, DataFusionError>>>,
 }
 
 impl std::fmt::Debug for BridgeStream {
@@ -202,7 +164,7 @@ impl Stream for BridgeStream {
     type Item = Result<RecordBatch, DataFusionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_recv(cx)
+        Pin::new(&mut self.receiver).poll_next(cx)
     }
 }
 

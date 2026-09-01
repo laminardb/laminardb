@@ -1,7 +1,8 @@
 LaminarDB has been deployed!
 
 Mode: {{ .Values.laminardb.mode }}
-{{- if eq .Values.laminardb.mode "delta" }}
+{{- $isCluster := eq .Values.laminardb.mode "cluster" }}
+{{- if $isCluster }}
 Replicas: {{ .Values.replicaCount }}
 {{- end }}
 
@@ -33,11 +34,11 @@ Replicas: {{ .Values.replicaCount }}
 6. Trigger a checkpoint:
   curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/checkpoint
 
-{{- if eq .Values.laminardb.mode "delta" }}
-
-Delta mode cluster info:
+{{- if $isCluster }}
+{{- $cluster := .Values.laminardb.cluster | default dict }}
+Cluster mode info:
   Nodes: {{ .Values.replicaCount }}
-  Discovery: {{ .Values.laminardb.delta.discovery.strategy }}
-  Coordination: {{ .Values.laminardb.delta.coordination.strategy }}
+  Discovery: {{ ($cluster.discovery | default dict).strategy }}
+  Control plane: shared-store leader lease and assignment CAS
   Headless service: {{ include "laminardb.headlessServiceName" . }}
 {{- end }}

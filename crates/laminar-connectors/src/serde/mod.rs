@@ -1,18 +1,5 @@
-//! Record serialization and deserialization framework.
-//!
-//! Provides traits and implementations for converting between external
-//! data formats and Arrow `RecordBatch`:
-//!
-//! - `RecordDeserializer`: Converts raw bytes to `RecordBatch`
-//! - `RecordSerializer`: Converts `RecordBatch` to raw bytes
-//! - `Format`: Enum of supported serialization formats
-//!
-//! ## Implementations
-//!
-//! - `json`: JSON format using `serde_json`
-//! - `csv`: CSV format
-//! - `raw`: Raw bytes pass-through
-//! - `debezium`: Debezium CDC envelope format
+//! Record (de)serialization: bytes ↔ Arrow `RecordBatch`. Format
+//! implementations in `json`, `csv`, `raw`, `debezium`.
 
 pub mod csv;
 pub mod debezium;
@@ -185,7 +172,7 @@ pub fn create_deserializer(format: Format) -> Result<Box<dyn RecordDeserializer>
         Format::Raw => Ok(Box::new(raw::RawBytesDeserializer::new())),
         Format::Debezium => Ok(Box::new(debezium::DebeziumDeserializer::new())),
         Format::Avro => Err(SerdeError::UnsupportedFormat(
-            "Avro deserialization requires the 'kafka' feature".into(),
+            "Avro requires a connector-provided deserializer".into(),
         )),
     }
 }
@@ -204,50 +191,10 @@ pub fn create_serializer(format: Format) -> Result<Box<dyn RecordSerializer>, Se
             "Debezium is a deserialization-only format".into(),
         )),
         Format::Avro => Err(SerdeError::UnsupportedFormat(
-            "Avro serialization requires the 'kafka' feature".into(),
+            "Avro requires a connector-provided serializer".into(),
         )),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_from_str() {
-        assert_eq!(Format::parse("json").unwrap(), Format::Json);
-        assert_eq!(Format::parse("JSON").unwrap(), Format::Json);
-        assert_eq!(Format::parse("csv").unwrap(), Format::Csv);
-        assert_eq!(Format::parse("raw").unwrap(), Format::Raw);
-        assert_eq!(Format::parse("bytes").unwrap(), Format::Raw);
-        assert_eq!(Format::parse("debezium").unwrap(), Format::Debezium);
-        assert_eq!(Format::parse("debezium-json").unwrap(), Format::Debezium);
-        assert_eq!(Format::parse("avro").unwrap(), Format::Avro);
-        assert_eq!(Format::parse("confluent-avro").unwrap(), Format::Avro);
-    }
-
-    #[test]
-    fn test_format_display() {
-        assert_eq!(Format::Json.to_string(), "json");
-        assert_eq!(Format::Csv.to_string(), "csv");
-        assert_eq!(Format::Raw.to_string(), "raw");
-        assert_eq!(Format::Debezium.to_string(), "debezium");
-        assert_eq!(Format::Avro.to_string(), "avro");
-    }
-
-    #[test]
-    fn test_create_deserializer() {
-        assert!(create_deserializer(Format::Json).is_ok());
-        assert!(create_deserializer(Format::Csv).is_ok());
-        assert!(create_deserializer(Format::Raw).is_ok());
-        assert!(create_deserializer(Format::Debezium).is_ok());
-    }
-
-    #[test]
-    fn test_create_serializer() {
-        assert!(create_serializer(Format::Json).is_ok());
-        assert!(create_serializer(Format::Csv).is_ok());
-        assert!(create_serializer(Format::Raw).is_ok());
-        assert!(create_serializer(Format::Debezium).is_err()); // deser-only
-    }
-}
+mod tests;

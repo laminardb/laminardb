@@ -1,7 +1,6 @@
 #![allow(clippy::disallowed_types)]
 
 mod history;
-mod latency;
 mod tui;
 mod types;
 
@@ -39,14 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::sleep(Duration::from_secs(2));
 
     // ── Subscribe to 8 unified streams + 2 depth streams ─────
-    let spread_sub = db.subscribe::<Spread>("spreads")?;
-    let vwap_sub = db.subscribe::<Vwap>("vwap")?;
-    let micro_sub = db.subscribe::<MicroCandle>("micro")?;
-    let momentum_sub = db.subscribe::<Momentum>("momentum")?;
-    let burst_sub = db.subscribe::<Burst>("bursts")?;
-    let signal_sub = db.subscribe::<Signal>("signals")?;
-    let depth_bids_sub = db.subscribe::<DepthLevel>("depth_bids")?;
-    let depth_asks_sub = db.subscribe::<DepthLevel>("depth_asks")?;
+    let mut spread_sub = db.subscribe::<Spread>("spreads").await?;
+    let mut vwap_sub = db.subscribe::<Vwap>("vwap").await?;
+    let mut micro_sub = db.subscribe::<MicroCandle>("micro").await?;
+    let mut momentum_sub = db.subscribe::<Momentum>("momentum").await?;
+    let mut burst_sub = db.subscribe::<Burst>("bursts").await?;
+    let mut signal_sub = db.subscribe::<Signal>("signals").await?;
+    let mut depth_bids_sub = db.subscribe::<DepthLevel>("depth_bids").await?;
+    let mut depth_asks_sub = db.subscribe::<DepthLevel>("depth_asks").await?;
 
     let mut state = DashState::new();
     let mut last_events = 0u64;
@@ -76,14 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        drain_sub(&spread_sub, &mut state.spreads, |r| r.symbol.clone());
-        drain_sub(&vwap_sub, &mut state.vwap, |r| r.symbol.clone());
-        drain_sub(&momentum_sub, &mut state.momentum, |r| r.symbol.clone());
-        drain_sub(&burst_sub, &mut state.bursts, |r| r.symbol.clone());
-        drain_sub(&signal_sub, &mut state.signals, |r| r.symbol.clone());
-        drain_micro(&micro_sub, &mut state);
-        drain_depth(&depth_bids_sub, &mut state.depth_bids);
-        drain_depth(&depth_asks_sub, &mut state.depth_asks);
+        drain_sub(&mut spread_sub, &mut state.spreads, |r| r.symbol.clone())?;
+        drain_sub(&mut vwap_sub, &mut state.vwap, |r| r.symbol.clone())?;
+        drain_sub(&mut momentum_sub, &mut state.momentum, |r| r.symbol.clone())?;
+        drain_sub(&mut burst_sub, &mut state.bursts, |r| r.symbol.clone())?;
+        drain_sub(&mut signal_sub, &mut state.signals, |r| r.symbol.clone())?;
+        drain_micro(&mut micro_sub, &mut state)?;
+        drain_depth(&mut depth_bids_sub, &mut state.depth_bids)?;
+        drain_depth(&mut depth_asks_sub, &mut state.depth_asks)?;
 
         let m = db.metrics();
         state.total_events = m.total_events_ingested;
@@ -92,8 +91,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.source_count = m.source_count;
         state.stream_count = m.stream_count;
         state.pipeline_watermark = m.pipeline_watermark;
-        state.latency.record(m.last_cycle_duration_ns);
-        state.latency_history.push(m.last_cycle_duration_ns);
 
         let elapsed = last_tp_time.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
@@ -113,12 +110,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn drain_sub<T: Clone + FromBatch>(
-    sub: &TypedSubscription<T>,
+    sub: &mut TypedSubscription<T>,
     map: &mut HashMap<String, T>,
     key_fn: fn(&T) -> String,
-) {
+) -> Result<(), laminar_db::SubscriptionError> {
     for _ in 0..64 {
-        match sub.poll() {
+        match sub.poll()? {
             Some(rows) => {
                 for r in rows {
                     map.insert(key_fn(&r), r);
@@ -127,11 +124,15 @@ fn drain_sub<T: Clone + FromBatch>(
             None => break,
         }
     }
+    Ok(())
 }
 
-fn drain_micro(sub: &TypedSubscription<MicroCandle>, state: &mut DashState) {
+fn drain_micro(
+    sub: &mut TypedSubscription<MicroCandle>,
+    state: &mut DashState,
+) -> Result<(), laminar_db::SubscriptionError> {
     for _ in 0..64 {
-        match sub.poll() {
+        match sub.poll()? {
             Some(rows) => {
                 for r in rows {
                     let key = r.symbol.clone();
@@ -146,11 +147,15 @@ fn drain_micro(sub: &TypedSubscription<MicroCandle>, state: &mut DashState) {
             None => break,
         }
     }
+    Ok(())
 }
 
-fn drain_depth(sub: &TypedSubscription<DepthLevel>, buf: &mut Vec<DepthLevel>) {
+fn drain_depth(
+    sub: &mut TypedSubscription<DepthLevel>,
+    buf: &mut Vec<DepthLevel>,
+) -> Result<(), laminar_db::SubscriptionError> {
     for _ in 0..64 {
-        match sub.poll() {
+        match sub.poll()? {
             Some(rows) => {
                 buf.clear();
                 buf.extend(rows);
@@ -158,4 +163,5 @@ fn drain_depth(sub: &TypedSubscription<DepthLevel>, buf: &mut Vec<DepthLevel>) {
             None => break,
         }
     }
+    Ok(())
 }

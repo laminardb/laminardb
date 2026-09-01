@@ -1,34 +1,4 @@
 //! Channel type derivation from query plan analysis.
-//!
-//! This module analyzes query plans to automatically determine whether sources
-//! need SPSC (single consumer) or broadcast (multiple consumer) channels.
-//!
-//! # Key Principle
-//!
-//! **Users never specify broadcast mode.** The planner analyzes MVs and sources
-//! to derive the correct channel type automatically:
-//!
-//! - If a source is consumed by exactly 1 MV → SPSC (optimal)
-//! - If a source is consumed by 2+ MVs → Broadcast
-//!
-//! # Example
-//!
-//! ```sql
-//! CREATE SOURCE trades (...);
-//!
-//! CREATE MATERIALIZED VIEW vwap AS
-//!   SELECT symbol, SUM(price * volume) / SUM(volume) AS vwap
-//!   FROM trades
-//!   GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE);
-//!
-//! CREATE MATERIALIZED VIEW max_price AS
-//!   SELECT symbol, MAX(price)
-//!   FROM trades
-//!   GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE);
-//! ```
-//!
-//! In this example, `trades` source has 2 consumers (`vwap` and `max_price`),
-//! so the planner derives `Broadcast { consumer_count: 2 }` for `trades`.
 
 #[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::HashMap;
@@ -134,50 +104,7 @@ impl MvDefinition {
     }
 }
 
-/// Analyzes query plan to determine channel types per source.
-///
-/// Examines how many MVs consume each source and determines whether
-/// SPSC or Broadcast channels are needed.
-///
-/// # Arguments
-///
-/// * `sources` - Registered source definitions
-/// * `mvs` - Materialized view definitions
-///
-/// # Returns
-///
-/// A map from source name to derived channel type.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_sql::planner::channel_derivation::*;
-///
-/// let sources = vec![
-///     SourceDefinition::new("trades"),
-///     SourceDefinition::new("orders"),
-/// ];
-///
-/// let mvs = vec![
-///     MvDefinition::from_source("vwap", "trades"),
-///     MvDefinition::from_source("max_price", "trades"),
-///     MvDefinition::from_source("order_count", "orders"),
-/// ];
-///
-/// let channel_types = derive_channel_types(&sources, &mvs);
-///
-/// // trades has 2 consumers → Broadcast
-/// assert_eq!(
-///     channel_types.get("trades"),
-///     Some(&DerivedChannelType::Broadcast { consumer_count: 2 })
-/// );
-///
-/// // orders has 1 consumer → SPSC
-/// assert_eq!(
-///     channel_types.get("orders"),
-///     Some(&DerivedChannelType::Spsc)
-/// );
-/// ```
+/// Maps each source to SPSC (single consumer) or Broadcast (multi-consumer).
 #[must_use]
 pub fn derive_channel_types(
     sources: &[SourceDefinition],

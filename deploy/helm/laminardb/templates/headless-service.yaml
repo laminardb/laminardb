@@ -1,4 +1,5 @@
-{{- if or .Values.headlessService.enabled (eq .Values.laminardb.mode "delta") }}
+{{- $isCluster := eq .Values.laminardb.mode "cluster" -}}
+{{- if or .Values.headlessService.enabled $isCluster }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -8,20 +9,20 @@ metadata:
 spec:
   type: ClusterIP
   clusterIP: None
+  # Pods must resolve each other DURING cluster formation, before any pod is
+  # Ready (the server blocks on membership before serving probes) — without
+  # this, multi-replica discovery deadlocks.
+  publishNotReadyAddresses: true
   ports:
     - port: {{ .Values.service.httpPort }}
       targetPort: http
       protocol: TCP
       name: http
-    {{- if eq .Values.laminardb.mode "delta" }}
+    {{- if $isCluster }}
     - port: {{ .Values.service.gossipPort }}
       targetPort: gossip
       protocol: TCP
       name: gossip
-    - port: {{ .Values.service.raftPort }}
-      targetPort: raft
-      protocol: TCP
-      name: raft
     {{- end }}
   selector:
     {{- include "laminardb.selectorLabels" . | nindent 4 }}

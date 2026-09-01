@@ -1,19 +1,15 @@
 # laminar-sql
 
-SQL layer for LaminarDB with streaming extensions.
-
-## Overview
-
-Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windows, watermarks, EMIT clauses, ASOF joins. DataFusion handles query planning and execution.
+Streaming SQL extensions on top of sqlparser-rs: tumbling/session windows, watermarks, EMIT clauses, and bounded joins. DataFusion handles query planning and execution.
 
 ## Key Modules
 
 | Module | Purpose |
 |--------|---------|
-| `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE) |
+| `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE), `SUBSCRIBE`, `DECLARE … CURSOR FOR SUBSCRIBE`, `FETCH`, `CLOSE` |
 | `planner` | `StreamingPlanner` converts parsed SQL into `StreamingPlan` / `QueryPlan` |
-| `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join |
-| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, watermark filter pushdown, PROCTIME() UDF, JSON functions, complex type functions |
+| `translator` | Operator config builders: window, join, analytic, order, having, DDL |
+| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, PROCTIME() UDF, JSON functions, complex type functions |
 | `error` | User-friendly DataFusion error translation with `LDB-NNNN` codes |
 
 ## Streaming SQL Extensions
@@ -39,14 +35,15 @@ SELECT ... EMIT ON WINDOW CLOSE
 SELECT ... EMIT CHANGES
 SELECT ... EMIT FINAL
 
--- ASOF JOIN
-SELECT ... FROM orders ASOF JOIN trades ON o.symbol = t.symbol AND o.ts >= t.ts
-
 -- Lookup tables
-CREATE LOOKUP TABLE instruments FROM POSTGRES (...)
+CREATE LOOKUP TABLE instruments (
+    symbol VARCHAR NOT NULL,
+    PRIMARY KEY (symbol)
+) WITH ('connector' = 'postgres', 'connection' = '...', 'table' = 'instruments')
 
 -- Late data handling
-SELECT ... ALLOWED_LATENESS INTERVAL '10' SECOND
+SELECT ... ALLOW LATENESS INTERVAL '10' SECOND
+SELECT ... LATE DATA TO <side_output_sink>
 
 -- Window functions
 SELECT ..., LAG(price, 1) OVER (PARTITION BY symbol ORDER BY ts) FROM trades
@@ -56,11 +53,27 @@ SELECT ..., ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY price DESC) FROM tra
 SELECT ..., SUM(vol) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 5 PRECEDING AND CURRENT ROW)
 
 -- Connector DDL
-CREATE SOURCE ... FROM KAFKA (brokers = '...', topic = '...', format = 'json')
-CREATE SOURCE ... FROM POSTGRES_CDC (hostname = '...', database = '...')
-CREATE SOURCE ... FROM MYSQL_CDC (hostname = '...', database = '...')
-CREATE SINK ... INTO KAFKA (brokers = '...', topic = '...')
-CREATE SINK ... INTO DELTA_LAKE (path = '...')
+CREATE SOURCE ... FROM KAFKA ('bootstrap.servers' = '...', topic = '...') FORMAT JSON
+CREATE SOURCE ... FROM "postgres-cdc" (host = '...', database = '...')
+CREATE SINK ... FROM input INTO KAFKA ('bootstrap.servers' = '...', topic = '...')
+CREATE SINK ... FROM input INTO "delta-lake" ('table.path' = '...')
+
+-- Retain a bounded ring of recent epochs so SUBSCRIBE clients can
+-- reconnect without gaps.
+CREATE STREAM trades AS SELECT * FROM events
+  WITH ('retain_history' = '64mb')
+
+-- Streaming subscriptions (consumed by the pgwire listener or the
+-- in-process SubscriptionPortal API in laminar-db).
+SUBSCRIBE my_stream
+SUBSCRIBE my_stream WHERE symbol = 'AAPL'
+SUBSCRIBE my_stream AS OF EPOCH 42
+
+-- Forward-only cursor over a SUBSCRIBE for libpq clients that prefer
+-- FETCH-driven flow control (e.g. psql with \set FETCH_COUNT 100).
+DECLARE c CURSOR FOR SUBSCRIBE my_stream
+FETCH FORWARD 100 FROM c
+CLOSE c
 ```
 
 ## Custom UDFs Registered with DataFusion
@@ -84,10 +97,6 @@ The `StreamingPhysicalValidator` rule catches invalid physical plans (e.g., Sort
 - **Reject** (default) -- fails with an error
 - **Warn** -- logs a warning but allows execution
 - **Off** -- disables validation
-
-## Watermark Filter Pushdown
-
-The `WatermarkDynamicFilter` pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation. Uses shared `Arc<AtomicI64>` for zero-copy watermark updates from Ring 0.
 
 ## Public API
 

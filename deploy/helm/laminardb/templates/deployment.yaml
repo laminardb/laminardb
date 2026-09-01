@@ -30,6 +30,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "laminardb.serviceAccountName" . }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.initContainers }}
@@ -51,17 +54,16 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
-            {{- if .Values.service.pgEnabled }}
+            {{- if .Values.laminardb.pgwire.enabled }}
             - name: pg
               containerPort: 5432
               protocol: TCP
             {{- end }}
-            {{- if eq .Values.laminardb.mode "delta" }}
+            {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
+            {{- $cluster := .Values.laminardb.cluster | default dict }}
+            {{- if $isCluster }}
             - name: gossip
-              containerPort: {{ .Values.laminardb.delta.discovery.gossipPort }}
-              protocol: TCP
-            - name: raft
-              containerPort: {{ .Values.laminardb.delta.coordination.raftPort }}
+              containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
               protocol: TCP
             {{- end }}
           startupProbe:
@@ -98,28 +100,43 @@ spec:
             {{- end }}
           {{- end }}
           env:
-            {{- if eq .Values.laminardb.mode "delta" }}
+            {{- if not .Values.laminardb.configWatch }}
+            # Config changes roll pods via the checksum annotation; the in-pod watcher is redundant on ConfigMap mounts.
+            - name: LAMINAR_DISABLE_FILE_WATCH
+              value: "1"
+            {{- end }}
+            {{- if eq .Values.laminardb.mode "cluster" }}
             - name: HOSTNAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
             {{- end }}
+            {{- with (.Values.laminardb.consoleToken | default dict).existingSecret }}
+            - name: LAMINAR_CONSOLE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.laminardb.consoleToken.secretKey | default "token" }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/laminardb
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.persistence.state.enabled }}
-            - name: state
-              mountPath: /var/lib/laminardb/state
-            {{- end }}
-            {{- if .Values.persistence.checkpoints.enabled }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
+            {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
+            - name: pgwire-tls
+              mountPath: /etc/laminardb/pgwire-tls
+              readOnly: true
             {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
@@ -130,20 +147,13 @@ spec:
             name: {{ include "laminardb.fullname" . }}
         - name: tmp
           emptyDir: {}
-        {{- if .Values.persistence.state.enabled }}
-        - name: state
-          {{- if .Values.persistence.state.useEmptyDir }}
-          emptyDir:
-            {{- if .Values.persistence.state.emptyDirMedium }}
-            medium: {{ .Values.persistence.state.emptyDirMedium }}
-            {{- end }}
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
-        {{- end }}
-        {{- if .Values.persistence.checkpoints.enabled }}
+        # Volatile; durable checkpoints need the StatefulSet PVC or an object store.
         - name: checkpoints
           emptyDir: {}
+        {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
+        - name: pgwire-tls
+          secret:
+            secretName: {{ .Values.laminardb.pgwire.tls.existingSecret }}
         {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}

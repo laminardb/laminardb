@@ -4,34 +4,34 @@
 -- ── Sources: one WebSocket per symbol ────────────────────────────
 
 CREATE SOURCE btcusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/btcusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/btcusdt@trade') FORMAT JSON;
 
 CREATE SOURCE ethusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/ethusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/ethusdt@trade') FORMAT JSON;
 
 CREATE SOURCE solusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/solusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/solusdt@trade') FORMAT JSON;
 
 CREATE SOURCE dogeusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/dogeusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/dogeusdt@trade') FORMAT JSON;
 
 CREATE SOURCE xrpusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/xrpusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/xrpusdt@trade') FORMAT JSON;
 
 CREATE SOURCE bnbusdt (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
-) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/bnbusdt@trade', format = 'json');
+) FROM WEBSOCKET (url = 'wss://stream.binance.com:9443/ws/bnbusdt@trade') FORMAT JSON;
 
 -- ── VWAP: 10-second tumbling windows ─────────────────────────────
 

@@ -5,16 +5,107 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB Docs — Configuration Reference</title>
   <meta name="description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
-  <meta name="robots" content="index, follow">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f8fafc">
   <link rel="canonical" href="https://laminardb.io/docs/">
+  <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
+
+  <meta property="og:title" content="LaminarDB Docs — Configuration Reference">
+  <meta property="og:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
+  <meta property="og:url" content="https://laminardb.io/docs/">
+  <meta property="og:type" content="article">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="LaminarDB Docs — Configuration Reference">
+  <meta name="twitter:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment.">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "TechArticle",
+        "@id": "https://laminardb.io/docs/#article",
+        "headline": "LaminarDB Configuration Reference",
+        "description": "Complete configuration reference for the LaminarDB standalone server: TOML fields, REST API endpoints, connector properties, checkpoint configuration, hot reload, Prometheus metrics, and join semantics. Every field verified against the source code.",
+        "url": "https://laminardb.io/docs/",
+        "inLanguage": "en",
+        "dateModified": "2026-05-25",
+        "isPartOf": { "@id": "https://laminardb.io/#website" },
+        "about": { "@id": "https://laminardb.io/#software" },
+        "author": { "@id": "https://laminardb.io/#org" },
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "proficiencyLevel": "Expert",
+        "articleSection": [
+          "Server Configuration",
+          "State Configuration",
+          "Checkpoint Configuration",
+          "REST API",
+          "Hot Reload",
+          "Prometheus Metrics",
+          "Source Connectors",
+          "Sink Connectors",
+          "Lookup Sources",
+          "Join Semantics"
+        ],
+        "keywords": "streaming SQL, LaminarDB configuration, Kafka connector, CDC, Delta Lake, Iceberg, OpenTelemetry, bounded join, exactly-once, barrier checkpoint"
+      },
+      {
+        "@type": "BreadcrumbList",
+        "itemListElement": [
+          {
+            "@type": "ListItem",
+            "position": 1,
+            "name": "Home",
+            "item": "https://laminardb.io"
+          },
+          {
+            "@type": "ListItem",
+            "position": 2,
+            "name": "Docs",
+            "item": "https://laminardb.io/docs/"
+          }
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://laminardb.io/#website",
+        "url": "https://laminardb.io",
+        "name": "LaminarDB"
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://laminardb.io/#software",
+        "name": "LaminarDB",
+        "url": "https://laminardb.io",
+        "applicationCategory": "DatabaseApplication"
+      },
+      {
+        "@type": "Organization",
+        "@id": "https://laminardb.io/#org",
+        "name": "LaminarDB Contributors",
+        "url": "https://laminardb.io",
+        "sameAs": [
+          "https://github.com/laminardb",
+          "https://github.com/laminardb/laminardb"
+        ]
+      }
+    ]
+  }
+  </script>
 
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" rel="stylesheet">
   <link rel="stylesheet" href="../css/style.css">
+  <script>
+    (function() {
+      const theme = localStorage.getItem('theme') || 'system';
+      const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    })();
+  </script>
 
   <style>
     /* --- Docs-specific layout --- */
@@ -336,26 +427,67 @@
     <div class="nav-inner">
       <a href="../" class="nav-brand" aria-label="LaminarDB home">
         <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
-          <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00b4d8"/><stop offset="100%" stop-color="#38cbeb"/></linearGradient></defs>
+          <defs>
+            <linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#0ea5e9"/>
+              <stop offset="100%" stop-color="#8b5cf6"/>
+            </linearGradient>
+          </defs>
           <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
           <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#logo-g)" stroke-width="3" fill="none" stroke-linecap="round"/>
           <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
-        <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.12</span>
+        <span>LAMINARDB.IO</span>
+        <span class="version-badge" data-version="tag">v0.25.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
+        <a href="../#features">Features</a>
+        <a href="../#architecture">Architecture</a>
         <a href="../#quick-start">Quick Start</a>
         <a href="./">Docs</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
-        <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
-          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener" class="btn btn-secondary" style="padding: 6px 14px; font-size: 0.8rem;">API Reference</a>
+        <a href="https://github.com/laminardb/laminardb" class="btn btn-primary" target="_blank" rel="noopener" style="padding: 6px 16px; font-size: 0.8rem;">
+          <svg viewBox="0 0 16 16" style="width:14px;height:14px;fill:currentColor;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
       </nav>
+
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon sun-icon" style="display: none;">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon moon-icon" style="display: none;">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon system-icon" style="display: none;">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+      </button>
+
+      <button class="nav-toggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="mobile-menu">
+        <span></span><span></span><span></span>
+      </button>
+
+      <div class="mobile-menu" id="mobile-menu">
+        <a href="../#features">Features</a>
+        <a href="../#architecture">Architecture</a>
+        <a href="../#quick-start">Quick Start</a>
+        <a href="./">Docs</a>
+        <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+      </div>
     </div>
   </header>
 
@@ -365,8 +497,9 @@
     <aside class="docs-sidebar" aria-label="Documentation navigation">
       <h4>Server</h4>
       <a href="#server-config">Server Config</a>
-      <a href="#state-config">State Store</a>
+      <a href="#cluster-config">Cluster Config</a>
       <a href="#checkpoint-config">Checkpoints</a>
+      <a href="#console-ui-api">Console UI &amp; Control API</a>
       <a href="#rest-api">REST API</a>
       <a href="#hot-reload">Hot Reload</a>
       <a href="#prometheus">Prometheus Metrics</a>
@@ -381,7 +514,6 @@
       <a href="#kafka-source">Kafka Source</a>
       <a href="#kafka-sink">Kafka Sink</a>
       <a href="#postgres-cdc">PostgreSQL CDC</a>
-      <a href="#mysql-cdc">MySQL CDC</a>
       <a href="#mongodb-cdc">MongoDB CDC Source</a>
       <a href="#mongodb-sink">MongoDB Sink</a>
       <a href="#postgres-sink">PostgreSQL Sink</a>
@@ -394,40 +526,48 @@
 
       <h4>Joins</h4>
       <a href="#join-interval">Interval Join</a>
-      <a href="#join-asof">ASOF Join</a>
       <a href="#join-temporal">Temporal Join</a>
       <a href="#join-lookup">Lookup Join</a>
 
       <h4>Advanced</h4>
       <a href="#env-vars">Environment Variables</a>
-      <a href="#tiering">S3 Tiering</a>
       <a href="#delivery">Delivery Guarantees</a>
     </aside>
 
     <!-- Content -->
     <main class="docs-content">
+      <article>
+
+      <nav aria-label="Breadcrumb" style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 0.75rem;">
+        <a href="../" style="color: var(--text-dim);">Home</a>
+        <span style="margin: 0 6px;">&rsaquo;</span>
+        <span style="color: var(--text-secondary);">Docs</span>
+      </nav>
 
       <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Standalone Server &amp; Configuration Reference</h1>
       <p style="color: var(--text-dim); margin-bottom: 1rem;">
         The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
         Every field on this page is verified against
         <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
+        Last updated: 25 May 2026.
       </p>
 
       <h3>Install</h3>
       <div class="toml-block">
         <div class="toml-header">Install &amp; run</div>
-        <pre><code class="language-bash"># Pre-built binary (Linux x86_64)
-curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz"
+        <pre><code class="language-bash"># Pre-built binary (Linux x86_64) — resolve the latest release tag
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
 tar xzf laminardb-server-*.tar.gz
 
 # Or build from source
 cargo install laminar-server
 
-# Or Docker
-docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
+# Or Docker (multi-arch — Docker Hub or GHCR)
+docker run -d -p 8080:8080 laminardb/laminardb-server:latest
+# docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
 
-# Run
+# Run the binary
 ./laminardb --config laminardb.toml</code></pre>
       </div>
 
@@ -438,7 +578,6 @@ docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
           <tr><td class="field-name">--config &lt;FILE&gt;</td><td class="field-default">laminardb.toml</td><td>TOML configuration file path</td></tr>
           <tr><td class="field-name">--log-level &lt;LEVEL&gt;</td><td class="field-default">info</td><td>trace, debug, info, warn, error</td></tr>
           <tr><td class="field-name">--admin-bind &lt;ADDR&gt;</td><td></td><td>Override HTTP bind address from config</td></tr>
-          <tr><td class="field-name">--validate-checkpoints</td><td></td><td>Validate all stored checkpoints and exit</td></tr>
         </tbody>
       </table>
 
@@ -447,7 +586,11 @@ docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
       <!-- ============================================================ -->
 
       <h2 id="server-config">[server]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:201</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:244</a></div>
+
+      <p>
+        The <code>[server]</code> section configures standalone server behaviors, control plane security, and pgwire network parameters.
+      </p>
 
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
@@ -455,26 +598,113 @@ docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
           <tr>
             <td class="field-name">mode</td>
             <td class="field-type">String</td>
-            <td class="field-default">"embedded"</td>
-            <td>"embedded" (single-node) or "delta" (multi-node, coming soon)</td>
+            <td class="field-default">"single"</td>
+            <td>Run mode. <code>"single"</code> (standalone) or <code>"cluster"</code> (multi-node deployment).</td>
+          </tr>
+          <tr>
+            <td class="field-name">key_groups</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">256</td>
+            <td>Stable hash partitions for keyed aggregates and interval joins. A single-node runtime owns all of them; a cluster distributes them across nodes.</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>
             <td class="field-type">String</td>
             <td class="field-default">"127.0.0.1:8080"</td>
-            <td>HTTP API bind address</td>
+            <td>HTTP API and Console UI control-plane bind address.</td>
           </tr>
           <tr>
-            <td class="field-name">workers</td>
-            <td class="field-type">usize</td>
-            <td class="field-default">0</td>
-            <td>Worker threads. 0 = auto-detect CPU count.</td>
-          </tr>
-          <tr>
-            <td class="field-name">log_level</td>
+            <td class="field-name">delivery</td>
             <td class="field-type">String</td>
-            <td class="field-default">"info"</td>
-            <td>trace, debug, info, warn, error</td>
+            <td class="field-default">"at_least_once"</td>
+            <td>Pipeline-wide contract: <code>best_effort</code>, <code>at_least_once</code>, or <code>exactly_once</code>. Connector protocols are derived from this value; sinks do not have an independent delivery setting.</td>
+          </tr>
+          <tr>
+            <td class="field-name">incremental_emit</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">true</td>
+            <td>Query execution policy: emit dirty-only changelog updates for keyed non-windowed running aggregates.</td>
+          </tr>
+          <tr>
+            <td class="field-name">console_token</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Bearer token gating HTTP control-plane API access and WebSockets. If omitted, API is unauthenticated.</td>
+          </tr>
+          <tr>
+            <td class="field-name">console_cors_allowed_origins</td>
+            <td class="field-type">Array&lt;String&gt;</td>
+            <td class="field-default">none</td>
+            <td>CORS origins allowed to access control-plane REST/WS endpoints.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_bind</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Postgres wire protocol listener bind address. Disabled if omitted.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_allow_remote</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">false</td>
+            <td>Must be set to <code>true</code> to allow binding pgwire on non-loopback interfaces.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_users</td>
+            <td class="field-type">Map</td>
+            <td class="field-default">{}</td>
+            <td>A map of usernames to MD5 or plain-text passwords for pgwire client authentication.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_cert</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM certificate file for pgwire TLS connection support.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_key</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM private key (PKCS#8/RSA) for pgwire TLS.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_client_ca</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM CA bundle for enforcing mutual TLS (mTLS) verification.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_max_connections</td>
+            <td class="field-type">usize</td>
+            <td class="field-default">256</td>
+            <td>Maximum active pgwire sessions before connections are closed.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_max_auth_failures_per_min</td>
+            <td class="field-type">u32</td>
+            <td class="field-default">10</td>
+            <td>Failed authentications per IP per minute before temporary ban. 0 disables.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_min_version</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"1.2"</td>
+            <td>Minimum TLS protocol version (<code>"1.2"</code> or <code>"1.3"</code>).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong>Top-Level Config Keys:</strong>
+      </p>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">node_id</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Unique node identity (required if <code>mode = "cluster"</code>; falls back to <code>{hostname}-{port}</code>).</td>
           </tr>
         </tbody>
       </table>
@@ -482,33 +712,72 @@ docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
       <div class="toml-block">
         <div class="toml-header">laminardb.toml</div>
         <pre><code class="language-toml">[server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
-workers = 4
-log_level = "info"</code></pre>
+console_token = "supersecret"
+pgwire_bind = "0.0.0.0:5433"
+pgwire_allow_remote = true</code></pre>
       </div>
 
-      <!-- STATE -->
-      <h2 id="state-config">[state]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:233</a></div>
+      <!-- ============================================================ -->
+      <!-- CLUSTER CONFIG -->
+      <!-- ============================================================ -->
 
+      <h2 id="cluster-config">Cluster Config</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
+
+      <p>
+        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared checkpoint object store; there is no separate <code>[coordination]</code> section or embedded Raft service.
+      </p>
+      <p>
+        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated; the current admitted composition is exact-certified Kafka input with direct S3/S3A append-mode Delta Lake, pending the production soak gate. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
+      </p>
+
+      <h3>[discovery]</h3>
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
           <tr>
-            <td class="field-name">backend</td>
+            <td class="field-name">strategy</td>
             <td class="field-type">String</td>
-            <td class="field-default">"memory"</td>
-            <td>"memory", "mmap", or "disaggregated"</td>
+            <td class="field-required">required</td>
+            <td>Discovery mode. Either <code>"gossip"</code> (Chitchat p2p membership) or <code>"static"</code>.</td>
           </tr>
           <tr>
-            <td class="field-name">path</td>
+            <td class="field-name">seeds</td>
+            <td class="field-type">Array&lt;String&gt;</td>
+            <td class="field-default">[]</td>
+            <td>Gossip/Static seed peer addresses to join the cluster (e.g. <code>["10.0.0.1:7946", "10.0.0.2:7946"]</code>). Required for static strategy.</td>
+          </tr>
+          <tr>
+            <td class="field-name">gossip_port</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">7946</td>
+            <td>Gossip communications port.</td>
+          </tr>
+          <tr>
+            <td class="field-name">advertise_host</td>
             <td class="field-type">String</td>
-            <td class="field-default">"./data/state"</td>
-            <td>Persistent state directory (mmap backend)</td>
+            <td class="field-default">none</td>
+            <td>The host/IP address this node advertises to peers. Falls back to loopback if DNS resolution fails.</td>
           </tr>
         </tbody>
       </table>
+
+      <div class="toml-block">
+        <div class="toml-header">laminardb.toml (Cluster sections)</div>
+        <pre><code class="language-toml">node_id = "node-1"
+
+[server]
+mode = "cluster"
+key_groups = 256
+
+[discovery]
+strategy = "gossip"
+gossip_port = 7946
+advertise_host = "10.0.0.1"
+seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
+      </div>
 
       <!-- CHECKPOINT -->
       <h2 id="checkpoint-config">[checkpoint]</h2>
@@ -520,14 +789,20 @@ log_level = "info"</code></pre>
           <tr>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
-            <td class="field-default">"file:///tmp/laminardb/checkpoints"</td>
-            <td>Storage URL. file:///, s3://, gs://</td>
+            <td class="field-default">OS temp/laminardb</td>
+            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>/<code>abfss://</code>. R2 and MinIO use <code>s3://</code> with an endpoint option. Use an explicit durable location in production.</td>
           </tr>
           <tr>
             <td class="field-name">interval</td>
             <td class="field-type">Duration</td>
             <td class="field-default">"10s"</td>
-            <td>Checkpoint interval. Supports humantime: "10s", "1m", "500ms"</td>
+            <td>Checkpoint interval; must be greater than zero. Supports humantime such as <code>"10s"</code>, <code>"1m"</code>, or <code>"500ms"</code>. Cluster mode has a 100ms minimum.</td>
+          </tr>
+          <tr>
+            <td class="field-name">timeout</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"120s"</td>
+            <td>One absolute end-to-end deadline spanning admission, alignment, capture, durable publication, and completion delivery.</td>
           </tr>
           <tr>
             <td class="field-name">storage</td>
@@ -536,10 +811,10 @@ log_level = "info"</code></pre>
             <td>Cloud storage credentials. Keys: aws_access_key_id, aws_region, etc.</td>
           </tr>
           <tr>
-            <td class="field-name">tiering</td>
-            <td class="field-type">Section</td>
+            <td class="field-name">max_node_data_bytes</td>
+            <td class="field-type">u64</td>
             <td class="field-default">none</td>
-            <td>Optional S3 storage class tiering. See <a href="#tiering">Tiering</a>.</td>
+            <td>Bound on captured state bytes awaiting durable upload (runtime default 512 MiB).</td>
           </tr>
         </tbody>
       </table>
@@ -555,6 +830,63 @@ aws_region = "us-east-1"
 aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
 aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </div>
+
+      <!-- CONSOLE UI & CONTROL API -->
+      <h2 id="console-ui-api">Console UI &amp; Control API</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
+
+      <p>
+        The Console UI is a web client that lets you inspect your streaming SQL nodes, view lineage dependency graphs, and author queries. You can access the hosted console at <strong><a href="https://laminardb.github.io/laminardb-console-ui/" target="_blank" rel="noopener">laminardb.github.io/laminardb-console-ui</a></strong>.
+      </p>
+      <p>
+        The console connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
+      </p>
+
+      <h3>Security &amp; Gating</h3>
+      <ul>
+        <li><strong>HTTP Authentication:</strong> Send the configured token in the header: <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+        <li><strong>WebSocket Authentication:</strong> Pass the token as a query parameter: <code>/ws/{name}?token=&lt;token&gt;</code>.</li>
+        <li><strong>CORS Gating:</strong> Restrict client origins using the <code>server.console_cors_allowed_origins</code> array in TOML.</li>
+      </ul>
+
+      <h3>Lineage Dependency Graph</h3>
+      <p>
+        <code>GET /api/v1/graph</code> parses SQL statements and queries the engine schema to return a directed acyclic graph (DAG) of the data pipeline.
+      </p>
+      <div class="toml-block">
+        <div class="toml-header">GET /api/v1/graph Response Format</div>
+        <pre><code class="language-json">{
+  "nodes": [
+    { "id": "trades", "type": "source", "label": "trades" },
+    { "id": "vwap", "type": "stream", "label": "vwap" },
+    { "id": "trade_archive", "type": "sink", "label": "trade_archive" }
+  ],
+  "edges": [
+    { "source": "trades", "target": "vwap" },
+    { "source": "vwap", "target": "trade_archive" }
+  ]
+}</code></pre>
+      </div>
+
+      <h3>Realtime Telemetry &amp; WebSocket Protocol</h3>
+      <p>
+        WebSocket client connects to <code>GET /ws/{name}</code>. Messages are serialized using Arrow JSON format:
+      </p>
+      <pre><code class="language-json">{
+  "type": "data",
+  "subscription_id": 1,
+  "data": [ { "symbol": "AAPL", "price": 178.5 } ],
+  "sequence": 42
+}</code></pre>
+      <p>A heartbeat ping frame is sent by the server every 15 seconds; the client must respond to prevent connection termination.</p>
+
+      <h3>Cluster Management Endpoints</h3>
+      <ul>
+        <li><code>GET /api/v1/cluster/nodes</code> &mdash; Returns list of cluster members, including their node IDs, network addresses, and states (<code>Active</code>, <code>Draining</code>, <code>Suspected</code>, <code>Left</code>).</li>
+        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current key-group assignment map for active cluster nodes.</li>
+        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active durable leader-lease holder.</li>
+        <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Returns history and completion metadata of recent coordinator checkpoints.</li>
+      </ul>
 
       <!-- REST API -->
       <h2 id="rest-api">REST API</h2>
@@ -599,34 +931,79 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-desc">Stream detail by name</span>
         </div>
         <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/mvs</span>
+          <span class="endpoint-desc">List materialized views</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/connectors</span>
+          <span class="endpoint-desc">List available connector types and config options</span>
+        </div>
+        <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/checkpoint</span>
-          <span class="endpoint-desc">Trigger an immediate checkpoint</span>
+          <span class="endpoint-desc">Trigger immediate coordinator checkpoint</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/sql</span>
-          <span class="endpoint-desc">Execute ad-hoc SQL query</span>
+          <span class="endpoint-desc">Execute DDL/SQL query (returns JSON rows or metadata)</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/reload</span>
-          <span class="endpoint-desc">Hot-reload configuration</span>
+          <span class="endpoint-desc">Hot-reload configuration and certificates</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/graph</span>
+          <span class="endpoint-desc">Generate pipeline dependency graph (nodes &amp; edges)</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>
           <span class="endpoint-path">/api/v1/cluster</span>
-          <span class="endpoint-desc">Cluster status (delta mode only)</span>
+          <span class="endpoint-desc">Retrieve basic engine cluster status</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/nodes</span>
+          <span class="endpoint-desc">List nodes and their membership state</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/vnodes</span>
+          <span class="endpoint-desc">Get current key-group assignments</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/leader</span>
+          <span class="endpoint-desc">Get current leader node details</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/checkpoints</span>
+          <span class="endpoint-desc">List completed checkpoint metadata</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/pause</span>
-          <span class="endpoint-desc">Pause pipeline (not yet implemented &mdash; returns 501)</span>
+          <span class="endpoint-path">/api/v1/pipeline/start</span>
+          <span class="endpoint-desc">Resume execution of a specific pipeline</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/resume</span>
-          <span class="endpoint-desc">Resume pipeline (not yet implemented &mdash; returns 501)</span>
+          <span class="endpoint-path">/api/v1/pipeline/stop</span>
+          <span class="endpoint-desc">Stop execution of a specific pipeline</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/pipeline/status</span>
+          <span class="endpoint-desc">Query individual pipeline state</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/ws/{name}</span>
+          <span class="endpoint-desc">WebSocket query/stream realtime subscription channel</span>
         </div>
       </div>
 
@@ -641,7 +1018,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </p>
 
       <p><strong>What reloads without restart:</strong> sources, pipelines, sinks, lookups (add, remove, or change).</p>
-      <p><strong>What requires restart:</strong> <code>[server]</code>, <code>[state]</code>, <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
+      <p><strong>What requires restart:</strong> <code>[server]</code> and <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         Reload order: remove changed/deleted sinks &rarr; pipelines &rarr; lookups &rarr; sources,
@@ -699,13 +1076,13 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "websocket", "files", "delta-lake"</td>
+            <td>"kafka", "postgres-cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
             <td class="field-type">String</td>
             <td class="field-default">"json"</td>
-            <td>"json", "avro", "protobuf", "csv"</td>
+            <td>Connector-specific; see the source connector tables below</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -736,9 +1113,9 @@ connector = "kafka"
 format = "json"
 
 [source.properties]
-bootstrap.servers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
 topic = "market-trades"
-group.id = "laminar-analytics"
+"group.id" = "laminar-analytics"
 
 [[source.schema]]
 name = "symbol"
@@ -751,7 +1128,7 @@ type = "DOUBLE"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -807,13 +1184,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "delta-lake", "websocket", "files", "stdout"</td>
-          </tr>
-          <tr>
-            <td class="field-name">delivery</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"at_least_once"</td>
-            <td>"at_least_once" or "exactly_once"</td>
+            <td>"kafka", "postgres-sink", "mongodb-sink", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -823,6 +1194,8 @@ max_out_of_orderness = "5s"</code></pre>
           </tr>
         </tbody>
       </table>
+
+      <p>Delivery is configured once at <code>[server].delivery</code>. A per-sink <code>delivery</code> field is rejected so a pipeline cannot silently mix checkpoint semantics.</p>
 
       <h2 id="lookups">[[lookup]]</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:373</a></div>
@@ -870,7 +1243,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">cache.hybrid</td>
             <td class="field-type">bool</td>
             <td class="field-default">false</td>
-            <td>Enable memory + disk caching via foyer</td>
+            <td>Enable in-memory caching via quick_cache</td>
           </tr>
         </tbody>
       </table>
@@ -881,13 +1254,17 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="connectors" style="font-size: 1.5rem;">Connectors</h2>
       <p>All connectors are feature-gated. Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.</p>
+      <p>Set delivery once at <code>[server].delivery</code> (or <code>LaminarDbBuilder::delivery_guarantee</code> when embedded). The runtime injects the selected protocol and owns checkpoint/committer identities; connector properties do not require public writer IDs.</p>
 
       <div class="connector-grid">
         <div class="connector-card"><a href="#kafka-source"><h4>Kafka</h4></a><div class="direction">Source + Sink</div><div class="feature">kafka</div></div>
+        <div class="connector-card"><a href="#nats-source"><h4>NATS</h4></a><div class="direction">Source + Sink</div><div class="feature">nats</div></div>
         <div class="connector-card"><a href="#postgres-cdc"><h4>PostgreSQL CDC</h4></a><div class="direction">Source</div><div class="feature">postgres-cdc</div></div>
-        <div class="connector-card"><a href="#mysql-cdc"><h4>MySQL CDC</h4></a><div class="direction">Source</div><div class="feature">mysql-cdc</div></div>
+        <div class="connector-card"><a href="#mongodb-cdc"><h4>MongoDB CDC</h4></a><div class="direction">Source + Sink</div><div class="feature">mongodb-cdc</div></div>
         <div class="connector-card"><a href="#postgres-sink"><h4>PostgreSQL Sink</h4></a><div class="direction">Sink</div><div class="feature">postgres-sink</div></div>
         <div class="connector-card"><a href="#delta-source"><h4>Delta Lake</h4></a><div class="direction">Source + Sink</div><div class="feature">delta-lake</div></div>
+        <div class="connector-card"><h4>Apache Iceberg</h4><div class="direction">Source + Sink</div><div class="feature">iceberg</div></div>
+        <div class="connector-card"><h4>OpenTelemetry</h4><div class="direction">Source (OTLP/gRPC)</div><div class="feature">otel</div></div>
         <div class="connector-card"><a href="#websocket-source"><h4>WebSocket</h4></a><div class="direction">Source + Sink</div><div class="feature">websocket</div></div>
         <div class="connector-card"><a href="#file-source"><h4>File Auto-Loader</h4></a><div class="direction">Source + Sink</div><div class="feature">files</div></div>
       </div>
@@ -910,7 +1287,7 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw, debezium</td></tr>
           <tr><td class="field-name">schema.registry.url</td><td></td><td>Confluent Schema Registry URL</td></tr>
           <tr><td class="field-name">schema.registry.username</td><td></td><td>Schema Registry auth</td></tr>
           <tr><td class="field-name">schema.registry.password</td><td></td><td>Schema Registry auth</td></tr>
@@ -933,12 +1310,11 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">startup.mode</td><td class="field-default">earliest</td><td>earliest, latest, none</td></tr>
+          <tr><td class="field-name">startup.mode</td><td class="field-default">group-offsets</td><td>group-offsets, earliest, latest</td></tr>
+          <tr><td class="field-name">auto.offset.reset</td><td class="field-default">earliest</td><td>earliest, latest, none (used when group offsets do not exist)</td></tr>
           <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll batch</td></tr>
           <tr><td class="field-name">isolation.level</td><td class="field-default">read_committed</td><td>read_uncommitted, read_committed</td></tr>
-          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, sticky, cooperative-sticky</td></tr>
-          <tr><td class="field-name">max.out.of.orderness.ms</td><td class="field-default">5000</td><td>Watermark out-of-order tolerance</td></tr>
-          <tr><td class="field-name">idle.timeout.ms</td><td class="field-default">30000</td><td>Idle watermark advancement timeout</td></tr>
+          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, cooperative-sticky</td></tr>
         </tbody>
       </table>
 
@@ -953,21 +1329,90 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">bootstrap.servers</td><td><span class="field-required">required</span></td><td>Kafka broker addresses</td></tr>
           <tr><td class="field-name">topic</td><td><span class="field-required">required</span></td><td>Target topic</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw</td></tr>
           <tr><td class="field-name">key.column</td><td></td><td>Column for partition key</td></tr>
           <tr><td class="field-name">partitioner</td><td class="field-default">key-hash</td><td>key-hash, round-robin, sticky</td></tr>
           <tr><td class="field-name">compression.type</td><td class="field-default">none</td><td>none, gzip, snappy, lz4, zstd</td></tr>
-          <tr><td class="field-name">acks</td><td class="field-default">all</td><td>all, 1, 0</td></tr>
           <tr><td class="field-name">linger.ms</td><td class="field-default">5</td><td>Batch linger time</td></tr>
           <tr><td class="field-name">batch.size</td><td class="field-default">16384</td><td>Max batch bytes</td></tr>
-          <tr><td class="field-name">transactional.id</td><td></td><td>For exactly-once producer</td></tr>
+        </tbody>
+      </table>
+
+      <!-- NATS SOURCE -->
+      <h3 id="nats-source">NATS Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/nats/source.rs" target="_blank" rel="noopener">nats/source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
+          <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
+          <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
+          <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
+          <tr><td class="field-name">token</td><td></td><td>Auth token (required for token)</td></tr>
+          <tr><td class="field-name">creds.file</td><td></td><td>Path to creds file (required for creds_file)</td></tr>
+          <tr><td class="field-name">tls.enabled</td><td class="field-default">false</td><td>Enable TLS</td></tr>
+          <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
+          <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
+          <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>NATS JetStream stream name (required in jetstream mode)</td></tr>
+          <tr><td class="field-name">subject</td><td></td><td>Subscription subject (required in core mode)</td></tr>
+          <tr><td class="field-name">subject.filters</td><td></td><td>Comma-separated JetStream subject filters</td></tr>
+          <tr><td class="field-name">consumer</td><td></td><td>Pull consumer durable name (required in jetstream mode)</td></tr>
+          <tr><td class="field-name">deliver.policy</td><td class="field-default">all</td><td>all, new, by_start_sequence, by_start_time</td></tr>
+          <tr><td class="field-name">start.sequence</td><td></td><td>Start sequence (required if deliver.policy=by_start_sequence)</td></tr>
+          <tr><td class="field-name">start.time</td><td></td><td>Start RFC3339 timestamp (required if deliver.policy=by_start_time)</td></tr>
+          <tr><td class="field-name">ack.policy</td><td class="field-default">explicit</td><td>explicit, none</td></tr>
+          <tr><td class="field-name">ack.wait.ms</td><td class="field-default">60000</td><td>Ack wait timeout in milliseconds</td></tr>
+          <tr><td class="field-name">max.deliver</td><td class="field-default">5</td><td>Max deliveries</td></tr>
+          <tr><td class="field-name">max.ack.pending</td><td class="field-default">10000</td><td>Max outstanding unacknowledged messages</td></tr>
+          <tr><td class="field-name">fetch.batch</td><td class="field-default">500</td><td>Batch size for fetch operations</td></tr>
+          <tr><td class="field-name">fetch.max.wait.ms</td><td class="field-default">500</td><td>Max wait for fetch operations in milliseconds</td></tr>
+          <tr><td class="field-name">queue.group</td><td></td><td>Queue group (core mode only)</td></tr>
+        </tbody>
+      </table>
+      <p>JetStream messages receive confirmed acknowledgements asynchronously after successful deserialization;
+         acknowledgement failures and timeouts leave them eligible for broker redelivery. NATS
+         source progress is not checkpoint-coupled, and both JetStream and Core modes are admitted
+         only as ephemeral/best-effort sources.</p>
+
+      <!-- NATS SINK -->
+      <h3 id="nats-sink">NATS Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/nats/sink.rs" target="_blank" rel="noopener">nats/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
+          <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
+          <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
+          <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
+          <tr><td class="field-name">token</td><td></td><td>Auth token (required for token)</td></tr>
+          <tr><td class="field-name">creds.file</td><td></td><td>Path to creds file (required for creds_file)</td></tr>
+          <tr><td class="field-name">tls.enabled</td><td class="field-default">false</td><td>Enable TLS</td></tr>
+          <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
+          <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
+          <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>JetStream target, required in JetStream mode and forbidden in Core mode; file storage, three replicas, and publish acknowledgements are validated at startup</td></tr>
+          <tr><td class="field-name">subject</td><td></td><td>Literal publishing subject. Mutually exclusive with subject.column.</td></tr>
+          <tr><td class="field-name">subject.column</td><td></td><td>Per-row subject column name. Mutually exclusive with subject.</td></tr>
+          <tr><td class="field-name">dedup.id.column</td><td></td><td>Column to use for JetStream message deduplication IDs</td></tr>
+          <tr><td class="field-name">min.duplicate.window.ms</td><td class="field-default">120000</td><td>Minimum duplicate window in milliseconds</td></tr>
+          <tr><td class="field-name">max.pending</td><td class="field-default">4096</td><td>Maximum pending publish futures</td></tr>
+          <tr><td class="field-name">ack.timeout.ms</td><td class="field-default">30000</td><td>Ack timeout in milliseconds</td></tr>
+          <tr><td class="field-name">header.columns</td><td></td><td>Comma-separated column names to map to NATS headers</td></tr>
         </tbody>
       </table>
 
       <!-- POSTGRES CDC -->
       <h3 id="postgres-cdc">PostgreSQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/postgres/source.rs" target="_blank" rel="noopener">cdc/postgres/source.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/cdc/source.rs" target="_blank" rel="noopener">postgres/cdc/source.rs</a></div>
+
+      <p><strong>Delivery boundary:</strong> the source resumes from the last fully emitted committed transaction and is admitted for at-least-once processing. It does not create an initial snapshot, so fresh startup is rejected before network I/O. Both the control and replication connections use the same verified TLS policy.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
@@ -979,31 +1424,11 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
           <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot</td></tr>
           <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
-          <tr><td class="field-name">ssl.mode</td><td class="field-default">prefer</td><td>disable, prefer, require, verify-ca, verify-full</td></tr>
-          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
-          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated table filter</td></tr>
-          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated table exclusions</td></tr>
-          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll</td></tr>
-        </tbody>
-      </table>
-
-      <!-- MYSQL CDC -->
-      <h3 id="mysql-cdc">MySQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/mysql/source.rs" target="_blank" rel="noopener">cdc/mysql/source.rs</a></div>
-
-      <table class="config-table">
-        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr><td class="field-name">host</td><td><span class="field-required">required</span></td><td>MySQL hostname</td></tr>
-          <tr><td class="field-name">port</td><td class="field-default">3306</td><td>Port</td></tr>
-          <tr><td class="field-name">username</td><td><span class="field-required">required</span></td><td>Auth username</td></tr>
-          <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
-          <tr><td class="field-name">database</td><td></td><td>Database filter</td></tr>
-          <tr><td class="field-name">server.id</td><td class="field-default">1001</td><td>Unique replica server ID</td></tr>
-          <tr><td class="field-name">use.gtid</td><td class="field-default">true</td><td>GTID-based replication</td></tr>
-          <tr><td class="field-name">gtid.set</td><td></td><td>Starting GTID set</td></tr>
-          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
-          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated tables (db.table format)</td></tr>
+          <tr><td class="field-name">ssl.mode</td><td class="field-default">verify-full</td><td><code>verify-full</code> or explicit plaintext <code>disable</code></td></tr>
+          <tr><td class="field-name">ssl.ca.cert.path</td><td></td><td>Optional PEM CA bundle for <code>verify-full</code>; web PKI roots are used by default</td></tr>
+          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated, schema-qualified table filter</td></tr>
+          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated, schema-qualified table exclusions</td></tr>
+          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">268435456</td><td>Total connector-owned payload budget across raw WAL, decoded transactions, and Arrow construction (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
 
@@ -1023,9 +1448,9 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">schema.name</td><td class="field-default">public</td><td>PostgreSQL schema</td></tr>
           <tr><td class="field-name">write.mode</td><td class="field-default">append</td><td>append (COPY BINARY) or upsert (INSERT ON CONFLICT)</td></tr>
           <tr><td class="field-name">primary.key</td><td></td><td>PK columns for upsert (comma-separated). Required if write.mode=upsert.</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">4096</td><td>Records per flush</td></tr>
-          <tr><td class="field-name">pool.size</td><td class="field-default">4</td><td>Connection pool size</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at_least_once</td><td>at_least_once, exactly_once (2PC)</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Maximum time to buffer before flushing</td></tr>
+          <tr><td class="field-name">connect.timeout.ms</td><td class="field-default">10000</td><td>Connection deadline</td></tr>
+          <tr><td class="field-name">statement.timeout.ms</td><td class="field-default">30000</td><td>Per-query deadline</td></tr>
           <tr><td class="field-name">auto.create.table</td><td class="field-default">false</td><td>Create table if missing</td></tr>
         </tbody>
       </table>
@@ -1034,36 +1459,31 @@ max_out_of_orderness = "5s"</code></pre>
       <h3 id="mongodb-cdc">MongoDB CDC Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/source.rs" target="_blank" rel="noopener">mongodb/source.rs</a></div>
 
-      <p>Consumes MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a>.
-         Resume tokens provide at-least-once delivery across restarts. Requires MongoDB 4.0+ (replica set) or 4.2+ (sharded cluster).</p>
+      <p>Consumes fixed-collection MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a> with byte-bounded backpressure, reconnect, and deployment- and collection-bound resume-token checkpoints. Fresh sources establish an exact empty bootstrap cut. Delivery is replayable at-least-once.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
-          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Collection name, or <code>*</code> for all collections in database</td></tr>
-          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta, update_lookup, required, when_available</td></tr>
-          <tr><td class="field-name">max.await.time.ms</td><td class="field-default">1000</td><td><code>getMore</code> await timeout (milliseconds)</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">1000</td><td>Cursor batch size hint</td></tr>
-          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Max records per poll batch</td></tr>
-          <tr><td class="field-name">max.buffered.events</td><td class="field-default">100000</td><td>Max buffered events before backpressure</td></tr>
+          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Fixed collection name; the collection must exist before source startup</td></tr>
+          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta or required</td></tr>
+          <tr><td class="field-name">pipeline</td><td class="field-default">[]</td><td>JSON array of at most 64 <code>$match</code> stages, bounded to 256 KiB</td></tr>
+          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">67108864</td><td>Retained decoded-byte limit across the reader queue and poll buffer (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Full document modes:</strong>
-        <code>delta</code> — update description only (default).
-        <code>update_lookup</code> — fetches current document on updates.
-        <code>required</code> — requires <code>changeStreamPreAndPostImages</code> enabled on collection.
-        <code>when_available</code> — returns post-image when available, null otherwise.
+        <code>delta</code> sends the update description only (default).
+        <code>required</code> needs <code>changeStreamPreAndPostImages</code> enabled on the collection.
       </p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>CDC envelope schema:</strong>
         <code>_namespace</code> (Utf8), <code>_op</code> (Utf8: I/U/R/D/DROP),
         <code>_document_key</code> (Utf8), <code>_cluster_time_s</code> (UInt32),
-        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Int64),
+        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Timestamp(ms)),
         <code>_full_document</code> (Utf8, nullable), <code>_update_desc</code> (Utf8, nullable),
         <code>_resume_token</code> (Utf8).
       </p>
@@ -1075,25 +1495,22 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Target database name</td></tr>
           <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Target collection name</td></tr>
-          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, replace, cdc_replay</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">500</td><td>Max documents per bulk write</td></tr>
-          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">1000</td><td>Max time between flushes (ms)</td></tr>
-          <tr><td class="field-name">ordered</td><td class="field-default">true</td><td>true = fail-fast ordered writes; false = unordered (higher throughput)</td></tr>
-          <tr><td class="field-name">write.concern.w</td><td class="field-default">majority</td><td>majority or integer node count</td></tr>
-          <tr><td class="field-name">write.concern.journal</td><td class="field-default">true</td><td>Wait for journal commit</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, cdc_replay</td></tr>
+          <tr><td class="field-name">write.mode.key_fields</td><td></td><td>Comma-separated top-level keys; required for upsert</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Max time between flushes (ms)</td></tr>
+          <tr><td class="field-name">sink.write.timeout.ms</td><td class="field-default">30000</td><td>End-to-end write deadline</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Write modes:</strong>
-        <code>insert</code> — append-only.
-        <code>upsert</code> — replace by key fields (set via <code>upsert.key.fields</code>).
-        <code>replace</code> — full document replacement.
-        <code>cdc_replay</code> — routes by <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
-        Time series collections only support <code>insert</code> mode.
+        <code>insert</code> is append-only.
+        <code>upsert</code> replaces documents by the fields listed in <code>write.mode.key_fields</code>.
+        <code>cdc_replay</code> routes by the <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
+        Writes are ordered and majority-journaled; these correctness settings are not user-tunable. Time series collections only support <code>insert</code>.
       </p>
 
       <!-- DELTA LAKE SOURCE -->
@@ -1126,35 +1543,31 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">target.file.size</td><td class="field-default">134217728</td><td>Target Parquet file size (128 MB)</td></tr>
           <tr><td class="field-name">max.buffer.records</td><td class="field-default">100000</td><td>Records before flush</td></tr>
           <tr><td class="field-name">max.buffer.duration.ms</td><td class="field-default">60000</td><td>Time before flush</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
-          <tr><td class="field-name">writer.id</td><td></td><td>Writer ID (required for exactly-once)</td></tr>
           <tr><td class="field-name">schema.evolution</td><td class="field-default">false</td><td>Auto-merge new columns</td></tr>
-          <tr><td class="field-name">compaction.enabled</td><td class="field-default">false</td><td>Enable automatic compaction</td></tr>
-          <tr><td class="field-name">vacuum.retention.hours</td><td class="field-default">168</td><td>Retention hours (7 days)</td></tr>
           <tr><td class="field-name">catalog.type</td><td class="field-default">none</td><td>none, glue, unity</td></tr>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode. Cluster exact admission is limited to direct S3/S3A and remains a native-cloud fault/soak gate. Alternate log stores and custom production endpoints fail closed.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/websocket/source.rs" target="_blank" rel="noopener">websocket/source.rs</a></div>
 
-      <p><strong>Note:</strong> WebSocket is non-replayable. At-most-once delivery on recovery.</p>
+      <p><strong>Note:</strong> WebSocket is non-replayable and therefore requires pipeline-wide <code>best_effort</code>. Reconnects can create gaps or duplicates; stronger guarantees fail admission.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">mode</td><td class="field-default">client</td><td>client (connect out) or server (accept connections)</td></tr>
-          <tr><td class="field-name">url</td><td></td><td>WebSocket URL (client mode, comma-separated for multi)</td></tr>
-          <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, binary, csv</td></tr>
-          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after handshake (client mode)</td></tr>
-          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect (client mode)</td></tr>
+          <tr><td class="field-name">url</td><td><span class="field-required">required</span></td><td>WebSocket URL (comma-separated in failover order)</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, or binary</td></tr>
+          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after each handshake</td></tr>
+          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect</td></tr>
+          <tr><td class="field-name">reconnect.initial.delay.ms</td><td class="field-default">100</td><td>Initial reconnect delay</td></tr>
           <tr><td class="field-name">reconnect.max.delay.ms</td><td class="field-default">30000</td><td>Max backoff delay</td></tr>
-          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Keepalive ping interval</td></tr>
-          <tr><td class="field-name">auth.type</td><td></td><td>bearer, basic, hmac</td></tr>
+          <tr><td class="field-name">reconnect.max.retries</td><td></td><td>Maximum reconnect attempts; empty means unlimited</td></tr>
+          <tr><td class="field-name">on.backpressure</td><td class="field-default">block</td><td>block or drop_newest</td></tr>
+          <tr><td class="field-name">max.message.size</td><td class="field-default">67108864</td><td>Maximum accepted message size in bytes</td></tr>
         </tbody>
       </table>
 
@@ -1168,12 +1581,13 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">mode</td><td class="field-default">server</td><td>server (accept clients) or client (push to remote)</td></tr>
           <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
           <tr><td class="field-name">url</td><td></td><td>Remote URL (client mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, arrow_ipc, binary</td></tr>
           <tr><td class="field-name">max.connections</td><td class="field-default">10000</td><td>Max concurrent clients (server mode)</td></tr>
-          <tr><td class="field-name">slow.client.policy</td><td class="field-default">drop_oldest</td><td>drop_oldest, drop_newest, disconnect</td></tr>
-          <tr><td class="field-name">replay.buffer.size</td><td></td><td>Messages replayed to new clients</td></tr>
+          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Ping interval (server mode)</td></tr>
+          <tr><td class="field-name">ping.timeout.ms</td><td class="field-default">10000</td><td>Pong timeout (server mode)</td></tr>
         </tbody>
       </table>
+
+      <p>Client mode sends one schema-encoded JSON row per text frame. Server-mode clients must first send <code>{"action":"subscribe"}</code>; the server replies with a subscription ID and then emits <code>{"type":"data","data":[...],"sequence":N}</code> text frames. Server fan-out uses a shared 32-frame ring with 256 KiB frames; an oversized row or burst is rejected before publication, and a lagging subscriber is disconnected so sequence gaps remain visible. The built-in server does not terminate TLS or authenticate clients; expose it only on a trusted network or behind an authenticated TLS reverse proxy.</p>
 
       <!-- FILE SOURCE -->
       <h3 id="file-source">File Source (Auto-Loader)</h3>
@@ -1217,36 +1631,31 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
       <p>
-        LaminarDB supports four join types. All are stateful and operate on
-        streaming data. Join types are detected from SQL syntax automatically.
+        Bounded interval joins are the stateful stream-stream joins.
+        Temporal and lookup joins are local dimension enrichments; cluster admission
+        rejects unsupported join shapes before execution.
       </p>
 
       <table class="config-table">
-        <thead><tr><th>Join Type</th><th>Time Bound</th><th>Match</th><th>Use Case</th></tr></thead>
+        <thead><tr><th>Join Type</th><th>State</th><th>Scope</th><th>Match</th></tr></thead>
         <tbody>
           <tr>
-            <td class="field-name" style="color: var(--text);">Interval</td>
-            <td>Required</td>
+            <td class="field-name" style="color: var(--text);">Bounded interval</td>
+            <td>Keyed stream state</td>
+            <td>Single node and cluster</td>
             <td>All pairs within window</td>
-            <td>Stream-stream correlation</td>
-          </tr>
-          <tr>
-            <td class="field-name" style="color: var(--text);">ASOF</td>
-            <td>Optional tolerance</td>
-            <td>One closest per key</td>
-            <td>Trade/quote enrichment</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">Temporal</td>
-            <td>Implicit (version time)</td>
+            <td>Versioned dimension</td>
+            <td>Local</td>
             <td>Point-in-time lookup</td>
-            <td>Versioned dimension tables</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">Lookup</td>
-            <td>None</td>
+            <td>Reference dimension</td>
+            <td>Local</td>
             <td>Key equality</td>
-            <td>Static reference enrichment</td>
           </tr>
         </tbody>
       </table>
@@ -1262,7 +1671,7 @@ max_out_of_orderness = "5s"</code></pre>
         watermark advances past the bound.
       </p>
 
-      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT SEMI, LEFT ANTI, RIGHT SEMI, RIGHT ANTI</p>
+      <p><strong>Supported types:</strong> INNER, LEFT, RIGHT, FULL, LEFT/RIGHT SEMI, LEFT/RIGHT ANTI</p>
 
       <div class="toml-block">
         <div class="toml-header">Interval join — match orders to payments within 1 hour</div>
@@ -1271,16 +1680,7 @@ SELECT o.order_id, o.amount, p.status
 FROM orders o
 INNER JOIN payments p
     ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">Semi join — orders that have at least one payment</div>
-        <pre><code class="language-sql">SELECT o.order_id, o.amount
-FROM orders o
-LEFT SEMI JOIN payments p
-    ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;</code></pre>
+    AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR;</code></pre>
       </div>
 
       <p style="font-size: 0.82rem;">
@@ -1290,77 +1690,9 @@ LEFT SEMI JOIN payments p
         right state; new right rows probe only old left state (avoids double-emit).
         Checkpointed via Arrow IPC serialization.
       </p>
-
-      <!-- ASOF JOIN -->
-      <h3 id="join-asof">ASOF Join</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/asof_batch.rs" target="_blank" rel="noopener">asof_batch.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">join_parser.rs</a></div>
-
-      <p>
-        For each left row, finds the <strong>one</strong> closest right row by timestamp
-        within the same key partition. Uses Snowflake-compatible <code>MATCH_CONDITION</code> syntax.
-      </p>
-
-      <p><strong>Supported types:</strong> INNER, LEFT</p>
-
-      <h4>Three directions</h4>
-      <table class="config-table">
-        <thead><tr><th>Direction</th><th>Syntax</th><th>Behavior</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">Backward</td>
-            <td><code>t.ts &gt;= q.ts</code></td>
-            <td>Most recent prior right event</td>
-          </tr>
-          <tr>
-            <td class="field-name">Forward</td>
-            <td><code>t.ts &lt;= q.ts</code></td>
-            <td>Next future right event</td>
-          </tr>
-          <tr>
-            <td class="field-name">Nearest</td>
-            <td><code>NEAREST(t.ts, q.ts)</code></td>
-            <td>Closest by absolute time difference</td>
-          </tr>
-        </tbody>
-      </table>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF backward — enrich trades with most recent quote</div>
-        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts >= q.ts)
-    ON t.symbol = q.symbol;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF with tolerance — max 5 second gap</div>
-        <pre><code class="language-sql">SELECT t.symbol, t.price, q.bid, q.ask
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts >= q.ts AND t.ts - q.ts <= INTERVAL '5' SECOND)
-    ON t.symbol = q.symbol;</code></pre>
-      </div>
-
-      <div class="toml-block">
-        <div class="toml-header">ASOF nearest — closest event by absolute time</div>
-        <pre><code class="language-sql">SELECT s.sensor_id, s.reading, c.calibration
-FROM sensor_data s
-ASOF JOIN calibrations c
-    MATCH_CONDITION(NEAREST(s.ts, c.ts))
-    ON s.sensor_id = c.sensor_id;</code></pre>
-      </div>
-
-      <p style="font-size: 0.82rem;">
-        <strong>State:</strong> Right-side events stored in per-key
-        <code>BTreeMap&lt;timestamp, Vec&lt;row_index&gt;&gt;</code> for O(log n) temporal lookups.
-        Multiple rows at the same timestamp are handled correctly.
-        Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
-      </p>
-
       <!-- TEMPORAL JOIN -->
       <h3 id="join-temporal">Temporal Join (FOR SYSTEM_TIME AS OF)</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/stream_executor.rs" target="_blank" rel="noopener">stream_executor.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/operator/temporal_join.rs" target="_blank" rel="noopener">operator/temporal_join.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">parser/join_parser.rs</a></div>
 
       <p>
         Point-in-time lookup against a versioned table. For each stream event,
@@ -1391,7 +1723,7 @@ JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
 
       <p>
         Enriches stream events against a static or slowly-changing reference table.
-        No time bound &mdash; matches by key equality only. Results are cached with
+        Matches by key equality with no time bound. Results are cached with a
         configurable TTL.
       </p>
 
@@ -1406,7 +1738,7 @@ LEFT JOIN products p
       </div>
 
       <p style="font-size: 0.82rem;">
-        <strong>Cache:</strong> Foyer-backed memory/hybrid cache. Configure via
+        <strong>Cache:</strong> quick_cache-backed in-memory cache. Configure via
         <code>[[lookup]]</code> section: <code>cache.size_bytes</code>,
         <code>cache.ttl</code>, <code>cache.hybrid</code>.
         Supports predicate pushdown to the lookup connector.
@@ -1419,17 +1751,25 @@ LEFT JOIN products p
       <h2 id="env-vars">Environment Variables</h2>
 
       <p>
-        All string values in TOML support <code>${VAR}</code> substitution.
+        All string values in the TOML configuration file support <code>${VAR}</code> substitution.
         Use <code>${VAR:-default}</code> for optional variables with fallbacks.
         Missing variables without defaults cause a startup error.
+      </p>
+
+      <p>
+        <strong>SQL Queries:</strong> Because substitution is performed on the raw configuration file contents before parsing, environment variables can be embedded directly within SQL statements defined in the TOML file (such as in <code>[[pipeline]]</code> SQL queries or the top-level <code>sql</code> string).
+      </p>
+
+      <p>
+        <strong>Dynamic Queries:</strong> Environment variables are <strong>not</strong> expanded in queries submitted dynamically after startup (e.g., via the pgwire protocol or the <code>POST /api/v1/sql</code> HTTP endpoint).
       </p>
 
       <div class="toml-block">
         <div class="toml-header">Environment variable examples</div>
         <pre><code class="language-toml">[source.properties]
-bootstrap.servers = "${KAFKA_BROKERS:-localhost:9092}"
-sasl.username = "${KAFKA_USER}"
-sasl.password = "${KAFKA_PASSWORD}"
+"bootstrap.servers" = "${KAFKA_BROKERS:-localhost:9092}"
+"sasl.username" = "${KAFKA_USER}"
+"sasl.password" = "${KAFKA_PASSWORD}"
 
 [checkpoint]
 url = "s3://${S3_BUCKET}/checkpoints"
@@ -1439,22 +1779,6 @@ aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
 aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </div>
 
-      <h2 id="tiering">S3 Storage Class Tiering</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:295</a></div>
-
-      <p>Active checkpoints use the hot tier. Older checkpoints automatically tier down via S3 Lifecycle rules.</p>
-
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr><td class="field-name">hot_class</td><td class="field-default">"STANDARD"</td><td>Storage class for active checkpoints (e.g. "EXPRESS_ONE_ZONE")</td></tr>
-          <tr><td class="field-name">warm_class</td><td class="field-default">"STANDARD"</td><td>Storage class for older checkpoints</td></tr>
-          <tr><td class="field-name">cold_class</td><td class="field-default">""</td><td>Archive class (e.g. "GLACIER_IR"). Empty = no cold tier.</td></tr>
-          <tr><td class="field-name">hot_retention</td><td class="field-default">"24h"</td><td>Time before hot &rarr; warm</td></tr>
-          <tr><td class="field-name">warm_retention</td><td class="field-default">"7d"</td><td>Time before warm &rarr; cold</td></tr>
-        </tbody>
-      </table>
-
       <h2 id="delivery">Delivery Guarantees</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/connector.rs" target="_blank" rel="noopener">connector.rs:DeliveryGuarantee</a></div>
 
@@ -1462,21 +1786,29 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <thead><tr><th>Guarantee</th><th>How it works</th><th>Requirements</th></tr></thead>
         <tbody>
           <tr>
+            <td class="field-name" style="color: var(--text);">best_effort</td>
+            <td>No replay promise. This is the low-latency mode for inputs or outputs that cannot survive a failure.</td>
+            <td>Accepts ephemeral connectors; failure may lose accepted events.</td>
+          </tr>
+          <tr>
             <td class="field-name" style="color: var(--text);">at_least_once</td>
-            <td>Default. On recovery, sources replay from last checkpoint offset. Some records may be reprocessed.</td>
-            <td>Checkpointing enabled. Works with all connectors.</td>
+            <td>Default. Recovery resumes replayable sources from the finalized checkpoint cut, so some records may be processed again.</td>
+            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires a cluster-shared checkpoint URL.</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
-            <td>Barrier-aligned checkpoints with two-phase commit to sinks. No duplicates in output.</td>
-            <td>All sources must support replay. Sinks must support 2PC. Currently: Kafka sink and PostgreSQL sink.</td>
+            <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
+            <td>Single-node currently requires an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode requires a shared checkpoint URL, exact-certified Kafka input, and direct S3/S3A append-mode Delta Lake; production certification remains release-soak gated. Kafka output and Apache Iceberg remain durable at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
 
       <p>
-        WebSocket sources are <strong>non-replayable</strong>. Under exactly-once mode,
-        they degrade to at-most-once delivery with a warning.
+        Delivery is one pipeline-wide setting. Per-connector delivery fields are rejected, and
+        incompatible connectors fail before external I/O. For example, WebSocket, OTLP, and NATS
+        Core sources are non-replayable and therefore require <code>best_effort</code>. Cluster
+        <code>exactly_once</code> admits only exact-certified Kafka input with direct S3/S3A
+        append-mode Delta Lake; other combinations fail closed before connector I/O.
       </p>
 
       <!-- Full example -->
@@ -1485,13 +1817,9 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <div class="toml-block">
         <div class="toml-header">laminardb.toml</div>
         <pre><code class="language-toml">[server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
-workers = 4
-log_level = "info"
-
-[state]
-backend = "memory"
+delivery = "at_least_once"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -1508,11 +1836,11 @@ connector = "kafka"
 format = "avro"
 
 [source.properties]
-bootstrap.servers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "market-trades"
-group.id = "laminar-vwap"
-schema.registry.url = "${SCHEMA_REGISTRY_URL}"
-startup.mode = "earliest"
+"group.id" = "laminar-vwap"
+"schema.registry.url" = "${SCHEMA_REGISTRY_URL}"
+"startup.mode" = "earliest"
 
 [[source.schema]]
 name = "symbol"
@@ -1529,7 +1857,7 @@ type = "BIGINT"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -1544,10 +1872,10 @@ strategy = "poll"
 pushdown = true
 
 [lookup.properties]
-hostname = "db.internal"
+host = "db.internal"
 database = "reference_data"
 username = "reader"
-table.name = "instruments"
+table = "instruments"
 
 [lookup.cache]
 size_bytes = 104857600
@@ -1574,27 +1902,25 @@ EMIT ON WINDOW CLOSE
 name = "kafka_output"
 pipeline = "vwap"
 connector = "kafka"
-delivery = "exactly_once"
+format = "json"
 
 [sink.properties]
-bootstrap.servers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "vwap-1m"
-format = "json"
-key.column = "symbol"
-compression.type = "lz4"
+"key.column" = "symbol"
+"compression.type" = "lz4"
 
 [[sink]]
 name = "lake"
 pipeline = "vwap"
 connector = "delta-lake"
-delivery = "exactly_once"
 
 [sink.properties]
-table.path = "s3://my-bucket/delta/vwap"
-partition.columns = "exchange"
-writer.id = "vwap-writer"</code></pre>
+"table.path" = "s3://my-bucket/delta/vwap"
+"partition.columns" = "exchange"</code></pre>
       </div>
 
+      </article>
     </main>
   </div>
 
@@ -1602,17 +1928,27 @@ writer.id = "vwap-writer"</code></pre>
   <footer class="footer">
     <div class="container">
       <div class="footer-inner">
-        <div class="footer-left">
-          LaminarDB &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.12</span>
+        <div class="footer-logo">
+          <svg viewBox="0 0 40 40" width="24" height="24" aria-hidden="true">
+            <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+            <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="#0ea5e9" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+          </svg>
+          <span>LAMINARDB.IO</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
           <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
+          <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
           <a href="mailto:support@laminardb.io">Support</a>
         </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Laminar Technologies &amp; Contributors. Licensed Apache 2.0.</span>
+        <span>Current version: <span data-version="tag">v0.25.0</span></span>
       </div>
     </div>
   </footer>

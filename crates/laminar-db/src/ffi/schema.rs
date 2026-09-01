@@ -1,6 +1,4 @@
 //! FFI schema inspection functions.
-//!
-//! Provides `extern "C"` wrappers for schema inspection operations.
 
 use std::ffi::{c_char, CStr, CString};
 
@@ -20,13 +18,11 @@ pub struct LaminarSchema {
 }
 
 impl LaminarSchema {
-    /// Create from Arrow schema.
     pub(crate) fn new(schema: SchemaRef) -> Self {
         Self { inner: schema }
     }
 
-    /// Get inner schema reference.
-    #[allow(dead_code)] // Used for Arrow C Data Interface export
+    #[allow(dead_code)] // used in arrow_ffi
     pub(crate) fn schema(&self) -> &SchemaRef {
         &self.inner
     }
@@ -34,21 +30,9 @@ impl LaminarSchema {
 
 /// Get schema for a source.
 ///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `name` - Null-terminated source name
-/// * `out` - Pointer to receive schema handle
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `name` must be a valid null-terminated UTF-8 string
-/// * `out` must be a valid pointer
+/// `conn`, `name`, and `out` must be valid non-null pointers; `name` must be null-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_get_schema(
     conn: *mut LaminarConnection,
@@ -61,18 +45,15 @@ pub unsafe extern "C" fn laminar_get_schema(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: name is non-null (checked above)
     let Ok(name_str) = (unsafe { CStr::from_ptr(name) }).to_str() else {
         return LAMINAR_ERR_INVALID_UTF8;
     };
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     match conn_ref.get_schema(name_str) {
         Ok(schema) => {
             let handle = Box::new(LaminarSchema::new(schema));
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = Box::into_raw(handle) };
             LAMINAR_OK
         }
@@ -84,23 +65,11 @@ pub unsafe extern "C" fn laminar_get_schema(
     }
 }
 
-/// List all sources as JSON array.
-///
-/// Returns a JSON array like `["source1", "source2"]`.
-///
-/// # Arguments
-///
-/// * `conn` - Database connection
-/// * `out` - Pointer to receive JSON string (caller frees with `laminar_string_free`)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// List all sources as a JSON array (e.g., `["src1","src2"]`). Caller frees with `laminar_string_free`.
 ///
 /// # Safety
 ///
-/// * `conn` must be a valid connection handle
-/// * `out` must be a valid pointer
+/// `conn` and `out` must be valid non-null pointers.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_list_sources(
     conn: *mut LaminarConnection,
@@ -112,7 +81,6 @@ pub unsafe extern "C" fn laminar_list_sources(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: conn is non-null (checked above)
     let conn_ref = unsafe { &(*conn).inner };
 
     let sources = conn_ref.list_sources();
@@ -127,7 +95,6 @@ pub unsafe extern "C" fn laminar_list_sources(
 
     match CString::new(json) {
         Ok(c_str) => {
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = take_ownership_string(c_str) };
             LAMINAR_OK
         }
@@ -137,19 +104,9 @@ pub unsafe extern "C" fn laminar_list_sources(
 
 /// Get the number of fields in a schema.
 ///
-/// # Arguments
-///
-/// * `schema` - Schema handle
-/// * `out` - Pointer to receive field count
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
-///
 /// # Safety
 ///
-/// * `schema` must be a valid schema handle
-/// * `out` must be a valid pointer
+/// `schema` and `out` must be valid non-null pointers.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_schema_num_fields(
     schema: *mut LaminarSchema,
@@ -161,30 +118,17 @@ pub unsafe extern "C" fn laminar_schema_num_fields(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: schema and out are non-null (checked above)
     unsafe {
         *out = (*schema).inner.fields().len();
     }
     LAMINAR_OK
 }
 
-/// Get the name of a field by index.
-///
-/// # Arguments
-///
-/// * `schema` - Schema handle
-/// * `index` - Field index (0-based)
-/// * `out` - Pointer to receive field name (caller frees with `laminar_string_free`)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Get the name of a field by index. Caller frees the result with `laminar_string_free`.
 ///
 /// # Safety
 ///
-/// * `schema` must be a valid schema handle
-/// * `index` must be less than the number of fields
-/// * `out` must be a valid pointer
+/// `schema` and `out` must be valid non-null pointers; `index` must be in range.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_schema_field_name(
     schema: *mut LaminarSchema,
@@ -197,17 +141,15 @@ pub unsafe extern "C" fn laminar_schema_field_name(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: schema is non-null (checked above)
     let schema_ref = unsafe { &(*schema).inner };
 
     if index >= schema_ref.fields().len() {
-        return LAMINAR_ERR_NULL_POINTER; // Index out of bounds
+        return LAMINAR_ERR_NULL_POINTER;
     }
 
     let name = schema_ref.field(index).name();
     match CString::new(name.as_str()) {
         Ok(c_str) => {
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = take_ownership_string(c_str) };
             LAMINAR_OK
         }
@@ -215,25 +157,11 @@ pub unsafe extern "C" fn laminar_schema_field_name(
     }
 }
 
-/// Get the type of a field by index.
-///
-/// Returns the Arrow data type as a string (e.g., "Int64", "Utf8", "Float64").
-///
-/// # Arguments
-///
-/// * `schema` - Schema handle
-/// * `index` - Field index (0-based)
-/// * `out` - Pointer to receive type name (caller frees with `laminar_string_free`)
-///
-/// # Returns
-///
-/// `LAMINAR_OK` on success, or an error code.
+/// Get the Arrow data type of a field by index as a string. Caller frees with `laminar_string_free`.
 ///
 /// # Safety
 ///
-/// * `schema` must be a valid schema handle
-/// * `index` must be less than the number of fields
-/// * `out` must be a valid pointer
+/// `schema` and `out` must be valid non-null pointers; `index` must be in range.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_schema_field_type(
     schema: *mut LaminarSchema,
@@ -246,18 +174,16 @@ pub unsafe extern "C" fn laminar_schema_field_type(
         return LAMINAR_ERR_NULL_POINTER;
     }
 
-    // SAFETY: schema is non-null (checked above)
     let schema_ref = unsafe { &(*schema).inner };
 
     if index >= schema_ref.fields().len() {
-        return LAMINAR_ERR_NULL_POINTER; // Index out of bounds
+        return LAMINAR_ERR_NULL_POINTER;
     }
 
     let data_type = schema_ref.field(index).data_type();
     let type_str = format!("{data_type:?}");
     match CString::new(type_str) {
         Ok(c_str) => {
-            // SAFETY: out is non-null (checked above)
             unsafe { *out = take_ownership_string(c_str) };
             LAMINAR_OK
         }
@@ -267,17 +193,12 @@ pub unsafe extern "C" fn laminar_schema_field_type(
 
 /// Free a schema handle.
 ///
-/// # Arguments
-///
-/// * `schema` - Schema handle to free
-///
 /// # Safety
 ///
 /// `schema` must be a valid handle from a laminar function, or NULL.
 #[no_mangle]
 pub unsafe extern "C" fn laminar_schema_free(schema: *mut LaminarSchema) {
     if !schema.is_null() {
-        // SAFETY: schema is non-null and was allocated by Box
         drop(unsafe { Box::from_raw(schema) });
     }
 }

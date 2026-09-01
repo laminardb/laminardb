@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+// Cross-node shuffle transport.
+package laminar.shuffle.v1;
+
+service ShuffleTransport {
+  // Bind both process incarnations and the assignment certificate before data.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Shuffle(stream ShuffleFrame) returns (ShuffleSummary);
+}
+
+// Hello must be the first frame.
+message ShuffleFrame {
+  oneof kind {
+    Hello hello = 1;
+    RoutedData data = 2;
+    Barrier barrier = 3;
+    Frontier frontier = 4;
+  }
+}
+
+message Hello {
+  uint64 node_id = 1;
+  // Canonical UUID bytes for this sender process.
+  bytes sender_incarnation = 2;
+  // Exact receiver process returned by Handshake.
+  bytes receiver_incarnation = 3;
+  // Connection-unique canonical UUID bytes.
+  bytes stream_id = 4;
+  // Nonzero assignment scope.
+  uint64 assignment_version = 5;
+  // Coordinated recovery scope.
+  uint64 recovery_gen = 6;
+  // SHA-256 of the owner map and exact participant-incarnation roster.
+  bytes assignment_certificate_digest = 7;
+}
+
+message HandshakeRequest {
+  uint64 sender_node_id = 1;
+  bytes sender_incarnation = 2;
+  bytes stream_id = 3;
+  uint64 assignment_version = 4;
+  uint64 recovery_gen = 5;
+  bytes assignment_certificate_digest = 6;
+}
+
+message HandshakeResponse {
+  uint64 receiver_node_id = 1;
+  bytes receiver_incarnation = 2;
+  // The remaining fields echo the exact request scope.
+  bytes sender_incarnation = 3;
+  bytes stream_id = 4;
+  uint64 assignment_version = 5;
+  uint64 recovery_gen = 6;
+  bytes assignment_certificate_digest = 7;
+}
+
+// A pre-routed batch; stage is demultiplexing metadata only.
+message RoutedData {
+  string stage = 1;
+  // Ascending, duplicate-free receiver-owned vnode set. This remains out of
+  // the user Arrow schema.
+  repeated uint32 routed_vnodes = 2;
+  // Slice of one self-contained Arrow IPC batch. All slices share one sender allocation.
+  bytes arrow_ipc = 3;
+  // Must match the stream recovery scope.
+  uint64 recovery_gen = 4;
+  // Allocated before enqueue; discarded frames leave detectable gaps. Monotonic
+  // within the certified process, assignment, and recovery scope.
+  uint64 seq = 5;
+  uint32 fragment_index = 6;
+  uint32 fragment_count = 7;
+  // Repeated on every fragment and validated before reassembly. Stage and route metadata are
+  // carried only by fragment zero; continuation fragments leave them empty.
+  uint32 total_payload_bytes = 8;
+}
+
+// Per-stage event-time progress ordered with routed data.
+message Frontier {
+  string stage = 1;
+  // Absent means the channel has not established an event-time watermark.
+  optional int64 watermark = 2;
+  bool idle = 3;
+  // Must match the stream recovery scope.
+  uint64 recovery_gen = 4;
+  // Shares RoutedData's monotonic sequence domain.
+  uint64 seq = 5;
+}
+
+// Ordered after the sender's preceding checkpointed data and frontiers.
+message Barrier {
+  uint64 checkpoint_id = 1;
+  uint64 epoch = 2;
+  uint64 flags = 3;
+  // Exclusive data/frontier high-water for this ordered stream.
+  uint64 last_seq = 4;
+  // Must equal the stream and checkpoint assignment certificate.
+  uint64 assignment_version = 5;
+  bytes assignment_digest = 6;
+  // Must equal the stream recovery scope.
+  uint64 recovery_gen = 7;
+}
+
+message ShuffleSummary {
+  uint64 frames_received = 1;
+}

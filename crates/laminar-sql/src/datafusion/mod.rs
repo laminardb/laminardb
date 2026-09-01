@@ -1,72 +1,7 @@
-//! `DataFusion` integration for SQL processing
-//!
-//! This module provides the integration layer between `LaminarDB`'s push-based
-//! streaming engine and `DataFusion`'s pull-based SQL query execution.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    Ring 2: Query Planning                        │
-//! │  SQL Query → SessionContext → LogicalPlan → ExecutionPlan       │
-//! │                                      │                          │
-//! │                            StreamingScanExec                    │
-//! │                                      │                          │
-//! │                              ┌───────▼──────┐                   │
-//! │                              │ StreamBridge │ (tokio channel)   │
-//! │                              └───────▲──────┘                   │
-//! ├──────────────────────────────────────┼──────────────────────────┤
-//! │                    Ring 0: Hot Path   │                          │
-//! │                                      │                          │
-//! │  Source → Reactor.poll() ────────────┘                          │
-//! │              (Events with RecordBatch data)                     │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Components
-//!
-//! - [`StreamSource`]: Trait for streaming data sources
-//! - [`StreamBridge`]: Channel-based push-to-pull bridge
-//! - [`StreamingScanExec`]: `DataFusion` execution plan for streaming scans
-//! - [`StreamingTableProvider`]: `DataFusion` table provider for streaming sources
-//! - [`ChannelStreamSource`]: Concrete source using channels
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_sql::datafusion::{
-//!     create_streaming_context, ChannelStreamSource, StreamingTableProvider,
-//! };
-//! use std::sync::Arc;
-//!
-//! // Create a streaming context
-//! let ctx = create_streaming_context();
-//!
-//! // Create a channel source
-//! let schema = Arc::new(Schema::new(vec![
-//!     Field::new("id", DataType::Int64, false),
-//!     Field::new("value", DataType::Float64, true),
-//! ]));
-//! let source = Arc::new(ChannelStreamSource::new(schema));
-//! let sender = source.sender();
-//!
-//! // Register as a table
-//! let provider = StreamingTableProvider::new("events", source);
-//! ctx.register_table("events", Arc::new(provider))?;
-//!
-//! // Push data from the Reactor
-//! sender.send(batch).await?;
-//!
-//! // Execute SQL queries
-//! let df = ctx.sql("SELECT * FROM events WHERE value > 100").await?;
-//! ```
+//! DataFusion integration for SQL processing.
 
-/// DataFusion aggregate bridge for streaming aggregation.
-///
-/// Bridges DataFusion's `Accumulator` trait with `laminar-core`'s
-/// `DynAccumulator` / `DynAggregatorFactory` traits. This avoids
-/// duplicating aggregation logic.
-pub mod aggregate_bridge;
+/// Marker UDFs for the `ai_*` SQL functions (rewritten by the AI operator).
+pub mod ai_udf;
 mod bridge;
 mod channel_source;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
@@ -90,6 +25,8 @@ pub mod json_types;
 pub mod json_udaf;
 /// PostgreSQL-compatible JSON scalar UDFs
 pub mod json_udf;
+/// Live source provider for streaming execution with plan caching
+pub mod live_source;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
 /// Physical execution plan and extension planner for lookup joins.
@@ -99,16 +36,12 @@ pub mod proctime_udf;
 mod source;
 mod table_provider;
 /// Dynamic watermark filter for scan-level late-data pruning
-pub mod watermark_filter;
 /// Watermark UDF for current watermark access
 pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
 
-pub use aggregate_bridge::{
-    create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
-    DataFusionAccumulatorAdapter, DataFusionAggregateFactory,
-};
+pub use ai_udf::{ai_function_markers, AiFunctionMarker};
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use complex_type_lambda::{
@@ -137,17 +70,19 @@ pub use json_udf::{
     JsonbExistsAll, JsonbExistsAny, JsonbGet, JsonbGetIdx, JsonbGetPath, JsonbGetPathText,
     JsonbGetText, JsonbGetTextIdx, ToJsonb,
 };
+pub use live_source::{LiveSourceHandle, LiveSourceProvider};
 pub use lookup_join_exec::{
     LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
-    PartialLookupJoinExec, PartialLookupState, RegisteredLookup, VersionedLookupJoinExec,
-    VersionedLookupState,
+    PartialLookupJoinExec, PartialLookupState, RegisteredLookup,
 };
 pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
-pub use watermark_filter::WatermarkDynamicFilter;
 pub use watermark_udf::WatermarkUdf;
-pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
+pub use window_udf::{
+    CumulateWindowEnd, CumulateWindowStart, HopWindowEnd, HopWindowStart, SessionWindowStart,
+    TumbleWindowEnd, TumbleWindowStart,
+};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -168,6 +103,10 @@ use crate::planner::streaming_optimizer::{StreamingPhysicalValidator, StreamingV
 pub fn base_session_config() -> SessionConfig {
     let mut config = SessionConfig::new();
     config.options_mut().sql_parser.enable_ident_normalization = false;
+    // Single partition for streaming micro-batch execution. Multi-partition
+    // plans contain stateful operators (RepartitionExec) that cannot be
+    // reused across cycles, causing panics on cached physical plans.
+    config = config.with_target_partitions(1);
     config
 }
 
@@ -215,9 +154,7 @@ pub fn create_streaming_context() -> SessionContext {
 /// (no plan-time validation).
 #[must_use]
 pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> SessionContext {
-    let config = base_session_config()
-        .with_batch_size(8192)
-        .with_target_partitions(1); // Single partition for streaming
+    let config = base_session_config().with_batch_size(8192);
 
     let ctx = if matches!(mode, StreamingValidatorMode::Off) {
         SessionContext::new_with_config(config)
@@ -246,53 +183,47 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
     ctx
 }
 
-/// Registers `LaminarDB` streaming UDFs with a session context.
-///
-/// Registers the following scalar functions:
-/// - `tumble(timestamp, interval)` — tumbling window start
-/// - `hop(timestamp, slide, size)` — hopping window start
-/// - `session(timestamp, gap)` — session window pass-through
-/// - `watermark()` — current watermark (returns NULL, no live source)
-///
-/// Use [`register_streaming_functions_with_watermark`] to provide a
-/// live watermark source from Ring 0.
-pub fn register_streaming_functions(ctx: &SessionContext) {
+/// Window-time, JSON, complex-type, lambda, and `proctime()` UDFs —
+/// every streaming UDF except `watermark()`. Pulled out of the public
+/// `register_streaming_functions*` entry points so they share a single
+/// list and stay in sync.
+fn register_non_watermark_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
+    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
+    for marker in ai_function_markers() {
+        ctx.register_udf(marker);
+    }
     register_json_functions(ctx);
     register_json_extensions(ctx);
     register_complex_type_functions(ctx);
     register_lambda_functions(ctx);
 }
 
-/// Registers streaming UDFs with a live watermark source.
-///
-/// Same as [`register_streaming_functions`] but connects the `watermark()`
-/// UDF to a shared atomic value that Ring 0 updates in real time.
-///
-/// # Arguments
-///
-/// * `ctx` - `DataFusion` session context
-/// * `watermark_ms` - Shared atomic holding the current watermark in
-///   milliseconds since epoch. Values < 0 mean "no watermark" (returns NULL).
+/// Registers `LaminarDB` streaming UDFs with a session context. The
+/// `watermark()` UDF is registered in unset mode (always returns NULL);
+/// use [`register_streaming_functions_with_watermark`] to provide a
+/// live watermark source from Ring 0.
+pub fn register_streaming_functions(ctx: &SessionContext) {
+    register_non_watermark_udfs(ctx);
+    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
+}
+
+/// Registers streaming UDFs with a live watermark source — same as
+/// [`register_streaming_functions`] but `watermark()` reads
+/// `watermark_ms` (in milliseconds since epoch; values < 0 mean "no
+/// watermark", returning NULL).
 pub fn register_streaming_functions_with_watermark(
     ctx: &SessionContext,
     watermark_ms: Arc<AtomicI64>,
 ) {
-    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
+    register_non_watermark_udfs(ctx);
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
-    ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
-    register_json_functions(ctx);
-    register_json_extensions(ctx);
-    register_complex_type_functions(ctx);
-    register_lambda_functions(ctx);
 }
 
 /// Registers all PostgreSQL-compatible JSON UDFs and UDAFs
@@ -342,500 +273,4 @@ pub fn register_json_functions(ctx: &SessionContext) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_array::{Float64Array, Int64Array, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::FunctionRegistry;
-    use futures::StreamExt;
-    use std::sync::Arc;
-
-    fn test_schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Float64, true),
-        ]))
-    }
-
-    /// Take the sender from a `ChannelStreamSource`, panicking if already taken.
-    fn take_test_sender(source: &ChannelStreamSource) -> super::bridge::BridgeSender {
-        source.take_sender().expect("sender already taken")
-    }
-
-    fn test_batch(schema: &Arc<Schema>, ids: Vec<i64>, values: Vec<f64>) -> RecordBatch {
-        RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![
-                Arc::new(Int64Array::from(ids)),
-                Arc::new(Float64Array::from(values)),
-            ],
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_create_streaming_context() {
-        let ctx = create_streaming_context();
-        let state = ctx.state();
-        let config = state.config();
-
-        assert_eq!(config.batch_size(), 8192);
-        assert_eq!(config.target_partitions(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_full_query_pipeline() {
-        let ctx = create_streaming_context();
-        let schema = test_schema();
-
-        // Create source and take the sender (important for channel closure)
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        // Send test data
-        sender
-            .send(test_batch(&schema, vec![1, 2, 3], vec![10.0, 20.0, 30.0]))
-            .await
-            .unwrap();
-        sender
-            .send(test_batch(&schema, vec![4, 5], vec![40.0, 50.0]))
-            .await
-            .unwrap();
-        drop(sender); // Close the channel
-
-        // Execute query
-        let df = ctx.sql("SELECT * FROM events").await.unwrap();
-        let batches = df.collect().await.unwrap();
-
-        // Verify results
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 5);
-    }
-
-    #[tokio::test]
-    async fn test_query_with_projection() {
-        let ctx = create_streaming_context();
-        let schema = test_schema();
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        sender
-            .send(test_batch(&schema, vec![1, 2], vec![100.0, 200.0]))
-            .await
-            .unwrap();
-        drop(sender);
-
-        // Query only the id column
-        let df = ctx.sql("SELECT id FROM events").await.unwrap();
-        let batches = df.collect().await.unwrap();
-
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_columns(), 1);
-        assert_eq!(batches[0].schema().field(0).name(), "id");
-    }
-
-    #[tokio::test]
-    async fn test_query_with_filter() {
-        let ctx = create_streaming_context();
-        let schema = test_schema();
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        sender
-            .send(test_batch(
-                &schema,
-                vec![1, 2, 3, 4, 5],
-                vec![10.0, 20.0, 30.0, 40.0, 50.0],
-            ))
-            .await
-            .unwrap();
-        drop(sender);
-
-        // Filter for value > 25
-        let df = ctx
-            .sql("SELECT * FROM events WHERE value > 25")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3); // 30, 40, 50
-    }
-
-    #[tokio::test]
-    async fn test_unbounded_aggregation_rejected() {
-        // Aggregations on unbounded streams should be rejected by `DataFusion`.
-        // Streaming aggregations require windows, which are implemented.
-        let ctx = create_streaming_context();
-        let schema = test_schema();
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        sender
-            .send(test_batch(&schema, vec![1, 2, 3], vec![10.0, 20.0, 30.0]))
-            .await
-            .unwrap();
-        drop(sender);
-
-        // Aggregate query on unbounded stream should fail at execution
-        let df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await.unwrap();
-
-        // Execution should fail because we can't aggregate an infinite stream
-        let result = df.collect().await;
-        assert!(
-            result.is_err(),
-            "Aggregation on unbounded stream should fail"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_query_with_order_by() {
-        let ctx = create_streaming_context();
-        let schema = test_schema();
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        sender
-            .send(test_batch(&schema, vec![3, 1, 2], vec![30.0, 10.0, 20.0]))
-            .await
-            .unwrap();
-        drop(sender);
-
-        // Query with ORDER BY (`DataFusion` handles this with Sort operator)
-        let df = ctx.sql("SELECT id, value FROM events").await.unwrap();
-        let batches = df.collect().await.unwrap();
-
-        // Verify we got results (ordering may vary due to streaming nature)
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3);
-    }
-
-    #[tokio::test]
-    async fn test_bridge_throughput() {
-        // Benchmark-style test for bridge performance
-        let schema = test_schema();
-        let bridge = StreamBridge::new(Arc::clone(&schema), 10000);
-        let sender = bridge.sender();
-        let mut stream = bridge.into_stream();
-
-        let batch_count = 1000;
-        let batch = test_batch(&schema, vec![1, 2, 3, 4, 5], vec![1.0, 2.0, 3.0, 4.0, 5.0]);
-
-        // Spawn sender task
-        let send_task = tokio::spawn(async move {
-            for _ in 0..batch_count {
-                sender.send(batch.clone()).await.unwrap();
-            }
-        });
-
-        // Receive all batches
-        let mut received = 0;
-        while let Some(result) = stream.next().await {
-            result.unwrap();
-            received += 1;
-            if received == batch_count {
-                break;
-            }
-        }
-
-        send_task.await.unwrap();
-        assert_eq!(received, batch_count);
-    }
-
-    // ── Integration Tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_streaming_functions_registered() {
-        let ctx = create_streaming_context();
-        // Verify all 4 UDFs are registered
-        assert!(ctx.udf("tumble").is_ok(), "tumble UDF not registered");
-        assert!(ctx.udf("hop").is_ok(), "hop UDF not registered");
-        assert!(ctx.udf("session").is_ok(), "session UDF not registered");
-        assert!(ctx.udf("watermark").is_ok(), "watermark UDF not registered");
-    }
-
-    #[test]
-    fn test_streaming_functions_with_watermark() {
-        use std::sync::atomic::AtomicI64;
-
-        let ctx = create_session_context();
-        let wm = Arc::new(AtomicI64::new(42_000));
-        register_streaming_functions_with_watermark(&ctx, wm);
-
-        assert!(ctx.udf("tumble").is_ok());
-        assert!(ctx.udf("watermark").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_tumble_udf_via_datafusion() {
-        use arrow_array::TimestampMillisecondArray;
-        use arrow_schema::TimeUnit;
-
-        let ctx = create_streaming_context();
-
-        // Create schema with timestamp and value columns
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-            Field::new("value", DataType::Float64, false),
-        ]));
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        // Send events across two 5-minute windows:
-        // Window [0, 300_000): timestamps 60_000, 120_000
-        // Window [300_000, 600_000): timestamps 360_000
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![
-                    60_000i64, 120_000, 360_000,
-                ])),
-                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
-            ],
-        )
-        .unwrap();
-        sender.send(batch).await.unwrap();
-        drop(sender);
-
-        // Verify the tumble UDF computes correct window starts via DataFusion
-        // (GROUP BY aggregation and ORDER BY on unbounded streams are handled by Ring 0)
-        let df = ctx
-            .sql(
-                "SELECT tumble(event_time, INTERVAL '5' MINUTE) as window_start, \
-                 value \
-                 FROM events",
-            )
-            .await
-            .unwrap();
-
-        let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3);
-
-        // Verify the window_start values (single batch, order preserved)
-        let ws_col = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .expect("window_start should be TimestampMillisecond");
-        // 60_000 and 120_000 → window [0, 300_000), start = 0
-        assert_eq!(ws_col.value(0), 0);
-        assert_eq!(ws_col.value(1), 0);
-        // 360_000 → window [300_000, 600_000), start = 300_000
-        assert_eq!(ws_col.value(2), 300_000);
-    }
-
-    #[tokio::test]
-    async fn test_logical_plan_from_windowed_query() {
-        use arrow_schema::TimeUnit;
-
-        let ctx = create_streaming_context();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-            Field::new("value", DataType::Float64, false),
-        ]));
-
-        let source = Arc::new(ChannelStreamSource::new(schema));
-        let _sender = source.take_sender();
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        // Create a LogicalPlan for a windowed query
-        let df = ctx
-            .sql(
-                "SELECT tumble(event_time, INTERVAL '5' MINUTE) as w, \
-                 COUNT(*) as cnt \
-                 FROM events \
-                 GROUP BY tumble(event_time, INTERVAL '5' MINUTE)",
-            )
-            .await;
-
-        // Should succeed in creating the logical plan (UDFs are registered)
-        assert!(df.is_ok(), "Failed to create logical plan: {df:?}");
-    }
-
-    #[tokio::test]
-    async fn test_end_to_end_execute_streaming_sql() {
-        use crate::planner::StreamingPlanner;
-
-        let ctx = create_streaming_context();
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("items", source);
-        ctx.register_table("items", Arc::new(provider)).unwrap();
-
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(arrow_array::StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )
-        .unwrap();
-        sender.send(batch).await.unwrap();
-        drop(sender);
-
-        let mut planner = StreamingPlanner::new();
-        let result = execute_streaming_sql("SELECT id FROM items WHERE id > 1", &ctx, &mut planner)
-            .await
-            .unwrap();
-
-        match result {
-            StreamingSqlResult::Query(qr) => {
-                let mut stream = qr.stream;
-                let mut total = 0;
-                while let Some(batch) = stream.next().await {
-                    total += batch.unwrap().num_rows();
-                }
-                assert_eq!(total, 2); // id=2, id=3
-            }
-            StreamingSqlResult::Ddl(_) => panic!("Expected Query result"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_watermark_function_in_filter() {
-        use arrow_array::TimestampMillisecondArray;
-        use arrow_schema::TimeUnit;
-        use std::sync::atomic::AtomicI64;
-
-        // Create context with a specific watermark value
-        let config = base_session_config()
-            .with_batch_size(8192)
-            .with_target_partitions(1);
-        let ctx = SessionContext::new_with_config(config);
-        let wm = Arc::new(AtomicI64::new(200_000)); // watermark at 200s
-        register_streaming_functions_with_watermark(&ctx, wm);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "event_time",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
-                false,
-            ),
-            Field::new("value", DataType::Float64, false),
-        ]));
-
-        let source = Arc::new(ChannelStreamSource::new(Arc::clone(&schema)));
-        let sender = take_test_sender(&source);
-        let provider = StreamingTableProvider::new("events", source);
-        ctx.register_table("events", Arc::new(provider)).unwrap();
-
-        // Events: 100s, 200s, 300s - watermark is at 200s
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(TimestampMillisecondArray::from(vec![
-                    100_000i64, 200_000, 300_000,
-                ])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        sender.send(batch).await.unwrap();
-        drop(sender);
-
-        // Filter events after watermark
-        let df = ctx
-            .sql("SELECT value FROM events WHERE event_time > watermark()")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        // Only event at 300s is after watermark (200s)
-        assert_eq!(total_rows, 1);
-    }
-
-    #[tokio::test]
-    async fn test_date_trunc_available() {
-        let ctx = create_streaming_context();
-        let df = ctx
-            .sql("SELECT date_trunc('hour', TIMESTAMP '2026-01-15 14:30:00')")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_date_bin_available() {
-        let ctx = create_streaming_context();
-        let df = ctx
-            .sql(
-                "SELECT date_bin(\
-                 INTERVAL '15 minutes', \
-                 TIMESTAMP '2026-01-15 14:32:00', \
-                 TIMESTAMP '2026-01-01 00:00:00')",
-            )
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_unnest_literal_array() {
-        let ctx = create_streaming_context();
-        let df = ctx
-            .sql("SELECT unnest(make_array(1, 2, 3)) AS val")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3);
-    }
-
-    #[tokio::test]
-    async fn test_unnest_from_table_with_array_col() {
-        let ctx = create_streaming_context();
-        // Register a table with an array column
-        ctx.sql(
-            "CREATE TABLE arr_table (id INT, tags INT[]) \
-             AS VALUES (1, make_array(10, 20)), (2, make_array(30))",
-        )
-        .await
-        .unwrap();
-        let df = ctx
-            .sql("SELECT id, unnest(tags) AS tag FROM arr_table")
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        // Row 1: [10,20] → 2 rows, Row 2: [30] → 1 row = 3 total
-        assert_eq!(total_rows, 3);
-    }
-}
+mod tests;

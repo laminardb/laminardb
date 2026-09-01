@@ -7,57 +7,105 @@ use std::path::PathBuf;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
-/// SQL identifier case sensitivity mode.
+/// Default pipeline-wide lower-bound charge allowed for managed operator working state.
 ///
-/// Controls how unquoted SQL identifiers are matched against Arrow
-/// schema field names.
-///
-/// `LaminarDB` defaults to [`CaseSensitive`](IdentifierCaseSensitivity::CaseSensitive)
-/// (normalization disabled) so that mixed-case column names from
-/// external sources (Kafka, CDC, `WebSocket`) work without double-quoting.
+/// This execution budget is independent of checkpoint storage.
+pub const DEFAULT_MAX_MANAGED_STATE_BYTES: usize = 256 * 1024 * 1024;
+
+pub(crate) fn event_time_max_future_skew_ms(
+    skew: std::time::Duration,
+) -> Result<i64, &'static str> {
+    let skew_ms = i64::try_from(skew.as_millis())
+        .map_err(|_| "event_time_max_future_skew exceeds the supported millisecond range")?;
+    if !skew.is_zero() && skew_ms == 0 {
+        return Err("event_time_max_future_skew must be zero or at least 1ms");
+    }
+    Ok(skew_ms)
+}
+
+pub(crate) fn source_idle_timeout_ms(
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<u64>, &'static str> {
+    let Some(timeout) = timeout else {
+        return Ok(None);
+    };
+    let timeout_ms = u64::try_from(timeout.as_millis())
+        .map_err(|_| "source_idle_timeout exceeds the supported millisecond range")?;
+    if timeout_ms == 0 {
+        return Err("source_idle_timeout must be at least 1ms");
+    }
+    Ok(Some(timeout_ms))
+}
+
+pub(crate) fn temporal_join_idle_history_retention_ms(
+    retention: Option<std::time::Duration>,
+) -> Result<i64, &'static str> {
+    let retention = retention
+        .ok_or("temporal_join_idle_history_retention must be configured for temporal joins")?;
+    let retention_ms = i64::try_from(retention.as_millis()).map_err(|_| {
+        "temporal_join_idle_history_retention exceeds the supported millisecond range"
+    })?;
+    if retention_ms == 0 {
+        return Err("temporal_join_idle_history_retention must be at least 1ms");
+    }
+    Ok(retention_ms)
+}
+
+/// What to do when an operator's input buffer exceeds its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IdentifierCaseSensitivity {
-    /// Preserve case as-written, case-sensitive matching (default).
-    ///
-    /// `SELECT tradeId` matches only `tradeId` in the schema.
-    /// This is the recommended mode for financial / `IoT` data sources
-    /// that use `camelCase` or `PascalCase` field names.
+pub enum BackpressurePolicy {
+    /// Defer the producer; sources block on `send`. No data loss.
     #[default]
-    CaseSensitive,
-    /// Normalize unquoted identifiers to lowercase (standard SQL behaviour).
-    ///
-    /// `SELECT TradeId` becomes `SELECT tradeid` before schema matching.
-    /// Use this if all your schemas use lowercase column names.
-    Lowercase,
+    Backpressure,
+    /// Drop oldest batches; counted in `shed_records_total`.
+    ShedOldest,
+    /// Error out the cycle.
+    Fail,
 }
 
-/// S3 storage class tiering configuration.
-///
-/// Controls how checkpoint objects are assigned to S3 storage classes
-/// for cost optimization. Active checkpoints use the hot tier (fast access),
-/// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TieringConfig {
-    /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
-    pub hot_class: String,
-    /// Storage class for older checkpoints (e.g., `"STANDARD"`).
-    pub warm_class: String,
-    /// Storage class for archive checkpoints (e.g., `"GLACIER_IR"`). Empty = no cold tier.
-    pub cold_class: String,
-    /// Time before moving objects from hot to warm tier (seconds).
-    pub hot_retention_secs: u64,
-    /// Time before moving objects from warm to cold tier (seconds). 0 = no cold tier.
-    pub warm_retention_secs: u64,
+/// String wrapper whose `Debug` redacts the value, for credentials in [`LaminarConfig`].
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrow the underlying secret. Call only at the point of use.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
-impl Default for TieringConfig {
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"[REDACTED]\"")
+    }
+}
+
+/// Auto-restart policy for the fault supervisor (see `LaminarDB::enable_supervision`).
+#[derive(Debug, Clone)]
+pub struct RestartPolicy {
+    /// Max restarts within `window` before the pipeline is left hard-faulted.
+    pub max_restarts: usize,
+    /// Sliding window over which `max_restarts` is counted.
+    pub window: std::time::Duration,
+    /// Backoff before the first restart in a window.
+    pub initial_backoff: std::time::Duration,
+    /// Cap on the exponential backoff.
+    pub max_backoff: std::time::Duration,
+}
+
+impl Default for RestartPolicy {
     fn default() -> Self {
         Self {
-            hot_class: "STANDARD".to_string(),
-            warm_class: "STANDARD".to_string(),
-            cold_class: String::new(),
-            hot_retention_secs: 86400,    // 24h
-            warm_retention_secs: 604_800, // 7d
+            max_restarts: 5,
+            window: std::time::Duration::from_secs(60),
+            initial_backoff: std::time::Duration::from_millis(500),
+            max_backoff: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -65,30 +113,57 @@ impl Default for TieringConfig {
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
-    /// Default buffer size for streaming channels.
+    /// Streaming channel buffer size.
     pub default_buffer_size: usize,
-    /// Default backpressure strategy.
+    /// Backpressure strategy.
     pub default_backpressure: BackpressureStrategy,
-    /// Storage directory for WAL and checkpoints (`None` = in-memory only).
+    /// Checkpoint directory. `None` = in-memory only.
     pub storage_dir: Option<PathBuf>,
-    /// Streaming checkpoint configuration (`None` = disabled).
+    /// Checkpoint config. `None` = disabled.
     pub checkpoint: Option<StreamCheckpointConfig>,
-    /// SQL identifier case sensitivity mode.
-    pub identifier_case: IdentifierCaseSensitivity,
-    /// Object store URL for cloud checkpoint storage (e.g., `s3://bucket/prefix`).
+    /// Emit dirty-only changelogs for keyed non-windowed aggregate materialized views instead of
+    /// re-materializing every group each cycle. This is query execution policy, not checkpointing.
+    pub incremental_emit: bool,
+    /// Cloud checkpoint URL, e.g. `s3://bucket/prefix`.
     pub object_store_url: Option<String>,
-    /// Explicit credential/config overrides for the object store builder.
+    /// Credential/config overrides for the object store.
     pub object_store_options: HashMap<String, String>,
-    /// S3 storage class tiering configuration (`None` = use default STANDARD).
-    pub tiering: Option<TieringConfig>,
-    /// End-to-end delivery guarantee (default: at-least-once).
+    /// Bearer token presented when forwarding requests to the cluster leader's
+    /// HTTP API (set when the server gates `/api/v1` with `console_token`).
+    pub http_auth_token: Option<SecretString>,
+    /// Delivery guarantee.
     pub delivery_guarantee: DeliveryGuarantee,
-    /// Maximum state bytes per operator before the query fails (`None` = unlimited).
-    ///
-    /// When set, the executor checks each aggregate/window operator's estimated
-    /// memory usage after every processing cycle. At 80% of the limit a warning
-    /// is emitted; at 100% the query returns an error.
-    pub max_state_bytes_per_operator: Option<usize>,
+    /// Source-to-coordinator channel capacity. `None` = 64.
+    pub pipeline_channel_capacity: Option<usize>,
+    /// Micro-batch coalescing window. `None` = 5ms connectors / 0 embedded.
+    pub pipeline_batch_window: Option<std::time::Duration>,
+    /// Drain budget per cycle (ns). `None` = 1ms.
+    pub pipeline_drain_budget_ns: Option<u64>,
+    /// Per-query budget (ns). `None` = 8ms.
+    pub pipeline_query_budget_ns: Option<u64>,
+    /// Per-port operator input-buffer cap (batches). `None` = 256.
+    pub pipeline_max_input_buf_batches: Option<usize>,
+    /// Per-port operator input-buffer cap (bytes). `None` = disabled.
+    pub pipeline_max_input_buf_bytes: Option<usize>,
+    /// Pipeline-wide managed working-state budget in charged bytes. `None` resolves to
+    /// [`DEFAULT_MAX_MANAGED_STATE_BYTES`] when the database is constructed.
+    pub pipeline_max_managed_state_bytes: Option<usize>,
+    /// Retention contract for right-side history while a temporal join input is idle.
+    /// Required only when the pipeline contains a temporal join.
+    pub temporal_join_idle_history_retention: Option<std::time::Duration>,
+    /// Mark inactive watermarked sources and input channels idle after this duration.
+    /// `None` disables automatic idle detection.
+    pub source_idle_timeout: Option<std::time::Duration>,
+    /// Event timestamps farther ahead of wall clock do not advance source watermarks.
+    /// Zero disables the guard.
+    pub event_time_max_future_skew: std::time::Duration,
+    /// Backpressure policy. See [`BackpressurePolicy`].
+    pub pipeline_backpressure_policy: BackpressurePolicy,
+    /// Auto-restart policy applied when supervision is enabled.
+    pub restart_policy: RestartPolicy,
+    /// Isolate queries that share a source into independent failure domains.
+    /// Default off; when off, shared-source queries fault and recover together.
+    pub shared_source_isolation: bool,
 }
 
 impl Default for LaminarConfig {
@@ -98,12 +173,26 @@ impl Default for LaminarConfig {
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,
             checkpoint: None,
-            identifier_case: IdentifierCaseSensitivity::default(),
+            incremental_emit: true,
             object_store_url: None,
             object_store_options: HashMap::new(),
-            tiering: None,
+            http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
-            max_state_bytes_per_operator: None,
+            pipeline_channel_capacity: None,
+            pipeline_batch_window: None,
+            pipeline_drain_budget_ns: None,
+            pipeline_query_budget_ns: None,
+            pipeline_max_input_buf_batches: None,
+            pipeline_max_input_buf_bytes: None,
+            pipeline_max_managed_state_bytes: None,
+            temporal_join_idle_history_retention: None,
+            source_idle_timeout: None,
+            event_time_max_future_skew: std::time::Duration::from_millis(
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS.unsigned_abs(),
+            ),
+            pipeline_backpressure_policy: BackpressurePolicy::default(),
+            restart_policy: RestartPolicy::default(),
+            shared_source_isolation: false,
         }
     }
 }

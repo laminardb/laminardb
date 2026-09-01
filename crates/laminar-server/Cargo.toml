@@ -14,21 +14,51 @@ publish = false
 name = "laminardb"
 path = "src/main.rs"
 
+[[bin]]
+name = "hash_test"
+path = "src/bin/hash_test.rs"
+required-features = ["cluster"]
+
+[[test]]
+name = "cluster_soak"
+path = "tests/cluster_soak.rs"
+required-features = ["cluster"]
+
+[[test]]
+name = "iceberg_cluster_soak"
+path = "tests/iceberg_cluster_soak.rs"
+required-features = ["cluster", "aws", "kafka", "iceberg"]
+
 [dependencies]
-# All LaminarDB crates
-laminar-core = { path = "../laminar-core", version = "0.18.10", features = ["delta"] }
-laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
-laminar-db = { path = "../laminar-db", version = "0.18.10" }
+# LaminarDB crates. laminar-db re-exports the rest of the workspace; the
+# server only needs the unified facade plus laminar-core for things like
+# metrics types referenced directly.
+laminar-core = { path = "../laminar-core", version = "0.30.0" }
+laminar-db = { path = "../laminar-db", version = "0.30.0", default-features = false, features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.30.0" }
+# Read-only Delta snapshot oracle for the ignored end-to-end EO soak.
+deltalake = { workspace = true, optional = true, features = ["rustls"] }
+
+# For pgwire dispatch on parsed AST
+sqlparser = { workspace = true }
+
+# Arrow (for WS JSON serialization + pgwire row encoder)
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-json = { workspace = true }
+arrow-schema = { workspace = true }
+parking_lot = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
-config = { version = "0.15", default-features = false, features = ["toml"] }
-directories = "6.0"
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+# CancellationToken for the cluster leader-lease renewal loop (cluster).
+tokio-util = { workspace = true, optional = true }
+crossfire = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -39,27 +69,57 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Serialization
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "1.0"
+tungstenite = "0.28"
+toml = "1.1"
 
 # Web framework
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
+# pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
+# extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
+pgwire = { package = "laminardb-pgwire", path = "../../vendor/pgwire", version = "=0.30.0", default-features = false, features = [
+    "server-api",
+    "_aws-lc-rs",
+    "pg-type-chrono",
+    "pg-type-rust-decimal",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws-lc-rs",
+    "tls12",
+] }
+rustls-pemfile = "2"
+x509-parser = "0.16"
+md-5 = "0.10"
+time = "0.3"
+async-trait = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true, optional = true }
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
 # Config helpers
 regex = { workspace = true }
 humantime-serde = { workspace = true }
 chrono = { workspace = true }
 
+# Metrics
+prometheus = { workspace = true }
+
 # File watching for hot reload
 notify = { workspace = true }
 
-# Delta mode: hostname discovery and unique node IDs
+# Hostname for metrics instance label + cluster mode
 gethostname = { workspace = true }
-uuid = { workspace = true }
-xxhash-rust = { workspace = true }
+uuid = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
 
 # Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
@@ -69,16 +129,29 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
+# Kafka admin, producer, and committed-offset oracle used by the cluster soak.
+# Optional normal dependencies let the existing `kafka` feature exclude librdkafka
+# from no-default test builds; Windows resolves OpenSSL via OPENSSL_DIR.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
+
 # Allocator: mimalloc for Windows MSVC where jemalloc is unavailable.
 [target.'cfg(target_env = "msvc")'.dependencies]
 mimalloc = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
+
 [dev-dependencies]
+parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rcgen = "0.13"
+serde_json = { workspace = true }
 
 [features]
-# Cross-platform defaults. On Linux, add `--features linux-perf` for
-# io_uring, NUMA topology, and XDP/eBPF optimizations.
+# Cross-platform defaults.
 default = [
     "jemalloc",
     "mimalloc",
@@ -88,22 +161,27 @@ default = [
     "iceberg",
     "postgres-cdc",
     "postgres-sink",
-    "mysql-cdc",
     "mongodb-cdc",
+    "nats",
     "files",
     "parquet-lookup",
+    "otel",
+    "cluster",
+    "aws",
+    "gcs",
+    "azure",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Connector features (forwarded to laminar-db → laminar-connectors)
-kafka = ["laminar-db/kafka"]
+kafka = ["laminar-db/kafka", "dep:rdkafka"]
 websocket = ["laminar-db/websocket"]
 postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
-mysql-cdc = ["laminar-db/mysql-cdc"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
-delta-lake = ["laminar-db/delta-lake"]
-delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3"]
+nats = ["laminar-db/nats"]
+delta-lake = ["laminar-db/delta-lake", "dep:deltalake", "deltalake/datafusion"]
+delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "laminar-db/delta-lake-azure"]
 delta-lake-gcs = ["delta-lake", "laminar-db/delta-lake-gcs"]
 delta-lake-unity = ["delta-lake", "laminar-db/delta-lake-unity"]
@@ -112,19 +190,22 @@ delta-lake-glue = ["delta-lake", "laminar-db/delta-lake-glue"]
 delta = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue", "laminar-db/delta-lake-all"]
 iceberg = ["laminar-db/iceberg"]
 files = ["laminar-db/files"]
+otel = ["laminar-db/otel"]
 parquet-lookup = ["laminar-db/parquet-lookup"]
 # Cloud object store backends for checkpoints
-aws = ["laminar-db/aws"]
-gcs = ["laminar-db/gcs"]
-azure = ["laminar-db/azure"]
-# Performance features
-# Linux-only performance features (cannot be default — crates won't compile on Windows/macOS)
-io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
-hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
-# Meta-feature: enable all Linux-specific performance optimizations.
-# Recommended for production Linux deployments:
-#   cargo build --release --features linux-perf
-linux-perf = ["io-uring", "hwloc"]
+aws = ["laminar-db/aws", "laminar-core/aws"]
+gcs = ["laminar-db/gcs", "laminar-core/gcs"]
+azure = ["laminar-db/azure", "laminar-core/azure"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
+# Cluster mode.
+cluster = [
+    "laminar-core/cluster",
+    "laminar-db/cluster",
+    "dep:uuid",
+    "dep:xxhash-rust",
+    "dep:sha2",
+    "dep:tokio-util",
+    "dep:reqwest",
+]
 vendored-openssl = ["dep:openssl"]

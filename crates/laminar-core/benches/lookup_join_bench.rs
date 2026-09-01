@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::RngExt;
 
-use laminar_core::lookup::foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig};
+use laminar_core::lookup::lookup_cache::{LookupMemoryCache, LookupMemoryCacheConfig};
 
 fn bench_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]))
@@ -46,12 +46,13 @@ fn zipfian_keys(key_range: usize, count: usize, skew: f64) -> Vec<String> {
 fn bench_lookup_join_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("lookup_join_throughput");
 
-    let dim_size = 10_000;
-    let cache = FoyerMemoryCache::new(
+    let dim_size: usize = 10_000;
+    let cache = LookupMemoryCache::new(
         1,
-        FoyerMemoryCacheConfig {
-            capacity: dim_size * 2,
-            shards: 16,
+        LookupMemoryCacheConfig {
+            // Generous byte budget so the dimension set is never evicted mid-bench.
+            capacity_bytes: dim_size.saturating_mul(8 * 1024),
+            ttl: None,
         },
     );
 
@@ -90,12 +91,13 @@ fn bench_lookup_join_throughput(c: &mut Criterion) {
 fn bench_lookup_join_miss_rate(c: &mut Criterion) {
     let mut group = c.benchmark_group("lookup_join_miss_rate");
 
-    let dim_size = 1_000;
-    let cache = FoyerMemoryCache::new(
+    let dim_size: usize = 1_000;
+    let cache = LookupMemoryCache::new(
         1,
-        FoyerMemoryCacheConfig {
-            capacity: dim_size * 2,
-            shards: 16,
+        LookupMemoryCacheConfig {
+            // Generous byte budget so the dimension set is never evicted mid-bench.
+            capacity_bytes: dim_size.saturating_mul(8 * 1024),
+            ttl: None,
         },
     );
 

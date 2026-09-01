@@ -10,12 +10,11 @@ CREATE SOURCE market_ticks (
     side            VARCHAR NOT NULL,
     ts              BIGINT NOT NULL
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'market-ticks',
-    group_id = '${GROUP_ID}',
-    format = 'json',
-    offset_reset = 'earliest'
-);
+    'group.id' = '${GROUP_ID}',
+    'auto.offset.reset' = 'earliest'
+) FORMAT JSON;
 
 CREATE SOURCE order_events (
     order_id        VARCHAR NOT NULL,
@@ -25,12 +24,11 @@ CREATE SOURCE order_events (
     price           DOUBLE NOT NULL,
     ts              BIGINT NOT NULL
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'order-events',
-    group_id = '${GROUP_ID}',
-    format = 'json',
-    offset_reset = 'earliest'
-);
+    'group.id' = '${GROUP_ID}',
+    'auto.offset.reset' = 'earliest'
+) FORMAT JSON;
 
 CREATE SOURCE book_updates (
     symbol          VARCHAR NOT NULL,
@@ -41,9 +39,8 @@ CREATE SOURCE book_updates (
     order_count     BIGINT NOT NULL,
     ts              BIGINT NOT NULL
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'book-updates',
-    group_id = '${GROUP_ID}',
-    format = 'json',
-    offset_reset = 'earliest'
-);
+    'group.id' = '${GROUP_ID}',
+    'auto.offset.reset' = 'earliest'
+) FORMAT JSON;

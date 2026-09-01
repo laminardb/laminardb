@@ -1,0 +1,685 @@
+//! Multi-instance integration tests for the cluster control plane.
+//!
+//! Each test spawns a real N-node `MiniCluster` — N chitchat
+//! instances on loopback UDP plus per-node `ClusterController`s —
+//! and exercises a specific property. Timeouts are generous to
+//! accommodate gossip propagation variability.
+//!
+//! Feature-gated on `cluster`. Run with:
+//!     cargo test -p laminar-core --features cluster \
+//!         --test cluster_integration
+
+#![cfg(feature = "cluster")]
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use laminar_core::cluster::control::{
+    AssignmentSnapshot, AssignmentSnapshotStore, BarrierAck, BarrierAckDisposition,
+    BarrierAnnouncement, CheckpointAssignmentFence, CheckpointParticipant,
+    CheckpointPrepareObservation, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+    ProcessLease, QuorumOutcome,
+};
+use laminar_core::cluster::discovery::NodeId;
+use laminar_core::cluster::testing::{FaultyObjectStore, MiniCluster, ObjectStoreFault};
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
+
+const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(8);
+/// After killing a node, how long to wait for the remaining nodes to
+/// observe its `Left` announcement via gossip. 5 s covers the
+/// 500 ms gossip_discovery watcher interval plus a margin.
+const FAILOVER_DEADLINE: Duration = Duration::from_secs(5);
+
+fn test_participants(vnodes: &BTreeMap<u32, NodeId>) -> Vec<CheckpointParticipant> {
+    let mut owners = vnodes.values().map(|owner| owner.0).collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+        .into_iter()
+        .map(|node_id| CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        })
+        .collect()
+}
+
+fn test_snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
+    let participants = test_participants(&vnodes);
+    AssignmentSnapshot::empty()
+        .next_for_participants(vnodes, participants)
+        .unwrap()
+}
+
+async fn announce_certified_prepare(
+    cluster: &MiniCluster,
+    checkpoint_id: u64,
+    quorum_window: Duration,
+) -> BarrierAnnouncement {
+    let owners = cluster
+        .nodes
+        .iter()
+        .map(|node| node.instance_id.0)
+        .collect::<Vec<_>>();
+    let participants = cluster
+        .nodes
+        .iter()
+        .map(|node| CheckpointParticipant {
+            node_id: node.instance_id.0,
+            boot_incarnation: node.controller.recovery_incarnation(),
+        })
+        .collect();
+    let fence = CheckpointAssignmentFence::from_owner_map(checkpoint_id, &owners, participants)
+        .expect("canonical assignment fence");
+
+    let leader = &cluster.nodes[0];
+    let leader_owner = LeaderLeaseOwner {
+        node: leader.instance_id,
+        boot: leader.controller.recovery_incarnation(),
+        process_term: 1,
+    };
+    let authority = Arc::new(LeaderLeaseStore::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        30_000,
+    ));
+    let leader_lease = match authority.begin_new_term(&leader_owner, 1).await.unwrap() {
+        LeaseOutcome::Acquired(lease) => lease,
+        LeaseOutcome::Held(_) => unreachable!("fresh authority cannot already be held"),
+    };
+
+    for node in &cluster.nodes {
+        node.controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))))
+            .unwrap();
+        node.controller
+            .set_leader_lease_store(Arc::clone(&authority));
+        node.controller
+            .publish_checkpoint_assignment_fence(Some(fence.clone()));
+        node.controller
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                &ProcessLease {
+                    node: node.instance_id,
+                    owner: node.controller.recovery_incarnation(),
+                    term: 1,
+                    seq: 1,
+                    expires_at_ms: i64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    leader
+        .controller
+        .set_leader_lease_watch(
+            tokio::sync::watch::channel(Some(leader_lease.clone())).1,
+            leader_owner,
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))),
+        )
+        .unwrap();
+    leader.controller.install_local_leader_proof_provider();
+
+    let announcement = BarrierAnnouncement {
+        epoch: checkpoint_id,
+        checkpoint_id,
+        assignment_fence: Some(fence),
+        leader_proof: Some(leader_lease.proof()),
+        phase: laminar_core::cluster::control::Phase::Prepare,
+        flags: 0,
+    };
+    leader
+        .controller
+        .announce_prepare_barrier(&announcement, quorum_window)
+        .await
+        .expect("announce certified Prepare");
+    announcement
+}
+
+async fn wait_for_certified_prepare(
+    node: &laminar_core::cluster::testing::NodeHandle,
+    expected: &BarrierAnnouncement,
+) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            match node.controller.observe_checkpoint_prepare().await {
+                Ok(Some(CheckpointPrepareObservation::AssignmentReady(observed)))
+                    if observed == *expected =>
+                {
+                    return;
+                }
+                Ok(Some(CheckpointPrepareObservation::AssignmentRejected { error, .. })) => {
+                    panic!("certified Prepare rejected: {error}");
+                }
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("node {} did not observe Prepare", node.instance_id.0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn three_node_cluster_converges() {
+    let cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("cluster must converge");
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_is_consistent_across_nodes() {
+    let cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("convergence");
+
+    // Every node's view must agree on the leader (lowest ID).
+    // Node IDs are 1, 2, 3 → leader is 1.
+    let leaders: Vec<_> = cluster
+        .nodes
+        .iter()
+        .map(|n| n.controller.current_leader())
+        .collect();
+
+    for (i, l) in leaders.iter().enumerate() {
+        assert_eq!(
+            *l,
+            Some(cluster.nodes[0].instance_id),
+            "node {i} disagrees on leader; got {l:?}"
+        );
+    }
+
+    // Exactly one `is_leader() == true`.
+    let leader_count = cluster
+        .nodes
+        .iter()
+        .filter(|n| n.controller.is_leader())
+        .count();
+    assert_eq!(
+        leader_count, 1,
+        "exactly one node must self-identify as leader"
+    );
+    assert!(
+        cluster.nodes[0].controller.is_leader(),
+        "node 0 (lowest id) is leader"
+    );
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_announce_then_follower_observes_and_acks() {
+    // Certified Prepare uses leased direct endpoints discovered through gossip.
+    let cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("convergence");
+
+    let leader = &cluster.nodes[0];
+    let followers: Vec<_> = cluster.nodes.iter().skip(1).collect();
+    let follower_ids: Vec<_> = followers.iter().map(|n| n.instance_id).collect();
+    let announcement = announce_certified_prepare(&cluster, 7, Duration::from_secs(6)).await;
+    let assignment_digest = announcement
+        .assignment_fence
+        .as_ref()
+        .map(CheckpointAssignmentFence::digest);
+
+    // Each follower validates the exact assignment and authority before acknowledging.
+    for follower in &followers {
+        wait_for_certified_prepare(follower, &announcement).await;
+        follower
+            .controller
+            .ack_barrier(&BarrierAck {
+                epoch: 7,
+                checkpoint_id: 7,
+                assignment_digest,
+                flags: 0,
+                disposition: BarrierAckDisposition::Captured,
+                error: None,
+                watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
+            })
+            .await
+            .expect("ack");
+    }
+
+    // The leader collects the remote roster; its local capture is coordinated separately.
+    let outcome = leader
+        .controller
+        .wait_for_quorum(&announcement, &follower_ids, Duration::from_secs(6))
+        .await;
+    match outcome {
+        QuorumOutcome::Reached { mut acks, .. } => {
+            acks.sort_by_key(|n| n.0);
+            let mut expected = follower_ids.clone();
+            expected.sort_by_key(|n| n.0);
+            assert_eq!(acks, expected);
+        }
+        other => panic!("expected Reached, got {other:?}"),
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_failover_on_kill() {
+    // Kill the original leader (lowest id); verify the next-lowest-id
+    // node takes over within FAILOVER_DEADLINE and every surviving
+    // node agrees on the new leader.
+    let mut cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("convergence");
+
+    assert!(
+        cluster.nodes[0].controller.is_leader(),
+        "node 0 (lowest id) starts as leader"
+    );
+
+    // Graceful kill: the stopped discovery tells peers it's Left.
+    // Surviving nodes' current_leader() must switch to node 1.
+    let original_leader = cluster.nodes.remove(0);
+    let original_id = original_leader.instance_id;
+    original_leader.kill().await;
+
+    let start = Instant::now();
+    let expected = cluster.nodes[0].instance_id;
+    loop {
+        let leaders: Vec<_> = cluster
+            .nodes
+            .iter()
+            .map(|n| n.controller.current_leader())
+            .collect();
+        let all_agree = leaders.iter().all(|l| *l == Some(expected));
+        let correct_self_id =
+            cluster.nodes[0].controller.is_leader() && !cluster.nodes[1].controller.is_leader();
+        if all_agree && correct_self_id {
+            break;
+        }
+        if start.elapsed() > FAILOVER_DEADLINE {
+            panic!(
+                "leader failover incomplete after {:?}: got leaders {leaders:?}, expected {expected:?} (original {original_id:?})",
+                FAILOVER_DEADLINE
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_partition_produces_two_leaders() {
+    // Partition the cluster into [1,2] and [3,4]. Each side sees the
+    // other as unreachable, marks them suspected, and its own lowest-
+    // live-id instance takes leader role. This is the split-brain
+    // symptom the commit-manifest CAS fence resolves at durable
+    // commit time (see design doc §7).
+    let cluster = MiniCluster::spawn_partitionable(4).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("initial convergence");
+
+    // Pre-partition invariant: one leader, all agree.
+    let pre = cluster.nodes[0].controller.current_leader();
+    assert_eq!(pre, Some(cluster.nodes[0].instance_id));
+
+    let addrs = cluster.addrs();
+    let rules = cluster
+        .rules
+        .as_ref()
+        .expect("partitionable cluster has rules");
+    rules.partition(&addrs[0..2], &addrs[2..4]);
+
+    // Wait for each side to re-derive its local leader.
+    // Side A (nodes 0,1): leader becomes node 0 (id 1). Side B
+    // (nodes 2,3): leader becomes node 2 (id 3).
+    let expected_side_a = cluster.nodes[0].instance_id;
+    let expected_side_b = cluster.nodes[2].instance_id;
+
+    let start = Instant::now();
+    loop {
+        let side_a = cluster.nodes[0].controller.current_leader();
+        let side_a_peer = cluster.nodes[1].controller.current_leader();
+        let side_b = cluster.nodes[2].controller.current_leader();
+        let side_b_peer = cluster.nodes[3].controller.current_leader();
+
+        let converged = side_a == Some(expected_side_a)
+            && side_a_peer == Some(expected_side_a)
+            && side_b == Some(expected_side_b)
+            && side_b_peer == Some(expected_side_b);
+
+        if converged {
+            // Two leaders — exactly the split-brain we expected.
+            break;
+        }
+        if start.elapsed() > FAILOVER_DEADLINE {
+            panic!(
+                "partition did not produce split leaders within {:?}: \
+                 side_a={side_a:?} side_a_peer={side_a_peer:?} \
+                 side_b={side_b:?} side_b_peer={side_b_peer:?}",
+                FAILOVER_DEADLINE
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Healing restores a single leader across all four nodes.
+    rules.heal();
+    let start = Instant::now();
+    loop {
+        let leaders: Vec<_> = cluster
+            .nodes
+            .iter()
+            .map(|n| n.controller.current_leader())
+            .collect();
+        if leaders.iter().all(|l| *l == Some(expected_side_a)) {
+            break;
+        }
+        if start.elapsed() > FAILOVER_DEADLINE {
+            panic!("partition did not heal in {FAILOVER_DEADLINE:?}: {leaders:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
+    // Phase C.5 failure-matrix row: "object store unavailable".
+    //
+    // FaultyObjectStore wraps a real LocalFileSystem. Toggling the
+    // fault mode mid-test simulates a backing-store outage:
+    //   1. Normal save succeeds.
+    //   2. set_fault(FailWrites) → subsequent save returns Generic
+    //      error, but the prior snapshot on disk is unaffected.
+    //   3. set_fault(FailReads) → load also errors (NotFound injection).
+    //   4. set_fault(None) → next save + load succeed; the new
+    //      snapshot is visible.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let inner: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let faulty = Arc::new(FaultyObjectStore::new(inner));
+    let store = Arc::new(AssignmentSnapshotStore::new(
+        Arc::clone(&faulty) as Arc<dyn ObjectStore>
+    ));
+
+    // Step 1: save baseline via CAS-create.
+    let mut v1_map = BTreeMap::new();
+    v1_map.insert(0u32, NodeId(1));
+    let v1 = test_snapshot(v1_map);
+    store.save_if_absent(&v1).await.expect("baseline save");
+
+    // Step 2: turn writes off; the next rotate must fail.
+    faulty.set_fault(ObjectStoreFault::FailWrites);
+    let mut v2_map = BTreeMap::new();
+    v2_map.insert(0u32, NodeId(2));
+    let v2 = v1
+        .next_for_participants(v2_map.clone(), test_participants(&v2_map))
+        .unwrap();
+    let write_err = store
+        .save_if_version(&v2, v1.version)
+        .await
+        .expect_err("write should fail");
+    assert!(
+        format!("{write_err}").to_lowercase().contains("injected")
+            || matches!(
+                write_err,
+                laminar_core::cluster::control::SnapshotError::Io(_)
+            ),
+        "unexpected error shape: {write_err:?}"
+    );
+
+    // Step 3: load still sees the v1 snapshot in Normal / writes-off
+    // mode (reads are fine).
+    let still_v1 = store.load().await.expect("load ok").expect("present");
+    assert_eq!(still_v1.version, 1);
+
+    // Step 4: fail reads; load surfaces either Err or Ok(None).
+    // Under the versioned layout, `load` uses `list` first and
+    // tolerates a missing listing as "empty store"; backends that
+    // model FailReads as a failed get (without failing list) return
+    // Ok(None), while backends that fail the list stream return Err.
+    // Both are legitimate read-fault behaviors.
+    faulty.set_fault(ObjectStoreFault::FailReads);
+    match store.load().await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(s)) => panic!("expected read fault, got Ok(Some({s:?}))"),
+    }
+
+    // Step 5: heal; rotate v1 → v2, verify visible.
+    faulty.set_fault(ObjectStoreFault::None);
+    assert!(matches!(
+        store
+            .save_if_version(&v2, v1.version)
+            .await
+            .expect("rotate after heal"),
+        laminar_core::cluster::control::RotateOutcome::Rotated,
+    ));
+    let loaded = store.load().await.unwrap().unwrap();
+    assert_eq!(loaded.version, 2);
+    assert_eq!(loaded.vnodes.get(&0), Some(&NodeId(2)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assignment_snapshot_survives_full_cluster_restart() {
+    // 1. Spin up a cluster backed by a shared on-disk object store.
+    // 2. Leader writes an assignment snapshot via its controller.
+    // 3. Shut the cluster down entirely (all nodes die).
+    // 4. Spin a fresh cluster pointing at the same object-store dir.
+    // 5. Verify the fresh leader reads the prior snapshot back
+    //    unchanged.
+    //
+    // This is the cold-recovery contract from the design doc §7:
+    // "the assignment snapshot lives on object store so full-cluster
+    // restart doesn't lose state."
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fs_a: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let store_a = Arc::new(AssignmentSnapshotStore::new(fs_a));
+
+    // ── First cluster ────────────────────────────────────────────
+    let cluster_a = MiniCluster::spawn_with_snapshot(3, Arc::clone(&store_a)).await;
+    cluster_a
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("initial convergence");
+
+    let leader = &cluster_a.nodes[0];
+    assert!(leader.controller.is_leader());
+
+    let mut vnodes = BTreeMap::new();
+    vnodes.insert(0u32, NodeId(1));
+    vnodes.insert(1u32, NodeId(2));
+    vnodes.insert(2u32, NodeId(3));
+    let snapshot = test_snapshot(vnodes);
+
+    leader
+        .controller
+        .snapshot_store()
+        .expect("snapshot store installed")
+        .save_if_absent(&snapshot)
+        .await
+        .expect("save");
+
+    cluster_a.shutdown().await;
+
+    // ── Fresh cluster against the same directory ─────────────────
+    let fs_b: Arc<dyn ObjectStore> =
+        Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+    let store_b = Arc::new(AssignmentSnapshotStore::new(fs_b));
+    let cluster_b = MiniCluster::spawn_with_snapshot(3, Arc::clone(&store_b)).await;
+    cluster_b
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("restart convergence");
+
+    let leader_b = &cluster_b.nodes[0];
+    assert!(leader_b.controller.is_leader());
+
+    let loaded = leader_b
+        .controller
+        .snapshot_store()
+        .expect("snapshot store installed")
+        .load()
+        .await
+        .expect("load")
+        .expect("snapshot present");
+
+    assert_eq!(loaded.version, snapshot.version);
+    assert_eq!(loaded.vnodes, snapshot.vnodes);
+
+    cluster_b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_node_can_join_running_cluster() {
+    // Diagnostic: validates that join_node() itself works, distinct
+    // from the rejoin-with-same-id case. If this passes but
+    // killed_node_can_rejoin fails, the bug is specific to same-id
+    // rejoin (chitchat generation collision, state reconciliation,
+    // etc.).
+    let mut cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("initial convergence");
+
+    cluster.join_node(NodeId(99)).await;
+
+    let start = Instant::now();
+    loop {
+        let all_see_four = cluster
+            .nodes
+            .iter()
+            .all(|n| n.controller.live_instances().len() == 4);
+        if all_see_four {
+            break;
+        }
+        if start.elapsed() > FAILOVER_DEADLINE {
+            let dumps: Vec<_> = cluster
+                .nodes
+                .iter()
+                .map(|n| (n.instance_id, n.controller.live_instances()))
+                .collect();
+            panic!("fresh join didn't converge: {dumps:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    cluster.shutdown().await;
+}
+
+// Same-id rejoin is a known-hard case with chitchat 0.10: after a
+// peer is announced Left, its entry lingers in cluster state until
+// phi-accrual fires + marked_for_deletion_grace_period elapses.
+// A fresh instance with the same `node_id` string but a higher
+// generation can race with the stale entry, and chitchat's state
+// merge rules sometimes keep the Left record. Production flows
+// around this by either (a) restarting with a distinct logical id
+// (common in k8s pod rollovers — each pod gets a fresh UUID), or
+// (b) waiting for explicit reaping. The `fresh_node_can_join_running_cluster`
+// test above validates the common-case (a) path. Re-enable this
+// test once we add an explicit reap primitive to the harness.
+#[ignore = "known chitchat same-id rejoin limitation; see fresh_node_can_join_running_cluster for the (a)-path test"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn killed_node_can_rejoin() {
+    let mut cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("initial convergence");
+
+    let killed_id = cluster.nodes[0].instance_id;
+    let killed = cluster.nodes.remove(0);
+    killed.kill().await;
+
+    // Allow phi-accrual + GC of the Left record before rejoining.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    cluster.join_node(killed_id).await;
+    let rejoined_idx = cluster
+        .nodes
+        .iter()
+        .position(|n| n.instance_id == killed_id)
+        .expect("rejoined node present");
+    cluster.nodes.swap(0, rejoined_idx);
+
+    let start = Instant::now();
+    loop {
+        let leaders: Vec<_> = cluster
+            .nodes
+            .iter()
+            .map(|n| n.controller.current_leader())
+            .collect();
+        if leaders.iter().all(|l| *l == Some(killed_id)) {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("rejoined leader never surfaced: {leaders:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cluster.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quorum_times_out_when_follower_silent() {
+    // A certified Prepare must time out when one exact participant stays silent.
+    let cluster = MiniCluster::spawn(3).await;
+    cluster
+        .wait_for_convergence(CONVERGENCE_DEADLINE)
+        .await
+        .expect("convergence");
+
+    let leader = &cluster.nodes[0];
+    let silent = cluster.nodes[1].instance_id;
+    let acker = &cluster.nodes[2];
+    let expected_acks = vec![silent, acker.instance_id];
+
+    let announcement = announce_certified_prepare(&cluster, 42, Duration::from_secs(3)).await;
+    let assignment_digest = announcement
+        .assignment_fence
+        .as_ref()
+        .map(CheckpointAssignmentFence::digest);
+
+    // Only one follower acknowledges; the other retains its pending Prepare.
+    wait_for_certified_prepare(acker, &announcement).await;
+    acker
+        .controller
+        .ack_barrier(&BarrierAck {
+            epoch: 42,
+            checkpoint_id: 42,
+            assignment_digest,
+            flags: 0,
+            disposition: BarrierAckDisposition::Captured,
+            error: None,
+            watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
+        })
+        .await
+        .unwrap();
+
+    // Leader should time out waiting for the silent follower.
+    let outcome = leader
+        .controller
+        .wait_for_quorum(&announcement, &expected_acks, Duration::from_secs(2))
+        .await;
+    match outcome {
+        QuorumOutcome::TimedOut { got, missing } => {
+            assert_eq!(got, vec![acker.instance_id]);
+            assert_eq!(missing, vec![silent]);
+        }
+        other => panic!("expected TimedOut, got {other:?}"),
+    }
+
+    cluster.shutdown().await;
+}

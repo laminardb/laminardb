@@ -4,7 +4,6 @@
 //! - [`JsonObjectAgg`] — `json_object_agg(key, value) -> jsonb` — collects
 //!   key-value pairs into a JSON object
 
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -61,7 +60,7 @@ impl Hash for JsonAgg {
 }
 
 impl AggregateUDFImpl for JsonAgg {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
@@ -209,7 +208,7 @@ impl Hash for JsonObjectAgg {
 }
 
 impl AggregateUDFImpl for JsonObjectAgg {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 

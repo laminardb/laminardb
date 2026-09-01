@@ -3,3 +3,13 @@
 # LaminarDB does not use minizip — only zlib decompression (via libssl3/curl).
 # Debian has not patched this in bookworm as minizip is considered optional.
 CVE-2023-45853
+
+# CVE-2026-33845: GnuTLS DoS via DTLS zero-length fragment.
+# CVE-2026-42010: GnuTLS authentication bypass via NUL character in username.
+# Both are in the gnutls package, a transitive dependency of the bookworm base
+# image. The LaminarDB server binary does its own TLS via rustls/aws-lc and
+# never links or calls gnutls, so neither CVE is reachable by the application.
+# `apt-get upgrade` in the Dockerfile picks up the fixes once Debian ships them;
+# these entries keep the scan green in the meantime.
+CVE-2026-33845
+CVE-2026-42010

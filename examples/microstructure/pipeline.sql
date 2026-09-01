@@ -18,13 +18,12 @@
 -- json.path = 'data' unwraps {"stream":"...","data":{trade fields}}.
 
 CREATE SOURCE all_trades (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT, m BOOLEAN,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP, m BOOLEAN,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/dogeusdt@trade/xrpusdt@trade/bnbusdt@trade',
-    format = 'json',
     json.path = 'data'
-);
+) FORMAT JSON;
 
 -- ── Layer 0: Combined Book Ticker Source ─────────────────────────
 
@@ -32,9 +31,8 @@ CREATE SOURCE all_books (
     s VARCHAR, b DOUBLE, "B" DOUBLE, a DOUBLE, "A" DOUBLE, u BIGINT
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker/dogeusdt@bookTicker/xrpusdt@bookTicker/bnbusdt@bookTicker',
-    format = 'json',
     json.path = 'data'
-);
+) FORMAT JSON;
 
 -- ── Layer 0: BTC Depth (orderbook) ──────────────────────────────
 -- json.path navigates to the "bids"/"asks" array.
@@ -45,19 +43,17 @@ CREATE SOURCE btc_depth_bids (
     price DOUBLE, qty DOUBLE
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/ws/btcusdt@depth20',
-    format = 'json',
     json.path = 'bids',
     json.explode = 'price,qty'
-);
+) FORMAT JSON;
 
 CREATE SOURCE btc_depth_asks (
     price DOUBLE, qty DOUBLE
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/ws/btcusdt@depth20',
-    format = 'json',
     json.path = 'asks',
     json.explode = 'price,qty'
-);
+) FORMAT JSON;
 
 -- ── Layer 0b: Depth Passthrough ───────────────────────────────
 -- Passthrough streams so the TUI can subscribe to depth data.

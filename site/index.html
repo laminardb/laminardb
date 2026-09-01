@@ -4,51 +4,184 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB — Streaming SQL Engine</title>
-  <meta name="description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster. Arrow, DataFusion. Apache 2.0.">
-  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, sub-microsecond, ASOF join, tumbling window, session window">
-  <meta name="robots" content="index, follow">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="description" content="LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. Embed it in Rust or Python, or run as a standalone server. Sub-microsecond state lookups. Apache 2.0.">
+  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, Apache Iceberg, OpenTelemetry, sub-microsecond, bounded join, tumbling window, session window, exactly-once, barrier checkpoint">
+  <meta name="author" content="LaminarDB Contributors">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#f8fafc">
   <link rel="canonical" href="https://laminardb.io">
+  <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
 
   <meta property="og:title" content="LaminarDB — Streaming SQL Engine">
-  <meta property="og:description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster.">
+  <meta property="og:description" content="Open-source streaming SQL engine in Rust. Runs continuous SQL over event streams using Apache Arrow and DataFusion. Embed in Rust or Python, or run as a standalone server.">
   <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
   <meta property="og:url" content="https://laminardb.io">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="LaminarDB">
+  <meta property="og:locale" content="en_US">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="LaminarDB — Streaming SQL Engine">
-  <meta name="twitter:description" content="The streaming engine that starts embedded. Sub-microsecond SQL. Embed in Rust or Python, run standalone, or scale to a cluster.">
+  <meta name="twitter:description" content="Open-source streaming SQL engine in Rust. Continuous SQL over event streams. Embed in Rust or Python, or run as a standalone server.">
   <meta name="twitter:image" content="https://laminardb.io/img/logo.jpg">
 
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
+  <script>
+    (function() {
+      const theme = localStorage.getItem('theme') || 'system';
+      const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    })();
+  </script>
+
+  <style>
+    /* FAQ section style adjustments */
+    #faq .faq-list { max-width: 820px; }
+  </style>
 
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    "name": "LaminarDB",
-    "description": "Streaming SQL engine with sub-microsecond state lookups. Process event streams using SQL, Rust, Apache Arrow, and DataFusion.",
-    "applicationCategory": "Database",
-    "operatingSystem": "Linux, macOS, Windows",
-    "license": "https://opensource.org/licenses/Apache-2.0",
-    "url": "https://laminardb.io",
-    "codeRepository": "https://github.com/laminardb/laminardb",
-    "programmingLanguage": ["Rust", "Python", "SQL"],
-    "softwareVersion": "0.18.12",
-    "author": {
-      "@type": "Organization",
-      "name": "LaminarDB Contributors",
-      "url": "https://github.com/laminardb"
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://laminardb.io/#software",
+        "name": "LaminarDB",
+        "alternateName": "laminar-db",
+        "description": "LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion, with sub-microsecond state lookups. Embed it in Rust or Python applications or run it as a standalone server.",
+        "applicationCategory": "DatabaseApplication",
+        "applicationSubCategory": "Streaming SQL Engine",
+        "operatingSystem": "Linux, macOS, Windows",
+        "license": "https://opensource.org/licenses/Apache-2.0",
+        "url": "https://laminardb.io",
+        "codeRepository": "https://github.com/laminardb/laminardb",
+        "programmingLanguage": ["Rust", "Python", "SQL"],
+        "softwareVersion": "0.25.0",
+        "softwareRequirements": "Rust 1.95 or newer (for embedded use)",
+        "dateModified": "2026-05-25",
+        "author": { "@id": "https://laminardb.io/#org" },
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "featureList": [
+          "Continuous SQL queries over event streams",
+          "Tumbling, sliding, hopping, and session windows",
+          "Bounded interval, temporal, and lookup joins",
+          "Exactly-once sinks via two-phase commit barrier checkpoints",
+          "Kafka, PostgreSQL/MongoDB CDC, Delta Lake, Iceberg, and OpenTelemetry connectors",
+          "Embed in Rust or Python, or run as a standalone server",
+          "Sub-microsecond state lookup target"
+        ]
+      },
+      {
+        "@type": "Organization",
+        "@id": "https://laminardb.io/#org",
+        "name": "LaminarDB Contributors",
+        "url": "https://laminardb.io",
+        "logo": "https://laminardb.io/img/logo.jpg",
+        "sameAs": [
+          "https://github.com/laminardb",
+          "https://github.com/laminardb/laminardb",
+          "https://crates.io/crates/laminar-db"
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://laminardb.io/#website",
+        "url": "https://laminardb.io",
+        "name": "LaminarDB",
+        "description": "The streaming engine that starts embedded",
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "inLanguage": "en"
+      },
+      {
+        "@type": "FAQPage",
+        "@id": "https://laminardb.io/#faq",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "What is LaminarDB?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How fast is LaminarDB?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB targets sub-microsecond state lookups (under 500 nanoseconds) and processes over 500,000 events per core per second. Criterion benchmarks on an AMD Ryzen AI 7 350 laptop measured state lookups in 10 to 16 nanoseconds and throughput of 1.1 to 1.46 million events per second per core."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What connectors does LaminarDB support?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB ships with sources and sinks for Apache Kafka, PostgreSQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is LaminarDB production-ready?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB is pre-1.0. Distributed-state production certification is pending the full single-node and cluster ALO/EO soak matrix."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I use LaminarDB from Python?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. Install the Python package with pip install laminardb. It exposes the same streaming SQL engine as the Rust crate, with a Python-native API for pushing events and subscribing to results."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What SQL features does LaminarDB support?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; bounded interval, temporal, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How does LaminarDB handle exactly-once delivery?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Exactly-once is connector-gated. Barrier checkpoints align source offsets, operator state, and coordinated sink publication; the current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does LaminarDB require a JVM?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No. LaminarDB is written in Rust and ships as a native binary. It has no JVM or other runtime dependencies beyond the operating system."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is LaminarDB open source?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at github.com/laminardb/laminardb."
+            }
+          }
+          ]
+        }
+      ]
     }
-  }
   </script>
 </head>
 <body>
@@ -58,41 +191,73 @@
     <div class="nav-inner">
       <a href="#" class="nav-brand" aria-label="LaminarDB home">
         <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
-          <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00b4d8"/><stop offset="100%" stop-color="#38cbeb"/></linearGradient></defs>
+          <defs>
+            <linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#0ea5e9"/>
+              <stop offset="100%" stop-color="#8b5cf6"/>
+            </linearGradient>
+          </defs>
           <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
           <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#logo-g)" stroke-width="3" fill="none" stroke-linecap="round"/>
           <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
-        <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.12</span>
+        <span>LAMINARDB.IO</span>
+        <span class="version-badge" data-version="tag">v0.25.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
+        <a href="#features">Features</a>
+        <a href="#architecture">Architecture</a>
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
-        <a href="#comparison">Comparison</a>
-        <a href="#status">Status</a>
+        <a href="#ai">AI Functions</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
-        <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
-          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener" class="btn btn-secondary" style="padding: 6px 14px; font-size: 0.8rem;">API Reference</a>
+        <a href="https://github.com/laminardb/laminardb" class="btn btn-primary" target="_blank" rel="noopener" style="padding: 6px 16px; font-size: 0.8rem;">
+          <svg viewBox="0 0 16 16" style="width:14px;height:14px;fill:currentColor;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
       </nav>
+
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon sun-icon" style="display: none;">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon moon-icon" style="display: none;">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon system-icon" style="display: none;">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+      </button>
 
       <button class="nav-toggle" aria-label="Toggle menu">
         <span></span><span></span><span></span>
       </button>
 
       <div class="mobile-menu">
+        <a href="#features">Features</a>
+        <a href="#architecture">Architecture</a>
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
-        <a href="#comparison">Comparison</a>
-        <a href="#status">Status</a>
+        <a href="#ai">AI Functions</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
         <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
       </div>
     </div>
@@ -102,13 +267,16 @@
 
     <!-- Hero -->
     <section class="hero" id="hero">
+      <canvas id="hero-canvas"></canvas>
       <div class="container">
-        <h1 class="hero-tagline">The streaming engine that starts embedded</h1>
+        <h1 class="hero-tagline">LAMINARDB: <span class="gradient-text">STREAMING DATA PLATFORM.</span></h1>
         <p class="hero-desc">
-          Sub-microsecond SQL over event streams.
-          Embed in Rust or Python, run as a standalone server,
-          or scale to a cluster. No JVM.
+          The open-source distributed SQL engine for millisecond-latency streaming and real-time state management.
         </p>
+
+        <div class="hero-actions">
+          <a href="#quick-start" class="btn btn-primary" style="padding: 14px 28px; font-size: 0.95rem;">START FOR FREE</a>
+        </div>
 
         <div class="hero-install-group">
           <div class="hero-install" role="button" tabindex="0" aria-label="Copy Rust install command">
@@ -123,159 +291,370 @@
           </div>
         </div>
 
-        <div class="hero-actions">
-          <a href="#quick-start" class="btn btn-primary">Quick Start</a>
-          <a href="https://github.com/laminardb/laminardb" class="btn btn-secondary" target="_blank" rel="noopener">
-            <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-            View on GitHub
-          </a>
+        <div class="hero-metrics">
+          <div class="hero-metric">
+            <div class="hero-metric-value">4.24<span class="unit">ns</span></div>
+            <div class="hero-metric-label">Tumbling Window</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/window_bench.rs" target="_blank" rel="noopener">core/window_bench.rs</a></div>
+          </div>
+          <div class="hero-metric">
+            <div class="hero-metric-value">235.9M<span class="unit">/s</span></div>
+            <div class="hero-metric-label">Window Throughput</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/window_bench.rs" target="_blank" rel="noopener">core/window_bench.rs</a></div>
+          </div>
+          <div class="hero-metric">
+            <div class="hero-metric-value">Low</div>
+            <div class="hero-metric-label">Hot-Path Overhead</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/Cargo.toml" target="_blank" rel="noopener">core/Cargo.toml</a></div>
+          </div>
         </div>
+      </div>
+    </section>
 
-        <div class="hero-code">
-          <div class="code-block">
-            <div class="code-header">
-              <span style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-dim);">main.rs</span>
-              <button class="copy-btn" aria-label="Copy code">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-                Copy
-              </button>
+    <!-- Features -->
+    <section id="features" style="background:#ffffff;">
+      <div class="container">
+        <h2>Built for High-Performance Streaming</h2>
+        <p class="section-desc">
+          Evaluate window functions, temporal joins, and custom state aggregations continuously as event data streams in.
+                <div class="card-grid">
+          <!-- Card 1 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>MILLISECOND STATEFUL PROCESSING</h3>
+              <p>
+                Execute window functions and session aggregations on a latency-focused, memory-accounted compute path.
+              </p>
             </div>
-            <div class="code-body">
-              <div class="tab-panel active">
-                <pre><code class="language-rust">let db = LaminarDB::open()?;
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Outer glow/flow wave lines (speed/trail) -->
+                <path d="M75 25 A 40 40 0 1 1 25 75" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.3"/>
+                <path d="M85 30 A 45 45 0 0 1 75 85" stroke="var(--accent-purple)" stroke-width="2" opacity="0.5"/>
+                <path d="M92 40 A 50 50 0 0 1 85 92" stroke="var(--accent)" stroke-width="1" stroke-dasharray="5 5" opacity="0.4"/>
+                
+                <!-- Stopwatch body -->
+                <circle cx="50" cy="55" r="30" stroke="var(--text)" stroke-width="3" fill="var(--bg-surface)"/>
+                <circle cx="50" cy="55" r="24" stroke="var(--text-dim)" stroke-width="1" stroke-dasharray="2 4"/>
+                
+                <!-- Stopwatch controls -->
+                <path d="M50 25 V 20 M45 20 H 55" stroke="var(--text)" stroke-width="3"/> <!-- Top plunger -->
+                <path d="M72 33 L 76 29" stroke="var(--text)" stroke-width="3"/> <!-- Side button -->
+                
+                <!-- Hand / Needle -->
+                <circle cx="50" cy="55" r="3" fill="var(--accent-purple)" stroke="var(--accent-purple)"/>
+                <line x1="50" y1="55" x2="68" y2="37" stroke="var(--accent-purple)" stroke-width="2.5"/>
+                
+                <!-- Tech details inside clock face -->
+                <path d="M45 42 H 55" stroke="var(--accent)" stroke-width="1.5" opacity="0.6"/>
+                <circle cx="50" cy="67" r="4" stroke="var(--accent)" stroke-width="1" opacity="0.8"/>
+              </svg>
+            </div>
+          </div>
 
-db.execute("CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
-)").await?;
+          <!-- Card 2 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>DISTRIBUTED MPP SCALING</h3>
+              <p>
+                Scale bounded interval joins across clusters with canonical vnode partitioning and lease-fenced coordination.
+              </p>
+            </div>
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Distributed background grid/connections -->
+                <path d="M20 75 L 50 25 L 80 75 Z" stroke="var(--text-dim)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.4"/>
+                <path d="M20 75 H 80" stroke="var(--text-dim)" stroke-width="1.5" stroke-dasharray="3 3" opacity="0.4"/>
+                
+                <!-- Coordinator Node (Top) -->
+                <circle cx="50" cy="25" r="12" stroke="var(--accent-purple)" stroke-width="2.5" fill="var(--bg-surface)"/>
+                <circle cx="50" cy="25" r="5" fill="var(--accent-purple)"/>
+                
+                <!-- Worker Node A (Bottom Left) -->
+                <circle cx="20" cy="75" r="10" stroke="var(--text)" stroke-width="2" fill="var(--bg-surface)"/>
+                <circle cx="20" cy="75" r="4" fill="var(--accent)"/>
+                
+                <!-- Worker Node B (Bottom Right) -->
+                <circle cx="80" cy="75" r="10" stroke="var(--text)" stroke-width="2" fill="var(--bg-surface)"/>
+                <circle cx="80" cy="75" r="4" fill="var(--accent)"/>
+                
+                <!-- Data packets flowing -->
+                <circle cx="35" cy="50" r="3" fill="var(--accent)"/>
+                <circle cx="65" cy="50" r="3" fill="var(--accent-purple)"/>
+                <path d="M50 75 L 50 83" stroke="var(--text-dim)" stroke-width="1" stroke-dasharray="2 2" opacity="0.6"/>
+              </svg>
+            </div>
+          </div>
 
-db.execute("CREATE STREAM vwap AS
-    SELECT symbol,
-           SUM(price * CAST(volume AS DOUBLE))
-             / SUM(CAST(volume AS DOUBLE)) AS vwap
-    FROM trades
-    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
-    EMIT ON WINDOW CLOSE
-").await?;
+          <!-- Card 3 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>ON-DEMAND LOOKUP SOURCES</h3>
+              <p>
+                Query slowly-changing reference tables (Postgres, CDC, Delta Lake, Iceberg) directly with in-memory caching (S3-FIFO eviction) and pushdown predicates.
+              </p>
+            </div>
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Top Stream input (Sine wave) -->
+                <path d="M10 25 C 20 15, 25 35, 35 25 C 45 15, 50 35, 60 25" stroke="var(--accent)" stroke-width="2.5"/>
+                <circle cx="10" cy="25" r="2.5" fill="var(--accent)"/>
+                <circle cx="60" cy="25" r="2.5" fill="var(--accent)"/>
 
-db.start().await?;</code></pre>
+                <!-- Bottom Table input (Grid representing dimension table) -->
+                <rect x="15" y="55" width="25" height="20" rx="3" stroke="var(--text-dim)" stroke-width="2" fill="var(--bg-surface)"/>
+                <line x1="15" y1="62" x2="40" y2="62" stroke="var(--text-dim)" stroke-width="1"/>
+                <line x1="15" y1="69" x2="40" y2="69" stroke="var(--text-dim)" stroke-width="1"/>
+                <line x1="27" y1="55" x2="27" y2="75" stroke="var(--text-dim)" stroke-width="1"/>
+                
+                <!-- Flow/connector arrows merging -->
+                <path d="M48 28 L 58 42" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="3 3"/>
+                <path d="M48 62 L 58 48" stroke="var(--text-dim)" stroke-width="1.5" stroke-dasharray="3 3"/>
+                
+                <!-- Output joined table/grid on the right -->
+                <rect x="62" y="32" width="28" height="28" rx="4" stroke="var(--accent-purple)" stroke-width="2.5" fill="var(--bg-surface)"/>
+                <line x1="62" y1="41" x2="90" y2="41" stroke="var(--accent-purple)" stroke-width="1.5"/>
+                <line x1="62" y1="50" x2="90" y2="50" stroke="var(--accent-purple)" stroke-width="1.5"/>
+                <line x1="71" y1="32" x2="71" y2="60" stroke="var(--accent-purple)" stroke-width="1.5"/>
+                <line x1="81" y1="32" x2="81" y2="60" stroke="var(--accent-purple)" stroke-width="1.5"/>
+
+                <!-- Glowing join node in the center -->
+                <circle cx="55" cy="45" r="5" fill="var(--accent-purple)" opacity="0.2"/>
+                <circle cx="55" cy="45" r="2.5" fill="var(--accent-purple)"/>
+                
+                <!-- Tech decoration (arrows/diagonal split) at top right -->
+                <path d="M80 12 L 88 12 M 88 12 V 20 M 88 12 L 80 20" stroke="var(--accent)" stroke-width="1.5" opacity="0.6"/>
+              </svg>
+            </div>
+          </div>
+
+          <!-- Card 4 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>STATEFUL STREAM JOINS</h3>
+              <p>
+                Correlate independent event pipelines using bounded interval joins.
+              </p>
+            </div>
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Stream 1 (top line) -->
+                <path d="M10 30 H 90" stroke="var(--accent)" stroke-width="2.5"/>
+                <circle cx="20" cy="30" r="3" fill="var(--accent)"/>
+                <circle cx="50" cy="30" r="3" fill="var(--accent)"/>
+                <circle cx="80" cy="30" r="3" fill="var(--accent)"/>
+
+                <!-- Stream 2 (bottom line) -->
+                <path d="M10 70 H 90" stroke="var(--accent-purple)" stroke-width="2.5"/>
+                <circle cx="35" cy="70" r="3" fill="var(--accent-purple)"/>
+                <circle cx="60" cy="70" r="3" fill="var(--accent-purple)"/>
+                <circle cx="85" cy="70" r="3" fill="var(--accent-purple)"/>
+
+                <!-- Join linkages representing temporal window bounds -->
+                <path d="M50 30 L 60 70" stroke="var(--text)" stroke-width="1.5" stroke-dasharray="3 3"/>
+                <path d="M20 30 L 35 70" stroke="var(--text)" stroke-width="1.5" stroke-dasharray="3 3"/>
+                <circle cx="55" cy="50" r="4" fill="var(--accent)" opacity="0.8"/>
+                <circle cx="27" cy="50" r="4" fill="var(--accent-purple)" opacity="0.8"/>
+
+                <!-- Decorative boundary box/brackets around join area -->
+                <path d="M40 20 H 45 V 80 H 40" stroke="var(--text-dim)" stroke-width="1" opacity="0.5"/>
+                <path d="M70 20 H 65 V 80 H 70" stroke="var(--text-dim)" stroke-width="1" opacity="0.5"/>
+              </svg>
+            </div>
+          </div>
+
+          <!-- Card 5 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>EXACTLY-ONCE GUARANTEES</h3>
+              <p>
+                Achieve transactional safety and partition-tolerant stream alignment via Chandy-Lamport barrier checkpoints and two-phase commits.
+              </p>
+            </div>
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Checkpoint storage (shield/safe icon in background) -->
+                <path d="M50 15 L 80 25 V 50 C 80 70, 50 85, 50 85 C 50 85, 20 70, 20 50 V 25 L 50 15 Z" stroke="var(--accent-purple)" stroke-width="2" fill="var(--bg-surface)" opacity="0.5"/>
+                
+                <!-- Horizontal event flow -->
+                <path d="M10 50 H 90" stroke="var(--text-dim)" stroke-width="2"/>
+                
+                <!-- Vertical Checkpoint Barrier line -->
+                <line x1="50" y1="20" x2="50" y2="80" stroke="var(--accent)" stroke-width="3" stroke-dasharray="4 4"/>
+                
+                <!-- Checkpoint barrier packet/marker -->
+                <circle cx="50" cy="50" r="5" fill="var(--accent)" stroke="var(--accent)" stroke-width="1"/>
+                <circle cx="30" cy="50" r="3" fill="var(--text)"/>
+                <circle cx="70" cy="50" r="3" fill="var(--text)"/>
+              </svg>
+            </div>
+          </div>
+
+          <!-- Card 6 -->
+          <div class="card">
+            <div class="card-content">
+              <h3>LIVE MATERIALIZED VIEWS</h3>
+              <p>
+                Query active streaming state instantly with standard SQL, using automatically updated materialized views that act like regular tables.
+              </p>
+            </div>
+            <div class="card-illustration">
+              <svg viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="illustration-svg">
+                <!-- Stacked database cylinders / tables representing materialized views -->
+                <!-- Top Table -->
+                <rect x="50" y="20" width="35" height="16" rx="3" stroke="var(--accent)" stroke-width="2" fill="var(--bg-surface)"/>
+                <line x1="50" y1="28" x2="85" y2="28" stroke="var(--accent)" stroke-width="1"/>
+                <line x1="62" y1="20" x2="62" y2="36" stroke="var(--accent)" stroke-width="1"/>
+                
+                <!-- Middle Table -->
+                <rect x="45" y="42" width="35" height="16" rx="3" stroke="var(--accent-purple)" stroke-width="2.5" fill="var(--bg-surface)"/>
+                <line x1="45" y1="50" x2="80" y2="50" stroke="var(--accent-purple)" stroke-width="1.5"/>
+                <line x1="57" y1="42" x2="57" y2="58" stroke="var(--accent-purple)" stroke-width="1.5"/>
+                
+                <!-- Bottom Table -->
+                <rect x="40" y="64" width="35" height="16" rx="3" stroke="var(--text-dim)" stroke-width="2" fill="var(--bg-surface)"/>
+                <line x1="40" y1="72" x2="75" y2="72" stroke="var(--text-dim)" stroke-width="1"/>
+                <line x1="52" y1="64" x2="52" y2="80" stroke="var(--text-dim)" stroke-width="1"/>
+
+                <!-- Left: Continuous dynamic update arrows flowing in -->
+                <path d="M10 35 C 20 35, 20 45, 30 45" stroke="var(--accent)" stroke-width="2" stroke-dasharray="3 3"/>
+                <path d="M10 50 C 25 50, 20 50, 35 50" stroke="var(--accent-purple)" stroke-width="2.5"/>
+                <path d="M10 65 C 20 65, 20 55, 30 55" stroke="var(--accent)" stroke-width="2" stroke-dasharray="3 3"/>
+                
+                <!-- Flow arrowhead indicators -->
+                <path d="M30 42 L 35 50 L 30 58" fill="var(--accent-purple)" stroke="var(--accent-purple)" stroke-width="1"/>
+                <path d="M25 32 L 30 35 L 25 38" fill="var(--accent)" stroke="var(--accent)" stroke-width="1" opacity="0.6"/>
+
+                <!-- Refresh / live loop decoration at top right -->
+                <path d="M82 15 A 6 6 0 1 1 78 10" stroke="var(--accent)" stroke-width="1.5" opacity="0.6"/>
+                <path d="M78 7 H 82 V 11" stroke="var(--accent)" stroke-width="1.5" opacity="0.6"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Architecture Split Section -->
+    <section id="architecture">
+      <div class="container">
+        <div class="split-layout">
+          <div class="split-text">
+            <h2>Engineered for Low-Overhead Stream Processing</h2>
+            <p>
+              LaminarDB runs SQL queries over event streams. Aggregations, joins, and windows are evaluated continuously in a dedicated thread topology.
+            </p>
+            <p>
+              <strong>Latency-focused compute.</strong> Bounded batches, managed state accounting, and lock-free channels reduce hot-path overhead.
+            </p>
+            <p>
+              <strong>Connector-gated exactly-once delivery.</strong> Barrier checkpoints align source offsets, state, and coordinated sink publication. The current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake.
+            </p>
+          </div>
+
+          <div class="arch-schematic">
+            <!-- Ring 0 -->
+            <div class="arch-layer ring-0">
+              <div class="layer-header">
+                <span class="layer-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="4"></circle></svg>
+                  Compute Thread
+                </span>
+                <span class="layer-badge">Ring 0</span>
+              </div>
+              <p class="layer-desc">Dedicated tokio runtime · Zero allocations on data path</p>
+              <div class="layer-components">
+                <span class="layer-chip">StreamingCoordinator</span>
+                <span class="layer-chip">Operators</span>
+                <span class="layer-chip">In-Memory State</span>
+                <span class="layer-chip">DataFusion Exec</span>
+              </div>
+            </div>
+
+            <div class="arch-connector">Crossfire MPSC Channels</div>
+
+            <!-- Ring 1 -->
+            <div class="arch-layer">
+              <div class="layer-header">
+                <span class="layer-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"></circle></svg>
+                  I/O Runtime
+                </span>
+                <span class="layer-badge">Ring 1</span>
+              </div>
+              <p class="layer-desc">Main tokio runtime · Asynchronous boundary</p>
+              <div class="layer-components">
+                <span class="layer-chip">Source Tasks</span>
+                <span class="layer-chip">Sink Tasks</span>
+                <span class="layer-chip">Checkpoint Coordinator</span>
+                <span class="layer-chip">Recovery</span>
+              </div>
+            </div>
+
+            <div class="arch-connector">Bounded Channels</div>
+
+            <!-- Ring 2 -->
+            <div class="arch-layer">
+              <div class="layer-header">
+                <span class="layer-title">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+                  Control Plane
+                </span>
+                <span class="layer-badge">Ring 2</span>
+              </div>
+              <p class="layer-desc">No latency requirements · Cluster coordination</p>
+              <div class="layer-components">
+                <span class="layer-chip">REST API</span>
+                <span class="layer-chip">WebSocket</span>
+                <span class="layer-chip">Console UI</span>
+                <span class="layer-chip">Cluster Coordination</span>
+                <span class="layer-chip">Metrics</span>
               </div>
             </div>
           </div>
         </div>
-
-        <div class="hero-metrics">
-          <div class="hero-metric">
-            <div class="hero-metric-value">&lt;500<span class="unit">ns</span></div>
-            <div class="hero-metric-label">state lookup</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></div>
-          </div>
-          <div class="hero-metric">
-            <div class="hero-metric-value">1M+<span class="unit">/s</span></div>
-            <div class="hero-metric-label">events per core</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/streaming_bench.rs" target="_blank" rel="noopener">streaming_bench.rs</a></div>
-          </div>
-          <div class="hero-metric">
-            <div class="hero-metric-value">0</div>
-            <div class="hero-metric-label">hot-path allocations</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/alloc/guard.rs" target="_blank" rel="noopener">alloc/guard.rs</a></div>
-          </div>
-        </div>
       </div>
     </section>
 
-    <!-- What It Is -->
-    <section id="what">
+    <!-- Quick Start (Code Section) -->
+    <section id="quick-start" class="code-section">
       <div class="container">
-        <h2>What it is</h2>
-        <div class="text-block">
-          <p>
-            LaminarDB is a streaming SQL engine.
-            Write SQL queries over event streams &mdash; windows, joins, aggregations &mdash;
-            and the engine evaluates them continuously as events arrive.
-            Built on <a href="https://arrow.apache.org/" target="_blank" rel="noopener">Apache Arrow 57</a>
-            and <a href="https://datafusion.apache.org/" target="_blank" rel="noopener">DataFusion 52</a>.
-          </p>
-          <p>
-            <strong>Three deployment modes.</strong>
-            Embed it in your application &mdash; Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
-            Run it as a standalone server (<code>laminardb</code> binary) with Kafka, CDC, and Delta Lake connectors.
-            Or deploy as a cluster &mdash; distributed mode is coming soon.
-          </p>
-          <p>
-            It is not a message broker (it consumes from Kafka, doesn't replace it)
-            and it is not a general-purpose OLTP/OLAP database &mdash; it processes streams.
-          </p>
-        </div>
+        <h2>Write Streaming SQL</h2>
+        <p class="section-desc">
+          Add the dependency to your project and execute continuous queries using standard SQL.
+        </p>
 
-        <div class="arch-rings">
-          <div class="ring ring-0">
-            <div class="ring-header">
-              <span class="ring-name">Ring 0 &mdash; Hot Path</span>
-              <span class="ring-constraint">&lt;500ns &middot; zero alloc &middot; no locks</span>
+        <!-- Mock Editor -->
+        <div class="editor-window code-block">
+          <div class="editor-header">
+            <div class="editor-dots">
+              <span class="editor-dot red"></span>
+              <span class="editor-dot yellow"></span>
+              <span class="editor-dot green"></span>
             </div>
-            <div class="ring-chips">
-              <span class="ring-chip">Reactor</span>
-              <span class="ring-chip">Operators</span>
-              <span class="ring-chip">State Store</span>
-              <span class="ring-chip">SPSC Queues</span>
-            </div>
-          </div>
-          <div class="ring-divider">SPSC queues</div>
-          <div class="ring ring-1">
-            <div class="ring-header">
-              <span class="ring-name">Ring 1 &mdash; Background I/O</span>
-              <span class="ring-constraint">async &middot; bounded latency impact</span>
-            </div>
-            <div class="ring-chips">
-              <span class="ring-chip">WAL</span>
-              <span class="ring-chip">Checkpoints</span>
-              <span class="ring-chip">Connectors</span>
-              <span class="ring-chip">Recovery</span>
-            </div>
-          </div>
-          <div class="ring-divider">Bounded channels</div>
-          <div class="ring ring-2">
-            <div class="ring-header">
-              <span class="ring-name">Ring 2 &mdash; Control Plane</span>
-              <span class="ring-constraint">no latency requirements</span>
-            </div>
-            <div class="ring-chips">
-              <span class="ring-chip">REST API</span>
-              <span class="ring-chip">Metrics</span>
-              <span class="ring-chip">Config</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- Quick Start -->
-    <section id="quick-start">
-      <div class="container">
-        <h2>Quick start</h2>
-        <p class="section-desc">Add the dependency and write your first streaming query.</p>
-
-        <div class="code-block">
-          <div class="code-header">
-            <div class="code-tabs">
-              <button class="code-tab active" data-tab="qs-rust">Rust Library</button>
-              <button class="code-tab" data-tab="qs-sql">SQL Examples</button>
-              <button class="code-tab" data-tab="qs-server">Standalone Server</button>
-              <button class="code-tab" data-tab="qs-kafka">Kafka Pipeline</button>
+            <div class="editor-tabs">
+              <button class="code-tab active" data-tab="qs-rust">main.rs (Rust)</button>
+              <button class="code-tab" data-tab="qs-python">app.py (Python)</button>
+              <button class="code-tab" data-tab="qs-docker">docker run</button>
+              <button class="code-tab" data-tab="qs-helm">helm install</button>
+              <button class="code-tab" data-tab="qs-binary">prebuilt binary</button>
+              <button class="code-tab" data-tab="qs-sql">streaming.sql</button>
             </div>
             <button class="copy-btn" aria-label="Copy code">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
               Copy
             </button>
           </div>
-          <div class="code-body">
-            <div class="tab-panel active" id="qs-rust">
-              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.18", tokio = { version = "1", features = ["full"] }
+          <div class="editor-container collapsed">
+            <div class="editor-body">
+              <!-- Rust -->
+              <div class="tab-panel active" id="qs-rust">
+                <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.25", tokio = { version = "1", features = ["full"] }
 
 use laminar_db::LaminarDB;
 
 #[tokio::main]
-async fn main() -&gt; anyhow::Result&lt;()&gt; {
+async fn main() -> anyhow::Result<()> {
     let db = LaminarDB::open()?;
 
     db.execute("CREATE SOURCE events (
@@ -292,23 +671,102 @@ async fn main() -&gt; anyhow::Result&lt;()&gt; {
     db.start().await?;
 
     // Push events into the source (typed via derive macro)
-    let source = db.source::&lt;Event&gt;("events")?;
+    let source = db.source::<Event>("events")?;
     source.push(Event { key: "sensor-1".into(), value: 42.0, ts: 1700000000000 });
 
     // Subscribe to streaming results
-    let sub = db.subscribe::&lt;Summary&gt;("summary")?;
+    let sub = db.subscribe::<Summary>("summary")?;
     while let Some(rows) = sub.poll() {
-        for row in &amp;rows {
+        for row in &rows {
             println!("{}: count={}, avg={:.2}", row.key, row.total, row.avg);
         }
     }
 
     Ok(())
 }</code></pre>
-            </div>
+              </div>
 
-            <div class="tab-panel" id="qs-sql">
-              <pre><code class="language-sql">-- Tumbling window: 1-minute OHLC bars
+              <!-- Python -->
+              <div class="tab-panel" id="qs-python">
+                <pre><code class="language-python"># pip install laminardb
+
+import laminardb
+
+conn = laminardb.open(":memory:")
+
+conn.execute("""
+    CREATE SOURCE events (key VARCHAR, value DOUBLE, ts TIMESTAMP)
+""")
+
+conn.execute("""
+    CREATE STREAM summary AS
+    SELECT key, COUNT(*) AS total, AVG(value) AS avg
+    FROM events
+    GROUP BY key, TUMBLE(ts, INTERVAL '1' MINUTE)
+    EMIT ON WINDOW CLOSE
+""")
+
+# Push events in, then query results back
+conn.insert("events", [
+    {"key": "sensor-1", "value": 42.0, "ts": 1700000000000},
+    {"key": "sensor-1", "value": 44.0, "ts": 1700000001000},
+])
+
+conn.sql("SELECT * FROM summary").show()
+conn.close()</code></pre>
+              </div>
+
+              <!-- Docker -->
+              <div class="tab-panel" id="qs-docker">
+                <pre><code class="language-bash"># Pull the latest standalone LaminarDB server image
+docker pull laminardb/laminardb-server:latest
+
+# Run standalone server with REST/WebSocket API on port 8080
+docker run -d \
+  --name laminardb \
+  -p 8080:8080 \
+  -v $(pwd)/laminardb.toml:/etc/laminardb/laminardb.toml \
+  laminardb/laminardb-server:latest
+
+# Verify that the server is responding to health checks
+curl http://localhost:8080/health</code></pre>
+              </div>
+
+              <!-- Helm -->
+              <div class="tab-panel" id="qs-helm">
+                <pre><code class="language-bash"># 1. Add the LaminarDB Helm repository and install the standalone release
+helm repo add laminardb https://laminardb.io/charts
+helm repo update
+helm install laminar-dev laminardb/laminardb
+
+# 2. For high-availability clustering, install with clustered parameters:
+helm install laminar-prod laminardb/laminardb \
+  --set replicaCount=3 \
+  --set cluster.enabled=true \
+  --set persistence.size=10Gi</code></pre>
+              </div>
+
+              <!-- Prebuilt Binary -->
+              <div class="tab-panel" id="qs-binary">
+                <pre><code class="language-bash"># 1. Fetch the latest release version dynamically
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+
+# 2. Download and extract the matching package for your platform
+# For Linux x86_64:
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
+tar xzf laminardb-server-*-linux-gnu-${VERSION}.tar.gz
+
+# For macOS (Apple Silicon):
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-aarch64-apple-darwin-${VERSION}.tar.gz"
+tar xzf laminardb-server-*-apple-darwin-${VERSION}.tar.gz
+
+# 3. Start standalone server using configuration file
+./laminardb --config laminardb.toml</code></pre>
+              </div>
+
+              <!-- SQL -->
+              <div class="tab-panel" id="qs-sql">
+                <pre><code class="language-sql">-- Tumbling window: 1-minute OHLC bars
 CREATE STREAM ohlc_1m AS
 SELECT symbol,
        first_value(price) AS open,
@@ -327,499 +785,396 @@ FROM clickstream
 GROUP BY user_id, session(ts, INTERVAL '30' SECOND)
 EMIT ON WINDOW CLOSE;
 
--- ASOF join: enrich trades with closest preceding quote
-SELECT t.symbol, t.price, q.bid, q.ask,
-       t.price - q.bid AS spread
-FROM trades t
-ASOF JOIN quotes q
-    MATCH_CONDITION(t.ts &gt;= q.ts)
-    ON t.symbol = q.symbol;
-
 -- Interval join: match orders to payments within 1 hour
 CREATE STREAM matched AS
 SELECT o.order_id, o.amount, p.status
 FROM orders o
 INNER JOIN payments p ON o.order_id = p.order_id
-    AND p.ts BETWEEN o.ts AND o.ts + 3600000;
-
--- Temporal join: point-in-time lookup
-SELECT o.*, r.rate
-FROM orders o
-JOIN rates FOR SYSTEM_TIME AS OF o.order_time AS r
-    ON o.currency = r.currency;</code></pre>
+    AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR;</code></pre>
+              </div>
             </div>
-
-            <div class="tab-panel" id="qs-server">
-              <pre><code class="language-bash"># Option 1: Download pre-compiled binary (latest release)
-VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
-
-# Linux x86_64
-curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
-tar xzf laminardb-server-*.tar.gz
-
-# macOS Apple Silicon
-curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-aarch64-apple-darwin-${VERSION}.tar.gz"
-
-# All platforms: github.com/laminardb/laminardb/releases
-
-# Option 2: Build from source
-cargo install laminar-server
-
-# Option 3: Docker
-docker compose up
-
-# Run
-./laminardb --config laminardb.toml</code></pre>
-            </div>
-
-            <div class="tab-panel" id="qs-kafka">
-              <pre><code class="language-sql">-- Kafka source with Avro and Schema Registry
-CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT
-) FROM KAFKA (
-    brokers = 'localhost:9092',
-    topic = 'market-trades',
-    group_id = 'laminar-analytics',
-    format = 'avro',
-    schema.registry.url = 'http://schema-registry:8081'
-);
-
--- Real-time aggregation
-CREATE STREAM trade_summary AS
-SELECT symbol, COUNT(*) AS trades,
-       AVG(price) AS avg_price,
-       SUM(volume) AS total_volume
-FROM trades
-GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
-EMIT ON WINDOW CLOSE;
-
--- Kafka sink with exactly-once delivery
-CREATE SINK output INTO KAFKA (
-    brokers = 'localhost:9092',
-    topic = 'trade-summaries',
-    format = 'json',
-    delivery.guarantee = 'exactly-once'
-) AS SELECT * FROM trade_summary;
-
--- Delta Lake sink for historical analytics
-CREATE SINK lake INTO DELTA_LAKE (
-    path = 's3://my-bucket/trade_summary',
-    write_mode = 'append',
-    delivery.guarantee = 'exactly-once'
-) AS SELECT * FROM trade_summary;</code></pre>
+            <div class="expand-overlay">
+              <button class="expand-btn" aria-label="Expand code block">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                Expand Code
+              </button>
             </div>
           </div>
         </div>
-
-        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
-          More examples:
-          <a href="https://github.com/laminardb/laminardb/tree/main/examples" target="_blank" rel="noopener">examples/</a> &middot;
-          <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API reference</a> &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/docs/SQL_REFERENCE.md" target="_blank" rel="noopener">SQL reference</a>
-        </p>
       </div>
     </section>
 
-    <!-- Connectors -->
+    <!-- Connectors Section -->
     <section id="connectors">
       <div class="container">
-        <h2>Connectors</h2>
+        <h2>Unified Connectivity</h2>
         <p class="section-desc">
-          All connectors are feature-gated. Compile only what you use.
-          Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.
+          Build end-to-end streaming architectures. All connectors are compiled conditionally via Cargo feature gates.
         </p>
 
-        <div class="connector-table-wrapper">
-          <table class="connector-table">
-            <thead>
-              <tr>
-                <th>Connector</th>
-                <th>Direction</th>
-                <th>Status</th>
-                <th>Feature Flag</th>
-                <th>Notes</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Kafka</td>
-                <td>Source + Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">kafka</code></td>
-                <td>Avro, JSON, CSV. Confluent Schema Registry. Exactly-once via 2PC.</td>
-              </tr>
-              <tr>
-                <td>PostgreSQL CDC</td>
-                <td>Source</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">postgres-cdc</code></td>
-                <td>Logical replication via pgoutput. LSN-based checkpoint tracking.</td>
-              </tr>
-              <tr>
-                <td>PostgreSQL Sink</td>
-                <td>Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">postgres-sink</code></td>
-                <td>COPY BINARY (append) or INSERT ON CONFLICT (upsert).</td>
-              </tr>
-              <tr>
-                <td>MySQL CDC</td>
-                <td>Source</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">mysql-cdc</code></td>
-                <td>Binlog replication. GTID or file+position modes.</td>
-              </tr>
-              <tr>
-                <td>MongoDB CDC</td>
-                <td>Source + Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">mongodb-cdc</code></td>
-                <td>Change streams, resume tokens. Sink: ordered/unordered writes, upsert, CDC replay.</td>
-              </tr>
-              <tr>
-                <td>Delta Lake</td>
-                <td>Source + Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">delta-lake</code></td>
-                <td>S3, Azure, GCS, Unity, Glue catalogs. Exactly-once epoch tracking.</td>
-              </tr>
-              <tr>
-                <td>WebSocket</td>
-                <td>Source + Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">websocket</code></td>
-                <td>Client and server modes. JSON/CSV serialization.</td>
-              </tr>
-              <tr>
-                <td>File Auto-Loader</td>
-                <td>Source + Sink</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">files</code></td>
-                <td>CSV, JSON Lines, Parquet, plain text. Schema inference and evolution.</td>
-              </tr>
-              <tr>
-                <td>Parquet Lookup</td>
-                <td>Source</td>
-                <td><span class="status-impl">Implemented</span></td>
-                <td><code class="feature-flag">parquet-lookup</code></td>
-                <td>Object-store-backed dimension tables for lookup joins.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
-          Custom connectors: implement the
-          <a href="https://laminardb.io/api/laminar_connectors/connector/trait.SourceConnector.html" target="_blank" rel="noopener">SourceConnector</a> /
-          <a href="https://laminardb.io/api/laminar_connectors/connector/trait.SinkConnector.html" target="_blank" rel="noopener">SinkConnector</a>
-          traits.
-        </p>
-      </div>
-    </section>
-
-    <!-- Deployment Modes -->
-    <section id="deployment">
-      <div class="container">
-        <h2>Deployment</h2>
-
-        <div class="deploy-grid">
-          <div class="deploy-card">
-            <h3>Embedded</h3>
-            <p>
-              Rust: <code>cargo add laminar-db</code>.
-              Python: <code>pip install laminardb</code>.
-              The engine runs in your process &mdash; push events, subscribe to results.
-            </p>
-            <p>Good fit for edge processing, embedded analytics, and latency-sensitive apps.</p>
+        <div class="connectors-grid">
+          <!-- Card Kafka -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">Apache Kafka</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink</div>
+            <div class="connector-flag">--features kafka</div>
           </div>
-          <div class="deploy-card">
-            <h3>Standalone Server</h3>
-            <p>
-              <a href="https://github.com/laminardb/laminardb/releases/latest" target="_blank" rel="noopener">Download pre-compiled binaries</a>
-              for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
-              Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
-            </p>
-            <p>
-              TOML configuration with <code>${ENV_VAR}</code> substitution.
-              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload (edit config &rarr; automatic apply).
-            </p>
-            <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
+
+          <!-- Card NATS -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">NATS</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink (JetStream)</div>
+            <div class="connector-flag">--features nats</div>
           </div>
-          <div class="deploy-card">
-            <h3>Cluster</h3>
-            <span class="label-planned">Coming Soon</span>
-            <p>
-              Multi-node deployment using Raft consensus and gossip discovery.
-              Core primitives are in the workspace &mdash; cluster mode is being wired into the server.
-            </p>
-            <p><a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Track progress on the roadmap</a></p>
+
+          <!-- Card PG CDC -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">PostgreSQL CDC</span>
+              <span class="connector-badge">Preview</span>
+            </div>
+            <div class="connector-direction">Source (pgoutput)</div>
+            <div class="connector-flag">--features postgres-cdc</div>
+          </div>
+
+          <!-- Card PG Sink -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">PostgreSQL Sink</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Sink (COPY/UPSERT)</div>
+            <div class="connector-flag">--features postgres-sink</div>
+          </div>
+
+          <!-- Card MongoDB CDC -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">MongoDB CDC</span>
+              <span class="connector-badge">Preview</span>
+            </div>
+            <div class="connector-direction">Source + Sink</div>
+            <div class="connector-flag">--features mongodb-cdc</div>
+          </div>
+
+          <!-- Card Delta Lake -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">Delta Lake</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink</div>
+            <div class="connector-flag">--features delta-lake</div>
+          </div>
+
+          <!-- Card Apache Iceberg -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">Apache Iceberg</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink</div>
+            <div class="connector-flag">--features iceberg</div>
+          </div>
+
+          <!-- Card OpenTelemetry -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">OpenTelemetry</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source (OTLP/gRPC)</div>
+            <div class="connector-flag">--features otel</div>
+          </div>
+
+          <!-- Card WebSocket -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">WebSocket</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink</div>
+            <div class="connector-flag">--features websocket</div>
+          </div>
+
+          <!-- Card Files -->
+          <div class="connector-card">
+            <div class="connector-header">
+              <span class="connector-name">File Loader</span>
+              <span class="connector-badge stable">Stable</span>
+            </div>
+            <div class="connector-direction">Source + Sink (Parquet/JSON)</div>
+            <div class="connector-flag">--features files</div>
           </div>
         </div>
       </div>
     </section>
 
-    <!-- Comparison -->
-    <section id="comparison">
+    <!-- Web Console Section -->
+    <section id="console">
       <div class="container">
-        <h2>How it compares</h2>
-        <p class="section-desc">
-          Different tools for different problems.
-          LaminarDB targets low-latency, single-node workloads today &mdash; cluster mode is coming.
-        </p>
+        <div class="split-layout">
+          <div class="split-text">
+            <h2>LaminarDB Web Console</h2>
+            <p>
+              Inspect and manage your streaming SQL nodes. Author queries, inspect schemas, and watch data flow through your pipeline in real time.
+            </p>
+            <ul class="feature-list" style="margin: 1.5rem 0; padding-left: 1.25rem; color: var(--slate-600); line-height: 1.75;">
+              <li><strong>Interactive SQL Worksheet</strong>: Execute streaming DDL/DML with live tailing subscription panels.</li>
+              <li><strong>Live Lineage DAGs</strong>: Introspect query topologies and watch throughput rates from sources to sinks.</li>
+              <li><strong>Catalog Browser</strong>: Browse active streams, materialized views, schemas, and connector configurations.</li>
+              <li><strong>Cluster Health Heatmaps</strong>: Monitor coordinator leader status, active node gossip, and partition leases.</li>
+            </ul>
+            <a href="https://laminardb.github.io/laminardb-console-ui/" target="_blank" rel="noopener" class="btn btn-primary" style="display: inline-flex; align-items: center; gap: 8px;">
+              Open Web Console
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg>
+            </a>
+          </div>
 
-        <div class="comparison-wrapper">
-          <table class="comparison-table">
-            <thead>
-              <tr>
-                <th></th>
-                <th class="hl">LaminarDB</th>
-                <th>Apache Flink</th>
-                <th>Kafka Streams</th>
-                <th>Arroyo</th>
-                <th>kdb+</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Type</td>
-                <td class="hl">SQL engine</td>
-                <td>Distributed framework</td>
-                <td>Stream library (JVM)</td>
-                <td>Distributed engine</td>
-                <td>Timeseries DB</td>
-              </tr>
-              <tr>
-                <td>Language</td>
-                <td class="hl">Rust + Python</td>
-                <td>Java / Scala</td>
-                <td>Java</td>
-                <td>Rust</td>
-                <td>q/k (proprietary)</td>
-              </tr>
-              <tr>
-                <td>SQL</td>
-                <td class="hl">DataFusion</td>
-                <td>Flink SQL</td>
-                <td>None</td>
-                <td>DataFusion</td>
-                <td>q language</td>
-              </tr>
-              <tr>
-                <td>Deployment</td>
-                <td class="hl">Embedded, server, cluster (soon)</td>
-                <td class="win">Cluster (YARN/K8s)</td>
-                <td>In-app (JVM)</td>
-                <td class="win">Kubernetes</td>
-                <td>Single process</td>
-              </tr>
-              <tr>
-                <td>Latency target</td>
-                <td class="hl">10&ndash;16ns state lookup</td>
-                <td>~10ms</td>
-                <td>~1ms</td>
-                <td>~10ms</td>
-                <td>&lt;1&micro;s</td>
-              </tr>
-              <tr>
-                <td>Horizontal scale</td>
-                <td class="hl">No (single node)</td>
-                <td class="win">Yes</td>
-                <td class="win">Via Kafka partitions</td>
-                <td class="win">Yes</td>
-                <td>No</td>
-              </tr>
-              <tr>
-                <td>Exactly-once</td>
-                <td class="hl">Barrier checkpoints</td>
-                <td>Barrier checkpoints</td>
-                <td>Kafka transactions</td>
-                <td>Barrier checkpoints</td>
-                <td>N/A</td>
-              </tr>
-              <tr>
-                <td>Connectors</td>
-                <td class="hl">10</td>
-                <td class="win">100+</td>
-                <td>Kafka only</td>
-                <td class="win">15+</td>
-                <td>Custom</td>
-              </tr>
-              <tr>
-                <td>Ops overhead</td>
-                <td class="hl">None (lib) / low</td>
-                <td>High (cluster, JVM)</td>
-                <td>Low</td>
-                <td>Medium (K8s)</td>
-                <td>Low</td>
-              </tr>
-              <tr>
-                <td>License</td>
-                <td class="hl">Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Proprietary</td>
-              </tr>
-              <tr>
-                <td>Maturity</td>
-                <td class="hl">Pre-1.0 (<span data-version="tag">v0.18.12</span>)</td>
-                <td class="win">Production (10+ yrs)</td>
-                <td class="win">Production (8+ yrs)</td>
-                <td class="win">Production (~2 yrs)</td>
-                <td class="win">Production (30+ yrs)</td>
-              </tr>
-            </tbody>
-          </table>
+          <div style="flex: 1; min-width: 300px; display: flex; align-items: center; justify-content: center;">
+            <div class="console-mockup" style="border-radius: 12px; width: 100%; max-width: 520px; overflow: hidden; padding: 20px;">
+              <div class="console-mockup-header" style="display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; margin-bottom: 16px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #ef4444;"></span>
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #eab308;"></span>
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #22c55e;"></span>
+                  <span class="console-mockup-title" style="font-family: var(--font-sans); font-size: 0.8rem; font-weight: 600; margin-left: 8px;">LaminarDB Console</span>
+                </div>
+                <span style="font-size: 0.75rem; color: #22c55e; background: rgba(34, 197, 94, 0.08); padding: 2px 8px; border-radius: 12px; font-family: var(--font-mono); font-weight: 500;">Connected</span>
+              </div>
+              
+              <!-- Console Mockup Visuals -->
+              <div class="console-mockup-body" style="font-family: var(--font-mono); font-size: 0.75rem; display: flex; flex-direction: column; gap: 12px;">
+                <!-- SQL Bar -->
+                <div class="console-mockup-code" style="border-radius: 6px; padding: 10px;">
+                  <span style="color: #64748b;">-- Authoring continuous stream join</span><br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">SELECT</span> symbol, price, volume<br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">FROM</span> trades <span style="color: #0ea5e9; font-weight: bold;">INNER JOIN</span> quotes<br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">ON</span> trades.symbol = quotes.symbol <span style="color: #0ea5e9; font-weight: bold;">AND</span> quotes.ts <span style="color: #0ea5e9; font-weight: bold;">BETWEEN</span> trades.ts <span style="color: #0ea5e9; font-weight: bold;">AND</span> trades.ts + <span style="color: #0ea5e9; font-weight: bold;">INTERVAL</span> '5' SECOND
+                </div>
+                <!-- Nodes/DAG visual mockup -->
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0;">
+                  <div class="console-mockup-node" style="border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong>trades</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Source</span>
+                  </div>
+                  <div style="flex: 1; height: 2px; background: linear-gradient(90deg, #0ea5e9 0%, #8b5cf6 100%); margin: 0 8px; position: relative;">
+                    <span style="position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 0.55rem; color: #8b5cf6; font-weight: bold;">24.5k eps</span>
+                  </div>
+                  <div class="console-mockup-node" style="border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong>vwap_sink</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Sink</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
+      </div>
+    </section>
 
-        <p class="comparison-note">
-          Bold cells show where a competitor has a clear advantage.
-          LaminarDB wins on latency and deployment flexibility.
-          It loses on maturity, horizontal scale, and ecosystem breadth.
-        </p>
+    <!-- AI Functions Section -->
+    <section id="ai" style="background:#ffffff;">
+      <div class="container">
+        <div class="split-layout">
+          <div class="editor-window code-block" style="width: 100%; max-width: 520px; margin: 0;">
+            <div class="editor-header">
+              <div class="editor-dots">
+                <span class="editor-dot red"></span>
+                <span class="editor-dot yellow"></span>
+                <span class="editor-dot green"></span>
+              </div>
+              <span style="font-family: var(--font-mono); font-size: 0.75rem; color: #64748b; margin-right: auto; padding-left: 12px;">sentiment.sql</span>
+              <button class="copy-btn" aria-label="Copy code">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                Copy
+              </button>
+            </div>
+            <div class="editor-container collapsed">
+              <div class="editor-body">
+                <pre><code class="language-sql">-- Score headlines continuously in your pipeline
+CREATE STREAM flagged AS
+SELECT id, headline,
+       ai_sentiment(headline, model => 'finbert') AS sentiment
+FROM news;
 
-        <h3 style="margin-bottom: 1rem;">When to choose something else</h3>
-        <div class="alternatives">
-          <div class="alt-card">
-            <h4>Apache Flink</h4>
-            <p>Need to scale across a cluster? Flink handles 100+ connectors and complex event processing. Trade-off: heavyweight JVM footprint and operational overhead.</p>
+-- Classify tickets on-the-fly
+SELECT id,
+       ai_classify(body, model => 'intent-mini',
+                   labels => ARRAY['question', 'complaint']) AS intent
+FROM tickets;</code></pre>
+              </div>
+              <div class="expand-overlay">
+                <button class="expand-btn" aria-label="Expand code block">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                  Expand Code
+                </button>
+              </div>
+            </div>
           </div>
-          <div class="alt-card">
-            <h4>Kafka Streams</h4>
-            <p>Strictly Kafka in/out and already running JVM services? Streams is the simplest fit. No SQL though.</p>
-          </div>
-          <div class="alt-card">
-            <h4>Arroyo</h4>
-            <p>Distributed streaming in Rust with a web UI. Runs on Kubernetes. Shares the DataFusion SQL foundation with LaminarDB.</p>
-          </div>
-          <div class="alt-card">
-            <h4>kdb+</h4>
-            <p>Finance teams with q/k expertise and sub-microsecond timeseries analytics. 30+ years of production track record. Licensing is steep.</p>
+
+          <div class="split-text">
+            <h2>Native Inline AI Inference</h2>
+            <p>
+              Call machine learning and AI models directly within your continuous SQL statements.
+            </p>
+            <p>
+              <strong>Off the hot path.</strong> The streaming execution pipeline never blocks on model inference. The operator queries the internal state cache inline, routing misses to asynchronous background workers.
+            </p>
+            <p>
+              <strong>Dual inference backend.</strong> Configure models to point either to local, in-process ONNX Runtime encoders (highly efficient for classification and embeddings) or to remote LLMs via OpenAI-compatible endpoints.
+            </p>
           </div>
         </div>
       </div>
     </section>
 
     <!-- Benchmarks -->
-    <section id="benchmarks">
+    <section id="benchmarks" class="metrics-section">
       <div class="container">
-        <h2>Benchmarks</h2>
+        <h2>Proven Performance</h2>
         <p class="section-desc">
-          Criterion benchmarks run on an AMD Ryzen AI 7 350 laptop.
-          These are not server numbers. Dedicated hardware with isolated cores will perform better.
-          <a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Full results</a>.
+          Criterion benchmark metrics recorded on single-node consumer-grade hardware. Dedicated server environments achieve higher rates.
         </p>
 
-        <div class="connector-table-wrapper">
-          <table class="connector-table">
-            <thead>
-              <tr>
-                <th>Metric</th>
-                <th>Target</th>
-                <th>Measured</th>
-                <th>Benchmark File</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>State lookup (AHash get_ref)</td>
-                <td>&lt;500ns</td>
-                <td>10&ndash;16ns (zero-copy)</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></td>
-              </tr>
-              <tr>
-                <td>Throughput / core</td>
-                <td>500K events/s</td>
-                <td>1.1&ndash;1.46M events/s</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/streaming_bench.rs" target="_blank" rel="noopener">streaming_bench.rs</a></td>
-              </tr>
-              <tr>
-                <td>Event latency (mean)</td>
-                <td>&lt;10&micro;s</td>
-                <td>0.55&ndash;1.16&micro;s</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/latency_bench.rs" target="_blank" rel="noopener">latency_bench.rs</a></td>
-              </tr>
-              <tr>
-                <td>Checkpoint recovery</td>
-                <td>&lt;10s</td>
-                <td>1.39ms</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/checkpoint_bench.rs" target="_blank" rel="noopener">checkpoint_bench.rs</a></td>
-              </tr>
-              <tr>
-                <td>WAL append</td>
-                <td>&lt;1&micro;s</td>
-                <td>541ns</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-storage/benches/wal_bench.rs" target="_blank" rel="noopener">wal_bench.rs</a></td>
-              </tr>
-            </tbody>
-          </table>
+        <div class="benchmarks-grid">
+          <!-- Bench 1 -->
+          <div class="bench-card">
+            <div class="bench-val">4.24<span>ns</span></div>
+            <div class="bench-label">Tumbling Window Assignment</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/window_bench.rs" target="_blank" rel="noopener">window_bench.rs</a></div>
+          </div>
+          <!-- Bench 2 -->
+          <div class="bench-card">
+            <div class="bench-val">235.9M<span>/s</span></div>
+            <div class="bench-label">Window Assignment Throughput</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/window_bench.rs" target="_blank" rel="noopener">window_bench.rs</a></div>
+          </div>
+          <!-- Bench 3 -->
+          <div class="bench-card">
+            <div class="bench-val">383<span>ns</span></div>
+            <div class="bench-label">Hot State Update Latency</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/latency_bench.rs" target="_blank" rel="noopener">latency_bench.rs</a></div>
+          </div>
+          <!-- Bench 4 -->
+          <div class="bench-card">
+            <div class="bench-val">2.65M<span>/s</span></div>
+            <div class="bench-label">Sustained Aggregation Rate</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/latency_bench.rs" target="_blank" rel="noopener">latency_bench.rs</a></div>
+          </div>
+          <!-- Bench 5 -->
+          <div class="bench-card">
+            <div class="bench-val">451.1<span>µs</span></div>
+            <div class="bench-label">Full State Recovery (1MB)</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/benches/recovery_bench.rs" target="_blank" rel="noopener">recovery_bench.rs</a></div>
+          </div>
+          <!-- Bench 6 -->
+          <div class="bench-card">
+            <div class="bench-val">40.27<span>ms</span></div>
+            <div class="bench-label">Checkpoint Save (1MB state)</div>
+            <div class="bench-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/benches/recovery_bench.rs" target="_blank" rel="noopener">recovery_bench.rs</a></div>
+          </div>
         </div>
-
-        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
-          Reproduce: <code>cargo bench --bench state_bench</code>,
-          <code>cargo bench --bench streaming_bench</code>,
-          <code>cargo bench --bench latency_bench</code>.
-          All benchmarks use <a href="https://github.com/bheisler/criterion.rs" target="_blank" rel="noopener">Criterion</a> for statistical analysis.
-        </p>
       </div>
     </section>
 
     <!-- Status -->
-    <section id="status">
+    <section id="status" style="background:#ffffff;">
       <div class="container">
-        <h2>Status</h2>
+        <h2>Implementation Status</h2>
         <p class="section-desc">
-          Current version: <strong data-version="bare">0.18.12</strong> (pre-1.0).
-          <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+          Current development milestone: <strong data-version="bare">0.25.0</strong> (pre-1.0 release).
         </p>
 
-        <div class="status-grid">
-          <div class="status-col stable">
-            <h3>Stable</h3>
-            <ul>
-              <li>Core engine (reactor, state stores, DAG executor)</li>
-              <li>Window functions (tumbling, sliding, hopping, session)</li>
-              <li>Joins (interval, ASOF, temporal, lookup, semi/anti)</li>
-              <li>All 10 connectors (Kafka, CDC, MongoDB, Delta, WS, files)</li>
-              <li>Barrier-based checkpointing with 2PC exactly-once</li>
-              <li>Per-core WAL for durability</li>
-              <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
-              <li>Docker (multi-arch) and Helm chart deployment</li>
+        <div class="status-container">
+          <div class="status-column stable">
+            <h3>Engine &amp; SQL</h3>
+            <ul class="status-list">
+              <li>Streaming operator graph evaluation (tumble, sliding, hopping, session windows).</li>
+              <li>Bounded interval joins; lookup and temporal joins in local mode.</li>
+              <li>Dynamic vnode partitioning and in-memory lookup indexes.</li>
+              <li>Chandy-Lamport barrier checkpointing (2-phase commit).</li>
+              <li>Multi-node coordination, gossip discovery, durable leader leases, and CAS-published assignments.</li>
             </ul>
           </div>
-          <div class="status-col experimental">
-            <h3>Experimental</h3>
-            <ul>
-              <li>io_uring storage (Linux only, feature-gated)</li>
-              <li>Incremental checkpoints</li>
+          <div class="status-column stable">
+            <h3>Operations &amp; CLI</h3>
+            <ul class="status-list">
+              <li>Conditionally-compiled source/sink connector plugins (including Kafka, CDC, Delta Lake, Iceberg, NATS).</li>
+              <li>Checkpoint snapshot archival to local FS, S3, Azure Blob, or GCS.</li>
+              <li>Standalone server binary with REST health check endpoints.</li>
+              <li>Dynamic pipeline hot-reloads of configuration parameters.</li>
+              <li>Console UI Vite application for DAG pipeline visualization.</li>
             </ul>
           </div>
-          <div class="status-col unimplemented">
-            <h3>Not yet implemented</h3>
-            <ul>
-              <li>Cluster / multi-node deployment (coming soon)</li>
-              <li>PostgreSQL wire protocol (planned)</li>
-              <li>Redis connector</li>
-            </ul>
-          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section id="faq">
+      <div class="container">
+        <h2>Frequently Asked Questions</h2>
+        <p class="section-desc">Common questions regarding LaminarDB features, internals, and operations.</p>
+
+        <div class="faq-list">
+          <details open>
+            <summary>What is LaminarDB?</summary>
+            <p>LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server.</p>
+          </details>
+          <details>
+            <summary>How fast is LaminarDB?</summary>
+            <p>LaminarDB targets sub-microsecond state lookups (under 500 nanoseconds) and processes over 500,000 events per core per second. Criterion benchmarks on an AMD Ryzen AI 7 350 laptop measured state lookups in 10 to 16 nanoseconds and throughput of 1.1 to 1.46 million events per second per core.</p>
+          </details>
+          <details>
+            <summary>What connectors does LaminarDB support?</summary>
+            <p>LaminarDB ships with sources and sinks for Apache Kafka, NATS, PostgreSQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use.</p>
+          </details>
+          <details>
+            <summary>Is LaminarDB production-ready?</summary>
+            <p>LaminarDB is pre-1.0. Distributed-state production certification is pending the full single-node and cluster ALO/EO soak matrix.</p>
+          </details>
+          <details>
+            <summary>Can I use LaminarDB from Python?</summary>
+            <p>Yes. Install the Python package with <code>pip install laminardb</code>. It exposes the same streaming SQL engine as the Rust crate, with a Python-native API for pushing events and subscribing to results.</p>
+          </details>
+          <details>
+            <summary>What SQL features does LaminarDB support?</summary>
+            <p>LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; bounded interval, temporal, and lookup joins; EMIT clauses (<code>ON WATERMARK</code>, <code>ON WINDOW CLOSE</code>, <code>PERIODICALLY</code>, <code>CHANGES</code>, <code>FINAL</code>); watermarks with <code>ALLOW LATENESS</code>; and late data routing via <code>LATE DATA TO</code>.</p>
+          </details>
+          <details>
+            <summary>How does LaminarDB handle exactly-once delivery?</summary>
+            <p>Exactly-once is connector-gated. Barrier checkpoints align source offsets, operator state, and coordinated sink publication; the current cluster candidate is Kafka input to direct S3/S3A append-mode Delta Lake.</p>
+          </details>
+          <details>
+            <summary>Does LaminarDB require a JVM?</summary>
+            <p>No. LaminarDB is written in Rust and ships as a native binary. It has no JVM or other runtime dependencies beyond the operating system.</p>
+          </details>
+          <details>
+            <summary>Is LaminarDB open source?</summary>
+            <p>Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">github.com/laminardb/laminardb</a>.</p>
+          </details>
         </div>
       </div>
     </section>
 
     <!-- Contributing -->
-    <section id="contributing">
+    <section id="contributing" style="background:#ffffff;">
       <div class="container">
-        <h2>Contributing</h2>
-        <p style="max-width: 600px; margin-bottom: 1.5rem;">
-          LaminarDB is Apache 2.0 licensed. Contributions welcome.
-          Rust 1.85+ required. See the contribution guide for Ring 0 constraints
-          (no allocations, no locks, no syscalls on the hot path).
-        </p>
-        <div class="contrib-links">
-          <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" class="btn btn-secondary" target="_blank" rel="noopener">Contribution Guide</a>
-          <a href="https://github.com/laminardb/laminardb/discussions" class="btn btn-secondary" target="_blank" rel="noopener">Discussions</a>
-          <a href="https://github.com/laminardb/laminardb/labels/good%20first%20issue" class="btn btn-secondary" target="_blank" rel="noopener">Good First Issues</a>
+        <div class="contrib-box">
+          <h2>Contributing to LaminarDB</h2>
+          <p>
+            LaminarDB is Apache 2.0 licensed and welcomes community contributions. Check out our guides to get started with local compilation.
+          </p>
+          <div class="contrib-actions">
+            <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" class="btn btn-primary" target="_blank" rel="noopener">Contribution Guide</a>
+            <a href="https://github.com/laminardb/laminardb/discussions" class="btn btn-secondary" target="_blank" rel="noopener">Discussions Board</a>
+            <a href="https://github.com/laminardb/laminardb/labels/good%20first%20issue" class="btn btn-secondary" target="_blank" rel="noopener">Good First Issues</a>
+          </div>
         </div>
       </div>
     </section>
@@ -830,10 +1185,15 @@ CREATE SINK lake INTO DELTA_LAKE (
   <footer class="footer">
     <div class="container">
       <div class="footer-inner">
-        <div class="footer-left">
-          LaminarDB &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.12</span>
+        <div class="footer-logo">
+          <svg viewBox="0 0 40 40" width="24" height="24" aria-hidden="true">
+            <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+            <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="#0ea5e9" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+          </svg>
+          <span>LAMINARDB.IO</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
@@ -843,6 +1203,10 @@ CREATE SINK lake INTO DELTA_LAKE (
           <a href="mailto:support@laminardb.io">Support</a>
         </div>
       </div>
+      <div class="footer-bottom">
+        <span>© 2026 Laminar Technologies &amp; Contributors. Licensed Apache 2.0.</span>
+        <span>Current version: <span data-version="tag">v0.25.0</span></span>
+      </div>
     </div>
   </footer>
 
@@ -850,6 +1214,407 @@ CREATE SINK lake INTO DELTA_LAKE (
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
   <script defer src="js/main.js"></script>
+
+  <!-- LaminarDB RAG Chat Widget -->
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+    #ldb-chat-root {
+      --ldb-bg: #ffffff;
+      --ldb-surface: #f8fafc;
+      --ldb-border: #e2e8f0;
+      --ldb-accent: #0ea5e9;
+      --ldb-accent-dim: rgba(14, 165, 233, 0.06);
+      --ldb-text: #0f172a;
+      --ldb-muted: #64748b;
+      --ldb-radius: 12px;
+      --ldb-font-sans: 'Inter', system-ui, sans-serif;
+      --ldb-font-mono: 'JetBrains Mono', monospace;
+      font-family: var(--ldb-font-sans);
+    }
+
+    #ldb-toggle {
+      position: fixed; bottom: 28px; right: 28px; z-index: 9999;
+      width: 52px; height: 52px; border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-purple) 100%);
+      border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 24px rgba(14, 165, 233, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+    #ldb-toggle:hover {
+      transform: scale(1.08);
+      box-shadow: 0 6px 32px rgba(14, 165, 233, 0.35);
+    }
+    #ldb-toggle svg {
+      stroke: #ffffff;
+    }
+
+    #ldb-panel {
+      position: fixed; bottom: 92px; right: 28px; z-index: 9998;
+      width: 400px; max-width: calc(100vw - 40px);
+      height: 560px; max-height: calc(100vh - 120px);
+      background: var(--ldb-bg); border: 1px solid var(--ldb-border);
+      border-radius: 12px; display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.12);
+      transform: translateY(12px) scale(0.97); opacity: 0; pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease, width 0.25s ease, height 0.25s ease;
+    }
+    #ldb-panel.ldb-expanded {
+      width: 650px;
+      height: 700px;
+    }
+    #ldb-expand {
+      background: none; border: none; cursor: pointer; color: var(--ldb-muted);
+      padding: 2px; display: flex; align-items: center; border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+      margin-right: 2px;
+    }
+    #ldb-expand:hover { color: var(--ldb-text); background: rgba(15, 23, 42, 0.05); }
+    #ldb-panel.ldb-expanded .ldb-expand-icon { display: none; }
+    #ldb-panel.ldb-expanded .ldb-contract-icon { display: inline !important; }
+    #ldb-panel.ldb-open { opacity: 1; pointer-events: all; transform: none; }
+
+    #ldb-header {
+      padding: 14px 16px; background: var(--ldb-surface);
+      border-bottom: 1px solid var(--ldb-border);
+      display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+    }
+    #ldb-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ldb-accent); box-shadow: 0 0 8px var(--ldb-accent);
+      animation: ldb-pulse 2.4s ease-in-out infinite; flex-shrink: 0;
+    }
+    @keyframes ldb-pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    #ldb-title { font-size: 13px; font-weight: 600; color: var(--ldb-text); flex: 1; }
+    #ldb-subtitle { font-size: 11px; color: var(--ldb-muted); font-family: var(--ldb-font-mono); }
+    #ldb-close {
+      background: none; border: none; cursor: pointer; color: var(--ldb-muted);
+      padding: 2px; display: flex; align-items: center; border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+    }
+    #ldb-close:hover { color: var(--ldb-text); background: rgba(15, 23, 42, 0.05); }
+
+    #ldb-messages {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: flex; flex-direction: column; gap: 14px;
+      scrollbar-width: thin; scrollbar-color: var(--ldb-border) transparent;
+      background: var(--ldb-bg);
+    }
+    #ldb-messages::-webkit-scrollbar { width: 4px; }
+    #ldb-messages::-webkit-scrollbar-thumb { background: var(--ldb-border); border-radius: 4px; }
+
+    .ldb-msg { display: flex; flex-direction: column; gap: 3px; animation: ldb-in 0.18s ease; }
+    @keyframes ldb-in { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+
+    .ldb-label {
+      font-size: 10px; font-family: var(--ldb-font-mono); font-weight: 500;
+      letter-spacing: 0.08em; text-transform: uppercase;
+    }
+    .ldb-user .ldb-label { color: var(--ldb-accent); text-align: right; }
+    .ldb-bot .ldb-label { color: var(--ldb-muted); }
+
+    .ldb-bubble {
+      padding: 10px 13px; border-radius: var(--ldb-radius);
+      font-size: 13.5px; line-height: 1.6; color: var(--ldb-text); word-break: break-word;
+    }
+    .ldb-user .ldb-bubble {
+      background: var(--ldb-accent-dim); border: 1px solid rgba(14,165,233,0.15);
+      align-self: flex-end; border-bottom-right-radius: 2px;
+    }
+    .ldb-bot .ldb-bubble {
+      background: var(--ldb-surface); border: 1px solid var(--ldb-border);
+      align-self: flex-start; border-bottom-left-radius: 2px;
+    }
+    .ldb-bubble code {
+      font-family: var(--ldb-font-mono); font-size: 12px;
+      background: rgba(14, 165, 233, 0.05); border: 1px solid rgba(14, 165, 233, 0.12);
+      padding: 1px 5px; border-radius: 3px; color: #0284c7;
+    }
+    .ldb-bubble pre {
+      background: #f8fafc; border: 1px solid var(--ldb-border);
+      border-radius: var(--ldb-radius); padding: 10px 12px;
+      overflow-x: auto; margin: 8px 0 2px;
+    }
+    .ldb-bubble pre code { background:none; border:none; padding:0; color:var(--ldb-text); font-size:12px; }
+    .ldb-bubble strong { color: var(--ldb-text); font-weight: 600; }
+    .ldb-bubble p { margin: 0 0 6px; }
+    .ldb-bubble p:last-child { margin: 0; }
+
+    .ldb-sources {
+      display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; padding-left: 2px;
+    }
+    .ldb-source-tag {
+      font-family: var(--font-mono); font-size: 10px;
+      color: var(--ldb-muted); background: rgba(15, 23, 42, 0.03);
+      border: 1px solid var(--ldb-border); border-radius: 3px;
+      padding: 1px 6px;
+    }
+
+    .ldb-typing {
+      display: flex; gap: 4px; padding: 10px 13px;
+      background: var(--ldb-surface); border: 1px solid var(--ldb-border);
+      border-radius: var(--ldb-radius); border-bottom-left-radius: 2px;
+      align-self: flex-start; width: fit-content;
+    }
+    .ldb-typing span {
+      width: 6px; height: 6px; background: var(--ldb-muted);
+      border-radius: 50%; animation: ldb-bounce 1.2s ease-in-out infinite;
+    }
+    .ldb-typing span:nth-child(2){animation-delay:.2s}
+    .ldb-typing span:nth-child(3){animation-delay:.4s}
+    @keyframes ldb-bounce{0%,80%,100%{transform:translateY(0);opacity:.4}40%{transform:translateY(-5px);opacity:1}}
+
+    #ldb-examples { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+    .ldb-ex {
+      background: #ffffff; border: 1px solid var(--ldb-border); border-radius: var(--ldb-radius);
+      color: var(--ldb-muted); font-size: 12px; font-family: var(--ldb-font-sans);
+      padding: 7px 10px; cursor: pointer; text-align: left;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+    .ldb-ex:hover { border-color: rgba(14,165,233,0.25); color: #0ea5e9; background: var(--ldb-accent-dim); }
+
+    #ldb-footer {
+      padding: 12px; border-top: 1px solid var(--ldb-border);
+      background: var(--ldb-surface); flex-shrink: 0;
+    }
+    #ldb-row { display: flex; gap: 8px; align-items: flex-end; }
+    #ldb-input {
+      flex: 1; background: var(--ldb-bg); border: 1px solid var(--ldb-border);
+      border-radius: var(--ldb-radius); color: var(--ldb-text);
+      font-family: var(--ldb-font-sans); font-size: 13px;
+      padding: 9px 12px; resize: none; outline: none; max-height: 100px;
+      transition: border-color 0.15s; line-height: 1.5;
+    }
+    #ldb-input::placeholder { color: var(--ldb-muted); }
+    #ldb-input:focus { border-color: rgba(14,165,233,0.4); }
+    #ldb-send {
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-purple) 100%);
+      border: none; border-radius: var(--ldb-radius);
+      color: #fff; cursor: pointer; width: 36px; height: 36px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      transition: opacity 0.15s, transform 0.15s;
+    }
+    #ldb-send:hover:not(:disabled){opacity:.85;transform:scale(1.05)}
+    #ldb-send:disabled{opacity:.35;cursor:not-allowed}
+    #ldb-note { font-size: 10px; color: var(--ldb-muted); font-family: var(--ldb-font-mono); margin-top: 8px; text-align: center; }
+  </style>
+
+  <div id="ldb-chat-root">
+    <button id="ldb-toggle" aria-label="Open LaminarDB assistant">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+    </button>
+
+    <div id="ldb-panel" role="dialog" aria-label="LaminarDB assistant">
+      <div id="ldb-header">
+        <div id="ldb-dot"></div>
+        <div id="ldb-title">LaminarDB Assistant</div>
+        <span id="ldb-subtitle">streaming SQL · Rust</span>
+        <button id="ldb-expand" aria-label="Expand panel">
+          <svg class="ldb-expand-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+          </svg>
+          <svg class="ldb-contract-icon" style="display:none;" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7"/>
+          </svg>
+        </button>
+        <button id="ldb-close" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+
+      <div id="ldb-messages">
+        <div class="ldb-msg ldb-bot">
+          <span class="ldb-label">laminar</span>
+          <div class="ldb-bubble">Ask me anything about LaminarDB — window syntax, stream joins, connectors, the Ring model, checkpointing, or Python bindings.</div>
+        </div>
+        <div id="ldb-examples">
+          <button class="ldb-ex">How do I define a TUMBLE window?</button>
+          <button class="ldb-ex">How do bounded interval joins use watermarks?</button>
+          <button class="ldb-ex">How does Ring 0 enforce zero-alloc?</button>
+          <button class="ldb-ex">How do I connect a Kafka source?</button>
+        </div>
+      </div>
+
+      <div id="ldb-footer">
+        <div id="ldb-row">
+          <textarea id="ldb-input" rows="1" placeholder="Ask about SQL syntax, connectors, architecture…" aria-label="Message"></textarea>
+          <button id="ldb-send" aria-label="Send">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </div>
+        <div id="ldb-note">answers grounded in source code · laminardb.io</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  (function () {
+    const WORKER_URL = "https://laminardb-chatbot.sujitnair.workers.dev";
+
+    const panel    = document.getElementById("ldb-panel");
+    const toggle   = document.getElementById("ldb-toggle");
+    const expandBtn = document.getElementById("ldb-expand");
+    const closeBtn = document.getElementById("ldb-close");
+    const messages = document.getElementById("ldb-messages");
+    const input    = document.getElementById("ldb-input");
+    const sendBtn  = document.getElementById("ldb-send");
+
+    let history = [];
+    let busy = false;
+
+    toggle.addEventListener("click", () => {
+      panel.classList.toggle("ldb-open");
+      if (panel.classList.contains("ldb-open")) input.focus();
+    });
+    expandBtn.addEventListener("click", () => {
+      panel.classList.toggle("ldb-expanded");
+    });
+    closeBtn.addEventListener("click", () => {
+      panel.classList.remove("ldb-open");
+      panel.classList.remove("ldb-expanded");
+    });
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape" && panel.classList.contains("ldb-open")) {
+        panel.classList.remove("ldb-open");
+        panel.classList.remove("ldb-expanded");
+        toggle.focus();
+      }
+    });
+
+    const escapeHtml = s => s.replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+
+    document.querySelectorAll(".ldb-ex").forEach(btn => {
+      btn.addEventListener("click", () => {
+        input.value = btn.textContent;
+        document.getElementById("ldb-examples")?.remove();
+        send();
+      });
+    });
+
+    input.addEventListener("input", () => {
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, 100) + "px";
+    });
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+    sendBtn.addEventListener("click", send);
+
+    function addMessage(role, html, sources) {
+      const wrap = document.createElement("div");
+      wrap.className = `ldb-msg ldb-${role === "user" ? "user" : "bot"}`;
+
+      const label = document.createElement("span");
+      label.className = "ldb-label";
+      label.textContent = role === "user" ? "you" : "laminar";
+
+      const bubble = document.createElement("div");
+      bubble.className = "ldb-bubble";
+      bubble.innerHTML = html;
+
+      wrap.appendChild(label);
+      wrap.appendChild(bubble);
+
+      // Source citations (bot only)
+      if (role !== "user" && sources?.length) {
+        const srcRow = document.createElement("div");
+        srcRow.className = "ldb-sources";
+        sources.slice(0, 5).forEach(s => {
+          const tag = document.createElement("span");
+          tag.className = "ldb-source-tag";
+          tag.textContent = s.split("/").pop(); // just filename
+          tag.title = s; // full path on hover
+          srcRow.appendChild(tag);
+        });
+        wrap.appendChild(srcRow);
+      }
+
+      messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function showTyping() {
+      const wrap = document.createElement("div");
+      wrap.className = "ldb-msg ldb-bot";
+      wrap.id = "ldb-typing";
+      const label = document.createElement("span");
+      label.className = "ldb-label";
+      label.textContent = "laminar";
+      const dots = document.createElement("div");
+      dots.className = "ldb-typing";
+      dots.innerHTML = "<span></span><span></span><span></span>";
+      wrap.appendChild(label);
+      wrap.appendChild(dots);
+      messages.appendChild(wrap);
+      messages.scrollTop = messages.scrollHeight;
+    }
+
+    function removeTyping() {
+      document.getElementById("ldb-typing")?.remove();
+    }
+
+    function md(text) {
+      return text
+        .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+        .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+          `<pre><code>${code.trim()}</code></pre>`)
+        .replace(/`([^`]+)`/g, "<code>$1</code>")
+        .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+        .replace(/\n{2,}/g, "</p><p>")
+        .replace(/\n/g, "<br>")
+        .replace(/^/, "<p>").replace(/$/, "</p>")
+        .replace(/<p><\/p>/g, "");
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text || busy) return;
+
+      busy = true;
+      sendBtn.disabled = true;
+      input.value = "";
+      input.style.height = "auto";
+
+      addMessage("user", md(text));
+      history.push({ role: "user", content: text });
+      showTyping();
+
+      try {
+        const res = await fetch(WORKER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: history }),
+        });
+
+        removeTyping();
+
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const reply = data.reply ?? "Something went wrong.";
+        const sources = data.sources ?? [];
+
+        history.push({ role: "assistant", content: reply });
+        addMessage("assistant", md(reply), sources);
+      } catch (err) {
+        removeTyping();
+        addMessage("assistant", `<span style="color:#ff6b6b">Error: ${escapeHtml(err.message)}</span>`);
+      }
+
+      busy = false;
+      sendBtn.disabled = false;
+      input.focus();
+    }
+  })();
+  </script>
+
 </body>
 </html>

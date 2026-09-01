@@ -69,33 +69,28 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cross: false
             features: --all-features
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
-            # Cross builds: skip hwloc (needs target-arch libhwloc);
-            # io-uring is pure syscalls so cross-compiles fine;
-            # vendored-openssl compiles OpenSSL from source for the target triple
-            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            cross: false
+            # Native ARM runner — no QEMU emulation, system libssl-dev is available
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
             # vendored-openssl: musl has no system libssl-dev; compile from source
-            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring)
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
           - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring)
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-            # Windows: skip Linux-only features (hwloc, io-uring)
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            features: --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,websocket"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -114,6 +109,10 @@ jobs:
           # Use perl for cross-platform in-place editing (macOS sed differs from GNU sed)
           # Update workspace version in root Cargo.toml
           perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
+
+          # Keep the publishable maintained forks on the release version.
+          perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
 
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
@@ -135,7 +134,7 @@ jobs:
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -323,6 +322,10 @@ jobs:
           # Update workspace version in root Cargo.toml
           perl -i -pe 's/^version = ".*"/version = "'"$VERSION"'"/' Cargo.toml
 
+          # Keep the publishable maintained forks on the release version.
+          perl -0pi -e 's{(\[package\][^\[]*?\nversion = ")[^"]+(")}{${1}'"$VERSION"'${2}}' \
+            vendor/pgwire/Cargo.toml vendor/pgwire-replication/Cargo.toml
+
           # Update inter-crate path dependency versions
           find crates examples -name Cargo.toml -exec \
             perl -i -pe 's/(path = "\.\.\/[^"]*", )version = "[^"]*"/${1}version = "'"$VERSION"'"/g' {} +
@@ -341,6 +344,17 @@ jobs:
           # which aren't on crates.io yet. Safe to remove: CI already tested.
           perl -i -ne 'print unless /^laminar-(?:core|connectors)\s*=/' \
             crates/laminar-derive/Cargo.toml
+
+      - name: Publish laminardb-pgwire
+        run: cargo publish --manifest-path vendor/pgwire/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Publish laminardb-pgwire-replication
+        run: cargo publish --manifest-path vendor/pgwire-replication/Cargo.toml --registry crates-io --allow-dirty --no-verify
+        continue-on-error: true
+
+      - name: Wait for fork index entries
+        run: sleep 30
 
       - name: Publish laminar-derive
         run: cargo publish -p laminar-derive --registry crates-io --allow-dirty --no-verify
@@ -363,12 +377,6 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Publish laminar-storage
-        run: cargo publish -p laminar-storage --registry crates-io --allow-dirty --no-verify
-        continue-on-error: true
-
-      - name: Wait for index
-        run: sleep 30
 
       - name: Publish laminar-connectors
         run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty --no-verify
@@ -377,17 +385,6 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Strip iceberg feature before publishing laminar-db
-        run: |
-          # The iceberg feature is a placeholder that aliases laminar-connectors/delta-lake.
-          # Real iceberg support is not yet implemented — strip it so cargo publish
-          # doesn't advertise a non-functional feature.
-          # Also strip from laminar-server (publish=false, but workspace resolution
-          # requires consistency).
-          for TOML in crates/laminar-db/Cargo.toml crates/laminar-server/Cargo.toml; do
-            perl -i -ne 'print unless /^iceberg\s*=/' "$TOML"
-          done
-
       - name: Publish laminar-db
         run: cargo publish -p laminar-db --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
@@ -395,12 +392,8 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Publish laminar-auth
-        run: cargo publish -p laminar-auth --registry crates-io --allow-dirty --no-verify
-        continue-on-error: true
-
-      - name: Publish laminar-observe
-        run: cargo publish -p laminar-observe --registry crates-io --allow-dirty --no-verify
+      - name: Publish laminar-server
+        run: cargo publish -p laminar-server --registry crates-io --allow-dirty --no-verify
         continue-on-error: true
 
   # ============================================
@@ -412,11 +405,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
           ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Download checksums
         run: |
@@ -445,10 +439,22 @@ jobs:
           }
           EOF
 
-      - name: Commit and push
+      - name: Commit and create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
+          BRANCH_NAME="chore/update-compatibility-v${{ needs.verify.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # -B + --force so re-running the release for the same version overwrites
+          # any stale branch instead of failing.
+          git checkout -B "$BRANCH_NAME"
           git add compatibility.json
           git commit -m "chore: update compatibility.json for v${{ needs.verify.outputs.version }}" || exit 0
-          git push
+          git push -u origin "$BRANCH_NAME" --force
+          # Only open a PR if one doesn't already exist for this branch.
+          gh pr view "$BRANCH_NAME" > /dev/null 2>&1 || gh pr create \
+            --title "chore: update compatibility.json for v${{ needs.verify.outputs.version }}" \
+            --body "Auto-generated compatibility manifest update for release v${{ needs.verify.outputs.version }}." \
+            --base main \
+            --head "$BRANCH_NAME"

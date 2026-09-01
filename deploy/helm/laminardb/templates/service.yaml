@@ -15,21 +15,11 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
-    {{- if .Values.service.pgEnabled }}
+    {{- if .Values.laminardb.pgwire.enabled }}
     - port: {{ .Values.service.pgPort }}
       targetPort: pg
       protocol: TCP
       name: pg
-    {{- end }}
-    {{- if eq .Values.laminardb.mode "delta" }}
-    - port: {{ .Values.service.gossipPort }}
-      targetPort: gossip
-      protocol: TCP
-      name: gossip
-    - port: {{ .Values.service.raftPort }}
-      targetPort: raft
-      protocol: TCP
-      name: raft
     {{- end }}
   selector:
     {{- include "laminardb.selectorLabels" . | nindent 4 }}

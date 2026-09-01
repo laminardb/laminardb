@@ -1,0 +1,36 @@
+replicaCount: 3
+
+laminardb:
+  mode: cluster
+  delivery: at_least_once
+  logLevel: info
+  checkpoint:
+    url: "s3://laminardb-ci/checkpoints"
+  cluster:
+    discovery:
+      strategy: gossip
+      gossipPort: 7946
+
+persistence:
+  checkpoints:
+    enabled: false
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 4Gi
+  requests:
+    cpu: "1"
+    memory: 2Gi
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: laminardb

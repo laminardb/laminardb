@@ -14,6 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -38,6 +41,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo +nightly fmt --all -- --check
+      - name: Readability review baseline
+        run: cargo +nightly run --quiet --manifest-path tools/readability-check/Cargo.toml -- .
 
   # ============================================
   # Clippy Lints
@@ -48,10 +53,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
       - name: Set swap space
         uses: pierotofy/set-swap-space@v1.0
         with:
@@ -61,13 +71,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       - name: Clippy (no default features)
         run: cargo clippy --workspace --no-default-features -- -D warnings
+      - name: Clippy (readability check)
+        run: cargo clippy --manifest-path tools/readability-check/Cargo.toml --all-targets -- -D warnings
 
   # ============================================
   # Build & Test (Multi-Platform)
@@ -83,10 +95,15 @@ jobs:
       - uses: actions/checkout@v6
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
       - name: Set swap space (Linux)
         if: runner.os == 'Linux'
         uses: pierotofy/set-swap-space@v1.0
@@ -100,7 +117,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -113,17 +130,49 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo nextest run --workspace --all-features
         env:
+          # Debug-build recovery scenarios exceed libtest's 2 MiB worker stack. Keep the
+          # larger bounded stack scoped to test processes on resource-constrained runners.
+          RUST_MIN_STACK: 4194304
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-      # Windows: explicit features (skip hwloc, io-uring)
+      # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
+        # Windows hosted runners have less scheduling and linking headroom. Two
+        # concurrent test processes keep async runtime workers responsive.
+        run: cargo nextest run --workspace --test-threads=2 --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,files,parquet-lookup"
+        env:
+          RUST_MIN_STACK: 4194304
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
         if: runner.os == 'Linux'
         run: cargo test --doc --workspace
+
+  # ============================================
+  # PostgreSQL CDC Compatibility
+  # ============================================
+  postgres-cdc-integration:
+    name: PostgreSQL CDC (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["17", "18"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres-cdc-${{ matrix.postgres }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Run PostgreSQL CDC integration tests
+        run: cargo test -p laminar-connectors --no-default-features --features postgres-cdc --test postgres_cdc_integration -- --test-threads=1 --nocapture
+        env:
+          LAMINAR_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ============================================
   # Release Build (main/develop only)
@@ -136,10 +185,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
       - name: Set swap space
         uses: pierotofy/set-swap-space@v1.0
         with:
@@ -149,7 +203,7 @@ jobs:
         with:
           key: release
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build release
         run: cargo build --workspace --release --all-features
         env:
@@ -164,15 +218,20 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
       - name: Check no default features
         run: cargo check --workspace --no-default-features
@@ -186,22 +245,88 @@ jobs:
         run: |
           # Core features
           cargo check -p laminar-core --no-default-features
-          cargo check -p laminar-core --features io-uring
-          cargo check -p laminar-core --features hwloc
-          cargo check -p laminar-core --features delta
+          cargo check -p laminar-core --no-default-features --features cluster
 
           # DB features
-          cargo check -p laminar-db --features delta
+          cargo check -p laminar-db --no-default-features --features cluster
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features
-          cargo check -p laminar-connectors --features kafka
-          cargo check -p laminar-connectors --features postgres-cdc
-          cargo check -p laminar-connectors --features postgres-sink
-          cargo check -p laminar-connectors --features mysql-cdc
-          cargo check -p laminar-connectors --features kafka-discovery
-          cargo check -p laminar-connectors --features files
-          cargo check -p laminar-connectors --features parquet-lookup
+          cargo check -p laminar-connectors --no-default-features --features kafka
+          cargo check -p laminar-connectors --no-default-features --features postgres-cdc
+          cargo check -p laminar-connectors --no-default-features --features postgres-sink
+          cargo check -p laminar-connectors --no-default-features --features mongodb-cdc
+          cargo check -p laminar-connectors --no-default-features --features files
+          cargo check -p laminar-connectors --no-default-features --features parquet-lookup
+
+          # Iceberg catalog and storage isolation
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-core
+          cargo clippy -p laminar-connectors --all-targets --no-default-features --features iceberg-core -- -D warnings
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-rest
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-glue
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-hms
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-s3tables
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-catalog-sql
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-s3
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-gcs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-azure
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg-storage-fs
+          cargo check -p laminar-connectors --all-targets --no-default-features --features iceberg
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-gcs"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-storage-azure"
+          cargo check -p laminar-connectors --all-targets --no-default-features --features "iceberg-catalog-rest,iceberg-catalog-glue,iceberg-catalog-hms,iceberg-catalog-s3tables,iceberg-catalog-sql,iceberg-storage-s3,iceberg-storage-gcs,iceberg-storage-azure,iceberg-storage-fs"
+
+  iceberg-integration:
+    name: Iceberg REST, S3, and cluster recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: iceberg-integration
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Start Iceberg REST, MinIO, and Redpanda
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml up -d --wait
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml up -d --wait redpanda
+      - name: Run Iceberg append integration tests
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features iceberg --test iceberg_append -- --ignored --test-threads=1 --nocapture
+      - name: Run Iceberg cluster recovery test
+        run: cargo test --profile soak -p laminar-server --no-default-features --features "cluster,aws,kafka,iceberg" --test iceberg_cluster_soak -- --ignored --exact --test-threads=1 --nocapture
+      - name: Capture service logs after failure
+        if: failure()
+        continue-on-error: true
+        run: |
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml logs --no-color
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml logs --no-color redpanda
+      - name: Stop Iceberg REST, MinIO, and Redpanda
+        if: always()
+        run: |
+          docker compose -p laminardb-kafka-ci -f tests/docker/compose.yml down -v
+          docker compose -p laminardb-iceberg-ci -f tests/docker/iceberg-compose.yml down -v
+
+  dependency-generations:
+    name: Analytical Dependency Generations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Reject divergent analytical dependency generations
+        run: python3 tools/check_analytical_dependencies.py
+      - name: Verify maintained fork packages can be assembled
+        run: |
+          cargo package --manifest-path vendor/pgwire/Cargo.toml --no-verify
+          cargo package --manifest-path vendor/pgwire-replication/Cargo.toml --no-verify
+      - name: Verify workspace packages can be assembled
+        run: |
+          # The release publishes both maintained forks before the Laminar crates.
+          cargo package --workspace --locked --no-verify \
+            --config 'patch.crates-io.laminardb-pgwire.path="vendor/pgwire"' \
+            --config 'patch.crates-io.laminardb-pgwire-replication.path="vendor/pgwire-replication"'
 
   # ============================================
   # MSRV Check
@@ -214,9 +339,9 @@ jobs:
       - name: Extract MSRV
         id: msrv
         run: |
-          MSRV=$(grep -m1 'rust-version' Cargo.toml | cut -d'"' -f2 || echo "1.75")
+          MSRV=$(grep -m1 'rust-version' Cargo.toml | cut -d'"' -f2 || echo "1.95")
           if [[ -z "$MSRV" ]]; then
-            MSRV="1.85"
+            MSRV="1.95"
           fi
           echo "MSRV: $MSRV"
           echo "version=$MSRV" >> $GITHUB_OUTPUT
@@ -237,14 +362,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
         env:
@@ -294,19 +424,63 @@ jobs:
         run: cargo +nightly miri setup
       - name: Run Miri on core
         run: |
-          cargo +nightly miri test -p laminar-core --lib -- \
-            --skip test_tpc \
-            --skip test_io_uring
+          cargo +nightly miri test -p laminar-core --lib
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         continue-on-error: true
+
+  # ============================================
+  # Independent Evidence Contract Scaffolds
+  # ============================================
+  soak-contract-scaffold:
+    name: Ineligible contract/model scaffolds (NOT evidence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          components: clippy, rustfmt
+      - name: Format standalone contract tool
+        run: cargo fmt --manifest-path tools/independent-soak-contract/Cargo.toml -- --check
+      - name: Lint standalone contract tool
+        run: cargo clippy --locked --manifest-path tools/independent-soak-contract/Cargo.toml --all-targets -- -D warnings
+      - name: Test standalone contract tool
+        run: cargo test --locked --manifest-path tools/independent-soak-contract/Cargo.toml
+      - name: Reject Laminar, path, and workspace dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=tools/independent-soak-contract/Cargo.toml
+          if grep -Eq '(path|workspace)[[:space:]]*=' "$manifest"; then
+            echo "standalone soak contract unexpectedly uses a path or workspace dependency"
+            exit 1
+          fi
+          dependency_tree="$(cargo tree --locked --manifest-path tools/independent-soak-contract/Cargo.toml --prefix none)"
+          if grep -Eq '^laminar[-_]' <<< "$dependency_tree"; then
+            echo "standalone soak contract unexpectedly depends on a Laminar package"
+            exit 1
+          fi
+      - name: Validate ineligible draft and golden oracle fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          draft_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- validate-contract tools/independent-soak-contract/contracts/draft-v1alpha1.json 2>&1)"
+          echo "$draft_output"
+          grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$draft_output"
+          grep -Fq 'VALID_INELIGIBLE_DRAFT' <<< "$draft_output"
+
+          fixture_output="$(cargo run --quiet --locked --manifest-path tools/independent-soak-contract/Cargo.toml -- verify-oracle-fixture tools/independent-soak-contract/fixtures/grouped-count-sum-alo-v2.json 2>&1)"
+          echo "$fixture_output"
+          grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
+          grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"
 
   # ============================================
   # CI Success Gate
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, features, msrv, docs]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, iceberg-integration, dependency-generations, msrv, docs, soak-contract-scaffold]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -315,9 +489,13 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
+             [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
+             [[ "${{ needs.iceberg-integration.result }}" != "success" ]] || \
+             [[ "${{ needs.dependency-generations.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
-             [[ "${{ needs.docs.result }}" != "success" ]]; then
+             [[ "${{ needs.docs.result }}" != "success" ]] || \
+             [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi

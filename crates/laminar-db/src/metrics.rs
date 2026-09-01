@@ -1,24 +1,22 @@
-//! Pipeline observability metrics types.
-//!
-//! Provides atomic counters for pipeline-loop aggregates and snapshot types
-//! for querying source, stream, and pipeline-wide metrics from user code.
+//! Pipeline observability metrics.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// The state of a streaming pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
-    /// Pipeline has been created but not started.
+    /// Created but not started.
     Created,
-    /// Pipeline is in the process of starting.
+    /// Starting.
     Starting,
-    /// Pipeline is actively processing events.
+    /// Processing events.
     Running,
-    /// Pipeline is gracefully shutting down.
+    /// Gracefully shutting down.
     ShuttingDown,
-    /// Pipeline has stopped.
+    /// Stopped.
     Stopped,
+    /// Compute thread crashed (operator panic); recoverable via restart.
+    Faulted,
 }
 
 impl std::fmt::Display for PipelineState {
@@ -29,269 +27,108 @@ impl std::fmt::Display for PipelineState {
             Self::Running => write!(f, "Running"),
             Self::ShuttingDown => write!(f, "ShuttingDown"),
             Self::Stopped => write!(f, "Stopped"),
+            Self::Faulted => write!(f, "Faulted"),
         }
     }
-}
-
-/// Cache line size (bytes) for padding between hot/cold counter groups.
-const CACHE_LINE_SIZE: usize = 64;
-
-/// Shared atomic counters incremented by the pipeline processing loop.
-///
-/// Counters are separated into two groups on different cache lines to
-/// prevent false sharing between Ring 0 (hot path) and Ring 2 (checkpoint):
-///
-/// - **Ring 0 group** (`events_ingested` … `total_batches`): incremented on
-///   every processing cycle from the reactor thread.
-/// - **Ring 2 group** (`checkpoints_completed` … `checkpoint_epoch`): updated
-///   from the async checkpoint coordinator.
-///
-/// All reads and writes use `Ordering::Relaxed` — metrics are advisory,
-/// not transactional.
-#[repr(C)]
-pub struct PipelineCounters {
-    // ── Ring 0 counters (hot path, tight loop) ──
-    /// Total events ingested from sources.
-    pub events_ingested: AtomicU64,
-    /// Total events emitted to streams/sinks.
-    pub events_emitted: AtomicU64,
-    /// Total events dropped (e.g. backpressure).
-    pub events_dropped: AtomicU64,
-    /// Total processing cycles completed.
-    pub cycles: AtomicU64,
-    /// Duration of the last processing cycle in nanoseconds.
-    pub last_cycle_duration_ns: AtomicU64,
-    /// Total batches processed.
-    pub total_batches: AtomicU64,
-
-    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
-    pub queries_compiled: AtomicU64,
-    /// Queries using cached logical plan (physical planning per cycle).
-    pub queries_cached_plan: AtomicU64,
-
-    // ── Cache line padding ──
-    // Ring 0 group is 8 × 8 = 64 bytes. Pad to a full cache line boundary
-    // so Ring 2 counters start on a separate cache line.
-    _pad: [u8; CACHE_LINE_SIZE - (8 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
-
-    // ── Ring 2 counters (checkpoint coordinator, async) ──
-    /// Total checkpoints completed successfully.
-    pub checkpoints_completed: AtomicU64,
-    /// Total checkpoints that failed.
-    pub checkpoints_failed: AtomicU64,
-    /// Duration of the last checkpoint in milliseconds.
-    pub last_checkpoint_duration_ms: AtomicU64,
-    /// Current checkpoint epoch.
-    pub checkpoint_epoch: AtomicU64,
-    /// Maximum configured state bytes per operator (0 = unlimited).
-    pub max_state_bytes: AtomicU64,
-    /// Cycle duration p50 in nanoseconds (updated periodically).
-    pub cycle_p50_ns: AtomicU64,
-    /// Cycle duration p95 in nanoseconds (updated periodically).
-    pub cycle_p95_ns: AtomicU64,
-    /// Cycle duration p99 in nanoseconds (updated periodically).
-    pub cycle_p99_ns: AtomicU64,
-
-    // ── Sink 2PC timing (checkpoint coordinator, async) ──
-    /// Duration of the last sink pre-commit phase in microseconds.
-    pub sink_precommit_duration_us: AtomicU64,
-    /// Duration of the last sink commit phase in microseconds.
-    pub sink_commit_duration_us: AtomicU64,
-
-    // ── Checkpoint size / lag ──
-    /// Size of the last checkpoint in bytes (sidecar + manifest).
-    pub last_checkpoint_size_bytes: AtomicU64,
-    /// Wall-clock timestamp (ms since epoch) of the last successful checkpoint.
-    pub last_checkpoint_timestamp_ms: AtomicU64,
-}
-
-impl PipelineCounters {
-    /// Create zeroed counters.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            events_ingested: AtomicU64::new(0),
-            events_emitted: AtomicU64::new(0),
-            events_dropped: AtomicU64::new(0),
-            cycles: AtomicU64::new(0),
-            last_cycle_duration_ns: AtomicU64::new(0),
-            total_batches: AtomicU64::new(0),
-            queries_compiled: AtomicU64::new(0),
-            queries_cached_plan: AtomicU64::new(0),
-            _pad: [0; CACHE_LINE_SIZE - (8 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
-            checkpoints_completed: AtomicU64::new(0),
-            checkpoints_failed: AtomicU64::new(0),
-            last_checkpoint_duration_ms: AtomicU64::new(0),
-            checkpoint_epoch: AtomicU64::new(0),
-            max_state_bytes: AtomicU64::new(0),
-            cycle_p50_ns: AtomicU64::new(0),
-            cycle_p95_ns: AtomicU64::new(0),
-            cycle_p99_ns: AtomicU64::new(0),
-            sink_precommit_duration_us: AtomicU64::new(0),
-            sink_commit_duration_us: AtomicU64::new(0),
-            last_checkpoint_size_bytes: AtomicU64::new(0),
-            last_checkpoint_timestamp_ms: AtomicU64::new(0),
-        }
-    }
-
-    /// Take a snapshot of all counters.
-    #[must_use]
-    pub fn snapshot(&self) -> CounterSnapshot {
-        CounterSnapshot {
-            events_ingested: self.events_ingested.load(Ordering::Relaxed),
-            events_emitted: self.events_emitted.load(Ordering::Relaxed),
-            events_dropped: self.events_dropped.load(Ordering::Relaxed),
-            cycles: self.cycles.load(Ordering::Relaxed),
-            last_cycle_duration_ns: self.last_cycle_duration_ns.load(Ordering::Relaxed),
-            total_batches: self.total_batches.load(Ordering::Relaxed),
-            queries_compiled: self.queries_compiled.load(Ordering::Relaxed),
-            queries_cached_plan: self.queries_cached_plan.load(Ordering::Relaxed),
-            checkpoints_completed: self.checkpoints_completed.load(Ordering::Relaxed),
-            checkpoints_failed: self.checkpoints_failed.load(Ordering::Relaxed),
-            last_checkpoint_duration_ms: self.last_checkpoint_duration_ms.load(Ordering::Relaxed),
-            checkpoint_epoch: self.checkpoint_epoch.load(Ordering::Relaxed),
-            max_state_bytes: self.max_state_bytes.load(Ordering::Relaxed),
-            cycle_p50_ns: self.cycle_p50_ns.load(Ordering::Relaxed),
-            cycle_p95_ns: self.cycle_p95_ns.load(Ordering::Relaxed),
-            cycle_p99_ns: self.cycle_p99_ns.load(Ordering::Relaxed),
-            sink_precommit_duration_us: self.sink_precommit_duration_us.load(Ordering::Relaxed),
-            sink_commit_duration_us: self.sink_commit_duration_us.load(Ordering::Relaxed),
-            last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
-            last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
-        }
-    }
-}
-
-impl Default for PipelineCounters {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A point-in-time snapshot of [`PipelineCounters`].
-#[derive(Debug, Clone, Copy)]
-pub struct CounterSnapshot {
-    /// Total events ingested.
-    pub events_ingested: u64,
-    /// Total events emitted.
-    pub events_emitted: u64,
-    /// Total events dropped.
-    pub events_dropped: u64,
-    /// Total processing cycles.
-    pub cycles: u64,
-    /// Last cycle duration in nanoseconds.
-    pub last_cycle_duration_ns: u64,
-    /// Total batches processed.
-    pub total_batches: u64,
-    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
-    pub queries_compiled: u64,
-    /// Queries using cached logical plan (physical planning per cycle).
-    pub queries_cached_plan: u64,
-    /// Total checkpoints completed.
-    pub checkpoints_completed: u64,
-    /// Total checkpoints failed.
-    pub checkpoints_failed: u64,
-    /// Last checkpoint duration in milliseconds.
-    pub last_checkpoint_duration_ms: u64,
-    /// Current checkpoint epoch.
-    pub checkpoint_epoch: u64,
-    /// Maximum configured state bytes per operator (0 = unlimited).
-    pub max_state_bytes: u64,
-    /// Cycle duration p50 in nanoseconds.
-    pub cycle_p50_ns: u64,
-    /// Cycle duration p95 in nanoseconds.
-    pub cycle_p95_ns: u64,
-    /// Cycle duration p99 in nanoseconds.
-    pub cycle_p99_ns: u64,
-    /// Last sink pre-commit duration in microseconds.
-    pub sink_precommit_duration_us: u64,
-    /// Last sink commit duration in microseconds.
-    pub sink_commit_duration_us: u64,
-    /// Last checkpoint size in bytes.
-    pub last_checkpoint_size_bytes: u64,
-    /// Wall-clock timestamp (ms since epoch) of last successful checkpoint.
-    pub last_checkpoint_timestamp_ms: u64,
 }
 
 /// Pipeline-wide metrics snapshot.
 #[derive(Debug, Clone)]
 pub struct PipelineMetrics {
-    /// Total events ingested across all sources.
+    /// Events ingested.
     pub total_events_ingested: u64,
-    /// Total events emitted to streams/sinks.
+    /// Events emitted.
     pub total_events_emitted: u64,
-    /// Total events dropped.
+    /// Events dropped.
     pub total_events_dropped: u64,
-    /// Total processing cycles completed.
+    /// Cycles.
     pub total_cycles: u64,
-    /// Total batches processed.
+    /// Batches.
     pub total_batches: u64,
-    /// Time since the pipeline was created.
+    /// Uptime.
     pub uptime: Duration,
-    /// Current pipeline state.
+    /// State.
     pub state: PipelineState,
-    /// Duration of the last processing cycle in nanoseconds.
-    pub last_cycle_duration_ns: u64,
-    /// Number of registered sources.
+    /// Sources.
     pub source_count: usize,
-    /// Number of registered streams.
+    /// Streams.
     pub stream_count: usize,
-    /// Number of registered sinks.
+    /// Sinks.
     pub sink_count: usize,
-    /// Global pipeline watermark (minimum across all source watermarks).
+    /// Min watermark across all sources.
     pub pipeline_watermark: i64,
+    /// MV updates.
+    pub mv_updates: u64,
+    /// Approximate MV bytes.
+    pub mv_bytes_stored: u64,
 }
 
 /// Metrics for a single registered source.
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
-    /// Source name.
+    /// Name.
     pub name: String,
-    /// Total events pushed to this source (sequence number).
+    /// Total events (sequence number).
     pub total_events: u64,
-    /// Number of events currently buffered.
+    /// Buffered events.
     pub pending: usize,
-    /// Buffer capacity.
+    /// Capacity.
     pub capacity: usize,
-    /// Whether the source is experiencing backpressure (>80% full).
+    /// >80% full.
     pub is_backpressured: bool,
-    /// Current watermark value.
+    /// Watermark.
     pub watermark: i64,
-    /// Buffer utilization ratio (0.0 to 1.0).
+    /// 0.0..1.0.
     pub utilization: f64,
 }
 
 /// Metrics for a single registered stream.
 #[derive(Debug, Clone)]
 pub struct StreamMetrics {
-    /// Stream name.
+    /// Name.
     pub name: String,
-    /// Total events pushed to this stream.
+    /// Total rows emitted by this stream since it started.
     pub total_events: u64,
-    /// Number of events currently buffered.
-    pub pending: usize,
-    /// Buffer capacity.
-    pub capacity: usize,
-    /// Whether the stream is experiencing backpressure (>80% full).
-    pub is_backpressured: bool,
-    /// Current watermark value.
-    pub watermark: i64,
-    /// SQL query that defines this stream, if any.
+    /// Defining SQL query.
     pub sql: Option<String>,
 }
 
-/// Backpressure threshold: a buffer is considered backpressured when
-/// its utilization exceeds this fraction.
+/// Process-local, bounded-cardinality health snapshot for committed cluster subscriptions.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClusterSubscriptionOutputHealth {
+    /// Readers currently attached to this gateway.
+    pub active_readers: u64,
+    /// In-memory output bytes awaiting checkpoint disposition.
+    pub pending_bytes: u64,
+    /// Bytes reachable from retained committed history.
+    pub retained_bytes: u64,
+    /// Grace-held unreachable bytes found by the latest orphan scan.
+    pub orphan_bytes: u64,
+    /// Failed opens since this process started.
+    pub open_failures: u64,
+    /// Segment write failures since this process started.
+    pub segment_write_failures: u64,
+    /// Manifest failures since this process started.
+    pub manifest_failures: u64,
+    /// Integrity failures since this process started.
+    pub integrity_failures: u64,
+    /// Stale writer rejections since this process started.
+    pub stale_writer_rejections: u64,
+    /// Partition sequence gaps since this process started.
+    pub sequence_gaps: u64,
+    /// Bounded-lag gateway disconnects since this process started.
+    pub lag_disconnects: u64,
+}
+
 const BACKPRESSURE_THRESHOLD: f64 = 0.8;
 
-/// Compute whether a buffer is backpressured given pending and capacity.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn is_backpressured(pending: usize, capacity: usize) -> bool {
     capacity > 0 && (pending as f64 / capacity as f64) > BACKPRESSURE_THRESHOLD
 }
 
-/// Compute buffer utilization as a ratio (0.0 to 1.0).
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn utilization(pending: usize, capacity: usize) -> f64 {
@@ -307,63 +144,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pipeline_counters_default() {
-        let c = PipelineCounters::new();
-        let s = c.snapshot();
-        assert_eq!(s.events_ingested, 0);
-        assert_eq!(s.events_emitted, 0);
-        assert_eq!(s.events_dropped, 0);
-        assert_eq!(s.cycles, 0);
-        assert_eq!(s.total_batches, 0);
-        assert_eq!(s.last_cycle_duration_ns, 0);
-    }
-
-    #[test]
-    fn test_pipeline_counters_increment() {
-        let c = PipelineCounters::new();
-        c.events_ingested.fetch_add(100, Ordering::Relaxed);
-        c.events_emitted.fetch_add(50, Ordering::Relaxed);
-        c.events_dropped.fetch_add(3, Ordering::Relaxed);
-        c.cycles.fetch_add(10, Ordering::Relaxed);
-        c.total_batches.fetch_add(5, Ordering::Relaxed);
-        c.last_cycle_duration_ns.store(1234, Ordering::Relaxed);
-
-        let s = c.snapshot();
-        assert_eq!(s.events_ingested, 100);
-        assert_eq!(s.events_emitted, 50);
-        assert_eq!(s.events_dropped, 3);
-        assert_eq!(s.cycles, 10);
-        assert_eq!(s.total_batches, 5);
-        assert_eq!(s.last_cycle_duration_ns, 1234);
-    }
-
-    #[test]
-    fn test_pipeline_counters_concurrent_access() {
-        use std::sync::Arc;
-        let c = Arc::new(PipelineCounters::new());
-        let c2 = Arc::clone(&c);
-
-        let t = std::thread::spawn(move || {
-            for _ in 0..1000 {
-                c2.events_ingested.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-
-        for _ in 0..1000 {
-            c.events_ingested.fetch_add(1, Ordering::Relaxed);
-        }
-
-        t.join().unwrap();
-        assert_eq!(c.events_ingested.load(Ordering::Relaxed), 2000);
-    }
-
-    #[test]
     fn test_pipeline_state_display() {
         assert_eq!(PipelineState::Created.to_string(), "Created");
         assert_eq!(PipelineState::Starting.to_string(), "Starting");
         assert_eq!(PipelineState::Running.to_string(), "Running");
         assert_eq!(PipelineState::ShuttingDown.to_string(), "ShuttingDown");
         assert_eq!(PipelineState::Stopped.to_string(), "Stopped");
+        assert_eq!(PipelineState::Faulted.to_string(), "Faulted");
     }
 
     #[test]
@@ -406,11 +193,12 @@ mod tests {
             total_batches: 5,
             uptime: Duration::from_secs(60),
             state: PipelineState::Running,
-            last_cycle_duration_ns: 500,
             source_count: 2,
             stream_count: 1,
             sink_count: 1,
             pipeline_watermark: i64::MIN,
+            mv_updates: 0,
+            mv_bytes_stored: 0,
         };
         let m2 = m.clone();
         assert_eq!(m2.total_events_ingested, 100);
@@ -434,46 +222,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_line_separation() {
-        let c = PipelineCounters::new();
-        let base = &raw const c as usize;
-        let ring0_start = &raw const c.events_ingested as usize;
-        let ring2_start = &raw const c.checkpoints_completed as usize;
-
-        // Ring 0 starts at offset 0
-        assert_eq!(ring0_start - base, 0);
-        // Ring 2 starts at least 64 bytes from Ring 0
-        assert!(
-            ring2_start - ring0_start >= 64,
-            "Ring 2 counters must be on a separate cache line (offset: {})",
-            ring2_start - ring0_start
-        );
-    }
-
-    #[test]
-    fn test_checkpoint_counters() {
-        let c = PipelineCounters::new();
-        c.checkpoints_completed.fetch_add(5, Ordering::Relaxed);
-        c.checkpoints_failed.fetch_add(1, Ordering::Relaxed);
-        c.last_checkpoint_duration_ms.store(250, Ordering::Relaxed);
-        c.checkpoint_epoch.store(10, Ordering::Relaxed);
-
-        let s = c.snapshot();
-        assert_eq!(s.checkpoints_completed, 5);
-        assert_eq!(s.checkpoints_failed, 1);
-        assert_eq!(s.last_checkpoint_duration_ms, 250);
-        assert_eq!(s.checkpoint_epoch, 10);
-    }
-
-    #[test]
     fn test_stream_metrics_with_sql() {
         let m = StreamMetrics {
             name: "avg_price".to_string(),
             total_events: 500,
-            pending: 0,
-            capacity: 1024,
-            is_backpressured: false,
-            watermark: 0,
             sql: Some("SELECT symbol, AVG(price) FROM trades GROUP BY symbol".to_string()),
         };
         assert_eq!(

@@ -1,0 +1,110 @@
+# Local infrastructure for the Kafka → Iceberg time-series demo.
+#
+# Starts:
+#   - Redpanda           (Kafka API, port 9092)
+#   - MinIO              (S3 API, port 9000; console 9001)
+#   - apache/iceberg-rest catalog (port 8181)
+#   - one-shot init containers create the topic and the S3 bucket
+#
+# laminar-server is expected to run on the host (`cargo run --release -p
+# laminar-server -- --config laminar.toml`) and reach these services via
+# `localhost:<port>`. demo.sql and query.sql use those localhost addresses.
+# Inside the docker network, services use service names.
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v23.3.18
+    container_name: laminar-demo-redpanda
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "9092:9092"
+      # 9644 (redpanda admin) is not exposed to the host because the
+      # demo's healthchecks and init containers reach the broker via the
+      # docker-internal network (`redpanda:9092`). If you want to run
+      # `rpk` against the demo broker from the host, `docker exec
+      # laminar-demo-redpanda rpk …` is the supported route.
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info --brokers=localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+
+  redpanda-init:
+    image: redpandadata/redpanda:v23.3.18
+    container_name: laminar-demo-redpanda-init
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        rpk topic create crypto.ticks
+        --brokers=redpanda:9092
+        --partitions 3
+        --replicas 1
+        || true
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: laminar-demo-minio
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: laminar-demo-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb -p local/warehouse || true
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.2
+    container_name: laminar-demo-iceberg-rest
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/wh
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+
+volumes:
+  redpanda-data:
+  minio-data:

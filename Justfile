@@ -6,6 +6,10 @@ set dotenv-load
 default:
     @just --list
 
+# Enforce syntax-aware readability review ceilings and the legacy no-growth baseline.
+readability-check:
+    cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .
+
 # ── Docker ───────────────────────────────────────────────────────────────
 
 # Build Docker image locally
