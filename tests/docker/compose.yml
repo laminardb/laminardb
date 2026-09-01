@@ -34,6 +34,11 @@ services:
     ports:
       - "127.0.0.1:10000:10000"
     command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --disableTelemetry --skipApiVersionCheck
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:10000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
   gcs-emulator:
     # The pinned object_store XML client requires the upstream test image's XML API fixes.
@@ -42,6 +47,11 @@ services:
     ports:
       - "127.0.0.1:4443:4443"
     command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "127.0.0.1:4443"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4443/storage/v1/b"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
 
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.13

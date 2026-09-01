@@ -54,9 +54,10 @@ endpoints, Azure, and GCS do not inherit that admission.
 ## Locations and canonicalisation
 
 All consumers use one parsed provider/location model, then a small consumer-specific adapter.
-Schemes are case-insensitive. URLs containing user-info, query parameters, or fragments are
-rejected; credentials, SAS tokens, and signed query parameters must be configured separately.
-`http://`, `https://`, and `s3n://` are not storage locations.
+Schemes are case-insensitive. Query parameters, fragments, and credential-bearing user-info are
+rejected; credentials, SAS tokens, and signed query parameters must be configured separately. The
+user-info component in a qualified Azure Hadoop URL carries its filesystem/container rather than a
+credential. `http://`, `https://`, and `s3n://` are not storage locations.
 
 | Provider | Accepted input | Consumer form |
 |---|---|---|

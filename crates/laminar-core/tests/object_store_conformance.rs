@@ -1200,8 +1200,8 @@ fn emulator_context() -> Result<(CloudStoreTestContext, StoreConfig), String> {
     let base_url = required_env("LAMINAR_CLOUD_EMULATOR_TEST_URL")?;
     let location = StorageLocation::parse(&base_url)
         .map_err(|error| format!("LAMINAR_CLOUD_EMULATOR_TEST_URL is invalid: {error}"))?;
-    if location.provider != provider {
-        return Err("emulator test URL does not match the selected provider".into());
+    if location.provider != provider || location.endpoint_class() != StorageEndpointClass::Native {
+        return Err("emulator test URL must use the selected provider's direct scheme".into());
     }
     let endpoint = loopback_emulator_endpoint(&required_env("LAMINAR_CLOUD_EMULATOR_ENDPOINT")?)?;
     let run_id = required_env("GITHUB_RUN_ID").or_else(|_| required_env("LAMINAR_RUN_ID"))?;

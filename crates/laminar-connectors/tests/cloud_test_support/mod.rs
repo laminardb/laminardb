@@ -1,12 +1,14 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use laminar_connectors::storage::{
     StorageCredentialResolver, StorageEndpointClass, StorageLocation, StorageProvider,
 };
 use serde::Serialize;
+
+#[allow(clippy::disallowed_types)]
+type StorageOptions = std::collections::HashMap<String, String>;
 
 pub struct NativeCloudContext {
     pub provider: StorageProvider,
@@ -200,7 +202,7 @@ impl NativeCloudContext {
 pub struct EmulatorCloudContext {
     pub provider: StorageProvider,
     pub test_url: String,
-    pub options: HashMap<String, String>,
+    pub options: StorageOptions,
 }
 
 impl std::fmt::Debug for EmulatorCloudContext {
@@ -273,19 +275,19 @@ fn loopback_emulator_endpoint(raw: &str) -> Result<String, String> {
     Ok(raw.trim_end_matches('/').to_string())
 }
 
-fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String, String> {
+fn emulator_options(provider: StorageProvider, endpoint: &str) -> StorageOptions {
     const AZURITE_ACCOUNT: &str = "devstoreaccount1";
     const AZURITE_KEY: &str =
         "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
 
     match provider {
-        StorageProvider::AzureAdls => HashMap::from([
+        StorageProvider::AzureAdls => StorageOptions::from([
             ("azure_storage_account_name".into(), AZURITE_ACCOUNT.into()),
             ("azure_storage_account_key".into(), AZURITE_KEY.into()),
             ("azure_storage_endpoint".into(), endpoint.into()),
             ("azure_allow_http".into(), "true".into()),
         ]),
-        StorageProvider::Gcs => HashMap::from([
+        StorageProvider::Gcs => StorageOptions::from([
             ("google_allow_http".into(), "true".into()),
             (
                 "google_service_account_key".into(),
@@ -299,7 +301,7 @@ fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String
                 .to_string(),
             ),
         ]),
-        StorageProvider::AwsS3 | StorageProvider::Local => HashMap::new(),
+        StorageProvider::AwsS3 | StorageProvider::Local => StorageOptions::new(),
     }
 }
 

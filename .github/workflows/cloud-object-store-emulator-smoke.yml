@@ -56,7 +56,7 @@ jobs:
           key: cloud-emulator-${{ matrix.provider }}
 
       - name: Start ${{ matrix.provider }} emulator
-        run: docker compose -f tests/docker/compose.yml up -d "${{ matrix.service }}"
+        run: docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 "${{ matrix.service }}"
 
       - name: Wait for emulator and create isolated test container
         shell: bash
@@ -106,8 +106,22 @@ jobs:
           CORE_FEATURE: ${{ matrix.core_feature }}
 
       - name: Run Delta emulator protocol smoke
-        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" --test delta_emulator_smoke delta_emulator_protocol_smoke -- --ignored --exact --nocapture
+        shell: bash
+        run: |
+          set -euo pipefail
+          delta_log="$(mktemp)"
+          trap 'rm -f -- "$delta_log"' EXIT
+          cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" \
+            --test delta_emulator_smoke delta_emulator_protocol_smoke \
+            -- --ignored --exact --nocapture 2>&1 | tee "$delta_log"
+          if ! grep -Fq \
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;' \
+            "$delta_log"; then
+            echo 'delta_emulator_protocol_smoke did not execute exactly once'
+            exit 1
+          fi
         env:
+          CARGO_TERM_COLOR: never
           DELTA_FEATURE: ${{ matrix.delta_feature }}
           LAMINAR_ENABLED_CARGO_FEATURES: ${{ matrix.delta_feature }}
 
