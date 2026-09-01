@@ -393,7 +393,7 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
 | Delta Lake | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
 | Iceberg | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog mode fails closed | ✅ |
-| Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
+| Files (AutoLoader) | `files` | Local glob discovery/watch, Parquet/CSV/JSON; remote URLs fail at startup | ✅ |
 | Postgres Lookup | `postgres-cdc` | Connector name `postgres`; external table enrichment | ✅ |
 
 ### Sinks
@@ -407,9 +407,9 @@ Feature-gated connectors for external systems. Each advertises a typed recovery,
 | Iceberg | `iceberg` | Bounded rolling append writers; coordinated local exactly-once and REST + direct S3/S3A cluster exactly-once append; MOR/COW fail closed | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
-| Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
+| Files | `files` | Local Parquet/CSV/JSON with timestamp/partition templates; remote URLs fail at startup | ✅ |
 
-Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs. Iceberg's umbrella feature includes REST, S3, and local filesystem support; GCS and ADLS are isolated as `iceberg-storage-gcs` and `iceberg-storage-azure`. Glue, HMS, S3 Tables, and SQL Iceberg catalog selections currently return explicit unsupported-capability errors.
+Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs. Iceberg's umbrella feature includes REST, S3, and local filesystem support; use `iceberg-gcs` for GCS and the experimental `iceberg-azure` feature for ADLS/Blob. Glue, HMS, S3 Tables, and SQL Iceberg catalog selections currently return explicit unsupported-capability errors. See the [cloud object-store support matrix](docs/cloud-object-store-support.md) for URI aliases, evidence levels, credentials, and delivery admission.
 Iceberg REST authentication supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication until the OAuth2 path has a cluster recovery fault matrix. Data-storage credentials for cluster exactly-once use `storage.property.*`; secret-bearing `catalog.property.*` values remain uncertified catalog authentication.
 
 ### Connector Example
@@ -529,11 +529,12 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
 | `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
 | `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-gcs` / `iceberg-azure` | REST Iceberg with GCS / experimental Azure ADLS storage |
 | `iceberg-catalog-rest` | Iceberg REST catalog implementation |
 | `iceberg-catalog-glue` / `iceberg-catalog-hms` / `iceberg-catalog-s3tables` / `iceberg-catalog-sql` | Typed catalog capability selections; unsupported by the resolved released APIs |
 | `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
 | `websocket` | WebSocket source and sink connectors |
-| `files` | File source (AutoLoader) and sink (rolling Parquet/CSV/JSON) |
+| `files` | Local file source (AutoLoader) and sink (rolling Parquet/CSV/JSON); remote URLs are rejected |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `api` / `ffi` | C FFI layer with Arrow C Data Interface |
