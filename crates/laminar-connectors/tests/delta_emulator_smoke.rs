@@ -1,7 +1,8 @@
-//! Coordinated Delta protocol smoke coverage against Azure and GCS emulators.
+//! Delta protocol smoke coverage against Azure and GCS emulators.
 //!
-//! Emulator success validates LaminarDB's publication and recovery protocol only. The production
-//! cluster-admission predicate remains native-evidence gated.
+//! Azure exercises coordinated publication and recovery. The pinned GCS emulator cannot enforce
+//! generation preconditions, so GCS is limited to at-least-once append/read/reopen coverage. The
+//! production cluster-admission predicate remains native-evidence gated.
 
 #![cfg(feature = "delta-lake")]
 #![allow(clippy::disallowed_types)]
@@ -21,6 +22,7 @@ use laminar_connectors::connector::{
 };
 use laminar_connectors::lakehouse::delta_table_provider::register_delta_table;
 use laminar_connectors::lakehouse::{DeltaLakeSink, DeltaLakeSinkConfig, DeltaWriteMode};
+use laminar_connectors::storage::StorageProvider;
 use laminar_core::checkpoint::checkpoint_manifest::PipelineIdentity;
 use laminar_core::checkpoint::CheckpointAttempt;
 use object_store::ObjectStoreExt as _;
@@ -49,10 +51,13 @@ fn batch(ids: Vec<i64>) -> Result<RecordBatch, String> {
         .map_err(|_| "cannot build the Delta emulator input batch".to_string())
 }
 
-fn sink_config(context: &EmulatorCloudContext) -> DeltaLakeSinkConfig {
+fn sink_config(
+    context: &EmulatorCloudContext,
+    delivery_guarantee: DeliveryGuarantee,
+) -> DeltaLakeSinkConfig {
     let mut config = DeltaLakeSinkConfig::new(&context.test_url);
     config.write_mode = DeltaWriteMode::Append;
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    config.delivery_guarantee = delivery_guarantee;
     config.storage_options.clone_from(&context.options);
     config
 }
@@ -96,7 +101,10 @@ async fn prepared_sink(
     context: &EmulatorCloudContext,
     ids: Vec<i64>,
 ) -> Result<(DeltaLakeSink, Vec<u8>), String> {
-    let mut sink = DeltaLakeSink::with_schema(sink_config(context), schema());
+    let mut sink = DeltaLakeSink::with_schema(
+        sink_config(context, DeliveryGuarantee::ExactlyOnce),
+        schema(),
+    );
     let contract = sink
         .contract(&ConnectorConfig::new("delta-lake"))
         .map_err(|_| "Delta emulator contract validation failed".to_string())?;
@@ -149,7 +157,7 @@ async fn read_ids(context: &EmulatorCloudContext) -> Result<Vec<i64>, String> {
     Ok(ids)
 }
 
-async fn run_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
+async fn run_coordinated_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
     let namespace = namespace()?;
     let (mut first, first_descriptor) = prepared_sink(context, vec![1, 2]).await?;
     let (mut second, second_descriptor) = prepared_sink(context, vec![99]).await?;
@@ -180,7 +188,10 @@ async fn run_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
         );
     }
 
-    let mut fresh = DeltaLakeSink::with_schema(sink_config(context), schema());
+    let mut fresh = DeltaLakeSink::with_schema(
+        sink_config(context, DeliveryGuarantee::ExactlyOnce),
+        schema(),
+    );
     fresh
         .open(&ConnectorConfig::new("delta-lake"))
         .await
@@ -219,6 +230,58 @@ async fn run_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
         .map_err(|_| "fresh Delta emulator sink close failed".to_string())
 }
 
+async fn run_basic_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
+    let config = ConnectorConfig::new("delta-lake");
+    let mut sink = DeltaLakeSink::with_schema(
+        sink_config(context, DeliveryGuarantee::AtLeastOnce),
+        schema(),
+    );
+    let contract = sink
+        .contract(&config)
+        .map_err(|_| "GCS emulator Delta contract validation failed".to_string())?;
+    if contract.is_cluster_exact_delivery_certified() {
+        return Err("GCS emulator storage unexpectedly granted cluster certification".into());
+    }
+    sink.open(&config)
+        .await
+        .map_err(|_| "GCS emulator Delta sink open failed".to_string())?;
+    sink.write_batch(&batch(vec![1, 2])?)
+        .await
+        .map_err(|_| "GCS emulator Delta append failed".to_string())?;
+    sink.flush()
+        .await
+        .map_err(|_| "GCS emulator Delta flush failed".to_string())?;
+    sink.close()
+        .await
+        .map_err(|_| "GCS emulator Delta sink close failed".to_string())?;
+
+    let mut fresh = DeltaLakeSink::with_schema(
+        sink_config(context, DeliveryGuarantee::AtLeastOnce),
+        schema(),
+    );
+    fresh
+        .open(&config)
+        .await
+        .map_err(|_| "fresh GCS emulator Delta client open failed".to_string())?;
+    if read_ids(context).await? != vec![1, 2] {
+        return Err("fresh GCS emulator Delta client read different records".into());
+    }
+    fresh
+        .close()
+        .await
+        .map_err(|_| "fresh GCS emulator Delta client close failed".to_string())
+}
+
+async fn run_protocol(context: &EmulatorCloudContext) -> Result<(), String> {
+    match context.provider {
+        StorageProvider::AzureAdls => run_coordinated_protocol(context).await,
+        StorageProvider::Gcs => run_basic_protocol(context).await,
+        StorageProvider::AwsS3 | StorageProvider::Local => {
+            Err("cloud emulator provider was not Azure or GCS".into())
+        }
+    }
+}
+
 async fn cleanup(context: &EmulatorCloudContext) -> Result<(), String> {
     tokio::time::timeout(CLEANUP_TIMEOUT, cleanup_inner(context))
         .await
@@ -253,7 +316,7 @@ async fn cleanup_inner(context: &EmulatorCloudContext) -> Result<(), String> {
 
 #[tokio::test]
 #[ignore = "requires an explicitly marked Azure or GCS emulator"]
-async fn delta_emulator_coordinated_commit_smoke() {
+async fn delta_emulator_protocol_smoke() {
     let context = EmulatorCloudContext::load(provider_feature_enabled())
         .unwrap_or_else(|reason| panic!("Delta emulator setup is incomplete: {reason}"));
     let result = tokio::time::timeout(PROTOCOL_TIMEOUT, run_protocol(&context))

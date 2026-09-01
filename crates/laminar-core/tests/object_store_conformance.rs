@@ -104,6 +104,12 @@ struct FaultResults {
     recovered_checksum_matches: bool,
 }
 
+#[derive(Clone, Copy)]
+enum CapabilityScope {
+    Full,
+    Basic,
+}
+
 #[derive(Serialize)]
 struct CloudEvidence {
     schema_version: u32,
@@ -217,6 +223,7 @@ async fn native_object_store_conformance() {
         "checkpoint-object-store-conformance",
         "native_object_store_conformance",
         "storage-capability-only",
+        CapabilityScope::Full,
     )
     .await;
     write_evidence(&evidence).expect("native evidence artifact must be written");
@@ -228,12 +235,28 @@ async fn native_object_store_conformance() {
 async fn emulator_object_store_conformance() {
     let (context, config) = emulator_context()
         .unwrap_or_else(|reason| panic!("cloud-emulator setup is incomplete: {reason}"));
+    let (test_suite, delivery_contract, scope) = match context.provider {
+        StorageProvider::Gcs => (
+            "checkpoint-object-store-emulator-basic-smoke",
+            "storage-basic-emulator-smoke",
+            CapabilityScope::Basic,
+        ),
+        StorageProvider::AzureAdls => (
+            "checkpoint-object-store-emulator-conformance",
+            "storage-capability-emulator-smoke",
+            CapabilityScope::Full,
+        ),
+        StorageProvider::AwsS3 | StorageProvider::Local => {
+            panic!("cloud emulator provider was prevalidated as Azure or GCS")
+        }
+    };
     let evidence = capability_evidence(
         &context,
         &config,
-        "checkpoint-object-store-emulator-conformance",
+        test_suite,
         "emulator_object_store_conformance",
-        "storage-capability-emulator-smoke",
+        delivery_contract,
+        scope,
     )
     .await;
     write_evidence(&evidence).expect("emulator evidence artifact must be written");
@@ -299,11 +322,15 @@ async fn capability_evidence(
     test_suite: &'static str,
     test_name: &'static str,
     delivery_contract: &'static str,
+    scope: CapabilityScope,
 ) -> CloudEvidence {
     let started_at = chrono::Utc::now();
     let started = Instant::now();
     let mut capabilities = CapabilityResults::default();
-    let result = run_contract(context, config, &mut capabilities).await;
+    let result = match scope {
+        CapabilityScope::Full => run_contract(context, config, &mut capabilities).await,
+        CapabilityScope::Basic => run_basic_contract(context, config, &mut capabilities).await,
+    };
     let cleanup = cleanup_prefixes(config, &context.unique_prefix).await;
     let cleanup_result = cleanup_result(&cleanup);
     let failure = result.as_ref().err().cloned().or_else(|| cleanup.err());
@@ -459,47 +486,10 @@ async fn run_contract(
     config: &StoreConfig,
     results: &mut CapabilityResults,
 ) -> Result<(), String> {
+    run_basic_contract(context, config, results).await?;
+
     let store = config.build()?;
     let prefix = Path::from(context.unique_prefix.trim_end_matches('/'));
-    let object = child(&prefix, "basic/object.bin");
-    let payload = Bytes::from_static(b"laminardb-object-store-conformance");
-
-    bounded("put", store.put(&object, payload.clone().into())).await?;
-    let read = bounded("get", store.get(&object)).await?;
-    let read = bounded("get body", read.bytes()).await?;
-    require(read == payload, "full object read did not match the write")?;
-    results.put_get = true;
-
-    let range = bounded("range get", store.get_range(&object, 2..10)).await?;
-    require(
-        range == payload.slice(2..10),
-        "range read returned different bytes",
-    )?;
-    results.range_get = true;
-
-    let metadata = bounded("head", store.head(&object)).await?;
-    require(
-        metadata.e_tag.is_some() || metadata.version.is_some(),
-        "head returned neither ETag nor provider version metadata",
-    )?;
-    results.head_version = true;
-
-    let listed = list_prefix(&store, Some(&prefix), "list").await?;
-    require(
-        listed.iter().any(|entry| entry.location == object),
-        "prefix listing did not contain the written object",
-    )?;
-    results.list = true;
-
-    bounded("delete", store.delete(&object)).await?;
-    require(
-        bounded("head after delete", store.head(&object))
-            .await
-            .is_err(),
-        "deleted object remained visible",
-    )?;
-    results.delete = true;
-
     multipart_roundtrip(&store, &child(&prefix, "multipart/large.bin")).await?;
     results.multipart = true;
 
@@ -585,6 +575,69 @@ async fn run_contract(
         ),
     )
     .await?;
+    results.fresh_client = true;
+    Ok(())
+}
+
+async fn run_basic_contract(
+    context: &CloudStoreTestContext,
+    config: &StoreConfig,
+    results: &mut CapabilityResults,
+) -> Result<(), String> {
+    let store = config.build()?;
+    let prefix = Path::from(context.unique_prefix.trim_end_matches('/'));
+    let object = child(&prefix, "basic/object.bin");
+    let payload = Bytes::from_static(b"laminardb-object-store-conformance");
+
+    bounded("put", store.put(&object, payload.clone().into())).await?;
+    let read = bounded("get", store.get(&object)).await?;
+    let read = bounded("get body", read.bytes()).await?;
+    require(read == payload, "full object read did not match the write")?;
+    results.put_get = true;
+
+    let range = bounded("range get", store.get_range(&object, 2..10)).await?;
+    require(
+        range == payload.slice(2..10),
+        "range read returned different bytes",
+    )?;
+    results.range_get = true;
+
+    let metadata = bounded("head", store.head(&object)).await?;
+    require(
+        metadata.e_tag.is_some() || metadata.version.is_some(),
+        "head returned neither ETag nor provider version metadata",
+    )?;
+    results.head_version = true;
+
+    let listed = list_prefix(&store, Some(&prefix), "list").await?;
+    require(
+        listed.iter().any(|entry| entry.location == object),
+        "prefix listing did not contain the written object",
+    )?;
+    results.list = true;
+
+    bounded("delete", store.delete(&object)).await?;
+    require(
+        bounded("head after delete", store.head(&object))
+            .await
+            .is_err(),
+        "deleted object remained visible",
+    )?;
+    results.delete = true;
+
+    let restart_path = child(&prefix, "restart/object.bin");
+    let restart_payload = Bytes::from_static(b"fresh-client-restart");
+    bounded(
+        "restart put",
+        store.put(&restart_path, restart_payload.clone().into()),
+    )
+    .await?;
+    let fresh_store = config.build()?;
+    let fresh_read = bounded("fresh-client get", fresh_store.get(&restart_path)).await?;
+    require(
+        bounded("fresh-client body", fresh_read.bytes()).await? == restart_payload,
+        "fresh client did not observe the previously written object",
+    )?;
     results.fresh_client = true;
 
     let sibling_prefix = Path::from(sibling_prefix(&context.unique_prefix));

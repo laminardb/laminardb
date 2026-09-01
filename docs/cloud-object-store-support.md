@@ -33,9 +33,9 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
-| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator smoke job; native capability + fault jobs; no current native artifact | Supported; crash-durable only for absolute `file://` URLs | URI/config; MinIO smoke coverage; compatibility tier only |
+| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; native jobs have no current artifact | Supported; crash-durable only for absolute `file://` URLs | URI/config; MinIO smoke coverage; compatibility tier only |
 | Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; native job; no current native artifact | Supported | MinIO smoke; compatibility tier only |
-| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
+| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; native job; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
 | Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
@@ -150,10 +150,18 @@ never option values or full signed URLs.
 
 `.github/workflows/cloud-object-store-emulator-smoke.yml` runs on pull requests without cloud
 credentials. It uses version-pinned Azurite and GCS-compatible containers, creates a per-job test
-container/bucket, and executes the shared conditional-create, stale-CAS, fresh-client, cleanup, and
+container/bucket, and emits artifacts that are explicitly classified as emulator evidence.
+
+The Azure job executes the shared conditional-create, stale-CAS, fresh-client, cleanup, and
 checkpoint fault-boundary contracts. It also exercises Delta's coordinated descriptor publication,
-conflicting-cut rejection, idempotent retry, read, and fresh-client cursor recovery. Emulator
-endpoints are admitted only behind explicit debug/soak markers; release builds remain fail-closed.
+conflicting-cut rejection, idempotent retry, read, and fresh-client cursor recovery. Coordinated
+emulator endpoints are admitted only behind explicit debug/soak markers; release builds remain
+fail-closed.
+
+The GCS job is deliberately narrower. The fake server used by pinned `object_store 0.13.2` does not
+implement XML multipart upload or honor `ifGenerationMatch`, so it runs basic put/get/range/head,
+list/delete, prefix-isolation, cleanup, fresh-client, and Delta ALO append/read/reopen smoke only.
+Its evidence records conditional-create, stale-CAS, and multipart as unproven (`false`).
 
 Azurite covers the Azure Blob protocol only and does not emulate ADLS Gen2 hierarchical namespace
 behavior. The GCS-compatible container does not establish native generation, identity, retry, or

@@ -20,7 +20,7 @@ env:
 
 jobs:
   protocol-smoke:
-    name: ${{ matrix.provider }} conditional-write and Delta protocol smoke
+    name: ${{ matrix.provider }} object-store and Delta emulator smoke
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -92,19 +92,21 @@ jobs:
               >/dev/null
           fi
 
-      - name: Run conditional-write object-store contract
+      - name: Run object-store emulator contract
         run: |
           cargo test -p laminar-core --no-default-features --features "$CORE_FEATURE" \
             --test object_store_conformance emulator_object_store_conformance \
             -- --ignored --exact --nocapture
-          cargo test -p laminar-core --no-default-features --features "$CORE_FEATURE" \
-            --test object_store_conformance emulator_checkpoint_store_fault_contract \
-            -- --ignored --exact --nocapture
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            cargo test -p laminar-core --no-default-features --features "$CORE_FEATURE" \
+              --test object_store_conformance emulator_checkpoint_store_fault_contract \
+              -- --ignored --exact --nocapture
+          fi
         env:
           CORE_FEATURE: ${{ matrix.core_feature }}
 
-      - name: Run coordinated Delta publication smoke
-        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" --test delta_emulator_smoke delta_emulator_coordinated_commit_smoke -- --ignored --exact --nocapture
+      - name: Run Delta emulator protocol smoke
+        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" --test delta_emulator_smoke delta_emulator_protocol_smoke -- --ignored --exact --nocapture
         env:
           DELTA_FEATURE: ${{ matrix.delta_feature }}
           LAMINAR_ENABLED_CARGO_FEATURES: ${{ matrix.delta_feature }}
@@ -115,13 +117,18 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           evidence=(target/cloud-evidence/*.json)
-          if [ "${#evidence[@]}" -ne 2 ]; then
-            echo "expected two emulator evidence files, found ${#evidence[@]}"
+          expected_count=1
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            expected_count=2
+          fi
+          if [ "${#evidence[@]}" -ne "$expected_count" ]; then
+            echo "expected ${expected_count} emulator evidence files, found ${#evidence[@]}"
             exit 1
           fi
           for file in "${evidence[@]}"; do
-            jq -e --arg sha "$GITHUB_SHA" \
+            jq -e --arg sha "$GITHUB_SHA" --arg provider "$LAMINAR_CLOUD_EMULATOR_PROVIDER" \
               '.tested_sha == $sha and
+               .provider == $provider and
                .native_or_emulator == "emulator" and
                .redacted_endpoint_classification == "custom-or-emulator-endpoint" and
                .skip_count == 0 and
@@ -129,6 +136,21 @@ jobs:
                .cleanup_result == "passed"' \
               "$file" >/dev/null
           done
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            jq -e \
+              '.conditional_create_result == true and
+               .stale_cas_result == true and
+               .restart_result == true' \
+              "${evidence[@]}" >/dev/null
+          else
+            jq -e \
+              '.test_suite == "checkpoint-object-store-emulator-basic-smoke" and
+               .conditional_create_result == false and
+               .stale_cas_result == false and
+               .restart_result == true and
+               .capability_results.multipart == false' \
+              "${evidence[0]}" >/dev/null
+          fi
 
       - name: Upload emulator smoke evidence
         if: always()
