@@ -16,7 +16,7 @@ env:
   LAMINAR_RUN_ID: ${{ github.run_id }}
   LAMINAR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
   LAMINAR_TESTED_SHA: ${{ github.sha }}
-  LAMINAR_CLOUD_EVIDENCE_DIR: target/cloud-evidence
+  LAMINAR_CLOUD_EVIDENCE_DIR: ${{ github.workspace }}/target/cloud-evidence
 
 jobs:
   protocol-smoke:
@@ -74,7 +74,10 @@ jobs:
           done
 
           if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
-            connection_string='DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;'
+            source tests/docker/azurite-test.env
+            account_name="${AZURITE_ACCOUNTS%%:*}"
+            account_key="${AZURITE_ACCOUNTS#*:}"
+            connection_string="DefaultEndpointsProtocol=http;AccountName=${account_name};AccountKey=${account_key};BlobEndpoint=http://127.0.0.1:10000/${account_name};"
             az storage container create \
               --name laminardb-smoke \
               --connection-string "$connection_string" \
@@ -133,7 +136,7 @@ jobs:
         with:
           name: cloud-emulator-${{ matrix.provider }}-${{ github.run_id }}
           path: target/cloud-evidence/*.json
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Print emulator diagnostics on failure

@@ -29,16 +29,19 @@ services:
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:3.36.0
     container_name: laminardb-azurite
+    env_file:
+      - azurite-test.env
     ports:
       - "127.0.0.1:10000:10000"
-    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --disableTelemetry
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --disableTelemetry --skipApiVersionCheck
 
   gcs-emulator:
-    image: fsouza/fake-gcs-server:1.56.1
+    # The pinned object_store XML client requires the upstream test image's XML API fixes.
+    image: tustvold/fake-gcs-server@sha256:dcd3aeacc07c731f1336e90c2889be2af8626ae993ee1fe2c0ba042ebbeb5a04
     container_name: laminardb-gcs-emulator
     ports:
       - "127.0.0.1:4443:4443"
-    command: ["-scheme", "http", "-port", "4443", "-public-host", "127.0.0.1:4443"]
+    command: ["-scheme", "http", "-port", "4443", "-backend", "memory", "-public-host", "127.0.0.1:4443"]
 
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.13

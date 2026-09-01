@@ -286,13 +286,13 @@ fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String
             ("azure_allow_http".into(), "true".into()),
         ]),
         StorageProvider::Gcs => HashMap::from([
-            ("google_base_url".into(), endpoint.into()),
             ("google_allow_http".into(), "true".into()),
             (
                 "google_service_account_key".into(),
                 serde_json::json!({
                     "client_email": "",
                     "disable_oauth": true,
+                    "gcs_base_url": endpoint,
                     "private_key": "",
                     "private_key_id": ""
                 })

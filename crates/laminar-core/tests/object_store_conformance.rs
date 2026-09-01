@@ -237,7 +237,11 @@ async fn emulator_object_store_conformance() {
     )
     .await;
     write_evidence(&evidence).expect("emulator evidence artifact must be written");
-    assert!(evidence.passed, "emulator object-store conformance failed");
+    assert!(
+        evidence.passed,
+        "emulator object-store conformance failed: {}",
+        evidence.failure.as_deref().unwrap_or("unknown failure")
+    );
 }
 
 #[tokio::test]
@@ -284,7 +288,8 @@ async fn emulator_checkpoint_store_fault_contract() {
     write_evidence(&evidence).expect("emulator fault evidence artifact must be written");
     assert!(
         evidence.passed,
-        "emulator checkpoint-store fault contract failed"
+        "emulator checkpoint-store fault contract failed: {}",
+        evidence.failure.as_deref().unwrap_or("unknown failure")
     );
 }
 
@@ -1206,13 +1211,13 @@ fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String
             ("azure_allow_http".into(), "true".into()),
         ]),
         StorageProvider::Gcs => HashMap::from([
-            ("google_base_url".into(), endpoint.into()),
             ("google_allow_http".into(), "true".into()),
             (
                 "google_service_account_key".into(),
                 serde_json::json!({
                     "client_email": "",
                     "disable_oauth": true,
+                    "gcs_base_url": endpoint,
                     "private_key": "",
                     "private_key_id": ""
                 })
