@@ -26,6 +26,20 @@ services:
       timeout: 2s
       retries: 20
 
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.36.0
+    container_name: laminardb-azurite
+    ports:
+      - "127.0.0.1:10000:10000"
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --disableTelemetry
+
+  gcs-emulator:
+    image: fsouza/fake-gcs-server:1.56.1
+    container_name: laminardb-gcs-emulator
+    ports:
+      - "127.0.0.1:4443:4443"
+    command: ["-scheme", "http", "-port", "4443", "-public-host", "127.0.0.1:4443"]
+
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
     container_name: laminardb-redpanda

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use laminar_connectors::storage::{
@@ -193,6 +194,112 @@ impl NativeCloudContext {
             .map_err(|_| "cannot serialize native evidence".to_string())?;
         std::fs::write(std::path::Path::new(&directory).join(filename), bytes)
             .map_err(|_| "cannot write native evidence artifact".to_string())
+    }
+}
+
+pub struct EmulatorCloudContext {
+    pub provider: StorageProvider,
+    pub test_url: String,
+    pub options: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for EmulatorCloudContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmulatorCloudContext")
+            .field("provider", &self.provider)
+            .field("test_url", &"<redacted-location>")
+            .field("options", &"<redacted-options>")
+            .finish()
+    }
+}
+
+impl EmulatorCloudContext {
+    pub fn load(feature_enabled: bool) -> Result<Self, String> {
+        if !env_truthy("LAMINAR_CLOUD_EMULATOR") {
+            return Err("LAMINAR_CLOUD_EMULATOR=1 is required".into());
+        }
+        if env_truthy("LAMINAR_NATIVE_CLOUD") {
+            return Err("native and emulator cloud markers are mutually exclusive".into());
+        }
+        if !feature_enabled {
+            return Err("the selected provider Cargo feature is not enabled".into());
+        }
+        let provider = match required_env("LAMINAR_CLOUD_EMULATOR_PROVIDER")?.as_str() {
+            "azure" => StorageProvider::AzureAdls,
+            "gcs" => StorageProvider::Gcs,
+            _ => return Err("LAMINAR_CLOUD_EMULATOR_PROVIDER must be azure or gcs".into()),
+        };
+        let base_url = required_env("LAMINAR_CLOUD_EMULATOR_TEST_URL")?;
+        let location = StorageLocation::parse(&base_url)
+            .map_err(|error| format!("LAMINAR_CLOUD_EMULATOR_TEST_URL is invalid: {error}"))?;
+        if location.provider != provider
+            || location.endpoint_class() != StorageEndpointClass::Native
+        {
+            return Err("emulator test URL must use the selected provider's direct scheme".into());
+        }
+        let endpoint =
+            loopback_emulator_endpoint(&required_env("LAMINAR_CLOUD_EMULATOR_ENDPOINT")?)?;
+        let run_id = required_env("GITHUB_RUN_ID").or_else(|_| required_env("LAMINAR_RUN_ID"))?;
+        let base_sha = required_env("LAMINAR_BASE_SHA")?;
+        let prefix = format!(
+            "laminardb-tests/{}/{}/delta-emulator/{}/",
+            safe_component(&base_sha.chars().take(12).collect::<String>()),
+            safe_component(&run_id),
+            uuid::Uuid::new_v4()
+        );
+        Ok(Self {
+            provider,
+            test_url: format!("{}/{}", base_url.trim_end_matches('/'), prefix),
+            options: emulator_options(provider, &endpoint),
+        })
+    }
+}
+
+fn loopback_emulator_endpoint(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| "LAMINAR_CLOUD_EMULATOR_ENDPOINT must be an absolute URL".to_string())?;
+    if parsed.scheme() != "http"
+        || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "LAMINAR_CLOUD_EMULATOR_ENDPOINT must be a credential-free loopback HTTP URL".into(),
+        );
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String, String> {
+    const AZURITE_ACCOUNT: &str = "devstoreaccount1";
+    const AZURITE_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+    match provider {
+        StorageProvider::AzureAdls => HashMap::from([
+            ("azure_storage_account_name".into(), AZURITE_ACCOUNT.into()),
+            ("azure_storage_account_key".into(), AZURITE_KEY.into()),
+            ("azure_storage_endpoint".into(), endpoint.into()),
+            ("azure_allow_http".into(), "true".into()),
+        ]),
+        StorageProvider::Gcs => HashMap::from([
+            ("google_base_url".into(), endpoint.into()),
+            ("google_allow_http".into(), "true".into()),
+            (
+                "google_service_account_key".into(),
+                serde_json::json!({
+                    "client_email": "",
+                    "disable_oauth": true,
+                    "private_key": "",
+                    "private_key_id": ""
+                })
+                .to_string(),
+            ),
+        ]),
+        StorageProvider::AwsS3 | StorageProvider::Local => HashMap::new(),
     }
 }
 

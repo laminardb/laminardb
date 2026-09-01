@@ -1,7 +1,7 @@
 //! Provider-neutral object-store capability contract.
 //!
-//! The local test always runs. The ignored native entry point is invoked by the
-//! protected native-cloud workflow with an explicit provider marker.
+//! The local tests always run. Ignored cloud entry points require explicit native or emulator
+//! markers so an absent external service cannot be mistaken for evidence.
 
 #![allow(clippy::disallowed_types)] // Mirrors the checkpoint builder's public options type.
 
@@ -105,7 +105,7 @@ struct FaultResults {
 }
 
 #[derive(Serialize)]
-struct NativeEvidence {
+struct CloudEvidence {
     schema_version: u32,
     repository: &'static str,
     base_sha: String,
@@ -201,8 +201,6 @@ async fn local_object_store_satisfies_the_checkpoint_fault_contract() {
 #[tokio::test]
 #[ignore = "requires an explicit native-cloud marker and pre-provisioned location"]
 async fn native_object_store_conformance() {
-    let started_at = chrono::Utc::now();
-    let started = Instant::now();
     let required = env_truthy("LAMINAR_NATIVE_CLOUD_REQUIRED");
     let setup = native_context();
     let (context, config) = match setup {
@@ -213,70 +211,38 @@ async fn native_object_store_conformance() {
         }
         Err(reason) => panic!("required native object-store setup is incomplete: {reason}"),
     };
-
-    let mut capabilities = CapabilityResults::default();
-    let result = run_contract(&context, &config, &mut capabilities).await;
-    let cleanup = cleanup_prefixes(&config, &context.unique_prefix).await;
-    let cleanup_result = match &cleanup {
-        Ok(()) => "passed".to_string(),
-        Err(error) => error.clone(),
-    };
-    let failure = result.as_ref().err().cloned().or_else(|| cleanup.err());
-    let parsed = StorageLocation::parse(&context.base_url).expect("native URL was prevalidated");
-    let evidence = NativeEvidence {
-        schema_version: 1,
-        repository: "laminardb/laminardb",
-        base_sha: context.base_sha.clone(),
-        tested_sha: context.tested_sha.clone(),
-        workflow_run_id: context.run_id.clone(),
-        provider: provider_id(context.provider),
-        native_or_emulator: context.native_or_emulator,
-        redacted_endpoint_classification: endpoint_class_id(context.endpoint_class),
-        region_or_cloud_location: non_empty_env("LAMINAR_CLOUD_LOCATION"),
-        url_scheme: parsed.original_scheme,
-        enabled_cargo_features: non_empty_env("LAMINAR_ENABLED_CARGO_FEATURES")
-            .map(|features| features.split(',').map(str::to_string).collect())
-            .unwrap_or_default(),
-        object_store_version: "0.13.2",
-        deltalake_version: None,
-        iceberg_version: None,
-        opendal_version: None,
-        auth_source: context.auth_source,
-        test_suite: "checkpoint-object-store-conformance",
-        test_name: "native_object_store_conformance",
-        started_at: started_at.to_rfc3339(),
-        finished_at: chrono::Utc::now().to_rfc3339(),
-        duration_ms: started.elapsed().as_millis(),
-        iterations: 1,
-        process_kill_count: 0,
-        recovery_bound_ms: OPERATION_TIMEOUT.as_millis() as u64,
-        conditional_create_result: capabilities.conditional_create
-            && capabilities.create_race_single_winner,
-        stale_cas_result: capabilities.stale_update_rejected,
-        restart_result: capabilities.fresh_client,
-        delivery_contract_tested: "storage-capability-only",
-        records_produced: 0,
-        records_committed: 0,
-        records_recovered: 0,
-        duplicates: 0,
-        losses: 0,
-        passed: failure.is_none(),
-        skip_count: 0,
-        skip_reasons: Vec::new(),
-        cleanup_result,
-        failure,
-        capability_results: capabilities,
-        fault_results: None,
-    };
+    let evidence = capability_evidence(
+        &context,
+        &config,
+        "checkpoint-object-store-conformance",
+        "native_object_store_conformance",
+        "storage-capability-only",
+    )
+    .await;
     write_evidence(&evidence).expect("native evidence artifact must be written");
     assert!(evidence.passed, "native object-store conformance failed");
 }
 
 #[tokio::test]
+#[ignore = "requires an explicit local cloud-emulator marker"]
+async fn emulator_object_store_conformance() {
+    let (context, config) = emulator_context()
+        .unwrap_or_else(|reason| panic!("cloud-emulator setup is incomplete: {reason}"));
+    let evidence = capability_evidence(
+        &context,
+        &config,
+        "checkpoint-object-store-emulator-conformance",
+        "emulator_object_store_conformance",
+        "storage-capability-emulator-smoke",
+    )
+    .await;
+    write_evidence(&evidence).expect("emulator evidence artifact must be written");
+    assert!(evidence.passed, "emulator object-store conformance failed");
+}
+
+#[tokio::test]
 #[ignore = "requires an explicit native-cloud marker and pre-provisioned location"]
 async fn native_checkpoint_store_fault_contract() {
-    let started_at = chrono::Utc::now();
-    let started = Instant::now();
     let required = env_truthy("LAMINAR_NATIVE_CLOUD_REQUIRED");
     let setup = native_context();
     let (context, config) = match setup {
@@ -287,16 +253,60 @@ async fn native_checkpoint_store_fault_contract() {
         }
         Err(reason) => panic!("required native checkpoint-store setup is incomplete: {reason}"),
     };
-    let mut faults = FaultResults::default();
-    let result = run_checkpoint_fault_contract(&context, &config, &mut faults).await;
-    let cleanup = cleanup_prefixes(&config, &context.unique_prefix).await;
-    let cleanup_result = match &cleanup {
-        Ok(()) => "passed".to_string(),
-        Err(error) => error.clone(),
-    };
+    let evidence = fault_evidence(
+        &context,
+        &config,
+        "checkpoint-store-fault-contract",
+        "native_checkpoint_store_fault_contract",
+        "checkpoint-state-integrity",
+    )
+    .await;
+    write_evidence(&evidence).expect("native fault evidence artifact must be written");
+    assert!(
+        evidence.passed,
+        "native checkpoint-store fault contract failed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an explicit local cloud-emulator marker"]
+async fn emulator_checkpoint_store_fault_contract() {
+    let (context, config) = emulator_context()
+        .unwrap_or_else(|reason| panic!("cloud-emulator setup is incomplete: {reason}"));
+    let evidence = fault_evidence(
+        &context,
+        &config,
+        "checkpoint-store-emulator-fault-contract",
+        "emulator_checkpoint_store_fault_contract",
+        "checkpoint-protocol-emulator-smoke",
+    )
+    .await;
+    write_evidence(&evidence).expect("emulator fault evidence artifact must be written");
+    assert!(
+        evidence.passed,
+        "emulator checkpoint-store fault contract failed"
+    );
+}
+
+async fn capability_evidence(
+    context: &CloudStoreTestContext,
+    config: &StoreConfig,
+    test_suite: &'static str,
+    test_name: &'static str,
+    delivery_contract: &'static str,
+) -> CloudEvidence {
+    let started_at = chrono::Utc::now();
+    let started = Instant::now();
+    let mut capabilities = CapabilityResults::default();
+    let result = run_contract(context, config, &mut capabilities).await;
+    let cleanup = cleanup_prefixes(config, &context.unique_prefix).await;
+    let cleanup_result = cleanup_result(&cleanup);
     let failure = result.as_ref().err().cloned().or_else(|| cleanup.err());
-    let parsed = StorageLocation::parse(&context.base_url).expect("native URL was prevalidated");
-    let evidence = NativeEvidence {
+    let conditional_create =
+        capabilities.conditional_create && capabilities.create_race_single_winner;
+    let stale_cas = capabilities.stale_update_rejected;
+    let restart = capabilities.fresh_client;
+    CloudEvidence {
         schema_version: 1,
         repository: "laminardb/laminardb",
         base_sha: context.base_sha.clone(),
@@ -306,28 +316,27 @@ async fn native_checkpoint_store_fault_contract() {
         native_or_emulator: context.native_or_emulator,
         redacted_endpoint_classification: endpoint_class_id(context.endpoint_class),
         region_or_cloud_location: non_empty_env("LAMINAR_CLOUD_LOCATION"),
-        url_scheme: parsed.original_scheme,
-        enabled_cargo_features: non_empty_env("LAMINAR_ENABLED_CARGO_FEATURES")
-            .map(|features| features.split(',').map(str::to_string).collect())
-            .unwrap_or_default(),
+        url_scheme: context_scheme(context),
+        enabled_cargo_features: enabled_cargo_features(),
         object_store_version: "0.13.2",
         deltalake_version: None,
         iceberg_version: None,
         opendal_version: None,
         auth_source: context.auth_source,
-        test_suite: "checkpoint-store-fault-contract",
-        test_name: "native_checkpoint_store_fault_contract",
+        test_suite,
+        test_name,
         started_at: started_at.to_rfc3339(),
         finished_at: chrono::Utc::now().to_rfc3339(),
         duration_ms: started.elapsed().as_millis(),
-        iterations: 12,
+        iterations: 1,
         process_kill_count: 0,
         recovery_bound_ms: OPERATION_TIMEOUT.as_millis() as u64,
-        capability_results: CapabilityResults::default(),
-        conditional_create_result: faults.contending_writers_single_winner,
-        stale_cas_result: faults.stale_writer_rejected,
-        restart_result: faults.fresh_client_recovery,
-        delivery_contract_tested: "checkpoint-state-integrity",
+        capability_results: capabilities,
+        fault_results: None,
+        conditional_create_result: conditional_create,
+        stale_cas_result: stale_cas,
+        restart_result: restart,
+        delivery_contract_tested: delivery_contract,
         records_produced: 0,
         records_committed: 0,
         records_recovered: 0,
@@ -338,13 +347,87 @@ async fn native_checkpoint_store_fault_contract() {
         skip_reasons: Vec::new(),
         cleanup_result,
         failure,
+    }
+}
+
+async fn fault_evidence(
+    context: &CloudStoreTestContext,
+    config: &StoreConfig,
+    test_suite: &'static str,
+    test_name: &'static str,
+    delivery_contract: &'static str,
+) -> CloudEvidence {
+    let started_at = chrono::Utc::now();
+    let started = Instant::now();
+    let mut faults = FaultResults::default();
+    let result = run_checkpoint_fault_contract(context, config, &mut faults).await;
+    let cleanup = cleanup_prefixes(config, &context.unique_prefix).await;
+    let cleanup_result = cleanup_result(&cleanup);
+    let failure = result.as_ref().err().cloned().or_else(|| cleanup.err());
+    let conditional_create = faults.contending_writers_single_winner;
+    let stale_cas = faults.stale_writer_rejected;
+    let restart = faults.fresh_client_recovery;
+    CloudEvidence {
+        schema_version: 1,
+        repository: "laminardb/laminardb",
+        base_sha: context.base_sha.clone(),
+        tested_sha: context.tested_sha.clone(),
+        workflow_run_id: context.run_id.clone(),
+        provider: provider_id(context.provider),
+        native_or_emulator: context.native_or_emulator,
+        redacted_endpoint_classification: endpoint_class_id(context.endpoint_class),
+        region_or_cloud_location: non_empty_env("LAMINAR_CLOUD_LOCATION"),
+        url_scheme: context_scheme(context),
+        enabled_cargo_features: enabled_cargo_features(),
+        object_store_version: "0.13.2",
+        deltalake_version: None,
+        iceberg_version: None,
+        opendal_version: None,
+        auth_source: context.auth_source,
+        test_suite,
+        test_name,
+        started_at: started_at.to_rfc3339(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: started.elapsed().as_millis(),
+        iterations: 12,
+        process_kill_count: 0,
+        recovery_bound_ms: OPERATION_TIMEOUT.as_millis() as u64,
+        capability_results: CapabilityResults::default(),
         fault_results: Some(faults),
-    };
-    write_evidence(&evidence).expect("native fault evidence artifact must be written");
-    assert!(
-        evidence.passed,
-        "native checkpoint-store fault contract failed"
-    );
+        conditional_create_result: conditional_create,
+        stale_cas_result: stale_cas,
+        restart_result: restart,
+        delivery_contract_tested: delivery_contract,
+        records_produced: 0,
+        records_committed: 0,
+        records_recovered: 0,
+        duplicates: 0,
+        losses: 0,
+        passed: failure.is_none(),
+        skip_count: 0,
+        skip_reasons: Vec::new(),
+        cleanup_result,
+        failure,
+    }
+}
+
+fn context_scheme(context: &CloudStoreTestContext) -> String {
+    StorageLocation::parse(&context.base_url)
+        .expect("cloud test URL was prevalidated")
+        .original_scheme
+}
+
+fn enabled_cargo_features() -> Vec<String> {
+    non_empty_env("LAMINAR_ENABLED_CARGO_FEATURES")
+        .map(|features| features.split(',').map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn cleanup_result(cleanup: &Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => "passed".to_string(),
+        Err(error) => error.clone(),
+    }
 }
 
 #[tokio::test]
@@ -1032,6 +1115,114 @@ fn native_context() -> Result<(CloudStoreTestContext, StoreConfig), String> {
     ))
 }
 
+fn emulator_context() -> Result<(CloudStoreTestContext, StoreConfig), String> {
+    if !env_truthy("LAMINAR_CLOUD_EMULATOR") {
+        return Err("LAMINAR_CLOUD_EMULATOR=1 is required".into());
+    }
+    if env_truthy("LAMINAR_NATIVE_CLOUD") {
+        return Err("native and emulator cloud markers are mutually exclusive".into());
+    }
+    let provider_name = required_env("LAMINAR_CLOUD_EMULATOR_PROVIDER")?;
+    let (provider, feature_enabled, auth_source) = match provider_name.as_str() {
+        "azure" => (
+            StorageProvider::AzureAdls,
+            cfg!(feature = "azure"),
+            "explicit-static-emulator",
+        ),
+        "gcs" => (
+            StorageProvider::Gcs,
+            cfg!(feature = "gcs"),
+            "anonymous-emulator",
+        ),
+        _ => return Err("LAMINAR_CLOUD_EMULATOR_PROVIDER must be azure or gcs".into()),
+    };
+    if !feature_enabled {
+        return Err(format!("the {provider_name} Cargo feature is not enabled"));
+    }
+    let base_url = required_env("LAMINAR_CLOUD_EMULATOR_TEST_URL")?;
+    let location = StorageLocation::parse(&base_url)
+        .map_err(|error| format!("LAMINAR_CLOUD_EMULATOR_TEST_URL is invalid: {error}"))?;
+    if location.provider != provider {
+        return Err("emulator test URL does not match the selected provider".into());
+    }
+    let endpoint = loopback_emulator_endpoint(&required_env("LAMINAR_CLOUD_EMULATOR_ENDPOINT")?)?;
+    let run_id = required_env("GITHUB_RUN_ID").or_else(|_| required_env("LAMINAR_RUN_ID"))?;
+    let base_sha = required_env("LAMINAR_BASE_SHA")?;
+    let tested_sha = required_env("GITHUB_SHA").or_else(|_| required_env("LAMINAR_TESTED_SHA"))?;
+    let unique_prefix = format!(
+        "laminardb-tests/{}/{}/object-store-emulator/{}/",
+        safe_component(&base_sha.chars().take(12).collect::<String>()),
+        safe_component(&run_id),
+        uuid::Uuid::new_v4()
+    );
+    let options = emulator_options(provider, &endpoint);
+    Ok((
+        CloudStoreTestContext {
+            provider,
+            native_or_emulator: "emulator",
+            base_url: base_url.clone(),
+            unique_prefix,
+            run_id,
+            base_sha,
+            tested_sha,
+            endpoint_class: StorageEndpointClass::CustomOrEmulator,
+            auth_source,
+        },
+        StoreConfig {
+            url: base_url,
+            options,
+            test_store: None,
+        },
+    ))
+}
+
+fn loopback_emulator_endpoint(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| "LAMINAR_CLOUD_EMULATOR_ENDPOINT must be an absolute URL".to_string())?;
+    if parsed.scheme() != "http"
+        || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "LAMINAR_CLOUD_EMULATOR_ENDPOINT must be a credential-free loopback HTTP URL".into(),
+        );
+    }
+    Ok(raw.trim_end_matches('/').to_string())
+}
+
+fn emulator_options(provider: StorageProvider, endpoint: &str) -> HashMap<String, String> {
+    const AZURITE_ACCOUNT: &str = "devstoreaccount1";
+    const AZURITE_KEY: &str =
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==";
+
+    match provider {
+        StorageProvider::AzureAdls => HashMap::from([
+            ("azure_storage_account_name".into(), AZURITE_ACCOUNT.into()),
+            ("azure_storage_account_key".into(), AZURITE_KEY.into()),
+            ("azure_storage_endpoint".into(), endpoint.into()),
+            ("azure_allow_http".into(), "true".into()),
+        ]),
+        StorageProvider::Gcs => HashMap::from([
+            ("google_base_url".into(), endpoint.into()),
+            ("google_allow_http".into(), "true".into()),
+            (
+                "google_service_account_key".into(),
+                serde_json::json!({
+                    "client_email": "",
+                    "disable_oauth": true,
+                    "private_key": "",
+                    "private_key_id": ""
+                })
+                .to_string(),
+            ),
+        ]),
+        StorageProvider::AwsS3 | StorageProvider::Local => HashMap::new(),
+    }
+}
+
 fn validate_native_object_store_auth(provider: StorageProvider) -> Result<(), String> {
     if provider != StorageProvider::Gcs {
         return Ok(());
@@ -1133,11 +1324,11 @@ fn native_auth_source(provider: StorageProvider) -> Result<&'static str, String>
     })
 }
 
-fn write_evidence(evidence: &NativeEvidence) -> Result<(), String> {
+fn write_evidence(evidence: &CloudEvidence) -> Result<(), String> {
     let directory = non_empty_env("LAMINAR_CLOUD_EVIDENCE_DIR")
         .unwrap_or_else(|| "target/cloud-evidence".into());
     std::fs::create_dir_all(&directory)
-        .map_err(|_| "cannot create native evidence directory".to_string())?;
+        .map_err(|_| "cannot create cloud evidence directory".to_string())?;
     let filename = format!(
         "{}-{}-{}.json",
         safe_component(evidence.test_suite),
@@ -1146,8 +1337,8 @@ fn write_evidence(evidence: &NativeEvidence) -> Result<(), String> {
     );
     let path = std::path::Path::new(&directory).join(filename);
     let bytes = serde_json::to_vec_pretty(evidence)
-        .map_err(|_| "cannot serialize native evidence".to_string())?;
-    std::fs::write(path, bytes).map_err(|_| "cannot write native evidence artifact".to_string())
+        .map_err(|_| "cannot serialize cloud evidence".to_string())?;
+    std::fs::write(path, bytes).map_err(|_| "cannot write cloud evidence artifact".to_string())
 }
 
 fn required_env(name: &str) -> Result<String, String> {

@@ -489,6 +489,7 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
     }
 
     for options in [
+        HashMap::from([("google_base_url".into(), "http://gcs-emulator".into())]),
         HashMap::from([(
             "google_service_account_key".into(),
             r#"{"gcs_base_url":"http://gcs-emulator"}"#.into(),
@@ -522,6 +523,44 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             .unwrap()
     )
     .is_err());
+}
+
+#[test]
+fn coordinated_emulator_override_is_debug_soak_only() {
+    let azure_options = HashMap::from([(
+        "azure_storage_endpoint".into(),
+        "http://127.0.0.1:10000/devstoreaccount1".into(),
+    )]);
+    let azure_environment =
+        |key: &str| (key == "LAMINAR_SOAK_ALLOW_AZURE_EMULATOR").then(|| "1".to_string());
+    let azure = validate_coordinated_storage_preflight_with_env(
+        "az://container/table",
+        &azure_options,
+        &azure_environment,
+    );
+
+    let gcs_options = HashMap::from([
+        ("google_base_url".into(), "http://127.0.0.1:4443".into()),
+        (
+            "google_service_account_key".into(),
+            r#"{"disable_oauth":true}"#.into(),
+        ),
+    ]);
+    let gcs_environment =
+        |key: &str| (key == "LAMINAR_SOAK_ALLOW_GCS_EMULATOR").then(|| "true".to_string());
+    let gcs = validate_coordinated_storage_preflight_with_env(
+        "gs://bucket/table",
+        &gcs_options,
+        &gcs_environment,
+    );
+
+    if cfg!(debug_assertions) {
+        azure.unwrap();
+        gcs.unwrap();
+    } else {
+        assert!(azure.is_err());
+        assert!(gcs.is_err());
+    }
 }
 
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {

@@ -33,9 +33,9 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
-| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; native capability + fault jobs; no current artifact | URI/config; native capability + fault jobs; no current artifact | Supported; crash-durable only for absolute `file://` URLs | URI/config; MinIO smoke coverage; compatibility tier only |
-| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; native job; no current artifact | URI/config; native job; no current artifact | Supported | MinIO smoke; compatibility tier only |
-| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; native job; cluster ALO only | URI/config; native job; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
+| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator smoke job; native capability + fault jobs; no current native artifact | Supported; crash-durable only for absolute `file://` URLs | URI/config; MinIO smoke coverage; compatibility tier only |
+| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; native job; no current native artifact | Supported | MinIO smoke; compatibility tier only |
+| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
 | Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
@@ -145,6 +145,20 @@ Endpoint overrides are classified in diagnostics without hostname, path, query, 
 container, or object key. An S3 override is **S3-compatible**, while Azure/GCS overrides are
 **custom/emulator**. Debug/error/evidence paths expose option names and an authentication category,
 never option values or full signed URLs.
+
+## Emulator smoke workflow
+
+`.github/workflows/cloud-object-store-emulator-smoke.yml` runs on pull requests without cloud
+credentials. It uses version-pinned Azurite and GCS-compatible containers, creates a per-job test
+container/bucket, and executes the shared conditional-create, stale-CAS, fresh-client, cleanup, and
+checkpoint fault-boundary contracts. It also exercises Delta's coordinated descriptor publication,
+conflicting-cut rejection, idempotent retry, read, and fresh-client cursor recovery. Emulator
+endpoints are admitted only behind explicit debug/soak markers; release builds remain fail-closed.
+
+Azurite covers the Azure Blob protocol only and does not emulate ADLS Gen2 hierarchical namespace
+behavior. The GCS-compatible container does not establish native generation, identity, retry, or
+service behavior. Artifacts from this workflow therefore say `native_or_emulator=emulator` and are
+never eligible to promote delivery admission.
 
 ## Native evidence workflow
 
