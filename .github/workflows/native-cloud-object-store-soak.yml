@@ -203,6 +203,10 @@ jobs:
           LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
           LAMINAR_SOAK_RPS: "250"
           LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
+          # Match the established checkpoint-soak distribution. The default
+          # 4K-key/1.2-Zipf profile exceeds the bounded join oracle at 120s.
+          LAMINAR_SOAK_JOIN_KEYS: "65536"
+          LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
       - name: Clean interrupted native checkpoint prefix
         id: cleanup
