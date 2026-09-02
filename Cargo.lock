@@ -5084,6 +5084,7 @@ dependencies = [
  "arrow-select",
  "async-nats",
  "async-trait",
+ "aws-sdk-glue",
  "base64 0.22.1",
  "buoyant_kernel",
  "bytes",

@@ -73,18 +73,24 @@ jobs:
           INPUT_PROCESS_KILLS: ${{ inputs.process_kills }}
           INPUT_DURATION_SECONDS: ${{ inputs.duration_seconds }}
           INPUT_RECOVERY_TIMEOUT_MS: ${{ inputs.recovery_timeout_ms }}
+          INPUT_TEST_SUBSET: ${{ inputs.test_subset }}
         run: |
           set -euo pipefail
-          validate_positive_integer() {
-            local name="$1" value="$2" maximum="$3"
-            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > maximum )); then
-              echo "$name must be an integer between 1 and $maximum"
+          validate_integer_range() {
+            local name="$1" value="$2" minimum="$3" maximum="$4"
+            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < minimum || value > maximum )); then
+              echo "$name must be an integer between $minimum and $maximum"
               exit 1
             fi
           }
-          validate_positive_integer process_kills "$INPUT_PROCESS_KILLS" 100
-          validate_positive_integer duration_seconds "$INPUT_DURATION_SECONDS" 86400
-          validate_positive_integer recovery_timeout_ms "$INPUT_RECOVERY_TIMEOUT_MS" 3600000
+          case "$INPUT_TEST_SUBSET" in
+            all|delta) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 2 16 ;;
+            checkpoint) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 2 100 ;;
+            iceberg) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 1 100 ;;
+            *) echo "unsupported test_subset: $INPUT_TEST_SUBSET"; exit 1 ;;
+          esac
+          validate_integer_range duration_seconds "$INPUT_DURATION_SECONDS" 1 86400
+          validate_integer_range recovery_timeout_ms "$INPUT_RECOVERY_TIMEOUT_MS" 1 3600000
       - name: Reject unsupported GCS object_store WIF combinations
         if: github.event_name == 'workflow_dispatch' && inputs.provider == 'gcs' && (inputs.test_subset == 'checkpoint' || inputs.test_subset == 'delta' || inputs.test_subset == 'all')
         run: |

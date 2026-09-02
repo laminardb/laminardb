@@ -364,11 +364,15 @@ impl SinkConnector for IcebergSink {
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let config = IcebergSinkConfig::from_config(config)?;
         capabilities::validate_sink(&config)?;
-        let shared_warehouse = StorageProvider::is_shared_uri(&config.catalog.warehouse)
-            || matches!(
-                config.storage.storage_type,
-                Some(IcebergStorageType::S3 | IcebergStorageType::Gcs | IcebergStorageType::Azure)
-            );
+        let shared_warehouse = config.storage.storage_type.map_or_else(
+            || StorageProvider::is_shared_uri(&config.catalog.warehouse),
+            |storage_type| {
+                matches!(
+                    storage_type,
+                    IcebergStorageType::S3 | IcebergStorageType::Gcs | IcebergStorageType::Azure
+                )
+            },
+        );
         let consistency = if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             SinkConsistency::CheckpointCommittable
         } else {

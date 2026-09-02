@@ -195,6 +195,24 @@ fn provider_detection_does_not_reclassify_invalid_cloud_urls_as_local() {
 }
 
 #[test]
+fn provider_detection_retains_recognized_malformed_url_schemes() {
+    for (input, expected) in [
+        ("FILE://%", StorageProvider::Local),
+        ("S3://%", StorageProvider::AwsS3),
+        ("GCS://%", StorageProvider::Gcs),
+        ("ABFSS://%", StorageProvider::AzureAdls),
+    ] {
+        assert_eq!(
+            StorageProvider::detect_uri(input),
+            Some(expected),
+            "{input}"
+        );
+    }
+    assert_eq!(StorageProvider::detect_uri("relative:file"), None);
+    assert_eq!(StorageProvider::detect_uri("1s3://bucket"), None);
+}
+
+#[test]
 fn endpoint_overrides_are_redacted_and_classified() {
     let native = StorageLocation::parse("s3://bucket/path").unwrap();
     assert_eq!(native.endpoint_class(), StorageEndpointClass::Native);

@@ -636,11 +636,6 @@ async fn read_file_bytes(
     path: &str,
     task_guard: ConnectorTaskGuard,
 ) -> Result<Vec<u8>, ConnectorError> {
-    // Cloud paths are rejected at `start()`; this path is local-only.
-    debug_assert!(
-        !path.contains("://"),
-        "file URLs must be normalized at startup"
-    );
     let read_path = path.to_owned();
     let error_path = read_path.clone();
     tokio::task::spawn_blocking(move || {
@@ -796,6 +791,23 @@ mod tests {
         let mut source = FileSource::new();
         source.start(start_request(config, position)).await.unwrap();
         source
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_path_with_url_like_component_can_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("url:").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("data.txt"), b"local").unwrap();
+        let path = format!("{}/url://nested/data.txt", directory.path().display());
+        let (owner, _tracker) = ConnectorTaskOwner::new();
+
+        let bytes = read_file_bytes(&path, owner.track().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"local");
     }
 
     fn text_source_config(directory: &std::path::Path) -> ConnectorConfig {

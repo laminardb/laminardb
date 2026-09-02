@@ -95,7 +95,7 @@ impl SecretMasker {
                 {
                     return "<redacted-url>".into();
                 }
-            } else if value.contains('?') || value.contains('@') {
+            } else if value.contains('?') || value.contains('@') || value.contains('#') {
                 return "<redacted-url>".into();
             }
         }

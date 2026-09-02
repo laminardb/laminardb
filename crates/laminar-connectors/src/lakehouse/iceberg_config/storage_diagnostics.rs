@@ -25,10 +25,11 @@ impl IcebergStorageConfig {
         let provider = self.diagnostic_provider(warehouse);
         let property_endpoint = self.properties.iter().any(|(key, value)| {
             !value.trim().is_empty()
-                && matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "s3.endpoint" | "gcs.service.path"
-                )
+                && match provider {
+                    StorageProvider::AwsS3 => key.eq_ignore_ascii_case("s3.endpoint"),
+                    StorageProvider::Gcs => key.eq_ignore_ascii_case("gcs.service.path"),
+                    StorageProvider::AzureAdls | StorageProvider::Local => false,
+                }
         });
         if self
             .endpoint
@@ -56,9 +57,12 @@ impl IcebergStorageConfig {
     }
 
     pub(crate) fn diagnostic_auth_source(&self, warehouse: &str) -> AuthSource {
+        let provider = self.diagnostic_provider(warehouse);
         let has_key = |needles: &[&str]| {
             self.properties.iter().any(|(key, value)| {
-                if value.trim().is_empty() {
+                if value.trim().is_empty()
+                    || property_provider(key).is_some_and(|owner| owner != provider)
+                {
                     return false;
                 }
                 let key = key.to_ascii_lowercase().replace(['_', '.'], "-");
@@ -87,12 +91,28 @@ impl IcebergStorageConfig {
         if has_key(&["profile"]) {
             return AuthSource::Profile;
         }
-        classify_storage_auth_source(
-            self.diagnostic_provider(warehouse),
-            &HashMap::new(),
-            &|name| std::env::var(name).ok(),
-        )
+        classify_storage_auth_source(provider, &HashMap::new(), &|name| std::env::var(name).ok())
     }
+}
+
+fn property_provider(key: &str) -> Option<StorageProvider> {
+    let normalized = key.to_ascii_lowercase().replace(['_', '.'], "-");
+    if normalized.starts_with("s3-") || normalized.starts_with("aws-") {
+        return Some(StorageProvider::AwsS3);
+    }
+    if normalized.starts_with("gcs-")
+        || normalized.starts_with("gcp-")
+        || normalized.starts_with("google-")
+    {
+        return Some(StorageProvider::Gcs);
+    }
+    if normalized.starts_with("adls-")
+        || normalized.starts_with("azdls-")
+        || normalized.starts_with("azure-")
+    {
+        return Some(StorageProvider::AzureAdls);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -161,6 +181,23 @@ mod tests {
         assert_eq!(
             empty_token.diagnostic_auth_source("s3://bucket/path"),
             AuthSource::ExplicitStatic
+        );
+    }
+
+    #[test]
+    fn diagnostics_ignore_properties_owned_by_another_provider() {
+        let config = storage(&[
+            ("storage.type", "s3"),
+            ("storage.property.gcs.service.path", "http://gcs-emulator"),
+            ("storage.property.gcs.oauth2.token", "gcs-token"),
+        ]);
+        assert_eq!(
+            config.diagnostic_endpoint_class("s3://bucket/path"),
+            StorageEndpointClass::Native
+        );
+        assert_ne!(
+            config.diagnostic_auth_source("s3://bucket/path"),
+            AuthSource::ExplicitToken
         );
     }
 }

@@ -35,6 +35,7 @@ tokio-stream = { workspace = true, optional = true }
 # Delta Lake
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
 deltalake-catalog-glue = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
 url = { workspace = true }
 
@@ -146,7 +147,7 @@ delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
-delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
+delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue", "dep:aws-sdk-glue"]
 # Apache Iceberg
 iceberg-core = ["dep:iceberg", "dep:apache-avro", "dep:tokio-stream", "dep:futures-util", "dep:parquet", "dep:arrow-row", "dep:base64"]
 iceberg-catalog-rest = ["iceberg-core", "dep:iceberg-catalog-rest", "dep:delta-reqwest", "dep:jiff"]

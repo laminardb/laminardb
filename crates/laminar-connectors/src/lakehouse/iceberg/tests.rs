@@ -227,6 +227,7 @@ fn azure_and_gcs_warehouses_are_multi_writer_without_exact_certification() {
         let mut config = test_connector_config();
         config.set("catalog.warehouse", warehouse);
         config.set("storage.type", storage_type);
+        config.set("delivery.guarantee", "exactly-once");
         let contract = sink.contract(&config).unwrap();
         assert_eq!(contract.topology, SinkTopology::MultiWriter, "{warehouse}");
         assert!(
@@ -234,6 +235,18 @@ fn azure_and_gcs_warehouses_are_multi_writer_without_exact_certification() {
             "{warehouse}"
         );
     }
+}
+
+#[test]
+fn explicit_filesystem_storage_keeps_a_singleton_contract() {
+    let sink = IcebergSink::new(test_config(), None);
+    let mut config = test_connector_config();
+    config.set("catalog.warehouse", "gs://catalog-returned/warehouse");
+    config.set("storage.type", "fs");
+    assert_eq!(
+        sink.contract(&config).unwrap().topology,
+        SinkTopology::Singleton
+    );
 }
 
 #[tokio::test]

@@ -167,3 +167,11 @@ fn endpoints_and_signed_urls_are_described_without_authority_or_query() {
         assert!(!display.contains(secret));
     }
 }
+
+#[test]
+fn malformed_url_fragments_are_redacted() {
+    let map = HashMap::from([("warehouse".into(), "gs://[invalid#fragment-secret".into())]);
+    let display = SecretMasker::display_map(&map);
+    assert_eq!(display, "warehouse=<redacted-url>");
+    assert!(!display.contains("fragment-secret"));
+}

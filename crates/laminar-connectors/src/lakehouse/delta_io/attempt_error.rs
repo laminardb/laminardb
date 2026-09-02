@@ -158,19 +158,52 @@ fn object_store_error_category(error: &deltalake::ObjectStoreError) -> &'static 
         }
         deltalake::ObjectStoreError::Generic { source, .. } => {
             let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+            let mut saw_provider_response = false;
             while let Some(current) = cause {
                 if let Some(http) = current.downcast_ref::<object_store::client::HttpError>() {
-                    return match http.kind() {
-                        object_store::client::HttpErrorKind::Connect => "transport-connect",
-                        object_store::client::HttpErrorKind::Request => "transport-request",
-                        object_store::client::HttpErrorKind::Timeout => "transport-timeout",
-                        object_store::client::HttpErrorKind::Interrupted => "transport-interrupted",
-                        _ => "provider-response",
-                    };
+                    match http.kind() {
+                        object_store::client::HttpErrorKind::Connect => {
+                            return "transport-connect";
+                        }
+                        object_store::client::HttpErrorKind::Request => {
+                            return "transport-request";
+                        }
+                        object_store::client::HttpErrorKind::Timeout => {
+                            return "transport-timeout";
+                        }
+                        object_store::client::HttpErrorKind::Interrupted => {
+                            return "transport-interrupted";
+                        }
+                        _ => saw_provider_response = true,
+                    }
+                }
+                if let Some(request) = current.downcast_ref::<delta_reqwest::Error>() {
+                    if request.is_timeout() {
+                        return "transport-timeout";
+                    }
+                    if request.is_connect() {
+                        return "transport-connect";
+                    }
+                    if request.is_request() {
+                        return "transport-request";
+                    }
+                    if request.is_body() {
+                        return "transport-body";
+                    }
+                    if request.status().is_some() {
+                        saw_provider_response = true;
+                    }
+                }
+                if current.downcast_ref::<std::io::Error>().is_some() {
+                    return "transport-io";
                 }
                 cause = current.source();
             }
-            "provider-error"
+            if saw_provider_response {
+                "provider-response"
+            } else {
+                "provider-error"
+            }
         }
         _ => "object-store-error",
     }
@@ -270,4 +303,21 @@ pub(crate) fn is_definite_coordinated_nonpublication(error: &deltalake::DeltaTab
                         | TransactionError::MaxCommitAttempts(_)
                 }
         )
+}
+
+#[cfg(all(test, feature = "delta-lake"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_store_category_finds_concrete_io_causes() {
+        let error = deltalake::ObjectStoreError::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "private transport detail",
+            )),
+        };
+        assert_eq!(object_store_error_category(&error), "transport-io");
+    }
 }

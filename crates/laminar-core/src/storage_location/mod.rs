@@ -23,14 +23,10 @@ impl StorageProvider {
     /// Detect a recognized provider URI.
     #[must_use]
     pub fn detect_uri(location: &str) -> Option<Self> {
-        let parsed = url::Url::parse(location).ok()?;
-        match parsed.scheme().to_ascii_lowercase().as_str() {
-            "s3" | "s3a" => Some(Self::AwsS3),
-            "gs" | "gcs" => Some(Self::Gcs),
-            "az" | "abfs" | "abfss" | "wasb" | "wasbs" => Some(Self::AzureAdls),
-            "file" => Some(Self::Local),
-            _ => None,
+        if let Ok(parsed) = url::Url::parse(location) {
+            return provider_for_scheme(parsed.scheme());
         }
+        lexical_url_scheme(location).and_then(provider_for_scheme)
     }
 
     /// Detect a provider, retaining the historical local-path fallback.
@@ -72,6 +68,32 @@ impl StorageProvider {
             Self::Local => "Local Filesystem",
         }
     }
+}
+
+fn provider_for_scheme(scheme: &str) -> Option<StorageProvider> {
+    match scheme.to_ascii_lowercase().as_str() {
+        "s3" | "s3a" => Some(StorageProvider::AwsS3),
+        "gs" | "gcs" => Some(StorageProvider::Gcs),
+        "az" | "abfs" | "abfss" | "wasb" | "wasbs" => Some(StorageProvider::AzureAdls),
+        "file" => Some(StorageProvider::Local),
+        _ => None,
+    }
+}
+
+fn lexical_url_scheme(location: &str) -> Option<&str> {
+    let (scheme, remainder) = location.split_once(':')?;
+    if !remainder.starts_with("//") {
+        return None;
+    }
+    let mut chars = scheme.chars();
+    if !chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        || !chars.all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+    {
+        return None;
+    }
+    Some(scheme)
 }
 
 impl fmt::Display for StorageProvider {

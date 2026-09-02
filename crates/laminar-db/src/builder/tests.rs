@@ -225,6 +225,20 @@ async fn explicit_profile_cannot_bypass_file_url_validation() {
     );
 }
 
+#[tokio::test]
+async fn malformed_file_authority_cannot_bypass_file_url_validation() {
+    let error = LaminarDbBuilder::new()
+        .profile(Profile::BareMetal)
+        .object_store_url("FILE://%")
+        .build()
+        .await
+        .expect_err("a malformed file URL must not fall back to a local path");
+    assert!(
+        error.to_string().contains("invalid object store URL"),
+        "{error}"
+    );
+}
+
 #[test]
 fn cluster_delivery_defers_exact_connector_certification() {
     use laminar_connectors::connector::DeliveryGuarantee;

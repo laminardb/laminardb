@@ -294,10 +294,10 @@ impl BoundedStorage {
         if cfg!(test) && path.starts_with("memory://") {
             return Ok(path.to_string());
         }
-        let local_url = if path.contains("://") {
+        let native_path = std::path::Path::new(path);
+        let local_url = if !native_path.is_absolute() && has_leading_url_scheme(path) {
             None
         } else {
-            let native_path = std::path::Path::new(path);
             let absolute = if native_path.is_absolute() {
                 native_path.to_path_buf()
             } else {
@@ -328,6 +328,17 @@ impl BoundedStorage {
                 )
             })
     }
+}
+
+fn has_leading_url_scheme(path: &str) -> bool {
+    let Some((scheme, _)) = path.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
 }
 
 #[async_trait]
@@ -750,6 +761,19 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .starts_with("file://"));
+    }
+
+    #[test]
+    fn url_marker_in_a_later_path_component_is_not_a_scheme() {
+        assert!(!has_leading_url_scheme("relative/directory://data.parquet"));
+        assert!(has_leading_url_scheme("gs://bucket/data.parquet"));
+
+        #[cfg(not(windows))]
+        assert!(
+            BoundedStorage::canonical_path("relative/directory://data.parquet")
+                .unwrap()
+                .starts_with("file://")
+        );
     }
 
     #[tokio::test]

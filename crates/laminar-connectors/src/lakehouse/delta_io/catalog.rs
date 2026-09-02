@@ -10,7 +10,37 @@ use laminar_core::storage_location::StorageProvider;
 fn glue_init_error_category(error: &deltalake_catalog_glue::GlueError) -> &'static str {
     match error {
         deltalake_catalog_glue::GlueError::MissingMetadata { .. } => "missing-metadata",
-        deltalake_catalog_glue::GlueError::AWSError { .. } => "aws-sdk",
+        deltalake_catalog_glue::GlueError::AWSError { source } => aws_glue_error_category(source),
+    }
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
+    use aws_sdk_glue::Error;
+
+    match error {
+        Error::AccessDeniedException(_)
+        | Error::KmsKeyNotAccessibleFault(_)
+        | Error::PermissionTypeMismatchException(_) => "authorization",
+        Error::EntityNotFoundException(_)
+        | Error::IntegrationNotFoundFault(_)
+        | Error::ResourceNotFoundException(_)
+        | Error::TargetResourceNotFound(_) => "not-found",
+        Error::ConcurrentRunsExceededException(_)
+        | Error::IntegrationQuotaExceededFault(_)
+        | Error::ResourceNumberLimitExceededException(_)
+        | Error::ThrottlingException(_) => "throttled",
+        Error::OperationTimeoutException(_) => "service-timeout",
+        Error::FederationSourceRetryableException(_)
+        | Error::InternalServerException(_)
+        | Error::InternalServiceException(_)
+        | Error::ResourceNotReadyException(_) => "service-unavailable",
+        Error::InvalidInputException(_) | Error::ValidationException(_) => "invalid-request",
+        Error::AlreadyExistsException(_)
+        | Error::ConcurrentModificationException(_)
+        | Error::ConflictException(_)
+        | Error::VersionMismatchException(_) => "catalog-conflict",
+        _ => "sdk-or-service-error",
     }
 }
 
@@ -137,6 +167,16 @@ mod tests {
             .into();
         assert_eq!(glue_lookup_error_category(&error), "missing-metadata");
         assert!(!glue_lookup_error_category(&error).contains("secret"));
+
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: aws_sdk_glue::Error::AccessDeniedException(
+                aws_sdk_glue::types::error::AccessDeniedException::builder()
+                    .message("private provider detail")
+                    .build(),
+            ),
+        };
+        assert_eq!(glue_init_error_category(&error), "authorization");
+        assert!(!glue_init_error_category(&error).contains("private"));
     }
 }
 
