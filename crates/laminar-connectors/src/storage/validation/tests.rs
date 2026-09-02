@@ -284,6 +284,47 @@ fn every_endpoint_alias_is_validated_without_disclosing_queries() {
     assert!(!message.contains("signed.invalid"));
 }
 
+#[test]
+fn generic_endpoint_url_alias_is_validated() {
+    let resolved = make_resolved(
+        StorageProvider::Gcs,
+        &[(
+            "endpoint_url",
+            "https://emulator.invalid?token=do-not-print",
+        )],
+    );
+    let result = CloudConfigValidator::validate(&resolved);
+    assert!(!result.is_valid());
+    assert!(result.error_message().contains("endpoint_url"));
+    assert!(!result.error_message().contains("do-not-print"));
+}
+
+#[test]
+fn ambient_http_endpoints_require_provider_allow_http() {
+    let denied = StorageCredentialResolver::resolve_with_env(
+        "az://container/path",
+        &HashMap::new(),
+        |name| match name {
+            "AZURE_STORAGE_ACCOUNT_NAME" => Some("account".to_string()),
+            "AZURE_STORAGE_ENDPOINT" => Some("http://azurite.invalid".to_string()),
+            _ => None,
+        },
+    );
+    assert!(!CloudConfigValidator::validate(&denied).is_valid());
+
+    let allowed = StorageCredentialResolver::resolve_with_env(
+        "az://container/path",
+        &HashMap::new(),
+        |name| match name {
+            "AZURE_STORAGE_ACCOUNT_NAME" => Some("account".to_string()),
+            "AZURE_STORAGE_ENDPOINT" => Some("http://azurite.invalid".to_string()),
+            "AZURE_ALLOW_HTTP" => Some("true".to_string()),
+            _ => None,
+        },
+    );
+    assert!(CloudConfigValidator::validate(&allowed).is_valid());
+}
+
 // ── Local validation ──
 
 #[test]
@@ -306,6 +347,7 @@ fn test_error_message_formatting() {
     assert!(!result.is_valid());
     let msg = result.error_message();
     assert!(msg.contains("aws_role_arn"));
+    assert!(msg.contains("AWS_ROLE_ARN"));
 }
 
 #[test]

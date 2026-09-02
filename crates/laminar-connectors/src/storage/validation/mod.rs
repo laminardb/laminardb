@@ -29,7 +29,12 @@ impl CloudValidationResult {
     pub fn error_message(&self) -> String {
         self.errors
             .iter()
-            .map(|e| e.message.as_str())
+            .map(|error| match &error.env_var {
+                Some(env_var) if !error.message.contains(env_var) => {
+                    format!("{} (environment: {env_var})", error.message)
+                }
+                _ => error.message.clone(),
+            })
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -250,7 +255,9 @@ fn validate_endpoint_options(
     let endpoints = resolved.options.iter().filter(|(key, value)| {
         matches!(
             key.to_ascii_lowercase().as_str(),
-            "aws_endpoint"
+            "endpoint"
+                | "endpoint_url"
+                | "aws_endpoint"
                 | "aws_endpoint_url"
                 | "aws_endpoint_url_s3"
                 | "azure_storage_endpoint"
@@ -301,6 +308,7 @@ fn validate_endpoint_options(
                     "aws_allow_http",
                     "allow_http",
                     "google_allow_http",
+                    "azure_allow_http",
                     "azure_storage_use_emulator",
                     "use_emulator",
                 ],

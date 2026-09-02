@@ -18,9 +18,14 @@ fn test_file_scheme_empty_path_errors() {
 fn file_url_requires_an_absolute_local_path() {
     assert!(file_url_path("file://checkpoint-host/path").is_err());
     assert!(file_url_path("file://./relative").is_err());
+    let directory = tempfile::tempdir().unwrap();
+    let file_url = url::Url::from_directory_path(directory.path())
+        .unwrap()
+        .to_string();
+    let uppercase_file_url = file_url.replacen("file", "FILE", 1);
     assert_eq!(
-        file_url_path("FILE:///tmp/path").is_ok(),
-        file_url_path("file:///tmp/path").is_ok()
+        file_url_path(&uppercase_file_url).unwrap(),
+        directory.path()
     );
     assert!(file_url_path("file:///tmp/path?version=1").is_err());
     assert!(file_url_path("file:///tmp/path#fragment").is_err());

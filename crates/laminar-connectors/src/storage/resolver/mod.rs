@@ -66,6 +66,7 @@ const AZURE_ENV_MAPPING: &[(&str, &str)] = &[
     ("azure_federated_token_file", "AZURE_FEDERATED_TOKEN_FILE"),
     ("azure_storage_authority_host", "AZURE_AUTHORITY_HOST"),
     ("azure_storage_endpoint", "AZURE_STORAGE_ENDPOINT"),
+    ("azure_allow_http", "AZURE_ALLOW_HTTP"),
     ("azure_msi_endpoint", "IDENTITY_ENDPOINT"),
     ("azure_use_azure_cli", "AZURE_USE_AZURE_CLI"),
 ];
@@ -82,6 +83,7 @@ const GCS_ENV_MAPPING: &[(&str, &str)] = &[
     ),
     ("google_base_url", "GOOGLE_BASE_URL"),
     ("google_base_url", "GOOGLE_ENDPOINT_URL"),
+    ("google_allow_http", "GOOGLE_ALLOW_HTTP"),
 ];
 
 /// Resolved storage credentials ready for `object_store` / `deltalake`.
@@ -94,8 +96,9 @@ pub struct ResolvedStorageOptions {
     pub options: HashMap<String, String>,
     /// Canonical keys whose non-empty environment sources were observed.
     ///
-    /// Values are deliberately not retained. The downstream provider reads the
-    /// environment while constructing its refreshable credential chain.
+    /// Credential values are deliberately not retained. The effective endpoint
+    /// URL is retained only so the same validation applies to explicit and
+    /// environment-selected compatibility endpoints.
     pub env_resolved_keys: Vec<String>,
     /// Non-secret credential mechanism selected by resolution.
     pub auth_source: AuthSource,
@@ -237,24 +240,34 @@ impl StorageCredentialResolver {
 
         let mut resolved = explicit_options.clone();
         let mut env_resolved = Vec::new();
+        let explicit_endpoint = explicit_options
+            .iter()
+            .any(|(key, value)| is_endpoint_key(key) && !value.trim().is_empty());
 
         for (option_key, env_var) in env_mapping {
             if !resolved.contains_key(*option_key) {
                 if let Some(val) = env_lookup(env_var) {
                     if effective_environment_value(option_key, &val) {
-                        let option_key = (*option_key).to_string();
-                        if !env_resolved.contains(&option_key) {
-                            env_resolved.push(option_key);
+                        if explicit_endpoint && is_endpoint_key(option_key) {
+                            continue;
+                        }
+                        let canonical_key = (*option_key).to_string();
+                        if !env_resolved.contains(&canonical_key) {
+                            env_resolved.push(canonical_key.clone());
+                        }
+                        if is_endpoint_key(option_key)
+                            && !explicit_endpoint
+                            && !resolved.keys().any(|key| is_endpoint_key(key))
+                        {
+                            resolved.insert(canonical_key, val);
                         }
                     }
                 }
             }
         }
 
-        let endpoint_override_configured = explicit_options
-            .iter()
-            .any(|(key, value)| is_endpoint_key(key) && !value.trim().is_empty())
-            || env_resolved.iter().any(|key| is_endpoint_key(key));
+        let endpoint_override_configured =
+            explicit_endpoint || env_resolved.iter().any(|key| is_endpoint_key(key));
         let endpoint_class = resolved_endpoint_class(
             provider,
             parsed_location.as_ref(),
@@ -305,7 +318,7 @@ fn effective_environment_value(option_key: &str, value: &str) -> bool {
     if value.trim().is_empty() {
         return false;
     }
-    if option_key == "aws_allow_http" {
+    if option_key.ends_with("allow_http") {
         return value.trim().eq_ignore_ascii_case("true");
     }
     true
@@ -315,6 +328,7 @@ fn is_endpoint_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
         "endpoint"
+            | "endpoint_url"
             | "aws_endpoint"
             | "aws_endpoint_url"
             | "aws_endpoint_url_s3"

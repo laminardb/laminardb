@@ -117,7 +117,10 @@ impl Profile {
         match self {
             Self::BareMetal => Ok(()),
             Self::Embedded => {
-                if let Some(url) = object_store_url.filter(|url| url.starts_with("file://")) {
+                if let Some(url) = object_store_url.filter(|url| {
+                    laminar_core::storage_location::StorageProvider::detect_uri(url)
+                        == Some(laminar_core::storage_location::StorageProvider::Local)
+                }) {
                     laminar_core::checkpoint::object_store_builder::file_url_path(url)
                         .map_err(|error| ProfileError::RequirementNotMet(error.to_string()))?;
                     return Ok(());

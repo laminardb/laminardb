@@ -91,6 +91,7 @@ impl SecretMasker {
                 if !parsed.username().is_empty()
                     || parsed.password().is_some()
                     || parsed.query().is_some()
+                    || parsed.fragment().is_some()
                 {
                     return "<redacted-url>".into();
                 }

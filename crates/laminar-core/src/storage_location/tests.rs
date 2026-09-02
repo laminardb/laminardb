@@ -157,6 +157,43 @@ fn malformed_and_unsupported_locations_fail_closed() {
     }
 }
 
+#[cfg(feature = "aws")]
+#[test]
+fn s3a_object_store_adapter_builds_with_the_pinned_client() {
+    let adapted = StorageLocation::parse("s3a://bucket/prefix")
+        .unwrap()
+        .adapt(StorageConsumer::ObjectStore)
+        .unwrap();
+    let url = url::Url::parse(&adapted.url).unwrap();
+    let (store, prefix) = object_store::parse_url_opts(
+        &url,
+        [
+            ("aws_access_key_id", "test"),
+            ("aws_secret_access_key", "test"),
+            ("aws_region", "us-east-1"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(prefix.as_ref(), "prefix");
+    assert!(store.to_string().contains("AmazonS3"));
+}
+
+#[test]
+fn provider_detection_does_not_reclassify_invalid_cloud_urls_as_local() {
+    assert_eq!(
+        StorageProvider::detect_uri("GCS://bucket/path?X-Goog-Signature=secret"),
+        Some(StorageProvider::Gcs)
+    );
+    assert_eq!(
+        StorageProvider::detect_uri("ABFSS://filesystem@account.dfs.example/path#secret"),
+        Some(StorageProvider::AzureAdls)
+    );
+    assert_eq!(
+        StorageProvider::detect_uri("https://example.test/path"),
+        None
+    );
+}
+
 #[test]
 fn endpoint_overrides_are_redacted_and_classified() {
     let native = StorageLocation::parse("s3://bucket/path").unwrap();

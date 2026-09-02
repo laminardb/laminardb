@@ -312,7 +312,7 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
             ));
         }
     } else if config.server.delivery == DeliveryGuarantee::ExactlyOnce {
-        if !config.checkpoint.url.starts_with("file://") {
+        if checkpoint_scope != CheckpointStorageScope::NodeDurable {
             errors.push(
                 "[LDB-0014] embedded/single-node exactly-once currently requires a local \
                  file:// checkpoint namespace protected by an exclusive process lock; shared \

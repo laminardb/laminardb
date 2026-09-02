@@ -190,29 +190,6 @@ fn remote_source_and_sink_urls_fail_before_filesystem_io() {
 }
 
 #[test]
-fn runtime_path_validation_rejects_mutated_remote_configs() {
-    let mut source_config = ConnectorConfig::new("files");
-    source_config.set("path", "/data/logs");
-    source_config.set("format", "json");
-    let mut source = FileSourceConfig::from_connector_config(&source_config).unwrap();
-    source.path = "s3://bucket/path".into();
-    let source_error = source.normalise_local_path().unwrap_err();
-    assert!(source_error
-        .to_string()
-        .contains("remote Files connector backends are not enabled"));
-
-    let mut sink_config = ConnectorConfig::new("files");
-    sink_config.set("path", "/output");
-    sink_config.set("format", "parquet");
-    let mut sink = FileSinkConfig::from_connector_config(&sink_config).unwrap();
-    sink.path = "abfss://filesystem@account.dfs.core.windows.net/path".into();
-    let sink_error = sink.normalise_local_path().unwrap_err();
-    assert!(sink_error
-        .to_string()
-        .contains("remote Files connector backends are not enabled"));
-}
-
-#[test]
 fn signed_remote_file_url_is_rejected_without_echoing_query_material() {
     let mut config = ConnectorConfig::new("files");
     config.set(
@@ -236,4 +213,14 @@ fn absolute_file_url_is_normalized_to_a_local_path() {
     config.set("format", "csv");
     let parsed = FileSourceConfig::from_connector_config(&config).unwrap();
     assert_eq!(std::path::Path::new(&parsed.path), directory.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_local_path_with_url_like_component_remains_local() {
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "/tmp/url://component/data");
+    config.set("format", "json");
+    let parsed = FileSourceConfig::from_connector_config(&config).unwrap();
+    assert_eq!(parsed.path, "/tmp/url://component/data");
 }

@@ -5,6 +5,7 @@ use super::{
 };
 #[cfg(feature = "cluster")]
 use super::{report_cluster_terminal_halt, retire_cluster_compute_generation};
+use laminar_core::storage_location::StorageProvider;
 
 fn checkpoint_store(
     backing: Arc<dyn object_store::ObjectStore>,
@@ -541,12 +542,9 @@ impl LaminarDB {
         let has_injected_decision_store = false;
         if startup_runtime == RuntimeMode::Local
             && self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
-            && (self
-                .config
-                .object_store_url
-                .as_deref()
-                .is_some_and(|url| !url.starts_with("file://"))
-                || has_injected_decision_store)
+            && (self.config.object_store_url.as_deref().is_some_and(|url| {
+                StorageProvider::detect_uri(url) != Some(StorageProvider::Local)
+            }) || has_injected_decision_store)
         {
             return Err(DbError::Config(
                 "[LDB-0014] a local replay-capable deployment with a shared cloud checkpoint \
@@ -652,7 +650,7 @@ impl LaminarDB {
                 .config
                 .object_store_url
                 .as_deref()
-                .filter(|url| url.starts_with("file://"))
+                .filter(|url| StorageProvider::detect_uri(url) == Some(StorageProvider::Local))
                 .map(|url| {
                     laminar_core::checkpoint::object_store_builder::file_url_path(url)
                         .map_err(|error| DbError::Config(format!("object store: {error}")))

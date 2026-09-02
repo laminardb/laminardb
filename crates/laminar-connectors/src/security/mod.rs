@@ -1,5 +1,7 @@
 //! Shared secret classification for catalog and checkpoint metadata.
 
+use laminar_core::storage_location::{StorageLocation, StorageProvider};
+
 const REDACTED: &str = "<redacted>";
 
 fn normalized_key(key: &str) -> String {
@@ -86,12 +88,14 @@ fn uri_segment_contains_secret(segment: &str, allow_reference: bool) -> bool {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();
-    if let Some((userinfo, _)) = authority.rsplit_once('@') {
-        let secret = userinfo
-            .split_once(':')
-            .map_or(userinfo, |(_, password)| password);
-        if !(secret.is_empty() || allow_reference && is_env_reference(secret)) {
-            return true;
+    if !is_qualified_azure_location(segment) {
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            let secret = userinfo
+                .split_once(':')
+                .map_or(userinfo, |(_, password)| password);
+            if !(secret.is_empty() || allow_reference && is_env_reference(secret)) {
+                return true;
+            }
         }
     }
     after_scheme
@@ -105,6 +109,15 @@ fn uri_segment_contains_secret(segment: &str, allow_reference: bool) -> bool {
                 && !secret.is_empty()
                 && !(allow_reference && is_env_reference(secret))
         })
+}
+
+fn is_qualified_azure_location(segment: &str) -> bool {
+    let location = segment
+        .find(['?', '#'])
+        .map_or(segment, |index| &segment[..index]);
+    StorageLocation::parse(location).is_ok_and(|location| {
+        location.provider == StorageProvider::AzureAdls && location.filesystem.is_some()
+    })
 }
 
 /// Whether any URI in a comma/whitespace-delimited connector value embeds literal credentials.
@@ -152,7 +165,9 @@ fn sanitize_uri_segment(segment: &str) -> String {
     let authority = &segment[scheme_end..authority_end];
     let mut output = String::with_capacity(segment.len());
     output.push_str(&segment[..scheme_end]);
-    if let Some((_, host)) = authority.rsplit_once('@') {
+    if is_qualified_azure_location(segment) {
+        output.push_str(authority);
+    } else if let Some((_, host)) = authority.rsplit_once('@') {
         output.push_str(REDACTED);
         output.push('@');
         output.push_str(host);
@@ -161,21 +176,21 @@ fn sanitize_uri_segment(segment: &str) -> String {
     }
 
     let suffix = &segment[authority_end..];
+    let (suffix, had_fragment) = suffix
+        .split_once('#')
+        .map_or((suffix, false), |(before, _)| (before, true));
     let Some(query_start) = suffix.find('?') else {
         output.push_str(suffix);
+        if had_fragment {
+            output.push_str("#<redacted>");
+        }
         return output;
     };
     output.push_str(&suffix[..=query_start]);
-    let query_and_fragment = &suffix[query_start + 1..];
-    let (query, fragment) = query_and_fragment
-        .split_once('#')
-        .map_or((query_and_fragment, None), |(query, fragment)| {
-            (query, Some(fragment))
-        });
+    let query = &suffix[query_start + 1..];
     output.push_str(&sanitize_query(query));
-    if let Some(fragment) = fragment {
-        output.push('#');
-        output.push_str(fragment);
+    if had_fragment {
+        output.push_str("#<redacted>");
     }
     output
 }

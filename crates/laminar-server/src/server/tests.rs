@@ -4,15 +4,14 @@ use crate::config::*;
 
 #[test]
 fn checkpoint_config_rejects_relative_file_urls() {
-    let result = apply_local_checkpoint_config(
-        LaminarDB::builder(),
-        "file://./relative",
-        &CheckpointSection::default(),
-    );
-    let Err(error) = result else {
-        panic!("relative checkpoint URL was admitted");
-    };
-    assert!(error.to_string().contains("absolute local path"), "{error}");
+    for url in ["file://./relative", "FILE://./relative"] {
+        let result =
+            apply_local_checkpoint_config(LaminarDB::builder(), url, &CheckpointSection::default());
+        let Err(error) = result else {
+            panic!("relative checkpoint URL was admitted: {url}");
+        };
+        assert!(error.to_string().contains("absolute local path"), "{error}");
+    }
 }
 
 #[test]

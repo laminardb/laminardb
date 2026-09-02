@@ -34,6 +34,10 @@ fn embedded_accepts_an_absolute_file_checkpoint_url() {
     assert!(Profile::Embedded
         .validate_config(&config, Some(&url))
         .is_ok());
+    let uppercase_url = url.replacen("file", "FILE", 1);
+    assert!(Profile::Embedded
+        .validate_config(&config, Some(&uppercase_url))
+        .is_ok());
     assert!(Profile::Embedded
         .validate_config(&config, Some("file://./relative"))
         .is_err());

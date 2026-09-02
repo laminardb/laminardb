@@ -477,6 +477,13 @@ fn checkpoint_storage_scope_is_fail_closed() {
     validate_config(&local_exact)
         .expect("the default durable checkpoint URL is sufficient for local exactly-once");
 
+    let uppercase_local_exact: ServerConfig = toml::from_str(
+        "[server]\ndelivery = \"exactly_once\"\n[checkpoint]\nurl = \"FILE:///tmp/checkpoints\"\n",
+    )
+    .unwrap();
+    validate_config(&uppercase_local_exact)
+        .expect("file URL scheme matching is case-insensitive for local exactly-once");
+
     let local_cluster: ServerConfig = toml::from_str(
         r#"
 node_id = "node-1"

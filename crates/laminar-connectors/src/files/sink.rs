@@ -525,8 +525,7 @@ impl SinkConnector for FileSink {
                 actual: "already open".into(),
             });
         }
-        let mut sink_config = FileSinkConfig::from_connector_config(config)?;
-        sink_config.normalise_local_path()?;
+        let sink_config = FileSinkConfig::from_connector_config(config)?;
 
         // Validate the encoder before creating or cleaning any files.
         let schema = config

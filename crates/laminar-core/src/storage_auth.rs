@@ -169,10 +169,6 @@ where
         || signals.explicit_true(&["azure_storage_use_emulator", "use_emulator"])
     {
         AuthSource::Anonymous
-    } else if signals.explicit_true(&["azure_use_azure_cli", "use_azure_cli"])
-        || signals.env_true(&["AZURE_USE_AZURE_CLI"])
-    {
-        AuthSource::AzureCli
     } else if signals.explicit_has(&[
         "azure_storage_account_key",
         "azure_storage_access_key",
@@ -190,14 +186,18 @@ where
         "bearer_token",
     ]) {
         AuthSource::ExplicitToken
-    } else if signals.explicit_has(&["azure_federated_token_file", "federated_token_file"])
-        || signals.env_has(&["AZURE_FEDERATED_TOKEN_FILE"])
-    {
+    } else if signals.explicit_has(&["azure_federated_token_file", "federated_token_file"]) {
         AuthSource::WorkloadIdentity
+    } else if signals.explicit_true(&["azure_use_azure_cli", "use_azure_cli"]) {
+        AuthSource::AzureCli
     } else if signals.env_has(&["AZURE_STORAGE_SAS_TOKEN", "AZURE_STORAGE_TOKEN"]) {
         AuthSource::EnvironmentToken
     } else if signals.env_has(&["AZURE_STORAGE_ACCOUNT_KEY", "AZURE_CLIENT_SECRET"]) {
         AuthSource::EnvironmentStatic
+    } else if signals.env_has(&["AZURE_FEDERATED_TOKEN_FILE"]) {
+        AuthSource::WorkloadIdentity
+    } else if signals.env_true(&["AZURE_USE_AZURE_CLI"]) {
+        AuthSource::AzureCli
     } else {
         AuthSource::ManagedIdentityOrMetadata
     }
@@ -220,7 +220,7 @@ where
     ]) {
         AuthSource::ExplicitStatic
     } else if signals.explicit_has(&["gcs.token", "google_token"]) {
-        AuthSource::Unknown
+        AuthSource::ExplicitToken
     } else if signals.explicit_has(&["google_application_credentials", "application_credentials"])
         || signals.env_has(&["GOOGLE_APPLICATION_CREDENTIALS"])
     {
@@ -274,5 +274,29 @@ mod tests {
     fn display_is_low_cardinality_and_non_secret() {
         assert_eq!(AuthSource::WebIdentity.to_string(), "web-identity");
         assert_eq!(AuthSource::AzureCli.to_string(), "azure-cli");
+    }
+
+    #[test]
+    fn explicit_azure_credentials_take_precedence_over_ambient_cli() {
+        let options = HashMap::from([(
+            "azure_storage_account_key".to_string(),
+            "not-logged".to_string(),
+        )]);
+        assert_eq!(
+            classify_storage_auth_source(StorageProvider::AzureAdls, &options, &|key| lookup(
+                &[("AZURE_USE_AZURE_CLI", "true")],
+                key
+            )),
+            AuthSource::ExplicitStatic
+        );
+    }
+
+    #[test]
+    fn explicit_gcs_token_has_a_non_secret_source_classification() {
+        let options = HashMap::from([("gcs.token".to_string(), "not-logged".to_string())]);
+        assert_eq!(
+            classify_storage_auth_source(StorageProvider::Gcs, &options, &|_| None),
+            AuthSource::ExplicitToken
+        );
     }
 }

@@ -291,11 +291,11 @@ fn test_resolve_gcs_service_account_path_aliases() {
 }
 
 #[test]
-fn unsupported_gcs_access_token_is_not_reported_as_selected_authentication() {
+fn unsupported_gcs_access_token_is_classified_before_validation_rejects_it() {
     let options = HashMap::from([("gcs.token".to_string(), "short-lived-token".to_string())]);
     let resolved =
         StorageCredentialResolver::resolve_with_env("gs://bucket/path", &options, env_none);
-    assert_eq!(resolved.auth_source, AuthSource::Unknown);
+    assert_eq!(resolved.auth_source, AuthSource::ExplicitToken);
 }
 
 #[test]
@@ -394,19 +394,39 @@ fn short_lived_and_ambient_sources_are_classified_without_loading_tokens() {
 }
 
 #[test]
-fn ambient_endpoint_is_classified_without_retaining_its_value() {
+fn ambient_endpoint_is_retained_for_validation_and_redacted_from_debug() {
     let environment = |name: &str| match name {
         "AWS_ENDPOINT_URL" => Some("http://secret-bearing-host.invalid".into()),
         _ => None,
     };
     let resolved =
         StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), environment);
-    assert!(resolved.options.is_empty());
+    assert_eq!(
+        resolved.options["aws_endpoint"],
+        "http://secret-bearing-host.invalid"
+    );
     assert_eq!(
         resolved.endpoint_class(),
         laminar_core::storage_location::StorageEndpointClass::S3Compatible
     );
     assert!(!format!("{resolved:?}").contains("secret-bearing-host"));
+}
+
+#[test]
+fn explicit_endpoint_alias_takes_precedence_over_environment_endpoint() {
+    let options = HashMap::from([(
+        "endpoint_url".to_string(),
+        "https://explicit.invalid".to_string(),
+    )]);
+    let environment =
+        |name: &str| (name == "AWS_ENDPOINT_URL").then(|| "https://ambient.invalid".to_string());
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &options, environment);
+    assert_eq!(resolved.options["endpoint_url"], "https://explicit.invalid");
+    assert!(!resolved
+        .options
+        .values()
+        .any(|value| value == "https://ambient.invalid"));
 }
 
 #[test]

@@ -22,7 +22,7 @@ use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
-use super::config::{FileFormat, FileSourceConfig};
+use super::config::{local_files_path, FileFormat, FileSourceConfig};
 use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
 use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
@@ -227,8 +227,7 @@ impl SourceConnector for FileSource {
         }
 
         let (config, position, _) = request.into_parts();
-        let mut src_config = FileSourceConfig::from_connector_config(&config)?;
-        src_config.normalise_local_path()?;
+        let src_config = FileSourceConfig::from_connector_config(&config)?;
 
         // Decode and validate the durable manifest before discovery can observe a
         // single path. A corrupt engine checkpoint is fatal: starting from an empty
@@ -259,7 +258,12 @@ impl SourceConnector for FileSource {
                         ConnectorError::ConfigurationError(format!(
                             "invalid file progress in checkpoint {attempt:?}: {e}"
                         ))
-                    })?;
+                    })?
+                    .map(|mut progress| {
+                        progress.path = local_files_path(&progress.path)?;
+                        Ok::<_, ConnectorError>(progress)
+                    })
+                    .transpose()?;
                 if progress
                     .as_ref()
                     .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
@@ -1155,6 +1159,32 @@ mod tests {
             .await
             .expect_err("same-version unknown progress fields must fail closed");
         assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(source.discovery.is_none());
+        assert!(!source.is_open);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_remote_progress_before_filesystem_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = FileSource::new().checkpoint();
+        checkpoint.set_offset(
+            "file_progress",
+            r#"{"path":"az://container/path?sig=do-not-echo","size":1,"modified_ms":1,"content_sha256":"00","next_row":1}"#,
+        );
+        let mut source = FileSource::new();
+        let error = source
+            .start(start_request(
+                text_source_config(directory.path()),
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::canonical(9),
+                    checkpoint,
+                },
+            ))
+            .await
+            .expect_err("remote checkpoint progress must fail before filesystem access");
+        let message = error.to_string();
+        assert!(message.contains("query parameters"), "{message}");
+        assert!(!message.contains("do-not-echo"), "{message}");
         assert!(source.discovery.is_none());
         assert!(!source.is_open);
     }

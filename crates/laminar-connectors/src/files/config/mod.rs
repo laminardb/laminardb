@@ -114,11 +114,6 @@ impl FileSourceConfig {
             csv_has_header,
         })
     }
-
-    pub(crate) fn normalise_local_path(&mut self) -> Result<(), ConnectorError> {
-        self.path = local_files_path(&self.path)?;
-        Ok(())
-    }
 }
 
 /// Parsed configuration for [`super::sink::FileSink`].
@@ -231,20 +226,15 @@ impl FileSinkConfig {
             max_buffered_batches,
         })
     }
-
-    pub(crate) fn normalise_local_path(&mut self) -> Result<(), ConnectorError> {
-        self.path = local_files_path(&self.path)?;
-        Ok(())
-    }
 }
 
-fn local_files_path(path: &str) -> Result<String, ConnectorError> {
+pub(super) fn local_files_path(path: &str) -> Result<String, ConnectorError> {
     if path.trim().is_empty() {
         return Err(ConnectorError::ConfigurationError(
             "file connector 'path' must not be empty".into(),
         ));
     }
-    if !path.contains("://") {
+    if std::path::Path::new(path).is_absolute() || !path.contains("://") {
         return Ok(path.to_string());
     }
     let location = match StorageLocation::parse(path) {

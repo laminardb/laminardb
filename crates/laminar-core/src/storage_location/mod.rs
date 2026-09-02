@@ -23,9 +23,14 @@ impl StorageProvider {
     /// Detect a recognized provider URI.
     #[must_use]
     pub fn detect_uri(location: &str) -> Option<Self> {
-        StorageLocation::parse(location)
-            .ok()
-            .map(|parsed| parsed.provider)
+        let parsed = url::Url::parse(location).ok()?;
+        match parsed.scheme().to_ascii_lowercase().as_str() {
+            "s3" | "s3a" => Some(Self::AwsS3),
+            "gs" | "gcs" => Some(Self::Gcs),
+            "az" | "abfs" | "abfss" | "wasb" | "wasbs" => Some(Self::AzureAdls),
+            "file" => Some(Self::Local),
+            _ => None,
+        }
     }
 
     /// Detect a provider, retaining the historical local-path fallback.

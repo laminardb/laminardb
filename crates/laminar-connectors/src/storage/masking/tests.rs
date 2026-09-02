@@ -149,6 +149,10 @@ fn endpoints_and_signed_urls_are_described_without_authority_or_query() {
             "table.path".into(),
             "az://container/path?sv=1&sig=signed-secret".into(),
         ),
+        (
+            "warehouse".into(),
+            "gs://bucket/path#fragment-secret".into(),
+        ),
     ]);
     let display = SecretMasker::display_map(&map);
     assert!(display.contains("aws_endpoint=<custom-http-endpoint>"));
@@ -158,6 +162,7 @@ fn endpoints_and_signed_urls_are_described_without_authority_or_query() {
         "password",
         "signed-secret",
         "container/path",
+        "fragment-secret",
     ] {
         assert!(!display.contains(secret));
     }
