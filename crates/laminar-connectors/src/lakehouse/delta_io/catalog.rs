@@ -6,6 +6,28 @@ use super::{ConnectorError, HashMap};
 #[cfg(feature = "delta-lake-glue")]
 use laminar_core::storage_location::StorageProvider;
 
+#[cfg(feature = "delta-lake-glue")]
+fn glue_init_error_category(error: &deltalake_catalog_glue::GlueError) -> &'static str {
+    match error {
+        deltalake_catalog_glue::GlueError::MissingMetadata { .. } => "missing-metadata",
+        deltalake_catalog_glue::GlueError::AWSError { .. } => "aws-sdk",
+    }
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn glue_lookup_error_category(error: &deltalake::data_catalog::DataCatalogError) -> &'static str {
+    match error {
+        deltalake::data_catalog::DataCatalogError::Generic { source, .. } => source
+            .downcast_ref::<deltalake_catalog_glue::GlueError>()
+            .map_or("catalog-provider", glue_init_error_category),
+        deltalake::data_catalog::DataCatalogError::InvalidDataCatalog { .. } => "invalid-catalog",
+        deltalake::data_catalog::DataCatalogError::UnknownConfigKey { .. } => {
+            "invalid-catalog-configuration"
+        }
+        deltalake::data_catalog::DataCatalogError::RequestError { .. } => "catalog-request",
+    }
+}
+
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
 /// - `None`: returns table path and storage options as-is.
@@ -39,18 +61,23 @@ pub async fn resolve_catalog_options(
             })?;
             let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
                 .await
-                .map_err(|_| {
+                .map_err(|error| {
                     ConnectorError::ConnectionFailed(
-                        "failed to initialize Glue catalog using the downstream AWS credential chain"
-                            .into(),
+                        format!(
+                            "failed to initialize Glue catalog using the downstream AWS credential chain ({}); verify AWS region and credential-chain setup",
+                            glue_init_error_category(&error)
+                        ),
                     )
                 })?;
             let resolved = glue
                 .get_table_storage_location(catalog_name.map(String::from), database, table_path)
                 .await
-                .map_err(|_| {
+                .map_err(|error| {
                     ConnectorError::ConnectionFailed(
-                        "Glue catalog lookup failed for the configured table".into(),
+                        format!(
+                            "Glue catalog lookup failed ({}); verify catalog identifiers, AWS region, credentials, and glue:GetTable permission",
+                            glue_lookup_error_category(&error)
+                        ),
                     )
                 })?;
             info!(
@@ -94,6 +121,22 @@ pub async fn resolve_catalog_options(
              Build with: cargo build --features delta-lake-unity"
                 .into(),
         )),
+    }
+}
+
+#[cfg(all(test, feature = "delta-lake-glue"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glue_categories_are_actionable_without_provider_details() {
+        let error: deltalake::data_catalog::DataCatalogError =
+            deltalake_catalog_glue::GlueError::MissingMetadata {
+                metadata: "secret-table-location".into(),
+            }
+            .into();
+        assert_eq!(glue_lookup_error_category(&error), "missing-metadata");
+        assert!(!glue_lookup_error_category(&error).contains("secret"));
     }
 }
 

@@ -183,6 +183,7 @@ fn delta_write_attempt_errors_do_not_echo_signed_request_urls() {
     let attempt =
         classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(error))
             .to_string();
+    assert!(attempt.contains("transport-timeout"), "{attempt}");
     assert!(!attempt.contains("do-not-disclose"), "{attempt}");
     assert!(!attempt.contains("account.blob.example"), "{attempt}");
 }

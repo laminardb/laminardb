@@ -203,7 +203,7 @@ fn s3_storage_factory(
     _storage: &IcebergStorageConfig,
     _configured_properties: &HashMap<String, String>,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
-    Err(missing_storage_feature("s3", "iceberg"))
+    Err(missing_storage_feature("s3", "iceberg-storage-s3"))
 }
 
 #[cfg(feature = "iceberg-storage-gcs")]

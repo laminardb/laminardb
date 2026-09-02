@@ -910,6 +910,23 @@ fn delta_azure_adapter_rejects_conflicting_authority_options() {
 }
 
 #[test]
+fn delta_azure_adapter_checks_every_configured_alias() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([
+        (
+            "azure_storage_account_name".to_string(),
+            "account".to_string(),
+        ),
+        ("account_name".to_string(), "different".to_string()),
+    ]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("account_name"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
 fn delta_path_rejects_signed_queries_without_echoing_them() {
     let error = path_to_url("gs://bucket/table?X-Goog-Signature=secret-value").unwrap_err();
     assert!(!error.to_string().contains("secret-value"));

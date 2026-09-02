@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt as _;
 use iceberg::io::{
     FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
     StorageFactory, ADLS_ACCOUNT_KEY, ADLS_AUTHORITY_HOST, ADLS_CLIENT_ID, ADLS_CLIENT_SECRET,
@@ -21,16 +22,19 @@ use iceberg::io::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
-use serde::{Deserialize, Serialize};
+use serde::de::IgnoredAny;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::super::iceberg::capabilities::REST_REMOTE_SIGNING_ENABLED;
 use crate::storage::{StorageConsumer, StorageLocation};
 
 const MAX_DELETE_STREAM_OBJECTS: usize = 100_000;
+const MAX_DELETE_STREAM_PATH_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct BoundedStorageFactory {
+    #[serde(deserialize_with = "deserialize_resolving_factory")]
     inner: OpenDalResolvingStorageFactory,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -38,10 +42,45 @@ pub(super) struct BoundedStorageFactory {
     locally_configured_sensitive: Vec<SensitivePropertyFingerprint>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 struct SensitivePropertyFingerprint {
     property: String,
-    digest: [u8; 32],
+    digest: Option<[u8; 32]>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SensitivePropertyFingerprintRepr {
+    Current { property: String, digest: [u8; 32] },
+    Legacy(String),
+}
+
+impl<'de> Deserialize<'de> for SensitivePropertyFingerprint {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match SensitivePropertyFingerprintRepr::deserialize(deserializer)? {
+            SensitivePropertyFingerprintRepr::Current { property, digest } => Ok(Self {
+                property,
+                digest: Some(digest),
+            }),
+            SensitivePropertyFingerprintRepr::Legacy(property) => Ok(Self {
+                property,
+                digest: None,
+            }),
+        }
+    }
+}
+
+fn deserialize_resolving_factory<'de, D>(
+    deserializer: D,
+) -> std::result::Result<OpenDalResolvingStorageFactory, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(OpenDalResolvingStorageFactory::new())
 }
 
 const STORAGE_SENSITIVE_PROPERTIES: &[&str] = &[
@@ -86,7 +125,7 @@ impl BoundedStorageFactory {
             .filter(|(key, _)| is_sensitive_storage_property(key))
             .map(|(property, value)| SensitivePropertyFingerprint {
                 property: property.clone(),
-                digest: sensitive_property_digest(property, value),
+                digest: Some(sensitive_property_digest(property, value)),
             })
             .collect::<Vec<_>>();
         locally_configured_sensitive
@@ -126,9 +165,10 @@ impl BoundedStorageFactory {
 
     fn was_configured_locally(&self, property: &str, value: &str) -> bool {
         let digest = sensitive_property_digest(property, value);
-        self.locally_configured_sensitive
-            .iter()
-            .any(|configured| configured.property == property && configured.digest == digest)
+        self.locally_configured_sensitive.iter().any(|configured| {
+            configured.property == property
+                && configured.digest.is_some_and(|value| value == digest)
+        })
     }
 }
 
@@ -174,6 +214,7 @@ impl StorageFactory for BoundedStorageFactory {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct BoundedStorage {
+    #[serde(deserialize_with = "deserialize_resolving_factory")]
     factory: OpenDalResolvingStorageFactory,
     config: StorageConfig,
     connect_timeout: Duration,
@@ -253,7 +294,31 @@ impl BoundedStorage {
         if cfg!(test) && path.starts_with("memory://") {
             return Ok(path.to_string());
         }
-        StorageLocation::parse(path)
+        let local_url = if path.contains("://") {
+            None
+        } else {
+            let native_path = std::path::Path::new(path);
+            let absolute = if native_path.is_absolute() {
+                native_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|_| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            "relative Iceberg path could not be resolved",
+                        )
+                    })?
+                    .join(native_path)
+            };
+            Some(url::Url::from_file_path(absolute).map_err(|()| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "local Iceberg path could not be encoded as a file URL",
+                )
+            })?)
+        };
+        let location = local_url.as_ref().map_or(path, url::Url::as_str);
+        StorageLocation::parse(location)
             .and_then(|location| location.adapt(StorageConsumer::Iceberg))
             .map(|adapted| adapted.url)
             .map_err(|error| {
@@ -322,18 +387,14 @@ impl Storage for BoundedStorage {
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> Result<()> {
-        let mut deleted = 0_usize;
-        while let Some(path) = futures_util::StreamExt::next(&mut paths).await {
-            if deleted == MAX_DELETE_STREAM_OBJECTS {
-                return Err(Error::new(
-                    ErrorKind::Unexpected,
-                    "Iceberg delete stream exceeded its object safety bound",
-                ));
-            }
-            self.delete(&path).await?;
-            deleted += 1;
-        }
-        Ok(())
+        let canonical = collect_delete_paths(
+            &mut paths,
+            MAX_DELETE_STREAM_OBJECTS,
+            MAX_DELETE_STREAM_PATH_BYTES,
+        )
+        .await?;
+        let paths = futures_util::stream::iter(canonical).boxed();
+        self.initial(self.storage()?.delete_stream(paths)).await
     }
 
     fn new_input(&self, path: &str) -> Result<InputFile> {
@@ -349,6 +410,38 @@ impl Storage for BoundedStorage {
             Self::canonical_path(path)?,
         ))
     }
+}
+
+async fn collect_delete_paths(
+    paths: &mut BoxStream<'static, String>,
+    max_objects: usize,
+    max_path_bytes: usize,
+) -> Result<Vec<String>> {
+    let mut canonical = Vec::new();
+    let mut path_bytes = 0_usize;
+    while let Some(path) = paths.next().await {
+        if canonical.len() == max_objects {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "Iceberg delete stream exceeded its object safety bound",
+            ));
+        }
+        let path = BoundedStorage::canonical_path(&path)?;
+        path_bytes = path_bytes.checked_add(path.len()).ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Iceberg delete stream path-byte count overflowed",
+            )
+        })?;
+        if path_bytes > max_path_bytes {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "Iceberg delete stream exceeded its path-byte safety bound",
+            ));
+        }
+        canonical.push(path);
+    }
+    Ok(canonical)
 }
 
 struct BoundedFileRead {
@@ -553,13 +646,33 @@ mod tests {
         let serialized = serde_json::to_string(&factory).unwrap();
         assert!(!debug.contains("local-secret"));
         assert!(!serialized.contains("local-secret"));
-        factory
+        let restored: BoundedStorageFactory = serde_json::from_str(&serialized).unwrap();
+        restored
             .build(
                 &StorageConfig::new()
                     .with_prop(S3_ACCESS_KEY_ID, "local-id")
                     .with_prop(S3_SECRET_ACCESS_KEY, "local-secret"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_factory_serialization_deserializes_and_fails_closed_for_credentials() {
+        let legacy = serde_json::json!({
+            "inner": "Fs",
+            "connect_timeout": Duration::from_secs(1),
+            "request_timeout": Duration::from_secs(2),
+            "locally_configured_sensitive": [S3_SESSION_TOKEN],
+        });
+        let restored: BoundedStorageFactory = serde_json::from_value(legacy).unwrap();
+        restored.build(&StorageConfig::new()).unwrap();
+
+        let error = restored
+            .build(&StorageConfig::new().with_prop(S3_SESSION_TOKEN, "legacy-secret"))
+            .unwrap_err();
+        let diagnostic = error.to_string();
+        assert!(diagnostic.contains("LDB-ICEBERG-VENDED-CREDENTIALS-UNSUPPORTED"));
+        assert!(!diagnostic.contains("legacy-secret"));
     }
 
     #[test]
@@ -617,6 +730,39 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unsupported storage URL scheme"));
         assert!(!error.to_string().contains("bucket/path"));
+    }
+
+    #[test]
+    fn catalog_returned_absolute_local_paths_are_canonicalized() {
+        let directory = tempfile::tempdir().unwrap();
+        let factory = BoundedStorageFactory::new(
+            test_factory(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            &std::collections::HashMap::new(),
+        );
+        let storage = factory.build(&StorageConfig::new()).unwrap();
+        let input = storage
+            .new_input(directory.path().to_str().unwrap())
+            .unwrap();
+        assert!(input.location().to_ascii_lowercase().starts_with("file://"));
+        assert!(BoundedStorage::canonical_path("relative/data.parquet")
+            .unwrap()
+            .to_ascii_lowercase()
+            .starts_with("file://"));
+    }
+
+    #[tokio::test]
+    async fn delete_stream_bounds_are_checked_before_deletion() {
+        let mut paths = futures_util::stream::iter([
+            "memory://store/one".to_string(),
+            "memory://store/two".to_string(),
+        ])
+        .boxed();
+        let error = collect_delete_paths(&mut paths, 1, usize::MAX)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("object safety bound"));
     }
 
     fn test_factory() -> OpenDalResolvingStorageFactory {

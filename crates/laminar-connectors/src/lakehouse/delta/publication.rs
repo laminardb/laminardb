@@ -39,7 +39,10 @@ pub(super) fn classify_delta_attempt_error(
             // into retries merely because their message says "conflict".
             let retryable = super::super::delta_io::delta_error_has_retryable_transport(&error);
             ConnectorError::outcome_unknown(
-                "Delta write was dispatched but its catalog commit outcome is not known",
+                format!(
+                    "Delta write was dispatched but its catalog commit outcome is not known ({})",
+                    super::super::delta_io::delta_error_category(&error)
+                ),
                 retryable,
             )
         }

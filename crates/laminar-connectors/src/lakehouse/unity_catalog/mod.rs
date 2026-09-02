@@ -15,6 +15,7 @@ use tracing::info;
 use crate::error::ConnectorError;
 
 const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
+const ALREADY_EXISTS_MARKER: &[u8] = b"ALREADY_EXISTS";
 
 /// Builds a shared `reqwest::Client` with a 30-second timeout.
 fn http_client() -> reqwest::Client {
@@ -52,19 +53,21 @@ async fn response_reports_already_exists(
             "Unity Catalog error response body could not be read".into(),
         )
     })? {
-        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
-            ConnectorError::ConnectionFailed("Unity Catalog error response size overflow".into())
-        })?;
-        if next_len > MAX_ERROR_RESPONSE_BYTES {
+        let remaining = MAX_ERROR_RESPONSE_BYTES.saturating_sub(body.len());
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body
+            .windows(ALREADY_EXISTS_MARKER.len())
+            .any(|window| window == ALREADY_EXISTS_MARKER)
+        {
+            return Ok(true);
+        }
+        if chunk.len() > remaining {
             return Err(ConnectorError::ConnectionFailed(format!(
                 "Unity Catalog error response exceeds the {MAX_ERROR_RESPONSE_BYTES}-byte limit"
             )));
         }
-        body.extend_from_slice(&chunk);
     }
-    Ok(body
-        .windows(b"ALREADY_EXISTS".len())
-        .any(|window| window == b"ALREADY_EXISTS"))
+    Ok(false)
 }
 
 fn storage_provider_name(location: &str) -> &'static str {

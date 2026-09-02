@@ -281,11 +281,15 @@ async fn native_delta_fault_worker() {
         std::env::var("LAMINAR_DELTA_FAULT_SIGNAL_DIR")
             .expect("fault worker requires a signal directory"),
     );
-    std::fs::write(signals.join("ready"), b"ready")
-        .expect("fault worker must publish its pre-publication boundary");
     match mode.as_str() {
-        "before-publication" => {}
+        "before-publication" => {
+            append(&url, vec![id])
+                .await
+                .expect("the injected pre-publication boundary must suspend this append");
+        }
         "after-publication" => {
+            std::fs::write(signals.join("ready"), b"ready")
+                .expect("fault worker must publish its release boundary");
             wait_for_path(&signals.join("release"), Duration::from_secs(120))
                 .await
                 .expect("fault worker must receive the publication release");
@@ -335,11 +339,7 @@ async fn native_delta_append_read_restart() {
         "fault_soak": false
     });
     let evidence = context.evidence(
-        DependencyVersions {
-            deltalake: Some("0.32.4"),
-            iceberg: None,
-            opendal: None,
-        },
+        DependencyVersions::delta().expect("Delta dependency versions must match Cargo.lock"),
         capabilities,
         EvidenceOutcome {
             iterations: 4,
@@ -407,11 +407,7 @@ async fn native_delta_process_fault_soak() {
     });
     let records = result.as_ref().map_or(0, |run| run.records);
     let evidence = context.evidence(
-        DependencyVersions {
-            deltalake: Some("0.32.4"),
-            iceberg: None,
-            opendal: None,
-        },
+        DependencyVersions::delta().expect("Delta dependency versions must match Cargo.lock"),
         capabilities,
         EvidenceOutcome {
             iterations: kills,

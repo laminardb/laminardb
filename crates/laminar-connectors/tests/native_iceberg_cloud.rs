@@ -208,11 +208,7 @@ async fn native_iceberg_append_scan_restart() {
         "experimental": context.provider_id == "azure"
     });
     let evidence = context.evidence(
-        DependencyVersions {
-            deltalake: None,
-            iceberg: Some("0.10.1"),
-            opendal: Some("0.57.0"),
-        },
+        DependencyVersions::iceberg().expect("Iceberg dependency versions must match Cargo.lock"),
         capabilities,
         EvidenceOutcome {
             iterations: 4,

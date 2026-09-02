@@ -164,3 +164,26 @@ async fn bounded_already_exists_response_remains_idempotent() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn oversized_response_with_bounded_already_exists_marker_remains_idempotent() {
+    let server = MockServer::start().await;
+    let body = format!("ALREADY_EXISTS{}", "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1));
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/tables/"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    create_uc_table(
+        &server.uri(),
+        "configured-token",
+        "catalog",
+        "schema",
+        "table",
+        "s3://bucket/table",
+        &[],
+    )
+    .await
+    .unwrap();
+}

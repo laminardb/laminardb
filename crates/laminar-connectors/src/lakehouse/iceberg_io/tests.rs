@@ -231,14 +231,24 @@ fn test_storage_factory_rejects_unknown_storage_type() {
 
 #[test]
 fn storage_scheme_inference_covers_cloud_backends() {
-    assert_eq!(
-        infer_storage_type("gs://bucket/warehouse"),
-        Some(IcebergStorageType::Gcs)
-    );
-    assert_eq!(
-        infer_storage_type("abfss://container@account.dfs.core.windows.net/warehouse"),
-        Some(IcebergStorageType::Azure)
-    );
+    for (warehouse, expected) in [
+        ("s3://bucket/warehouse", IcebergStorageType::S3),
+        ("s3a://bucket/warehouse", IcebergStorageType::S3),
+        ("gs://bucket/warehouse", IcebergStorageType::Gcs),
+        ("gcs://bucket/warehouse", IcebergStorageType::Gcs),
+        (
+            "abfss://container@account.dfs.core.windows.net/warehouse",
+            IcebergStorageType::Azure,
+        ),
+        (
+            "wasbs://container@account.blob.core.windows.net/warehouse",
+            IcebergStorageType::Azure,
+        ),
+        ("file:///tmp/warehouse", IcebergStorageType::Fs),
+    ] {
+        assert_eq!(infer_storage_type(warehouse), Some(expected), "{warehouse}");
+    }
+    assert_eq!(infer_storage_type("https://example.test/warehouse"), None);
 }
 
 #[tokio::test]

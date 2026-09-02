@@ -126,16 +126,20 @@ pub(super) fn apply_url_derived_options(
             "azure_endpoint" => &["azure_endpoint", "azure_storage_endpoint", "endpoint"],
             _ => &[key.as_str()],
         };
-        if let Some((configured_key, configured_value)) = options.iter().find(|(candidate, _)| {
+        let mut configured_alias = false;
+        for (configured_key, configured_value) in options.iter().filter(|(candidate, _)| {
             aliases
                 .iter()
                 .any(|alias| candidate.eq_ignore_ascii_case(alias))
         }) {
+            configured_alias = true;
             if configured_value != value {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "storage option '{configured_key}' conflicts with the Delta table URL authority"
                 )));
             }
+        }
+        if configured_alias {
             continue;
         }
         options.insert(key.clone(), value.clone());
@@ -183,10 +187,12 @@ pub async fn open_or_create_table(
     // conflict-recovery opens otherwise copy the complete option map.
     let table = DeltaTable::try_from_url_with_storage_options(url, storage_options)
         .await
-        .map_err(|_| {
+        .map_err(|error| {
             ConnectorError::ConnectionFailed(
-                "failed to open Delta table; verify the redacted provider diagnostics and storage configuration"
-                    .into(),
+                format!(
+                    "failed to open Delta table ({}); verify the redacted provider diagnostics and storage configuration",
+                    super::attempt_error::delta_error_category(&error)
+                ),
             )
         })?;
 
@@ -218,10 +224,12 @@ pub async fn open_or_create_table(
         .create()
         .with_columns(delta_schema.fields().cloned())
         .await
-        .map_err(|_| {
+        .map_err(|error| {
             ConnectorError::ConnectionFailed(
-                "failed to create Delta table; verify provider permissions and conditional-write support"
-                    .into(),
+                format!(
+                    "failed to create Delta table ({}); verify provider permissions and conditional-write support",
+                    super::attempt_error::delta_error_category(&error)
+                ),
             )
         })?;
 
@@ -314,6 +322,9 @@ pub(crate) async fn write_batches(
         write_builder = write_builder.with_writer_properties(props);
     }
 
+    #[cfg(feature = "testing")]
+    delta_prepublication_fault_boundary().await?;
+
     // Execute the write.
     let table = write_builder.await.map_err(DeltaWriteAttemptError::Delta)?;
 
@@ -323,6 +334,27 @@ pub(crate) async fn write_batches(
     info!(version, total_rows, "committed Delta Lake transaction");
 
     Ok((table, version))
+}
+
+#[cfg(all(feature = "delta-lake", feature = "testing"))]
+async fn delta_prepublication_fault_boundary() -> Result<(), DeltaWriteAttemptError> {
+    if std::env::var("LAMINAR_DELTA_FAULT_WORKER_MODE").as_deref() != Ok("before-publication") {
+        return Ok(());
+    }
+    let signal_directory = std::env::var_os("LAMINAR_DELTA_FAULT_SIGNAL_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            DeltaWriteAttemptError::Local(ConnectorError::ConfigurationError(
+                "Delta test fault boundary requires an absolute signal directory".into(),
+            ))
+        })?;
+    std::fs::write(signal_directory.join("ready"), b"ready").map_err(|_| {
+        DeltaWriteAttemptError::Local(ConnectorError::WriteError(
+            "Delta test fault boundary could not publish its ready signal".into(),
+        ))
+    })?;
+    std::future::pending::<Result<(), DeltaWriteAttemptError>>().await
 }
 
 #[cfg(feature = "delta-lake")]

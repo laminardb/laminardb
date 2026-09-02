@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::path::Path;
 use std::time::Instant;
 
 use laminar_connectors::storage::{
@@ -150,7 +151,7 @@ impl NativeCloudContext {
             enabled_cargo_features: non_empty_env("LAMINAR_ENABLED_CARGO_FEATURES")
                 .map(|features| features.split(',').map(str::to_owned).collect())
                 .unwrap_or_default(),
-            object_store_version: "0.13.2",
+            object_store_version: dependencies.object_store,
             deltalake_version: dependencies.deltalake,
             iceberg_version: dependencies.iceberg,
             opendal_version: dependencies.opendal,
@@ -328,9 +329,30 @@ fn validate_pinned_gcs_adc() -> Result<(), String> {
 }
 
 pub struct DependencyVersions {
-    pub deltalake: Option<&'static str>,
-    pub iceberg: Option<&'static str>,
-    pub opendal: Option<&'static str>,
+    object_store: String,
+    deltalake: Option<String>,
+    iceberg: Option<String>,
+    opendal: Option<String>,
+}
+
+impl DependencyVersions {
+    pub fn delta() -> Result<Self, String> {
+        Ok(Self {
+            object_store: locked_dependency_version("object_store")?,
+            deltalake: Some(locked_dependency_version("deltalake")?),
+            iceberg: None,
+            opendal: None,
+        })
+    }
+
+    pub fn iceberg() -> Result<Self, String> {
+        Ok(Self {
+            object_store: locked_dependency_version("object_store")?,
+            deltalake: None,
+            iceberg: Some(locked_dependency_version("iceberg")?),
+            opendal: Some(locked_dependency_version("opendal")?),
+        })
+    }
 }
 
 pub struct EvidenceOutcome {
@@ -364,10 +386,10 @@ pub struct NativeEvidence {
     region_or_cloud_location: Option<String>,
     url_scheme: String,
     enabled_cargo_features: Vec<String>,
-    object_store_version: &'static str,
-    deltalake_version: Option<&'static str>,
-    iceberg_version: Option<&'static str>,
-    opendal_version: Option<&'static str>,
+    object_store_version: String,
+    deltalake_version: Option<String>,
+    iceberg_version: Option<String>,
+    opendal_version: Option<String>,
     auth_source: String,
     test_suite: &'static str,
     test_name: &'static str,
@@ -392,6 +414,39 @@ pub struct NativeEvidence {
     skip_reasons: Vec<String>,
     cleanup_result: String,
     failure: Option<&'static str>,
+}
+
+fn locked_dependency_version(package: &str) -> Result<String, String> {
+    let lockfile = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Cargo.lock");
+    let contents = std::fs::read_to_string(lockfile)
+        .map_err(|_| "workspace Cargo.lock cannot be read".to_string())?;
+    let mut versions = contents
+        .split("[[package]]")
+        .filter_map(|entry| locked_package_version(entry, package))
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    versions.dedup();
+    match versions.as_slice() {
+        [version] => Ok((*version).to_string()),
+        [] => Err(format!("{package} is absent from workspace Cargo.lock")),
+        _ => Err(format!(
+            "{package} has multiple versions in workspace Cargo.lock"
+        )),
+    }
+}
+
+fn locked_package_version<'a>(entry: &'a str, package: &str) -> Option<&'a str> {
+    let expected_name = format!("name = \"{package}\"");
+    if !entry.lines().any(|line| line.trim() == expected_name) {
+        return None;
+    }
+    entry.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("version = \"")
+            .and_then(|value| value.strip_suffix('"'))
+    })
 }
 
 fn reject_custom_endpoints() -> Result<(), String> {
