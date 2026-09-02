@@ -183,7 +183,11 @@ Protected GitHub environments named `native-cloud-aws`, `native-cloud-azure`, an
 - AWS: OIDC-trusted role, region, and `LAMINAR_AWS_TEST_URL`; grant list/read/create/update/delete
   only for the pre-provisioned test bucket/prefix.
 - Azure: federated client, tenant and subscription identifiers plus `LAMINAR_AZURE_TEST_URL`; grant
-  data-plane list/read/create/update/delete only for the test container. Use a fully qualified
+  the federated service principal the built-in **Storage Blob Data Contributor** role at the test
+  container scope. Management-plane Owner, Contributor, or Storage Account Contributor alone is
+  insufficient. The conformance cleanup uses Blob Batch, whose parent request needs blob write and
+  whose subrequests need blob delete; any role-assignment condition must allow both under the
+  generated `laminardb-tests/` prefix. Use a fully qualified
   `abfss://filesystem@account.dfs.<suffix>` or `wasbs://container@account.blob.<suffix>` URL so the
   account, filesystem/container, and native endpoint are derived without another identifier.
   Generic HTTPS and signed URLs are rejected. Iceberg additionally uses
