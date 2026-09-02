@@ -10513,17 +10513,24 @@ fn assert_no_local_checkpoint_consistency_fault(node: &Node) {
 }
 
 /// Wait until `pred` holds, polling, or panic with `what` at deadline.
-fn wait_for(what: &str, deadline: Duration, mut pred: impl FnMut() -> bool) {
+fn wait_for(what: &str, deadline: Duration, pred: impl FnMut() -> bool) {
+    if wait_until(deadline, pred) {
+        return;
+    }
+    panic!("soak: timed out after {deadline:?} waiting for: {what}");
+}
+
+fn wait_until(deadline: Duration, mut pred: impl FnMut() -> bool) -> bool {
     let expires_at = Instant::now() + deadline;
     while remaining_at(expires_at, Instant::now()).is_some() {
         if pred() {
-            return;
+            return true;
         }
         if let Some(remaining) = remaining_at(expires_at, Instant::now()) {
             std::thread::sleep(remaining.min(Duration::from_millis(250)));
         }
     }
-    panic!("soak: timed out after {deadline:?} waiting for: {what}");
+    false
 }
 
 #[cfg(feature = "kafka")]
@@ -11208,6 +11215,56 @@ fn assert_checkpoint_progress(
 /// Assert two committed checkpoints over advancing source data. With Kafka, also require a new
 /// broker offset commit so an empty-checkpoint loop cannot satisfy the soak.
 #[cfg(feature = "kafka")]
+fn durable_progress_diagnostics(
+    nodes: &[Node],
+    commit_oracle: Option<&KafkaJoinCommitOracle>,
+) -> String {
+    let live_nodes: Vec<&Node> = nodes.iter().filter(|node| node.child.is_some()).collect();
+    let live_node_ids: Vec<usize> = live_nodes.iter().map(|node| node.id).collect();
+    let leader_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.is_leader()))
+        .collect();
+    let checkpoint_size_bytes_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.metric("laminardb_checkpoint_size_bytes")))
+        .collect();
+    let durable_checkpoint_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.durable_checkpoint_status()))
+        .collect();
+    let completed = try_cluster_metric(nodes, "laminardb_checkpoints_completed_total");
+    let failed = try_cluster_metric(nodes, "laminardb_checkpoints_failed_total");
+    let recovery_metrics = [
+        (
+            "pipeline_faults",
+            try_cluster_metric(nodes, "laminardb_pipeline_faults_total"),
+        ),
+        (
+            "pipeline_restarts",
+            try_cluster_metric(nodes, "laminardb_pipeline_restarts_total"),
+        ),
+        (
+            "coordinated_recoveries",
+            try_cluster_metric(nodes, "laminardb_coordinated_recoveries_total"),
+        ),
+        (
+            "coordinated_recovery_failures",
+            try_cluster_metric(nodes, "laminardb_coordinated_recovery_failures_total"),
+        ),
+    ];
+    let offsets = commit_oracle.and_then(KafkaJoinCommitOracle::committed_offsets);
+    format!(
+        "live_node_ids={live_node_ids:?}, leader_by_node={leader_by_node:?}, \
+         completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
+         recovery_metrics={recovery_metrics:?}, \
+         checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
+         durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
+         committed_source_offsets={offsets:?}"
+    )
+}
+
+#[cfg(feature = "kafka")]
 fn assert_progress(
     nodes: &mut [Node],
     mut producer: Option<&mut ProducerGuard>,
@@ -11241,6 +11298,8 @@ fn assert_progress(
     // Take the durability baselines only after graph output advanced, so checkpoints that happened
     // before this phase cannot satisfy the source-offset proof.
     let checkpoint_target = cluster_commits(nodes) + 2.0;
+    let checkpoint_failure_baseline =
+        try_cluster_metric(nodes, "laminardb_checkpoints_failed_total");
     let mut kafka_offset_baseline = None;
     if let Some(oracle) = commit_oracle {
         wait_for(
@@ -11259,43 +11318,50 @@ fn assert_progress(
     let kafka_offset_targets = kafka_offset_baseline
         .as_ref()
         .map(|offsets| offsets.iter().map(|offset| offset + 1).collect::<Vec<_>>());
-    wait_for(
-        &format!("{label}: checkpoints and durable source offsets to advance"),
-        remaining_progress_window(deadline, label),
-        || {
-            assert_running_nodes(nodes);
-            if let Some(producer) = producer.as_deref_mut() {
-                producer.assert_running();
-            }
-            try_cluster_metric(nodes, "laminardb_checkpoints_completed_total")
-                .is_some_and(|commits| commits >= checkpoint_target)
-                && kafka_offset_targets.as_ref().is_none_or(|targets| {
-                    commit_oracle
-                        .and_then(KafkaJoinCommitOracle::committed_offsets)
-                        .is_some_and(|current| {
-                            let baseline = kafka_offset_baseline.as_ref().expect("offset baseline");
-                            assert_eq!(
-                                current.len(),
-                                baseline.len(),
-                                "Kafka committed-offset partition count changed"
-                            );
-                            for (partition, (current, baseline)) in
-                                current.iter().zip(baseline).enumerate()
-                            {
-                                assert!(
-                                    current >= baseline,
-                                    "Kafka partition {partition} committed offset regressed: \
+    let durability_window = remaining_progress_window(deadline, label);
+    let durability_advanced = wait_until(durability_window, || {
+        assert_running_nodes(nodes);
+        if let Some(producer) = producer.as_deref_mut() {
+            producer.assert_running();
+        }
+        try_cluster_metric(nodes, "laminardb_checkpoints_completed_total")
+            .is_some_and(|commits| commits >= checkpoint_target)
+            && kafka_offset_targets.as_ref().is_none_or(|targets| {
+                commit_oracle
+                    .and_then(KafkaJoinCommitOracle::committed_offsets)
+                    .is_some_and(|current| {
+                        let baseline = kafka_offset_baseline.as_ref().expect("offset baseline");
+                        assert_eq!(
+                            current.len(),
+                            baseline.len(),
+                            "Kafka committed-offset partition count changed"
+                        );
+                        for (partition, (current, baseline)) in
+                            current.iter().zip(baseline).enumerate()
+                        {
+                            assert!(
+                                current >= baseline,
+                                "Kafka partition {partition} committed offset regressed: \
                                      {current} < {baseline}"
-                                );
-                            }
-                            current
-                                .iter()
-                                .zip(targets)
-                                .all(|(current, target)| current >= target)
-                        })
-                })
-        },
-    );
+                            );
+                        }
+                        current
+                            .iter()
+                            .zip(targets)
+                            .all(|(current, target)| current >= target)
+                    })
+            })
+    });
+    if !durability_advanced {
+        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle);
+        panic!(
+            "soak: timed out after {durability_window:?} waiting for: {label}: checkpoints and \
+             durable source offsets to advance; checkpoint_target={checkpoint_target}, \
+             checkpoint_failure_baseline={checkpoint_failure_baseline:?}, \
+             kafka_offset_baseline={kafka_offset_baseline:?}, \
+             kafka_offset_targets={kafka_offset_targets:?}, observation=({diagnostics})"
+        );
+    }
     wait_for_converged_durable_checkpoint(nodes, deadline, label, previous_checkpoint)
 }
 
