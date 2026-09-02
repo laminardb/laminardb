@@ -16,7 +16,6 @@ fn glue_init_error_category(error: &deltalake_catalog_glue::GlueError) -> &'stat
 
 #[cfg(feature = "delta-lake-glue")]
 fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
-    use aws_sdk_glue::error::ProvideErrorMetadata;
     use aws_sdk_glue::Error;
 
     match error {
@@ -41,9 +40,37 @@ fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
         | Error::ConcurrentModificationException(_)
         | Error::ConflictException(_)
         | Error::VersionMismatchException(_) => "catalog-conflict",
-        error if error.code().is_none() => "client-or-transport",
-        _ => "unclassified-service-error",
+        _ => aws_glue_pre_service_error_category(error).unwrap_or("unclassified-service-error"),
     }
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn aws_glue_pre_service_error_category(error: &aws_sdk_glue::Error) -> Option<&'static str> {
+    type GetTableSdkError =
+        aws_sdk_glue::error::SdkError<aws_sdk_glue::operation::get_table::GetTableError>;
+
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<aws_sdk_glue::error::BuildError>()
+            .is_some()
+        {
+            return Some("client-input");
+        }
+        if let Some(sdk_error) = current.downcast_ref::<GetTableSdkError>() {
+            return match sdk_error {
+                GetTableSdkError::ConstructionFailure(_) => Some("client-input"),
+                GetTableSdkError::TimeoutError(_) => Some("client-timeout"),
+                GetTableSdkError::DispatchFailure(_) => Some("transport"),
+                GetTableSdkError::ResponseError(_) => Some("invalid-response"),
+                GetTableSdkError::ServiceError(_) => None,
+                _ => Some("unclassified-sdk-error"),
+            };
+        }
+        source = current.source();
+    }
+
+    None
 }
 
 #[cfg(feature = "delta-lake-glue")]
@@ -186,7 +213,28 @@ mod tests {
         let error = deltalake_catalog_glue::GlueError::AWSError {
             source: unhandled.into(),
         };
-        assert_eq!(glue_init_error_category(&error), "client-or-transport");
+        assert_eq!(glue_init_error_category(&error), "client-input");
+
+        let timeout: aws_sdk_glue::error::SdkError<
+            aws_sdk_glue::operation::get_table::GetTableError,
+        > = aws_sdk_glue::error::SdkError::timeout_error(std::io::Error::other(
+            "private transport detail",
+        ));
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: timeout.into(),
+        };
+        assert_eq!(glue_init_error_category(&error), "client-timeout");
+
+        let no_code_service_error = aws_sdk_glue::operation::get_table::GetTableError::unhandled(
+            std::io::Error::other("private provider response"),
+        );
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: no_code_service_error.into(),
+        };
+        assert_eq!(
+            glue_init_error_category(&error),
+            "unclassified-service-error"
+        );
     }
 }
 
