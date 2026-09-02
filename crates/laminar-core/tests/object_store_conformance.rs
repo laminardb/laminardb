@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MULTIPART_PART_BYTES: usize = 6 * 1024 * 1024;
 const MAX_LISTED_OBJECTS: usize = 10_000;
+const RANDOM_FAULT_FIRST_EPOCH: u64 = 4;
+const RANDOM_FAULT_LAST_EPOCH: u64 = 12;
+const RANDOM_FAULT_ITERATIONS: u64 = RANDOM_FAULT_LAST_EPOCH - RANDOM_FAULT_FIRST_EPOCH + 1;
 
 #[derive(Clone)]
 struct StoreConfig {
@@ -123,7 +126,7 @@ struct CloudEvidence {
     region_or_cloud_location: Option<String>,
     url_scheme: String,
     enabled_cargo_features: Vec<String>,
-    object_store_version: &'static str,
+    object_store_version: String,
     deltalake_version: Option<&'static str>,
     iceberg_version: Option<&'static str>,
     opendal_version: Option<&'static str>,
@@ -180,26 +183,16 @@ async fn in_memory_object_store_satisfies_the_conformance_contract() {
 }
 
 #[tokio::test]
-async fn local_object_store_satisfies_the_checkpoint_fault_contract() {
+async fn in_memory_object_store_satisfies_the_checkpoint_fault_contract() {
     let config = StoreConfig {
         url: "memory:///".into(),
         options: HashMap::new(),
         test_store: Some(Arc::new(object_store::memory::InMemory::new())),
     };
-    let context = CloudStoreTestContext {
-        provider: StorageProvider::Local,
-        native_or_emulator: "local",
-        base_url: "file:///local-test".into(),
-        unique_prefix: format!("laminardb-tests/local/{}/", uuid::Uuid::new_v4()),
-        run_id: "local".into(),
-        base_sha: "local".into(),
-        tested_sha: "local".into(),
-        endpoint_class: StorageEndpointClass::Local,
-        auth_source: "anonymous-local",
-    };
+    let prefix = format!("laminardb-tests/memory-fault/{}/", uuid::Uuid::new_v4());
     let mut faults = FaultResults::default();
-    let result = run_checkpoint_fault_contract(&context, &config, &mut faults).await;
-    let cleanup = cleanup_prefixes(&config, &context.unique_prefix).await;
+    let result = run_checkpoint_fault_contract(&prefix, "memory", &config, &mut faults).await;
+    let cleanup = cleanup_prefixes(&config, &prefix).await;
     assert!(result.is_ok(), "{}", result.unwrap_err());
     assert!(cleanup.is_ok(), "{}", cleanup.unwrap_err());
 }
@@ -350,7 +343,8 @@ async fn capability_evidence(
         region_or_cloud_location: non_empty_env("LAMINAR_CLOUD_LOCATION"),
         url_scheme: context_scheme(context),
         enabled_cargo_features: enabled_cargo_features(),
-        object_store_version: "0.13.2",
+        object_store_version: locked_dependency_version("object_store")
+            .expect("object_store dependency version must match Cargo.lock"),
         deltalake_version: None,
         iceberg_version: None,
         opendal_version: None,
@@ -392,7 +386,9 @@ async fn fault_evidence(
     let started_at = chrono::Utc::now();
     let started = Instant::now();
     let mut faults = FaultResults::default();
-    let result = run_checkpoint_fault_contract(context, config, &mut faults).await;
+    let result =
+        run_checkpoint_fault_contract(&context.unique_prefix, &context.run_id, config, &mut faults)
+            .await;
     let cleanup = cleanup_prefixes(config, &context.unique_prefix).await;
     let cleanup_result = cleanup_result(&cleanup);
     let failure = result.as_ref().err().cloned().or_else(|| cleanup.err());
@@ -411,7 +407,8 @@ async fn fault_evidence(
         region_or_cloud_location: non_empty_env("LAMINAR_CLOUD_LOCATION"),
         url_scheme: context_scheme(context),
         enabled_cargo_features: enabled_cargo_features(),
-        object_store_version: "0.13.2",
+        object_store_version: locked_dependency_version("object_store")
+            .expect("object_store dependency version must match Cargo.lock"),
         deltalake_version: None,
         iceberg_version: None,
         opendal_version: None,
@@ -421,7 +418,7 @@ async fn fault_evidence(
         started_at: started_at.to_rfc3339(),
         finished_at: chrono::Utc::now().to_rfc3339(),
         duration_ms: started.elapsed().as_millis(),
-        iterations: 12,
+        iterations: RANDOM_FAULT_ITERATIONS,
         process_kill_count: 0,
         recovery_bound_ms: OPERATION_TIMEOUT.as_millis() as u64,
         capability_results: CapabilityResults::default(),
@@ -517,8 +514,14 @@ async fn run_contract(
         outcomes
             .iter()
             .filter(|outcome| outcome.is_err())
-            .all(|outcome| matches!(outcome, Err(object_store::Error::AlreadyExists { .. }))),
-        "conditional create losers were not classified as AlreadyExists",
+            .all(|outcome| {
+                matches!(
+                    outcome,
+                    Err(object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. })
+                )
+            }),
+        "conditional create losers were not classified as atomic conflicts",
     )?;
     results.conditional_create = true;
     results.create_race_single_winner = true;
@@ -685,12 +688,13 @@ struct TestCheckpointManifest {
 }
 
 async fn run_checkpoint_fault_contract(
-    context: &CloudStoreTestContext,
+    unique_prefix: &str,
+    run_id: &str,
     config: &StoreConfig,
     results: &mut FaultResults,
 ) -> Result<(), String> {
     let store = config.build()?;
-    let prefix = Path::from(context.unique_prefix.trim_end_matches('/'));
+    let prefix = Path::from(unique_prefix.trim_end_matches('/'));
     let pointer_path = child(&prefix, "checkpoint/current.json");
     let initial = TestCheckpointPointer {
         epoch: 0,
@@ -714,7 +718,16 @@ async fn run_checkpoint_fault_contract(
     )?;
 
     let before_data = checkpoint_paths(&prefix, 1);
-    drop(before_data);
+    simulate_interrupted_data_publication(&store, &before_data.0).await?;
+    let partial = bounded_value(
+        "interrupted checkpoint visibility probe",
+        store.head(&before_data.0),
+    )
+    .await?;
+    require(
+        matches!(partial, Err(object_store::Error::NotFound { .. })),
+        "an incomplete checkpoint multipart upload became visible",
+    )?;
     require(
         recover_checkpoint(config, &pointer_path).await?.0 == 0,
         "a checkpoint killed before data publication became visible",
@@ -835,8 +848,8 @@ async fn run_checkpoint_fault_contract(
 
     let mut committed_epoch = winning_epoch;
     let mut previous_recovered = winning_epoch;
-    for epoch in 4..=12 {
-        let phase = deterministic_fault_phase(&context.run_id, epoch);
+    for epoch in RANDOM_FAULT_FIRST_EPOCH..=RANDOM_FAULT_LAST_EPOCH {
+        let phase = deterministic_fault_phase(run_id, epoch);
         let paths = checkpoint_paths(&prefix, epoch);
         let data = checkpoint_data(epoch);
         if phase >= 1 {
@@ -874,6 +887,23 @@ async fn run_checkpoint_fault_contract(
     results.committed_epochs_monotonic = true;
     results.fresh_client_recovery = true;
     Ok(())
+}
+
+async fn simulate_interrupted_data_publication(
+    store: &Arc<dyn ObjectStore>,
+    final_path: &Path,
+) -> Result<(), String> {
+    let mut upload = bounded(
+        "interrupted checkpoint multipart create",
+        store.put_multipart(final_path),
+    )
+    .await?;
+    bounded(
+        "interrupted checkpoint multipart part",
+        upload.put_part(Bytes::from(vec![b'i'; MULTIPART_PART_BYTES]).into()),
+    )
+    .await?;
+    bounded("interrupted checkpoint multipart cleanup", upload.abort()).await
 }
 
 async fn recover_checkpoint(
@@ -1397,6 +1427,35 @@ fn write_evidence(evidence: &CloudEvidence) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(evidence)
         .map_err(|_| "cannot serialize cloud evidence".to_string())?;
     std::fs::write(path, bytes).map_err(|_| "cannot write cloud evidence artifact".to_string())
+}
+
+fn locked_dependency_version(package: &str) -> Result<String, String> {
+    let lockfile = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Cargo.lock");
+    let contents = std::fs::read_to_string(lockfile)
+        .map_err(|_| "workspace Cargo.lock cannot be read".to_string())?;
+    let expected_name = format!("name = \"{package}\"");
+    let mut versions = contents
+        .split("[[package]]")
+        .filter(|entry| entry.lines().any(|line| line.trim() == expected_name))
+        .filter_map(|entry| {
+            entry.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("version = \"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+        })
+        .collect::<Vec<_>>();
+    versions.sort_unstable();
+    versions.dedup();
+    match versions.as_slice() {
+        [version] => Ok((*version).to_string()),
+        [] => Err(format!("{package} is absent from workspace Cargo.lock")),
+        _ => Err(format!(
+            "{package} has multiple versions in workspace Cargo.lock"
+        )),
+    }
 }
 
 fn required_env(name: &str) -> Result<String, String> {
