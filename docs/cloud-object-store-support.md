@@ -183,9 +183,11 @@ Protected GitHub environments named `native-cloud-aws`, `native-cloud-azure`, an
 - AWS: OIDC-trusted role, region, and `LAMINAR_AWS_TEST_URL`; grant list/read/create/update/delete
   only for the pre-provisioned test bucket/prefix.
 - Azure: federated client, tenant and subscription identifiers plus `LAMINAR_AZURE_TEST_URL`; grant
-  data-plane list/read/create/update/delete only for the test container. Iceberg additionally uses
-  `LAMINAR_AZURE_ICEBERG_TEST_URL` in the fully qualified `abfs[s]://` or `wasb[s]://` form because
-  its OpenDAL adapter derives account, filesystem/container, and service from the URL.
+  data-plane list/read/create/update/delete only for the test container. Use a fully qualified
+  `abfss://filesystem@account.dfs.<suffix>` or `wasbs://container@account.blob.<suffix>` URL so the
+  account, filesystem/container, and native endpoint are derived without another identifier.
+  Generic HTTPS and signed URLs are rejected. Iceberg additionally uses
+  `LAMINAR_AZURE_ICEBERG_TEST_URL` in the same fully qualified form.
 - GCP: Workload Identity Provider, service account, project, and `LAMINAR_GCS_TEST_URL`; grant
   object list/read/create/update/delete only for the test bucket/prefix.
 - Iceberg jobs additionally require the provider-specific

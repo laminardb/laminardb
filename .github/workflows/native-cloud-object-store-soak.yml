@@ -128,7 +128,7 @@ jobs:
       - name: Install process-soak dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler jq
+          sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler jq
       - name: Select isolated native locations
         shell: bash
         env:
@@ -224,9 +224,13 @@ jobs:
           if [[ -n "${LAMINAR_SOAK_CHECKPOINT_URL:-}" ]]; then
             scheme="${LAMINAR_SOAK_CHECKPOINT_URL%%:*}"
           fi
-          produced="$(sed -n 's/.*producer acknowledged \([0-9][0-9]*\) records.*/\1/p' native-checkpoint-soak.log 2>/dev/null | tail -1)"
-          produced="${produced:-0}"
-          output_summary="$(sed -n 's/.*output oracle consumed.*observed all \([0-9][0-9]*\) pairs.*with \([0-9][0-9]*\) at-least-once duplicates.*/\1 \2/p' native-checkpoint-soak.log 2>/dev/null | tail -1)"
+          produced=0
+          output_summary=""
+          if [[ -f native-checkpoint-soak.log ]]; then
+            produced="$(sed -n 's/.*producer acknowledged \([0-9][0-9]*\) records.*/\1/p' native-checkpoint-soak.log | tail -1)"
+            produced="${produced:-0}"
+            output_summary="$(sed -n 's/.*output oracle consumed.*observed all \([0-9][0-9]*\) pairs.*with \([0-9][0-9]*\) at-least-once duplicates.*/\1 \2/p' native-checkpoint-soak.log | tail -1)"
+          fi
           recovered=0
           duplicates=0
           if [[ -n "$output_summary" ]]; then read -r recovered duplicates <<< "$output_summary"; fi
