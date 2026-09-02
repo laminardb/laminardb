@@ -55,10 +55,6 @@ env:
   LAMINAR_TESTED_SHA: ${{ github.sha }}
   LAMINAR_CLOUD_EVIDENCE_DIR: target/cloud-evidence
   AZURE_USE_AZURE_CLI: "true"
-  LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
-  LAMINAR_AZURE_TEST_URL: ${{ vars.LAMINAR_AZURE_TEST_URL }}
-  LAMINAR_AZURE_ICEBERG_TEST_URL: ${{ vars.LAMINAR_AZURE_ICEBERG_TEST_URL }}
-  LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
 
 jobs:
   policy:
@@ -69,6 +65,31 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.delivery_mode != 'at-least-once'
         run: |
           echo "This workflow currently has no provider-matrix exactly-once fault contract."
+          exit 1
+      - name: Validate bounded numeric inputs
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          INPUT_PROCESS_KILLS: ${{ inputs.process_kills }}
+          INPUT_DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          INPUT_RECOVERY_TIMEOUT_MS: ${{ inputs.recovery_timeout_ms }}
+        run: |
+          set -euo pipefail
+          validate_positive_integer() {
+            local name="$1" value="$2" maximum="$3"
+            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > maximum )); then
+              echo "$name must be an integer between 1 and $maximum"
+              exit 1
+            fi
+          }
+          validate_positive_integer process_kills "$INPUT_PROCESS_KILLS" 100
+          validate_positive_integer duration_seconds "$INPUT_DURATION_SECONDS" 86400
+          validate_positive_integer recovery_timeout_ms "$INPUT_RECOVERY_TIMEOUT_MS" 3600000
+      - name: Reject unsupported GCS object_store WIF combinations
+        if: github.event_name == 'workflow_dispatch' && inputs.provider == 'gcs' && (inputs.test_subset == 'checkpoint' || inputs.test_subset == 'delta' || inputs.test_subset == 'all')
+        run: |
+          echo "The pinned object_store client cannot consume the external_account file produced by GCP Workload Identity Federation for checkpoint or Delta clients."
+          echo "Run the GCS Iceberg subset, or first land and validate a refreshable upstream GCS WIF implementation."
           exit 1
 
   checkpoint-native:
@@ -84,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure"]') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -111,6 +132,10 @@ jobs:
           sudo apt-get install -y cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler jq
       - name: Select isolated native locations
         shell: bash
+        env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_TEST_URL: ${{ vars.LAMINAR_AZURE_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
         run: |
           set -euo pipefail
           case "${{ matrix.provider }}" in
@@ -120,12 +145,15 @@ jobs:
           esac
           base_sha="$(git merge-base HEAD origin/main)"
           root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/checkpoint"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
           echo "PROVIDER_FEATURE=${{ matrix.provider }}" >> "$GITHUB_ENV"
           echo "LAMINAR_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
           echo "LAMINAR_ENABLED_CARGO_FEATURES=${{ matrix.provider }},cluster,kafka" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
           echo "$location_env=$root" >> "$GITHUB_ENV"
           echo "LAMINAR_SOAK_CHECKPOINT_URL=$root/process-soak" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
@@ -149,7 +177,7 @@ jobs:
             local suite="$1" test_name="$2" output="$3"
             if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/${suite}-*.json" >/dev/null; then return; fi
             jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg suite "$suite" --arg test "$test_name" --arg now "$(date --utc --iso-8601=seconds)" \
-              '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$provider],object_store_version:"0.13.2",deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:$suite,test_name:$test,started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:90000,capability_results:{},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"checkpoint-state-integrity",records_produced:0,records_committed:0,records_recovered:0,duplicates:0,losses:0,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+              '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:$suite,test_name:$test,started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:90000,capability_results:{},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"checkpoint-state-integrity",records_produced:0,records_committed:0,records_recovered:0,duplicates:0,losses:0,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
               > "$LAMINAR_CLOUD_EVIDENCE_DIR/$output"
           }
           write_missing checkpoint-object-store-conformance native_object_store_conformance "checkpoint-object-store-conformance-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
@@ -186,6 +214,9 @@ jobs:
       - name: Write process-soak evidence
         if: always()
         shell: bash
+        env:
+          EVIDENCE_PROCESS_KILLS: ${{ inputs.process_kills || '4' }}
+          EVIDENCE_RECOVERY_TIMEOUT_MS: ${{ inputs.recovery_timeout_ms || '90000' }}
         run: |
           set -euo pipefail
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
@@ -214,11 +245,11 @@ jobs:
             --arg scheme "$scheme" \
             --arg started "$started" --arg finished "$(date --utc --iso-8601=seconds)" \
             --arg cleanup "$cleanup_result" --argjson passed "$passed" \
-            --argjson kills "${{ inputs.process_kills || '4' }}" \
-            --argjson recovery "${{ inputs.recovery_timeout_ms || '90000' }}" \
+            --argjson kills "$EVIDENCE_PROCESS_KILLS" \
+            --argjson recovery "$EVIDENCE_RECOVERY_TIMEOUT_MS" \
             --argjson produced "$produced" --argjson recovered "$recovered" \
             --argjson duplicates "$duplicates" --argjson duration "$duration_ms" \
-            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run_id,provider:$provider,native_or_emulator:"native",redacted_endpoint_classification:"native-provider-default",region_or_cloud_location:(env.LAMINAR_CLOUD_LOCATION // null),url_scheme:$scheme,enabled_cargo_features:["cluster","kafka",$provider],object_store_version:"0.13.2",deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"checkpoint-native-process-soak",test_name:"three_node_alo_join_kill9_soak",started_at:$started,finished_at:$finished,duration_ms:$duration,iterations:$kills,process_kill_count:$kills,recovery_bound_ms:$recovery,capability_results:{real_process_kill:true,fresh_client_recovery:$passed,no_loss_assertion:$passed,duplicates_identified_and_bounded:$passed},conditional_create_result:null,stale_cas_result:null,restart_result:$passed,delivery_contract_tested:"at-least-once",records_produced:$produced,records_committed:(if $passed then $recovered else 0 end),records_recovered:(if $passed then $recovered else 0 end),duplicates:(if $passed then $duplicates else null end),losses:(if $passed then 0 else null end),passed:$passed,skip_count:0,skip_reasons:[],cleanup_result:$cleanup,failure:(if $passed then null else "native checkpoint process soak, output evidence, or cleanup failed" end)}' \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run_id,provider:$provider,native_or_emulator:"native",redacted_endpoint_classification:"native-provider-default",region_or_cloud_location:(env.LAMINAR_CLOUD_LOCATION // null),url_scheme:$scheme,enabled_cargo_features:["cluster","kafka",$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"checkpoint-native-process-soak",test_name:"three_node_alo_join_kill9_soak",started_at:$started,finished_at:$finished,duration_ms:$duration,iterations:$kills,process_kill_count:$kills,recovery_bound_ms:$recovery,capability_results:{real_process_kill:true,fresh_client_recovery:$passed,no_loss_assertion:$passed,duplicates_identified_and_bounded:$passed},conditional_create_result:null,stale_cas_result:null,restart_result:$passed,delivery_contract_tested:"at-least-once",records_produced:$produced,records_committed:(if $passed then $recovered else 0 end),records_recovered:(if $passed then $recovered else 0 end),duplicates:(if $passed then $duplicates else null end),losses:(if $passed then 0 else null end),passed:$passed,skip_count:0,skip_reasons:[],cleanup_result:$cleanup,failure:(if $passed then null else "native checkpoint process soak, output evidence, or cleanup failed" end)}' \
             > "$LAMINAR_CLOUD_EVIDENCE_DIR/checkpoint-native-process-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
       - name: Validate native evidence eligibility
         id: validate_evidence
@@ -269,7 +300,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure"]') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -292,6 +323,10 @@ jobs:
           key: native-delta-${{ matrix.provider }}
       - name: Select Delta provider feature
         shell: bash
+        env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_TEST_URL: ${{ vars.LAMINAR_AZURE_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
         run: |
           set -euo pipefail
           case "${{ matrix.provider }}" in
@@ -301,6 +336,9 @@ jobs:
           esac
           base_sha="$(git merge-base HEAD origin/main)"
           root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/delta"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
+          deltalake_version="$(jq -er '[.packages[] | select(.name == "deltalake") | .version] | unique | if length == 1 then .[0] else error("deltalake version is not unique") end' <<<"$metadata")"
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
           echo "DELTA_FEATURE=$feature" >> "$GITHUB_ENV"
@@ -308,12 +346,14 @@ jobs:
           echo "PROVIDER_FEATURE=$provider_feature" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
           echo "LAMINAR_ENABLED_CARGO_FEATURES=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_DELTALAKE_VERSION=$deltalake_version" >> "$GITHUB_ENV"
           echo "$location_env=$root" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
       - name: Run native Delta append/read/restart integration
         id: delta_test
         continue-on-error: true
-        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" --test native_delta_cloud native_delta_append_read_restart -- --ignored --exact --nocapture
+        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE,testing" --test native_delta_cloud native_delta_append_read_restart -- --ignored --exact --nocapture
       - name: Write Delta setup-failure evidence when the test could not start
         if: always()
         shell: bash
@@ -322,12 +362,12 @@ jobs:
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-integration-*.json" >/dev/null; then exit 0; fi
           jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${DELTA_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
-            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:"0.13.2",deltalake_version:"0.32.4",iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-integration",test_name:"native_delta_append_read_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"at-least-once-native-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:(env.LAMINAR_DELTALAKE_VERSION // "unknown"),iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-integration",test_name:"native_delta_append_read_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"at-least-once-native-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
             > "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-integration-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
       - name: Run native Delta process-fault soak
         id: delta_fault_test
         continue-on-error: true
-        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" --test native_delta_cloud native_delta_process_fault_soak -- --ignored --exact --nocapture
+        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE,testing" --test native_delta_cloud native_delta_process_fault_soak -- --ignored --exact --nocapture
         env:
           LAMINAR_SOAK_KILLS: ${{ inputs.process_kills || '4' }}
       - name: Write Delta fault setup-failure evidence when the test could not start
@@ -338,7 +378,7 @@ jobs:
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-fault-soak-*.json" >/dev/null; then exit 0; fi
           jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${DELTA_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
-            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:"0.13.2",deltalake_version:"0.32.4",iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-fault-soak",test_name:"native_delta_process_fault_soak",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:120000,capability_results:{fault_soak:true},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"delta-at-least-once-process-fault",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or fault test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or fault test failed before evidence was written"}' \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:(env.LAMINAR_DELTALAKE_VERSION // "unknown"),iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-fault-soak",test_name:"native_delta_process_fault_soak",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:120000,capability_results:{fault_soak:true},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"delta-at-least-once-process-fault",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or fault test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or fault test failed before evidence was written"}' \
             > "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-fault-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
       - name: Clean interrupted native Delta prefixes
         id: delta_cleanup
@@ -410,9 +450,13 @@ jobs:
       - name: Select Iceberg provider feature and catalog
         shell: bash
         env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_ICEBERG_TEST_URL: ${{ vars.LAMINAR_AZURE_ICEBERG_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
           AWS_CATALOG: ${{ vars.LAMINAR_AWS_ICEBERG_CATALOG_URI }}
           AZURE_CATALOG: ${{ vars.LAMINAR_AZURE_ICEBERG_CATALOG_URI }}
           GCS_CATALOG: ${{ vars.LAMINAR_GCS_ICEBERG_CATALOG_URI }}
+          ICEBERG_NAMESPACE: ${{ vars.LAMINAR_ICEBERG_NATIVE_NAMESPACE || 'laminar_native_tests' }}
         run: |
           set -euo pipefail
           case "${{ matrix.provider }}" in
@@ -422,15 +466,22 @@ jobs:
           esac
           base_sha="$(git merge-base HEAD origin/main)"
           root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/iceberg"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
+          iceberg_version="$(jq -er '[.packages[] | select(.name == "iceberg") | .version] | unique | if length == 1 then .[0] else error("iceberg version is not unique") end' <<<"$metadata")"
+          opendal_version="$(jq -er '[.packages[] | select(.name == "opendal") | .version] | unique | if length == 1 then .[0] else error("opendal version is not unique") end' <<<"$metadata")"
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
           echo "ICEBERG_FEATURE=$feature" >> "$GITHUB_ENV"
           echo "LAMINAR_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
           echo "PROVIDER_FEATURE=$provider_feature" >> "$GITHUB_ENV"
           echo "LAMINAR_ICEBERG_CATALOG_URI=$catalog" >> "$GITHUB_ENV"
-          echo "LAMINAR_ICEBERG_NAMESPACE=${{ vars.LAMINAR_ICEBERG_NATIVE_NAMESPACE || 'laminar_native_tests' }}" >> "$GITHUB_ENV"
+          echo "LAMINAR_ICEBERG_NAMESPACE=$ICEBERG_NAMESPACE" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
           echo "LAMINAR_ENABLED_CARGO_FEATURES=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_ICEBERG_VERSION=$iceberg_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_OPENDAL_VERSION=$opendal_version" >> "$GITHUB_ENV"
           echo "$location_env=$root" >> "$GITHUB_ENV"
           echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
       - name: Run native Iceberg REST/warehouse integration
@@ -445,7 +496,7 @@ jobs:
           mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
           if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/iceberg-native-integration-*.json" >/dev/null; then exit 0; fi
           jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${ICEBERG_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
-            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:"0.13.2",deltalake_version:null,iceberg_version:"0.10.1",opendal_version:"0.57.0",auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"iceberg-native-integration",test_name:"native_iceberg_append_scan_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false,experimental:($provider == "azure")},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"iceberg-append-at-least-once-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:(env.LAMINAR_ICEBERG_VERSION // "unknown"),opendal_version:(env.LAMINAR_OPENDAL_VERSION // "unknown"),auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"iceberg-native-integration",test_name:"native_iceberg_append_scan_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false,experimental:($provider == "azure")},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"iceberg-append-at-least-once-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
             > "$LAMINAR_CLOUD_EVIDENCE_DIR/iceberg-native-integration-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
       - name: Clean interrupted native Iceberg prefixes
         id: iceberg_cleanup

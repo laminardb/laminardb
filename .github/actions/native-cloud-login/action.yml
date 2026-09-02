@@ -31,6 +31,46 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Validate selected provider login configuration
+      shell: bash
+      env:
+        LOGIN_PROVIDER: ${{ inputs.provider }}
+        AWS_ROLE_ARN: ${{ inputs.aws-role-arn }}
+        AWS_REGION: ${{ inputs.aws-region }}
+        AZURE_CLIENT_ID: ${{ inputs.azure-client-id }}
+        AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+        AZURE_SUBSCRIPTION_ID: ${{ inputs.azure-subscription-id }}
+        GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.gcp-workload-identity-provider }}
+        GCP_SERVICE_ACCOUNT: ${{ inputs.gcp-service-account }}
+        GCP_PROJECT_ID: ${{ inputs.gcp-project-id }}
+      run: |
+        set -euo pipefail
+        require_value() {
+          if [[ -z "$2" ]]; then
+            echo "$1 is required for the selected native provider"
+            exit 1
+          fi
+        }
+        case "$LOGIN_PROVIDER" in
+          aws)
+            require_value AWS_NATIVE_TEST_ROLE_ARN "$AWS_ROLE_ARN"
+            require_value AWS_NATIVE_TEST_REGION "$AWS_REGION"
+            ;;
+          azure)
+            require_value AZURE_NATIVE_TEST_CLIENT_ID "$AZURE_CLIENT_ID"
+            require_value AZURE_NATIVE_TEST_TENANT_ID "$AZURE_TENANT_ID"
+            require_value AZURE_NATIVE_TEST_SUBSCRIPTION_ID "$AZURE_SUBSCRIPTION_ID"
+            ;;
+          gcs)
+            require_value GCP_NATIVE_TEST_WORKLOAD_IDENTITY_PROVIDER "$GCP_WORKLOAD_IDENTITY_PROVIDER"
+            require_value GCP_NATIVE_TEST_SERVICE_ACCOUNT "$GCP_SERVICE_ACCOUNT"
+            require_value GCP_NATIVE_TEST_PROJECT_ID "$GCP_PROJECT_ID"
+            ;;
+          *)
+            echo "provider must be aws, azure, or gcs"
+            exit 1
+            ;;
+        esac
     - name: Authenticate to AWS with OIDC
       if: inputs.provider == 'aws'
       uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3

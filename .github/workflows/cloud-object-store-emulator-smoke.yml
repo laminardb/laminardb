@@ -151,11 +151,13 @@ jobs:
               "$file" >/dev/null
           done
           if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
-            jq -e \
-              '.conditional_create_result == true and
-               .stale_cas_result == true and
-               .restart_result == true' \
-              "${evidence[@]}" >/dev/null
+            for file in "${evidence[@]}"; do
+              jq -e \
+                '.conditional_create_result == true and
+                 .stale_cas_result == true and
+                 .restart_result == true' \
+                "$file" >/dev/null
+            done
           else
             jq -e \
               '.test_suite == "checkpoint-object-store-emulator-basic-smoke" and

@@ -1,6 +1,6 @@
 # Cloud object-store support
 
-**Status:** current implementation boundary, 2026-09-01
+**Status:** current implementation boundary, 2026-09-02
 
 Cloud storage is a backend capability, not a file or table format. This page records support for
 each storage consumer separately. It also separates code/configuration support from evidence: a
@@ -33,9 +33,9 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
-| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; native jobs have no current artifact | Supported; crash-durable only for absolute `file://` URLs | URI/config; MinIO smoke coverage; compatibility tier only |
-| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; native job; no current native artifact | Supported | MinIO smoke; compatibility tier only |
-| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; native job; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
+| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; native harness blocked by the pinned WIF gap | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
+| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; native harness blocked by the pinned WIF gap | Supported | MinIO smoke; compatibility tier only |
+| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; native harness blocked by the pinned WIF gap; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
 | Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
@@ -137,10 +137,12 @@ not cache refreshable tokens or replace SDK/provider default chains with static 
   the pinned experimental AzDLS adapter derives its endpoint from the fully qualified URL.
 
 These pinned-library credential differences are an explicit native-evidence gate. In particular,
-the GCS checkpoint and Delta jobs cannot pass the repository's keyless GitHub WIF policy until the
-pinned `object_store` path gains refreshable external-account support (or an equivalent upstream
-provider is adopted and tested). Their current protected jobs therefore fail closed; this is not a
-GCS certification claim. The GCS Iceberg job uses OpenDAL's independent credential implementation.
+the GCS checkpoint and Delta harnesses cannot pass the repository's keyless GitHub WIF policy until
+the pinned `object_store` path gains refreshable external-account support (or an equivalent upstream
+provider is adopted and tested). Protected dispatch rejects those combinations before cloud I/O,
+and scheduled matrices omit them rather than producing a knowingly skipped or failing certification
+job. This is not a GCS certification claim. The GCS Iceberg job uses OpenDAL's independent
+credential implementation.
 
 Endpoint overrides are classified in diagnostics without hostname, path, query, bucket, account,
 container, or object key. An S3 override is **S3-compatible**, while Azure/GCS overrides are
