@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 const MULTIPART_PART_BYTES: usize = 6 * 1024 * 1024;
 const MAX_LISTED_OBJECTS: usize = 10_000;
-const RANDOM_FAULT_FIRST_EPOCH: u64 = 4;
-const RANDOM_FAULT_LAST_EPOCH: u64 = 12;
+const INTERRUPTED_DATA_EPOCH: u64 = 1;
+const FIRST_COMMITTED_EPOCH: u64 = 2;
+const FIRST_CONTENDING_EPOCH: u64 = 3;
+const SECOND_CONTENDING_EPOCH: u64 = 4;
+const RANDOM_FAULT_FIRST_EPOCH: u64 = 5;
+const RANDOM_FAULT_LAST_EPOCH: u64 = 13;
 const RANDOM_FAULT_ITERATIONS: u64 = RANDOM_FAULT_LAST_EPOCH - RANDOM_FAULT_FIRST_EPOCH + 1;
 
 #[derive(Clone)]
@@ -717,7 +721,7 @@ async fn run_checkpoint_fault_contract(
         "initial pointer did not recover at epoch zero",
     )?;
 
-    let before_data = checkpoint_paths(&prefix, 1);
+    let before_data = checkpoint_paths(&prefix, INTERRUPTED_DATA_EPOCH);
     simulate_interrupted_data_publication(&store, &before_data.0).await?;
     let partial = bounded_value(
         "interrupted checkpoint visibility probe",
@@ -734,51 +738,56 @@ async fn run_checkpoint_fault_contract(
     )?;
     results.interruption_before_data_publication = true;
 
-    let data_epoch_1 = checkpoint_data(1);
-    let paths_epoch_1 = checkpoint_paths(&prefix, 1);
-    put_create(&store, &paths_epoch_1.0, data_epoch_1.clone()).await?;
+    // RECOVERY: immutable keys from an interrupted upload are never reused. Providers may retain
+    // uncommitted multipart state even when the final object is not visible.
+    let first_data = checkpoint_data(FIRST_COMMITTED_EPOCH);
+    let first_paths = checkpoint_paths(&prefix, FIRST_COMMITTED_EPOCH);
+    put_create(&store, &first_paths.0, first_data.clone()).await?;
     require(
         recover_checkpoint(config, &pointer_path).await?.0 == 0,
         "data without metadata was selected as committed",
     )?;
     results.interruption_after_data_before_metadata = true;
 
-    write_manifest_for_existing_data(&store, 1, &paths_epoch_1, &data_epoch_1).await?;
+    write_manifest_for_existing_data(&store, FIRST_COMMITTED_EPOCH, &first_paths, &first_data)
+        .await?;
     require(
         recover_checkpoint(config, &pointer_path).await?.0 == 0,
         "metadata without pointer CAS was selected as committed",
     )?;
     results.interruption_before_pointer_cas = true;
 
-    let pointer_epoch_1 = TestCheckpointPointer {
-        epoch: 1,
-        manifest_path: paths_epoch_1.1.to_string(),
+    let first_pointer = TestCheckpointPointer {
+        epoch: FIRST_COMMITTED_EPOCH,
+        manifest_path: first_paths.1.to_string(),
     };
-    let committed_epoch_1 = bounded(
+    let first_commit = bounded(
         "pointer CAS before acknowledgement",
         store.put_opts(
             &pointer_path,
-            json_payload(&pointer_epoch_1)?,
+            json_payload(&first_pointer)?,
             PutOptions::from(PutMode::Update(current_version.clone())),
         ),
     )
     .await?;
-    current_version = committed_epoch_1.into();
+    current_version = first_commit.into();
     let recovered = recover_checkpoint(config, &pointer_path).await?;
     require(
-        recovered.0 == 1 && recovered.1 == sha256_hex(&data_epoch_1),
+        recovered.0 == FIRST_COMMITTED_EPOCH && recovered.1 == sha256_hex(&first_data),
         "a successful pointer CAS was not recoverable after acknowledgement loss",
     )?;
     results.interruption_after_cas_before_acknowledgement = true;
     results.recovery_reconstructed_client = true;
     results.recovered_checksum_matches = true;
 
-    let data_epoch_2 = write_checkpoint_objects(&store, &prefix, 2).await?;
-    let data_epoch_3 = write_checkpoint_objects(&store, &prefix, 3).await?;
-    let pointer_epoch_2 = pointer_for(&prefix, 2);
-    let pointer_epoch_3 = pointer_for(&prefix, 3);
+    let first_contender_data =
+        write_checkpoint_objects(&store, &prefix, FIRST_CONTENDING_EPOCH).await?;
+    let second_contender_data =
+        write_checkpoint_objects(&store, &prefix, SECOND_CONTENDING_EPOCH).await?;
+    let first_contender = pointer_for(&prefix, FIRST_CONTENDING_EPOCH);
+    let second_contender = pointer_for(&prefix, SECOND_CONTENDING_EPOCH);
     let stale_version = current_version.clone();
-    let contenders = [pointer_epoch_2, pointer_epoch_3]
+    let contenders = [first_contender, second_contender]
         .into_iter()
         .map(|pointer| {
             let store = Arc::clone(&store);
@@ -819,10 +828,10 @@ async fn run_checkpoint_fault_contract(
     current_version = winning_result
         .map(UpdateVersion::from)
         .map_err(|_| "winning pointer result disappeared".to_string())?;
-    let expected_digest = if winning_epoch == 2 {
-        sha256_hex(&data_epoch_2)
+    let expected_digest = if winning_epoch == FIRST_CONTENDING_EPOCH {
+        sha256_hex(&first_contender_data)
     } else {
-        sha256_hex(&data_epoch_3)
+        sha256_hex(&second_contender_data)
     };
     let recovered = recover_checkpoint(config, &pointer_path).await?;
     require(
@@ -835,7 +844,7 @@ async fn run_checkpoint_fault_contract(
         "stale pointer CAS",
         store.put_opts(
             &pointer_path,
-            json_payload(&pointer_for(&prefix, 1))?,
+            json_payload(&pointer_for(&prefix, FIRST_COMMITTED_EPOCH))?,
             PutOptions::from(PutMode::Update(stale_version)),
         ),
     )
