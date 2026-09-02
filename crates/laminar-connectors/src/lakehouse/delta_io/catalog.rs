@@ -16,6 +16,7 @@ fn glue_init_error_category(error: &deltalake_catalog_glue::GlueError) -> &'stat
 
 #[cfg(feature = "delta-lake-glue")]
 fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
+    use aws_sdk_glue::error::ProvideErrorMetadata;
     use aws_sdk_glue::Error;
 
     match error {
@@ -40,7 +41,8 @@ fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
         | Error::ConcurrentModificationException(_)
         | Error::ConflictException(_)
         | Error::VersionMismatchException(_) => "catalog-conflict",
-        _ => "sdk-or-service-error",
+        error if error.code().is_none() => "client-or-transport",
+        _ => "unclassified-service-error",
     }
 }
 
@@ -177,6 +179,14 @@ mod tests {
         };
         assert_eq!(glue_init_error_category(&error), "authorization");
         assert!(!glue_init_error_category(&error).contains("private"));
+
+        let unhandled = aws_sdk_glue::types::TableInput::builder()
+            .build()
+            .expect_err("missing table name must produce a client-side build error");
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: unhandled.into(),
+        };
+        assert_eq!(glue_init_error_category(&error), "client-or-transport");
     }
 }
 
