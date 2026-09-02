@@ -53,7 +53,9 @@ env:
   LAMINAR_NATIVE_CLOUD: "1"
   LAMINAR_NATIVE_CLOUD_REQUIRED: "1"
   LAMINAR_TESTED_SHA: ${{ github.sha }}
-  LAMINAR_CLOUD_EVIDENCE_DIR: target/cloud-evidence
+  # Cargo may execute integration tests from the package directory. Keep Rust
+  # evidence and shell fallbacks anchored to one workspace-absolute location.
+  LAMINAR_CLOUD_EVIDENCE_DIR: ${{ github.workspace }}/target/cloud-evidence
   AZURE_USE_AZURE_CLI: "true"
 
 jobs:
