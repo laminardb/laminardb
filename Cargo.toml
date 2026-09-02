@@ -120,10 +120,14 @@ prometheus = { version = "0.14", features = ["process"] }
 
 # Object store (S3/GCS/Azure/local filesystem) — shared across crates.
 object_store = "=0.13.2"
+# `object_store` 0.13 cannot parse external-account ADC files. Keep its data
+# client pinned and inject Google's refreshable WIF credential provider.
+google-cloud-auth = { version = "=1.16.0", default-features = false, features = ["default-rustls-provider"] }
 
 # Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
 deltalake = { version = "=0.32.4", default-features = false }
 deltalake-catalog-glue = { version = "=0.16.0", default-features = false }
+aws-sdk-glue = { version = "=1.137.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
 
 # Apache Iceberg

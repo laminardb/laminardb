@@ -1,0 +1,188 @@
+name: Cloud object-store emulator smoke
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_BUILD_JOBS: 2
+  LAMINAR_CLOUD_EMULATOR: "1"
+  LAMINAR_RUN_ID: ${{ github.run_id }}
+  LAMINAR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+  LAMINAR_TESTED_SHA: ${{ github.sha }}
+  LAMINAR_CLOUD_EVIDENCE_DIR: ${{ github.workspace }}/target/cloud-evidence
+
+jobs:
+  protocol-smoke:
+    name: ${{ matrix.provider }} object-store and Delta emulator smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: azure
+            service: azurite
+            core_feature: azure
+            delta_feature: delta-lake-azure
+            test_url: az://laminardb-smoke
+            endpoint: http://127.0.0.1:10000/devstoreaccount1
+          - provider: gcs
+            service: gcs-emulator
+            core_feature: gcs
+            delta_feature: delta-lake-gcs
+            test_url: gs://laminardb-smoke
+            endpoint: http://127.0.0.1:4443
+    env:
+      LAMINAR_CLOUD_EMULATOR_PROVIDER: ${{ matrix.provider }}
+      LAMINAR_CLOUD_EMULATOR_TEST_URL: ${{ matrix.test_url }}
+      LAMINAR_CLOUD_EMULATOR_ENDPOINT: ${{ matrix.endpoint }}
+      LAMINAR_ENABLED_CARGO_FEATURES: ${{ matrix.core_feature }}
+      LAMINAR_SOAK_ALLOW_AZURE_EMULATOR: "1"
+      LAMINAR_SOAK_ALLOW_GCS_EMULATOR: "1"
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: cloud-emulator-${{ matrix.provider }}
+
+      - name: Start ${{ matrix.provider }} emulator
+        run: docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 "${{ matrix.service }}"
+
+      - name: Wait for emulator and create isolated test container
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if curl --silent --show-error --output /dev/null "$LAMINAR_CLOUD_EMULATOR_ENDPOINT"; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "${LAMINAR_CLOUD_EMULATOR_PROVIDER} emulator did not become ready"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            source tests/docker/azurite-test.env
+            account_name="${AZURITE_ACCOUNTS%%:*}"
+            account_key="${AZURITE_ACCOUNTS#*:}"
+            connection_string="DefaultEndpointsProtocol=http;AccountName=${account_name};AccountKey=${account_key};BlobEndpoint=http://127.0.0.1:10000/${account_name};"
+            az storage container create \
+              --name laminardb-smoke \
+              --connection-string "$connection_string" \
+              --only-show-errors \
+              --output none
+          else
+            curl --fail --silent --show-error \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --data '{"name":"laminardb-smoke"}' \
+              http://127.0.0.1:4443/storage/v1/b \
+              >/dev/null
+          fi
+
+      - name: Run object-store emulator contract
+        run: |
+          cargo test -p laminar-core --no-default-features --features "$CORE_FEATURE" \
+            --test object_store_conformance emulator_object_store_conformance \
+            -- --ignored --exact --nocapture
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            cargo test -p laminar-core --no-default-features --features "$CORE_FEATURE" \
+              --test object_store_conformance emulator_checkpoint_store_fault_contract \
+              -- --ignored --exact --nocapture
+          fi
+        env:
+          CORE_FEATURE: ${{ matrix.core_feature }}
+
+      - name: Run Delta emulator protocol smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          delta_log="$(mktemp)"
+          trap 'rm -f -- "$delta_log"' EXIT
+          cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE" \
+            --test delta_emulator_smoke delta_emulator_protocol_smoke \
+            -- --ignored --exact --nocapture 2>&1 | tee "$delta_log"
+          if ! grep -Fq \
+            'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;' \
+            "$delta_log"; then
+            echo 'delta_emulator_protocol_smoke did not execute exactly once'
+            exit 1
+          fi
+        env:
+          CARGO_TERM_COLOR: never
+          DELTA_FEATURE: ${{ matrix.delta_feature }}
+          LAMINAR_ENABLED_CARGO_FEATURES: ${{ matrix.delta_feature }}
+
+      - name: Validate emulator evidence classification
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          evidence=(target/cloud-evidence/*.json)
+          expected_count=1
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            expected_count=2
+          fi
+          if [ "${#evidence[@]}" -ne "$expected_count" ]; then
+            echo "expected ${expected_count} emulator evidence files, found ${#evidence[@]}"
+            exit 1
+          fi
+          for file in "${evidence[@]}"; do
+            jq -e --arg sha "$GITHUB_SHA" --arg provider "$LAMINAR_CLOUD_EMULATOR_PROVIDER" \
+              '.tested_sha == $sha and
+               .provider == $provider and
+               .native_or_emulator == "emulator" and
+               .redacted_endpoint_classification == "custom-or-emulator-endpoint" and
+               .skip_count == 0 and
+               .passed == true and
+               .cleanup_result == "passed"' \
+              "$file" >/dev/null
+          done
+          if [ "$LAMINAR_CLOUD_EMULATOR_PROVIDER" = azure ]; then
+            for file in "${evidence[@]}"; do
+              jq -e \
+                '.conditional_create_result == true and
+                 .stale_cas_result == true and
+                 .restart_result == true' \
+                "$file" >/dev/null
+            done
+          else
+            jq -e \
+              '.test_suite == "checkpoint-object-store-emulator-basic-smoke" and
+               .conditional_create_result == false and
+               .stale_cas_result == false and
+               .restart_result == true and
+               .capability_results.multipart == false' \
+              "${evidence[0]}" >/dev/null
+          fi
+
+      - name: Upload emulator smoke evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cloud-emulator-${{ matrix.provider }}-${{ github.run_id }}
+          path: target/cloud-evidence/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Print emulator diagnostics on failure
+        if: failure()
+        run: |
+          docker compose -f tests/docker/compose.yml ps -a
+          docker compose -f tests/docker/compose.yml logs "${{ matrix.service }}"
+
+      - name: Stop emulator
+        if: always()
+        run: docker compose -f tests/docker/compose.yml down -v

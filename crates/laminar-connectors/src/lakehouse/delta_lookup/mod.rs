@@ -179,7 +179,6 @@ async fn warn_if_unclustered(config: &DeltaLookupSourceConfig) {
         .any(|k| partition_columns.contains(k))
     {
         tracing::warn!(
-            table = %config.table_path,
             primary_key = ?config.primary_key_columns,
             partition_columns = ?partition_columns,
             "delta lookup table is not partitioned on the lookup key; unless it is \

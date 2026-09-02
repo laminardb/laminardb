@@ -252,6 +252,25 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(!untyped.is_transient());
 }
 
+#[test]
+fn delta_storage_errors_do_not_echo_signed_request_urls() {
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let signed = "https://account.blob.example/table?sig=do-not-disclose";
+    let error = deltalake::DeltaTableError::ObjectStore {
+        source: deltalake::ObjectStoreError::Generic {
+            store: "Azure",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, signed),
+            )),
+        },
+    };
+    let metadata = classify_delta_metadata_error("read cursor", &error).to_string();
+    assert!(!metadata.contains("do-not-disclose"), "{metadata}");
+    assert!(!metadata.contains("account.blob.example"), "{metadata}");
+}
+
 #[tokio::test]
 async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
     use object_store::aws::AmazonS3Builder;
@@ -470,6 +489,7 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
     }
 
     for options in [
+        HashMap::from([("google_base_url".into(), "http://gcs-emulator".into())]),
         HashMap::from([(
             "google_service_account_key".into(),
             r#"{"gcs_base_url":"http://gcs-emulator"}"#.into(),
@@ -503,6 +523,44 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             .unwrap()
     )
     .is_err());
+}
+
+#[test]
+fn coordinated_emulator_override_is_debug_soak_only() {
+    let azure_options = HashMap::from([(
+        "azure_storage_endpoint".into(),
+        "http://127.0.0.1:10000/devstoreaccount1".into(),
+    )]);
+    let azure_environment =
+        |key: &str| (key == "LAMINAR_SOAK_ALLOW_AZURE_EMULATOR").then(|| "1".to_string());
+    let azure = validate_coordinated_storage_preflight_with_env(
+        "az://container/table",
+        &azure_options,
+        &azure_environment,
+    );
+
+    let gcs_options = HashMap::from([
+        ("google_base_url".into(), "http://127.0.0.1:4443".into()),
+        (
+            "google_service_account_key".into(),
+            r#"{"disable_oauth":true}"#.into(),
+        ),
+    ]);
+    let gcs_environment =
+        |key: &str| (key == "LAMINAR_SOAK_ALLOW_GCS_EMULATOR").then(|| "true".to_string());
+    let gcs = validate_coordinated_storage_preflight_with_env(
+        "gs://bucket/table",
+        &gcs_options,
+        &gcs_environment,
+    );
+
+    if cfg!(debug_assertions) {
+        azure.unwrap();
+        gcs.unwrap();
+    } else {
+        assert!(azure.is_err());
+        assert!(gcs.is_err());
+    }
 }
 
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {
@@ -816,6 +874,62 @@ fn test_path_to_url_azure() {
 fn test_path_to_url_gcs() {
     let url = path_to_url("gs://my-bucket/path/to/table").unwrap();
     assert_eq!(url.scheme(), "gs");
+
+    let alias = path_to_url("GCS://my-bucket/path/to/table").unwrap();
+    assert_eq!(alias.scheme(), "gs");
+}
+
+#[test]
+fn delta_azure_adapter_preserves_qualified_authority_as_options() {
+    let adapted =
+        adapt_delta_location("wasbs://container@account.blob.core.chinacloudapi.cn/path/to/table")
+            .unwrap();
+    assert_eq!(adapted.url, "az://container/path/to/table");
+    let mut options = HashMap::new();
+    apply_url_derived_options(&mut options, &adapted).unwrap();
+    assert_eq!(options["azure_storage_account_name"], "account");
+    assert_eq!(options["azure_container_name"], "container");
+    assert_eq!(
+        options["azure_endpoint"],
+        "https://account.blob.core.chinacloudapi.cn"
+    );
+}
+
+#[test]
+fn delta_azure_adapter_rejects_conflicting_authority_options() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([(
+        "azure_storage_account_name".to_string(),
+        "different".to_string(),
+    )]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("conflicts"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
+fn delta_azure_adapter_checks_every_configured_alias() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([
+        (
+            "azure_storage_account_name".to_string(),
+            "account".to_string(),
+        ),
+        ("account_name".to_string(), "different".to_string()),
+    ]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("account_name"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
+fn delta_path_rejects_signed_queries_without_echoing_them() {
+    let error = path_to_url("gs://bucket/table?X-Goog-Signature=secret-value").unwrap_err();
+    assert!(!error.to_string().contains("secret-value"));
 }
 
 // ── End-to-end tests for new functionality ──

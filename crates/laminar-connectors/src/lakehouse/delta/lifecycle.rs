@@ -4,7 +4,7 @@ use super::{
     async_trait, debug, info, warn, Arc, ConnectorConfig, ConnectorError, ConnectorState,
     ConnectorTaskTracker, DeliveryGuarantee, DeltaLakeSink, DeltaLakeSinkConfig, DeltaWriteMode,
     Duration, Instant, RecordBatch, SchemaRef, SinkConnector, SinkConsistency, SinkContract,
-    SinkInputMode, SinkTopology, StorageProvider, WriteResult,
+    SinkInputMode, SinkTopology, StorageCredentialResolver, StorageProvider, WriteResult,
 };
 #[cfg(feature = "delta-lake")]
 use super::{
@@ -105,12 +105,34 @@ impl SinkConnector for DeltaLakeSink {
             ));
         }
 
-        info!(
-            table_path = %self.config.table_path,
-            mode = %self.config.write_mode,
-            guarantee = %self.config.delivery_guarantee,
-            "opening Delta Lake sink connector"
-        );
+        if self.config.catalog_type == super::super::delta_config::DeltaCatalogType::None {
+            let explicit_storage = if config.properties().is_empty() {
+                self.config.storage_options.clone()
+            } else {
+                config.properties_with_prefix("storage.")
+            };
+            let diagnostics =
+                StorageCredentialResolver::resolve(&self.config.table_path, &explicit_storage);
+            info!(
+                operation_class = "connector-open",
+                storage_provider = %diagnostics.provider,
+                storage_endpoint_class = %diagnostics.endpoint_class(),
+                storage_auth_source = %diagnostics.auth_source,
+                mode = %self.config.write_mode,
+                guarantee = %self.config.delivery_guarantee,
+                "opening Delta Lake sink connector"
+            );
+        } else {
+            info!(
+                operation_class = "connector-open",
+                storage_provider = "catalog-resolved",
+                storage_endpoint_class = "catalog-resolved",
+                storage_auth_source = "catalog-resolved",
+                mode = %self.config.write_mode,
+                guarantee = %self.config.delivery_guarantee,
+                "opening Delta Lake sink connector"
+            );
+        }
 
         // When delta-lake feature is enabled, open/create the actual table.
         // If Unity Catalog auto-create is configured but no schema is available
@@ -489,7 +511,6 @@ impl SinkConnector for DeltaLakeSink {
         self.state = ConnectorState::Closed;
 
         info!(
-            table_path = %self.config.table_path,
             delta_version = self.delta_version,
             "Delta Lake sink connector closed"
         );

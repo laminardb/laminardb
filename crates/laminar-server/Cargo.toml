@@ -189,6 +189,8 @@ delta-lake-glue = ["delta-lake", "laminar-db/delta-lake-glue"]
 # Meta-feature: all Delta Lake backends + catalogs
 delta = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue", "laminar-db/delta-lake-all"]
 iceberg = ["laminar-db/iceberg"]
+iceberg-gcs = ["laminar-db/iceberg-gcs"]
+iceberg-azure = ["laminar-db/iceberg-azure"]
 files = ["laminar-db/files"]
 otel = ["laminar-db/otel"]
 parquet-lookup = ["laminar-db/parquet-lookup"]
@@ -196,6 +198,9 @@ parquet-lookup = ["laminar-db/parquet-lookup"]
 aws = ["laminar-db/aws", "laminar-core/aws"]
 gcs = ["laminar-db/gcs", "laminar-core/gcs"]
 azure = ["laminar-db/azure", "laminar-core/azure"]
+checkpoint-aws = ["aws"]
+checkpoint-gcs = ["gcs"]
+checkpoint-azure = ["azure"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 # Cluster mode.

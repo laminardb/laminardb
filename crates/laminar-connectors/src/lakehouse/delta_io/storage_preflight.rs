@@ -84,6 +84,14 @@ fn is_truthy(value: &str) -> bool {
 }
 
 #[cfg(feature = "delta-lake")]
+fn debug_emulator_soak_enabled<F>(environment: &F, marker: &str) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    cfg!(debug_assertions) && environment(marker).as_deref().is_some_and(is_truthy)
+}
+
+#[cfg(feature = "delta-lake")]
 fn validate_coordinated_s3_options<F>(
     options: &HashMap<String, String>,
     environment: &F,
@@ -102,10 +110,7 @@ where
         &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
         environment,
     );
-    let soak_emulator = cfg!(debug_assertions)
-        && environment("LAMINAR_SOAK_ALLOW_S3_EMULATOR")
-            .as_deref()
-            .is_some_and(is_truthy);
+    let soak_emulator = debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_S3_EMULATOR");
     if custom_endpoint && !soak_emulator {
         return Err(ConnectorError::ConfigurationError(
             "Delta exactly-once does not admit custom S3 endpoints until their atomic-create behavior passes the release fault suite"
@@ -157,7 +162,7 @@ fn validate_coordinated_azure_options<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if has_effective_value(
+    let custom_endpoint = has_effective_value(
         options,
         &["endpoint", "azure_endpoint", "azure_storage_endpoint"],
         &["AZURE_ENDPOINT", "AZURE_STORAGE_ENDPOINT"],
@@ -173,8 +178,10 @@ where
         environment,
     )
     .iter()
-    .any(|value| is_truthy(value))
-    {
+    .any(|value| is_truthy(value));
+    let soak_emulator =
+        debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_AZURE_EMULATOR");
+    if custom_endpoint && !soak_emulator {
         return Err(ConnectorError::ConfigurationError(
             "Delta exactly-once does not admit custom Azure endpoints or emulators until their atomic-create behavior passes the release fault suite"
                 .into(),
@@ -191,6 +198,19 @@ fn validate_coordinated_gcs_options<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    let soak_emulator = debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_GCS_EMULATOR");
+    let custom_endpoint = has_effective_value(
+        options,
+        &["google_base_url", "base_url"],
+        &["GOOGLE_BASE_URL", "GOOGLE_ENDPOINT_URL"],
+        environment,
+    );
+    if custom_endpoint && !soak_emulator {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once does not admit a custom GCS endpoint until its atomic-create behavior passes the release fault suite"
+                .into(),
+        ));
+    }
     if has_effective_value(
         options,
         &[
@@ -218,7 +238,7 @@ where
                 "invalid GCS service-account key for Delta exactly-once: {error}"
             ))
         })?;
-        if document.get("gcs_base_url").is_some() {
+        if document.get("gcs_base_url").is_some() && !soak_emulator {
             return Err(ConnectorError::ConfigurationError(
                 "Delta exactly-once does not admit a custom gcs_base_url until its atomic-create behavior passes the release fault suite"
                     .into(),

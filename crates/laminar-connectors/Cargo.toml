@@ -35,8 +35,9 @@ tokio-stream = { workspace = true, optional = true }
 # Delta Lake
 deltalake = { workspace = true, optional = true, features = ["rustls"] }
 deltalake-catalog-glue = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
-url = { version = "2", optional = true }
+url = { workspace = true }
 
 # Apache Iceberg
 iceberg = { workspace = true, optional = true }
@@ -141,12 +142,12 @@ mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.
 changelog-collapse = ["dep:arrow-row"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
+delta-lake = ["dep:deltalake", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
-delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
+delta-lake-gcs = ["delta-lake", "deltalake/gcs", "laminar-core/gcs", "dep:futures-util"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
-delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
+delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue", "dep:aws-sdk-glue"]
 # Apache Iceberg
 iceberg-core = ["dep:iceberg", "dep:apache-avro", "dep:tokio-stream", "dep:futures-util", "dep:parquet", "dep:arrow-row", "dep:base64"]
 iceberg-catalog-rest = ["iceberg-core", "dep:iceberg-catalog-rest", "dep:delta-reqwest", "dep:jiff"]
@@ -159,10 +160,14 @@ iceberg-storage-gcs = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typet
 iceberg-storage-azure = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-azdls"]
 iceberg-storage-fs = ["iceberg-core", "dep:iceberg-storage-opendal", "dep:typetag", "iceberg-storage-opendal/opendal-fs"]
 iceberg = ["iceberg-catalog-rest", "iceberg-storage-s3", "iceberg-storage-fs"]
+# Provider-scoped entry points. `iceberg` retains its historical REST + S3 +
+# filesystem behavior; GCS and experimental Azure remain explicit additions.
+iceberg-gcs = ["iceberg-catalog-rest", "iceberg-storage-gcs"]
+iceberg-azure = ["iceberg-catalog-rest", "iceberg-storage-azure"]
 # Parquet schema and codec helpers (not a standalone connector)
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink
-websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
+websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util"]
 # File source and sink (AutoLoader-style)
 files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream"]
 # OpenTelemetry OTLP/gRPC source

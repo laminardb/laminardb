@@ -22,7 +22,7 @@ use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
-use super::config::{FileFormat, FileSourceConfig};
+use super::config::{local_files_path, FileFormat, FileSourceConfig};
 use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
 use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
@@ -258,7 +258,12 @@ impl SourceConnector for FileSource {
                         ConnectorError::ConfigurationError(format!(
                             "invalid file progress in checkpoint {attempt:?}: {e}"
                         ))
-                    })?;
+                    })?
+                    .map(|mut progress| {
+                        progress.path = local_files_path(&progress.path)?;
+                        Ok::<_, ConnectorError>(progress)
+                    })
+                    .transpose()?;
                 if progress
                     .as_ref()
                     .is_some_and(|p| manifest.contains(&p.path) || p.next_row == 0)
@@ -270,15 +275,6 @@ impl SourceConnector for FileSource {
                 (manifest, progress)
             }
         };
-
-        // The file source is local-only; reject unsupported paths before
-        // discovery or reads can start.
-        if is_cloud_url(&src_config.path) {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "cloud paths are not supported by the 'files' source: {}",
-                src_config.path
-            )));
-        }
 
         // Resolve format (explicit or auto-detect from path).
         let format = match src_config.format {
@@ -630,14 +626,6 @@ fn build_decoder_and_schema(
     }
 }
 
-fn is_cloud_url(path: &str) -> bool {
-    const CLOUD_SCHEMES: &[&str] = &["s3", "s3a", "s3n", "gs", "gcs", "az", "abfs", "abfss"];
-    let Some((scheme, _)) = path.split_once("://") else {
-        return false;
-    };
-    CLOUD_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
@@ -648,11 +636,6 @@ async fn read_file_bytes(
     path: &str,
     task_guard: ConnectorTaskGuard,
 ) -> Result<Vec<u8>, ConnectorError> {
-    // Cloud paths are rejected at `start()`; this path is local-only.
-    debug_assert!(
-        !is_cloud_url(path),
-        "cloud paths must be rejected at start()"
-    );
     let read_path = path.to_owned();
     let error_path = read_path.clone();
     tokio::task::spawn_blocking(move || {
@@ -808,6 +791,23 @@ mod tests {
         let mut source = FileSource::new();
         source.start(start_request(config, position)).await.unwrap();
         source
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_path_with_url_like_component_can_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("url:").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("data.txt"), b"local").unwrap();
+        let path = format!("{}/url://nested/data.txt", directory.path().display());
+        let (owner, _tracker) = ConnectorTaskOwner::new();
+
+        let bytes = read_file_bytes(&path, owner.track().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, b"local");
     }
 
     fn text_source_config(directory: &std::path::Path) -> ConnectorConfig {
@@ -1171,6 +1171,32 @@ mod tests {
             .await
             .expect_err("same-version unknown progress fields must fail closed");
         assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(source.discovery.is_none());
+        assert!(!source.is_open);
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_remote_progress_before_filesystem_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut checkpoint = FileSource::new().checkpoint();
+        checkpoint.set_offset(
+            "file_progress",
+            r#"{"path":"az://container/path?sig=do-not-echo","size":1,"modified_ms":1,"content_sha256":"00","next_row":1}"#,
+        );
+        let mut source = FileSource::new();
+        let error = source
+            .start(start_request(
+                text_source_config(directory.path()),
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::canonical(9),
+                    checkpoint,
+                },
+            ))
+            .await
+            .expect_err("remote checkpoint progress must fail before filesystem access");
+        let message = error.to_string();
+        assert!(message.contains("query parameters"), "{message}");
+        assert!(!message.contains("do-not-echo"), "{message}");
         assert!(source.discovery.is_none());
         assert!(!source.is_open);
     }

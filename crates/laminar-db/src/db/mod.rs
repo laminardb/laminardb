@@ -4451,7 +4451,11 @@ impl LaminarDB {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry)?;
             laminar_connectors::lakehouse::register_delta_lake_source(registry)?;
         }
-        #[cfg(feature = "iceberg")]
+        #[cfg(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        ))]
         {
             laminar_connectors::lakehouse::register_iceberg_sink(registry)?;
             laminar_connectors::lakehouse::register_iceberg_source(registry)?;

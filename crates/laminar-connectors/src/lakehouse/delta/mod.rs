@@ -50,7 +50,7 @@ use crate::connector::{
     SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
-use crate::storage::StorageProvider;
+use crate::storage::{StorageCredentialResolver, StorageProvider};
 
 use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
@@ -218,7 +218,7 @@ impl std::fmt::Debug for DeltaLakeSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaLakeSink")
             .field("state", &self.state)
-            .field("table_path", &self.config.table_path)
+            .field("table_path", &"<configured>")
             .field("mode", &self.config.write_mode)
             .field("guarantee", &self.config.delivery_guarantee)
             .field("current_epoch", &self.current_epoch)

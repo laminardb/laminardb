@@ -77,10 +77,9 @@ fn test_resolve_s3_explicit_keys() {
 fn test_resolve_s3_env_fallback() {
     let resolved =
         StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), aws_env);
-    assert_eq!(resolved.options["aws_access_key_id"], "AKID_FROM_ENV");
-    assert_eq!(resolved.options["aws_secret_access_key"], "SECRET_FROM_ENV");
-    assert_eq!(resolved.options["aws_region"], "us-west-2");
+    assert!(resolved.options.is_empty());
     assert_eq!(resolved.env_resolved_keys.len(), 3);
+    assert_eq!(resolved.auth_source, AuthSource::EnvironmentStatic);
     assert!(resolved.has_credentials());
 }
 
@@ -90,9 +89,9 @@ fn test_resolve_s3_explicit_overrides_env() {
     opts.insert("aws_region".to_string(), "ap-southeast-1".to_string());
 
     let resolved = StorageCredentialResolver::resolve_with_env("s3://bucket/path", &opts, aws_env);
-    // Explicit region preserved; env keys and secret filled from env.
+    // Explicit region is retained; ambient credentials are observed but not copied.
     assert_eq!(resolved.options["aws_region"], "ap-southeast-1");
-    assert_eq!(resolved.options["aws_access_key_id"], "AKID_FROM_ENV");
+    assert!(!resolved.options.contains_key("aws_access_key_id"));
     assert!(!resolved
         .env_resolved_keys
         .contains(&"aws_region".to_string()));
@@ -119,7 +118,11 @@ fn test_resolve_s3_session_token() {
     };
     let resolved =
         StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), env);
-    assert_eq!(resolved.options["aws_session_token"], "token123");
+    assert!(!resolved.options.contains_key("aws_session_token"));
+    assert_eq!(resolved.auth_source, AuthSource::EnvironmentToken);
+    assert!(resolved
+        .env_resolved_keys
+        .contains(&"aws_session_token".to_string()));
 }
 
 #[test]
@@ -149,6 +152,27 @@ fn test_resolve_s3_custom_endpoint() {
     let resolved = StorageCredentialResolver::resolve_with_env("s3://bucket/path", &opts, env_none);
     assert_eq!(resolved.options["aws_endpoint"], "http://localhost:9000");
     assert_eq!(resolved.options["aws_s3_allow_unsafe_rename"], "true");
+    assert_eq!(
+        resolved.endpoint_class(),
+        laminar_core::storage_location::StorageEndpointClass::S3Compatible
+    );
+}
+
+#[test]
+fn endpoint_class_is_low_cardinality_and_provider_specific() {
+    let local = StorageCredentialResolver::resolve_with_env("/data/table", &empty_opts(), env_none);
+    assert_eq!(local.endpoint_class().to_string(), "local");
+
+    let gcs = StorageCredentialResolver::resolve_with_env(
+        "gs://bucket/path",
+        &HashMap::from([("google_base_url".into(), "http://emulator.invalid".into())]),
+        env_none,
+    );
+    assert_eq!(gcs.endpoint_class().to_string(), "custom-or-emulator");
+
+    let azure =
+        StorageCredentialResolver::resolve_with_env("az://container/path", &empty_opts(), env_none);
+    assert_eq!(azure.endpoint_class().to_string(), "native");
 }
 
 // ── Azure tests ──
@@ -161,8 +185,14 @@ fn test_resolve_azure_env_fallback() {
         azure_env,
     );
     assert_eq!(resolved.provider, StorageProvider::AzureAdls);
-    assert_eq!(resolved.options["azure_storage_account_name"], "myaccount");
-    assert_eq!(resolved.options["azure_storage_account_key"], "base64key==");
+    assert!(resolved.options.is_empty());
+    assert!(resolved
+        .env_resolved_keys
+        .contains(&"azure_storage_account_name".to_string()));
+    assert!(resolved
+        .env_resolved_keys
+        .contains(&"azure_storage_account_key".to_string()));
+    assert_eq!(resolved.auth_source, AuthSource::EnvironmentStatic);
     assert!(resolved.has_credentials());
 }
 
@@ -198,7 +228,7 @@ fn test_resolve_azure_client_id() {
 
     let resolved =
         StorageCredentialResolver::resolve_with_env("az://container/path", &opts, env_none);
-    assert!(resolved.has_credentials());
+    assert_eq!(resolved.auth_source, AuthSource::ManagedIdentityOrMetadata);
 }
 
 #[test]
@@ -208,6 +238,19 @@ fn test_resolve_azure_no_credentials() {
     assert!(!resolved.has_credentials());
 }
 
+#[test]
+fn azure_cli_selection_is_classified_without_copying_environment_state() {
+    let environment = |name: &str| (name == "AZURE_USE_AZURE_CLI").then(|| "true".to_string());
+    let resolved = StorageCredentialResolver::resolve_with_env(
+        "az://container/path",
+        &empty_opts(),
+        environment,
+    );
+    assert_eq!(resolved.auth_source, AuthSource::AzureCli);
+    assert!(resolved.has_credentials());
+    assert!(!resolved.options.contains_key("azure_use_azure_cli"));
+}
+
 // ── GCS tests ──
 
 #[test]
@@ -215,11 +258,44 @@ fn test_resolve_gcs_env_fallback() {
     let resolved =
         StorageCredentialResolver::resolve_with_env("gs://bucket/path", &empty_opts(), gcs_env);
     assert_eq!(resolved.provider, StorageProvider::Gcs);
-    assert_eq!(
-        resolved.options["google_service_account_path"],
-        "/path/to/creds.json"
-    );
-    assert!(resolved.has_credentials());
+    assert!(!resolved
+        .options
+        .contains_key("google_application_credentials"));
+    assert!(resolved
+        .env_resolved_keys
+        .contains(&"google_application_credentials".to_string()));
+    assert_eq!(resolved.auth_source, AuthSource::ApplicationDefault);
+}
+
+#[test]
+fn test_resolve_gcs_service_account_path_aliases() {
+    for variable in [
+        "SERVICE_ACCOUNT",
+        "GOOGLE_SERVICE_ACCOUNT",
+        "GOOGLE_SERVICE_ACCOUNT_PATH",
+    ] {
+        let environment = |candidate: &str| {
+            (candidate == variable).then(|| "/path/to/service-account.json".to_string())
+        };
+        let resolved = StorageCredentialResolver::resolve_with_env(
+            "gs://bucket/path",
+            &empty_opts(),
+            environment,
+        );
+        assert_eq!(resolved.auth_source, AuthSource::EnvironmentStatic);
+        assert!(resolved
+            .env_resolved_keys
+            .contains(&"google_service_account_path".to_string()));
+        assert!(!resolved.options.contains_key("google_service_account_path"));
+    }
+}
+
+#[test]
+fn unsupported_gcs_access_token_is_classified_before_validation_rejects_it() {
+    let options = HashMap::from([("gcs.token".to_string(), "short-lived-token".to_string())]);
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("gs://bucket/path", &options, env_none);
+    assert_eq!(resolved.auth_source, AuthSource::ExplicitToken);
 }
 
 #[test]
@@ -277,4 +353,131 @@ fn test_s3a_resolves_as_s3() {
         StorageCredentialResolver::resolve_with_env("s3a://bucket/path", &empty_opts(), aws_env);
     assert_eq!(resolved.provider, StorageProvider::AwsS3);
     assert!(resolved.has_credentials());
+}
+
+#[test]
+fn short_lived_and_ambient_sources_are_classified_without_loading_tokens() {
+    let web_identity = |name: &str| match name {
+        "AWS_WEB_IDENTITY_TOKEN_FILE" => Some("/var/run/secrets/token".into()),
+        "AWS_ROLE_ARN" => Some("role-reference".into()),
+        _ => None,
+    };
+    let aws = StorageCredentialResolver::resolve_with_env(
+        "s3://bucket/path",
+        &empty_opts(),
+        web_identity,
+    );
+    assert_eq!(aws.auth_source, AuthSource::WebIdentity);
+    assert!(!aws.options.contains_key("aws_web_identity_token_file"));
+    assert!(aws
+        .env_resolved_keys
+        .contains(&"aws_web_identity_token_file".to_string()));
+
+    let container = |name: &str| match name {
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI" => Some("/v2/credentials/task".into()),
+        _ => None,
+    };
+    let aws =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), container);
+    assert_eq!(aws.auth_source, AuthSource::ManagedIdentityOrMetadata);
+
+    let azure = |name: &str| match name {
+        "AZURE_FEDERATED_TOKEN_FILE" => Some("/var/run/secrets/azure-token".into()),
+        "AZURE_CLIENT_ID" => Some("client-reference".into()),
+        "AZURE_TENANT_ID" => Some("tenant-reference".into()),
+        _ => None,
+    };
+    let azure =
+        StorageCredentialResolver::resolve_with_env("az://container/path", &empty_opts(), azure);
+    assert_eq!(azure.auth_source, AuthSource::WorkloadIdentity);
+    assert!(!azure.options.contains_key("azure_federated_token_file"));
+}
+
+#[test]
+fn ambient_endpoint_is_retained_for_validation_and_redacted_from_debug() {
+    let environment = |name: &str| match name {
+        "AWS_ENDPOINT_URL" => Some("http://secret-bearing-host.invalid".into()),
+        _ => None,
+    };
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), environment);
+    assert_eq!(
+        resolved.options["aws_endpoint"],
+        "http://secret-bearing-host.invalid"
+    );
+    assert_eq!(
+        resolved.endpoint_class(),
+        laminar_core::storage_location::StorageEndpointClass::S3Compatible
+    );
+    assert!(!format!("{resolved:?}").contains("secret-bearing-host"));
+}
+
+#[test]
+fn explicit_endpoint_alias_takes_precedence_over_environment_endpoint() {
+    let options = HashMap::from([(
+        "endpoint_url".to_string(),
+        "https://explicit.invalid".to_string(),
+    )]);
+    let environment =
+        |name: &str| (name == "AWS_ENDPOINT_URL").then(|| "https://ambient.invalid".to_string());
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &options, environment);
+    assert_eq!(resolved.options["endpoint_url"], "https://explicit.invalid");
+    assert!(!resolved
+        .options
+        .values()
+        .any(|value| value == "https://ambient.invalid"));
+}
+
+#[test]
+fn qualified_azure_authority_supplies_non_secret_client_options() {
+    let resolved = StorageCredentialResolver::resolve_with_env(
+        "wasbs://container@account.blob.core.usgovcloudapi.net/path",
+        &empty_opts(),
+        env_none,
+    );
+    assert_eq!(resolved.options["azure_storage_account_name"], "account");
+    assert_eq!(resolved.options["azure_container_name"], "container");
+    assert_eq!(
+        resolved.options["azure_endpoint"],
+        "https://account.blob.core.usgovcloudapi.net"
+    );
+    assert_eq!(resolved.endpoint_class(), StorageEndpointClass::Native);
+    assert!(!resolved.endpoint_override_configured);
+
+    let private = StorageCredentialResolver::resolve_with_env(
+        "abfss://filesystem@account.dfs.storage.private.example/path",
+        &empty_opts(),
+        env_none,
+    );
+    assert_eq!(
+        private.endpoint_class(),
+        StorageEndpointClass::CustomOrEmulator
+    );
+    assert!(!private.endpoint_override_configured);
+}
+
+#[test]
+fn false_ambient_allow_http_is_not_an_effective_override() {
+    let environment = |name: &str| (name == "AWS_ALLOW_HTTP").then(|| "false".to_string());
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &empty_opts(), environment);
+    assert!(!resolved
+        .env_resolved_keys
+        .contains(&"aws_allow_http".to_string()));
+}
+
+#[test]
+fn resolved_debug_contains_only_option_keys_and_auth_category() {
+    let options = HashMap::from([
+        ("aws_access_key_id".into(), "access-id".into()),
+        ("aws_secret_access_key".into(), "secret-value".into()),
+    ]);
+    let resolved =
+        StorageCredentialResolver::resolve_with_env("s3://bucket/path", &options, env_none);
+    let debug = format!("{resolved:?}");
+    assert!(debug.contains("ExplicitStatic"));
+    assert!(debug.contains("aws_access_key_id"));
+    assert!(!debug.contains("access-id"));
+    assert!(!debug.contains("secret-value"));
 }

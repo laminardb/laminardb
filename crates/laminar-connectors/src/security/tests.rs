@@ -38,3 +38,31 @@ fn durable_identity_preserves_endpoint_but_removes_uri_credentials() {
     assert!(!sanitized.contains("pass"));
     assert!(!sanitized.contains("abc"));
 }
+
+#[test]
+fn durable_identity_redacts_url_fragments() {
+    let sanitized = sanitize_identity_value(
+        "table.path",
+        "gs://bucket/path#opaque-secret s3://bucket/other?version=1#another-secret",
+    );
+    assert_eq!(
+        sanitized,
+        "gs://bucket/path#<redacted> s3://bucket/other?version=1#<redacted>"
+    );
+    assert!(!sanitized.contains("opaque-secret"));
+    assert!(!sanitized.contains("another-secret"));
+}
+
+#[test]
+fn qualified_azure_authorities_are_not_treated_as_credentials() {
+    let location = "abfss://filesystem@account.dfs.core.windows.net/path?version=1#opaque-secret";
+    assert!(!value_contains_uri_secret(location, false));
+    assert!(value_contains_uri_secret(
+        "abfss://user:pass@account.dfs.core.windows.net/path",
+        false
+    ));
+    assert_eq!(
+        sanitize_identity_value("catalog.warehouse", location),
+        "abfss://filesystem@account.dfs.core.windows.net/path?version=1#<redacted>"
+    );
+}

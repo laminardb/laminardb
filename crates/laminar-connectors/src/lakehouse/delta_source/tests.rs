@@ -334,7 +334,8 @@ fn test_debug_output() {
     let source = DeltaSource::new(test_config(), None);
     let debug = format!("{source:?}");
     assert!(debug.contains("DeltaSource"));
-    assert!(debug.contains("/tmp/delta_source_test"));
+    assert!(debug.contains("table_path: \"<configured>\""));
+    assert!(!debug.contains("/tmp/delta_source_test"));
 }
 
 #[tokio::test]

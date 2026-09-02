@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{info, warn};
 
+use laminar_core::storage_location::StorageProvider;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, EngineMetrics, LaminarDB};
 
@@ -381,7 +382,7 @@ pub(crate) fn apply_local_checkpoint_config(
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    if checkpoint_url.starts_with("file://") {
+    if StorageProvider::detect_uri(checkpoint_url) == Some(StorageProvider::Local) {
         laminar_core::checkpoint::object_store_builder::file_url_path(checkpoint_url)?;
     }
     builder = apply_checkpoint_settings(builder, checkpoint)?;

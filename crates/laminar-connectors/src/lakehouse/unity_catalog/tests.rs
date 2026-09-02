@@ -1,6 +1,8 @@
 use super::*;
 use arrow_schema::{Field, Schema, TimeUnit};
 use std::sync::Arc;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -114,4 +116,74 @@ fn test_arrow_to_uc_columns_position_sequential() {
     for (i, col) in cols.iter().enumerate() {
         assert_eq!(col["position"], i);
     }
+}
+
+#[tokio::test]
+async fn catalog_auth_error_does_not_echo_response_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.1/unity-catalog/tables/catalog.schema.table"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string("signed URL contains sig=do-not-disclose"),
+        )
+        .mount(&server)
+        .await;
+
+    let error =
+        get_table_storage_location(&server.uri(), "configured-token", "catalog.schema.table")
+            .await
+            .unwrap_err()
+            .to_string();
+
+    assert!(error.contains("HTTP 403"));
+    assert!(!error.contains("do-not-disclose"));
+    assert!(!error.contains("configured-token"));
+}
+
+#[tokio::test]
+async fn bounded_already_exists_response_remains_idempotent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/tables/"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error_code": "ALREADY_EXISTS",
+            "message": "contains sig=do-not-disclose"
+        })))
+        .mount(&server)
+        .await;
+
+    create_uc_table(
+        &server.uri(),
+        "configured-token",
+        "catalog",
+        "schema",
+        "table",
+        "s3://bucket/table",
+        &[],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn oversized_response_with_bounded_already_exists_marker_remains_idempotent() {
+    let server = MockServer::start().await;
+    let body = format!("ALREADY_EXISTS{}", "x".repeat(MAX_ERROR_RESPONSE_BYTES + 1));
+    Mock::given(method("POST"))
+        .and(path("/api/2.1/unity-catalog/tables/"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(body))
+        .mount(&server)
+        .await;
+
+    create_uc_table(
+        &server.uri(),
+        "configured-token",
+        "catalog",
+        "schema",
+        "table",
+        "s3://bucket/table",
+        &[],
+    )
+    .await
+    .unwrap();
 }

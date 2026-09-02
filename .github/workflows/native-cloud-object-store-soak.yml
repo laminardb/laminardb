@@ -1,0 +1,527 @@
+name: Native cloud object-store soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Native provider to test
+        required: true
+        type: choice
+        default: all
+        options: [all, aws, azure, gcs]
+      process_kills:
+        description: Real process-kill rounds
+        required: false
+        default: "4"
+      duration_seconds:
+        description: Steady observation after fault rounds
+        required: false
+        default: "120"
+      recovery_timeout_ms:
+        description: Per failover/rejoin ceiling
+        required: false
+        default: "90000"
+      delivery_mode:
+        description: Delivery contract requested for native fault tests
+        required: true
+        type: choice
+        default: at-least-once
+        options: [at-least-once, exactly-once]
+      test_subset:
+        description: Native test suite
+        required: true
+        type: choice
+        default: all
+        options: [all, checkpoint, delta, iceberg]
+      preserve_failed_prefix:
+        description: Preserve a failed checkpoint prefix for controlled diagnosis
+        required: true
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_TEST_DEBUG: 0
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+  LAMINAR_NATIVE_CLOUD: "1"
+  LAMINAR_NATIVE_CLOUD_REQUIRED: "1"
+  LAMINAR_TESTED_SHA: ${{ github.sha }}
+  LAMINAR_CLOUD_EVIDENCE_DIR: target/cloud-evidence
+  AZURE_USE_AZURE_CLI: "true"
+
+jobs:
+  policy:
+    name: Fail-closed delivery selection
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject delivery modes without a native fault contract
+        if: github.event_name == 'workflow_dispatch' && inputs.delivery_mode != 'at-least-once'
+        run: |
+          echo "This workflow currently has no provider-matrix exactly-once fault contract."
+          exit 1
+      - name: Validate bounded numeric inputs
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          INPUT_PROCESS_KILLS: ${{ inputs.process_kills }}
+          INPUT_DURATION_SECONDS: ${{ inputs.duration_seconds }}
+          INPUT_RECOVERY_TIMEOUT_MS: ${{ inputs.recovery_timeout_ms }}
+          INPUT_TEST_SUBSET: ${{ inputs.test_subset }}
+        run: |
+          set -euo pipefail
+          validate_integer_range() {
+            local name="$1" value="$2" minimum="$3" maximum="$4"
+            if [[ ! "$value" =~ ^[0-9]+$ ]] || (( value < minimum || value > maximum )); then
+              echo "$name must be an integer between $minimum and $maximum"
+              exit 1
+            fi
+          }
+          case "$INPUT_TEST_SUBSET" in
+            all|delta) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 2 16 ;;
+            checkpoint) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 2 100 ;;
+            iceberg) validate_integer_range process_kills "$INPUT_PROCESS_KILLS" 1 100 ;;
+            *) echo "unsupported test_subset: $INPUT_TEST_SUBSET"; exit 1 ;;
+          esac
+          validate_integer_range duration_seconds "$INPUT_DURATION_SECONDS" 1 86400
+          validate_integer_range recovery_timeout_ms "$INPUT_RECOVERY_TIMEOUT_MS" 1 3600000
+  checkpoint-native:
+    name: Checkpoint native capability and process faults (${{ matrix.provider }})
+    needs: policy
+    if: github.event_name == 'schedule' || inputs.test_subset == 'all' || inputs.test_subset == 'checkpoint'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: native-cloud-${{ matrix.provider }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/native-cloud-login
+        with:
+          provider: ${{ matrix.provider }}
+          aws-role-arn: ${{ vars.AWS_NATIVE_TEST_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_NATIVE_TEST_REGION }}
+          azure-client-id: ${{ vars.AZURE_NATIVE_TEST_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.AZURE_NATIVE_TEST_TENANT_ID }}
+          azure-subscription-id: ${{ vars.AZURE_NATIVE_TEST_SUBSCRIPTION_ID }}
+          gcp-workload-identity-provider: ${{ vars.GCP_NATIVE_TEST_WORKLOAD_IDENTITY_PROVIDER }}
+          gcp-service-account: ${{ vars.GCP_NATIVE_TEST_SERVICE_ACCOUNT }}
+          gcp-project-id: ${{ vars.GCP_NATIVE_TEST_PROJECT_ID }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: native-checkpoint-${{ matrix.provider }}
+      - name: Install process-soak dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler jq
+      - name: Select isolated native locations
+        shell: bash
+        env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_TEST_URL: ${{ vars.LAMINAR_AZURE_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            aws) base="${LAMINAR_AWS_TEST_URL:?LAMINAR_AWS_TEST_URL is required}"; location_env=LAMINAR_AWS_TEST_URL ;;
+            azure) base="${LAMINAR_AZURE_TEST_URL:?LAMINAR_AZURE_TEST_URL is required}"; location_env=LAMINAR_AZURE_TEST_URL ;;
+            gcs) base="${LAMINAR_GCS_TEST_URL:?LAMINAR_GCS_TEST_URL is required}"; location_env=LAMINAR_GCS_TEST_URL ;;
+          esac
+          base_sha="$(git merge-base HEAD origin/main)"
+          root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/checkpoint"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
+          echo "PROVIDER_FEATURE=${{ matrix.provider }}" >> "$GITHUB_ENV"
+          echo "LAMINAR_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
+          echo "LAMINAR_ENABLED_CARGO_FEATURES=${{ matrix.provider }},cluster,kafka" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
+          echo "$location_env=$root" >> "$GITHUB_ENV"
+          echo "LAMINAR_SOAK_CHECKPOINT_URL=$root/process-soak" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
+          echo "SOAK_STARTED_AT=$(date --utc --iso-8601=seconds)" >> "$GITHUB_ENV"
+          echo "SOAK_STARTED_EPOCH_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+      - name: Run native object-store conformance
+        id: conformance
+        continue-on-error: true
+        run: cargo test -p laminar-core --no-default-features --features "$PROVIDER_FEATURE" --test object_store_conformance native_object_store_conformance -- --ignored --exact --nocapture
+      - name: Run native checkpoint storage fault-boundary contract
+        id: fault_contract
+        continue-on-error: true
+        run: cargo test -p laminar-core --no-default-features --features "$PROVIDER_FEATURE" --test object_store_conformance native_checkpoint_store_fault_contract -- --ignored --exact --nocapture
+      - name: Write checkpoint setup-failure evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          write_missing() {
+            local suite="$1" test_name="$2" output="$3"
+            if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/${suite}-*.json" >/dev/null; then return; fi
+            jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg suite "$suite" --arg test "$test_name" --arg now "$(date --utc --iso-8601=seconds)" \
+              '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:$suite,test_name:$test,started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:90000,capability_results:{},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"checkpoint-state-integrity",records_produced:0,records_committed:0,records_recovered:0,duplicates:0,losses:0,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+              > "$LAMINAR_CLOUD_EVIDENCE_DIR/$output"
+          }
+          write_missing checkpoint-object-store-conformance native_object_store_conformance "checkpoint-object-store-conformance-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+          write_missing checkpoint-store-fault-contract native_checkpoint_store_fault_contract "checkpoint-store-fault-contract-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+      - name: Start replayable source service
+        run: docker compose -f tests/docker/compose.yml up -d --wait --wait-timeout 60 redpanda
+      - name: Run native checkpoint process-kill soak
+        id: process_soak
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --profile soak -p laminar-server --no-default-features --features "cluster,kafka,$PROVIDER_FEATURE" --test cluster_soak three_node_alo_join_kill9_soak -- --ignored --exact --nocapture --color never 2>&1 | tee native-checkpoint-soak.log
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          LAMINAR_SOAK_KILLS: ${{ inputs.process_kills || '4' }}
+          LAMINAR_SOAK_SECONDS: ${{ inputs.duration_seconds || '120' }}
+          LAMINAR_SOAK_INTERVAL_MS: "500"
+          LAMINAR_SOAK_CHECKPOINT_SLO_MODE: observe
+          LAMINAR_SOAK_HOT_SLO_MODE: observe
+          LAMINAR_SOAK_MAX_RECOVERY_MS: ${{ inputs.recovery_timeout_ms || '90000' }}
+          LAMINAR_SOAK_MIN_LIVE_STATE_BYTES: "8388608"
+          LAMINAR_SOAK_RPS: "250"
+          LAMINAR_SOAK_JOIN_INTERVAL_MS: "15000"
+          LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
+      - name: Clean interrupted native checkpoint prefix
+        id: cleanup
+        if: always() && !(steps.process_soak.outcome == 'failure' && inputs.preserve_failed_prefix == true)
+        continue-on-error: true
+        run: cargo test -p laminar-core --no-default-features --features "$PROVIDER_FEATURE" --test object_store_conformance native_cleanup_prefix -- --ignored --exact --nocapture
+      - name: Stop replayable source service
+        if: always()
+        run: docker compose -f tests/docker/compose.yml down -v
+      - name: Write process-soak evidence
+        if: always()
+        shell: bash
+        env:
+          EVIDENCE_PROCESS_KILLS: ${{ inputs.process_kills || '4' }}
+          EVIDENCE_RECOVERY_TIMEOUT_MS: ${{ inputs.recovery_timeout_ms || '90000' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          started="${SOAK_STARTED_AT:-$(date --utc --iso-8601=seconds)}"
+          scheme=unknown
+          if [[ -n "${LAMINAR_SOAK_CHECKPOINT_URL:-}" ]]; then
+            scheme="${LAMINAR_SOAK_CHECKPOINT_URL%%:*}"
+          fi
+          produced="$(sed -n 's/.*producer acknowledged \([0-9][0-9]*\) records.*/\1/p' native-checkpoint-soak.log 2>/dev/null | tail -1)"
+          produced="${produced:-0}"
+          output_summary="$(sed -n 's/.*output oracle consumed.*observed all \([0-9][0-9]*\) pairs.*with \([0-9][0-9]*\) at-least-once duplicates.*/\1 \2/p' native-checkpoint-soak.log 2>/dev/null | tail -1)"
+          recovered=0
+          duplicates=0
+          if [[ -n "$output_summary" ]]; then read -r recovered duplicates <<< "$output_summary"; fi
+          passed=false
+          if [[ "${{ steps.process_soak.outcome }}" == "success" && "${{ steps.cleanup.outcome }}" == "success" && -n "$output_summary" ]]; then passed=true; fi
+          cleanup_result=failed
+          if [[ "${{ steps.cleanup.outcome }}" == "success" ]]; then cleanup_result=passed; fi
+          if [[ "${{ steps.cleanup.outcome }}" == "skipped" ]]; then cleanup_result="preserved-on-request"; fi
+          now_ms="$(date +%s%3N)"
+          started_ms="${SOAK_STARTED_EPOCH_MS:-$now_ms}"
+          duration_ms=$((now_ms - started_ms))
+          jq -n \
+            --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" \
+            --arg scheme "$scheme" \
+            --arg started "$started" --arg finished "$(date --utc --iso-8601=seconds)" \
+            --arg cleanup "$cleanup_result" --argjson passed "$passed" \
+            --argjson kills "$EVIDENCE_PROCESS_KILLS" \
+            --argjson recovery "$EVIDENCE_RECOVERY_TIMEOUT_MS" \
+            --argjson produced "$produced" --argjson recovered "$recovered" \
+            --argjson duplicates "$duplicates" --argjson duration "$duration_ms" \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run_id,provider:$provider,native_or_emulator:"native",redacted_endpoint_classification:"native-provider-default",region_or_cloud_location:(env.LAMINAR_CLOUD_LOCATION // null),url_scheme:$scheme,enabled_cargo_features:["cluster","kafka",$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"checkpoint-native-process-soak",test_name:"three_node_alo_join_kill9_soak",started_at:$started,finished_at:$finished,duration_ms:$duration,iterations:$kills,process_kill_count:$kills,recovery_bound_ms:$recovery,capability_results:{real_process_kill:true,fresh_client_recovery:$passed,no_loss_assertion:$passed,duplicates_identified_and_bounded:$passed},conditional_create_result:null,stale_cas_result:null,restart_result:$passed,delivery_contract_tested:"at-least-once",records_produced:$produced,records_committed:(if $passed then $recovered else 0 end),records_recovered:(if $passed then $recovered else 0 end),duplicates:(if $passed then $duplicates else null end),losses:(if $passed then 0 else null end),passed:$passed,skip_count:0,skip_reasons:[],cleanup_result:$cleanup,failure:(if $passed then null else "native checkpoint process soak, output evidence, or cleanup failed" end)}' \
+            > "$LAMINAR_CLOUD_EVIDENCE_DIR/checkpoint-native-process-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+      - name: Validate native evidence eligibility
+        id: validate_evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=0
+          for evidence in "$LAMINAR_CLOUD_EVIDENCE_DIR"/*.json; do
+            jq -e --arg sha "$GITHUB_SHA" '.tested_sha == $sha and .native_or_emulator == "native" and .skip_count == 0 and .passed == true and .cleanup_result == "passed"' "$evidence" >/dev/null
+            count=$((count + 1))
+          done
+          test "$count" -eq 3
+      - name: Upload native checkpoint evidence
+        id: upload_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-checkpoint-${{ matrix.provider }}-${{ github.run_id }}
+          path: |
+            target/cloud-evidence/*.json
+            native-checkpoint-soak.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce native checkpoint result
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.conformance.outcome }}" = success
+          test "${{ steps.fault_contract.outcome }}" = success
+          test "${{ steps.process_soak.outcome }}" = success
+          test "${{ steps.cleanup.outcome }}" = success
+          test "${{ steps.validate_evidence.outcome }}" = success
+          test "${{ steps.upload_evidence.outcome }}" = success
+
+  delta-native:
+    name: Delta native integration (${{ matrix.provider }})
+    needs: policy
+    if: github.event_name == 'schedule' || inputs.test_subset == 'all' || inputs.test_subset == 'delta'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: native-cloud-${{ matrix.provider }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/native-cloud-login
+        with:
+          provider: ${{ matrix.provider }}
+          aws-role-arn: ${{ vars.AWS_NATIVE_TEST_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_NATIVE_TEST_REGION }}
+          azure-client-id: ${{ vars.AZURE_NATIVE_TEST_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.AZURE_NATIVE_TEST_TENANT_ID }}
+          azure-subscription-id: ${{ vars.AZURE_NATIVE_TEST_SUBSCRIPTION_ID }}
+          gcp-workload-identity-provider: ${{ vars.GCP_NATIVE_TEST_WORKLOAD_IDENTITY_PROVIDER }}
+          gcp-service-account: ${{ vars.GCP_NATIVE_TEST_SERVICE_ACCOUNT }}
+          gcp-project-id: ${{ vars.GCP_NATIVE_TEST_PROJECT_ID }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: native-delta-${{ matrix.provider }}
+      - name: Select Delta provider feature
+        shell: bash
+        env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_TEST_URL: ${{ vars.LAMINAR_AZURE_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            aws) feature=delta-lake-s3; provider_feature=aws; base="${LAMINAR_AWS_TEST_URL:?LAMINAR_AWS_TEST_URL is required}"; location_env=LAMINAR_AWS_TEST_URL ;;
+            azure) feature=delta-lake-azure; provider_feature=azure; base="${LAMINAR_AZURE_TEST_URL:?LAMINAR_AZURE_TEST_URL is required}"; location_env=LAMINAR_AZURE_TEST_URL ;;
+            gcs) feature=delta-lake-gcs; provider_feature=gcs; base="${LAMINAR_GCS_TEST_URL:?LAMINAR_GCS_TEST_URL is required}"; location_env=LAMINAR_GCS_TEST_URL ;;
+          esac
+          base_sha="$(git merge-base HEAD origin/main)"
+          root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/delta"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
+          deltalake_version="$(jq -er '[.packages[] | select(.name == "deltalake") | .version] | unique | if length == 1 then .[0] else error("deltalake version is not unique") end' <<<"$metadata")"
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
+          echo "DELTA_FEATURE=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "PROVIDER_FEATURE=$provider_feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
+          echo "LAMINAR_ENABLED_CARGO_FEATURES=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_DELTALAKE_VERSION=$deltalake_version" >> "$GITHUB_ENV"
+          echo "$location_env=$root" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
+      - name: Run native Delta append/read/restart integration
+        id: delta_test
+        continue-on-error: true
+        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE,testing" --test native_delta_cloud native_delta_append_read_restart -- --ignored --exact --nocapture
+      - name: Write Delta setup-failure evidence when the test could not start
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-integration-*.json" >/dev/null; then exit 0; fi
+          jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${DELTA_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:(env.LAMINAR_DELTALAKE_VERSION // "unknown"),iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-integration",test_name:"native_delta_append_read_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"at-least-once-native-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+            > "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-integration-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+      - name: Run native Delta process-fault soak
+        id: delta_fault_test
+        continue-on-error: true
+        run: cargo test -p laminar-connectors --no-default-features --features "$DELTA_FEATURE,testing" --test native_delta_cloud native_delta_process_fault_soak -- --ignored --exact --nocapture
+        env:
+          LAMINAR_SOAK_KILLS: ${{ inputs.process_kills || '4' }}
+      - name: Write Delta fault setup-failure evidence when the test could not start
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-fault-soak-*.json" >/dev/null; then exit 0; fi
+          jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${DELTA_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:(env.LAMINAR_DELTALAKE_VERSION // "unknown"),iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"delta-native-fault-soak",test_name:"native_delta_process_fault_soak",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:120000,capability_results:{fault_soak:true},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"delta-at-least-once-process-fault",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or fault test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or fault test failed before evidence was written"}' \
+            > "$LAMINAR_CLOUD_EVIDENCE_DIR/delta-native-fault-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+      - name: Clean interrupted native Delta prefixes
+        id: delta_cleanup
+        if: always() && !((steps.delta_test.outcome == 'failure' || steps.delta_fault_test.outcome == 'failure') && inputs.preserve_failed_prefix == true)
+        continue-on-error: true
+        run: cargo test -p laminar-core --no-default-features --features "$PROVIDER_FEATURE" --test object_store_conformance native_cleanup_prefix -- --ignored --exact --nocapture
+      - name: Validate native Delta evidence
+        id: validate_delta_evidence
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          jq -e --arg sha "$GITHUB_SHA" '.tested_sha == $sha and .native_or_emulator == "native" and .skip_count == 0 and .passed == true and .cleanup_result == "passed" and .delivery_contract_tested == "at-least-once-native-integration"' target/cloud-evidence/delta-native-integration-*.json >/dev/null
+          jq -e --arg sha "$GITHUB_SHA" '.tested_sha == $sha and .native_or_emulator == "native" and .skip_count == 0 and .passed == true and .cleanup_result == "passed" and .delivery_contract_tested == "delta-at-least-once-process-fault" and .process_kill_count > 0 and .capability_results.fault_soak == true' target/cloud-evidence/delta-native-fault-soak-*.json >/dev/null
+      - name: Upload native Delta evidence
+        id: upload_delta_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-delta-${{ matrix.provider }}-${{ github.run_id }}
+          path: target/cloud-evidence/*.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce native Delta result
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.delta_test.outcome }}" = success
+          test "${{ steps.delta_fault_test.outcome }}" = success
+          test "${{ steps.delta_cleanup.outcome }}" = success
+          test "${{ steps.validate_delta_evidence.outcome }}" = success
+          test "${{ steps.upload_delta_evidence.outcome }}" = success
+
+  iceberg-native:
+    name: Iceberg native integration (${{ matrix.provider }})
+    needs: policy
+    if: github.event_name == 'schedule' || inputs.test_subset == 'all' || inputs.test_subset == 'iceberg'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: native-cloud-${{ matrix.provider }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/native-cloud-login
+        with:
+          provider: ${{ matrix.provider }}
+          aws-role-arn: ${{ vars.AWS_NATIVE_TEST_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_NATIVE_TEST_REGION }}
+          azure-client-id: ${{ vars.AZURE_NATIVE_TEST_CLIENT_ID }}
+          azure-tenant-id: ${{ vars.AZURE_NATIVE_TEST_TENANT_ID }}
+          azure-subscription-id: ${{ vars.AZURE_NATIVE_TEST_SUBSCRIPTION_ID }}
+          gcp-workload-identity-provider: ${{ vars.GCP_NATIVE_TEST_WORKLOAD_IDENTITY_PROVIDER }}
+          gcp-service-account: ${{ vars.GCP_NATIVE_TEST_SERVICE_ACCOUNT }}
+          gcp-project-id: ${{ vars.GCP_NATIVE_TEST_PROJECT_ID }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          key: native-iceberg-${{ matrix.provider }}
+      - name: Select Iceberg provider feature and catalog
+        shell: bash
+        env:
+          LAMINAR_AWS_TEST_URL: ${{ vars.LAMINAR_AWS_TEST_URL }}
+          LAMINAR_AZURE_ICEBERG_TEST_URL: ${{ vars.LAMINAR_AZURE_ICEBERG_TEST_URL }}
+          LAMINAR_GCS_TEST_URL: ${{ vars.LAMINAR_GCS_TEST_URL }}
+          AWS_CATALOG: ${{ vars.LAMINAR_AWS_ICEBERG_CATALOG_URI }}
+          AZURE_CATALOG: ${{ vars.LAMINAR_AZURE_ICEBERG_CATALOG_URI }}
+          GCS_CATALOG: ${{ vars.LAMINAR_GCS_ICEBERG_CATALOG_URI }}
+          ICEBERG_NAMESPACE: ${{ vars.LAMINAR_ICEBERG_NATIVE_NAMESPACE || 'laminar_native_tests' }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.provider }}" in
+            aws) feature=iceberg; provider_feature=aws; base="${LAMINAR_AWS_TEST_URL:?LAMINAR_AWS_TEST_URL is required}"; location_env=LAMINAR_AWS_TEST_URL; catalog="${AWS_CATALOG:?LAMINAR_AWS_ICEBERG_CATALOG_URI is required}" ;;
+            azure) feature=iceberg-azure; provider_feature=azure; base="${LAMINAR_AZURE_ICEBERG_TEST_URL:?LAMINAR_AZURE_ICEBERG_TEST_URL is required}"; location_env=LAMINAR_AZURE_TEST_URL; catalog="${AZURE_CATALOG:?LAMINAR_AZURE_ICEBERG_CATALOG_URI is required}" ;;
+            gcs) feature=iceberg-gcs; provider_feature=gcs; base="${LAMINAR_GCS_TEST_URL:?LAMINAR_GCS_TEST_URL is required}"; location_env=LAMINAR_GCS_TEST_URL; catalog="${GCS_CATALOG:?LAMINAR_GCS_ICEBERG_CATALOG_URI is required}" ;;
+          esac
+          base_sha="$(git merge-base HEAD origin/main)"
+          root="${base%/}/laminardb-tests/${base_sha}/${GITHUB_RUN_ID}/iceberg"
+          metadata="$(cargo metadata --locked --format-version 1)"
+          object_store_version="$(jq -er '[.packages[] | select(.name == "object_store") | .version] | unique | if length == 1 then .[0] else error("object_store version is not unique") end' <<<"$metadata")"
+          iceberg_version="$(jq -er '[.packages[] | select(.name == "iceberg") | .version] | unique | if length == 1 then .[0] else error("iceberg version is not unique") end' <<<"$metadata")"
+          opendal_version="$(jq -er '[.packages[] | select(.name == "opendal") | .version] | unique | if length == 1 then .[0] else error("opendal version is not unique") end' <<<"$metadata")"
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          find "$LAMINAR_CLOUD_EVIDENCE_DIR" -maxdepth 1 -type f -name '*.json' -delete
+          echo "ICEBERG_FEATURE=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_BASE_SHA=$base_sha" >> "$GITHUB_ENV"
+          echo "PROVIDER_FEATURE=$provider_feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_ICEBERG_CATALOG_URI=$catalog" >> "$GITHUB_ENV"
+          echo "LAMINAR_ICEBERG_NAMESPACE=$ICEBERG_NAMESPACE" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLOUD_PROVIDER=${{ matrix.provider }}" >> "$GITHUB_ENV"
+          echo "LAMINAR_ENABLED_CARGO_FEATURES=$feature" >> "$GITHUB_ENV"
+          echo "LAMINAR_OBJECT_STORE_VERSION=$object_store_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_ICEBERG_VERSION=$iceberg_version" >> "$GITHUB_ENV"
+          echo "LAMINAR_OPENDAL_VERSION=$opendal_version" >> "$GITHUB_ENV"
+          echo "$location_env=$root" >> "$GITHUB_ENV"
+          echo "LAMINAR_NATIVE_CLEANUP_URL=$root" >> "$GITHUB_ENV"
+      - name: Run native Iceberg REST/warehouse integration
+        id: iceberg_test
+        continue-on-error: true
+        run: cargo test -p laminar-connectors --no-default-features --features "$ICEBERG_FEATURE" --test native_iceberg_cloud native_iceberg_append_scan_restart -- --ignored --exact --nocapture
+      - name: Write Iceberg setup-failure evidence when the test could not start
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LAMINAR_CLOUD_EVIDENCE_DIR"
+          if compgen -G "$LAMINAR_CLOUD_EVIDENCE_DIR/iceberg-native-integration-*.json" >/dev/null; then exit 0; fi
+          jq -n --arg base_sha "${LAMINAR_BASE_SHA:-unknown}" --arg tested_sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg provider "${{ matrix.provider }}" --arg feature "${ICEBERG_FEATURE:-unknown}" --arg now "$(date --utc --iso-8601=seconds)" \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run,provider:$provider,native_or_emulator:"native-attempt-unverified",redacted_endpoint_classification:"unverified",region_or_cloud_location:null,url_scheme:"unknown",enabled_cargo_features:[$feature],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:(env.LAMINAR_ICEBERG_VERSION // "unknown"),opendal_version:(env.LAMINAR_OPENDAL_VERSION // "unknown"),auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"iceberg-native-integration",test_name:"native_iceberg_append_scan_restart",started_at:$now,finished_at:$now,duration_ms:0,iterations:0,process_kill_count:0,recovery_bound_ms:60000,capability_results:{fault_soak:false,experimental:($provider == "azure")},conditional_create_result:null,stale_cas_result:null,restart_result:false,delivery_contract_tested:"iceberg-append-at-least-once-integration",records_produced:0,records_committed:0,records_recovered:0,duplicates:null,losses:null,passed:false,skip_count:1,skip_reasons:["native setup or test failed before evidence was written"],cleanup_result:"not-run",failure:"native setup or test failed before evidence was written"}' \
+            > "$LAMINAR_CLOUD_EVIDENCE_DIR/iceberg-native-integration-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
+      - name: Clean interrupted native Iceberg prefixes
+        id: iceberg_cleanup
+        if: always() && !(steps.iceberg_test.outcome == 'failure' && inputs.preserve_failed_prefix == true)
+        continue-on-error: true
+        run: cargo test -p laminar-core --no-default-features --features "$PROVIDER_FEATURE" --test object_store_conformance native_cleanup_prefix -- --ignored --exact --nocapture
+      - name: Validate native Iceberg evidence
+        id: validate_iceberg_evidence
+        if: always()
+        continue-on-error: true
+        run: jq -e --arg sha "$GITHUB_SHA" '.tested_sha == $sha and .native_or_emulator == "native" and .skip_count == 0 and .passed == true and .cleanup_result == "passed" and .delivery_contract_tested == "iceberg-append-at-least-once-integration"' target/cloud-evidence/iceberg-native-integration-*.json >/dev/null
+      - name: Upload native Iceberg evidence
+        id: upload_iceberg_evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-iceberg-${{ matrix.provider }}-${{ github.run_id }}
+          path: target/cloud-evidence/*.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Enforce native Iceberg result
+        if: always()
+        shell: bash
+        run: |
+          test "${{ steps.iceberg_test.outcome }}" = success
+          test "${{ steps.iceberg_cleanup.outcome }}" = success
+          test "${{ steps.validate_iceberg_evidence.outcome }}" = success
+          test "${{ steps.upload_iceberg_evidence.outcome }}" = success

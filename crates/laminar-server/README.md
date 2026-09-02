@@ -65,7 +65,8 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
 
 [checkpoint]
-# Provider-neutral object_store URL: file://, s3://, gs://, az://, or abfs(s)://.
+# Provider-neutral object_store URL: absolute file://, s3[a]://, gs/gcs://,
+# az://, abfs[s]://, or wasb[s]://.
 # R2 and MinIO use s3:// with their endpoint option. Credentials come from the
 # standard provider environment or [checkpoint.storage]. Cluster URLs must be
 # visible to every node. Replay-capable single-node delivery currently requires
@@ -73,6 +74,9 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
 timeout = "120s" # one deadline across fence, capture, durable decision, and completion
+
+# Provider features, accepted aliases, ambient identity, and native evidence:
+# ../../docs/cloud-object-store-support.md
 
 [[source]]
 name = "trades"

@@ -214,6 +214,41 @@ fn local_storage_contract_is_singleton() {
     );
 }
 
+#[test]
+fn azure_and_gcs_warehouses_are_multi_writer_without_exact_certification() {
+    let sink = IcebergSink::new(test_config(), None);
+    for (warehouse, storage_type) in [
+        ("gs://bucket/iceberg", "gcs"),
+        (
+            "abfss://filesystem@account.dfs.core.windows.net/iceberg",
+            "azure",
+        ),
+    ] {
+        let mut config = test_connector_config();
+        config.set("catalog.warehouse", warehouse);
+        config.set("storage.type", storage_type);
+        config.set("delivery.guarantee", "exactly-once");
+        let contract = sink.contract(&config).unwrap();
+        assert_eq!(contract.topology, SinkTopology::MultiWriter, "{warehouse}");
+        assert!(
+            !contract.is_cluster_exact_delivery_certified(),
+            "{warehouse}"
+        );
+    }
+}
+
+#[test]
+fn explicit_filesystem_storage_keeps_a_singleton_contract() {
+    let sink = IcebergSink::new(test_config(), None);
+    let mut config = test_connector_config();
+    config.set("catalog.warehouse", "gs://catalog-returned/warehouse");
+    config.set("storage.type", "fs");
+    assert_eq!(
+        sink.contract(&config).unwrap().topology,
+        SinkTopology::Singleton
+    );
+}
+
 #[tokio::test]
 async fn unsupported_mutation_modes_reject_before_file_creation() {
     for mode in ["merge-on-read", "copy-on-write"] {

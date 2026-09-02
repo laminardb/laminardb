@@ -16,7 +16,7 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | Delta Lake Source | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
-| File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
+| File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
 
 ### On-demand lookup sources (partial cache mode)
 
@@ -49,9 +49,13 @@ backpressures rather than dropping rows.
 | Iceberg | `iceberg` | Rolling append writer; direct ALO, coordinated local EO, and REST + direct S3/S3A cluster EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
-| Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
+| Files | `files` | Local CSV, JSON, Parquet rolling output; remote URLs fail at startup | Implemented |
 
 Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix. Data-storage credentials for cluster exactly-once belong under `storage.property.*`; secret-bearing `catalog.property.*` values are treated as uncertified catalog authentication.
+
+Backend support and native-provider evidence are tracked independently in the
+[cloud object-store support matrix](../../docs/cloud-object-store-support.md). Azure Iceberg is
+experimental; remote Files source/sink URLs are unsupported.
 
 ### Upsert sinks and changelog collapse
 
@@ -122,12 +126,13 @@ requirements:
 | `delta-lake-unity` | Databricks Unity catalog for Delta Lake |
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
 | `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-gcs` / `iceberg-azure` | REST Iceberg with GCS / experimental Azure ADLS storage |
 | `iceberg-catalog-rest` | REST catalog; other typed catalog features currently fail with an explicit capability error |
 | `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
-| `files` | File source (auto-loader) and sink (rolling files) |
+| `files` | Local file source (auto-loader) and sink (rolling files); remote URLs are rejected |
 
 ## Custom Connectors
 

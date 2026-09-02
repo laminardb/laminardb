@@ -491,12 +491,10 @@ impl LaminarDbBuilder {
 
         self.config.object_store_url = self.object_store_url.take();
         self.config.object_store_options = std::mem::take(&mut self.object_store_options);
-        if let Some(url) = self
-            .config
-            .object_store_url
-            .as_deref()
-            .filter(|url| url.starts_with("file://"))
-        {
+        if let Some(url) = self.config.object_store_url.as_deref().filter(|url| {
+            laminar_core::storage_location::StorageProvider::detect_uri(url)
+                == Some(laminar_core::storage_location::StorageProvider::Local)
+        }) {
             laminar_core::checkpoint::object_store_builder::file_url_path(url)
                 .map_err(|error| DbError::Config(format!("checkpoint storage URL: {error}")))?;
         }
@@ -566,11 +564,10 @@ impl LaminarDbBuilder {
         if runtime_mode == RuntimeMode::Local
             && self.config.delivery_guarantee
                 != laminar_connectors::connector::DeliveryGuarantee::BestEffort
-            && self
-                .config
-                .object_store_url
-                .as_deref()
-                .is_some_and(|url| !url.starts_with("file://"))
+            && self.config.object_store_url.as_deref().is_some_and(|url| {
+                laminar_core::storage_location::StorageProvider::detect_uri(url)
+                    != Some(laminar_core::storage_location::StorageProvider::Local)
+            })
         {
             return Err(DbError::Config(
                 "[LDB-0014] a local replay-capable deployment with a shared cloud checkpoint namespace is not admitted until its writer lease is term-fenced; use a built-in or file:// local checkpoint directory, or best_effort delivery"
