@@ -18,6 +18,8 @@
 mod attempt_error;
 mod catalog;
 mod descriptor;
+#[cfg(feature = "delta-lake-gcs")]
+mod gcs_factory;
 mod merge;
 mod publication;
 mod read;

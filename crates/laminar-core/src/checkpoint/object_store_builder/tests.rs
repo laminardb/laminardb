@@ -173,6 +173,60 @@ fn signed_endpoint_query_is_rejected_without_disclosure() {
     assert!(!error.contains("compat.example"), "{error}");
 }
 
+#[cfg(feature = "gcs")]
+#[test]
+fn external_account_adc_builds_without_static_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let credential_path = directory.path().join("external-account.json");
+    std::fs::write(
+        &credential_path,
+        serde_json::to_vec(&serde_json::json!({
+            "type": "external_account",
+            "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/test/providers/github",
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "token_url": "https://sts.googleapis.com/v1/token",
+            "credential_source": { "file": "subject-token" }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let options = HashMap::from([(
+        "google_application_credentials".to_string(),
+        credential_path.to_string_lossy().into_owned(),
+    )]);
+
+    let store = build_object_store("gs://test-bucket/checkpoints", &options).unwrap();
+    assert!(!store.to_string().contains("external-account"));
+}
+
+#[cfg(feature = "gcs")]
+#[test]
+fn external_account_errors_are_redacted() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = "do-not-disclose";
+    let credential_path = directory.path().join(secret);
+    std::fs::write(
+        &credential_path,
+        serde_json::json!({
+            "type": "external_account",
+            "token_url": format!("https://{secret}.example/token"),
+            "credential_source": { "file": secret }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let options = HashMap::from([(
+        "google_application_credentials".to_string(),
+        credential_path.to_string_lossy().into_owned(),
+    )]);
+
+    let error = build_object_store("gs://test-bucket/checkpoints", &options)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("audience"), "{error}");
+    assert!(!error.contains(secret), "{error}");
+}
+
 #[cfg(feature = "aws")]
 #[test]
 fn explicit_provider_options_fail_closed() {

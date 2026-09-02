@@ -180,6 +180,10 @@ pub async fn open_or_create_table(
     } else {
         path_to_url(table_path)?
     };
+    #[cfg(feature = "delta-lake-gcs")]
+    if url.scheme() == "gs" {
+        super::gcs_factory::register_laminar_gcs_factory()?;
+    }
     info!("opening Delta Lake table");
 
     // Try to open or initialize the table. `url` and `storage_options` are

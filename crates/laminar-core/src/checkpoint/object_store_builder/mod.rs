@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[cfg(feature = "gcs")]
+use crate::gcs_credentials::{configure_gcs_workload_identity, gcs_workload_identity_provider};
 use crate::storage_auth::{classify_storage_auth_source, AuthSource};
 use crate::storage_location::{StorageConsumer, StorageLocation, StorageProvider};
 use object_store::ObjectStore;
@@ -115,6 +117,19 @@ pub fn build_object_store(
 
     environment.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     let auth_source = checkpoint_auth_source(location.provider, options);
+    #[cfg(feature = "gcs")]
+    let workload_identity = if location.provider == StorageProvider::Gcs {
+        gcs_workload_identity_provider(options, &|name| std::env::var(name).ok())
+            .map_err(|error| ObjectStoreBuilderError::Build(error.to_string()))?
+    } else {
+        None
+    };
+    #[cfg(feature = "gcs")]
+    let auth_source = if workload_identity.is_some() {
+        AuthSource::WorkloadIdentity
+    } else {
+        auth_source
+    };
     let endpoint_transport = location
         .endpoint_override
         .as_ref()
@@ -138,8 +153,17 @@ pub fn build_object_store(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone())),
         )
-        .chain(adapted.derived_options);
-    let (store, prefix) = object_store::parse_url_opts(&parsed, resolved).map_err(|_| {
+        .chain(adapted.derived_options)
+        .collect::<Vec<_>>();
+    #[cfg(feature = "gcs")]
+    let result = if let Some(credentials) = workload_identity {
+        build_gcs_workload_identity_store(&parsed, resolved, credentials)
+    } else {
+        object_store::parse_url_opts(&parsed, resolved)
+    };
+    #[cfg(not(feature = "gcs"))]
+    let result = object_store::parse_url_opts(&parsed, resolved);
+    let (store, prefix) = result.map_err(|_| {
         ObjectStoreBuilderError::Build(format!(
             "failed to construct the {} client; verify the configured option values and downstream credential chain",
             location.provider.name()
@@ -153,6 +177,19 @@ pub fn build_object_store(
             store, prefix,
         )))
     }
+}
+
+#[cfg(feature = "gcs")]
+fn build_gcs_workload_identity_store(
+    url: &url::Url,
+    options: Vec<(String, String)>,
+    credentials: object_store::gcp::GcpCredentialProvider,
+) -> object_store::Result<(Box<dyn ObjectStore>, object_store::path::Path)> {
+    let builder = object_store::gcp::GoogleCloudStorageBuilder::new().with_url(url.to_string());
+    let store = configure_gcs_workload_identity(builder, options, credentials).build()?;
+    let (_, prefix) = object_store::ObjectStoreScheme::parse(url)?;
+    let prefix = object_store::path::Path::parse(prefix)?;
+    Ok((Box::new(store), prefix))
 }
 
 /// Open the crash-durable local object store used by checkpoint data and metadata.

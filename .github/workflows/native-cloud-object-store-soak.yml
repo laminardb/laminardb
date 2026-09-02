@@ -91,13 +91,6 @@ jobs:
           esac
           validate_integer_range duration_seconds "$INPUT_DURATION_SECONDS" 1 86400
           validate_integer_range recovery_timeout_ms "$INPUT_RECOVERY_TIMEOUT_MS" 1 3600000
-      - name: Reject unsupported GCS object_store WIF combinations
-        if: github.event_name == 'workflow_dispatch' && inputs.provider == 'gcs' && (inputs.test_subset == 'checkpoint' || inputs.test_subset == 'delta' || inputs.test_subset == 'all')
-        run: |
-          echo "The pinned object_store client cannot consume the external_account file produced by GCP Workload Identity Federation for checkpoint or Delta clients."
-          echo "Run the GCS Iceberg subset, or first land and validate a refreshable upstream GCS WIF implementation."
-          exit 1
-
   checkpoint-native:
     name: Checkpoint native capability and process faults (${{ matrix.provider }})
     needs: policy
@@ -111,7 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure"]') }}
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -306,7 +299,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure"]') }}
+        provider: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.provider != 'all' && format('["{0}"]', inputs.provider) || '["aws","azure","gcs"]') }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

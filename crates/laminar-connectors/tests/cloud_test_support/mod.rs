@@ -82,7 +82,7 @@ impl NativeCloudContext {
             _ => return Err("LAMINAR_NATIVE_CLOUD_PROVIDER must be aws, azure, or gcs".into()),
         };
         if provider == StorageProvider::Gcs && suite.starts_with("delta-") {
-            validate_pinned_gcs_adc()?;
+            validate_supported_gcs_adc()?;
         }
         let base_url = required_env(location_env)?;
         let location = StorageLocation::parse(&base_url)
@@ -306,7 +306,7 @@ fn emulator_options(provider: StorageProvider, endpoint: &str) -> StorageOptions
     }
 }
 
-fn validate_pinned_gcs_adc() -> Result<(), String> {
+fn validate_supported_gcs_adc() -> Result<(), String> {
     let Some(path) = non_empty_env("GOOGLE_APPLICATION_CREDENTIALS") else {
         return Ok(());
     };
@@ -315,14 +315,9 @@ fn validate_pinned_gcs_adc() -> Result<(), String> {
     let document: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| "GOOGLE_APPLICATION_CREDENTIALS is not valid JSON".to_string())?;
     match document.get("type").and_then(serde_json::Value::as_str) {
-        Some("service_account" | "authorized_user") => Ok(()),
-        Some("external_account") => Err(
-            "pinned object_store 0.13.2 cannot load external_account GCS credentials; native Delta certification requires an upstream refreshable WIF implementation"
-                .into(),
-        ),
+        Some("service_account" | "authorized_user" | "external_account") => Ok(()),
         Some(_) => Err(
-            "GOOGLE_APPLICATION_CREDENTIALS uses a credential type unsupported by pinned object_store 0.13.2"
-                .into(),
+            "GOOGLE_APPLICATION_CREDENTIALS uses a credential type unsupported by LaminarDB".into(),
         ),
         None => Err("GOOGLE_APPLICATION_CREDENTIALS has no credential type".into()),
     }

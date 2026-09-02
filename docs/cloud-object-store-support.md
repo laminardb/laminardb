@@ -33,9 +33,9 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
-| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; native harness blocked by the pinned WIF gap | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
-| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; native harness blocked by the pinned WIF gap | Supported | MinIO smoke; compatibility tier only |
-| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; native harness blocked by the pinned WIF gap; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
+| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; keyless native job enabled; no current native artifact | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
+| Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; keyless native job enabled; no current native artifact | Supported | MinIO smoke; compatibility tier only |
+| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
 | Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
@@ -122,11 +122,11 @@ not cache refreshable tokens or replace SDK/provider default chains with static 
   its own Azure CLI/managed-identity default chain; it does not currently map a federated-token
   file property. A qualified Azure URL and conflicting explicit account/endpoint configuration
   fail closed.
-- GCS checkpoint and Delta accept service-account JSON/path, supported Application Default
-  Credentials (`service_account` or `authorized_user`), and metadata discovery. The pinned
-  `object_store` 0.13.2 ADC parser does **not** accept an `external_account` workload-identity
-  federation file, and it has no direct access-token configuration key. Such a token is rejected
-  at Delta configuration time instead of being silently ignored. Iceberg/OpenDAL independently
+- GCS checkpoint and Delta accept service-account JSON/path, Application Default Credentials,
+  metadata discovery, and `external_account` workload-identity federation files. The pinned
+  `object_store` 0.13.2 data client is retained; for external accounts LaminarDB injects the
+  official `google-cloud-auth` refreshable provider through its credential-provider hook. The
+  provider, rather than LaminarDB, owns token caching and refresh. Iceberg/OpenDAL independently
   supports `gcs.credentials-json`, `gcs.oauth2.token`, service-account paths, external-account
   ADC, and metadata/default discovery. Custom endpoints and no-auth are compatibility/test modes,
   not native evidence.
@@ -136,13 +136,10 @@ not cache refreshable tokens or replace SDK/provider default chains with static 
   `adls.client-secret`, and `adls.authority-host`. `storage.endpoint` maps to S3/GCS only;
   the pinned experimental AzDLS adapter derives its endpoint from the fully qualified URL.
 
-These pinned-library credential differences are an explicit native-evidence gate. In particular,
-the GCS checkpoint and Delta harnesses cannot pass the repository's keyless GitHub WIF policy until
-the pinned `object_store` path gains refreshable external-account support (or an equivalent upstream
-provider is adopted and tested). Protected dispatch rejects those combinations before cloud I/O,
-and scheduled matrices omit them rather than producing a knowingly skipped or failing certification
-job. This is not a GCS certification claim. The GCS Iceberg job uses OpenDAL's independent
-credential implementation.
+The code-side GCS WIF gate is closed, so protected checkpoint and Delta jobs include GCS on manual
+and scheduled matrices. This is not a GCS certification or delivery-admission claim: promotion
+still requires protected environment setup and eligible exact-commit native capability and fault
+artifacts. The GCS Iceberg job continues to use OpenDAL's independent credential implementation.
 
 Endpoint overrides are classified in diagnostics without hostname, path, query, bucket, account,
 container, or object key. An S3 override is **S3-compatible**, while Azure/GCS overrides are

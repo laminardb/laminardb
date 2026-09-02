@@ -120,6 +120,9 @@ prometheus = { version = "0.14", features = ["process"] }
 
 # Object store (S3/GCS/Azure/local filesystem) — shared across crates.
 object_store = "=0.13.2"
+# `object_store` 0.13 cannot parse external-account ADC files. Keep its data
+# client pinned and inject Google's refreshable WIF credential provider.
+google-cloud-auth = { version = "=1.16.0", default-features = false, features = ["default-rustls-provider"] }
 
 # Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
 deltalake = { version = "=0.32.4", default-features = false }

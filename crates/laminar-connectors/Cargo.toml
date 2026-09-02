@@ -145,7 +145,7 @@ changelog-collapse = ["dep:arrow-row"]
 delta-lake = ["dep:deltalake", "dep:object_store", "object_store/cloud", "dep:delta-reqwest", "dep:delta_kernel", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
-delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
+delta-lake-gcs = ["delta-lake", "deltalake/gcs", "laminar-core/gcs", "dep:futures-util"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue", "dep:aws-sdk-glue"]
 # Apache Iceberg
