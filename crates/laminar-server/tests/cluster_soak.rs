@@ -927,6 +927,25 @@ enum BoundedHttpError {
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Clone, Copy)]
+enum BoundedHttpAuthorization {
+    Public,
+    ConsoleBearer,
+}
+
+#[cfg(feature = "kafka")]
+fn bounded_http_get_request(path: &str, authorization: BoundedHttpAuthorization) -> String {
+    match authorization {
+        BoundedHttpAuthorization::Public => {
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        }
+        BoundedHttpAuthorization::ConsoleBearer => format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SOAK_CONSOLE_TOKEN}\r\nConnection: close\r\n\r\n"
+        ),
+    }
+}
+
+#[cfg(feature = "kafka")]
 #[derive(Debug, PartialEq, Eq)]
 enum ReadinessDiagnostic {
     Ready,
@@ -1994,7 +2013,12 @@ impl Node {
     #[cfg(feature = "kafka")]
     fn readiness_diagnostic(&self) -> ReadinessDiagnostic {
         let deadline = Instant::now() + Duration::from_secs(2);
-        match self.bounded_http_get("/ready", READINESS_DIAGNOSTIC_MAX_BYTES, deadline) {
+        match self.bounded_http_get(
+            "/ready",
+            READINESS_DIAGNOSTIC_MAX_BYTES,
+            deadline,
+            BoundedHttpAuthorization::Public,
+        ) {
             Ok(response) => classify_readiness_response(response.status, &response.body),
             Err(BoundedHttpError::Unavailable(_)) => ReadinessDiagnostic::TransportUnavailable,
             Err(BoundedHttpError::Invalid(_)) => ReadinessDiagnostic::InvalidResponse,
@@ -2007,6 +2031,7 @@ impl Node {
         path: &str,
         body_cap: usize,
         deadline: Instant,
+        authorization: BoundedHttpAuthorization,
     ) -> Result<BoundedHttpResponse, BoundedHttpError> {
         let remaining = || {
             remaining_at(deadline, Instant::now())
@@ -2030,9 +2055,7 @@ impl Node {
                     self.id
                 ))
             })?;
-        let request = format!(
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SOAK_CONSOLE_TOKEN}\r\nConnection: close\r\n\r\n"
-        );
+        let request = bounded_http_get_request(path, authorization);
         stream.write_all(request.as_bytes()).map_err(|error| {
             BoundedHttpError::Unavailable(format!("node{} HTTP request failed: {error}", self.id))
         })?;
@@ -2126,6 +2149,7 @@ impl Node {
             "/api/v1/cluster/local-evidence",
             LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES,
             deadline,
+            BoundedHttpAuthorization::ConsoleBearer,
         ) {
             Ok(response) => response,
             Err(BoundedHttpError::Unavailable(error)) => {
@@ -2216,6 +2240,7 @@ impl Node {
             &path,
             LOCAL_CHECKPOINT_BARRIER_TIMINGS_MAX_BYTES,
             deadline,
+            BoundedHttpAuthorization::ConsoleBearer,
         ) {
             Ok(response) => response,
             Err(BoundedHttpError::Unavailable(error)) => {
@@ -2291,6 +2316,7 @@ impl Node {
             "/api/v1/cluster/vnodes",
             ASSIGNMENT_SNAPSHOT_MAX_BYTES,
             deadline,
+            BoundedHttpAuthorization::ConsoleBearer,
         ) {
             Ok(response) => response,
             Err(BoundedHttpError::Unavailable(_)) => return Ok(None),
@@ -15219,6 +15245,19 @@ fn readiness_diagnostics_expose_only_fixed_state_categories() {
             expected
         );
     }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn public_readiness_request_omits_console_authorization() {
+    let public_request = bounded_http_get_request("/ready", BoundedHttpAuthorization::Public);
+    assert!(!public_request.contains("Authorization:"));
+
+    let console_request = bounded_http_get_request(
+        "/api/v1/cluster/local-evidence",
+        BoundedHttpAuthorization::ConsoleBearer,
+    );
+    assert!(console_request.contains("Authorization: Bearer "));
 }
 
 #[cfg(feature = "kafka")]
