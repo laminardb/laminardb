@@ -110,6 +110,8 @@ const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
 #[cfg(feature = "kafka")]
 const SOAK_HTTP_HEADER_MAX_BYTES: usize = 16 * 1_024;
 #[cfg(feature = "kafka")]
+const READINESS_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1_024;
+#[cfg(feature = "kafka")]
 const LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES: usize = 4 * 1_024;
 #[cfg(feature = "kafka")]
 const LOCAL_CHECKPOINT_BARRIER_TIMINGS_MAX_BYTES: usize = 64 * 1_024;
@@ -204,6 +206,56 @@ const RECOVERY_PREPARE_HANDOFF_LOG: &str =
     "retrying stopped recovery with a direct Prepare-to-Prepare handoff";
 #[cfg(feature = "kafka")]
 const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
+#[cfg(feature = "kafka")]
+const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "kafka")]
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 15] = [
+    (
+        "leader_local_deadline_expired",
+        "leader lease local deadline expired",
+    ),
+    (
+        "leader_operation_deadline_exceeded",
+        "leader lease operation exceeded its local deadline",
+    ),
+    (
+        "leader_response_after_deadline",
+        "leader lease response arrived after its local deadline",
+    ),
+    (
+        "leader_publication_after_deadline",
+        "leader lease publication crossed its local deadline",
+    ),
+    ("leader_operation_failed", "leader lease operation failed"),
+    ("leader_renewal_fenced", "leader lease renewal was fenced"),
+    (
+        "missing_live_leader_proof",
+        "coordinated recovery has no live durable leader proof",
+    ),
+    (
+        "fault_inventory_read_failed",
+        "could not read cluster recovery fault reports",
+    ),
+    (
+        "local_fault_read_failed",
+        "could not read the local recovery fault report",
+    ),
+    (
+        "decision_store_unreadable",
+        "coordinated recovery: decision store unreadable",
+    ),
+    (
+        "assignment_unavailable",
+        "coordinated recovery: no current owner-complete assignment certificate",
+    ),
+    (
+        "assignment_audit_failed",
+        "coordinated recovery: owner-complete assignment audit failed",
+    ),
+    ("recovery_prepare", RECOVERY_PREPARE_LOG),
+    ("recovery_start", "leader announced recovery start"),
+    ("recovery_release", RECOVERY_RELEASE_LOG),
+];
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -872,6 +924,58 @@ struct BoundedHttpResponse {
 enum BoundedHttpError {
     Unavailable(String),
     Invalid(String),
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, PartialEq, Eq)]
+enum ReadinessDiagnostic {
+    Ready,
+    Starting,
+    ServingFenced,
+    ProcessLeaseExpired,
+    Recovering,
+    PipelineNotRunning,
+    TemporarilyUnavailable,
+    UnexpectedStatus(u16),
+    TransportUnavailable,
+    InvalidResponse,
+}
+
+#[cfg(feature = "kafka")]
+fn classify_readiness_response(status: u16, body: &[u8]) -> ReadinessDiagnostic {
+    if status == 200 {
+        return ReadinessDiagnostic::Ready;
+    }
+    if status != 503 {
+        return ReadinessDiagnostic::UnexpectedStatus(status);
+    }
+    let body = String::from_utf8_lossy(body);
+    for (message, diagnostic) in [
+        (
+            "server startup is not complete",
+            ReadinessDiagnostic::Starting,
+        ),
+        (
+            "server serving authority is fenced",
+            ReadinessDiagnostic::ServingFenced,
+        ),
+        (
+            "server process lease is no longer live",
+            ReadinessDiagnostic::ProcessLeaseExpired,
+        ),
+        (
+            "server is completing coordinated recovery",
+            ReadinessDiagnostic::Recovering,
+        ),
+    ] {
+        if body.contains(message) {
+            return diagnostic;
+        }
+    }
+    if body.contains("pipeline is ") && body.contains(", not Running") {
+        return ReadinessDiagnostic::PipelineNotRunning;
+    }
+    ReadinessDiagnostic::TemporarilyUnavailable
 }
 
 #[cfg(feature = "kafka")]
@@ -1888,6 +1992,16 @@ impl Node {
     }
 
     #[cfg(feature = "kafka")]
+    fn readiness_diagnostic(&self) -> ReadinessDiagnostic {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        match self.bounded_http_get("/ready", READINESS_DIAGNOSTIC_MAX_BYTES, deadline) {
+            Ok(response) => classify_readiness_response(response.status, &response.body),
+            Err(BoundedHttpError::Unavailable(_)) => ReadinessDiagnostic::TransportUnavailable,
+            Err(BoundedHttpError::Invalid(_)) => ReadinessDiagnostic::InvalidResponse,
+        }
+    }
+
+    #[cfg(feature = "kafka")]
     fn bounded_http_get(
         &self,
         path: &str,
@@ -2434,6 +2548,21 @@ impl Node {
 
     fn log_len(&self) -> u64 {
         std::fs::metadata(&self.log_path).map_or(0, |metadata| metadata.len())
+    }
+
+    #[cfg(feature = "kafka")]
+    fn recovery_log_marker_counts(&self) -> Option<BTreeMap<&'static str, usize>> {
+        let mut log = std::fs::File::open(&self.log_path).ok()?;
+        let log_len = log.metadata().ok()?.len();
+        let start = log_len.saturating_sub(RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES);
+        log.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        log.take(RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES)
+            .read_to_end(&mut tail)
+            .ok()?;
+        Some(count_recovery_diagnostic_markers(&String::from_utf8_lossy(
+            &tail,
+        )))
     }
 
     #[cfg(feature = "kafka")]
@@ -10721,8 +10850,10 @@ fn wait_for_local_assignment_convergence(
         }
         sleep_until_local_evidence_poll(deadline);
     }
+    let diagnostics = durable_progress_diagnostics(nodes, None);
     panic!(
-        "soak: {context} did not reach exact local assignment convergence before its existing deadline: {last_pending}"
+        "soak: {context} did not reach exact local assignment convergence before its existing \
+         deadline: {last_pending}; observation=({diagnostics})"
     );
 }
 
@@ -11219,6 +11350,17 @@ fn assert_checkpoint_progress(
     current_epoch
 }
 
+#[cfg(feature = "kafka")]
+fn count_recovery_diagnostic_markers(log: &str) -> BTreeMap<&'static str, usize> {
+    RECOVERY_DIAGNOSTIC_MARKERS
+        .iter()
+        .filter_map(|(name, marker)| {
+            let count = log.matches(marker).count();
+            (count > 0).then_some((*name, count))
+        })
+        .collect()
+}
+
 /// Assert two committed checkpoints over advancing source data. With Kafka, also require a new
 /// broker offset commit so an empty-checkpoint loop cannot satisfy the soak.
 #[cfg(feature = "kafka")]
@@ -11231,6 +11373,14 @@ fn durable_progress_diagnostics(
     let leader_by_node: Vec<_> = live_nodes
         .iter()
         .map(|node| (node.id, node.is_leader()))
+        .collect();
+    let readiness_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.readiness_diagnostic()))
+        .collect();
+    let recovery_log_markers_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.recovery_log_marker_counts()))
         .collect();
     let checkpoint_size_bytes_by_node: Vec<_> = live_nodes
         .iter()
@@ -11259,12 +11409,22 @@ fn durable_progress_diagnostics(
             "coordinated_recovery_failures",
             try_cluster_metric(nodes, "laminardb_coordinated_recovery_failures_total"),
         ),
+        (
+            "shuffle_delivery_loss_incidents",
+            try_cluster_metric(nodes, "laminardb_shuffle_delivery_loss_incidents_total"),
+        ),
+        (
+            "pipeline_cycle_errors",
+            try_cluster_metric(nodes, "laminardb_pipeline_cycle_errors_total"),
+        ),
     ];
     let offsets = commit_oracle.and_then(KafkaJoinCommitOracle::committed_offsets);
     format!(
         "live_node_ids={live_node_ids:?}, leader_by_node={leader_by_node:?}, \
+         readiness_by_node={readiness_by_node:?}, \
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
+         recovery_log_markers_by_node={recovery_log_markers_by_node:?}, \
          checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
          durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
          committed_source_offsets={offsets:?}"
@@ -15011,6 +15171,71 @@ fn bounded_diagnostic_statuses_retry_only_transient_responses() {
             "HTTP {status} must not hide invalid or contradictory evidence"
         );
     }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn readiness_diagnostics_expose_only_fixed_state_categories() {
+    for (status, body, expected) in [
+        (200, "ready", ReadinessDiagnostic::Ready),
+        (
+            503,
+            "server startup is not complete",
+            ReadinessDiagnostic::Starting,
+        ),
+        (
+            503,
+            "server serving authority is fenced",
+            ReadinessDiagnostic::ServingFenced,
+        ),
+        (
+            503,
+            "server process lease is no longer live",
+            ReadinessDiagnostic::ProcessLeaseExpired,
+        ),
+        (
+            503,
+            "server is completing coordinated recovery",
+            ReadinessDiagnostic::Recovering,
+        ),
+        (
+            503,
+            "pipeline is Faulted, not Running",
+            ReadinessDiagnostic::PipelineNotRunning,
+        ),
+        (
+            503,
+            "unrecognized response containing sig=secret",
+            ReadinessDiagnostic::TemporarilyUnavailable,
+        ),
+        (
+            401,
+            "sig=secret",
+            ReadinessDiagnostic::UnexpectedStatus(401),
+        ),
+    ] {
+        assert_eq!(
+            classify_readiness_response(status, body.as_bytes()),
+            expected
+        );
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
+    let log = "leader lease operation failed: signed_url=?sig=secret\n\
+               leader lease operation failed: account=secret\n\
+               leader announced recovery prepare\n\
+               coordinated recovery has no live durable leader proof\n";
+    let counts = count_recovery_diagnostic_markers(log);
+    assert_eq!(counts.get("leader_operation_failed"), Some(&2));
+    assert_eq!(counts.get("recovery_prepare"), Some(&1));
+    assert_eq!(counts.get("missing_live_leader_proof"), Some(&1));
+    let diagnostic = format!("{counts:?}");
+    assert!(!diagnostic.contains("secret"));
+    assert!(!diagnostic.contains("sig="));
+    assert!(!diagnostic.contains("account="));
 }
 
 #[cfg(feature = "kafka")]
