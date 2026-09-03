@@ -11287,20 +11287,28 @@ fn assert_progress(
     }
     let ingested_target = cluster_metric(nodes, "laminardb_events_ingested_total") + 1.0;
     let emitted_target = cluster_metric(nodes, "laminardb_events_emitted_total") + 1.0;
-    wait_for(
-        &format!("{label}: source ingestion and graph output to advance"),
-        remaining_progress_window(deadline, label),
-        || {
-            assert_running_nodes(nodes);
-            if let Some(producer) = producer.as_deref_mut() {
-                producer.assert_running();
-            }
-            try_cluster_metric(nodes, "laminardb_events_ingested_total")
-                .is_some_and(|ingested| ingested >= ingested_target)
-                && try_cluster_metric(nodes, "laminardb_events_emitted_total")
-                    .is_some_and(|emitted| emitted >= emitted_target)
-        },
-    );
+    let advance_window = remaining_progress_window(deadline, label);
+    let graph_advanced = wait_until(advance_window, || {
+        assert_running_nodes(nodes);
+        if let Some(producer) = producer.as_deref_mut() {
+            producer.assert_running();
+        }
+        try_cluster_metric(nodes, "laminardb_events_ingested_total")
+            .is_some_and(|ingested| ingested >= ingested_target)
+            && try_cluster_metric(nodes, "laminardb_events_emitted_total")
+                .is_some_and(|emitted| emitted >= emitted_target)
+    });
+    if !graph_advanced {
+        let observed_ingested = try_cluster_metric(nodes, "laminardb_events_ingested_total");
+        let observed_emitted = try_cluster_metric(nodes, "laminardb_events_emitted_total");
+        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle);
+        panic!(
+            "soak: timed out after {advance_window:?} waiting for: {label}: source ingestion and \
+             graph output to advance; ingested_target={ingested_target}, \
+             observed_ingested={observed_ingested:?}, emitted_target={emitted_target}, \
+             observed_emitted={observed_emitted:?}, observation=({diagnostics})"
+        );
+    }
 
     // Take the durability baselines only after graph output advanced, so checkpoints that happened
     // before this phase cannot satisfy the source-offset proof.
@@ -13342,6 +13350,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
             killed_follower_nodes.insert(victim);
         }
         kills += 1;
+        eprintln!("soak round {round}: kill -9 delivered to {victim_role} node {victim}");
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),
