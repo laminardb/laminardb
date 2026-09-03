@@ -875,6 +875,13 @@ enum BoundedHttpError {
 }
 
 #[cfg(feature = "kafka")]
+fn is_retryable_diagnostic_status(status: u16) -> bool {
+    // 429 is the bounded single-flight/rate limit, 503 is unavailable evidence, and 504 is the
+    // diagnostic handler deadline. None contradicts the evidence being sampled.
+    matches!(status, 429 | 503 | 504)
+}
+
+#[cfg(feature = "kafka")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalAuthorityEvidenceEnvelope {
@@ -2014,10 +2021,10 @@ impl Node {
                 return LocalAuthorityObservation::Contradiction(error);
             }
         };
-        if response.status == 503 {
+        if is_retryable_diagnostic_status(response.status) {
             return LocalAuthorityObservation::Pending(format!(
-                "node{} local evidence is temporarily unavailable",
-                self.id
+                "node{} local evidence is temporarily unavailable (HTTP {})",
+                self.id, response.status
             ));
         }
         if response.status != 200 {
@@ -2104,10 +2111,10 @@ impl Node {
                 return CheckpointBarrierTimingObservation::Contradiction(error);
             }
         };
-        if response.status == 503 {
+        if is_retryable_diagnostic_status(response.status) {
             return CheckpointBarrierTimingObservation::Pending(format!(
-                "node{} local checkpoint barrier timings are temporarily unavailable",
-                self.id
+                "node{} local checkpoint barrier timings are temporarily unavailable (HTTP {})",
+                self.id, response.status
             ));
         }
         if response.status != 200 {
@@ -14978,6 +14985,23 @@ fn produce_join_inputs(
             broker_acked_at,
         }
     })
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn bounded_diagnostic_statuses_retry_only_transient_responses() {
+    for status in [429, 503, 504] {
+        assert!(
+            is_retryable_diagnostic_status(status),
+            "HTTP {status} must remain pending until the outer evidence deadline"
+        );
+    }
+    for status in [200, 400, 401, 403, 404, 500] {
+        assert!(
+            !is_retryable_diagnostic_status(status),
+            "HTTP {status} must not hide invalid or contradictory evidence"
+        );
+    }
 }
 
 #[cfg(feature = "kafka")]
