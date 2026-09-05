@@ -209,7 +209,9 @@ const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fres
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 15] = [
+const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(feature = "kafka")]
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 22] = [
     (
         "leader_local_deadline_expired",
         "leader lease local deadline expired",
@@ -253,6 +255,25 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 15] = [
         "coordinated recovery: owner-complete assignment audit failed",
     ),
     ("recovery_prepare", RECOVERY_PREPARE_LOG),
+    ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
+    ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
+    (
+        "recovery_stopped",
+        "stopped for recovery round; awaiting target",
+    ),
+    (
+        "recovery_stop_quorum_timeout",
+        "recovery stop quorum timed out",
+    ),
+    (
+        "recovery_successor_authorized",
+        "authorized successor assignment from the last committed cluster cut",
+    ),
+    ("assignment_rotated", "rotated assignment"),
+    (
+        "rebalance_failed",
+        "rebalance failed; retrying after backoff",
+    ),
     ("recovery_start", "leader announced recovery start"),
     ("recovery_release", RECOVERY_RELEASE_LOG),
 ];
@@ -957,6 +978,29 @@ enum ReadinessDiagnostic {
     TemporarilyUnavailable,
     UnexpectedStatus(u16),
     TransportUnavailable,
+    InvalidResponse,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, PartialEq, Eq)]
+enum LocalAssignmentDiagnostic {
+    Available {
+        version: u64,
+        vnode_state_ready: bool,
+    },
+    TemporarilyUnavailable,
+    InvalidResponse,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, PartialEq, Eq)]
+enum DurableAssignmentDiagnostic {
+    Available {
+        version: u64,
+        draining: bool,
+        participant_count: usize,
+    },
+    TemporarilyUnavailable,
     InvalidResponse,
 }
 
@@ -2216,6 +2260,25 @@ impl Node {
     }
 
     #[cfg(feature = "kafka")]
+    fn local_assignment_diagnostic(&self) -> LocalAssignmentDiagnostic {
+        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        match self.local_authority_observation(deadline) {
+            LocalAuthorityObservation::Available(evidence) => {
+                LocalAssignmentDiagnostic::Available {
+                    version: evidence.adopted_assignment.assignment_version,
+                    vnode_state_ready: evidence.adopted_assignment.vnode_state_ready,
+                }
+            }
+            LocalAuthorityObservation::Pending(_) => {
+                LocalAssignmentDiagnostic::TemporarilyUnavailable
+            }
+            LocalAuthorityObservation::Contradiction(_) => {
+                LocalAssignmentDiagnostic::InvalidResponse
+            }
+        }
+    }
+
+    #[cfg(feature = "kafka")]
     fn checkpoint_barrier_timing_observation(
         &self,
         expected_process: Option<LocalProcessAuthorityIdentity>,
@@ -2322,7 +2385,7 @@ impl Node {
             Err(BoundedHttpError::Unavailable(_)) => return Ok(None),
             Err(BoundedHttpError::Invalid(error)) => return Err(error),
         };
-        if response.status == 503 {
+        if is_retryable_diagnostic_status(response.status) {
             return Ok(None);
         }
         if response.status != 200 {
@@ -2350,6 +2413,20 @@ impl Node {
             return Ok(None);
         }
         Ok(Some(snapshot))
+    }
+
+    #[cfg(feature = "kafka")]
+    fn durable_assignment_diagnostic(&self) -> DurableAssignmentDiagnostic {
+        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        match self.durable_assignment_observation(deadline) {
+            Ok(Some(snapshot)) => DurableAssignmentDiagnostic::Available {
+                version: snapshot.version,
+                draining: snapshot.draining,
+                participant_count: snapshot.participants.len(),
+            },
+            Ok(None) => DurableAssignmentDiagnostic::TemporarilyUnavailable,
+            Err(_) => DurableAssignmentDiagnostic::InvalidResponse,
+        }
     }
 
     #[cfg(feature = "kafka")]
@@ -11404,6 +11481,14 @@ fn durable_progress_diagnostics(
         .iter()
         .map(|node| (node.id, node.readiness_diagnostic()))
         .collect();
+    let local_assignment_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.local_assignment_diagnostic()))
+        .collect();
+    let durable_assignment_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.durable_assignment_diagnostic()))
+        .collect();
     let recovery_log_markers_by_node: Vec<_> = live_nodes
         .iter()
         .map(|node| (node.id, node.recovery_log_marker_counts()))
@@ -11448,6 +11533,8 @@ fn durable_progress_diagnostics(
     format!(
         "live_node_ids={live_node_ids:?}, leader_by_node={leader_by_node:?}, \
          readiness_by_node={readiness_by_node:?}, \
+         local_assignment_by_node={local_assignment_by_node:?}, \
+         durable_assignment_by_node={durable_assignment_by_node:?}, \
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
          recovery_log_markers_by_node={recovery_log_markers_by_node:?}, \
@@ -15266,10 +15353,16 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     let log = "leader lease operation failed: signed_url=?sig=secret\n\
                leader lease operation failed: account=secret\n\
                leader announced recovery prepare\n\
+               recovery stop quorum timed out\n\
+               authorized successor assignment from the last committed cluster cut\n\
+               rebalance failed; retrying after backoff\n\
                coordinated recovery has no live durable leader proof\n";
     let counts = count_recovery_diagnostic_markers(log);
     assert_eq!(counts.get("leader_operation_failed"), Some(&2));
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
+    assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
+    assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
+    assert_eq!(counts.get("rebalance_failed"), Some(&1));
     assert_eq!(counts.get("missing_live_leader_proof"), Some(&1));
     let diagnostic = format!("{counts:?}");
     assert!(!diagnostic.contains("secret"));
