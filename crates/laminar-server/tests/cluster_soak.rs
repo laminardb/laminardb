@@ -211,7 +211,7 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 32] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 40] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -310,6 +310,32 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 32] = [
     ),
     ("recovery_start", "leader announced recovery start"),
     ("recovery_release", RECOVERY_RELEASE_LOG),
+    (
+        "kafka_source_started_fenced",
+        "Kafka source started fenced with no partitions until durable vnode adoption",
+    ),
+    (
+        "kafka_assigned_partitions",
+        "Kafka source assigned vnode-owned partitions (engine-controlled)",
+    ),
+    (
+        "kafka_assignment_inspection_failed",
+        "Kafka source could not inspect its current assignment; rotation will retry",
+    ),
+    ("kafka_assign_failed", "Kafka source assign failed"),
+    ("kafka_consumer_error", "Kafka consumer error"),
+    (
+        "source_intake_opened",
+        "Cluster assignment certified; source intake opened",
+    ),
+    (
+        "source_intake_recovery_fenced",
+        "Cluster source intake remains fenced for coordinated recovery",
+    ),
+    (
+        "worker_no_vnodes",
+        "Cluster worker owns no vnodes; data plane remains fenced pending assignment",
+    ),
 ];
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
@@ -1476,6 +1502,20 @@ fn prometheus_histogram_bucket_value(body: &str, metric: &str, upper_bound: f64)
     found.then_some(sum)
 }
 
+fn prometheus_metric_sum(body: &str, name: &str) -> Option<f64> {
+    let mut found = false;
+    let sum = body
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+        })
+        .filter_map(|line| line.split_whitespace().last()?.parse::<f64>().ok())
+        .inspect(|_| found = true)
+        .sum();
+    found.then_some(sum)
+}
+
 #[cfg(feature = "kafka")]
 #[derive(Clone, Copy, Debug)]
 struct HotPathLatencySnapshot {
@@ -2482,17 +2522,39 @@ impl Node {
     /// Scrape one gauge/counter from `/metrics`; `None` while the node is down or booting.
     fn metric(&self, name: &str) -> Option<f64> {
         let body = self.http_get("/metrics")?;
-        let mut found = false;
-        let sum = body
-            .lines()
-            .filter(|line| {
-                line.strip_prefix(name)
-                    .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
-            })
-            .filter_map(|line| line.split_whitespace().last()?.parse::<f64>().ok())
-            .inspect(|_| found = true)
-            .sum();
-        found.then_some(sum)
+        prometheus_metric_sum(&body, name)
+    }
+
+    #[cfg(feature = "kafka")]
+    fn ingestion_diagnostic_metrics(&self) -> [(&'static str, Option<f64>); 6] {
+        const METRICS: [(&str, &str); 6] = [
+            ("events_ingested", "laminardb_events_ingested_total"),
+            (
+                "kafka_records_polled",
+                "laminardb_kafka_source_records_polled_total",
+            ),
+            (
+                "kafka_batches_polled",
+                "laminardb_kafka_source_batches_polled_total",
+            ),
+            ("kafka_source_errors", "laminardb_kafka_source_errors_total"),
+            (
+                "kafka_source_rebalances",
+                "laminardb_kafka_source_rebalances_total",
+            ),
+            (
+                "kafka_source_commits",
+                "laminardb_kafka_source_commits_total",
+            ),
+        ];
+        let body = self.http_get("/metrics");
+        METRICS.map(|(label, name)| {
+            (
+                label,
+                body.as_deref()
+                    .and_then(|metrics| prometheus_metric_sum(metrics, name)),
+            )
+        })
     }
 
     #[cfg(feature = "kafka")]
@@ -11447,14 +11509,32 @@ fn assert_every_node_ingests(nodes: &mut [Node], producer: &mut ProducerGuard, w
                 .expect("node did not expose events_ingested_total")
         })
         .collect();
-    wait_for("every node to ingest assigned Kafka work", window, || {
+    if wait_until(window, || {
         assert_running_nodes(nodes);
         producer.assert_running();
         nodes.iter().zip(&baselines).all(|(node, baseline)| {
             node.metric("laminardb_events_ingested_total")
                 .is_some_and(|ingested| ingested > *baseline)
         })
-    });
+    }) {
+        return;
+    }
+    let ingestion_progress_by_node = nodes
+        .iter()
+        .zip(&baselines)
+        .map(|(node, baseline)| {
+            (
+                node.id,
+                *baseline,
+                node.metric("laminardb_events_ingested_total"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let diagnostics = durable_progress_diagnostics(nodes, &[]);
+    panic!(
+        "soak: timed out after {window:?} waiting for: every node to ingest assigned Kafka work; \
+         ingestion_progress_by_node={ingestion_progress_by_node:?}; observation=({diagnostics})"
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -11578,6 +11658,10 @@ fn durable_progress_diagnostics(
         .iter()
         .map(|node| (node.id, node.recovery_log_marker_counts()))
         .collect();
+    let ingestion_metrics_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.ingestion_diagnostic_metrics()))
+        .collect();
     let checkpoint_size_bytes_by_node: Vec<_> = live_nodes
         .iter()
         .map(|node| (node.id, node.metric("laminardb_checkpoint_size_bytes")))
@@ -11627,6 +11711,7 @@ fn durable_progress_diagnostics(
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
          recovery_log_markers_by_node={recovery_log_markers_by_node:?}, \
+         ingestion_metrics_by_node={ingestion_metrics_by_node:?}, \
          checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
          durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
          committed_source_offsets={offsets:?}"
@@ -15474,7 +15559,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                recovery stop quorum timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
                rebalance failed; retrying after backoff\n\
-               coordinated recovery has no live durable leader proof\n";
+               coordinated recovery has no live durable leader proof\n\
+               Kafka source assign failed: token=secret\n\
+               Kafka consumer error: credential=secret\n\
+               Cluster source intake remains fenced for coordinated recovery\n";
     let counts = count_recovery_diagnostic_markers(log);
     assert_eq!(counts.get("leader_operation_failed"), Some(&2));
     assert_eq!(
@@ -15487,6 +15575,9 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
     assert_eq!(counts.get("rebalance_failed"), Some(&1));
     assert_eq!(counts.get("missing_live_leader_proof"), Some(&1));
+    assert_eq!(counts.get("kafka_assign_failed"), Some(&1));
+    assert_eq!(counts.get("kafka_consumer_error"), Some(&1));
+    assert_eq!(counts.get("source_intake_recovery_fenced"), Some(&1));
     let diagnostic = format!("{counts:?}");
     assert!(!diagnostic.contains("secret"));
     assert!(!diagnostic.contains("sig="));
