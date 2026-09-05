@@ -211,7 +211,7 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 48] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 52] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -330,6 +330,22 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 48] = [
     (
         "recovery_handoff_manifest_missing",
         "handoff manifest is missing",
+    ),
+    (
+        "recovery_handoff_manifest_read_timeout",
+        "handoff manifest read timed out",
+    ),
+    (
+        "recovery_handoff_manifest_read_failed",
+        "handoff manifest read failed",
+    ),
+    (
+        "recovery_handoff_read_timeout",
+        "vnode handoff read timed out",
+    ),
+    (
+        "recovery_handoff_frame_read_timeout",
+        "vnode handoff frame read timed out",
     ),
     (
         "recovery_retained_state_missing",
@@ -15597,6 +15613,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                recovery assignment 2 adoption exceeded its end-to-end deadline\n\
                recovery assignment materialization exceeded its deadline\n\
                participant 2 handoff manifest is missing\n\
+               participant 2 handoff manifest read timed out\n\
+               participant 2 handoff manifest read failed: credential=secret\n\
+               vnode handoff read timed out\n\
+               vnode handoff frame read timed out\n\
                cannot reuse retained vnode memory without its exact predecessor binding\n\
                rebalance failed; retrying after backoff\n\
                coordinated recovery has no live durable leader proof\n\
@@ -15623,6 +15643,16 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_adoption_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_materialization_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_handoff_manifest_missing"), Some(&1));
+    assert_eq!(
+        counts.get("recovery_handoff_manifest_read_timeout"),
+        Some(&1)
+    );
+    assert_eq!(
+        counts.get("recovery_handoff_manifest_read_failed"),
+        Some(&1)
+    );
+    assert_eq!(counts.get("recovery_handoff_read_timeout"), Some(&1));
+    assert_eq!(counts.get("recovery_handoff_frame_read_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_retained_state_missing"), Some(&1));
     assert_eq!(counts.get("rebalance_failed"), Some(&1));
     assert_eq!(counts.get("missing_live_leader_proof"), Some(&1));
