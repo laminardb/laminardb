@@ -211,7 +211,41 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 22] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 32] = [
+    ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
+    ("checkpoint_attempt_failed", "checkpoint attempt failed"),
+    (
+        "checkpoint_continuation_failed",
+        CHECKPOINT_CONTINUATION_FAILED_LOG,
+    ),
+    (
+        "checkpoint_before_durable_tail",
+        "checkpoint failed before its durable tail",
+    ),
+    (
+        "checkpoint_state_serialization_timeout",
+        "checkpoint state serialization timed out",
+    ),
+    (
+        "checkpoint_capture_quorum_timeout",
+        "capture quorum exhausted the",
+    ),
+    (
+        "checkpoint_graph_drain_timeout",
+        "checkpoint graph drain exhausted its end-to-end deadline",
+    ),
+    (
+        "checkpoint_sink_fence_timeout",
+        "checkpoint sink write fence exhausted the end-to-end attempt deadline",
+    ),
+    (
+        "checkpoint_source_cut_incomplete",
+        "checkpoint source cut is incomplete",
+    ),
+    (
+        "follower_checkpoint_capture_failed",
+        "follower checkpoint capture failed",
+    ),
     (
         "leader_local_deadline_expired",
         "leader lease local deadline expired",
@@ -5480,6 +5514,57 @@ impl KafkaJoinCommitOracle {
                 && self.left.covers(&boundary[..partitions])
                 && self.right.covers(&boundary[partitions..])
         })
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, PartialEq, Eq)]
+enum OffsetCoverageDiagnostic {
+    Unavailable {
+        expected_partitions: usize,
+    },
+    PartitionCountMismatch {
+        expected_partitions: usize,
+        observed_partitions: usize,
+    },
+    Available {
+        partitions: usize,
+        covered_partitions: usize,
+        largest_shortfall: i64,
+    },
+}
+
+#[cfg(feature = "kafka")]
+fn offset_coverage_diagnostic(
+    observed: Option<&[i64]>,
+    boundary: &[i64],
+) -> OffsetCoverageDiagnostic {
+    let Some(observed) = observed else {
+        return OffsetCoverageDiagnostic::Unavailable {
+            expected_partitions: boundary.len(),
+        };
+    };
+    if observed.len() != boundary.len() {
+        return OffsetCoverageDiagnostic::PartitionCountMismatch {
+            expected_partitions: boundary.len(),
+            observed_partitions: observed.len(),
+        };
+    }
+    let covered_partitions = observed
+        .iter()
+        .zip(boundary)
+        .filter(|(current, target)| current >= target)
+        .count();
+    let largest_shortfall = observed
+        .iter()
+        .zip(boundary)
+        .map(|(current, target)| target.saturating_sub(*current).max(0))
+        .max()
+        .unwrap_or(0);
+    OffsetCoverageDiagnostic::Available {
+        partitions: boundary.len(),
+        covered_partitions,
+        largest_shortfall,
     }
 }
 
@@ -10953,7 +11038,7 @@ fn wait_for_local_assignment_convergence(
         }
         sleep_until_local_evidence_poll(deadline);
     }
-    let diagnostics = durable_progress_diagnostics(nodes, None);
+    let diagnostics = durable_progress_diagnostics(nodes, &[]);
     panic!(
         "soak: {context} did not reach exact local assignment convergence before its existing \
          deadline: {last_pending}; observation=({diagnostics})"
@@ -11469,7 +11554,7 @@ fn count_recovery_diagnostic_markers(log: &str) -> BTreeMap<&'static str, usize>
 #[cfg(feature = "kafka")]
 fn durable_progress_diagnostics(
     nodes: &[Node],
-    commit_oracle: Option<&KafkaJoinCommitOracle>,
+    commit_oracles: &[&KafkaJoinCommitOracle],
 ) -> String {
     let live_nodes: Vec<&Node> = nodes.iter().filter(|node| node.child.is_some()).collect();
     let live_node_ids: Vec<usize> = live_nodes.iter().map(|node| node.id).collect();
@@ -11529,7 +11614,11 @@ fn durable_progress_diagnostics(
             try_cluster_metric(nodes, "laminardb_pipeline_cycle_errors_total"),
         ),
     ];
-    let offsets = commit_oracle.and_then(KafkaJoinCommitOracle::committed_offsets);
+    let offsets = commit_oracles
+        .iter()
+        .enumerate()
+        .map(|(oracle_index, oracle)| (oracle_index, oracle.committed_offsets()))
+        .collect::<Vec<_>>();
     format!(
         "live_node_ids={live_node_ids:?}, leader_by_node={leader_by_node:?}, \
          readiness_by_node={readiness_by_node:?}, \
@@ -11574,7 +11663,7 @@ fn assert_progress(
     if !graph_advanced {
         let observed_ingested = try_cluster_metric(nodes, "laminardb_events_ingested_total");
         let observed_emitted = try_cluster_metric(nodes, "laminardb_events_emitted_total");
-        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle);
+        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
         panic!(
             "soak: timed out after {advance_window:?} waiting for: {label}: source ingestion and \
              graph output to advance; ingested_target={ingested_target}, \
@@ -11641,7 +11730,7 @@ fn assert_progress(
             })
     });
     if !durability_advanced {
-        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle);
+        let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
         panic!(
             "soak: timed out after {durability_window:?} waiting for: {label}: checkpoints and \
              durable source offsets to advance; checkpoint_target={checkpoint_target}, \
@@ -11696,22 +11785,49 @@ fn assert_final_input_cuts(
             )
         })
         .collect::<Vec<_>>();
-    wait_for(
-        "frozen input offsets and two later checkpoints to commit",
-        remaining_progress_window(deadline, "final input cut"),
-        || {
-            assert_running_nodes(nodes);
-            checkpoint_targets.iter().all(|(node_id, target)| {
-                nodes
+    let progress_window = remaining_progress_window(deadline, "final input cut");
+    let reached = wait_until(progress_window, || {
+        assert_running_nodes(nodes);
+        checkpoint_targets.iter().all(|(node_id, target)| {
+            nodes
+                .iter()
+                .find(|node| node.id == *node_id && node.child.is_some())
+                .and_then(Node::commits)
+                .is_some_and(|commits| commits >= *target)
+        }) && commit_oracles
+            .iter()
+            .all(|oracle| oracle.covers(input_boundary))
+    });
+    if !reached {
+        let checkpoint_progress = checkpoint_targets
+            .iter()
+            .map(|(node_id, target)| {
+                let current = nodes
                     .iter()
                     .find(|node| node.id == *node_id && node.child.is_some())
-                    .and_then(Node::commits)
-                    .is_some_and(|commits| commits >= *target)
-            }) && commit_oracles
-                .iter()
-                .all(|oracle| oracle.covers(input_boundary))
-        },
-    );
+                    .and_then(Node::commits);
+                (*node_id, *target, current)
+            })
+            .collect::<Vec<_>>();
+        let source_cut_progress = commit_oracles
+            .iter()
+            .enumerate()
+            .map(|(oracle_index, oracle)| {
+                let observed = oracle.committed_offsets();
+                (
+                    oracle_index,
+                    offset_coverage_diagnostic(observed.as_deref(), input_boundary),
+                )
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = durable_progress_diagnostics(nodes, commit_oracles);
+        panic!(
+            "soak: timed out after {progress_window:?} waiting for: frozen input offsets and two \
+             later checkpoints to commit; checkpoint_progress=(node_id, target, current) \
+             {checkpoint_progress:?}, source_cut_progress={source_cut_progress:?}, \
+             observation=({diagnostics})"
+        );
+    }
     wait_for_converged_durable_checkpoint(
         nodes,
         deadline,
@@ -15352,6 +15468,8 @@ fn public_readiness_request_omits_console_authorization() {
 fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     let log = "leader lease operation failed: signed_url=?sig=secret\n\
                leader lease operation failed: account=secret\n\
+               checkpoint state serialization timed out: token=secret\n\
+               checkpoint source cut is incomplete: credential=secret\n\
                leader announced recovery prepare\n\
                recovery stop quorum timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
@@ -15359,6 +15477,11 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                coordinated recovery has no live durable leader proof\n";
     let counts = count_recovery_diagnostic_markers(log);
     assert_eq!(counts.get("leader_operation_failed"), Some(&2));
+    assert_eq!(
+        counts.get("checkpoint_state_serialization_timeout"),
+        Some(&1)
+    );
+    assert_eq!(counts.get("checkpoint_source_cut_incomplete"), Some(&1));
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
@@ -15368,6 +15491,42 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert!(!diagnostic.contains("secret"));
     assert!(!diagnostic.contains("sig="));
     assert!(!diagnostic.contains("account="));
+    assert!(!diagnostic.contains("token="));
+    assert!(!diagnostic.contains("credential="));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn offset_coverage_diagnostics_are_bounded_progress_summaries() {
+    assert_eq!(
+        offset_coverage_diagnostic(None, &[4, 8]),
+        OffsetCoverageDiagnostic::Unavailable {
+            expected_partitions: 2,
+        }
+    );
+    assert_eq!(
+        offset_coverage_diagnostic(Some(&[4]), &[4, 8]),
+        OffsetCoverageDiagnostic::PartitionCountMismatch {
+            expected_partitions: 2,
+            observed_partitions: 1,
+        }
+    );
+    assert_eq!(
+        offset_coverage_diagnostic(Some(&[4, 5, 12]), &[4, 8, 10]),
+        OffsetCoverageDiagnostic::Available {
+            partitions: 3,
+            covered_partitions: 2,
+            largest_shortfall: 3,
+        }
+    );
+    assert_eq!(
+        offset_coverage_diagnostic(Some(&[5, 9]), &[4, 8]),
+        OffsetCoverageDiagnostic::Available {
+            partitions: 2,
+            covered_partitions: 2,
+            largest_shortfall: 0,
+        }
+    );
 }
 
 #[cfg(feature = "kafka")]
