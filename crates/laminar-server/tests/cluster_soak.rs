@@ -211,7 +211,7 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 40] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 48] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -302,6 +302,38 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 40] = [
     (
         "recovery_successor_authorized",
         "authorized successor assignment from the last committed cluster cut",
+    ),
+    (
+        "snapshot_recovery_suspend_failed",
+        "snapshot watcher: could not suspend recovery assignment",
+    ),
+    (
+        "snapshot_recovery_fault_failed",
+        "snapshot watcher: could not publish recovery fault",
+    ),
+    (
+        "snapshot_recovery_checkpoint_settlement_failed",
+        "snapshot watcher: could not settle predecessor checkpoint for recovery",
+    ),
+    (
+        "snapshot_recovery_adoption_failed",
+        "snapshot watcher: adoption failed",
+    ),
+    (
+        "recovery_adoption_deadline",
+        "adoption exceeded its end-to-end deadline",
+    ),
+    (
+        "recovery_materialization_deadline",
+        "recovery assignment materialization exceeded its deadline",
+    ),
+    (
+        "recovery_handoff_manifest_missing",
+        "handoff manifest is missing",
+    ),
+    (
+        "recovery_retained_state_missing",
+        "cannot reuse retained vnode memory without its exact predecessor binding",
     ),
     ("assignment_rotated", "rotated assignment"),
     (
@@ -15558,6 +15590,14 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                leader announced recovery prepare\n\
                recovery stop quorum timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
+               snapshot watcher: could not suspend recovery assignment\n\
+               snapshot watcher: could not publish recovery fault\n\
+               snapshot watcher: could not settle predecessor checkpoint for recovery\n\
+               snapshot watcher: adoption failed\n\
+               recovery assignment 2 adoption exceeded its end-to-end deadline\n\
+               recovery assignment materialization exceeded its deadline\n\
+               participant 2 handoff manifest is missing\n\
+               cannot reuse retained vnode memory without its exact predecessor binding\n\
                rebalance failed; retrying after backoff\n\
                coordinated recovery has no live durable leader proof\n\
                Kafka source assign failed: token=secret\n\
@@ -15573,6 +15613,17 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
+    assert_eq!(counts.get("snapshot_recovery_suspend_failed"), Some(&1));
+    assert_eq!(counts.get("snapshot_recovery_fault_failed"), Some(&1));
+    assert_eq!(
+        counts.get("snapshot_recovery_checkpoint_settlement_failed"),
+        Some(&1)
+    );
+    assert_eq!(counts.get("snapshot_recovery_adoption_failed"), Some(&1));
+    assert_eq!(counts.get("recovery_adoption_deadline"), Some(&1));
+    assert_eq!(counts.get("recovery_materialization_deadline"), Some(&1));
+    assert_eq!(counts.get("recovery_handoff_manifest_missing"), Some(&1));
+    assert_eq!(counts.get("recovery_retained_state_missing"), Some(&1));
     assert_eq!(counts.get("rebalance_failed"), Some(&1));
     assert_eq!(counts.get("missing_live_leader_proof"), Some(&1));
     assert_eq!(counts.get("kafka_assign_failed"), Some(&1));
