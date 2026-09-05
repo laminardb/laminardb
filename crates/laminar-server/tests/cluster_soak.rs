@@ -211,7 +211,7 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 52] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 80] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -318,6 +318,112 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 52] = [
     (
         "snapshot_recovery_adoption_failed",
         "snapshot watcher: adoption failed",
+    ),
+    ("recovery_adoption_shutdown", "Database is shut down"),
+    (
+        "recovery_target_not_exact_successor",
+        "is not the exact successor of local assignment",
+    ),
+    (
+        "recovery_target_process_mismatch",
+        "target assignment does not bind local ownership to this process incarnation",
+    ),
+    (
+        "recovery_checkpoint_lifecycle_missing",
+        "has no audited checkpoint lifecycle",
+    ),
+    (
+        "recovery_checkpoint_pin_audit_failed",
+        "checkpoint-pin audit",
+    ),
+    (
+        "recovery_checkpoint_pin_mismatch",
+        "does not retain its exact authorized checkpoint pin",
+    ),
+    (
+        "recovery_stopped_prepare_audit_failed",
+        "stopped-recovery Prepare authority",
+    ),
+    (
+        "recovery_stopped_report_audit_failed",
+        "stopped-recovery local stopped-report read",
+    ),
+    (
+        "recovery_cold_bootstrap_required",
+        "must wait for a faulted cold bootstrap",
+    ),
+    (
+        "recovery_cold_publication_ineligible",
+        "cold publication requires the exact faulted graph",
+    ),
+    (
+        "recovery_target_ownership_missing",
+        "cold publication requires target-bound local vnode ownership",
+    ),
+    (
+        "recovery_installed_state_without_owner",
+        "found installed vnode state without current-process predecessor ownership",
+    ),
+    (
+        "recovery_pipeline_identity_changed",
+        "pipeline identity changed while preparing assignment",
+    ),
+    (
+        "recovery_stopped_topology_changed",
+        "stopped-recovery topology authority changed before registry commit",
+    ),
+    (
+        "recovery_local_execution_changed",
+        "local execution state changed while preparing assignment",
+    ),
+    (
+        "recovery_assignment_base_advanced",
+        "assignment base advanced from",
+    ),
+    (
+        "recovery_pending_transition",
+        "reached publication while another vnode transition was pending",
+    ),
+    (
+        "recovery_startup_deferred_ineligible",
+        "startup-deferred publication requires the exact Created assignment-zero lifecycle",
+    ),
+    (
+        "recovery_cold_authority_changed",
+        "cold-publication authority changed before registry commit",
+    ),
+    (
+        "recovery_publication_deadline",
+        "adoption reached its deadline before publication",
+    ),
+    (
+        "recovery_transition_coordinator_missing",
+        "has no checkpoint coordinator for transition identity",
+    ),
+    (
+        "recovery_bound_pipeline_missing",
+        "has no bound pipeline identity",
+    ),
+    ("recovery_authority_audit_failed", "authority audit failed"),
+    (
+        "recovery_materialization_mismatch",
+        "does not match its durable materialization",
+    ),
+    (
+        "recovery_durable_assignment_load_failed",
+        "failed to load durable assignment",
+    ),
+    (
+        "recovery_durable_assignment_missing",
+        "is absent from durable history",
+    ),
+    (
+        "recovery_local_identity_missing",
+        "has no live local process identity",
+    ),
+    (
+        "recovery_history_missing",
+        "cannot be adopted without durable assignment history",
     ),
     (
         "recovery_adoption_deadline",
@@ -15610,6 +15716,34 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                snapshot watcher: could not publish recovery fault\n\
                snapshot watcher: could not settle predecessor checkpoint for recovery\n\
                snapshot watcher: adoption failed\n\
+               Database is shut down\n\
+               is not the exact successor of local assignment\n\
+               target assignment does not bind local ownership to this process incarnation\n\
+               has no audited checkpoint lifecycle\n\
+               checkpoint-pin audit timed out\n\
+               does not retain its exact authorized checkpoint pin\n\
+               stopped-recovery Prepare authority observation timed out\n\
+               stopped-recovery local stopped-report read failed\n\
+               must wait for a faulted cold bootstrap\n\
+               cold publication requires the exact faulted graph\n\
+               cold publication requires target-bound local vnode ownership\n\
+               found installed vnode state without current-process predecessor ownership\n\
+               pipeline identity changed while preparing assignment\n\
+               stopped-recovery topology authority changed before registry commit\n\
+               local execution state changed while preparing assignment\n\
+               assignment base advanced from 1 to 2\n\
+               reached publication while another vnode transition was pending\n\
+               startup-deferred publication requires the exact Created assignment-zero lifecycle\n\
+               cold-publication authority changed before registry commit\n\
+               adoption reached its deadline before publication\n\
+               has no checkpoint coordinator for transition identity\n\
+               has no bound pipeline identity\n\
+               authority audit failed\n\
+               does not match its durable materialization\n\
+               failed to load durable assignment\n\
+               is absent from durable history\n\
+               has no live local process identity\n\
+               cannot be adopted without durable assignment history\n\
                recovery assignment 2 adoption exceeded its end-to-end deadline\n\
                recovery assignment materialization exceeded its deadline\n\
                participant 2 handoff manifest is missing\n\
@@ -15640,6 +15774,38 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
         Some(&1)
     );
     assert_eq!(counts.get("snapshot_recovery_adoption_failed"), Some(&1));
+    for marker in [
+        "recovery_adoption_shutdown",
+        "recovery_target_not_exact_successor",
+        "recovery_target_process_mismatch",
+        "recovery_checkpoint_lifecycle_missing",
+        "recovery_checkpoint_pin_audit_failed",
+        "recovery_checkpoint_pin_mismatch",
+        "recovery_stopped_prepare_audit_failed",
+        "recovery_stopped_report_audit_failed",
+        "recovery_cold_bootstrap_required",
+        "recovery_cold_publication_ineligible",
+        "recovery_target_ownership_missing",
+        "recovery_installed_state_without_owner",
+        "recovery_pipeline_identity_changed",
+        "recovery_stopped_topology_changed",
+        "recovery_local_execution_changed",
+        "recovery_assignment_base_advanced",
+        "recovery_pending_transition",
+        "recovery_startup_deferred_ineligible",
+        "recovery_cold_authority_changed",
+        "recovery_publication_deadline",
+        "recovery_transition_coordinator_missing",
+        "recovery_bound_pipeline_missing",
+        "recovery_authority_audit_failed",
+        "recovery_materialization_mismatch",
+        "recovery_durable_assignment_load_failed",
+        "recovery_durable_assignment_missing",
+        "recovery_local_identity_missing",
+        "recovery_history_missing",
+    ] {
+        assert_eq!(counts.get(marker), Some(&1), "missing {marker}");
+    }
     assert_eq!(counts.get("recovery_adoption_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_materialization_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_handoff_manifest_missing"), Some(&1));
