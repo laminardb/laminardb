@@ -39,6 +39,8 @@
 //! Environment knobs:
 //! - `LAMINAR_SOAK_SECONDS`      steady-soak duration after fault rounds (default 90)
 //! - `LAMINAR_SOAK_INTERVAL_MS`  checkpoint cadence (default 500; minimum 100)
+//! - `LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS`  optional bounded end-to-end checkpoint-attempt timeout;
+//!   it must remain below the configured recovery ceiling
 //! - `LAMINAR_SOAK_CHECKPOINT_SLO_MODE`  `certify` (default) enforces the checkpoint latency
 //!   sample-size and percentile SLOs; `observe` retains exact timing evidence and diagnostics for
 //!   functional smoke runs without claiming performance certification
@@ -50,7 +52,7 @@
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
 //! - `LAMINAR_SOAK_ALLOW_S3_EMULATOR=1`  debug/soak-only MinIO protocol validation; this does not
 //!   certify an emulator or custom endpoint for production; EO emulator runs use a bounded 60s
-//!   checkpoint-operation timeout while the real-store soak profile retains 30s
+//!   checkpoint-operation timeout
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
@@ -74,6 +76,8 @@
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 use std::collections::HashMap;
+#[cfg(feature = "kafka")]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Seek as _, SeekFrom, Write as _};
@@ -207,6 +211,10 @@ const RECOVERY_PREPARE_HANDOFF_LOG: &str =
 const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "kafka")]
+const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
+#[cfg(feature = "kafka")]
+const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
@@ -2907,7 +2915,7 @@ impl Node {
     }
 
     #[cfg(feature = "kafka")]
-    fn recovery_log_marker_counts(&self) -> Option<BTreeMap<&'static str, usize>> {
+    fn recovery_log_diagnostics(&self) -> Option<RecoveryLogDiagnostics> {
         let mut log = std::fs::File::open(&self.log_path).ok()?;
         let log_len = log.metadata().ok()?.len();
         let start = log_len.saturating_sub(RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES);
@@ -2916,9 +2924,7 @@ impl Node {
         log.take(RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES)
             .read_to_end(&mut tail)
             .ok()?;
-        Some(count_recovery_diagnostic_markers(&String::from_utf8_lossy(
-            &tail,
-        )))
+        Some(recovery_log_diagnostics(&String::from_utf8_lossy(&tail)))
     }
 
     #[cfg(feature = "kafka")]
@@ -9730,12 +9736,36 @@ impl JoinDelivery {
 }
 
 #[cfg(feature = "kafka")]
-fn cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bool) -> Duration {
+fn cluster_checkpoint_timeout(
+    delivery: JoinDelivery,
+    s3_emulator: bool,
+    configured: Option<Duration>,
+) -> Duration {
+    if let Some(configured) = configured {
+        assert!(
+            !configured.is_zero(),
+            "LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS must be greater than zero"
+        );
+        return configured;
+    }
     if delivery == JoinDelivery::ExactlyOnce && s3_emulator {
         CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
     } else {
         CLUSTER_CHECKPOINT_TIMEOUT
     }
+}
+
+#[cfg(feature = "kafka")]
+fn configured_cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bool) -> Duration {
+    let configured = std::env::var("LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS")
+        .ok()
+        .map(|value| {
+            let milliseconds = value.parse::<u64>().unwrap_or_else(|_| {
+                panic!("LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS must be an unsigned integer")
+            });
+            Duration::from_millis(milliseconds)
+        });
+    cluster_checkpoint_timeout(delivery, s3_emulator, configured)
 }
 
 #[cfg(feature = "kafka")]
@@ -10803,6 +10833,7 @@ fn write_config(
     dir: &Path,
     id: usize,
     interval_ms: u64,
+    checkpoint_timeout: Duration,
     key_groups: u32,
     checkpoint_url: &str,
     brokers: &str,
@@ -10838,8 +10869,11 @@ fn write_config(
     if storage.contains("endpoint") {
         storage.push_str("allow_http = \"true\"\n");
     }
-    let checkpoint_timeout_secs =
-        cluster_checkpoint_timeout(delivery, s3_emulator_enabled()).as_secs();
+    let checkpoint_timeout = if checkpoint_timeout.subsec_millis() == 0 {
+        format!("{}s", checkpoint_timeout.as_secs())
+    } else {
+        format!("{}ms", checkpoint_timeout.as_millis())
+    };
 
     // Discovery: gossip (phi-accrual failure detection) by default;
     // `LAMINAR_SOAK_DISCOVERY=static` for the seed-list heartbeat path.
@@ -10871,7 +10905,7 @@ advertise_host = "127.0.0.1"
 [checkpoint]
 url = "{url}"
 interval = "{interval_ms}ms"
-timeout = "{checkpoint_timeout_secs}s"
+timeout = "{checkpoint_timeout}"
 
 [checkpoint.storage]
 {storage}
@@ -11797,6 +11831,52 @@ fn assert_checkpoint_progress(
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryLogDiagnostics {
+    marker_counts: BTreeMap<&'static str, usize>,
+    recent_marker_sequence: Vec<&'static str>,
+    graph_drain_buffered_bytes: Vec<u64>,
+}
+
+#[cfg(feature = "kafka")]
+fn recovery_log_diagnostics(log: &str) -> RecoveryLogDiagnostics {
+    let mut recent_marker_sequence = VecDeque::with_capacity(RECOVERY_DIAGNOSTIC_SEQUENCE_MAX);
+    let mut graph_drain_buffered_bytes =
+        VecDeque::with_capacity(RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX);
+    for line in log.lines() {
+        for (name, marker) in RECOVERY_DIAGNOSTIC_MARKERS {
+            if line.contains(marker) {
+                if recent_marker_sequence.len() == RECOVERY_DIAGNOSTIC_SEQUENCE_MAX {
+                    recent_marker_sequence.pop_front();
+                }
+                recent_marker_sequence.push_back(name);
+            }
+        }
+        let Some((_, detail)) =
+            line.split_once("checkpoint graph drain exhausted its end-to-end deadline with ")
+        else {
+            continue;
+        };
+        let Some(bytes) = detail
+            .split_ascii_whitespace()
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if graph_drain_buffered_bytes.len() == RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX {
+            graph_drain_buffered_bytes.pop_front();
+        }
+        graph_drain_buffered_bytes.push_back(bytes);
+    }
+    RecoveryLogDiagnostics {
+        marker_counts: count_recovery_diagnostic_markers(log),
+        recent_marker_sequence: recent_marker_sequence.into_iter().collect(),
+        graph_drain_buffered_bytes: graph_drain_buffered_bytes.into_iter().collect(),
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn count_recovery_diagnostic_markers(log: &str) -> BTreeMap<&'static str, usize> {
     RECOVERY_DIAGNOSTIC_MARKERS
         .iter()
@@ -11832,9 +11912,9 @@ fn durable_progress_diagnostics(
         .iter()
         .map(|node| (node.id, node.durable_assignment_diagnostic()))
         .collect();
-    let recovery_log_markers_by_node: Vec<_> = live_nodes
+    let recovery_log_diagnostics_by_node: Vec<_> = live_nodes
         .iter()
-        .map(|node| (node.id, node.recovery_log_marker_counts()))
+        .map(|node| (node.id, node.recovery_log_diagnostics()))
         .collect();
     let ingestion_metrics_by_node: Vec<_> = live_nodes
         .iter()
@@ -11888,7 +11968,7 @@ fn durable_progress_diagnostics(
          durable_assignment_by_node={durable_assignment_by_node:?}, \
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
-         recovery_log_markers_by_node={recovery_log_markers_by_node:?}, \
+         recovery_log_diagnostics_by_node={recovery_log_diagnostics_by_node:?}, \
          ingestion_metrics_by_node={ingestion_metrics_by_node:?}, \
          checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
          durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
@@ -13415,7 +13495,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    let checkpoint_timeout = cluster_checkpoint_timeout(delivery, s3_emulator_enabled());
+    let checkpoint_timeout = configured_cluster_checkpoint_timeout(delivery, s3_emulator_enabled());
     validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
     let durable_output_window = recovery_aware_durable_progress_window(
         interval_ms,
@@ -13600,8 +13680,9 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     let join_keys = env_u64("LAMINAR_SOAK_JOIN_KEYS", DEFAULT_JOIN_KEYS);
     let zipf_milli = env_u64("LAMINAR_SOAK_ZIPF_MILLI", DEFAULT_ZIPF_MILLI);
     eprintln!(
-        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
+        "soak: PROFILE mode=cluster delivery={} seconds={soak_secs} checkpoint_ms={interval_ms} checkpoint_timeout_ms={} checkpoint_slo_mode={} hot_path_slo_mode={} join_interval_ms={retained_interval_ms} rps={source_rps} keys={join_keys} zipf_milli={zipf_milli} kills={max_kills} min_live_state_bytes={minimum_live_state_bytes} kafka_sink_linger_ms={SOAK_KAFKA_SINK_LINGER_MS}",
         delivery.label(),
+        checkpoint_timeout.as_millis(),
         checkpoint_slo_mode.label(),
         hot_path_slo_mode.label(),
     );
@@ -13639,6 +13720,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
                 dir.path(),
                 id,
                 interval_ms,
+                checkpoint_timeout,
                 key_group_count,
                 &checkpoint_url,
                 &brokers,
@@ -15721,6 +15803,44 @@ fn public_readiness_request_omits_console_authorization() {
         BoundedHttpAuthorization::ConsoleBearer,
     );
     assert!(console_request.contains("Authorization: Bearer "));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_log_diagnostics_are_bounded_and_do_not_copy_log_values() {
+    let drain_count = RECOVERY_DIAGNOSTIC_SEQUENCE_MAX + 2;
+    let mut log = String::new();
+    for buffered_bytes in 0..drain_count {
+        log.push_str(&format!(
+            "checkpoint graph drain exhausted its end-to-end deadline with {buffered_bytes} \
+             buffered bytes token=never-copy-this\n"
+        ));
+    }
+    log.push_str("leader announced recovery prepare account=never-copy-this\n");
+
+    let diagnostics = recovery_log_diagnostics(&log);
+    assert_eq!(
+        diagnostics
+            .marker_counts
+            .get("checkpoint_graph_drain_timeout"),
+        Some(&drain_count)
+    );
+    assert_eq!(
+        diagnostics.recent_marker_sequence.len(),
+        RECOVERY_DIAGNOSTIC_SEQUENCE_MAX
+    );
+    assert_eq!(
+        diagnostics.recent_marker_sequence.last(),
+        Some(&"recovery_prepare")
+    );
+    let first_retained_sample = drain_count - RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX;
+    assert_eq!(
+        diagnostics.graph_drain_buffered_bytes,
+        (first_retained_sample..drain_count)
+            .map(|value| u64::try_from(value).unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert!(!format!("{diagnostics:?}").contains("never-copy-this"));
 }
 
 #[cfg(feature = "kafka")]
@@ -18284,16 +18404,24 @@ fn bounded_join_oracle_matches_one_sided_sql_contract() {
 fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     assert_eq!(CLUSTER_CHECKPOINT_TIMEOUT, Duration::from_secs(30));
     assert_eq!(
-        cluster_checkpoint_timeout(JoinDelivery::AtLeastOnce, true),
+        cluster_checkpoint_timeout(JoinDelivery::AtLeastOnce, true, None),
         CLUSTER_CHECKPOINT_TIMEOUT
     );
     assert_eq!(
-        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, false),
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, false, None),
         CLUSTER_CHECKPOINT_TIMEOUT
     );
     assert_eq!(
-        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, true),
+        cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, true, None),
         CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    );
+    assert_eq!(
+        cluster_checkpoint_timeout(
+            JoinDelivery::AtLeastOnce,
+            false,
+            Some(Duration::from_secs(60)),
+        ),
+        Duration::from_secs(60)
     );
     assert!(CLUSTER_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
     assert!(CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
@@ -18303,6 +18431,7 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         directory.path(),
         0,
         250,
+        CLUSTER_CHECKPOINT_TIMEOUT,
         DEFAULT_CLUSTER_KEY_GROUPS,
         "s3://soak/checkpoints",
         "broker:9092",
