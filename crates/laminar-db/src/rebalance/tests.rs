@@ -26,24 +26,52 @@ impl laminar_core::cluster::control::ClusterKv for DelayedScanKv {
     }
 }
 
-struct PendingListStore {
-    inner: Arc<dyn ObjectStore>,
+struct GetBarrier {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    reads_before_wait: std::sync::atomic::AtomicUsize,
+    armed: std::sync::atomic::AtomicBool,
 }
 
-impl std::fmt::Debug for PendingListStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingListStore").finish_non_exhaustive()
+impl GetBarrier {
+    async fn wait_once(&self) {
+        if self
+            .reads_before_wait
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return;
+        }
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
     }
 }
 
-impl std::fmt::Display for PendingListStore {
+struct ReadBarrierStore {
+    inner: Arc<dyn ObjectStore>,
+    get: Option<Arc<GetBarrier>>,
+    stall_list: bool,
+}
+
+impl std::fmt::Debug for ReadBarrierStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PendingListStore")
+        f.debug_struct("ReadBarrierStore").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ReadBarrierStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadBarrierStore")
     }
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for PendingListStore {
+impl ObjectStore for ReadBarrierStore {
     async fn put_opts(
         &self,
         location: &object_store::path::Path,
@@ -66,6 +94,9 @@ impl ObjectStore for PendingListStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if let Some(get) = &self.get {
+            get.wait_once().await;
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -81,9 +112,13 @@ impl ObjectStore for PendingListStore {
 
     fn list(
         &self,
-        _prefix: Option<&object_store::path::Path>,
+        prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        Box::pin(futures::stream::pending())
+        if self.stall_list {
+            Box::pin(futures::stream::pending())
+        } else {
+            self.inner.list(prefix)
+        }
     }
 
     async fn list_with_delimiter(
@@ -1764,6 +1799,29 @@ async fn faulted_owner_cold_publishes_the_next_committed_drain_topology() {
 }
 
 #[tokio::test]
+async fn already_faulted_recovery_adoption_preserves_terminal_drain_authority() {
+    let (db, controller, registry, _current, target, _checkpoint_dir) =
+        stopped_recovery_topology_fixture(true, true, AssignmentDrainVerdict::Commit).await;
+    *db.runtime_shutdown.write() = tokio_util::sync::CancellationToken::new();
+    controller.set_recovering(true);
+    DbState::Faulted.store(&db.state);
+
+    let adoption = db
+        .adopt_recovery_assignment_snapshot(target.clone(), Duration::from_secs(1))
+        .await
+        .expect("an already-cold adoption must retain audited terminal-drain authority");
+
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), target.version);
+    assert_eq!(registry.owner(0), NodeId(2));
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(db.cluster_intake_fenced());
+    assert!(db.coordinated_recovery_in_progress());
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
+}
+
+#[tokio::test]
 async fn faulted_owner_cold_publishes_an_aborted_drain_rollback_topology() {
     let (db, controller, registry, current, target, _checkpoint_dir) =
         stopped_recovery_topology_fixture(true, true, AssignmentDrainVerdict::Abort).await;
@@ -3217,6 +3275,93 @@ fn takeover_audits_a_recovery_head_while_its_pin_is_propagated_to_the_next_gener
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_adoption_observes_a_compute_fault_during_authority_audit() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect_err("live adoption intentionally lacks the failed owner's handoff manifest");
+    assert!(
+        error.contains("participant 2 handoff manifest is missing"),
+        "{error}"
+    );
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(
+        crate::db::DbState::load(&db.state),
+        crate::db::DbState::Running
+    );
+    assert!(db.installed_vnode_state.lock().is_some());
+    assert!(db.pending_recovery_fault.load(Ordering::Acquire) != 0);
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let get = Arc::new(GetBarrier {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        // The first read materializes the requested target. Block the audit's independent
+        // recovery-materialization read so the generation changes during the authority audit.
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let delayed_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(get),
+        stall_list: false,
+    });
+    *db.assignment_snapshot_store.lock() =
+        Some(Arc::new(AssignmentSnapshotStore::new(delayed_store)));
+
+    let adopting_db = Arc::clone(&db);
+    let adoption = tokio::spawn(async move {
+        adopting_db
+            .adopt_recovery_assignment_snapshot(successor, Duration::from_secs(2))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("recovery adoption did not enter its durable authority audit");
+
+    db.fence_coordinated_recovery_lifecycle();
+    let generation = Arc::clone(&db.rotation_execution_fence).write_owned().await;
+    db.installed_vnode_state.lock().take();
+    crate::db::DbState::Faulted.store(&db.state);
+    drop(generation);
+    release.notify_one();
+
+    let adoption = tokio::time::timeout(Duration::from_secs(3), adoption)
+        .await
+        .expect("recovery adoption remained blocked after the authority audit resumed")
+        .unwrap()
+        .expect("the faulted generation must use cold recovery in the same adoption attempt");
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert_eq!(
+        crate::db::DbState::load(&db.state),
+        crate::db::DbState::Faulted
+    );
+}
+
 #[tokio::test]
 async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     let self_id = NodeId(1);
@@ -3564,7 +3709,11 @@ async fn wait_until_drained_fails_closed_when_no_snapshot() {
 #[tokio::test]
 async fn wait_until_drained_bounds_a_stalled_snapshot_read() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let blocked: Arc<dyn ObjectStore> = Arc::new(PendingListStore { inner });
+    let blocked: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner,
+        get: None,
+        stall_list: true,
+    });
     let store = AssignmentSnapshotStore::new(blocked);
 
     let drained = tokio::time::timeout(

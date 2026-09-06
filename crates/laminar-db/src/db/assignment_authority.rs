@@ -1,8 +1,24 @@
-use super::{AssignmentAuthorityActivation, DbError, LaminarDB};
+use super::{AssignmentAdoptionMode, AssignmentAuthorityActivation, DbError, DbState, LaminarDB};
 use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant, LeaderProof};
 use laminar_core::cluster::control::{
     ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryRound,
 };
+
+impl AssignmentAdoptionMode {
+    pub(super) fn after_authority_audit(
+        self,
+        audited_recovery: bool,
+        terminal_drain: bool,
+        state: DbState,
+    ) -> (Self, bool) {
+        let faulted = state == DbState::Faulted;
+        let faulted_terminal_drain = faulted && terminal_drain;
+        let use_cold =
+            self == Self::LiveTransition && faulted && (audited_recovery || terminal_drain);
+        let selected = if use_cold { Self::ColdRecovery } else { self };
+        (selected, faulted_terminal_drain)
+    }
+}
 
 async fn observe_stopped_round(
     controller: &ClusterController,

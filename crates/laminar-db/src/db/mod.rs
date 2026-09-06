@@ -2889,7 +2889,6 @@ impl LaminarDB {
         mode: AssignmentAdoptionMode,
     ) -> futures::future::BoxFuture<'_, Result<SnapshotAdoption, DbError>> {
         Box::pin(async move {
-            let mut mode = mode;
             if snapshot.draining {
                 return Err(DbError::Checkpoint(format!(
                     "assignment {} is a draining generation and cannot publish ownership",
@@ -3003,11 +3002,14 @@ impl LaminarDB {
             // still needs topology publication before a pristine graph can restore that older cut.
             // Reuse the cold-publication path only when the immutable drain audit and exact faulted
             // lifecycle below both hold; neither outcome reuses predecessor heap memory.
-            let faulted_terminal_drain_cold =
-                terminal_drain_authority && DbState::load(&self.state) == DbState::Faulted;
-            if mode == AssignmentAdoptionMode::LiveTransition && faulted_terminal_drain_cold {
-                mode = AssignmentAdoptionMode::ColdRecovery;
-            }
+            // The durable audit above can outlive the compute generation on a remote store. Select
+            // the recovery mode again after that I/O so a graph that faulted meanwhile does not
+            // pay for a known-invalid live transition and a second complete authority audit.
+            let (mut mode, faulted_terminal_drain_cold) = mode.after_authority_audit(
+                audited_recovery,
+                terminal_drain_authority,
+                DbState::load(&self.state),
+            );
             let target_fence = snapshot
                 .assignment_fence()
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
