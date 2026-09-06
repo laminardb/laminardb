@@ -14424,7 +14424,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         .collect::<Vec<_>>();
     let observation_budget = checkpoint_observation_budget(
         interval_ms,
-        CLUSTER_CHECKPOINT_TIMEOUT,
+        checkpoint_timeout,
         recovery_ceiling,
         &live_observation_budget,
     )
