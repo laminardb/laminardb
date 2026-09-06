@@ -76,9 +76,7 @@
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write as _};
-#[cfg(feature = "kafka")]
-use std::io::{Seek as _, SeekFrom};
+use std::io::{Read, Seek as _, SeekFrom, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -104,6 +102,7 @@ use laminar_core::cluster::control::{
 };
 
 const NODES: usize = 3;
+const NODE_LOG_TAIL_BYTES: u64 = 64 * 1024;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
 const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
@@ -2964,10 +2963,29 @@ impl Node {
 
     fn dump_log_tail(&self) {
         eprintln!("--- node{} log tail:", self.id);
-        if let Ok(log) = std::fs::read_to_string(&self.log_path) {
-            for line in log.lines().rev().take(40).collect::<Vec<_>>().iter().rev() {
-                eprintln!("  {line}");
-            }
+        let Ok(mut log) = std::fs::File::open(&self.log_path) else {
+            return;
+        };
+        let Ok(end) = log.seek(SeekFrom::End(0)) else {
+            return;
+        };
+        let start = end.saturating_sub(NODE_LOG_TAIL_BYTES);
+        if log.seek(SeekFrom::Start(start)).is_err() {
+            return;
+        }
+        let mut bytes = Vec::new();
+        if log.take(end - start).read_to_end(&mut bytes).is_err() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let text = if start == 0 {
+            text.as_ref()
+        } else {
+            text.split_once('\n')
+                .map_or(text.as_ref(), |(_, tail)| tail)
+        };
+        for line in text.lines().rev().take(40).collect::<Vec<_>>().iter().rev() {
+            eprintln!("  {line}");
         }
     }
 
@@ -11910,6 +11928,9 @@ fn assert_progress(
         let observed_ingested = try_cluster_metric(nodes, "laminardb_events_ingested_total");
         let observed_emitted = try_cluster_metric(nodes, "laminardb_events_emitted_total");
         let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
+        for node in nodes.iter() {
+            node.dump_log_tail();
+        }
         panic!(
             "soak: timed out after {advance_window:?} waiting for: {label}: source ingestion and \
              graph output to advance; ingested_target={ingested_target}, \
@@ -11977,6 +11998,9 @@ fn assert_progress(
     });
     if !durability_advanced {
         let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
+        for node in nodes.iter() {
+            node.dump_log_tail();
+        }
         panic!(
             "soak: timed out after {durability_window:?} waiting for: {label}: checkpoints and \
              durable source offsets to advance; checkpoint_target={checkpoint_target}, \
