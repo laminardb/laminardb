@@ -103,6 +103,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      # Native control-plane and checkpoint I/O share one semantic attempt deadline. Keep the
+      # provider-latency allowance bounded below the 90-second recovery liveness ceiling.
+      LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS: "60000"
     strategy:
       fail-fast: false
       matrix:
@@ -236,11 +240,14 @@ jobs:
           requested_kills="$EVIDENCE_PROCESS_KILLS"
           actual_kills=0
           produced=null
+          checkpoint_timeout=null
           output_summary=""
           if [[ -f native-checkpoint-soak.log ]]; then
             actual_kills="$(awk '/^soak round [0-9]+: kill -9 delivered / { count++ } END { print count + 0 }' native-checkpoint-soak.log)"
             produced_value="$(sed -n 's/.*producer acknowledged \([0-9][0-9]*\) records.*/\1/p' native-checkpoint-soak.log | tail -1)"
             if [[ -n "$produced_value" ]]; then produced="$produced_value"; fi
+            checkpoint_timeout_value="$(sed -n 's/^soak: PROFILE mode=cluster .* checkpoint_timeout_ms=\([0-9][0-9]*\) .*/\1/p' native-checkpoint-soak.log | tail -1)"
+            if [[ -n "$checkpoint_timeout_value" ]]; then checkpoint_timeout="$checkpoint_timeout_value"; fi
             output_summary="$(sed -n 's/.*output oracle consumed.*observed all \([0-9][0-9]*\) pairs.*with \([0-9][0-9]*\) at-least-once duplicates.*/\1 \2/p' native-checkpoint-soak.log | tail -1)"
           fi
           recovered=0
@@ -251,6 +258,7 @@ jobs:
           cleanup_result=failed
           if [[ "${{ steps.cleanup.outcome }}" == "success" ]]; then cleanup_result=passed; fi
           if [[ "${{ steps.cleanup.outcome }}" == "skipped" ]]; then cleanup_result="preserved-on-request"; fi
+          if [[ "$checkpoint_timeout" != "$LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS" ]]; then passed=false; fi
           now_ms="$(date +%s%3N)"
           started_ms="${SOAK_STARTED_EPOCH_MS:-$now_ms}"
           duration_ms=$((now_ms - started_ms))
@@ -262,9 +270,10 @@ jobs:
             --arg cleanup "$cleanup_result" --argjson passed "$passed" \
             --argjson kills "$actual_kills" --argjson requested_kills "$requested_kills" \
             --argjson recovery "$EVIDENCE_RECOVERY_TIMEOUT_MS" \
+            --argjson checkpoint_timeout "$checkpoint_timeout" \
             --argjson produced "$produced" --argjson recovered "$recovered" \
             --argjson duplicates "$duplicates" --argjson duration "$duration_ms" \
-            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run_id,provider:$provider,native_or_emulator:"native",redacted_endpoint_classification:"native-provider-default",region_or_cloud_location:(env.LAMINAR_CLOUD_LOCATION // null),url_scheme:$scheme,enabled_cargo_features:["cluster","kafka",$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"checkpoint-native-process-soak",test_name:"three_node_alo_join_kill9_soak",started_at:$started,finished_at:$finished,duration_ms:$duration,iterations:$kills,process_kill_count:$kills,requested_process_kill_count:$requested_kills,recovery_bound_ms:$recovery,capability_results:{real_process_kill:($kills > 0),all_requested_process_kills:($kills == $requested_kills),fresh_client_recovery:$passed,no_loss_assertion:$passed,duplicates_identified_and_bounded:$passed},conditional_create_result:null,stale_cas_result:null,restart_result:$passed,delivery_contract_tested:"at-least-once",records_produced:$produced,records_committed:(if $passed then $recovered else null end),records_recovered:(if $passed then $recovered else null end),duplicates:(if $passed then $duplicates else null end),losses:(if $passed then 0 else null end),passed:$passed,skip_count:0,skip_reasons:[],cleanup_result:$cleanup,failure:(if $passed then null else "native checkpoint process soak, output evidence, or cleanup failed" end)}' \
+            '{schema_version:1,repository:"laminardb/laminardb",base_sha:$base_sha,tested_sha:$tested_sha,workflow_run_id:$run_id,provider:$provider,native_or_emulator:"native",redacted_endpoint_classification:"native-provider-default",region_or_cloud_location:(env.LAMINAR_CLOUD_LOCATION // null),url_scheme:$scheme,enabled_cargo_features:["cluster","kafka",$provider],object_store_version:(env.LAMINAR_OBJECT_STORE_VERSION // "unknown"),deltalake_version:null,iceberg_version:null,opendal_version:null,auth_source:(env.LAMINAR_NATIVE_AUTH_SOURCE // "unknown"),test_suite:"checkpoint-native-process-soak",test_name:"three_node_alo_join_kill9_soak",started_at:$started,finished_at:$finished,duration_ms:$duration,iterations:$kills,process_kill_count:$kills,requested_process_kill_count:$requested_kills,recovery_bound_ms:$recovery,checkpoint_timeout_ms:$checkpoint_timeout,capability_results:{real_process_kill:($kills > 0),all_requested_process_kills:($kills == $requested_kills),fresh_client_recovery:$passed,no_loss_assertion:$passed,duplicates_identified_and_bounded:$passed},conditional_create_result:null,stale_cas_result:null,restart_result:$passed,delivery_contract_tested:"at-least-once",records_produced:$produced,records_committed:(if $passed then $recovered else null end),records_recovered:(if $passed then $recovered else null end),duplicates:(if $passed then $duplicates else null end),losses:(if $passed then 0 else null end),passed:$passed,skip_count:0,skip_reasons:[],cleanup_result:$cleanup,failure:(if $passed then null else "native checkpoint process soak, output evidence, or cleanup failed" end)}' \
             > "$LAMINAR_CLOUD_EVIDENCE_DIR/checkpoint-native-process-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json"
       - name: Validate native evidence eligibility
         id: validate_evidence
@@ -278,6 +287,9 @@ jobs:
             jq -e --arg sha "$GITHUB_SHA" '.tested_sha == $sha and .native_or_emulator == "native" and .skip_count == 0 and .passed == true and .cleanup_result == "passed"' "$evidence" >/dev/null
             count=$((count + 1))
           done
+          jq -e --argjson timeout "$LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS" \
+            '.checkpoint_timeout_ms == $timeout' \
+            "$LAMINAR_CLOUD_EVIDENCE_DIR/checkpoint-native-process-soak-${{ matrix.provider }}-$GITHUB_RUN_ID.json" >/dev/null
           test "$count" -eq 3
       - name: Upload native checkpoint evidence
         id: upload_evidence
