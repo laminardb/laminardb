@@ -1208,7 +1208,7 @@ async fn stopped_recovery_topology_requires_the_exact_durable_fault_sequence() {
 }
 
 #[tokio::test]
-async fn stopped_recovery_owner_topology_publishes_an_audited_recovery_successor() {
+async fn stopped_recovery_owner_publishes_successor_after_driver_candidacy_loss() {
     let (db, controller, registry, _current, target, round, process_authority, _checkpoint_dir) =
         stopped_recovery_successor_fixture(true).await;
     assert!(controller.recovery_round_requires_current_process_stop(&round));
@@ -1223,6 +1223,8 @@ async fn stopped_recovery_owner_topology_publishes_an_audited_recovery_successor
         .is_none(),
         "Prepare is the only quiescence witness until the exact target roster adopts"
     );
+    controller.set_active(false);
+    assert!(!controller.recovery_driver_is_current(&round));
 
     let adoption = db
         .adopt_recovery_assignment_snapshot(

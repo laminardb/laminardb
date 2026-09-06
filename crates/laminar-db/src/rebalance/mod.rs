@@ -18,8 +18,8 @@ use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
-    RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult, RotateOutcome,
-    SnapshotError,
+    LeaderProof, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
+    RotateOutcome, SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{
@@ -1425,6 +1425,7 @@ pub(crate) struct AuditedAssignmentAuthority {
     predecessor: Option<CheckpointAssignmentFence>,
     handoff_checkpoint: Option<CommittedCheckpointRef>,
     recovery_checkpoint: Option<AuditedRecoveryCheckpoint>,
+    recovery_leader_proof: Option<LeaderProof>,
     terminal: Option<AuditedDrainOutcome>,
 }
 
@@ -1494,6 +1495,7 @@ impl AuditedAssignmentAuthority {
             predecessor: None,
             handoff_checkpoint: None,
             recovery_checkpoint: None,
+            recovery_leader_proof: None,
             terminal: None,
         }
     }
@@ -1502,6 +1504,7 @@ impl AuditedAssignmentAuthority {
         target_version: u64,
         predecessor: CheckpointAssignmentFence,
         recovery_checkpoint: AuditedRecoveryCheckpoint,
+        recovery_leader_proof: LeaderProof,
     ) -> Self {
         let handoff_checkpoint = recovery_checkpoint.checkpoint().clone();
         Self {
@@ -1509,6 +1512,7 @@ impl AuditedAssignmentAuthority {
             predecessor: Some(predecessor),
             handoff_checkpoint: Some(handoff_checkpoint),
             recovery_checkpoint: Some(recovery_checkpoint),
+            recovery_leader_proof: Some(recovery_leader_proof),
             terminal: None,
         }
     }
@@ -1520,6 +1524,7 @@ impl AuditedAssignmentAuthority {
             predecessor: Some(terminal.transition.predecessor.clone()),
             handoff_checkpoint,
             recovery_checkpoint: None,
+            recovery_leader_proof: None,
             terminal: Some(terminal),
         }
     }
@@ -1550,6 +1555,13 @@ impl AuditedAssignmentAuthority {
         self.recovery_checkpoint
             .as_ref()
             .is_some_and(AuditedRecoveryCheckpoint::pin_is_active)
+    }
+
+    pub(crate) fn active_recovery_leader_proof(&self) -> Option<&LeaderProof> {
+        self.recovery_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.pin_is_active())
+            .and(self.recovery_leader_proof.as_ref())
     }
 
     pub(crate) fn recovery_checkpoint_was_consumed(&self) -> bool {
@@ -1779,13 +1791,14 @@ pub(crate) fn audit_assignment_snapshot_authority_outcome<'a>(
             .await
             .map_err(|error| error.to_string())?
         else {
-            let (predecessor, handoff_checkpoint) =
+            let (predecessor, handoff_checkpoint, leader_proof) =
                 audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
                     .await?;
             return Ok(AuditedAssignmentAuthority::recovery(
                 snapshot.version,
                 predecessor,
                 handoff_checkpoint,
+                leader_proof,
             ));
         };
         audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
@@ -1865,29 +1878,29 @@ fn validate_portable_recovery_cut(
     Ok(origin.clone())
 }
 
+type AuditedRecoveryAuthority = (
+    CheckpointAssignmentFence,
+    AuditedRecoveryCheckpoint,
+    LeaderProof,
+);
+
 fn audit_materialized_recovery_with_authority<'a>(
     store: &'a AssignmentSnapshotStore,
     authority: Option<&'a LeaderLeaseStore>,
     snapshot: &'a AssignmentSnapshot,
-) -> futures::future::BoxFuture<
-    'a,
-    Result<(CheckpointAssignmentFence, AuditedRecoveryCheckpoint), String>,
-> {
+) -> futures::future::BoxFuture<'a, Result<AuditedRecoveryAuthority, String>> {
     Box::pin(async move {
+        let version = snapshot.version;
         let authority = authority.ok_or_else(|| {
-            format!(
-                "materialized assignment recovery {} has no cluster authority",
-                snapshot.version
-            )
+            format!("materialized assignment recovery {version} has no cluster authority")
         })?;
         let decision = authority
-            .assignment_recovery_decision(snapshot.version)
+            .assignment_recovery_decision(version)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
                 format!(
-                    "assignment {} has no drain transition or recovery authority decision",
-                    snapshot.version
+                    "assignment {version} has no drain transition or recovery authority decision"
                 )
             })?;
         let proposal = store
@@ -1905,8 +1918,7 @@ fn audit_materialized_recovery_with_authority<'a>(
                 snapshot.version
             ));
         }
-        let predecessor_version = snapshot
-            .version
+        let predecessor_version = version
             .checked_sub(1)
             .ok_or_else(|| "recovery assignment has no predecessor generation".to_string())?;
         let predecessor = store
@@ -1914,10 +1926,7 @@ fn audit_materialized_recovery_with_authority<'a>(
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
-                format!(
-                    "recovery assignment {} lost predecessor {predecessor_version}",
-                    snapshot.version
-                )
+                format!("recovery assignment {version} lost predecessor {predecessor_version}")
             })?;
         if predecessor.draining
             || predecessor
@@ -2101,7 +2110,11 @@ fn audit_materialized_recovery_with_authority<'a>(
                 successor: successor.target,
             }
         };
-        Ok((decision.predecessor, recovery_checkpoint))
+        Ok((
+            decision.predecessor,
+            recovery_checkpoint,
+            decision.leader_proof,
+        ))
     })
 }
 
@@ -2139,7 +2152,7 @@ fn abort_predecessor_checkpoint_for_recovery<'a>(
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        let (predecessor, audited_recovery) = tokio::time::timeout_at(
+        let (predecessor, audited_recovery, _) = tokio::time::timeout_at(
             deadline,
             audit_materialized_recovery_with_authority(store, Some(authority.as_ref()), snapshot),
         )

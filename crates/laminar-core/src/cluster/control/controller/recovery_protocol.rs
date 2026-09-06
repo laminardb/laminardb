@@ -370,18 +370,12 @@ impl ClusterController {
         }
     }
 
-    /// Active recovery announcement with semantic failures separated from uncertain I/O.
-    ///
-    /// # Errors
-    /// Classifies malformed state, superseded authority, and retryable durable I/O separately.
-    pub async fn observe_recover_control(
+    async fn recovery_announcement_for_driver(
         &self,
+        driver: NodeId,
     ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
-        let Some(current_driver) = self.current_leader() else {
-            return Ok(None);
-        };
         let Some(raw) = self
-            .read_recovery_value(current_driver, "control:recover")
+            .read_recovery_value(driver, "control:recover")
             .await
             .map_err(RecoveryControlError::Uncertain)?
         else {
@@ -397,43 +391,104 @@ impl ClusterController {
                 "committed recovery release appeared in the mutable intent slot".into(),
             ));
         }
-        if announcement.round.id.driver != current_driver {
+        if announcement.round.id.driver != driver {
             return Err(RecoveryControlError::Conflict(format!(
-                "recovery publisher {current_driver} is not declared driver {}",
+                "recovery publisher {driver} is not declared driver {}",
                 announcement.round.id.driver
             )));
         }
+        Ok(Some(announcement))
+    }
+
+    async fn recovery_authority_matches_for_observation(
+        &self,
+        proof: &LeaderProof,
+    ) -> Result<bool, RecoveryControlError> {
         let authority = self
             .checkpoint_authority()
             .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?;
-        let Some(authority_before) = authority.load().await.map_err(|error| match error {
-            super::super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
-            error => RecoveryControlError::Conflict(error.to_string()),
-        })?
-        else {
-            return Err(RecoveryControlError::Superseded(
-                "durable recovery authority has no leader".into(),
-            ));
+        authority
+            .load()
+            .await
+            .map_err(|error| match error {
+                super::super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
+                error => RecoveryControlError::Conflict(error.to_string()),
+            })
+            .map(|lease| lease.is_some_and(|lease| lease.matches_proof(proof)))
+    }
+
+    /// Active recovery announcement with semantic failures separated from uncertain I/O.
+    ///
+    /// # Errors
+    /// Classifies malformed state, superseded authority, and retryable durable I/O separately.
+    pub async fn observe_recover_control(
+        &self,
+    ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+        let Some(current_driver) = self.current_leader() else {
+            return Ok(None);
         };
-        if !authority_before.matches_proof(&announcement.round.leader_proof) {
+        let Some(announcement) = self
+            .recovery_announcement_for_driver(current_driver)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if !self
+            .recovery_authority_matches_for_observation(&announcement.round.leader_proof)
+            .await?
+        {
             return Err(RecoveryControlError::Superseded(format!(
                 "recovery phase from {current_driver} does not match durable leader authority"
             )));
         }
-        let Some(authority_after) = authority.load().await.map_err(|error| match error {
-            super::super::LeaseError::Io(reason) => RecoveryControlError::Uncertain(reason),
-            error => RecoveryControlError::Conflict(error.to_string()),
-        })?
-        else {
-            return Err(RecoveryControlError::Superseded(
-                "durable recovery authority vanished during observation".into(),
-            ));
-        };
         if self.current_leader() != Some(current_driver)
-            || !authority_after.matches_proof(&announcement.round.leader_proof)
+            || !self
+                .recovery_authority_matches_for_observation(&announcement.round.leader_proof)
+                .await?
         {
             return Err(RecoveryControlError::Superseded(format!(
                 "recovery authority changed while observing {current_driver}"
+            )));
+        }
+        Ok(Some(announcement))
+    }
+
+    /// Observe a nonterminal recovery announcement through an exact durable leader proof.
+    ///
+    /// This is intentionally independent of the local gossip candidacy view. It permits a stopped
+    /// process to finish publishing an already-audited recovery topology after its driver loses
+    /// candidacy, while the durable fencing term remains unchanged.
+    ///
+    /// # Errors
+    /// Classifies malformed state, superseded authority, and retryable durable I/O separately.
+    pub async fn observe_recover_control_for_durable_proof(
+        &self,
+        proof: &LeaderProof,
+    ) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+        if !proof.is_canonical() {
+            return Err(RecoveryControlError::Conflict(
+                "recovery observation requires a canonical durable leader proof".into(),
+            ));
+        }
+        if !self
+            .recovery_authority_matches_for_observation(proof)
+            .await?
+        {
+            return Err(RecoveryControlError::Superseded(
+                "durable recovery authority does not match the audited proof".into(),
+            ));
+        }
+        let driver = NodeId(proof.owner.node_id);
+        let Some(announcement) = self.recovery_announcement_for_driver(driver).await? else {
+            return Ok(None);
+        };
+        if announcement.round.leader_proof != *proof
+            || !self
+                .recovery_authority_matches_for_observation(proof)
+                .await?
+        {
+            return Err(RecoveryControlError::Superseded(format!(
+                "recovery authority changed while observing {driver} through its durable proof"
             )));
         }
         Ok(Some(announcement))

@@ -5,6 +5,10 @@
 mod assignment_authority;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+#[cfg(feature = "cluster")]
+pub(crate) use assignment_authority::{
+    audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1428,81 +1432,6 @@ enum AssignmentAdoptionMode {
     /// process, or an exact recovery successor whose pinned cut still belongs to the stopped
     /// predecessor. The successor graph restores the durable cut at startup.
     StoppedRecoveryTopology,
-}
-
-#[cfg(feature = "cluster")]
-pub(crate) async fn audited_stopped_terminal_round(
-    controller: &laminar_core::cluster::control::ClusterController,
-    predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
-    deadline: tokio::time::Instant,
-) -> Result<Option<laminar_core::cluster::control::RecoveryRound>, DbError> {
-    use laminar_core::cluster::control::{RecoverPhase, RecoveryAnnouncement};
-
-    let active = tokio::time::timeout_at(deadline, controller.observe_recover_control())
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery Prepare authority observation timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery Prepare authority observation failed: {error}"
-            ))
-        })?;
-    let Some(RecoveryAnnouncement {
-        round,
-        phase: RecoverPhase::Prepare,
-    }) = active
-    else {
-        return Ok(None);
-    };
-    let local = controller.instance_id();
-    if round.assignment_fence != *predecessor
-        || !controller.recovery_driver_is_current(&round)
-        || !controller.recovery_round_requires_current_process_stop(&round)
-        || !controller.process_lease_is_live()
-    {
-        return Ok(None);
-    }
-    let reports = tokio::time::timeout_at(deadline, controller.read_stopped(&round, &[local]))
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery local stopped-report read timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery local stopped-report read failed: {error}"
-            ))
-        })?;
-    let expected = laminar_core::checkpoint::CheckpointParticipant {
-        node_id: local.0,
-        boot_incarnation: controller.recovery_incarnation(),
-    };
-    if reports.len() != 1
-        || reports[0].publisher() != expected
-        || reports[0].validate(&round).is_err()
-    {
-        return Ok(None);
-    }
-    let confirmed = tokio::time::timeout_at(deadline, controller.observe_recover_control())
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery Prepare authority recheck timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery Prepare authority recheck failed: {error}"
-            ))
-        })?;
-    if confirmed
-        != Some(RecoveryAnnouncement {
-            round: round.clone(),
-            phase: RecoverPhase::Prepare,
-        })
-        || !controller.process_lease_is_live()
-    {
-        return Ok(None);
-    }
-    Ok(Some(round))
 }
 
 /// Result of certifying a clustered process at startup.
@@ -3042,9 +2971,8 @@ impl LaminarDB {
             let audited_predecessor = audited_target.predecessor().cloned();
             let committed_handoff_checkpoint = audited_target.handoff_checkpoint().cloned();
             let recovery_origin = audited_target.recovery_origin().cloned();
-            let recovery_pin_is_active = audited_target.recovery_pin_is_active();
-            let recovery_checkpoint_was_consumed =
-                audited_target.recovery_checkpoint_was_consumed();
+            let recovery_proof = audited_target.active_recovery_leader_proof().cloned();
+            let recovery_was_consumed = audited_target.recovery_checkpoint_was_consumed();
             let audited_drain = audited_target.into_terminal();
             let terminal_drain_authority = !audited_recovery && audited_drain.is_some();
             let aborted_drain_authority = !audited_recovery
@@ -3073,7 +3001,7 @@ impl LaminarDB {
                 .assignment_fence()
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
             let recovery_requires_cold = audited_recovery
-                && (recovery_checkpoint_was_consumed
+                && (recovery_was_consumed
                     || recovery_origin.as_ref().is_some_and(|origin| {
                         audited_predecessor.as_ref().is_some_and(|predecessor| {
                             origin.assignment_version < predecessor.assignment_version
@@ -3099,7 +3027,7 @@ impl LaminarDB {
                             snapshot.version
                         ))
                     })?;
-                    if recovery_pin_is_active {
+                    if recovery_proof.is_some() {
                         let pinned = tokio::time::timeout_at(
                             deadline,
                             authority.assignment_handoff_checkpoint(&target_fence),
@@ -3123,7 +3051,7 @@ impl LaminarDB {
                                 snapshot.version
                             )));
                         }
-                    } else if recovery_checkpoint_was_consumed {
+                    } else if recovery_was_consumed {
                         let head = tokio::time::timeout_at(
                             deadline,
                             authority.highest_cluster_committed_outcome(),
@@ -3475,8 +3403,7 @@ impl LaminarDB {
                 && target_fence.participant_incarnation(self_id.0).is_none();
             let stopped_aborted_topology_shape =
                 stopped_aborted_owner_topology_shape || stopped_aborted_ownerless_topology_shape;
-            let stopped_recovery_successor_topology_shape = audited_recovery
-                && recovery_pin_is_active
+            let stopped_recovery_successor_topology_shape = recovery_proof.is_some()
                 && committed_handoff_checkpoint.is_some()
                 && predecessor_fence.is_some();
             let prepared_recovery_fault_is_active = if stopped_recovery_topology_common
@@ -3537,11 +3464,12 @@ impl LaminarDB {
                 };
             let stopped_recovery_successor_round =
                 if stopped_recovery_topology_common && stopped_recovery_successor_topology_shape {
-                    audited_stopped_terminal_round(
+                    audited_stopped_recovery_successor_round(
                         controller.as_ref(),
                         predecessor_fence
                             .as_ref()
                             .expect("recovery successor shape has predecessor"),
+                        recovery_proof.as_ref().expect("audited active proof"),
                         deadline,
                     )
                     .await?
@@ -3867,11 +3795,12 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_recovery_successor_topology_shape
             {
-                audited_stopped_terminal_round(
+                audited_stopped_recovery_successor_round(
                     controller.as_ref(),
                     predecessor_fence
                         .as_ref()
                         .expect("recovery successor shape has predecessor"),
+                    recovery_proof.as_ref().expect("audited active proof"),
                     deadline,
                 )
                 .await?
