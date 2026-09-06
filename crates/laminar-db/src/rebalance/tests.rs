@@ -1227,10 +1227,7 @@ async fn stopped_recovery_owner_publishes_successor_after_driver_candidacy_loss(
     assert!(!controller.recovery_driver_is_current(&round));
 
     let adoption = db
-        .adopt_recovery_assignment_snapshot(
-            target.clone(),
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(target.clone(), Duration::from_secs(1))
         .await
         .expect("an exact stopped owner must topology-publish its audited recovery successor");
 
@@ -1323,16 +1320,67 @@ async fn stopped_recovery_owner_publishes_successor_after_driver_candidacy_loss(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_adoption_execution_budget_starts_after_serialization() {
+    let (db, controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
+        stopped_recovery_successor_fixture(true).await;
+    controller.set_active(false);
+
+    let operation_timeout = Duration::from_millis(500);
+    let serialization = Arc::clone(&db.assignment_adoption_lock).lock_owned().await;
+    let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+    let adopting_db = Arc::clone(&db);
+    let started = tokio::time::Instant::now();
+    let adoption = tokio::spawn(async move {
+        adopting_db
+            .adopt_recovery_assignment_snapshot(target, operation_timeout)
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    drop(serialization);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(execution);
+
+    let adoption = tokio::time::timeout(Duration::from_secs(2), adoption)
+        .await
+        .expect("recovery adoption remained blocked after both bounded phases")
+        .unwrap()
+        .expect("serialized recovery adoption must retain its full execution budget");
+    assert!(started.elapsed() > operation_timeout);
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+}
+
+#[tokio::test]
+async fn recovery_adoption_serialization_timeout_is_fail_closed() {
+    let (db, controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
+        stopped_recovery_successor_fixture(true).await;
+    controller.set_active(false);
+    let _serialization = Arc::clone(&db.assignment_adoption_lock).lock_owned().await;
+
+    let error = db
+        .adopt_recovery_assignment_snapshot(target, Duration::from_millis(50))
+        .await
+        .expect_err("recovery adoption must not wait indefinitely for assignment serialization");
+
+    assert!(
+        error
+            .to_string()
+            .contains("timed out waiting for assignment serialization"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+}
+
 #[tokio::test]
 async fn stopped_recovery_successor_requires_the_exact_local_stopped_report() {
     let (db, _controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
         stopped_recovery_successor_fixture(false).await;
 
     let error = db
-        .adopt_recovery_assignment_snapshot(
-            target,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(target, Duration::from_secs(1))
         .await
         .expect_err(
             "Prepare without this boot's Stopped report must not publish recovery topology",
@@ -3184,10 +3232,7 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     crate::db::DbState::Faulted.store(&db.state);
 
     let error = db
-        .adopt_recovery_assignment_snapshot(
-            successor,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(successor, Duration::from_secs(1))
         .await
         .expect_err("cold publication requires coordinated recovery lifecycle ownership");
     assert!(error.to_string().contains("recovery lifecycle fence"));

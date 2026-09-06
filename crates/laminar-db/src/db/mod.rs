@@ -2845,23 +2845,34 @@ impl LaminarDB {
     /// Install an authority-sequenced failure-recovery successor. A still-running graph uses the
     /// ordinary live transition. Only an exactly faulted, terminally observed and recovery-fenced
     /// graph selects cold publication without reusing predecessor heap memory.
+    ///
+    /// Waiting for another assignment operation and executing this adoption are independently
+    /// bounded. A competing observer must not consume the durable re-audit and publication budget
+    /// after this caller acquires serialization.
     #[cfg(feature = "cluster")]
     pub(crate) async fn adopt_recovery_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
-        deadline: tokio::time::Instant,
+        operation_timeout: Duration,
     ) -> Result<SnapshotAdoption, DbError> {
         let version = snapshot.version;
-        tokio::time::timeout_at(deadline, async {
-            let _adoption = self.assignment_adoption_lock.lock().await;
-            let mode = if DbState::load(&self.state) == DbState::Faulted {
-                AssignmentAdoptionMode::ColdRecovery
-            } else {
-                AssignmentAdoptionMode::LiveTransition
-            };
-            self.adopt_assignment_snapshot_locked(snapshot, deadline, mode)
-                .await
-        })
+        let _adoption = tokio::time::timeout(operation_timeout, self.assignment_adoption_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "recovery assignment {version} adoption timed out waiting for assignment serialization"
+                ))
+            })?;
+        let deadline = tokio::time::Instant::now() + operation_timeout;
+        let mode = if DbState::load(&self.state) == DbState::Faulted {
+            AssignmentAdoptionMode::ColdRecovery
+        } else {
+            AssignmentAdoptionMode::LiveTransition
+        };
+        tokio::time::timeout_at(
+            deadline,
+            self.adopt_assignment_snapshot_locked(snapshot, deadline, mode),
+        )
         .await
         .unwrap_or_else(|_| {
             Err(DbError::Checkpoint(format!(
