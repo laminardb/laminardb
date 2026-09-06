@@ -4,6 +4,28 @@ use std::collections::BTreeMap;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
 
+#[derive(Debug)]
+struct DelayedScanKv {
+    inner: laminar_core::cluster::control::InMemoryKv,
+    scan_delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::ClusterKv for DelayedScanKv {
+    async fn write(&self, key: &str, value: String) {
+        self.inner.write(key, value).await;
+    }
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        self.inner.read_from(who, key).await
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        tokio::time::sleep(self.scan_delay).await;
+        self.inner.scan(key).await
+    }
+}
+
 struct PendingListStore {
     inner: Arc<dyn ObjectStore>,
 }
@@ -4305,6 +4327,112 @@ async fn startup_rejects_drain_that_does_not_bind_retained_predecessor() {
         error.contains("does not bind retained predecessor"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn watcher_authority_publication_gets_a_fresh_phase_budget() {
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeInfo;
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let boot = Uuid::from_u128(11);
+    let process = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: boot,
+    };
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed_store = AssignmentSnapshotStore::new(Arc::clone(&inner));
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(BTreeMap::from([(0, self_id)]), vec![process])
+        .unwrap();
+    seed_store.save_if_absent(&committed).await.unwrap();
+
+    let operation_timeout = Duration::from_millis(200);
+    let delayed: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        Arc::clone(&inner),
+        ThrottleConfig {
+            wait_list_per_call: Duration::from_millis(160),
+            ..ThrottleConfig::default()
+        },
+    ));
+    let durable = Arc::new(AssignmentSnapshotStore::new(delayed));
+    let kv = Arc::new(DelayedScanKv {
+        inner: InMemoryKv::new(self_id),
+        scan_delay: Duration::from_millis(30),
+    });
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        self_id,
+        control,
+        recovery,
+        Some(Arc::clone(&durable)),
+        members_rx,
+        boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(
+            laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+        ))
+        .unwrap();
+    controller.publish_recovery_incarnation().await.unwrap();
+    controller.set_active(true);
+    let _process_authority = install_test_process_authority(&controller, &[process]).await;
+    let _leader_lease = grant_test_leadership(&controller).await;
+
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(self_id.0, "127.0.0.1:0".parse().unwrap(), boot)
+            .await
+            .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(self_id.0, boot));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::clone(&inner))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(Arc::clone(&durable))
+        .shuffle_sender(sender)
+        .shuffle_receiver(receiver)
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(true);
+
+    let shutdown = CancellationToken::new();
+    let config = RebalanceConfig {
+        watcher_poll: Duration::from_secs(5),
+        checkpoint_timeout: operation_timeout,
+        ..RebalanceConfig::test_defaults()
+    };
+    let started = tokio::time::Instant::now();
+    let watcher = spawn_snapshot_watcher(
+        Arc::clone(&db),
+        durable,
+        registry,
+        shutdown.clone(),
+        config,
+        Some(Arc::clone(&controller)),
+    );
+    let publication = tokio::time::timeout(Duration::from_secs(2), async {
+        while controller
+            .checkpoint_assignment_fence(committed.version)
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    shutdown.cancel();
+    watcher.await.unwrap();
+
+    publication.expect("authority publication reused the exhausted durable-head audit deadline");
+    assert!(started.elapsed() > operation_timeout);
+    assert!(!db.cluster_intake_fenced());
 }
 
 #[tokio::test]

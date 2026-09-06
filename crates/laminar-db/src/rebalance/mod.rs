@@ -3,7 +3,7 @@
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 use std::time::Duration;
 
 use laminar_connectors::connector::{SourceDrainOutcome, SourceDrainResolution};
@@ -28,7 +28,7 @@ use laminar_core::state::{
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -416,12 +416,13 @@ impl SnapshotWatcher {
     async fn publish_authority(
         &mut self,
         mut authority_revision: u64,
-        head_deadline: tokio::time::Instant,
+        operation_timeout: Duration,
     ) {
-        let current_authority_revision = self
-            .db
-            .assignment_authority_revision
-            .load(std::sync::atomic::Ordering::Acquire);
+        // The durable-head audit and authority publication are independently bounded phases.
+        let (head_deadline, current_authority_revision) = (
+            Instant::now() + operation_timeout,
+            AtomicU64::load(&self.db.assignment_authority_revision, Ordering::Acquire),
+        );
         if authority_revision != current_authority_revision {
             // The durable head used above predates an authority closure by another adoption.
             // Keep that closure in force and re-read the head on the next tick.
@@ -1060,7 +1061,7 @@ impl SnapshotWatcher {
                                             audited_target.as_ref().expect(
                                                 "stable successor was audited before suspension",
                                             ),
-                                            head_deadline,
+                                            Instant::now() + self.config.checkpoint_timeout,
                                         )
                                         .await
                                     {
@@ -1070,8 +1071,11 @@ impl SnapshotWatcher {
                                     // The transition may have been staged before its predecessor
                                     // transport certificate became active. Repair that exact audited
                                     // authority before waiting for the newer durable head.
-                                    self.publish_authority(authority_revision, head_deadline)
-                                        .await;
+                                    self.publish_authority(
+                                        authority_revision,
+                                        self.config.checkpoint_timeout,
+                                    )
+                                    .await;
                                     continue;
                                 }
                                 Err(error) => {
@@ -1181,7 +1185,7 @@ impl SnapshotWatcher {
                                         audited_target
                                             .as_ref()
                                             .expect("stable successor was audited before adoption"),
-                                        head_deadline,
+                                        Instant::now() + self.config.checkpoint_timeout,
                                     )
                                     .await
                                 {
@@ -1237,7 +1241,7 @@ impl SnapshotWatcher {
                 }
             }
 
-            self.publish_authority(authority_revision, head_deadline)
+            self.publish_authority(authority_revision, self.config.checkpoint_timeout)
                 .await;
         }
     }
