@@ -1,4 +1,116 @@
 use super::{AssignmentAuthorityActivation, DbError, LaminarDB};
+use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant, LeaderProof};
+use laminar_core::cluster::control::{
+    ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryRound,
+};
+
+async fn observe_stopped_round(
+    controller: &ClusterController,
+    durable_proof: Option<&LeaderProof>,
+) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+    match durable_proof {
+        Some(proof) => {
+            controller
+                .observe_recover_control_for_durable_proof(proof)
+                .await
+        }
+        None => controller.observe_recover_control().await,
+    }
+}
+
+pub(crate) async fn audited_stopped_terminal_round(
+    controller: &ClusterController,
+    predecessor: &CheckpointAssignmentFence,
+    deadline: tokio::time::Instant,
+) -> Result<Option<RecoveryRound>, DbError> {
+    audited_stopped_round(controller, predecessor, None, deadline).await
+}
+
+pub(crate) async fn audited_stopped_recovery_successor_round(
+    controller: &ClusterController,
+    predecessor: &CheckpointAssignmentFence,
+    leader_proof: &LeaderProof,
+    deadline: tokio::time::Instant,
+) -> Result<Option<RecoveryRound>, DbError> {
+    audited_stopped_round(controller, predecessor, Some(leader_proof), deadline).await
+}
+
+async fn audited_stopped_round(
+    controller: &ClusterController,
+    predecessor: &CheckpointAssignmentFence,
+    durable_proof: Option<&LeaderProof>,
+    deadline: tokio::time::Instant,
+) -> Result<Option<RecoveryRound>, DbError> {
+    let active =
+        tokio::time::timeout_at(deadline, observe_stopped_round(controller, durable_proof))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "stopped-recovery Prepare authority observation timed out".into(),
+                )
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "stopped-recovery Prepare authority observation failed: {error}"
+                ))
+            })?;
+    let Some(RecoveryAnnouncement {
+        round,
+        phase: RecoverPhase::Prepare,
+    }) = active
+    else {
+        return Ok(None);
+    };
+    let local = controller.instance_id();
+    if round.assignment_fence != *predecessor
+        || (durable_proof.is_none() && !controller.recovery_driver_is_current(&round))
+        || !controller.recovery_round_requires_current_process_stop(&round)
+        || !controller.process_lease_is_live()
+    {
+        return Ok(None);
+    }
+    let reports = tokio::time::timeout_at(deadline, controller.read_stopped(&round, &[local]))
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint("stopped-recovery local stopped-report read timed out".into())
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "stopped-recovery local stopped-report read failed: {error}"
+            ))
+        })?;
+    let expected = CheckpointParticipant {
+        node_id: local.0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    if reports.len() != 1
+        || reports[0].publisher() != expected
+        || reports[0].validate(&round).is_err()
+    {
+        return Ok(None);
+    }
+    let confirmed =
+        tokio::time::timeout_at(deadline, observe_stopped_round(controller, durable_proof))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("stopped-recovery Prepare authority recheck timed out".into())
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "stopped-recovery Prepare authority recheck failed: {error}"
+                ))
+            })?;
+    if confirmed
+        != Some(RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Prepare,
+        })
+        || !controller.process_lease_is_live()
+    {
+        return Ok(None);
+    }
+    Ok(Some(round))
+}
 
 #[cfg(feature = "cluster")]
 impl LaminarDB {
