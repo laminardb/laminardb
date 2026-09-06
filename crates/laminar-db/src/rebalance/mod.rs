@@ -42,7 +42,8 @@ pub struct RebalanceConfig {
     pub watcher_poll: Duration,
     /// Quiet period before a membership change triggers rotation.
     pub rebalance_debounce: Duration,
-    /// Upper bound on the pre-rotation forced checkpoint.
+    /// Upper bound used for the pre-rotation checkpoint and each serialized recovery-adoption
+    /// phase.
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
@@ -1116,16 +1117,12 @@ impl SnapshotWatcher {
                             );
                         }
                     }
-                    let resolved_local = self.registry.assignment_version();
-                    if snap.version > resolved_local {
-                        debug!(
-                            local = resolved_local,
-                            remote = snap.version,
-                            "adopting newer assignment"
-                        );
+                    if snap.version > self.registry.assignment_version() {
+                        debug!(remote = snap.version, "adopting newer assignment");
+                        let recovery_timeout = self.config.checkpoint_timeout;
                         let adoption = if audited_recovery {
                             self.db
-                                .adopt_recovery_assignment_snapshot(snap.clone(), head_deadline)
+                                .adopt_recovery_assignment_snapshot(snap.clone(), recovery_timeout)
                                 .await
                         } else {
                             self.db
@@ -3111,7 +3108,7 @@ fn materialize_recovery_decision<'a>(
         })??;
         prepare_recovery_assignment_adoption(db, store, controller, &durable, deadline).await?;
         let version = durable.version;
-        db.adopt_recovery_assignment_snapshot(durable, deadline)
+        db.adopt_recovery_assignment_snapshot(durable, operation_timeout)
             .await
             .map_err(|error| error.to_string())?;
         let oldest_retained = version.saturating_sub(1);
@@ -3695,14 +3692,7 @@ fn execute_graceful_rotation_owned(
             }
             RotateOutcome::Conflict(winner) => {
                 let v = winner.version;
-                adopt_any(
-                    &db,
-                    &store,
-                    &controller,
-                    *winner,
-                    tokio::time::Instant::now() + config.checkpoint_timeout,
-                )
-                .await?;
+                adopt_any(&db, &store, &controller, *winner, config.checkpoint_timeout).await?;
                 Ok(Some(v))
             }
         }
@@ -3896,7 +3886,7 @@ fn try_rebalance_owned(
         {
             prepare_recovery_assignment_adoption(&db, &store, &controller, &current, head_deadline)
                 .await?;
-            db.adopt_recovery_assignment_snapshot(current.clone(), head_deadline)
+            db.adopt_recovery_assignment_snapshot(current.clone(), config.checkpoint_timeout)
                 .await
                 .map_err(|error| error.to_string())?;
             let reconciled_version = registry.assignment_version();
@@ -4900,8 +4890,9 @@ async fn adopt_any(
     store: &AssignmentSnapshotStore,
     controller: &ClusterController,
     snap: AssignmentSnapshot,
-    deadline: tokio::time::Instant,
+    operation_timeout: Duration,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + operation_timeout;
     let audited = tokio::time::timeout_at(
         deadline,
         audit_assignment_snapshot_authority_outcome(store, Some(controller), &snap),
@@ -4913,7 +4904,7 @@ async fn adopt_any(
             .map_err(|error| error.to_string())?;
     } else if audited.is_recovery() {
         prepare_recovery_assignment_adoption(db, store, controller, &snap, deadline).await?;
-        db.adopt_recovery_assignment_snapshot(snap, deadline)
+        db.adopt_recovery_assignment_snapshot(snap, operation_timeout)
             .await
             .map_err(|error| error.to_string())?;
     } else {

@@ -211,7 +211,7 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 80] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 81] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -424,6 +424,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 80] = [
     (
         "recovery_history_missing",
         "cannot be adopted without durable assignment history",
+    ),
+    (
+        "recovery_adoption_serialization_deadline",
+        "adoption timed out waiting for assignment serialization",
     ),
     (
         "recovery_adoption_deadline",
@@ -15744,6 +15748,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                is absent from durable history\n\
                has no live local process identity\n\
                cannot be adopted without durable assignment history\n\
+               recovery assignment 2 adoption timed out waiting for assignment serialization\n\
                recovery assignment 2 adoption exceeded its end-to-end deadline\n\
                recovery assignment materialization exceeded its deadline\n\
                participant 2 handoff manifest is missing\n\
@@ -15806,6 +15811,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     ] {
         assert_eq!(counts.get(marker), Some(&1), "missing {marker}");
     }
+    assert_eq!(
+        counts.get("recovery_adoption_serialization_deadline"),
+        Some(&1)
+    );
     assert_eq!(counts.get("recovery_adoption_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_materialization_deadline"), Some(&1));
     assert_eq!(counts.get("recovery_handoff_manifest_missing"), Some(&1));
