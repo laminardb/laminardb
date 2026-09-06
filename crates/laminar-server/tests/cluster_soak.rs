@@ -11259,6 +11259,9 @@ fn wait_for_local_assignment_convergence(
         sleep_until_local_evidence_poll(deadline);
     }
     let diagnostics = durable_progress_diagnostics(nodes, &[]);
+    for node in nodes.iter() {
+        node.dump_log_tail();
+    }
     panic!(
         "soak: {context} did not reach exact local assignment convergence before its existing \
          deadline: {last_pending}; observation=({diagnostics})"
