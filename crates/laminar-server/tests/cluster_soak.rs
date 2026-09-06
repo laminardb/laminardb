@@ -2996,11 +2996,9 @@ impl Node {
         match child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
-                self.dump_log_tail();
                 panic!("node{} exited before becoming ready: {status}", self.id);
             }
             Err(error) => {
-                self.dump_log_tail();
                 panic!("failed to inspect node{} process: {error}", self.id);
             }
         }
@@ -3009,6 +3007,10 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
+        // DIAGNOSTIC: unwind is the last common path before node processes are terminated.
+        if std::thread::panicking() {
+            self.dump_log_tail();
+        }
         self.terminate_best_effort();
     }
 }
@@ -11277,9 +11279,6 @@ fn wait_for_local_assignment_convergence(
         sleep_until_local_evidence_poll(deadline);
     }
     let diagnostics = durable_progress_diagnostics(nodes, &[]);
-    for node in nodes.iter() {
-        node.dump_log_tail();
-    }
     panic!(
         "soak: {context} did not reach exact local assignment convergence before its existing \
          deadline: {last_pending}; observation=({diagnostics})"
@@ -11928,9 +11927,6 @@ fn assert_progress(
         let observed_ingested = try_cluster_metric(nodes, "laminardb_events_ingested_total");
         let observed_emitted = try_cluster_metric(nodes, "laminardb_events_emitted_total");
         let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
-        for node in nodes.iter() {
-            node.dump_log_tail();
-        }
         panic!(
             "soak: timed out after {advance_window:?} waiting for: {label}: source ingestion and \
              graph output to advance; ingested_target={ingested_target}, \
@@ -11998,9 +11994,6 @@ fn assert_progress(
     });
     if !durability_advanced {
         let diagnostics = durable_progress_diagnostics(nodes, commit_oracle.as_slice());
-        for node in nodes.iter() {
-            node.dump_log_tail();
-        }
         panic!(
             "soak: timed out after {durability_window:?} waiting for: {label}: checkpoints and \
              durable source offsets to advance; checkpoint_target={checkpoint_target}, \
@@ -13686,7 +13679,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    // On boot failure dump the node log tails so the cause is visible in test output.
+    // DIAGNOSTIC: resume unwinding through `Node::drop` so every bounded tail is retained.
     let boot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_for(
             "all nodes to complete startup authority and become ready",
@@ -13701,10 +13694,7 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
         );
     }));
     if boot.is_err() {
-        for n in &nodes {
-            n.dump_log_tail();
-        }
-        panic!("soak: cluster failed to boot — node log tails above");
+        panic!("soak: cluster failed to boot; bounded node log tails follow during unwind");
     }
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
