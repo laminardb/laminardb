@@ -113,6 +113,8 @@ const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
 #[cfg(feature = "kafka")]
 const SOAK_HTTP_HEADER_MAX_BYTES: usize = 16 * 1_024;
 #[cfg(feature = "kafka")]
+const SOAK_HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(7);
+#[cfg(feature = "kafka")]
 const READINESS_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1_024;
 #[cfg(feature = "kafka")]
 const LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES: usize = 4 * 1_024;
@@ -2318,7 +2320,7 @@ impl Node {
     ) -> Result<BoundedHttpResponse, BoundedHttpError> {
         let remaining = || {
             remaining_at(deadline, Instant::now())
-                .map(|duration| duration.min(Duration::from_secs(6)))
+                .map(|duration| duration.min(SOAK_HTTP_OPERATION_TIMEOUT))
                 .ok_or_else(|| {
                     BoundedHttpError::Unavailable(format!(
                         "node{} HTTP evidence deadline was exhausted",

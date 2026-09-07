@@ -8,6 +8,9 @@ use std::sync::Arc;
 #[cfg(feature = "cluster")]
 use std::time::Instant;
 
+#[cfg(feature = "cluster")]
+use crate::cluster::OBJECT_STORE_CONTROL_IO_TIMEOUT;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 #[cfg(feature = "cluster")]
@@ -92,7 +95,10 @@ pub(super) const DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW: usize = 8;
 pub(super) const DIAGNOSTIC_READ_RATE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(1);
 #[cfg(feature = "cluster")]
-pub(super) const DIAGNOSTIC_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+// INVARIANT: a durable local-evidence read may consume the full control-I/O bound. The outer
+// deadline must still leave time for the handler to return its typed unavailable response.
+pub(super) const DIAGNOSTIC_READ_DEADLINE: std::time::Duration =
+    OBJECT_STORE_CONTROL_IO_TIMEOUT.saturating_add(std::time::Duration::from_secs(1));
 
 #[cfg(feature = "cluster")]
 pub(crate) struct DiagnosticRateWindow {
