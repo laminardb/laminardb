@@ -2502,7 +2502,7 @@ impl Node {
 
     #[cfg(feature = "kafka")]
     fn local_assignment_diagnostic(&self) -> LocalAssignmentDiagnostic {
-        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        let deadline = Instant::now() + SOAK_HTTP_OPERATION_TIMEOUT;
         match self.local_authority_observation(deadline) {
             LocalAuthorityObservation::Available(evidence) => {
                 LocalAssignmentDiagnostic::Available {
