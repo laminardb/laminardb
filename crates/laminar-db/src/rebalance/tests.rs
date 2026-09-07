@@ -3276,7 +3276,7 @@ fn takeover_audits_a_recovery_head_while_its_pin_is_propagated_to_the_next_gener
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_adoption_observes_a_compute_fault_during_authority_audit() {
+async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_audit() {
     let self_id = NodeId(1);
     let (
         db,
@@ -3331,7 +3331,7 @@ async fn recovery_adoption_observes_a_compute_fault_during_authority_audit() {
         Some(Arc::new(AssignmentSnapshotStore::new(delayed_store)));
 
     let adopting_db = Arc::clone(&db);
-    let adoption = tokio::spawn(async move {
+    let mut adoption = tokio::spawn(async move {
         adopting_db
             .adopt_recovery_assignment_snapshot(successor, Duration::from_secs(2))
             .await
@@ -3343,9 +3343,16 @@ async fn recovery_adoption_observes_a_compute_fault_during_authority_audit() {
     db.fence_coordinated_recovery_lifecycle();
     let generation = Arc::clone(&db.rotation_execution_fence).write_owned().await;
     db.installed_vnode_state.lock().take();
-    crate::db::DbState::Faulted.store(&db.state);
     drop(generation);
     release.notify_one();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut adoption)
+            .await
+            .is_err(),
+        "recovery adoption reused retired state before the compute fault was published"
+    );
+    crate::db::DbState::Faulted.store(&db.state);
 
     let adoption = tokio::time::timeout(Duration::from_secs(3), adoption)
         .await

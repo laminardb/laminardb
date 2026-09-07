@@ -5,18 +5,64 @@ use laminar_core::cluster::control::{
 };
 
 impl AssignmentAdoptionMode {
-    pub(super) fn after_authority_audit(
+    pub(super) async fn after_authority_audit(
         self,
+        db: &LaminarDB,
         audited_recovery: bool,
         terminal_drain: bool,
-        state: DbState,
-    ) -> (Self, bool) {
+        deadline: tokio::time::Instant,
+    ) -> Result<(Self, bool), DbError> {
+        let state = self
+            .state_after_retired_generation(db, audited_recovery, deadline)
+            .await?;
         let faulted = state == DbState::Faulted;
         let faulted_terminal_drain = faulted && terminal_drain;
         let use_cold =
             self == Self::LiveTransition && faulted && (audited_recovery || terminal_drain);
         let selected = if use_cold { Self::ColdRecovery } else { self };
-        (selected, faulted_terminal_drain)
+        Ok((selected, faulted_terminal_drain))
+    }
+
+    async fn state_after_retired_generation(
+        self,
+        db: &LaminarDB,
+        audited_recovery: bool,
+        deadline: tokio::time::Instant,
+    ) -> Result<DbState, DbError> {
+        let state = DbState::load(&db.state);
+        let retired_during_fault = self == Self::LiveTransition
+            && audited_recovery
+            && matches!(state, DbState::Running | DbState::ShuttingDown)
+            && db
+                .pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            && db.installed_vnode_state.lock().is_none();
+        if !retired_during_fault {
+            return Ok(state);
+        }
+
+        // RECOVERY: graph poison retires its state binding before the compute runtime finishes
+        // draining non-abortable storage work and publishes Faulted. Reusing that heap is unsafe;
+        // wait under the adoption deadline for the lifecycle owner to expose the stable boundary.
+        loop {
+            tokio::select! {
+                biased;
+                () = db.assignment_restore_shutdown.cancelled() => {
+                    return Err(DbError::Shutdown);
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(DbError::Checkpoint(
+                        "[LDB-6053] recovery assignment adoption timed out waiting for the retired compute generation lifecycle boundary".into(),
+                    ));
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+            let state = DbState::load(&db.state);
+            if !matches!(state, DbState::Running | DbState::ShuttingDown) {
+                return Ok(state);
+            }
+        }
     }
 }
 
