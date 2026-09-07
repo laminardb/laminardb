@@ -3005,11 +3005,9 @@ impl LaminarDB {
             // The durable audit above can outlive the compute generation on a remote store. Select
             // the recovery mode again after that I/O so a graph that faulted meanwhile does not
             // pay for a known-invalid live transition and a second complete authority audit.
-            let (mut mode, faulted_terminal_drain_cold) = mode.after_authority_audit(
-                audited_recovery,
-                terminal_drain_authority,
-                DbState::load(&self.state),
-            );
+            let (mut mode, faulted_terminal_drain_cold) = mode
+                .after_authority_audit(self, audited_recovery, terminal_drain_authority, deadline)
+                .await?;
             let target_fence = snapshot
                 .assignment_fence()
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
