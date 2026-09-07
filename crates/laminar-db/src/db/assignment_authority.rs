@@ -255,11 +255,13 @@ impl LaminarDB {
         let adoption =
             tokio::time::timeout_at(deadline, self.assignment_adoption_lock.lock()).await;
         let Ok(_adoption) = adoption else {
-            // Advancing the revision outside the lock makes any concurrent activation fail its
-            // final revision check, so timeout cleanup cannot leave half-published authority.
-            self.withdraw_assignment_authority(controller);
+            // RECOVERY: cleanup cannot safely clear controller state without owning adoption.
+            // Terminal process revocation linearizes with shuffle installation and prevents the
+            // lock holder (or a successor) from publishing usable authority after this timeout.
+            self.revoke_cluster_authority();
             return Err(DbError::Checkpoint(
-                "timed out reconciling failed watcher assignment activation; authority withdrawn"
+                "timed out reconciling failed watcher assignment activation; process authority \
+                 revoked"
                     .into(),
             ));
         };
