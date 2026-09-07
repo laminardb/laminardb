@@ -1707,7 +1707,7 @@ impl RecoveryMonitor {
             db,
             controller,
             &round.assignment_fence,
-            crate::rebalance::RebalanceConfig::default(),
+            checkpoint_bounded_rebalance_config(db),
         )
         .await
         {
@@ -3323,6 +3323,13 @@ async fn read_committed_target_bounded(
         .map_err(|_| {
             format!("decision-store recovery read timed out after {DECISION_IO_TIMEOUT:?}")
         })?
+}
+
+fn checkpoint_bounded_rebalance_config(db: &LaminarDB) -> crate::rebalance::RebalanceConfig {
+    crate::rebalance::RebalanceConfig {
+        checkpoint_timeout: crate::pipeline_lifecycle::configured_checkpoint_timeout(&db.config),
+        ..crate::rebalance::RebalanceConfig::default()
+    }
 }
 
 async fn read_recovery_gen(controller: &ClusterController) -> Result<u64, String> {

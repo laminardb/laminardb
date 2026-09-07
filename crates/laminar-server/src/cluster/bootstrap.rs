@@ -586,6 +586,7 @@ pub(super) async fn install_leader_lease_and_bootstrap_catalog(
         install_lease_gate_and_catalog(config, cluster_cfg, identity, runtime, discovery).await?;
     let rebalance_config = fence_startup_and_prepare_recovery_generation(
         cluster_cfg,
+        config.checkpoint.timeout,
         identity,
         db,
         discovery,
@@ -779,6 +780,7 @@ async fn bootstrap_cluster_catalog(
 /// before assignment certification.
 async fn fence_startup_and_prepare_recovery_generation(
     cluster_cfg: &ClusterConfig,
+    checkpoint_timeout: std::time::Duration,
     identity: &mut AcquiredClusterIdentity,
     db: &Arc<LaminarDB>,
     discovery: &mut DiscoveryImpl,
@@ -813,9 +815,22 @@ async fn fence_startup_and_prepare_recovery_generation(
             ));
         }
     }
-    let rebalance_config = laminar_db::rebalance::RebalanceConfig {
-        placement_isolation_tier: cluster_cfg.discovery.placement_isolation_tier,
-        ..laminar_db::rebalance::RebalanceConfig::default()
-    };
+    let rebalance_config = configured_rebalance(
+        cluster_cfg.discovery.placement_isolation_tier,
+        checkpoint_timeout,
+    );
     Ok(rebalance_config)
+}
+
+pub(super) fn configured_rebalance(
+    placement_isolation_tier: usize,
+    checkpoint_timeout: std::time::Duration,
+) -> laminar_db::rebalance::RebalanceConfig {
+    // Recovery materializes checkpoint-backed state against the same object store. Preserve the
+    // operator's explicit durable-I/O bound instead of silently substituting the library default.
+    laminar_db::rebalance::RebalanceConfig {
+        checkpoint_timeout,
+        placement_isolation_tier,
+        ..laminar_db::rebalance::RebalanceConfig::default()
+    }
 }

@@ -218,7 +218,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 81] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 93] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -303,12 +303,60 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 81] = [
         "stopped for recovery round; awaiting target",
     ),
     (
+        "recovery_leader_quiesce_failed",
+        "leader could not quiesce after publishing recovery Prepare",
+    ),
+    (
+        "recovery_stopped_ack_failed",
+        "could not acknowledge recovery Prepare",
+    ),
+    (
         "recovery_stop_quorum_timeout",
         "recovery stop quorum timed out",
     ),
     (
         "recovery_successor_authorized",
         "authorized successor assignment from the last committed cluster cut",
+    ),
+    (
+        "recovery_transition_still_pending",
+        "waits for a local vnode transition",
+    ),
+    (
+        "recovery_closure_serialization_deadline",
+        "timed out serializing assignment authority closure",
+    ),
+    (
+        "recovery_closure_execution_deadline",
+        "timed out draining assignment execution after closure",
+    ),
+    (
+        "recovery_proposal_load_deadline",
+        "recovery proposal load exceeded the materialization deadline",
+    ),
+    (
+        "recovery_assignment_audit_deadline",
+        "recovery assignment audit exceeded the materialization deadline",
+    ),
+    (
+        "recovery_suspension_serialization_deadline",
+        "timed out serializing recovery assignment suspension",
+    ),
+    (
+        "recovery_suspension_execution_deadline",
+        "timed out draining assignment execution after suspension",
+    ),
+    (
+        "recovery_decision_fenced",
+        "cluster checkpoint decision was fenced by a different durable leader term",
+    ),
+    (
+        "recovery_process_lease_lost",
+        "local process lease authority is not live",
+    ),
+    (
+        "recovery_leader_proof_lost",
+        "assignment recovery lost the current durable leader proof",
     ),
     (
         "snapshot_recovery_suspend_failed",
@@ -15851,8 +15899,20 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                checkpoint state serialization timed out: token=secret\n\
                checkpoint source cut is incomplete: credential=secret\n\
                leader announced recovery prepare\n\
+               leader could not quiesce after publishing recovery Prepare\n\
+               could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
+               recovery assignment 2 waits for a local vnode transition\n\
+               timed out serializing assignment authority closure\n\
+               timed out draining assignment execution after closure\n\
+               recovery proposal load exceeded the materialization deadline\n\
+               recovery assignment audit exceeded the materialization deadline\n\
+               timed out serializing recovery assignment suspension\n\
+               timed out draining assignment execution after suspension\n\
+               cluster checkpoint decision was fenced by a different durable leader term\n\
+               local process lease authority is not live\n\
+               assignment recovery lost the current durable leader proof\n\
                snapshot watcher: could not suspend recovery assignment\n\
                snapshot watcher: could not publish recovery fault\n\
                snapshot watcher: could not settle predecessor checkpoint for recovery\n\
@@ -15907,8 +15967,24 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     );
     assert_eq!(counts.get("checkpoint_source_cut_incomplete"), Some(&1));
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
+    assert_eq!(counts.get("recovery_leader_quiesce_failed"), Some(&1));
+    assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
+    for marker in [
+        "recovery_transition_still_pending",
+        "recovery_closure_serialization_deadline",
+        "recovery_closure_execution_deadline",
+        "recovery_proposal_load_deadline",
+        "recovery_assignment_audit_deadline",
+        "recovery_suspension_serialization_deadline",
+        "recovery_suspension_execution_deadline",
+        "recovery_decision_fenced",
+        "recovery_process_lease_lost",
+        "recovery_leader_proof_lost",
+    ] {
+        assert_eq!(counts.get(marker), Some(&1), "missing {marker}");
+    }
     assert_eq!(counts.get("snapshot_recovery_suspend_failed"), Some(&1));
     assert_eq!(counts.get("snapshot_recovery_fault_failed"), Some(&1));
     assert_eq!(

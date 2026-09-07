@@ -73,7 +73,7 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
-timeout = "120s" # one deadline across fence, capture, durable decision, and completion
+timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
 
 # Provider features, accepted aliases, ambient identity, and native evidence:
 # ../../docs/cloud-object-store-support.md

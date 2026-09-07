@@ -2549,6 +2549,26 @@ fn startup_leader_timeout_covers_manager_and_remote_audit_phases() {
     assert_eq!(timeout, std::time::Duration::from_millis(42_375));
 }
 
+#[test]
+fn control_plane_deadlines_reserve_a_full_leader_renewal_io_window() {
+    let config = laminar_core::cluster::control::LeaderLeaseConfig::default();
+    let renewal_budget = config
+        .ttl
+        .checked_sub(config.renew_interval)
+        .expect("the default renewal interval is below the lease TTL");
+
+    assert!(renewal_budget >= OBJECT_STORE_CONTROL_IO_TIMEOUT);
+}
+
+#[test]
+fn control_plane_deadlines_configure_recovery_from_checkpoint_timeout() {
+    let checkpoint_timeout = std::time::Duration::from_secs(73);
+    let config = bootstrap::configured_rebalance(4, checkpoint_timeout);
+
+    assert_eq!(config.checkpoint_timeout, checkpoint_timeout);
+    assert_eq!(config.placement_isolation_tier, 4);
+}
+
 #[tokio::test]
 async fn startup_leader_authority_requires_a_live_full_owner_and_keeps_intake_fenced() {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
