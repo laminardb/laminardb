@@ -1323,6 +1323,15 @@ fn test_default_values_applied() {
 }
 
 #[test]
+fn checkpoint_timeout_rejects_unrepresentable_deadline() {
+    let mut config: ServerConfig = toml::from_str("").unwrap();
+    config.checkpoint.timeout = Duration::MAX;
+
+    let error = validate_config(&config).unwrap_err().to_string();
+    assert!(error.contains("checkpoint.timeout exceeds the platform clock range"));
+}
+
+#[test]
 fn event_time_durations_use_engine_millisecond_bounds() {
     let parsed: ServerConfig = toml::from_str(
             "[server]\ntemporal_join_idle_history_retention = \"24h\"\nsource_idle_timeout = \"5s\"\nevent_time_max_future_skew = \"30s\"\n",
