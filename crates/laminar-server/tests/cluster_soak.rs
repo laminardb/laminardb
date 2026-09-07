@@ -218,8 +218,6 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 81] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
@@ -2658,7 +2656,7 @@ impl Node {
 
     #[cfg(feature = "kafka")]
     fn durable_assignment_diagnostic(&self) -> DurableAssignmentDiagnostic {
-        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        let deadline = Instant::now() + SOAK_HTTP_OPERATION_TIMEOUT;
         match self.durable_assignment_observation(deadline) {
             Ok(Some(snapshot)) => DurableAssignmentDiagnostic::Available {
                 version: snapshot.version,
