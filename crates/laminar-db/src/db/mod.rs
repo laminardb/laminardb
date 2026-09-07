@@ -2028,15 +2028,7 @@ impl LaminarDB {
         let receiver = self.shuffle_receiver.lock().clone();
         let sender = self.shuffle_sender.lock().clone();
         let expected_digest = fence.digest();
-        let receiver_exact = receiver.as_ref().is_none_or(|endpoint| {
-            endpoint.assignment_version() == fence.assignment_version
-                && endpoint.active_assignment_digest() == Some(expected_digest)
-        });
-        let sender_exact = sender.as_ref().is_none_or(|endpoint| {
-            endpoint.assignment_version() == fence.assignment_version
-                && endpoint.active_assignment_digest() == Some(expected_digest)
-        });
-        if receiver_exact && sender_exact {
+        if self.shuffle_assignment_authority_is_exact(fence) {
             if !controller.process_lease_is_live() {
                 self.invalidate_shuffle_assignment_fence();
                 return Err(DbError::Checkpoint(

@@ -2987,6 +2987,117 @@ async fn assignment_activation_skips_admission_io_while_recovering() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn timed_out_watcher_activation_retains_concurrent_recovery_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    fixture.controller.set_recovering(true);
+    fixture.db.set_source_gate(true);
+    let revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let adoption = fixture.db.assignment_adoption_lock.lock().await;
+    let activation_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    let activation = {
+        let db = Arc::clone(&fixture.db);
+        let controller = Arc::clone(&fixture.controller);
+        let fence = fixture.fence.clone();
+        tokio::spawn(async move {
+            db.activate_watcher_assignment_authority(
+                &controller,
+                &fence,
+                None,
+                revision,
+                activation_deadline,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    fixture
+        .db
+        .install_shuffle_assignment_fence(&fixture.fence)
+        .unwrap();
+    fixture
+        .controller
+        .publish_checkpoint_assignment_fence(Some(fixture.fence.clone()));
+    drop(adoption);
+
+    let retained = activation.await.unwrap().unwrap();
+    assert!(retained.installed);
+    assert!(!retained.intake_open);
+    assert_eq!(retained.revision, revision);
+    assert!(fixture.db.cluster_intake_fenced());
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        Some(fixture.fence.clone())
+    );
+    assert_eq!(
+        fixture.sender.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+    assert_eq!(
+        fixture.receiver.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn timed_out_watcher_activation_withdraws_non_recovery_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    let initial = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(initial.intake_open);
+    let revision = initial.revision;
+    let adoption = fixture.db.assignment_adoption_lock.lock().await;
+    let activation_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    let activation = {
+        let db = Arc::clone(&fixture.db);
+        let controller = Arc::clone(&fixture.controller);
+        let fence = fixture.fence.clone();
+        tokio::spawn(async move {
+            db.activate_watcher_assignment_authority(
+                &controller,
+                &fence,
+                None,
+                revision,
+                activation_deadline,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    drop(adoption);
+
+    let error = activation.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("timed out serializing assignment authority activation"),
+        "{error}"
+    );
+    assert_fault_audit_withdrew_authority(&fixture, revision);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn assignment_activation_does_not_duplicate_an_active_durable_fault() {
     let fixture = fault_audit_activation_fixture().await;
     let external_pending = std::sync::atomic::AtomicU64::new(0);
