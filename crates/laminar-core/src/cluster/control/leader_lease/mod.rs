@@ -1,8 +1,10 @@
 //! Durable, append-only leader fencing.
 
 mod artifact_admission;
+mod attempt_status;
 mod subscription_replay;
 
+pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
     SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
 };
@@ -5919,37 +5921,6 @@ impl LeaderLeaseStore {
         &self,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
         Ok(self.audited_cluster_outcomes().await?.1.last().cloned())
-    }
-
-    /// Return the exact immutable outcome for `attempt`, or the first audited terminal outcome
-    /// known to close that older checkpoint. Compacted continuity anchors are included in the
-    /// audit.
-    ///
-    /// # Errors
-    /// Returns an error for a noncanonical attempt identity or an unavailable or invalid durable
-    /// authority chain.
-    pub async fn cluster_attempt_settlement(
-        &self,
-        attempt: crate::checkpoint::CheckpointAttempt,
-    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        if !attempt.is_canonical() {
-            return Err(DecisionError::Conflict(
-                "cluster checkpoint settlement requires one nonzero canonical checkpoint ID".into(),
-            )
-            .into());
-        }
-        let outcomes = self.audited_cluster_outcomes().await?.1;
-        if let Ok(index) = outcomes.binary_search_by_key(&attempt.epoch, |outcome| outcome.epoch) {
-            return Ok(Some(outcomes[index].clone()));
-        }
-        let Some(highest) = outcomes.last() else {
-            return Ok(None);
-        };
-        if highest.checkpoint_id > attempt.checkpoint_id {
-            Ok(Some(highest.clone()))
-        } else {
-            Ok(None)
-        }
     }
 
     fn cleanup_participant_ids(

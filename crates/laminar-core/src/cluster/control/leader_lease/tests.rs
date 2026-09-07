@@ -4866,6 +4866,87 @@ async fn delayed_artifact_admission_cannot_reopen_a_durable_abort() {
 }
 
 #[tokio::test]
+async fn cluster_attempt_status_fences_commit_after_takeover_without_an_outcome() {
+    let store = store(10);
+    let incumbent = owner(1, 1, 1);
+    let successor = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let inventory = begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    assert_eq!(
+        store
+            .cluster_attempt_status(inventory.attempt, &fence, &proof)
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::Pending
+    );
+
+    let observation = store.observe_rival(&successor, &first).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(matches!(
+        store
+            .try_takeover(&successor, &observation, 20)
+            .await
+            .unwrap(),
+        LeaseOutcome::Acquired(_)
+    ));
+    assert_eq!(
+        store
+            .cluster_attempt_status(inventory.attempt, &fence, &proof)
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::CommitFenced
+    );
+    assert!(store
+        .cluster_attempt_settlement(inventory.attempt)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn cluster_attempt_status_retains_commit_when_it_wins_before_takeover() {
+    let store = store(10);
+    let incumbent = owner(1, 1, 1);
+    let successor = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let committed = match record_commit(&store, &proof, &fence, 1, 1).await {
+        RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => outcome,
+        RecordOutcomeResult::Conflict { winner } => {
+            panic!("unexpected checkpoint outcome winner: {winner:?}")
+        }
+    };
+
+    let observation = store.observe_rival(&successor, &first).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(matches!(
+        store
+            .try_takeover(&successor, &observation, 20)
+            .await
+            .unwrap(),
+        LeaseOutcome::Acquired(_)
+    ));
+    assert_eq!(
+        store
+            .cluster_attempt_status(
+                crate::checkpoint::CheckpointAttempt::canonical(1),
+                &fence,
+                &proof,
+            )
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::Settled(Box::new(committed))
+    );
+}
+
+#[tokio::test]
 async fn takeover_can_only_abort_the_exact_active_checkpoint_inventory() {
     let store = store(10);
     let incumbent = owner(1, 1, 1);

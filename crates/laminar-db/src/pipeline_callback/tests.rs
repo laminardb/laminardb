@@ -6651,8 +6651,23 @@ async fn terminal_hint_without_an_outcome_does_not_release_the_resume_gate() {
     use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
     for phase in [Phase::Commit, Phase::Abort] {
-        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let (kv, controller, leader_id, _members_tx, decision_store) = gate_controller().await;
         let (prepared_fence, identity) = resume_identity(3, 3);
+        controller
+            .checkpoint_authority()
+            .unwrap()
+            .begin_cluster_checkpoint_artifacts(
+                &identity.leader_proof,
+                laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                    deployment_id: decision_store.load_or_create_deployment_id().await.unwrap(),
+                    pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                    attempt: identity.attempt,
+                    assignment_fence: Some(prepared_fence.clone()),
+                    sink_artifact_intent_protocol: true,
+                },
+            )
+            .await
+            .unwrap();
         let terminal_fence = if phase == Phase::Commit {
             prepared_fence.clone()
         } else {
