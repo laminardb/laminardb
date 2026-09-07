@@ -2307,6 +2307,7 @@ impl ConnectorPipelineCallback {
             attempt.epoch,
             attempt.checkpoint_id,
             &assignment_fence,
+            &tail.identity.leader_proof,
             decision_timeout,
         )
         .await?;
@@ -2716,6 +2717,7 @@ impl ConnectorPipelineCallback {
         prepared_wait_timeout: std::time::Duration,
     ) -> Result<(), String> {
         use laminar_core::cluster::control::Phase;
+        use tokio::time::Instant;
 
         // The gate must outlast the leader's quorum wait: a slow-but-successful alignment that lands
         // `Aligned` AFTER the follower resumes would let epoch-N+1 shuffle rows cross a peer's
@@ -2723,7 +2725,7 @@ impl ConnectorPipelineCallback {
         // the durable-Prepared wait so the gate can never expire first (CL-6).
         let resume_gate_timeout = std::time::Duration::from_secs(10)
             .max(prepared_wait_timeout + std::time::Duration::from_secs(5));
-        let resume_gate_deadline = tokio::time::Instant::now() + resume_gate_timeout;
+        let resume_gate_deadline = Instant::now() + resume_gate_timeout;
 
         if !has_cluster_shuffle {
             return Ok(());
@@ -2757,9 +2759,8 @@ impl ConnectorPipelineCallback {
                             Phase::Prepare => false,
                         },
                         CheckpointAttemptRelation::Exact => match a.phase {
-                            // A successor may durably abort an attempt prepared by the old
-                            // leader. The terminal record is only a wake-up hint; durable outcome
-                            // validation owns its authority and performs the rollback.
+                            // A successor may abort an old leader's attempt. The terminal record
+                            // only wakes the follower; durable outcome validation owns rollback.
                             Phase::Abort => a.flags == identity.flags,
                             Phase::Aligned => {
                                 a.flags == identity.flags
@@ -2798,8 +2799,7 @@ impl ConnectorPipelineCallback {
             && released.checkpoint_id == identity.attempt.checkpoint_id
             && matches!(released.phase, Phase::Commit | Phase::Abort)
         {
-            let remaining =
-                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = resume_gate_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!(
                     "checkpoint {} epoch {} exhausted its shuffle resume deadline before the \
@@ -2812,6 +2812,7 @@ impl ConnectorPipelineCallback {
                 identity.attempt.epoch,
                 identity.attempt.checkpoint_id,
                 assignment_fence,
+                &identity.leader_proof,
                 remaining,
             )
             .await
@@ -2852,8 +2853,7 @@ impl ConnectorPipelineCallback {
                     released.epoch
                 ));
             }
-            let remaining =
-                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = resume_gate_deadline.saturating_duration_since(Instant::now());
             let certified = tokio::time::timeout(
                 remaining,
                 controller.checkpoint_assignment_fence_for_leader(

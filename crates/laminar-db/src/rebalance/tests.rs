@@ -2578,23 +2578,23 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         assignment_fence: Some(current.assignment_fence().unwrap()),
         sink_artifact_intent_protocol: true,
     };
+    let predecessor_proof = controller.capture_leader_proof().unwrap();
     authority
-        .begin_cluster_checkpoint_artifacts(
-            &controller.capture_leader_proof().unwrap(),
-            inventory.clone(),
-        )
+        .begin_cluster_checkpoint_artifacts(&predecessor_proof, inventory.clone())
         .await
         .unwrap();
 
     let follower = {
         let controller = Arc::clone(&controller);
         let predecessor = current.assignment_fence().unwrap();
+        let predecessor_proof = predecessor_proof.clone();
         tokio::spawn(Box::pin(async move {
             crate::checkpoint_coordinator::CheckpointCoordinator::await_follower_decision(
                 &controller,
                 attempt.epoch,
                 attempt.checkpoint_id,
                 &predecessor,
+                &predecessor_proof,
                 Duration::from_secs(5),
             )
             .await
@@ -2615,7 +2615,12 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         error.contains("participant 2 handoff manifest is missing"),
         "{error}"
     );
-    assert!(!follower.await.unwrap().unwrap());
+    match follower.await.unwrap() {
+        Ok(committed) => assert!(!committed),
+        Err(error) => assert!(error
+            .to_string()
+            .contains("leader term was durably superseded")),
+    }
 
     let settlement = authority
         .cluster_attempt_settlement(attempt)
@@ -2645,6 +2650,84 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
     assert_eq!(
         authority.cluster_checkpoint_artifacts().await.unwrap(),
         Some(inventory)
+    );
+}
+
+#[tokio::test]
+async fn follower_stops_waiting_when_checkpoint_commit_authority_is_fenced() {
+    let (
+        _db,
+        controller,
+        _durable,
+        _registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    let authority = controller.checkpoint_authority().unwrap();
+    let committed = authority
+        .highest_cluster_committed_outcome()
+        .await
+        .unwrap()
+        .expect("fixture must publish the predecessor checkpoint");
+    let recovery_index = authority
+        .load_committed_checkpoint(
+            committed
+                .committed_checkpoint
+                .as_ref()
+                .expect("fixture Commit must name its checkpoint index"),
+        )
+        .await
+        .unwrap();
+    let attempt = CheckpointAttempt::canonical(committed.checkpoint_id + 1);
+    let assignment_fence = current.assignment_fence().unwrap();
+    let predecessor_proof = controller.capture_leader_proof().unwrap();
+    authority
+        .begin_cluster_checkpoint_artifacts(
+            &predecessor_proof,
+            CheckpointArtifactInventory {
+                deployment_id: recovery_index.deployment_id,
+                pipeline_identity: recovery_index.pipeline_identity,
+                attempt,
+                assignment_fence: Some(assignment_fence.clone()),
+                sink_artifact_intent_protocol: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let replacement_owner = laminar_core::cluster::control::LeaderLeaseOwner {
+        node: controller.instance_id(),
+        boot: controller.recovery_incarnation(),
+        process_term: 1,
+    };
+    assert!(matches!(
+        authority
+            .begin_new_term(&replacement_owner, 1)
+            .await
+            .unwrap(),
+        laminar_core::cluster::control::LeaseOutcome::Acquired(_)
+    ));
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::checkpoint_coordinator::CheckpointCoordinator::await_follower_decision(
+            &controller,
+            attempt.epoch,
+            attempt.checkpoint_id,
+            &assignment_fence,
+            &predecessor_proof,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("fenced follower decision must not consume its settlement timeout")
+    .expect_err("a superseded leader cannot commit its in-doubt checkpoint");
+    assert!(
+        error
+            .to_string()
+            .contains("leader term was durably superseded"),
+        "{error}"
     );
 }
 
