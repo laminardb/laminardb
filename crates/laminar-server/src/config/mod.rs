@@ -349,7 +349,7 @@ pub struct CheckpointSection {
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
-    /// One end-to-end checkpoint-attempt deadline.
+    /// One checkpoint-attempt deadline; cluster assignment recovery phases use the same bound.
     #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
     pub timeout: Duration,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).

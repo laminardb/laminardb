@@ -344,6 +344,11 @@ fn collect_runtime_limit_errors(config: &ServerConfig, errors: &mut Vec<String>)
     }
     if config.checkpoint.timeout.is_zero() {
         errors.push("checkpoint.timeout must be > 0".to_string());
+    } else if tokio::time::Instant::now()
+        .checked_add(config.checkpoint.timeout)
+        .is_none()
+    {
+        errors.push("checkpoint.timeout exceeds the platform clock range".to_string());
     }
     if config.checkpoint.max_node_data_bytes == Some(0) {
         errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());

@@ -1,7 +1,7 @@
 use super::{
-    panic_message, publish_runtime_fault_state, required_recovery_scope, Arc,
-    CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, HashMap, LaminarDB,
-    PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
+    checked_pipeline_deadline, panic_message, publish_runtime_fault_state, required_recovery_scope,
+    Arc, CheckpointStorageScope, DbError, DbState, DeliveryGuarantee, FutureExt, HashMap,
+    LaminarDB, PipelineLifecycleAuthority, RuntimeMode, StartupAttempt, StartupDriverGuard,
 };
 #[cfg(feature = "cluster")]
 use super::{report_cluster_terminal_halt, retire_cluster_compute_generation};
@@ -24,6 +24,28 @@ fn checkpoint_store(
         store
     };
     Ok(Box::new(store))
+}
+
+fn validate_checkpoint_timing(
+    config: &laminar_core::streaming::StreamCheckpointConfig,
+) -> Result<(), DbError> {
+    if config.interval_ms == Some(0) {
+        return Err(DbError::Config(
+            "checkpoint.interval_ms must be greater than zero; use None for manual-only".into(),
+        ));
+    }
+    let Some(timeout_ms) = config.timeout_ms else {
+        return Ok(());
+    };
+    if timeout_ms == 0 {
+        return Err(DbError::Config(
+            "checkpoint.timeout_ms must be greater than zero".into(),
+        ));
+    }
+    checked_pipeline_deadline(std::time::Duration::from_millis(timeout_ms), "checkpoint").map_err(
+        |_| DbError::Config("checkpoint.timeout_ms exceeds the platform clock range".into()),
+    )?;
+    Ok(())
 }
 
 impl LaminarDB {
@@ -628,17 +650,7 @@ impl LaminarDB {
                     "checkpoint.max_node_data_bytes was not resolved at construction".into(),
                 )
             })?;
-            if cp_config.interval_ms == Some(0) {
-                return Err(DbError::Config(
-                    "checkpoint.interval_ms must be greater than zero; use None for manual-only"
-                        .into(),
-                ));
-            }
-            if cp_config.timeout_ms == Some(0) {
-                return Err(DbError::Config(
-                    "checkpoint.timeout_ms must be greater than zero".into(),
-                ));
-            }
+            validate_checkpoint_timing(cp_config)?;
             let key_group_count = self.checkpoint_key_groups();
 
             let data_dir = cp_config

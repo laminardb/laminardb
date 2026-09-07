@@ -6585,8 +6585,11 @@ pub struct LeaderLeaseConfig {
 impl Default for LeaderLeaseConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(5),
-            renew_interval: Duration::from_secs(2),
+            // Keep one full five-second control-I/O window after the renewal tick. Native cloud
+            // stores can legitimately consume that window while applying their bounded retry
+            // policy; expiring sooner would turn a transport tail into a needless leader term.
+            ttl: Duration::from_secs(15),
+            renew_interval: Duration::from_secs(5),
         }
     }
 }

@@ -62,7 +62,9 @@ fn checked_pipeline_deadline(
 }
 
 #[cfg(feature = "cluster")]
-fn configured_checkpoint_timeout(config: &crate::config::LaminarConfig) -> std::time::Duration {
+pub(crate) fn configured_checkpoint_timeout(
+    config: &crate::config::LaminarConfig,
+) -> std::time::Duration {
     config
         .checkpoint
         .as_ref()
