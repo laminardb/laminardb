@@ -117,6 +117,12 @@ fn diagnostic_read_gate_is_single_flight_and_rate_bounded() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn diagnostic_read_deadline_outlives_object_store_control_io() {
+    assert!(DIAGNOSTIC_READ_DEADLINE > crate::cluster::OBJECT_STORE_CONTROL_IO_TIMEOUT);
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn diagnostic_read_deadline_releases_the_single_flight_permit() {
     let (state, diagnostic) = diagnostic_middleware_state();

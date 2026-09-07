@@ -57,7 +57,7 @@ impl laminar_core::cluster::control::ClusterKv for StaticClusterKv {
     }
 }
 
-pub(super) const OBJECT_STORE_CONTROL_IO_TIMEOUT: std::time::Duration =
+pub(crate) const OBJECT_STORE_CONTROL_IO_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 const OBJECT_STORE_CONTROL_MAX_VALUE_BYTES: u64 = 1024 * 1024;
 const OBJECT_STORE_CONTROL_MAX_KEY_BYTES: usize = 1024;

@@ -113,6 +113,8 @@ const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
 #[cfg(feature = "kafka")]
 const SOAK_HTTP_HEADER_MAX_BYTES: usize = 16 * 1_024;
 #[cfg(feature = "kafka")]
+const SOAK_HTTP_OPERATION_TIMEOUT: Duration = Duration::from_secs(7);
+#[cfg(feature = "kafka")]
 const READINESS_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1_024;
 #[cfg(feature = "kafka")]
 const LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES: usize = 4 * 1_024;
@@ -215,8 +217,6 @@ const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
-#[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 81] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
@@ -2318,7 +2318,7 @@ impl Node {
     ) -> Result<BoundedHttpResponse, BoundedHttpError> {
         let remaining = || {
             remaining_at(deadline, Instant::now())
-                .map(|duration| duration.min(Duration::from_secs(6)))
+                .map(|duration| duration.min(SOAK_HTTP_OPERATION_TIMEOUT))
                 .ok_or_else(|| {
                     BoundedHttpError::Unavailable(format!(
                         "node{} HTTP evidence deadline was exhausted",
@@ -2500,7 +2500,7 @@ impl Node {
 
     #[cfg(feature = "kafka")]
     fn local_assignment_diagnostic(&self) -> LocalAssignmentDiagnostic {
-        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        let deadline = Instant::now() + SOAK_HTTP_OPERATION_TIMEOUT;
         match self.local_authority_observation(deadline) {
             LocalAuthorityObservation::Available(evidence) => {
                 LocalAssignmentDiagnostic::Available {
@@ -2656,7 +2656,7 @@ impl Node {
 
     #[cfg(feature = "kafka")]
     fn durable_assignment_diagnostic(&self) -> DurableAssignmentDiagnostic {
-        let deadline = Instant::now() + RECOVERY_DIAGNOSTIC_HTTP_TIMEOUT;
+        let deadline = Instant::now() + SOAK_HTTP_OPERATION_TIMEOUT;
         match self.durable_assignment_observation(deadline) {
             Ok(Some(snapshot)) => DurableAssignmentDiagnostic::Available {
                 version: snapshot.version,
