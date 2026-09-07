@@ -1,5 +1,9 @@
 use super::{AssignmentAdoptionMode, AssignmentAuthorityActivation, DbError, DbState, LaminarDB};
-use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant, LeaderProof};
+use std::time::Duration;
+
+use laminar_core::checkpoint::{
+    AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+};
 use laminar_core::cluster::control::{
     ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryRound,
 };
@@ -176,6 +180,112 @@ async fn audited_stopped_round(
 
 #[cfg(feature = "cluster")]
 impl LaminarDB {
+    pub(super) fn shuffle_assignment_authority_is_exact(
+        &self,
+        fence: &CheckpointAssignmentFence,
+    ) -> bool {
+        let expected_digest = fence.digest();
+        let receiver_exact = self
+            .shuffle_receiver
+            .lock()
+            .as_ref()
+            .is_none_or(|endpoint| {
+                endpoint.assignment_version() == fence.assignment_version
+                    && endpoint.active_assignment_digest() == Some(expected_digest)
+            });
+        let sender_exact = self.shuffle_sender.lock().as_ref().is_none_or(|endpoint| {
+            endpoint.assignment_version() == fence.assignment_version
+                && endpoint.active_assignment_digest() == Some(expected_digest)
+        });
+        receiver_exact && sender_exact
+    }
+
+    /// Activate watcher-owned authority, retaining an exact installation made by recovery while
+    /// the watcher's original deadline expired waiting for assignment serialization.
+    pub(crate) async fn activate_watcher_assignment_authority(
+        &self,
+        controller: &ClusterController,
+        fence: &CheckpointAssignmentFence,
+        drain_transition: Option<AssignmentDrainTransition>,
+        expected_revision: u64,
+        deadline: tokio::time::Instant,
+        reconciliation_timeout: Duration,
+    ) -> Result<AssignmentAuthorityActivation, DbError> {
+        let expected_drain = drain_transition.clone();
+        let error = match self
+            .activate_assignment_authority(fence, drain_transition, expected_revision, deadline)
+            .await
+        {
+            Ok(activation) => return Ok(activation),
+            Err(error) => error,
+        };
+
+        let reconciliation_deadline = tokio::time::Instant::now() + reconciliation_timeout;
+        match self
+            .settle_failed_watcher_activation(
+                controller,
+                fence,
+                expected_drain.as_ref(),
+                expected_revision,
+                reconciliation_deadline,
+            )
+            .await
+        {
+            Ok(true) => Ok(AssignmentAuthorityActivation {
+                installed: true,
+                intake_open: false,
+                revision: expected_revision,
+            }),
+            Ok(false) => Err(error),
+            Err(settlement) => Err(DbError::Checkpoint(format!(
+                "{error}; failed to settle watcher activation: {settlement}"
+            ))),
+        }
+    }
+
+    async fn settle_failed_watcher_activation(
+        &self,
+        controller: &ClusterController,
+        fence: &CheckpointAssignmentFence,
+        expected_drain: Option<&AssignmentDrainTransition>,
+        expected_revision: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, DbError> {
+        self.set_source_gate(true);
+        let adoption =
+            tokio::time::timeout_at(deadline, self.assignment_adoption_lock.lock()).await;
+        let Ok(_adoption) = adoption else {
+            // RECOVERY: cleanup cannot safely clear controller state without owning adoption.
+            // Terminal process revocation linearizes with shuffle installation and prevents the
+            // lock holder (or a successor) from publishing usable authority after this timeout.
+            self.revoke_cluster_authority();
+            return Err(DbError::Checkpoint(
+                "timed out reconciling failed watcher assignment activation; process authority \
+                 revoked"
+                    .into(),
+            ));
+        };
+        let exact_recovery_installation = controller.is_recovering()
+            && controller.process_lease_is_live()
+            && self.cluster_intake_fenced()
+            && self
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire)
+                == expected_revision
+            && controller
+                .checkpoint_assignment_fence(fence.assignment_version)
+                .as_ref()
+                == Some(fence)
+            && controller.checkpoint_drain_transition().as_ref() == expected_drain
+            && self.shuffle_assignment_authority_is_exact(fence);
+        if exact_recovery_installation {
+            return Ok(true);
+        }
+
+        self.withdraw_assignment_authority(controller);
+        Ok(false)
+    }
+
     fn assignment_authority_is_current(
         &self,
         controller: &laminar_core::cluster::control::ClusterController,

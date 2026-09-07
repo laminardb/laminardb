@@ -627,11 +627,13 @@ impl SnapshotWatcher {
                         }
                         match self
                             .db
-                            .activate_assignment_authority(
+                            .activate_watcher_assignment_authority(
+                                c,
                                 &fence,
                                 drain_transition,
                                 authority_revision,
                                 head_deadline,
+                                operation_timeout,
                             )
                             .await
                         {
@@ -642,8 +644,6 @@ impl SnapshotWatcher {
                             }
                             Ok(_) => self.assignment_authority_dirty = true,
                             Err(error) => {
-                                c.publish_checkpoint_drain_transition(None);
-                                c.publish_checkpoint_assignment_fence(None);
                                 self.installed_fence = None;
                                 self.assignment_authority_dirty = true;
                                 warn!(%error, version, "shuffle assignment certificate install failed");
