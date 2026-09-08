@@ -2147,12 +2147,24 @@ async fn leader_stop_wait_yields_on_same_node_leader_term_rotation() {
     controller.announce_recover_prepare(&round).await.unwrap();
     let retained_prepare = kv.read_from(self_id, "control:recover").await.unwrap();
 
+    let (stop_started_tx, stop_started_rx) = tokio::sync::oneshot::channel();
     let waiting = tokio::spawn({
         let controller = Arc::clone(&controller);
         let round = round.clone();
-        async move { await_recovery_driver_stop(&controller, &round, std::future::pending()).await }
+        async move {
+            let stop = async move {
+                stop_started_tx
+                    .send(())
+                    .expect("the driver stop wait must remain live");
+                std::future::pending().await
+            };
+            await_recovery_driver_stop(&controller, &round, stop).await
+        }
     });
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), stop_started_rx)
+        .await
+        .expect("the driver must begin awaiting its local stop")
+        .expect("the driver stop wait must remain live");
     assert!(
         !waiting.is_finished(),
         "the unfinished local stop must keep the original driver waiting"
