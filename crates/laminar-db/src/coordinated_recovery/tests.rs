@@ -2130,6 +2130,55 @@ async fn post_start_same_node_leader_term_rotation_retains_control_for_a_success
 }
 
 #[tokio::test]
+async fn leader_stop_wait_yields_on_same_node_leader_term_rotation() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(Vec::new());
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, backing).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1]).await;
+    publish_round_roster(&controller, &kv, &round).await;
+    controller.announce_recover_prepare(&round).await.unwrap();
+    let retained_prepare = kv.read_from(self_id, "control:recover").await.unwrap();
+
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let round = round.clone();
+        async move { await_recovery_driver_stop(&controller, &round, std::future::pending()).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "the unfinished local stop must keep the original driver waiting"
+    );
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(controller.is_leader());
+    assert!(!recovery_driver_proof_is_current(&controller, &round));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("proof rotation must release the old driver's stop wait")
+        .expect("the stop wait task must not panic");
+    assert_eq!(outcome, DriverStopOutcome::LeadershipLost);
+    assert_eq!(
+        kv.read_from(self_id, "control:recover").await.as_deref(),
+        Some(retained_prepare.as_str()),
+        "the successor must inherit the published Prepare"
+    );
+}
+
+#[tokio::test]
 async fn restore_quorum_accepts_an_intentionally_suspended_assignment_certificate() {
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     report_test_fault(&controller).await;
