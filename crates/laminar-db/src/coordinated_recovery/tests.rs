@@ -2,8 +2,8 @@ use super::*;
 use laminar_core::checkpoint::{CheckpointAssignmentFence, LeaderProof, LeaderProofOwner};
 use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentSnapshot, AssignmentSnapshotStore, CheckpointParticipant,
-    ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
-    ProcessLeaseAuthority, ProcessLeaseOutcome,
+    ClusterKv, InMemoryKv, LeaderLease, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline,
+    LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
 };
 use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
 use tokio::sync::watch;
@@ -92,6 +92,19 @@ async fn install_test_leader_authority(
     controller: &ClusterController,
     authority_store: Arc<dyn object_store::ObjectStore>,
 ) -> Arc<LeaderLeaseStore> {
+    install_test_leader_authority_with_watch(controller, authority_store)
+        .await
+        .0
+}
+
+async fn install_test_leader_authority_with_watch(
+    controller: &ClusterController,
+    authority_store: Arc<dyn object_store::ObjectStore>,
+) -> (
+    Arc<LeaderLeaseStore>,
+    watch::Sender<Option<LeaderLease>>,
+    LeaderLeaseOwner,
+) {
     let process_term =
         install_test_process_authority(controller, Arc::clone(&authority_store)).await;
     let authority = Arc::new(LeaderLeaseStore::new(authority_store, 10_000));
@@ -103,17 +116,17 @@ async fn install_test_leader_authority(
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
         panic!("empty recovery test authority must grant leadership");
     };
-    let (_lease_tx, lease_rx) = watch::channel(Some(lease));
+    let (lease_tx, lease_rx) = watch::channel(Some(lease));
     controller
         .set_leader_lease_watch(
             lease_rx,
-            owner,
+            owner.clone(),
             Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
         )
         .unwrap();
     controller.set_leader_lease_store(Arc::clone(&authority));
     controller.set_active(true);
-    authority
+    (authority, lease_tx, owner)
 }
 
 async fn controller(
@@ -1980,6 +1993,140 @@ async fn recovery_quorum_requires_the_exact_round_and_target() {
     let outcome = wait_restored_quorum(&controller, &start, Duration::from_secs(1)).await;
 
     assert_eq!(outcome, RecoveryQuorum::Reached);
+}
+
+#[tokio::test]
+async fn post_start_leadership_loss_retains_control_for_a_successor() {
+    let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
+    let controller = Arc::new(controller);
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        controller.recovery_incarnation().to_string(),
+    );
+    let original_fault = report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    activate_start(&controller, &kv, &round, 4).await;
+    let start = start(round.clone(), 4);
+    controller.announce_recovered(&start).await.unwrap();
+    let retained_start = kv.read_from(NodeId(1), "control:recover").await.unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+        &prometheus::Registry::new(),
+    ));
+    *db.engine_metrics.lock() = Some(Arc::clone(&metrics));
+    controller.set_recovering(true);
+    db.set_source_gate(true);
+    let inventory_before = controller.read_recovery_fault_inventory().await.unwrap();
+    let failures_before = metrics.coordinated_recovery_failures_total.get();
+
+    let wait_controller = Arc::clone(&controller);
+    let wait_start = start.clone();
+    let waiter = tokio::spawn(async move {
+        wait_restored_quorum(&wait_controller, &wait_start, Duration::from_secs(1)).await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "the missing follower acknowledgement must keep the restore quorum pending"
+    );
+    controller.fence_process_lease();
+    let outcome = waiter.await.unwrap();
+
+    assert_eq!(outcome, RecoveryQuorum::LeadershipLost);
+    retain_recovery_control_after_leadership_loss(&db, &controller, &round);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(
+        kv.read_from(NodeId(1), "control:recover").await.as_deref(),
+        Some(retained_start.as_str()),
+        "the published Start must remain available to the successor"
+    );
+    assert_eq!(
+        metrics.coordinated_recovery_failures_total.get(),
+        failures_before,
+        "an expected leadership handoff is not a failed recovery"
+    );
+    assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    assert_eq!(
+        controller.read_local_fault_report_control().await.unwrap(),
+        Some(original_fault.sequence)
+    );
+    assert_eq!(
+        controller.read_recovery_fault_inventory().await.unwrap(),
+        inventory_before,
+        "the original fault remains the successor generation's trigger"
+    );
+}
+
+#[tokio::test]
+async fn post_start_same_node_leader_term_rotation_retains_control_for_a_successor() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, backing).await;
+    let controller = Arc::new(controller);
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        controller.recovery_incarnation().to_string(),
+    );
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    activate_start(&controller, &kv, &round, 4).await;
+    let start = start(round.clone(), 4);
+    controller.announce_recovered(&start).await.unwrap();
+    let retained_start = kv.read_from(self_id, "control:recover").await.unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+
+    let wait_controller = Arc::clone(&controller);
+    let wait_start = start.clone();
+    let waiter = tokio::spawn(async move {
+        wait_restored_quorum(&wait_controller, &wait_start, Duration::from_secs(1)).await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "the missing follower acknowledgement must keep the restore quorum pending"
+    );
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(controller.is_leader());
+    assert_ne!(
+        controller.capture_leader_proof().as_ref(),
+        Some(&round.leader_proof)
+    );
+
+    let outcome = waiter.await.unwrap();
+    assert_eq!(outcome, RecoveryQuorum::LeadershipLost);
+
+    retain_recovery_control_after_leadership_loss(&db, &controller, &round);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(
+        kv.read_from(self_id, "control:recover").await.as_deref(),
+        Some(retained_start.as_str()),
+        "the published Start must remain available to the successor"
+    );
 }
 
 #[tokio::test]
