@@ -205,6 +205,13 @@ const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded"
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
 #[cfg(feature = "kafka")]
+const RECOVERY_START_LOG: &str = "leader announced recovery start";
+#[cfg(feature = "kafka")]
+const RECOVERY_STOPPED_LOG: &str = "stopped for recovery round; awaiting target";
+#[cfg(feature = "kafka")]
+const RECOVERY_DRIVER_HANDOFF_LOG: &str =
+    "recovery driver lost leadership; retaining current control and fence for successor generation";
+#[cfg(feature = "kafka")]
 const RECOVERY_SUPERSEDED_LOG: &str = "recovery round was superseded:";
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_HANDOFF_LOG: &str =
@@ -218,7 +225,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 93] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 98] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -298,9 +305,23 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 93] = [
     ("recovery_prepare", RECOVERY_PREPARE_LOG),
     ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
+    ("recovery_stopped", RECOVERY_STOPPED_LOG),
+    ("recovery_driver_lost", RECOVERY_DRIVER_HANDOFF_LOG),
     (
-        "recovery_stopped",
-        "stopped for recovery round; awaiting target",
+        "recovery_leader_self_restore_failed",
+        "leader self-restore failed",
+    ),
+    (
+        "recovery_pipeline_restart_failed",
+        "recovery pipeline restart failed",
+    ),
+    (
+        "recovery_restore_ack_failed",
+        "could not acknowledge recovery restore",
+    ),
+    (
+        "recovery_release_publish_failed",
+        "could not publish recovery Release",
     ),
     (
         "recovery_leader_quiesce_failed",
@@ -521,7 +542,7 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 93] = [
         "rebalance_failed",
         "rebalance failed; retrying after backoff",
     ),
-    ("recovery_start", "leader announced recovery start"),
+    ("recovery_start", RECOVERY_START_LOG),
     ("recovery_release", RECOVERY_RELEASE_LOG),
     (
         "kafka_source_started_fenced",
@@ -9341,8 +9362,106 @@ fn validate_recovery_checkpoint_failure_totals(
 #[cfg(feature = "kafka")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryPrepareSequence {
-    final_prepare_line: usize,
     abandoned_rounds: u32,
+    applied_rounds: u32,
+}
+
+#[cfg(feature = "kafka")]
+fn validate_fenced_prepare_replacement(
+    leader_lines: &[&str],
+    first: usize,
+    second: usize,
+) -> Result<(), String> {
+    let between = &leader_lines[first + 1..second];
+    let superseded = between
+        .iter()
+        .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
+        .ok_or_else(|| {
+            "two recovery Prepare records have no intervening superseded-round fence".to_string()
+        })?;
+    if !between[superseded + 1..]
+        .iter()
+        .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
+    {
+        return Err("two recovery Prepare records have no ordered direct handoff fence".into());
+    }
+    let retry_holds = between
+        .iter()
+        .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
+        .count();
+    if retry_holds != 1 {
+        return Err(format!(
+            "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kafka")]
+fn validate_post_start_leadership_handoff(
+    fault_logs: &[String],
+    leader_lines: &[&str],
+    leader_prepares: &[usize],
+) -> Result<(), String> {
+    let first_prepare = *leader_prepares
+        .first()
+        .ok_or_else(|| "old recovery driver has no Prepare".to_string())?;
+    let handoff = leader_lines
+        .iter()
+        .position(|line| line.contains(RECOVERY_DRIVER_HANDOFF_LOG))
+        .ok_or_else(|| {
+            "post-Start leadership handoff was not recorded by its old driver".to_string()
+        })?;
+    if first_prepare >= handoff {
+        return Err("leadership handoff preceded the old driver's recovery Prepare".into());
+    }
+    let before_handoff = &leader_lines[first_prepare + 1..handoff];
+    if !before_handoff
+        .iter()
+        .any(|line| line.contains(RECOVERY_START_LOG))
+    {
+        return Err("leadership handoff did not follow the old driver's recovery Start".into());
+    }
+    if before_handoff
+        .iter()
+        .any(|line| line.contains(RECOVERY_RELEASE_LOG))
+    {
+        return Err("leadership handoff followed a completed recovery Release".into());
+    }
+    if leader_prepares
+        .get(1)
+        .is_some_and(|successor_prepare| *successor_prepare < handoff)
+    {
+        return Err("successor recovery Prepare preceded the recorded leadership handoff".into());
+    }
+
+    for (node_id, log) in fault_logs.iter().enumerate() {
+        let mut waiting_for_start = false;
+        for line in log.lines() {
+            if line.contains(RECOVERY_PREPARE_LOG) {
+                if waiting_for_start {
+                    return Err(format!(
+                        "node{node_id} published another recovery Prepare before Start"
+                    ));
+                }
+                waiting_for_start = true;
+            }
+            if line.contains(RECOVERY_START_LOG) {
+                if !waiting_for_start {
+                    return Err(format!(
+                        "node{node_id} published recovery Start without its Prepare"
+                    ));
+                }
+                waiting_for_start = false;
+            }
+        }
+        if waiting_for_start {
+            return Err(format!(
+                "node{node_id} recovery Prepare was not followed by Start"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "kafka")]
@@ -9363,47 +9482,33 @@ fn validate_recovery_prepare_sequence(
         .iter()
         .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
         .sum::<usize>();
-    if total_prepares != prepares.len() {
-        return Err("recovery Prepare was emitted by a non-leader process".into());
-    }
-    match prepares.as_slice() {
-        [prepare] => Ok(RecoveryPrepareSequence {
-            final_prepare_line: *prepare,
+    let driver_handoffs = fault_logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_DRIVER_HANDOFF_LOG).count())
+        .sum::<usize>();
+
+    match (total_prepares, driver_handoffs, prepares.as_slice()) {
+        (1, 0, [_]) => Ok(RecoveryPrepareSequence {
             abandoned_rounds: 0,
+            applied_rounds: 1,
         }),
-        [first, second] => {
-            let between = &leader_lines[first + 1..*second];
-            let superseded = between
-                .iter()
-                .position(|line| line.contains(RECOVERY_SUPERSEDED_LOG))
-                .ok_or_else(|| {
-                    "two recovery Prepare records have no intervening superseded-round fence"
-                        .to_string()
-                })?;
-            if !between[superseded + 1..]
-                .iter()
-                .any(|line| line.contains(RECOVERY_PREPARE_HANDOFF_LOG))
-            {
-                return Err(
-                    "two recovery Prepare records have no ordered direct handoff fence".into(),
-                );
-            }
-            let retry_holds = between
-                .iter()
-                .filter(|line| line.contains(RECOVERY_RETRY_HOLD_LOG))
-                .count();
-            if retry_holds != 1 {
-                return Err(format!(
-                    "fenced recovery replacement recorded {retry_holds} retry holds; expected exactly one"
-                ));
-            }
+        (2, 0, [first, second]) => {
+            validate_fenced_prepare_replacement(&leader_lines, *first, *second)?;
             Ok(RecoveryPrepareSequence {
-                final_prepare_line: *second,
                 abandoned_rounds: 1,
+                applied_rounds: 1,
             })
         }
+        (2, 1, [_, ..]) => {
+            validate_post_start_leadership_handoff(fault_logs, &leader_lines, &prepares)?;
+            Ok(RecoveryPrepareSequence {
+                abandoned_rounds: 0,
+                applied_rounds: 2,
+            })
+        }
+        (1 | 2, 0, _) => Err("recovery Prepare was emitted by a non-leader process".into()),
         _ => Err(format!(
-            "explicit fault created {total_prepares} recovery Prepare generations; expected one, or one fenced direct replacement"
+            "explicit fault created {total_prepares} recovery Prepare generations and {driver_handoffs} post-Start leadership handoffs; expected one round, one fenced direct replacement, or one successor generation"
         )),
     }
 }
@@ -9447,11 +9552,15 @@ fn validate_recovery_checkpoint_failure_evidence(
             leader_failure = failures.first().copied();
         }
     }
-    let prepare = validate_recovery_prepare_sequence(fault_logs, leader)?.final_prepare_line;
+    validate_recovery_prepare_sequence(fault_logs, leader)?;
     let Some(failed) = leader_failure else {
         return Ok(None);
     };
     let leader_fault_lines = fault_logs[leader].lines().collect::<Vec<_>>();
+    let prepare = leader_fault_lines
+        .iter()
+        .position(|line| line.contains(RECOVERY_PREPARE_LOG))
+        .expect("validated recovery sequence has an initial leader Prepare");
     let mut fault_failure = None;
     for (index, line) in leader_fault_lines.iter().enumerate() {
         if checkpoint_failure_metric_from_log_line(line)? == Some(failed) {
@@ -9467,7 +9576,7 @@ fn validate_recovery_checkpoint_failure_evidence(
     })?;
     // A checkpoint already in flight at the fault boundary can observe the victim's closed
     // shuffle scope before the recovery leader durably announces Prepare. Both orders are valid;
-    // the captured log boundary and the single recovery generation provide the causal fence.
+    // the captured log boundary and validated recovery sequence provide the causal fence.
     if !leader_fault_lines[prepare + 1..]
         .iter()
         .any(|line| line.contains(RECOVERY_RELEASE_LOG))
@@ -9557,6 +9666,26 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         .collect::<Vec<_>>();
     let prepare_sequence = validate_recovery_prepare_sequence(&logs, evidence.recovery_leader)
         .unwrap_or_else(|error| panic!("explicit recovery Prepare sequence invalid: {error}"));
+    let recovery_starts = logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_START_LOG).count())
+        .sum::<usize>();
+    assert_eq!(
+        recovery_starts, prepare_sequence.applied_rounds as usize,
+        "explicit fault did not produce one Start per applied recovery generation"
+    );
+    let stopped_reports = logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
+        .sum::<usize>();
+    let applied_stopped_reports = (nodes.len() - 1) * prepare_sequence.applied_rounds as usize;
+    let maximum_stopped_reports =
+        applied_stopped_reports + (nodes.len() - 1) * prepare_sequence.abandoned_rounds as usize;
+    assert!(
+        (applied_stopped_reports..=maximum_stopped_reports).contains(&stopped_reports),
+        "explicit fault recorded {stopped_reports} follower stops; expected {applied_stopped_reports} exact-quorum stops plus at most {} from a fenced abandoned round",
+        maximum_stopped_reports - applied_stopped_reports
+    );
     let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
         .expect("read recovery leader log for checkpoint failure evidence");
     let interrupted = validate_recovery_checkpoint_failure_evidence(
@@ -9593,7 +9722,7 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
             .expect("node stopped exposing coordinated recovery count");
         assert_eq!(
             recoveries,
-            recovery_baseline + 1.0,
+            recovery_baseline + f64::from(prepare_sequence.applied_rounds),
             "node{} applied {} recovery generations for one explicit fault",
             node.id,
             recoveries - recovery_baseline
@@ -13503,25 +13632,36 @@ fn run_single_node_join_kill9_soak(delivery: JoinDelivery) {
 #[ignore = "spawns 3 real laminardb processes; run with --ignored"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false);
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, None);
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_cluster_subscription_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, true);
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, true, None);
 }
 
 #[test]
 #[ignore = "spawns 3 real laminardb processes with Kafka and Delta S3; run with --ignored"]
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 fn three_node_eo_join_kill9_soak() {
-    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, false);
+    run_three_node_join_kill9_soak(JoinDelivery::ExactlyOnce, false, None);
+}
+
+#[test]
+#[ignore = "spawns 3 real laminardb processes and injects a follower checkpoint fault"]
+#[cfg(feature = "kafka")]
+fn three_node_follower_checkpoint_fault_recovery_release_regression() {
+    run_three_node_join_kill9_soak(JoinDelivery::AtLeastOnce, false, Some("follower"));
 }
 
 #[cfg(feature = "kafka")]
-fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: bool) {
+fn run_three_node_join_kill9_soak(
+    delivery: JoinDelivery,
+    subscription_soak: bool,
+    forced_fault_role: Option<&str>,
+) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
         ResolvedExecutable::from_environment()
@@ -13559,14 +13699,20 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
     );
     let key_group_count = cluster_key_group_count();
     let kafka_partitions = cluster_kafka_partition_count();
-    let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
+    let fault_role = forced_fault_role
+        .map(str::to_owned)
+        .or_else(|| std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok());
     if let Some(role) = fault_role.as_deref() {
         assert!(
             matches!(role, "leader" | "follower"),
             "LAMINAR_SOAK_FAULT_INJECT_ROLE must be 'leader' or 'follower', got {role:?}"
         );
     }
-    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+    let max_kills = if forced_fault_role.is_some() {
+        0
+    } else {
+        env_u64("LAMINAR_SOAK_KILLS", 4)
+    };
     validate_matrix_recovery_horizon(max_kills, recovery_ceiling, soak_secs, retained_interval_ms);
     assert!(
         fault_role.is_none() || max_kills == 0,
@@ -13986,6 +14132,15 @@ fn run_three_node_join_kill9_soak(delivery: JoinDelivery, subscription_soak: boo
             remaining_progress_window(recovery_deadline, "coordinated recovery"),
             "progress after coordinated recovery",
             Some(latest_checkpoint),
+        );
+        wait_for(
+            "one live leader and every source gate reopened after recovery Release",
+            remaining_progress_window(recovery_deadline, "coordinated recovery"),
+            || {
+                assert_running_nodes(&mut nodes);
+                producer.assert_running();
+                observed_leader(&nodes).is_some() && nodes.iter().all(Node::is_ready)
+            },
         );
         local_convergence = wait_for_local_assignment_convergence(
             &mut nodes,
@@ -15899,6 +16054,11 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                checkpoint state serialization timed out: token=secret\n\
                checkpoint source cut is incomplete: credential=secret\n\
                leader announced recovery prepare\n\
+               recovery driver lost leadership; retaining current control and fence for successor generation\n\
+               leader self-restore failed; retrying\n\
+               recovery pipeline restart failed\n\
+               could not acknowledge recovery restore\n\
+               could not publish recovery Release\n\
                leader could not quiesce after publishing recovery Prepare\n\
                could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
@@ -15967,6 +16127,15 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     );
     assert_eq!(counts.get("checkpoint_source_cut_incomplete"), Some(&1));
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
+    for marker in [
+        "recovery_driver_lost",
+        "recovery_leader_self_restore_failed",
+        "recovery_pipeline_restart_failed",
+        "recovery_restore_ack_failed",
+        "recovery_release_publish_failed",
+    ] {
+        assert_eq!(counts.get(marker), Some(&1), "missing {marker}");
+    }
     assert_eq!(counts.get("recovery_leader_quiesce_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
@@ -16296,13 +16465,13 @@ fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
 
 #[cfg(feature = "kafka")]
 #[test]
-fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
+fn recovery_prepare_oracle_allows_only_fenced_transitions() {
     let one = vec![RECOVERY_PREPARE_LOG.to_string(), String::new()];
     assert_eq!(
         validate_recovery_prepare_sequence(&one, 0).unwrap(),
         RecoveryPrepareSequence {
-            final_prepare_line: 0,
             abandoned_rounds: 0,
+            applied_rounds: 1,
         }
     );
 
@@ -16316,8 +16485,35 @@ fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
     assert_eq!(
         validate_recovery_prepare_sequence(&replacement, 0).unwrap(),
         RecoveryPrepareSequence {
-            final_prepare_line: 4,
             abandoned_rounds: 1,
+            applied_rounds: 1,
+        }
+    );
+
+    let same_process_successor = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}\n{RECOVERY_DRIVER_HANDOFF_LOG}\n\
+             {RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}"
+        ),
+        String::new(),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&same_process_successor, 0).unwrap(),
+        RecoveryPrepareSequence {
+            abandoned_rounds: 0,
+            applied_rounds: 2,
+        }
+    );
+
+    let different_process_successor = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}\n{RECOVERY_DRIVER_HANDOFF_LOG}"),
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}"),
+    ];
+    assert_eq!(
+        validate_recovery_prepare_sequence(&different_process_successor, 0).unwrap(),
+        RecoveryPrepareSequence {
+            abandoned_rounds: 0,
+            applied_rounds: 2,
         }
     );
 
@@ -16347,6 +16543,38 @@ fn recovery_prepare_oracle_allows_only_fenced_direct_replacement() {
     assert!(validate_recovery_prepare_sequence(&wrong_process, 0)
         .unwrap_err()
         .contains("non-leader"));
+
+    let pre_start_handoff = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_DRIVER_HANDOFF_LOG}"),
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}"),
+    ];
+    assert!(validate_recovery_prepare_sequence(&pre_start_handoff, 0)
+        .unwrap_err()
+        .contains("did not follow"));
+
+    let post_release_handoff = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}\n{RECOVERY_RELEASE_LOG}\n\
+             {RECOVERY_DRIVER_HANDOFF_LOG}"
+        ),
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}"),
+    ];
+    assert!(validate_recovery_prepare_sequence(&post_release_handoff, 0)
+        .unwrap_err()
+        .contains("completed recovery Release"));
+
+    let successor_before_handoff = vec![
+        format!(
+            "{RECOVERY_PREPARE_LOG}\n{RECOVERY_START_LOG}\n{RECOVERY_PREPARE_LOG}\n\
+             {RECOVERY_START_LOG}\n{RECOVERY_DRIVER_HANDOFF_LOG}"
+        ),
+        String::new(),
+    ];
+    assert!(
+        validate_recovery_prepare_sequence(&successor_before_handoff, 0)
+            .unwrap_err()
+            .contains("preceded the recorded leadership handoff")
+    );
 }
 
 #[cfg(feature = "kafka")]

@@ -173,6 +173,7 @@ struct ReleaseDrainSettlementHook {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryQuorum {
     Reached,
+    LeadershipLost,
     Superseded,
     Conflicted,
     ParticipantsChanged,
@@ -1825,12 +1826,12 @@ impl RecoveryMonitor {
             tracing::error!(gen = gen_id, "leader self-restore failed; abandoning round");
             RecoveryQuorum::TimedOut
         };
+        if quorum == RecoveryQuorum::LeadershipLost {
+            retain_recovery_control_after_leadership_loss(db, controller, &round);
+            return;
+        }
         if quorum != RecoveryQuorum::Reached {
-            tracing::error!(
-                gen = gen_id,
-                ?quorum,
-                "exact recovery restore quorum was not reached; Start will not be released"
-            );
+            tracing::error!(gen = gen_id, ?quorum, "recovery restore quorum failed");
             let _ = controller.clear_recover(&round).await;
             hold_intake_and_request_retry(db, controller, gen_id, false).await;
             return;
@@ -4131,8 +4132,10 @@ async fn wait_restored_quorum_until(
 ) -> RecoveryQuorum {
     let round = &start.round;
     loop {
-        if !controller.is_leader() {
-            return RecoveryQuorum::ParticipantsChanged;
+        if round.id.driver != controller.instance_id()
+            || controller.capture_leader_proof().as_ref() != Some(&round.leader_proof)
+        {
+            return RecoveryQuorum::LeadershipLost;
         }
         let local_assignment_is_exact = controller
             .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
@@ -4187,6 +4190,9 @@ async fn wait_restored_quorum_until(
         let owners = round.owners();
         let pending = frozen_pending(&owners, reports, |ack| ack == start);
         if pending.is_empty() {
+            if controller.capture_leader_proof().as_ref() != Some(&round.leader_proof) {
+                return RecoveryQuorum::LeadershipLost;
+            }
             return RecoveryQuorum::Reached;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
