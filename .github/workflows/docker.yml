@@ -36,6 +36,8 @@ jobs:
   prepare:
     name: Prepare metadata
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.version.outputs.version }}
       tags: ${{ steps.meta.outputs.tags }}
@@ -79,6 +81,8 @@ jobs:
     needs: prepare
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
