@@ -2570,7 +2570,9 @@ async fn stalled_quorum_control_read_rechecks_leadership_before_the_quorum_deadl
         let round = round.clone();
         async move { wait_stopped_quorum_until(&controller, &round).await }
     });
-    authority_gate.wait_until_blocked().await;
+    tokio::time::timeout(Duration::from_secs(1), authority_gate.wait_until_blocked())
+        .await
+        .expect("the gated authority read must be entered");
 
     let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
         panic!("the current owner must rotate its leader term");
