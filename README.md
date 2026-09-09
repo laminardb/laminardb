@@ -1,4 +1,5 @@
 [![CI](https://github.com/laminardb/laminardb/actions/workflows/ci.yml/badge.svg)](https://github.com/laminardb/laminardb/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/laminardb/laminardb/badge.svg)](https://codecov.io/gh/laminardb/laminardb)
 [![Crates.io](https://img.shields.io/crates/v/laminar-db.svg)](https://crates.io/crates/laminar-db)
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
