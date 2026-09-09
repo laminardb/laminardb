@@ -198,6 +198,13 @@ enum StoppedQuorum {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverStopOutcome {
+    Stopped,
+    Failed,
+    LeadershipLost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoundDriverAuthority {
     Current,
     Superseded,
@@ -1553,12 +1560,7 @@ impl RecoveryMonitor {
             return;
         }
         tracing::warn!(gen = gen_id, "leader announced recovery prepare");
-        if !stop_for_recovery(db).await {
-            tracing::error!(
-                gen = gen_id,
-                "leader could not quiesce after publishing recovery Prepare; retaining the fence"
-            );
-            retain_stopped_prepare_and_request_retry(db, controller, &round).await;
+        if !quiesce_recovery_driver(db, controller, &round).await {
             return;
         }
         if let Err(error) = announce_stopped_bounded(controller, &round).await {
@@ -2156,10 +2158,7 @@ impl RecoveryMonitor {
             }
 
             if pending.round.id.driver == controller.instance_id() {
-                if !controller.is_leader()
-                    || controller.capture_leader_proof().as_ref()
-                        != Some(&pending.round.leader_proof)
-                {
+                if !recovery_driver_proof_is_current(controller, &pending.round) {
                     return None;
                 }
                 match tokio::time::timeout_at(
@@ -2524,6 +2523,57 @@ async fn stop_and_purge(db: &Arc<LaminarDB>) -> bool {
 async fn stop_for_recovery(db: &Arc<LaminarDB>) -> bool {
     db.fence_coordinated_recovery_lifecycle();
     stop_and_purge(db).await
+}
+
+fn recovery_driver_proof_is_current(controller: &ClusterController, round: &RecoveryRound) -> bool {
+    round.id.driver == controller.instance_id() && controller.proof_is_live(&round.leader_proof)
+}
+
+/// Wait for local quiescence only while this exact driver term remains authoritative. The
+/// lifecycle owner thread outlives a dropped await, so yielding here cannot cancel or overlap it.
+async fn await_recovery_driver_stop(
+    controller: &ClusterController,
+    round: &RecoveryRound,
+    stop: impl std::future::Future<Output = bool>,
+) -> DriverStopOutcome {
+    tokio::pin!(stop);
+    loop {
+        if !recovery_driver_proof_is_current(controller, round) {
+            return DriverStopOutcome::LeadershipLost;
+        }
+        if let Ok(stopped) = tokio::time::timeout(STOP_QUORUM_INITIAL_POLL, stop.as_mut()).await {
+            if !recovery_driver_proof_is_current(controller, round) {
+                return DriverStopOutcome::LeadershipLost;
+            }
+            return if stopped {
+                DriverStopOutcome::Stopped
+            } else {
+                DriverStopOutcome::Failed
+            };
+        }
+    }
+}
+
+async fn quiesce_recovery_driver(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+) -> bool {
+    match await_recovery_driver_stop(controller, round, stop_for_recovery(db)).await {
+        DriverStopOutcome::Stopped => true,
+        DriverStopOutcome::LeadershipLost => {
+            retain_recovery_control_after_leadership_loss(db, controller, round);
+            false
+        }
+        DriverStopOutcome::Failed => {
+            tracing::error!(
+                gen = round.id.generation,
+                "leader could not quiesce after publishing recovery Prepare; retaining the fence"
+            );
+            retain_stopped_prepare_and_request_retry(db, controller, round).await;
+            false
+        }
+    }
 }
 
 async fn install_recovery_start_assignment(
@@ -3964,9 +4014,7 @@ async fn wait_stopped_quorum_until(
     let mut poll = STOP_QUORUM_INITIAL_POLL;
     let mut next_roster_audit = tokio::time::Instant::now();
     loop {
-        if round.id.driver != controller.instance_id()
-            || controller.capture_leader_proof().as_ref() != Some(&round.leader_proof)
-        {
+        if !recovery_driver_proof_is_current(controller, round) {
             return StoppedQuorum::LeadershipLost;
         }
         let local_assignment_is_exact = controller
@@ -4132,9 +4180,7 @@ async fn wait_restored_quorum_until(
 ) -> RecoveryQuorum {
     let round = &start.round;
     loop {
-        if round.id.driver != controller.instance_id()
-            || controller.capture_leader_proof().as_ref() != Some(&round.leader_proof)
-        {
+        if !recovery_driver_proof_is_current(controller, round) {
             return RecoveryQuorum::LeadershipLost;
         }
         let local_assignment_is_exact = controller
@@ -4190,7 +4236,7 @@ async fn wait_restored_quorum_until(
         let owners = round.owners();
         let pending = frozen_pending(&owners, reports, |ack| ack == start);
         if pending.is_empty() {
-            if controller.capture_leader_proof().as_ref() != Some(&round.leader_proof) {
+            if !recovery_driver_proof_is_current(controller, round) {
                 return RecoveryQuorum::LeadershipLost;
             }
             return RecoveryQuorum::Reached;
