@@ -95,9 +95,10 @@ jobs:
           # WHY: vendor/ holds third-party pgwire forks. Their SCRAM/MD5
           # protocol constants and RFC test vectors trip the crypto queries,
           # and security fixes belong upstream — not patched in place where
-          # the next vendor update would clobber them.
+          # the next vendor update would clobber them. The config keys follow
+          # the custom-config-file format: the exclusion key is paths-ignore.
           config: |
-            ignore:
+            paths-ignore:
               - vendor
 
       - name: Perform CodeQL Analysis
