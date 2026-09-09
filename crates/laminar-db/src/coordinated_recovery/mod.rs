@@ -3432,6 +3432,21 @@ async fn announce_recover_prepare_bounded(
     })?
 }
 
+async fn observe_recovery_quorum_control_bounded(
+    controller: &ClusterController,
+) -> Result<Option<RecoveryAnnouncement>, RecoveryControlError> {
+    if let Ok(observed) =
+        tokio::time::timeout(DECISION_IO_TIMEOUT, controller.observe_recover_control()).await
+    {
+        observed
+    } else {
+        tracing::warn!("recovery quorum control observation timed out");
+        Err(RecoveryControlError::Uncertain(format!(
+            "recovery quorum control observation exceeded {DECISION_IO_TIMEOUT:?}"
+        )))
+    }
+}
+
 async fn driver_controls_prepare(controller: &ClusterController, round: &RecoveryRound) -> bool {
     if !controller.is_leader()
         || !matches!(
@@ -4045,7 +4060,7 @@ async fn wait_stopped_quorum_until(
                 }
             }
         }
-        match controller.observe_recover_control().await {
+        match observe_recovery_quorum_control_bounded(controller).await {
             Err(RecoveryControlError::Uncertain(_)) => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -4200,7 +4215,7 @@ async fn wait_restored_quorum_until(
         ) {
             return RecoveryQuorum::ParticipantsChanged;
         }
-        match controller.observe_recover_control().await {
+        match observe_recovery_quorum_control_bounded(controller).await {
             Err(RecoveryControlError::Uncertain(_)) => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;

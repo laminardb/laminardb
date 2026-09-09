@@ -225,7 +225,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 99] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 100] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -338,6 +338,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 99] = [
     (
         "recovery_stop_quorum_timeout",
         "recovery stop quorum timed out",
+    ),
+    (
+        "recovery_quorum_control_timeout",
+        "recovery quorum control observation timed out",
     ),
     (
         "recovery_successor_authorized",
@@ -16066,6 +16070,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                leader could not quiesce after publishing recovery Prepare\n\
                could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
+               recovery quorum control observation timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
                coordinated recovery cancelled fenced checkpoint durable tails\n\
                recovery assignment 2 waits for a local vnode transition\n\
@@ -16144,6 +16149,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_leader_quiesce_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
+    assert_eq!(counts.get("recovery_quorum_control_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
     assert_eq!(counts.get("recovery_checkpoint_tails_cancelled"), Some(&1));
     for marker in [
