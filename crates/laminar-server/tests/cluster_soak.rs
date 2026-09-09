@@ -225,7 +225,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 98] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 99] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -303,6 +303,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 98] = [
         "coordinated recovery: owner-complete assignment audit failed",
     ),
     ("recovery_prepare", RECOVERY_PREPARE_LOG),
+    (
+        "recovery_checkpoint_tails_cancelled",
+        "coordinated recovery cancelled fenced checkpoint durable tails",
+    ),
     ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
     ("recovery_stopped", RECOVERY_STOPPED_LOG),
@@ -16063,6 +16067,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
                authorized successor assignment from the last committed cluster cut\n\
+               coordinated recovery cancelled fenced checkpoint durable tails\n\
                recovery assignment 2 waits for a local vnode transition\n\
                timed out serializing assignment authority closure\n\
                timed out draining assignment execution after closure\n\
@@ -16140,6 +16145,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
+    assert_eq!(counts.get("recovery_checkpoint_tails_cancelled"), Some(&1));
     for marker in [
         "recovery_transition_still_pending",
         "recovery_closure_serialization_deadline",

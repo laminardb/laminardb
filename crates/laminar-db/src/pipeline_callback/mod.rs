@@ -1253,6 +1253,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Set only while the recovery monitor owns a lifecycle operation under a published round.
+    /// At that point predecessor checkpoint authority is fenced and its pending tails are stale.
+    #[cfg(feature = "cluster")]
+    pub(crate) coordinated_lifecycle_active: Arc<std::sync::atomic::AtomicBool>,
     /// Shared assignment/checkpoint admission boundary. The coordinator carries an owned guard
     /// from its exact assignment audit through durable Prepare and source-barrier installation.
     #[cfg(feature = "cluster")]
@@ -1411,26 +1415,6 @@ impl ConnectorPipelineCallback {
             assignment_version: assignment_fence.assignment_version,
             assignment_digest: assignment_fence.digest(),
         })
-    }
-
-    fn reap_checkpoint_tail_tasks(&mut self) {
-        while let Some(result) = self.checkpoint_tail_tasks.try_join_next() {
-            if let Err(error) = result {
-                set_checkpoint_fault(
-                    &self.checkpoint_fault,
-                    format!("checkpoint durable tail terminated unexpectedly: {error}"),
-                );
-            }
-        }
-    }
-
-    fn spawn_checkpoint_tail(
-        &mut self,
-        tail: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
-        self.reap_checkpoint_tail_tasks();
-        self.checkpoint_tail_tasks
-            .spawn_on(tail, &self.checkpoint_tail_runtime);
     }
 
     #[cfg(feature = "cluster")]
@@ -6158,22 +6142,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .or_else(|| self.graph.execution_poison_reason().map(str::to_owned))
     }
 
+    fn cancel_checkpoint_tails_for_recovery(&mut self) -> bool {
+        self.cancel_fenced_checkpoint_tail_tasks()
+    }
+
     async fn settle_checkpoint_tail_tasks(&mut self) -> Result<(), String> {
-        let mut failures = Vec::new();
-        while let Some(result) = self.checkpoint_tail_tasks.join_next().await {
-            match result {
-                Ok(()) => {}
-                Err(error) => failures.push(error.to_string()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "checkpoint durable tail task failure: {}",
-                failures.join("; ")
-            ))
-        }
+        self.settle_spawned_checkpoint_tail_tasks().await
     }
 
     fn record_checkpoint_failure(&mut self, checkpoint_id: u64, reason: &str) {

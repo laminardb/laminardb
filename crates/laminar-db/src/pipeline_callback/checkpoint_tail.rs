@@ -4,6 +4,71 @@ use super::{
 };
 
 impl ConnectorPipelineCallback {
+    pub(super) fn reap_checkpoint_tail_tasks(&mut self) {
+        while let Some(result) = self.checkpoint_tail_tasks.try_join_next() {
+            if let Err(error) = result {
+                set_checkpoint_fault(
+                    &self.checkpoint_fault,
+                    format!("checkpoint durable tail terminated unexpectedly: {error}"),
+                );
+            }
+        }
+    }
+
+    pub(super) fn spawn_checkpoint_tail(
+        &mut self,
+        tail: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.reap_checkpoint_tail_tasks();
+        self.checkpoint_tail_tasks
+            .spawn_on(tail, &self.checkpoint_tail_runtime);
+    }
+
+    pub(super) fn cancel_fenced_checkpoint_tail_tasks(&mut self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            use std::sync::atomic::Ordering;
+
+            if !self.coordinated_lifecycle_active.load(Ordering::Acquire) {
+                return false;
+            }
+            self.reap_checkpoint_tail_tasks();
+            let tail_count = self.checkpoint_tail_tasks.len();
+            if tail_count != 0 {
+                tracing::warn!(
+                    tail_count,
+                    "coordinated recovery cancelled fenced checkpoint durable tails"
+                );
+                self.checkpoint_tail_tasks.abort_all();
+            }
+        }
+        true
+    }
+
+    pub(super) async fn settle_spawned_checkpoint_tail_tasks(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        while let Some(result) = self.checkpoint_tail_tasks.join_next().await {
+            match result {
+                Ok(()) => {}
+                #[cfg(feature = "cluster")]
+                Err(error)
+                    if error.is_cancelled()
+                        && self
+                            .coordinated_lifecycle_active
+                            .load(std::sync::atomic::Ordering::Acquire) => {}
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "checkpoint durable tail task failure: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
     pub(super) async fn complete_successful_leader_tail(
         tail: &mut LeaderTail,
         result: crate::checkpoint_coordinator::CheckpointResult,

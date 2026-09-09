@@ -532,6 +532,8 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         cluster_controller: None,
         #[cfg(feature = "cluster")]
+        coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(feature = "cluster")]
         assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(feature = "cluster")]
         shuffle_delivery_loss_incidents: None,
@@ -1105,6 +1107,42 @@ async fn checkpoint_tail_settlement_waits_for_terminal_task() {
         settlement.await.unwrap();
     }
 
+    assert!(callback.checkpoint_tail_tasks.is_empty());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn coordinated_recovery_cancels_a_fenced_checkpoint_tail() {
+    let mut callback = empty_callback_fixture();
+    let in_flight = Arc::clone(&callback.checkpoint_in_flight);
+    let guard = EpochInFlightGuard::claim(
+        &in_flight,
+        &callback.checkpoint_fault,
+        CheckpointAttempt::canonical(1),
+        std::iter::empty(),
+    )
+    .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    callback.spawn_checkpoint_tail(async move {
+        let _guard = guard;
+        started_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    started_rx.await.unwrap();
+
+    callback
+        .coordinated_lifecycle_active
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(crate::pipeline::PipelineCallback::cancel_checkpoint_tails_for_recovery(&mut callback));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::pipeline::PipelineCallback::settle_checkpoint_tail_tasks(&mut callback),
+    )
+    .await
+    .expect("a recovery-fenced tail must not hold shutdown")
+    .unwrap();
+
+    assert_eq!(in_flight.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(callback.checkpoint_tail_tasks.is_empty());
 }
 
@@ -3468,6 +3506,7 @@ fn cluster_callback_fixture(
             checkpoint_admission_recovering: false,
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             cluster_controller: Some(controller),
+            coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
             shuffle_delivery_loss_incidents: None,
             shuffle_recovered_delivery_loss_incidents: None,
