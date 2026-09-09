@@ -8,6 +8,114 @@ use laminar_core::cluster::control::{
 use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
 use tokio::sync::watch;
 
+struct RecoveryAuthorityReadGateStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Semaphore,
+}
+
+impl RecoveryAuthorityReadGateStore {
+    fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::AcqRel),
+            "recovery control read gate is already armed"
+        );
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+}
+
+impl std::fmt::Debug for RecoveryAuthorityReadGateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryAuthorityReadGateStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for RecoveryAuthorityReadGateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecoveryAuthorityReadGateStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for RecoveryAuthorityReadGateStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if location.as_ref().starts_with("control/leader-lease/")
+            && self.armed.swap(false, Ordering::AcqRel)
+        {
+            self.entered.add_permits(1);
+            return std::future::pending().await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 #[test]
 fn recovery_timeout_envelope_covers_stop_and_stopped_reporting() {
     let internal_stop = Duration::from_secs(210);
@@ -2434,6 +2542,49 @@ async fn stopped_prepare_leadership_handoff_retains_fault_without_failure_accoun
         inventory_before,
         "the original unhandled inventory must remain the successor's live trigger"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_quorum_control_read_rechecks_leadership_before_the_quorum_deadline() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let authority_inner: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let authority_gate = Arc::new(RecoveryAuthorityReadGateStore::new(authority_inner));
+    let authority_store: Arc<dyn object_store::ObjectStore> = authority_gate.clone();
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, authority_store).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    publish_round_roster(&controller, &kv, &round).await;
+    controller.announce_recover_prepare(&round).await.unwrap();
+    controller.announce_stopped(&round).await.unwrap();
+
+    authority_gate.arm();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let round = round.clone();
+        async move { wait_stopped_quorum_until(&controller, &round).await }
+    });
+    authority_gate.wait_until_blocked().await;
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(!recovery_driver_proof_is_current(&controller, &round));
+
+    tokio::time::advance(DECISION_IO_TIMEOUT + STOP_QUORUM_INITIAL_POLL).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("the bounded observation must yield to the new leader proof")
+        .expect("the quorum task must not panic");
+    assert_eq!(outcome, StoppedQuorum::LeadershipLost);
 }
 
 #[tokio::test]
