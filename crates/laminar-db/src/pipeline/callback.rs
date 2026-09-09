@@ -641,6 +641,12 @@ pub trait PipelineCallback: Send + 'static {
         None
     }
 
+    /// Cancel checkpoint tails only after coordinated recovery owns the lifecycle fence.
+    /// Returns whether that fence was observed, so shutdown need not repeat cancellation.
+    fn cancel_checkpoint_tails_for_recovery(&mut self) -> bool {
+        false
+    }
+
     /// Record a checkpoint failure observed by the coordinator. Exactly-once implementations
     /// fault for recovery; weaker guarantees may retain retry-on-next-interval behaviour.
     fn record_checkpoint_failure(&mut self, _checkpoint_id: u64, _reason: &str) {}
