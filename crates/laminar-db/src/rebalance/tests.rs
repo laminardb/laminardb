@@ -923,9 +923,9 @@ async fn stopped_recovery_successor_fixture(
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the live predecessor intentionally lacks the removed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let target = durable
@@ -2485,9 +2485,9 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -2610,9 +2610,9 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption still requires the failed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     match follower.await.unwrap() {
@@ -2761,7 +2761,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     let ownerless_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&ownerless_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(ownerless_registry)
+        .vnode_registry(Arc::clone(&ownerless_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2775,6 +2775,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &ownerless_db,
         &durable,
         &ownerless_controller,
+        &ownerless_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -2806,10 +2807,11 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     // shared authority for the report audit but withdraw this controller's local leader proof.
     participant_leadership.send(None).unwrap();
     participant_controller.set_active(true);
+    let participant_registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let participant_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&participant_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .vnode_registry(Arc::clone(&participant_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2823,6 +2825,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &participant_db,
         &durable,
         &participant_controller,
+        &participant_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -3359,6 +3362,73 @@ fn takeover_audits_a_recovery_head_while_its_pin_is_propagated_to_the_next_gener
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_recovery_waits_for_running_graph_retirement() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        try_rebalance(
+            &db,
+            &controller,
+            &durable,
+            &registry,
+            &[self_id, NodeId(2)],
+            RebalanceConfig::test_defaults(),
+        ),
+    )
+    .await
+    .expect("recovery successor materialization exceeded the test deadline")
+    .expect_err("a running graph must not live-adopt a recovery checkpoint cut");
+    assert!(
+        error.contains("must wait for a faulted cold bootstrap"),
+        "{error}"
+    );
+
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(successor.version, current.version + 1);
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_some());
+    assert_eq!(DbState::load(&db.state), DbState::Running);
+
+    db.fence_coordinated_recovery_lifecycle();
+    let generation = Arc::clone(&db.rotation_execution_fence).write_owned().await;
+    db.installed_vnode_state.lock().take();
+    DbState::Faulted.store(&db.state);
+    drop(generation);
+
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(2),
+        try_rebalance(
+            &db,
+            &controller,
+            &durable,
+            &registry,
+            &[self_id, NodeId(2)],
+            RebalanceConfig::test_defaults(),
+        ),
+    )
+    .await
+    .expect("cold recovery adoption exceeded the test deadline")
+    .expect("the retired graph must cold-adopt the materialized successor");
+    assert_eq!(adopted, Some(successor.version));
+    assert_eq!(registry.assignment_version(), successor.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_audit() {
     let self_id = NodeId(1);
     let (
@@ -3382,9 +3452,9 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption intentionally lacks the failed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -3507,9 +3577,9 @@ async fn recovery_decision_fault_precedes_graph_execution_drain() {
         .await
         .expect("recovery assignment materialization did not finish")
         .unwrap()
-        .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+        .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
 }
@@ -3529,8 +3599,8 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    // Materialize v2 through the normal Running path first; the missing handoff manifest leaves
-    // v1 local, exactly as it does before a subsequent retry observes the faulted graph.
+    // Materialize v2 while Running first; cold-bootstrap admission leaves v1 local until a
+    // subsequent retry observes the faulted graph.
     let error = try_rebalance(
         &db,
         &controller,
@@ -3540,9 +3610,9 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption intentionally lacks the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -4395,9 +4465,9 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let recovery = durable.load().await.unwrap().unwrap();
