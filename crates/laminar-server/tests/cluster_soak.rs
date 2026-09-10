@@ -225,7 +225,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 100] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -308,6 +308,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 100] = [
         "coordinated recovery cancelled fenced checkpoint durable tails",
     ),
     ("recovery_prepare_handoff", RECOVERY_PREPARE_HANDOFF_LOG),
+    (
+        "recovery_fault_inventory_changed_after_stop",
+        "recovery fault inventory changed after stopped quorum; yielding stale Prepare",
+    ),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
     ("recovery_stopped", RECOVERY_STOPPED_LOG),
     ("recovery_driver_lost", RECOVERY_DRIVER_HANDOFF_LOG),
@@ -16062,6 +16066,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                checkpoint state serialization timed out: token=secret\n\
                checkpoint source cut is incomplete: credential=secret\n\
                leader announced recovery prepare\n\
+               recovery fault inventory changed after stopped quorum; yielding stale Prepare\n\
                recovery driver lost leadership; retaining current control and fence for successor generation\n\
                leader self-restore failed; retrying\n\
                recovery pipeline restart failed\n\
@@ -16137,6 +16142,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     );
     assert_eq!(counts.get("checkpoint_source_cut_incomplete"), Some(&1));
     assert_eq!(counts.get("recovery_prepare"), Some(&1));
+    assert_eq!(
+        counts.get("recovery_fault_inventory_changed_after_stop"),
+        Some(&1)
+    );
     for marker in [
         "recovery_driver_lost",
         "recovery_leader_self_restore_failed",

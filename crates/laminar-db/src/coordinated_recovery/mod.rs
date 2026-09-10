@@ -1253,15 +1253,8 @@ impl RecoveryMonitor {
         &mut self,
         controller: &ClusterController,
     ) -> Result<Vec<RecoveryFault>, String> {
-        let reported = self.reported_faults(controller).await?;
-        Ok(self.unhandled_faults(&reported))
-    }
-
-    async fn reported_faults(
-        &self,
-        controller: &ClusterController,
-    ) -> Result<Vec<RecoveryFault>, String> {
-        Ok(self.fault_inventory(controller).await?.faults().to_vec())
+        let inventory = self.fault_inventory(controller).await?;
+        Ok(self.unhandled_faults(inventory.faults()))
     }
 
     async fn fault_inventory(
@@ -1274,6 +1267,32 @@ impl RecoveryMonitor {
         )
         .await
         .map_err(|_| "cluster recovery fault inventory read timed out".to_string())?
+    }
+
+    async fn round_faults_are_current(
+        &self,
+        controller: &ClusterController,
+        round: &RecoveryRound,
+    ) -> bool {
+        match self.fault_inventory(controller).await {
+            Ok(inventory)
+                if inventory.revision() == round.fault_revision()
+                    && inventory.faults() == round.faults =>
+            {
+                true
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    gen = round.id.generation,
+                    "recovery fault inventory changed after stopped quorum; yielding stale Prepare"
+                );
+                false
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not read cluster recovery fault reports");
+                false
+            }
+        }
     }
 
     fn unhandled_faults(&self, reported: &[RecoveryFault]) -> Vec<RecoveryFault> {
@@ -1604,6 +1623,9 @@ impl RecoveryMonitor {
 
         if !continue_if_driver_owns_prepare(db, controller, &round, "before target selection").await
         {
+            return;
+        }
+        if !self.round_faults_are_current(controller, &round).await {
             return;
         }
         if round.has_terminal_fault() {

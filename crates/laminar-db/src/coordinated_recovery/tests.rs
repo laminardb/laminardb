@@ -2544,6 +2544,121 @@ async fn stopped_prepare_leadership_handoff_retains_fault_without_failure_accoun
     );
 }
 
+#[tokio::test]
+async fn late_fault_after_stopped_quorum_yields_stale_prepare_without_retry_churn() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let (controller, follower, kv) = driver_and_follower().await;
+    let original_fault = report_test_fault(&controller).await;
+    let owner = CheckpointParticipant {
+        node_id: controller.instance_id().0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let peer = CheckpointParticipant {
+        node_id: follower.instance_id().0,
+        boot_incarnation: follower.recovery_incarnation(),
+    };
+    let assignment_fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[owner.node_id, peer.node_id],
+        vec![owner, peer],
+    )
+    .unwrap();
+    let (assignments, _committed) =
+        initial_assignment_store(&assignment_fence, &[NodeId(1), NodeId(2)]).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(
+        Arc::from([StateNodeId(1), StateNodeId(2)]),
+        assignment_fence.assignment_version,
+    );
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(registry)
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+        &prometheus::Registry::new(),
+    ));
+    *db.engine_metrics.lock() = Some(Arc::clone(&metrics));
+    controller.publish_recovery_incarnation().await.unwrap();
+    kv.seed(
+        follower.instance_id(),
+        "control:recovery-incarnation",
+        follower.recovery_incarnation().to_string(),
+    );
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence));
+    controller.set_recovering(true);
+    db.set_source_gate(true);
+    db.coordinated_recovery_fenced
+        .store(true, Ordering::Release);
+
+    let initial_inventory = controller.read_recovery_fault_inventory().await.unwrap();
+    let driving = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let db = Arc::clone(&db);
+        let faults = initial_inventory.faults().to_vec();
+        async move {
+            let mut monitor = RecoveryMonitor::default();
+            monitor
+                .drive_round(&db, &controller, initial_inventory.revision(), faults, None)
+                .await;
+        }
+    });
+    let prepare = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(active) = controller.observe_recover_control().await.unwrap() else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if active.phase == RecoverPhase::Prepare
+                && !controller
+                    .read_stopped(&active.round, &[controller.instance_id()])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            {
+                break active;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the driver must publish Prepare and its local stopped report");
+    assert!(!driving.is_finished());
+
+    let late_fault = report_test_fault(&follower).await;
+    let changed_inventory = controller.read_recovery_fault_inventory().await.unwrap();
+    assert_eq!(changed_inventory.faults(), &[original_fault, late_fault]);
+    let peer_stopped = RecoveryStoppedReport::new(&prepare.round, peer).unwrap();
+    kv.seed(
+        follower.instance_id(),
+        "control:recovery-stopped",
+        serde_json::to_string(&peer_stopped).unwrap(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), driving)
+        .await
+        .expect("the stale stopped generation must yield promptly")
+        .expect("the recovery driver must not panic");
+    assert_eq!(
+        controller.observe_recover_control().await.unwrap(),
+        Some(prepare),
+        "the stopped Prepare must remain available for direct handoff"
+    );
+    assert_eq!(
+        controller.read_recovery_fault_inventory().await.unwrap(),
+        changed_inventory,
+        "the newer durable fault already drives the successor generation"
+    );
+    assert_eq!(metrics.coordinated_recovery_failures_total.get(), 0);
+    assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+}
+
 #[tokio::test(start_paused = true)]
 async fn stalled_quorum_control_read_rechecks_leadership_before_the_quorum_deadline() {
     let self_id = NodeId(1);
