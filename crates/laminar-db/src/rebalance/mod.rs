@@ -35,6 +35,13 @@ use tracing::{debug, info, warn};
 use crate::db::{DbState, LaminarDB};
 use crate::engine_metrics::EngineMetrics;
 
+mod recovery_adoption;
+use recovery_adoption::{
+    adopt_materialized_recovery_head, ensure_local_recovery_fault, local_recovery_assignment_scope,
+    prepare_recovery_assignment_adoption, prepare_watched_recovery_adoption,
+    LocalRecoveryAssignmentScope,
+};
+
 /// Tunables for the rebalance control plane.
 #[derive(Debug, Clone, Copy)]
 pub struct RebalanceConfig {
@@ -135,16 +142,6 @@ async fn close_local_assignment_authority(
     Ok(process_fences)
 }
 
-async fn ensure_local_recovery_fault(
-    db: &LaminarDB,
-    controller: &ClusterController,
-) -> Result<(), String> {
-    controller.set_recovering(true);
-    crate::coordinated_recovery::request_local_fault(controller, &db.pending_recovery_fault)
-        .await
-        .map(|_| ())
-}
-
 /// Fail closed for a transient durable snapshot read without forcing a new assignment version.
 /// The exact retained certificate can resume after the same durable head is audited again.
 async fn suspend_local_assignment_authority(
@@ -205,51 +202,6 @@ async fn try_suspend_recovery_assignment_authority(
     }
     suspend_local_assignment_authority_locked(db, Some(controller), deadline).await?;
     Ok(true)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalRecoveryAssignmentScope {
-    Participant,
-    Ownerless,
-}
-
-/// Classify this exact process generation against an authority-audited recovery target.
-///
-/// An ownerless process may follow the target topology, but it has no checkpoint or recovery
-/// authority and must not turn the target's recovery provenance into a new cluster-wide fault.
-fn local_recovery_assignment_scope(
-    snapshot: &AssignmentSnapshot,
-    controller: &ClusterController,
-) -> Result<LocalRecoveryAssignmentScope, String> {
-    let fence = snapshot
-        .assignment_fence()
-        .map_err(|error| error.to_string())?;
-    let owners = snapshot
-        .to_vnode_vec(fence.vnode_count)
-        .map_err(|error| error.to_string())?;
-    let owner_ids = owners.iter().map(|owner| owner.0).collect::<Vec<_>>();
-    if !fence.is_canonical() || !fence.matches_owner_map(&owner_ids) {
-        return Err(format!(
-            "recovery assignment {} has no canonical owner-complete target fence",
-            snapshot.version
-        ));
-    }
-
-    let local_id = controller.instance_id().0;
-    match fence.participant_incarnation(local_id) {
-        Some(incarnation) if incarnation == controller.recovery_incarnation() => {
-            Ok(LocalRecoveryAssignmentScope::Participant)
-        }
-        Some(_) => Err(format!(
-            "recovery assignment {} certifies another incarnation of process {local_id}",
-            snapshot.version
-        )),
-        None if owner_ids.contains(&local_id) => Err(format!(
-            "recovery assignment {} gives process {local_id} ownership without checkpoint authority",
-            snapshot.version
-        )),
-        None => Ok(LocalRecoveryAssignmentScope::Ownerless),
-    }
 }
 
 async fn hold_terminal_source_resolution(
@@ -1108,29 +1060,23 @@ impl SnapshotWatcher {
                             self.durable_snapshot = None;
                             self.durable_drain_transition = None;
                             self.installed_fence = None;
-                            if let Err(error) =
-                                ensure_local_recovery_fault(&self.db, controller).await
-                            {
-                                self.assignment_authority_dirty = true;
-                                warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
-                                continue;
-                            }
-                            if let Err(error) = abort_predecessor_checkpoint_for_recovery(
+                            match prepare_watched_recovery_adoption(
+                                &self.db,
                                 &self.store,
                                 controller,
+                                &self.registry,
                                 &snap,
                                 head_deadline,
                             )
                             .await
                             {
-                                self.assignment_authority_dirty = true;
-                                warn!(%error, version = snap.version, "snapshot watcher: could not settle predecessor checkpoint for recovery");
-                                continue;
+                                Ok(revision) => authority_revision = revision,
+                                Err(error) => {
+                                    self.assignment_authority_dirty = true;
+                                    warn!(%error, version = snap.version, "snapshot watcher: recovery assignment preparation failed");
+                                    continue;
+                                }
                             }
-                            authority_revision = self
-                                .db
-                                .assignment_authority_revision
-                                .load(std::sync::atomic::Ordering::Acquire);
                             self.assignment_authority_dirty = true;
                         } else {
                             debug!(
@@ -2431,30 +2377,6 @@ fn settle_audited_recovery_predecessor_checkpoint<'a>(
     })
 }
 
-fn prepare_recovery_assignment_adoption<'a>(
-    db: &'a Arc<LaminarDB>,
-    store: &'a AssignmentSnapshotStore,
-    controller: &'a ClusterController,
-    snapshot: &'a AssignmentSnapshot,
-    deadline: tokio::time::Instant,
-) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    Box::pin(async move {
-        if !try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
-            return Err(format!(
-                "recovery assignment {} waits for a local vnode transition",
-                snapshot.version
-            ));
-        }
-        if local_recovery_assignment_scope(snapshot, controller)?
-            == LocalRecoveryAssignmentScope::Ownerless
-        {
-            return Ok(());
-        }
-        ensure_local_recovery_fault(db, controller).await?;
-        abort_predecessor_checkpoint_for_recovery(store, controller, snapshot, deadline).await
-    })
-}
-
 async fn audit_materialized_drain_transition(
     store: &AssignmentSnapshotStore,
     authority: Option<&LeaderLeaseStore>,
@@ -3075,6 +2997,7 @@ fn materialize_recovery_decision<'a>(
     db: &'a Arc<LaminarDB>,
     store: &'a Arc<AssignmentSnapshotStore>,
     controller: &'a ClusterController,
+    registry: &'a VnodeRegistry,
     decision: AssignmentRecoveryDecision,
     operation_timeout: Duration,
 ) -> futures::future::BoxFuture<'a, Result<Option<u64>, String>> {
@@ -3126,7 +3049,8 @@ fn materialize_recovery_decision<'a>(
         .map_err(|_| {
             "recovery assignment audit exceeded the materialization deadline".to_string()
         })??;
-        prepare_recovery_assignment_adoption(db, store, controller, &durable, deadline).await?;
+        prepare_recovery_assignment_adoption(db, store, controller, registry, &durable, deadline)
+            .await?;
         let version = durable.version;
         db.adopt_recovery_assignment_snapshot(durable, operation_timeout)
             .await
@@ -3158,6 +3082,7 @@ async fn reconcile_pending_recovery_decision(
     db: &Arc<LaminarDB>,
     store: &Arc<AssignmentSnapshotStore>,
     controller: &ClusterController,
+    registry: &VnodeRegistry,
     current: &AssignmentSnapshot,
     operation_timeout: Duration,
 ) -> Result<Option<u64>, String> {
@@ -3187,7 +3112,8 @@ async fn reconcile_pending_recovery_decision(
             "pending recovery decision for assignment {target_version} has the wrong predecessor"
         ));
     }
-    materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
+    materialize_recovery_decision(db, store, controller, registry, decision, operation_timeout)
+        .await
 }
 
 fn replaced_predecessor_processes(
@@ -3700,7 +3626,15 @@ fn execute_graceful_rotation_owned(
             }
             RotateOutcome::Conflict(winner) => {
                 let v = winner.version;
-                adopt_any(&db, &store, &controller, *winner, config.checkpoint_timeout).await?;
+                adopt_any(
+                    &db,
+                    &store,
+                    &controller,
+                    &registry,
+                    *winner,
+                    config.checkpoint_timeout,
+                )
+                .await?;
                 Ok(Some(v))
             }
         }
@@ -3743,21 +3677,12 @@ fn try_rebalance_owned(
             .map_err(|error| error.to_string())?;
 
         let local_assignment = registry.versioned_snapshot();
-        if current.version < local_assignment.version() {
-            return Err(format!(
-                "durable assignment head {} regressed behind local assignment {}",
-                current.version,
-                local_assignment.version()
-            ));
-        }
-        if current.version == local_assignment.version()
-            && current_owners.as_slice() != local_assignment.owners()
-        {
-            return Err(format!(
-                "durable and local assignment {} have different owner maps",
-                current.version
-            ));
-        }
+        validate_local_assignment_head(
+            &current,
+            &current_owners,
+            local_assignment.version(),
+            local_assignment.owners(),
+        )?;
 
         // A propagated pin means D(current + 1) is already durable while `current` remains the
         // materialized assignment head. A faulted graph may cold-bootstrap directly from the
@@ -3775,6 +3700,7 @@ fn try_rebalance_owned(
                 Arc::clone(&db),
                 Arc::clone(&store),
                 Arc::clone(&controller),
+                Arc::clone(&registry),
                 current.clone(),
                 config.checkpoint_timeout,
             )
@@ -3892,19 +3818,17 @@ fn try_rebalance_owned(
             && current_authority.is_recovery()
             && assignment_binds_local_process(&current, &controller)?
         {
-            prepare_recovery_assignment_adoption(&db, &store, &controller, &current, head_deadline)
-                .await?;
-            db.adopt_recovery_assignment_snapshot(current.clone(), config.checkpoint_timeout)
-                .await
-                .map_err(|error| error.to_string())?;
-            let reconciled_version = registry.assignment_version();
-            if reconciled_version < current.version {
-                return Err(format!(
-                    "durable recovery assignment {} was not adopted; local assignment remains {}",
-                    current.version, reconciled_version
-                ));
-            }
-            return Ok(Some(reconciled_version));
+            return adopt_materialized_recovery_head(
+                &db,
+                &store,
+                &controller,
+                &registry,
+                &current,
+                head_deadline,
+                config.checkpoint_timeout,
+            )
+            .await
+            .map(Some);
         }
         if current.version > local_assignment.version() && current_roster_is_live {
             // A writer can fail after its durable CAS succeeds but before local adoption. Adopt
@@ -3930,6 +3854,7 @@ fn try_rebalance_owned(
             Arc::clone(&db),
             Arc::clone(&store),
             Arc::clone(&controller),
+            Arc::clone(&registry),
             current.clone(),
             config.checkpoint_timeout,
         )
@@ -3970,6 +3895,7 @@ fn try_rebalance_owned(
                 Arc::clone(&db),
                 Arc::clone(&store),
                 Arc::clone(&controller),
+                Arc::clone(&registry),
                 current.clone(),
                 proposal,
                 config.checkpoint_timeout,
@@ -3990,6 +3916,27 @@ fn try_rebalance_owned(
         )
         .await
     })
+}
+
+fn validate_local_assignment_head(
+    current: &AssignmentSnapshot,
+    current_owners: &[NodeId],
+    local_version: u64,
+    local_owners: &[NodeId],
+) -> Result<(), String> {
+    if current.version < local_version {
+        return Err(format!(
+            "durable assignment head {} regressed behind local assignment {local_version}",
+            current.version
+        ));
+    }
+    if current.version == local_version && current_owners != local_owners {
+        return Err(format!(
+            "durable and local assignment {} have different owner maps",
+            current.version
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4036,12 +3983,20 @@ fn reconcile_pending_recovery_decision_owned(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     controller: Arc<ClusterController>,
+    registry: Arc<VnodeRegistry>,
     current: AssignmentSnapshot,
     operation_timeout: Duration,
 ) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
     Box::pin(async move {
-        reconcile_pending_recovery_decision(&db, &store, &controller, &current, operation_timeout)
-            .await
+        reconcile_pending_recovery_decision(
+            &db,
+            &store,
+            &controller,
+            &registry,
+            &current,
+            operation_timeout,
+        )
+        .await
     })
 }
 
@@ -4049,6 +4004,7 @@ fn authorize_recovery_successor_owned(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     controller: Arc<ClusterController>,
+    registry: Arc<VnodeRegistry>,
     current: AssignmentSnapshot,
     proposal: AssignmentSnapshot,
     operation_timeout: Duration,
@@ -4065,7 +4021,15 @@ fn authorize_recovery_successor_owned(
             &reason,
         )
         .await?;
-        materialize_recovery_decision(&db, &store, &controller, decision, operation_timeout).await
+        materialize_recovery_decision(
+            &db,
+            &store,
+            &controller,
+            &registry,
+            decision,
+            operation_timeout,
+        )
+        .await
     })
 }
 
@@ -4897,6 +4861,7 @@ async fn adopt_any(
     db: &Arc<LaminarDB>,
     store: &AssignmentSnapshotStore,
     controller: &ClusterController,
+    registry: &VnodeRegistry,
     snap: AssignmentSnapshot,
     operation_timeout: Duration,
 ) -> Result<(), String> {
@@ -4911,7 +4876,8 @@ async fn adopt_any(
         db.validate_source_drain_snapshot(&snap)
             .map_err(|error| error.to_string())?;
     } else if audited.is_recovery() {
-        prepare_recovery_assignment_adoption(db, store, controller, &snap, deadline).await?;
+        prepare_recovery_assignment_adoption(db, store, controller, registry, &snap, deadline)
+            .await?;
         db.adopt_recovery_assignment_snapshot(snap, operation_timeout)
             .await
             .map_err(|error| error.to_string())?;
