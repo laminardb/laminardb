@@ -87,14 +87,13 @@ impl RebalanceConfig {
 
 async fn close_local_assignment_authority(
     db: &Arc<LaminarDB>,
-    controller: Option<&ClusterController>,
+    controller: &ClusterController,
+    recovery_target: &CheckpointAssignmentFence,
     deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     db.set_source_gate(true);
-    if let Some(controller) = controller {
-        controller.publish_checkpoint_assignment_fence(None);
-        controller.publish_checkpoint_drain_transition(None);
-    }
+    controller.publish_checkpoint_assignment_fence(None);
+    controller.publish_checkpoint_drain_transition(None);
     // Cancel first: a compute-cycle read guard may itself be blocked in shuffle admission.
     db.invalidate_shuffle_assignment_fence();
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
@@ -103,11 +102,16 @@ async fn close_local_assignment_authority(
     // A watcher that already owned the adoption lock could have republished and reopened after
     // the first cancellation. Reassert the full closure while serialized, before draining it.
     db.set_source_gate(true);
-    if let Some(controller) = controller {
-        controller.publish_checkpoint_assignment_fence(None);
-        controller.publish_checkpoint_drain_transition(None);
-    }
+    controller.publish_checkpoint_assignment_fence(None);
+    controller.publish_checkpoint_drain_transition(None);
     db.invalidate_shuffle_assignment_fence();
+    // RECOVERY: Prepare cancels graph work, so publish its fault before waiting for that work to
+    // release the execution fence. The serialized local authority is already closed above.
+    if recovery_target.participant_incarnation(controller.instance_id().0)
+        == Some(controller.recovery_incarnation())
+    {
+        ensure_local_recovery_fault(db, controller).await?;
+    }
     let _transition = tokio::time::timeout_at(
         deadline,
         Arc::clone(&db.rotation_execution_fence).write_owned(),
@@ -3062,7 +3066,7 @@ fn materialize_recovery_decision<'a>(
 ) -> futures::future::BoxFuture<'a, Result<Option<u64>, String>> {
     Box::pin(async move {
         let deadline = tokio::time::Instant::now() + operation_timeout;
-        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        close_local_assignment_authority(db, controller, &decision.target, deadline).await?;
         let proposal =
             tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
                 .await
@@ -3077,11 +3081,7 @@ fn materialize_recovery_decision<'a>(
         {
             return Err("recovery authority winner does not match its staged proposal".into());
         }
-        if local_recovery_assignment_scope(&proposal, controller)?
-            == LocalRecoveryAssignmentScope::Participant
-        {
-            ensure_local_recovery_fault(db, controller).await?;
-        }
+        local_recovery_assignment_scope(&proposal, controller)?;
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
@@ -3206,7 +3206,7 @@ fn authorize_recovery_successor<'a>(
             .assignment_fence()
             .map_err(|error| error.to_string())?;
         let deadline = controller.process_fencing_deadline(operation_timeout)?;
-        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        close_local_assignment_authority(db, controller, &target, deadline).await?;
         let proposal_ref =
             tokio::time::timeout_at(deadline, store.stage_recovery_proposal(&proposal))
                 .await

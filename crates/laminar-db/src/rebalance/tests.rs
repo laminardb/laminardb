@@ -3452,6 +3452,68 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_decision_fault_precedes_graph_execution_drain() {
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        _current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+    db.set_source_gate(false);
+    assert!(!db.cluster_intake_fenced());
+    let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+
+    let rebalancing_db = Arc::clone(&db);
+    let rebalancing_controller = Arc::clone(&controller);
+    let rebalancing_durable = Arc::clone(&durable);
+    let rebalancing_registry = Arc::clone(&registry);
+    let rebalancing = tokio::spawn(async move {
+        let mut config = RebalanceConfig::test_defaults();
+        config.checkpoint_timeout = Duration::from_secs(3);
+        try_rebalance(
+            &rebalancing_db,
+            &rebalancing_controller,
+            &rebalancing_durable,
+            &rebalancing_registry,
+            &[NodeId(1), NodeId(2)],
+            config,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !db.cluster_intake_fenced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery assignment authority was not closed");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controller.read_fault_reports().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery fault publication waited for the graph execution drain");
+
+    drop(execution);
+    let error = tokio::time::timeout(Duration::from_secs(2), rebalancing)
+        .await
+        .expect("recovery assignment materialization did not finish")
+        .unwrap()
+        .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+    assert!(
+        error.contains("participant 2 handoff manifest is missing"),
+        "{error}"
+    );
+}
+
 #[tokio::test]
 async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     let self_id = NodeId(1);
@@ -3839,7 +3901,10 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
             boot_incarnation: Uuid::from_u128(22),
         },
     ];
-    let assignment = CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants).unwrap();
+    let assignment =
+        CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants.clone()).unwrap();
+    let closure_target =
+        CheckpointAssignmentFence::from_owner_map(2, &[2, 2], vec![participants[1]]).unwrap();
     let controller = test_cluster_controller(NodeId(1), local_boot, None);
     let process_deadline = controller
         .process_lease_deadline()
@@ -3877,7 +3942,7 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let db = LaminarDB::builder()
-        .cluster_controller(controller)
+        .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
@@ -3903,7 +3968,9 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let closing = {
         let db = Arc::clone(&db);
-        tokio::spawn(async move { close_local_assignment_authority(&db, None, deadline).await })
+        tokio::spawn(async move {
+            close_local_assignment_authority(&db, &controller, &closure_target, deadline).await
+        })
     };
     tokio::time::timeout_at(deadline, async {
         while sender.assignment_version() != 0 {
