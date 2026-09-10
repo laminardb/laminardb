@@ -18,8 +18,8 @@ use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
-    LeaderProof, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
-    RotateOutcome, SnapshotError,
+    LeaderProof, ProcessLeaseFence, RecordAssignmentDrainDecisionResult,
+    RecordAssignmentRecoveryDecisionResult, RotateOutcome, SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{
@@ -89,8 +89,9 @@ async fn close_local_assignment_authority(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     recovery_target: &CheckpointAssignmentFence,
+    removed_processes: &[CheckpointParticipant],
     deadline: tokio::time::Instant,
-) -> Result<(), String> {
+) -> Result<Vec<ProcessLeaseFence>, String> {
     db.set_source_gate(true);
     controller.publish_checkpoint_assignment_fence(None);
     controller.publish_checkpoint_drain_transition(None);
@@ -100,13 +101,26 @@ async fn close_local_assignment_authority(
         .await
         .map_err(|_| "timed out serializing assignment authority closure".to_string())?;
     // A watcher that already owned the adoption lock could have republished and reopened after
-    // the first cancellation. Reassert the full closure while serialized, before draining it.
+    // the first cancellation. Reassert the full closure and retain serialization through process
+    // fencing, fault publication, and the execution drain.
     db.set_source_gate(true);
     controller.publish_checkpoint_assignment_fence(None);
     controller.publish_checkpoint_drain_transition(None);
     db.invalidate_shuffle_assignment_fence();
+    let fence_results = futures::future::join_all(
+        removed_processes
+            .iter()
+            .copied()
+            .map(|participant| controller.fence_process_incarnation(participant, deadline)),
+    )
+    .await;
+    let mut process_fences = Vec::with_capacity(fence_results.len());
+    for result in fence_results {
+        process_fences.push(result?);
+    }
     // RECOVERY: Prepare cancels graph work, so publish its fault before waiting for that work to
-    // release the execution fence. The serialized local authority is already closed above.
+    // release the execution fence. Process fencing above prevents a live predecessor from causing
+    // a spurious fault, and the serialized local authority is already closed.
     if recovery_target.participant_incarnation(controller.instance_id().0)
         == Some(controller.recovery_incarnation())
     {
@@ -118,7 +132,7 @@ async fn close_local_assignment_authority(
     )
     .await
     .map_err(|_| "timed out draining assignment execution after closure".to_string())?;
-    Ok(())
+    Ok(process_fences)
 }
 
 async fn ensure_local_recovery_fault(
@@ -3066,7 +3080,9 @@ fn materialize_recovery_decision<'a>(
 ) -> futures::future::BoxFuture<'a, Result<Option<u64>, String>> {
     Box::pin(async move {
         let deadline = tokio::time::Instant::now() + operation_timeout;
-        close_local_assignment_authority(db, controller, &decision.target, deadline).await?;
+        let _process_fences =
+            close_local_assignment_authority(db, controller, &decision.target, &[], deadline)
+                .await?;
         let proposal =
             tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
                 .await
@@ -3206,26 +3222,14 @@ fn authorize_recovery_successor<'a>(
             .assignment_fence()
             .map_err(|error| error.to_string())?;
         let deadline = controller.process_fencing_deadline(operation_timeout)?;
-        close_local_assignment_authority(db, controller, &target, deadline).await?;
+        let removed = replaced_predecessor_processes(&predecessor, &target);
+        let process_fences =
+            close_local_assignment_authority(db, controller, &target, &removed, deadline).await?;
         let proposal_ref =
             tokio::time::timeout_at(deadline, store.stage_recovery_proposal(&proposal))
                 .await
                 .map_err(|_| "recovery proposal staging exceeded the fencing deadline".to_string())?
                 .map_err(|error| error.to_string())?;
-
-        let removed = replaced_predecessor_processes(&predecessor, &target);
-        let fence_results = futures::future::join_all(
-            removed
-                .iter()
-                .copied()
-                .map(|participant| controller.fence_process_incarnation(participant, deadline)),
-        )
-        .await;
-        let mut process_fences = Vec::with_capacity(fence_results.len());
-        for result in fence_results {
-            process_fences.push(result?);
-        }
-
         let observed = tokio::time::timeout_at(deadline, store.load())
             .await
             .map_err(|_| "assignment head revalidation exceeded the fencing deadline".to_string())?

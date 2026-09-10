@@ -3969,7 +3969,7 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
     let closing = {
         let db = Arc::clone(&db);
         tokio::spawn(async move {
-            close_local_assignment_authority(&db, &controller, &closure_target, deadline).await
+            close_local_assignment_authority(&db, &controller, &closure_target, &[], deadline).await
         })
     };
     tokio::time::timeout_at(deadline, async {
