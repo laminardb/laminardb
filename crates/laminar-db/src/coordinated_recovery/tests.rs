@@ -1519,6 +1519,50 @@ async fn recovery_reconstructs_a_suspended_fence_from_exact_durable_adoption() {
 }
 
 #[tokio::test]
+async fn recovery_rejects_an_absent_predecessor_before_durable_incarnation_audit() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let (controller, _members_tx, kv) = controller(Vec::new()).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1, 2]).await;
+    let (assignments, _committed) =
+        initial_assignment_store(&round.assignment_fence, &[NodeId(1), NodeId(2)]).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(Arc::from([StateNodeId(1), StateNodeId(2)]), 1);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(registry)
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    publish_round_roster(&controller, &kv, &round).await;
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        "malformed".into(),
+    );
+    controller.set_recovering(true);
+    db.fence_coordinated_recovery_lifecycle();
+    controller.publish_checkpoint_assignment_fence(None);
+
+    let observed = tokio::time::timeout(
+        Duration::from_millis(100),
+        current_recovery_assignment_fence(
+            &db,
+            &controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("absent predecessor detection must not wait on durable incarnation I/O")
+    .expect("an absent predecessor is unavailable, not an assignment audit failure");
+    assert_eq!(observed, None);
+}
+
+#[tokio::test]
 async fn recovery_reconstructs_a_suspended_drain_predecessor_fence() {
     use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
