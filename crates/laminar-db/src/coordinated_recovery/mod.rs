@@ -2832,6 +2832,19 @@ fn assignment_adoptions_match(
     })
 }
 
+async fn read_assignment_adoptions(
+    controller: &ClusterController,
+    deadline: tokio::time::Instant,
+) -> Result<FxHashMap<u64, CheckpointAssignmentAdoption>, String> {
+    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
+        .await
+        .map_err(|_| "recovery assignment adoption read timed out".to_string())??;
+    Ok(reports
+        .into_iter()
+        .map(|(node, adoption)| (node.0, adoption))
+        .collect())
+}
+
 /// Reconstruct the withdrawn checkpoint certificate from durable authority, current process
 /// incarnations, and exact adoption while recovery owns the closed data plane. This read-only
 /// fallback neither republishes authority nor requires a faulted owner's stale vnode readiness.
@@ -2875,12 +2888,7 @@ async fn current_recovery_assignment_fence(
     if !recovery_fence_participants_present(controller, &candidate_fence) {
         return Ok(None);
     }
-    let adopted = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery assignment adoption audit timed out".to_string())??
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect::<FxHashMap<_, _>>();
+    let adopted = read_assignment_adoptions(controller, deadline).await?;
     if !assignment_adoptions_match(&candidate_fence, &adopted) {
         return Ok(None);
     }
@@ -2982,6 +2990,7 @@ async fn current_recovery_assignment_fence(
         .map(|owner| owner.0)
         .collect();
     let published = controller.checkpoint_assignment_watch().borrow().clone();
+    let confirmed_adopted = read_assignment_adoptions(controller, deadline).await?;
     if confirmed_committed != committed
         || controller
             .checkpoint_drain_transition()
@@ -2992,6 +3001,7 @@ async fn current_recovery_assignment_fence(
         || confirmed_assignment.owners() != local_assignment.owners()
         || !fence.matches_owner_map(&confirmed_owners)
         || !recovery_fence_participants_present(controller, &fence)
+        || !assignment_adoptions_match(&fence, &confirmed_adopted)
         || published
             .as_ref()
             .is_some_and(|published| published != &fence)
@@ -3012,7 +3022,7 @@ fn recovery_fence_participants_present(
 ) -> bool {
     // RECOVERY: A quarantined boot remains recoverable behind closed intake and durable audits;
     // Prepare/stop/readiness re-prove it. Require checkpoint membership, not responsiveness.
-    let available = controller.checkpoint_instances();
+    let available: FxHashSet<_> = controller.checkpoint_instances().into_iter().collect();
     fence
         .participants
         .iter()
@@ -3702,13 +3712,7 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     if live_target_participants != target.participants {
         return Err("materialized assignment target process roster is no longer exact".into());
     }
-    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery Prepare retirement adoption-report read timed out".to_string())??;
-    let reported: FxHashMap<u64, _> = reports
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect();
+    let reported = read_assignment_adoptions(controller, deadline).await?;
     if !assignment_adoptions_match(&target, &reported) {
         return Ok(None);
     }
@@ -3736,15 +3740,7 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
             "materialized assignment target process roster changed during retirement".into(),
         );
     }
-    let confirmed_reports =
-        tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-            .await
-            .map_err(|_| {
-                "recovery Prepare retirement adoption-report recheck timed out".to_string()
-            })??
-            .into_iter()
-            .map(|(node, adoption)| (node.0, adoption))
-            .collect::<FxHashMap<_, _>>();
+    let confirmed_reports = read_assignment_adoptions(controller, deadline).await?;
     if !assignment_adoptions_match(&target, &confirmed_reports)
         || !current_stopped_roster_has_adopted_target(
             controller,
