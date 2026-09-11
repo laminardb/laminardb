@@ -23,8 +23,8 @@ use laminar_core::cluster::control::controller::{
     RecoveryStoppedReport,
 };
 use laminar_core::cluster::control::{
-    ClusterController, RecoverPhase, RecoveryControlError, RecoveryFaultDisposition,
-    RecoveryFaultReportOutcome, ReleaseCommitStatus,
+    AssignmentSnapshot, ClusterController, RecoverPhase, RecoveryControlError,
+    RecoveryFaultDisposition, RecoveryFaultReportOutcome, ReleaseCommitStatus,
 };
 use laminar_core::cluster::discovery::NodeId;
 
@@ -2787,8 +2787,7 @@ where
     }
 }
 
-/// Current owner-complete assignment certificate. Recovery cannot invent a quorum from a
-/// transient membership view; it freezes this already-proven cut instead.
+/// Freeze the current owner-complete certificate rather than inventing a quorum from membership.
 fn current_assignment_fence(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -2814,15 +2813,42 @@ fn current_assignment_fence(
         })
 }
 
-/// Recover the exact current assignment cut after fault fencing has deliberately withdrawn the
-/// active checkpoint certificate. This is a read-only recovery proof: it never republishes the
-/// checkpoint fence, reopens intake, or grants shuffle authority.
-///
-/// The normal fast path retains the already-published certificate. The fallback is admitted only
-/// while coordinated recovery owns the closed data plane, and reconstructs the same certificate
-/// from the authority-audited durable head, exact current process incarnations, and durable
-/// assignment-adoption reports. `vnode_state_ready` is deliberately not required: a faulted owner
-/// must be recoverable after publishing a false readiness report.
+fn recovery_head_fence(head: &AssignmentSnapshot) -> Result<CheckpointAssignmentFence, String> {
+    match (head.draining, head.drain_transition.as_ref()) {
+        (true, Some(transition)) => Ok(transition.predecessor.clone()),
+        (true, None) => Err("draining recovery assignment has no transition".into()),
+        (false, _) => head.assignment_fence().map_err(|error| error.to_string()),
+    }
+}
+
+fn assignment_adoptions_match(
+    fence: &CheckpointAssignmentFence,
+    reported: &FxHashMap<u64, CheckpointAssignmentAdoption>,
+) -> bool {
+    fence.participants.iter().all(|participant| {
+        reported.get(&participant.node_id).is_some_and(|adoption| {
+            adoption.participant == *participant && adoption.matches_fence(fence)
+        })
+    })
+}
+
+async fn read_assignment_adoptions(
+    controller: &ClusterController,
+    deadline: tokio::time::Instant,
+    timeout_context: &str,
+) -> Result<FxHashMap<u64, CheckpointAssignmentAdoption>, String> {
+    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
+        .await
+        .map_err(|_| format!("recovery {timeout_context} adoption-report read timed out"))??;
+    Ok(reports
+        .into_iter()
+        .map(|(node, adoption)| (node.0, adoption))
+        .collect())
+}
+
+/// Reconstruct the withdrawn checkpoint certificate from durable authority, current process
+/// incarnations, and exact adoption while recovery owns the closed data plane. This read-only
+/// fallback neither republishes authority nor requires a faulted owner's stale vnode readiness.
 async fn current_recovery_assignment_fence(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -2858,6 +2884,15 @@ async fn current_recovery_assignment_fence(
         .map_err(|_| "recovery assignment head read timed out".to_string())?
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "recovery assignment audit has no durable head".to_string())?;
+    // RECOVERY: Missing adoption rejects before remote authority I/O; acceptance still audits.
+    let candidate_fence = recovery_head_fence(&head)?;
+    if !recovery_fence_participants_present(controller, &candidate_fence) {
+        return Ok(None);
+    }
+    let adopted = read_assignment_adoptions(controller, deadline, "assignment audit").await?;
+    if !assignment_adoptions_match(&candidate_fence, &adopted) {
+        return Ok(None);
+    }
     tokio::time::timeout_at(
         deadline,
         crate::rebalance::audit_assignment_snapshot_authority(&store, Some(controller), &head),
@@ -2920,20 +2955,6 @@ async fn current_recovery_assignment_fence(
     if incarnations != fence.participants {
         return Ok(None);
     }
-    let adopted = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery assignment adoption audit timed out".to_string())??
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect::<FxHashMap<_, _>>();
-    if fence.participants.iter().any(|participant| {
-        adopted.get(&participant.node_id).is_none_or(|adoption| {
-            adoption.participant != *participant || !adoption.matches_fence(&fence)
-        })
-    }) {
-        return Ok(None);
-    }
-
     let confirmed = tokio::time::timeout_at(deadline, store.load())
         .await
         .map_err(|_| "recovery assignment head recheck timed out".to_string())?
@@ -2991,6 +3012,11 @@ async fn current_recovery_assignment_fence(
     {
         return Ok(None);
     }
+    let confirmed_adopted =
+        read_assignment_adoptions(controller, deadline, "assignment recheck").await?;
+    if !assignment_adoptions_match(&fence, &confirmed_adopted) {
+        return Ok(None);
+    }
     Ok(Some(fence))
 }
 
@@ -2998,21 +3024,13 @@ fn recovery_fence_participants_present(
     controller: &ClusterController,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
 ) -> bool {
-    // A capture-quorum miss quarantines a process from ordinary checkpoint/placement authority,
-    // but it cannot make that exact live boot unrecoverable. This fallback is reachable only with
-    // recovery + intake fenced and separately audits durable incarnations and adoption reports;
-    // the Recovery Prepare/stop/readiness quorums must then re-prove every participant before
-    // Release. Keep requiring current checkpoint-capable membership here, but deliberately do not
-    // apply the ordinary `unresponsive` filter.
-    let available: FxHashSet<u64> = controller
-        .checkpoint_instances()
-        .into_iter()
-        .map(|node| node.0)
-        .collect();
+    // RECOVERY: A quarantined boot remains recoverable behind closed intake and durable audits;
+    // Prepare/stop/readiness re-prove it. Require checkpoint membership, not responsiveness.
+    let available: FxHashSet<_> = controller.checkpoint_instances().into_iter().collect();
     fence
         .participants
         .iter()
-        .all(|participant| available.contains(&participant.node_id))
+        .all(|participant| available.contains(&NodeId(participant.node_id)))
 }
 
 fn clear_stopped_assignment_quarantine(
@@ -3698,19 +3716,8 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     if live_target_participants != target.participants {
         return Err("materialized assignment target process roster is no longer exact".into());
     }
-    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery Prepare retirement adoption-report read timed out".to_string())??;
-    let reported: FxHashMap<u64, _> = reports
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect();
-    let owner_complete = target.participants.iter().all(|participant| {
-        reported.get(&participant.node_id).is_some_and(|adoption| {
-            adoption.participant == *participant && adoption.matches_fence(&target)
-        })
-    });
-    if !owner_complete {
+    let reported = read_assignment_adoptions(controller, deadline, "Prepare retirement").await?;
+    if !assignment_adoptions_match(&target, &reported) {
         return Ok(None);
     }
     if !current_stopped_roster_has_adopted_target(controller, round, &target, &reported, deadline)
@@ -3738,28 +3745,16 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
         );
     }
     let confirmed_reports =
-        tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-            .await
-            .map_err(|_| {
-                "recovery Prepare retirement adoption-report recheck timed out".to_string()
-            })??
-            .into_iter()
-            .map(|(node, adoption)| (node.0, adoption))
-            .collect::<FxHashMap<_, _>>();
-    if target.participants.iter().any(|participant| {
-        confirmed_reports
-            .get(&participant.node_id)
-            .is_none_or(|adoption| {
-                adoption.participant != *participant || !adoption.matches_fence(&target)
-            })
-    }) || !current_stopped_roster_has_adopted_target(
-        controller,
-        round,
-        &target,
-        &confirmed_reports,
-        deadline,
-    )
-    .await?
+        read_assignment_adoptions(controller, deadline, "Prepare retirement recheck").await?;
+    if !assignment_adoptions_match(&target, &confirmed_reports)
+        || !current_stopped_roster_has_adopted_target(
+            controller,
+            round,
+            &target,
+            &confirmed_reports,
+            deadline,
+        )
+        .await?
     {
         return Ok(None);
     }

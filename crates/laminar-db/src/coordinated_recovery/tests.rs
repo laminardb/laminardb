@@ -1563,6 +1563,95 @@ async fn recovery_rejects_an_absent_predecessor_before_durable_incarnation_audit
 }
 
 #[tokio::test]
+async fn recovery_rejects_incomplete_adoption_before_assignment_authority_audit() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let authority_gate = Arc::new(RecoveryAuthorityReadGateStore::new(backing));
+    let authority_store: Arc<dyn object_store::ObjectStore> = authority_gate.clone();
+    let (controller, _members_tx, _kv) = controller_on(Vec::new(), authority_store.clone()).await;
+    let controller = Arc::new(controller);
+    let participant = CheckpointParticipant {
+        node_id: controller.instance_id().0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[controller.instance_id()]),
+            vec![participant],
+        )
+        .unwrap();
+    let target = committed
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[controller.instance_id()]),
+            vec![participant],
+        )
+        .unwrap();
+    let assignments = Arc::new(AssignmentSnapshotStore::new(authority_store));
+    assignments.save_if_absent(&committed).await.unwrap();
+    assignments
+        .save_if_version(&target, committed.version)
+        .await
+        .unwrap();
+    let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
+    registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), target.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let fault = report_test_fault(&controller).await;
+    let mut monitor = RecoveryMonitor::default();
+    monitor.hold_for_pending_fault(&db, &controller, &[fault]);
+    controller.publish_checkpoint_assignment_fence(None);
+
+    authority_gate.arm();
+    let observed = tokio::time::timeout(
+        Duration::from_millis(100),
+        current_recovery_assignment_fence(
+            &db,
+            &controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("missing adoption must reject before durable assignment authority I/O")
+    .expect("missing adoption is unavailable, not an assignment audit failure");
+    assert_eq!(observed, None);
+    assert!(
+        authority_gate.armed.load(Ordering::Acquire),
+        "missing adoption must not consume the durable assignment authority read"
+    );
+
+    let adoption = db
+        .publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), false)
+        .await
+        .unwrap();
+    assert!(adoption.matches_fence(&target.assignment_fence().unwrap()));
+    let auditing_db = Arc::clone(&db);
+    let auditing_controller = Arc::clone(&controller);
+    let authority_audit = tokio::spawn(async move {
+        current_recovery_assignment_fence(
+            &auditing_db,
+            &auditing_controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        authority_gate.wait_until_blocked(),
+    )
+    .await
+    .expect("complete adoption must still require the durable assignment authority audit");
+    authority_audit.abort();
+}
+
+#[tokio::test]
 async fn recovery_reconstructs_a_suspended_drain_predecessor_fence() {
     use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
