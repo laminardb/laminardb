@@ -2905,6 +2905,7 @@ async fn current_recovery_assignment_fence(
             .participant_incarnation(local_id)
             .is_some_and(|incarnation| incarnation != controller.recovery_incarnation())
         || (fence.participant_incarnation(local_id).is_none() && local_owners.contains(&local_id))
+        || !recovery_fence_participants_present(controller, &fence)
     {
         return Ok(None);
     }
@@ -2916,9 +2917,7 @@ async fn current_recovery_assignment_fence(
     )
     .await
     .map_err(|_| "recovery assignment incarnation audit timed out".to_string())??;
-    if incarnations != fence.participants
-        || !recovery_fence_participants_present(controller, &fence)
-    {
+    if incarnations != fence.participants {
         return Ok(None);
     }
     let adopted = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
