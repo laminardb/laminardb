@@ -2835,10 +2835,11 @@ fn assignment_adoptions_match(
 async fn read_assignment_adoptions(
     controller: &ClusterController,
     deadline: tokio::time::Instant,
+    timeout_context: &str,
 ) -> Result<FxHashMap<u64, CheckpointAssignmentAdoption>, String> {
     let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
         .await
-        .map_err(|_| "recovery assignment adoption read timed out".to_string())??;
+        .map_err(|_| format!("recovery {timeout_context} adoption-report read timed out"))??;
     Ok(reports
         .into_iter()
         .map(|(node, adoption)| (node.0, adoption))
@@ -2888,7 +2889,7 @@ async fn current_recovery_assignment_fence(
     if !recovery_fence_participants_present(controller, &candidate_fence) {
         return Ok(None);
     }
-    let adopted = read_assignment_adoptions(controller, deadline).await?;
+    let adopted = read_assignment_adoptions(controller, deadline, "assignment audit").await?;
     if !assignment_adoptions_match(&candidate_fence, &adopted) {
         return Ok(None);
     }
@@ -2990,7 +2991,6 @@ async fn current_recovery_assignment_fence(
         .map(|owner| owner.0)
         .collect();
     let published = controller.checkpoint_assignment_watch().borrow().clone();
-    let confirmed_adopted = read_assignment_adoptions(controller, deadline).await?;
     if confirmed_committed != committed
         || controller
             .checkpoint_drain_transition()
@@ -3001,7 +3001,6 @@ async fn current_recovery_assignment_fence(
         || confirmed_assignment.owners() != local_assignment.owners()
         || !fence.matches_owner_map(&confirmed_owners)
         || !recovery_fence_participants_present(controller, &fence)
-        || !assignment_adoptions_match(&fence, &confirmed_adopted)
         || published
             .as_ref()
             .is_some_and(|published| published != &fence)
@@ -3011,6 +3010,11 @@ async fn current_recovery_assignment_fence(
         || !db.cluster_intake_fenced()
         || !db.coordinated_recovery_fenced.load(Ordering::Acquire)
     {
+        return Ok(None);
+    }
+    let confirmed_adopted =
+        read_assignment_adoptions(controller, deadline, "assignment recheck").await?;
+    if !assignment_adoptions_match(&fence, &confirmed_adopted) {
         return Ok(None);
     }
     Ok(Some(fence))
@@ -3712,7 +3716,7 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     if live_target_participants != target.participants {
         return Err("materialized assignment target process roster is no longer exact".into());
     }
-    let reported = read_assignment_adoptions(controller, deadline).await?;
+    let reported = read_assignment_adoptions(controller, deadline, "Prepare retirement").await?;
     if !assignment_adoptions_match(&target, &reported) {
         return Ok(None);
     }
@@ -3740,7 +3744,8 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
             "materialized assignment target process roster changed during retirement".into(),
         );
     }
-    let confirmed_reports = read_assignment_adoptions(controller, deadline).await?;
+    let confirmed_reports =
+        read_assignment_adoptions(controller, deadline, "Prepare retirement recheck").await?;
     if !assignment_adoptions_match(&target, &confirmed_reports)
         || !current_stopped_roster_has_adopted_target(
             controller,
