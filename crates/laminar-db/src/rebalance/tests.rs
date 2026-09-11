@@ -29,12 +29,19 @@ impl laminar_core::cluster::control::ClusterKv for DelayedScanKv {
 struct GetBarrier {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    path_prefix: Option<&'static str>,
     reads_before_wait: std::sync::atomic::AtomicUsize,
     armed: std::sync::atomic::AtomicBool,
 }
 
 impl GetBarrier {
-    async fn wait_once(&self) {
+    async fn wait_once(&self, location: &object_store::path::Path) {
+        if self
+            .path_prefix
+            .is_some_and(|prefix| !location.as_ref().starts_with(prefix))
+        {
+            return;
+        }
         if self
             .reads_before_wait
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -95,7 +102,7 @@ impl ObjectStore for ReadBarrierStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         if let Some(get) = &self.get {
-            get.wait_once().await;
+            get.wait_once(location).await;
         }
         self.inner.get_opts(location, options).await
     }
@@ -2551,6 +2558,86 @@ async fn dead_predecessor_retires_the_graph_and_publishes_an_authorized_recovery
 }
 
 #[tokio::test]
+async fn recovery_materialization_does_not_repeat_the_settlement_authority_audit() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let local_participant = current
+        .participants
+        .iter()
+        .copied()
+        .find(|participant| participant.node_id == self_id.0)
+        .unwrap();
+    let proposal = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local_participant],
+        )
+        .unwrap();
+    let decision = authorize_recovery_successor(
+        &db,
+        &durable,
+        &controller,
+        &current,
+        proposal,
+        Duration::from_secs(2),
+        "deterministic recovery audit regression",
+    )
+    .await
+    .expect("the successor must be authorized before materialization");
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(2),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    let materialization_store = Arc::new(AssignmentSnapshotStore::new(bounded_store));
+
+    let version = tokio::time::timeout(
+        Duration::from_secs(2),
+        materialize_recovery_decision(
+            &db,
+            &materialization_store,
+            &controller,
+            &registry,
+            decision,
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("recovery materialization exceeded the bounded test timeout")
+    .expect("one settlement authority audit must fit the materialization budget");
+
+    assert_eq!(version, Some(current.version + 1));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "materialization must validate the proposal and perform the settlement authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "a redundant third proposal read exhausted the materialization budget"
+    );
+}
+
+#[tokio::test]
 async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint() {
     let self_id = NodeId(1);
     let (
@@ -3422,6 +3509,7 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     let get = Arc::new(GetBarrier {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
+        path_prefix: None,
         // The first read materializes the requested target. Block the audit's independent
         // recovery-materialization read so the generation changes during the authority audit.
         reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
