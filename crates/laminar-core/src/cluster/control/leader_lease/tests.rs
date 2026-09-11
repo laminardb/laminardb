@@ -3654,6 +3654,79 @@ async fn recovery_requires_the_current_cut_and_pins_it_until_the_target_commits(
 }
 
 #[tokio::test]
+async fn recovery_decision_admission_audits_existing_assignment_history_once() {
+    let (raw, store) = blocking_store_at(1_000, OsPath::from("control/never-block"));
+    let incumbent = owner(1, 11, 1);
+    let failed_two = owner(2, 22, 1);
+    let failed_three = owner(3, 33, 1);
+    let replacement_two = owner(2, 222, 2);
+    let replacement_three = owner(3, 333, 2);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let first = assignment_recovery_decision(
+        &store,
+        1,
+        &[incumbent.clone(), failed_two.clone(), failed_three],
+        &[
+            incumbent.clone(),
+            failed_two.clone(),
+            replacement_three.clone(),
+        ],
+        proof.clone(),
+        1,
+    )
+    .await;
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, first)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert!(matches!(
+        store.materialize_assignment_recovery(2).await.unwrap(),
+        RotateOutcome::Rotated
+    ));
+
+    let second = assignment_recovery_decision(
+        &store,
+        2,
+        &[incumbent.clone(), failed_two, replacement_three.clone()],
+        &[incumbent.clone(), replacement_two, replacement_three],
+        proof.clone(),
+        2,
+    )
+    .await;
+    let prior_decision = store
+        .load_record()
+        .await
+        .unwrap()
+        .unwrap()
+        .assignment_decision_head
+        .unwrap();
+    raw.clear_authority_io_counts();
+
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, second)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert_eq!(
+        raw.get_count(&lease_path(prior_decision.sequence)),
+        2,
+        "recovery admission must read the published decision head and audit its link only once"
+    );
+}
+
+#[tokio::test]
 async fn competing_assignment_recoveries_have_one_same_version_winner() {
     let (raw, store) = blocking_store_at(1_000, lease_path(4));
     let incumbent = owner(1, 11, 1);
