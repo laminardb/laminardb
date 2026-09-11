@@ -914,6 +914,10 @@ async fn stopped_recovery_successor_fixture(
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[failed]);
 
+    // Keep this fixture at the materialized-but-not-retired boundary so the tests below can
+    // install an exact stopped Prepare themselves.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -924,6 +928,8 @@ async fn stopped_recovery_successor_fixture(
     )
     .await
     .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
         error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
@@ -2462,7 +2468,7 @@ async fn missing_source_drain_receipt_requires_stopped_recovery() {
 }
 
 #[tokio::test]
-async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
+async fn dead_predecessor_retires_the_graph_and_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
     let (
         db,
@@ -2476,21 +2482,22 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    let error = try_rebalance(
-        &db,
-        &controller,
-        &durable,
-        &registry,
-        &[self_id, NodeId(2)],
-        RebalanceConfig::test_defaults(),
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(2),
+        try_rebalance(
+            &db,
+            &controller,
+            &durable,
+            &registry,
+            &[self_id, NodeId(2)],
+            RebalanceConfig::test_defaults(),
+        ),
     )
     .await
-    .expect_err("vnode acquisition must wait for the running graph to retire");
-    assert!(
-        error.contains("must wait for a faulted cold bootstrap"),
-        "{error}"
-    );
+    .expect("recovery successor retirement exceeded the test deadline")
+    .expect("recovery successor must retire the graph before vnode acquisition");
     let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(successor.version));
     assert_eq!(successor.version, current.version + 1);
     assert!(!successor.draining);
     assert_eq!(successor.participants.len(), 1);
@@ -2528,7 +2535,11 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         )
         .await
         .unwrap());
-    assert_eq!(registry.assignment_version(), current.version);
+    assert_eq!(registry.assignment_version(), successor.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(!db.runtime_shutdown.read().is_cancelled());
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
     assert!(db.cluster_intake_fenced());
     assert!(controller.is_recovering());
     assert!(controller
@@ -2601,6 +2612,8 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         }))
     };
     controller.note_unresponsive(&[NodeId(2)]);
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -2611,6 +2624,8 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
     )
     .await
     .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
         error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
@@ -3362,73 +3377,6 @@ fn takeover_audits_a_recovery_head_while_its_pin_is_propagated_to_the_next_gener
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn materialized_recovery_waits_for_running_graph_retirement() {
-    let self_id = NodeId(1);
-    let (
-        db,
-        controller,
-        durable,
-        registry,
-        current,
-        _process_authority,
-        _authority_store,
-        _checkpoint_dir,
-    ) = dead_predecessor_fixture().await;
-    controller.note_unresponsive(&[NodeId(2)]);
-
-    let error = tokio::time::timeout(
-        Duration::from_secs(2),
-        try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id, NodeId(2)],
-            RebalanceConfig::test_defaults(),
-        ),
-    )
-    .await
-    .expect("recovery successor materialization exceeded the test deadline")
-    .expect_err("a running graph must not live-adopt a recovery checkpoint cut");
-    assert!(
-        error.contains("must wait for a faulted cold bootstrap"),
-        "{error}"
-    );
-
-    let successor = durable.load().await.unwrap().unwrap();
-    assert_eq!(successor.version, current.version + 1);
-    assert_eq!(registry.assignment_version(), current.version);
-    assert!(db.pending_vnode_transition.lock().is_none());
-    assert!(db.installed_vnode_state.lock().is_some());
-    assert_eq!(DbState::load(&db.state), DbState::Running);
-
-    db.fence_coordinated_recovery_lifecycle();
-    let generation = Arc::clone(&db.rotation_execution_fence).write_owned().await;
-    db.installed_vnode_state.lock().take();
-    DbState::Faulted.store(&db.state);
-    drop(generation);
-
-    let adopted = tokio::time::timeout(
-        Duration::from_secs(2),
-        try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id, NodeId(2)],
-            RebalanceConfig::test_defaults(),
-        ),
-    )
-    .await
-    .expect("cold recovery adoption exceeded the test deadline")
-    .expect("the retired graph must cold-adopt the materialized successor");
-    assert_eq!(adopted, Some(successor.version));
-    assert_eq!(registry.assignment_version(), successor.version);
-    assert!(db.pending_vnode_transition.lock().is_none());
-    assert!(db.installed_vnode_state.lock().is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_audit() {
     let self_id = NodeId(1);
     let (
@@ -3443,6 +3391,8 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -3453,6 +3403,8 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     )
     .await
     .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
         error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
@@ -3529,7 +3481,7 @@ async fn recovery_decision_fault_precedes_graph_execution_drain() {
         controller,
         durable,
         registry,
-        _current,
+        current,
         _process_authority,
         _authority_store,
         _checkpoint_dir,
@@ -3573,15 +3525,14 @@ async fn recovery_decision_fault_precedes_graph_execution_drain() {
     .expect("recovery fault publication waited for the graph execution drain");
 
     drop(execution);
-    let error = tokio::time::timeout(Duration::from_secs(2), rebalancing)
+    let adopted = tokio::time::timeout(Duration::from_secs(2), rebalancing)
         .await
         .expect("recovery assignment materialization did not finish")
         .unwrap()
-        .expect_err("vnode acquisition must wait for the running graph to retire");
-    assert!(
-        error.contains("must wait for a faulted cold bootstrap"),
-        "{error}"
-    );
+        .expect("recovery assignment must retire the graph after the execution fence drains");
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
 }
 
 #[tokio::test]
@@ -3601,6 +3552,8 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
 
     // Materialize v2 while Running first; cold-bootstrap admission leaves v1 local until a
     // subsequent retry observes the faulted graph.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -3611,6 +3564,10 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     )
     .await
     .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
+    db.coordinated_recovery_fenced
+        .store(false, Ordering::Release);
     assert!(
         error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
@@ -4456,6 +4413,8 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -4466,6 +4425,8 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
     )
     .await
     .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
         error.contains("must wait for a faulted cold bootstrap"),
         "{error}"

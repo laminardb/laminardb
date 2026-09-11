@@ -28,7 +28,7 @@ use laminar_core::cluster::control::{
 };
 use laminar_core::cluster::discovery::NodeId;
 
-use crate::LaminarDB;
+use crate::{db::DbState, LaminarDB};
 
 /// Healthy-state monitor cadence. Only the leader polls the shared fault inventory; followers use
 /// the replicated recovery intent unless they have a local settlement latch.
@@ -2545,6 +2545,38 @@ async fn stop_and_purge(db: &Arc<LaminarDB>) -> bool {
 async fn stop_for_recovery(db: &Arc<LaminarDB>) -> bool {
     db.fence_coordinated_recovery_lifecycle();
     stop_and_purge(db).await
+}
+
+/// Retire a live graph so an acquired recovery assignment cannot reuse predecessor heap state.
+pub(crate) async fn fault_for_recovery_assignment(db: &Arc<LaminarDB>) -> bool {
+    let lifecycle_timeout = recovery_stop_lifecycle_timeout(db);
+    db.fence_coordinated_recovery_lifecycle();
+    run_lifecycle(db, lifecycle_timeout, |db| async move {
+        db.stop_pipeline_for_coordinated_recovery().await?;
+        db.purge_shuffle_receiver_buffers();
+
+        let mut runtime_shutdown = db.runtime_shutdown.write();
+        let ready = !db.is_closed()
+            && DbState::load(&db.state) == DbState::Created
+            && runtime_shutdown.is_cancelled()
+            && db.cluster_intake_fenced()
+            && db.coordinated_recovery_in_progress()
+            && db.pending_recovery_fault.load(Ordering::Acquire) != 0
+            && db.pending_vnode_transition.lock().is_none()
+            && db.installed_vnode_state.lock().is_none();
+        if !ready {
+            return Err(crate::DbError::Checkpoint(
+                "recovery assignment could not establish a retired local graph boundary".into(),
+            ));
+        }
+
+        // RECOVERY: a naturally faulted generation leaves this token live. Recreate that exact
+        // cold-adoption invariant only after the cancelled runtime has joined and its heap retired.
+        *runtime_shutdown = tokio_util::sync::CancellationToken::new();
+        DbState::Faulted.store(&db.state);
+        Ok(())
+    })
+    .await
 }
 
 fn recovery_driver_proof_is_current(controller: &ClusterController, round: &RecoveryRound) -> bool {
