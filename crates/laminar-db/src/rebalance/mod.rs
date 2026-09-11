@@ -3041,14 +3041,6 @@ fn materialize_recovery_decision<'a>(
                 decision.target_version()
             ));
         }
-        tokio::time::timeout_at(
-            deadline,
-            audit_assignment_snapshot_authority(store, Some(controller), &durable),
-        )
-        .await
-        .map_err(|_| {
-            "recovery assignment audit exceeded the materialization deadline".to_string()
-        })??;
         prepare_recovery_assignment_adoption(db, store, controller, registry, &durable, deadline)
             .await?;
         let version = durable.version;
