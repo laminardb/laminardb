@@ -19,8 +19,8 @@ pub(super) async fn ensure_local_recovery_fault(
         .map(|_| ())
 }
 
-pub(super) fn require_recovery_cold_bootstrap(
-    db: &LaminarDB,
+pub(super) async fn require_recovery_cold_bootstrap(
+    db: &Arc<LaminarDB>,
     controller: &ClusterController,
     registry: &VnodeRegistry,
     snapshot: &AssignmentSnapshot,
@@ -37,11 +37,19 @@ pub(super) fn require_recovery_cold_bootstrap(
     if !acquires_vnodes {
         return Ok(());
     }
-    let state = DbState::load(&db.state);
+    let mut state = DbState::load(&db.state);
     if matches!(state, DbState::Created | DbState::Faulted)
         && db.installed_vnode_state.lock().is_none()
     {
         return Ok(());
+    }
+    if crate::coordinated_recovery::fault_for_recovery_assignment(db).await {
+        state = DbState::load(&db.state);
+        if matches!(state, DbState::Created | DbState::Faulted)
+            && db.installed_vnode_state.lock().is_none()
+        {
+            return Ok(());
+        }
     }
     Err(format!(
         "recovery assignment {} vnode acquisition must wait for a faulted cold bootstrap; local graph is {state:?}",
@@ -116,7 +124,7 @@ pub(super) fn prepare_recovery_assignment_adoption<'a>(
         }
         ensure_local_recovery_fault(db, controller).await?;
         abort_predecessor_checkpoint_for_recovery(store, controller, snapshot, deadline).await?;
-        require_recovery_cold_bootstrap(db, controller, registry, snapshot)
+        require_recovery_cold_bootstrap(db, controller, registry, snapshot).await
     })
 }
 
@@ -138,9 +146,11 @@ pub(super) async fn prepare_watched_recovery_adoption(
                 "snapshot watcher: could not settle predecessor checkpoint for recovery: {error}"
             )
         })?;
-    require_recovery_cold_bootstrap(db, controller, registry, snapshot).map_err(|error| {
-        format!("snapshot watcher: recovery assignment waits for compute retirement: {error}")
-    })?;
+    require_recovery_cold_bootstrap(db, controller, registry, snapshot)
+        .await
+        .map_err(|error| {
+            format!("snapshot watcher: recovery assignment waits for compute retirement: {error}")
+        })?;
     Ok(db.assignment_authority_revision.load(Ordering::Acquire))
 }
 
