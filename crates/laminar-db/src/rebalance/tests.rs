@@ -2558,6 +2558,78 @@ async fn dead_predecessor_retires_the_graph_and_publishes_an_authorized_recovery
 }
 
 #[tokio::test]
+async fn materialized_recovery_fence_audits_authority_once() {
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let adopted = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[NodeId(1), NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect("recovery successor materialization must succeed");
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(successor.version, current.version + 1);
+    let successor_fence = successor.assignment_fence().unwrap();
+    let adoption = db
+        .publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), false)
+        .await
+        .unwrap();
+    assert!(adoption.matches_fence(&successor_fence));
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    *db.assignment_snapshot_store.lock() =
+        Some(Arc::new(AssignmentSnapshotStore::new(bounded_store)));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::coordinated_recovery::current_recovery_assignment_fence(&db, &controller, deadline),
+    )
+    .await
+    .expect("recovery assignment audit exceeded the bounded test timeout")
+    .expect("one assignment-authority audit must fit the recovery decision budget");
+
+    assert_eq!(observed, Some(successor_fence));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "recovery must perform its final assignment-authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "recovery repeated its full assignment-authority audit"
+    );
+    proposal_reads.armed.store(false, Ordering::Release);
+    proposal_reads.release.notify_waiters();
+    db.close();
+}
+
+#[tokio::test]
 async fn recovery_materialization_does_not_repeat_the_settlement_authority_audit() {
     let self_id = NodeId(1);
     let (
