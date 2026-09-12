@@ -2615,6 +2615,11 @@ async fn materialized_recovery_fence_audits_authority_once() {
     .expect("one assignment-authority audit must fit the recovery decision budget");
 
     assert_eq!(observed, Some(successor_fence));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "recovery must perform its final assignment-authority audit"
+    );
     assert!(
         proposal_reads.armed.load(Ordering::Acquire),
         "recovery repeated its full assignment-authority audit"
