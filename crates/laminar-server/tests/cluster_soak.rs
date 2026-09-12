@@ -207,6 +207,8 @@ const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
 #[cfg(feature = "kafka")]
 const RECOVERY_START_LOG: &str = "leader announced recovery start";
 #[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_PUBLISHED_LOG: &str = "leader announced recovery release";
+#[cfg(feature = "kafka")]
 const RECOVERY_STOPPED_LOG: &str = "stopped for recovery round; awaiting target";
 #[cfg(feature = "kafka")]
 const RECOVERY_DRIVER_HANDOFF_LOG: &str =
@@ -225,7 +227,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 102] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -555,6 +557,7 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
         "rebalance failed; retrying after backoff",
     ),
     ("recovery_start", RECOVERY_START_LOG),
+    ("recovery_release_published", RECOVERY_RELEASE_PUBLISHED_LOG),
     ("recovery_release", RECOVERY_RELEASE_LOG),
     (
         "kafka_source_started_fenced",
@@ -9686,6 +9689,11 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         recovery_starts, prepare_sequence.applied_rounds as usize,
         "explicit fault did not produce one Start per applied recovery generation"
     );
+    assert!(
+        logs.iter()
+            .any(|log| log.contains(RECOVERY_RELEASE_PUBLISHED_LOG)),
+        "explicit fault had no successful recovery Release publication"
+    );
     let stopped_reports = logs
         .iter()
         .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
@@ -16018,6 +16026,36 @@ fn public_readiness_request_omits_console_authorization() {
         BoundedHttpAuthorization::ConsoleBearer,
     );
     assert!(console_request.contains("Authorization: Bearer "));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_log_diagnostics_distinguish_release_publication_from_open_gates() {
+    let published = format!(
+        "{RECOVERY_START_LOG}\n{RECOVERY_RELEASE_PUBLISHED_LOG} gen=1 token=never-copy-this\n"
+    );
+    let diagnostics = recovery_log_diagnostics(&published);
+    assert_eq!(
+        diagnostics.marker_counts.get("recovery_release_published"),
+        Some(&1)
+    );
+    assert!(!diagnostics.marker_counts.contains_key("recovery_release"));
+    assert_eq!(
+        diagnostics.recent_marker_sequence,
+        ["recovery_start", "recovery_release_published"]
+    );
+    assert!(!format!("{diagnostics:?}").contains("never-copy-this"));
+
+    let released = recovery_log_diagnostics(&format!("{published}{RECOVERY_RELEASE_LOG}\n"));
+    assert_eq!(released.marker_counts.get("recovery_release"), Some(&1));
+    assert_eq!(
+        released.recent_marker_sequence,
+        [
+            "recovery_start",
+            "recovery_release_published",
+            "recovery_release"
+        ]
+    );
 }
 
 #[cfg(feature = "kafka")]

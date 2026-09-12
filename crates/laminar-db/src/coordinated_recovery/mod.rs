@@ -1875,6 +1875,7 @@ impl RecoveryMonitor {
             hold_intake_and_request_retry(db, controller, gen_id, true).await;
             return;
         }
+        tracing::warn!(gen = gen_id, "leader announced recovery release");
         let release = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch: target },
