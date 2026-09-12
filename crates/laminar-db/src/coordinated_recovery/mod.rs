@@ -2849,7 +2849,7 @@ async fn read_assignment_adoptions(
 /// Reconstruct the withdrawn checkpoint certificate from durable authority, current process
 /// incarnations, and exact adoption while recovery owns the closed data plane. This read-only
 /// fallback neither republishes authority nor requires a faulted owner's stale vnode readiness.
-async fn current_recovery_assignment_fence(
+pub(crate) async fn current_recovery_assignment_fence(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     deadline: tokio::time::Instant,
@@ -2884,7 +2884,7 @@ async fn current_recovery_assignment_fence(
         .map_err(|_| "recovery assignment head read timed out".to_string())?
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "recovery assignment audit has no durable head".to_string())?;
-    // RECOVERY: Missing adoption rejects before remote authority I/O; acceptance still audits.
+    // RECOVERY: Reject cheap local mismatches before the final remote authority audit.
     let candidate_fence = recovery_head_fence(&head)?;
     if !recovery_fence_participants_present(controller, &candidate_fence) {
         return Ok(None);
@@ -2893,12 +2893,6 @@ async fn current_recovery_assignment_fence(
     if !assignment_adoptions_match(&candidate_fence, &adopted) {
         return Ok(None);
     }
-    tokio::time::timeout_at(
-        deadline,
-        crate::rebalance::audit_assignment_snapshot_authority(&store, Some(controller), &head),
-    )
-    .await
-    .map_err(|_| "recovery assignment authority audit timed out".to_string())??;
     let expected_drain_transition = head.drain_transition.clone();
     let committed = if head.draining {
         let Some(expected) = expected_drain_transition.as_ref() else {
