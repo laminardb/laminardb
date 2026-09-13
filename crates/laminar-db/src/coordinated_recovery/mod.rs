@@ -365,6 +365,7 @@ impl RecoveryMonitor {
                                 );
                             }
                             Ok(None) => {
+                                tracing::warn!("waits to supersede stopped Prepare");
                                 hold_intake_for_retry(
                                     &db,
                                     &controller,

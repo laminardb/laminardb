@@ -227,6 +227,27 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
+      - name: Collect filtered node logs
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          mkdir -p native-checkpoint-node-logs
+          node_log_dir=$(sed -n 's/^soak: node logs in //p' native-checkpoint-soak.log | head -1)
+          if [ -z "$node_log_dir" ] || [ ! -d "$node_log_dir" ]; then
+            printf 'node log directory %s not found\n' "$node_log_dir" > native-checkpoint-node-logs/unavailable.txt
+          else
+            # WARN/ERROR lines only: killed-node logs stop mid-file, credential-shaped
+            # values are redacted, and each node is capped at 1 MiB.
+            for log in "$node_log_dir"/*; do
+              [ -f "$log" ] || continue
+              grep -aE 'WARN|ERROR' "$log" \
+                | sed -E 's/([a-z_]*(sig|token|secret|credential|password|authorization|account|key)[a-z_]*)=[^ ,"]+/\1=REDACTED/gI' \
+                | tail -c 1048576 \
+                > "native-checkpoint-node-logs/$(basename "$log").warn"
+            done
+          fi
+          ls -l native-checkpoint-node-logs
       - name: Clean interrupted native checkpoint prefix
         id: cleanup
         if: always() && !(steps.process_soak.outcome == 'failure' && inputs.preserve_failed_prefix == true)
@@ -314,6 +335,7 @@ jobs:
             target/cloud-evidence/*.json
             native-checkpoint-soak.log
             native-checkpoint-resources.log
+            native-checkpoint-node-logs/*
           if-no-files-found: error
           retention-days: 30
       - name: Enforce native checkpoint result
