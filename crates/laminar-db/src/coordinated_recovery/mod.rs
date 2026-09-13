@@ -136,8 +136,9 @@ struct RecoveryMonitor {
     handled_faults: FxHashMap<NodeId, u64>,
     /// Leader term for which this node has resumed any durable artifact cleanup.
     retention_leader: Option<laminar_core::checkpoint::LeaderProof>,
-    /// Last poll's leadership-gate outcome; only transitions are logged.
-    monitor_leadership: bool,
+    /// Last poll's monitor gate snapshot: (leadership held, idle with the recovery latch
+    /// held). Only transitions are logged.
+    monitor_gates: (bool, bool),
     /// Whether a visible, unhandled durable fault has already suspended local assignment
     /// authority. The report remains level-triggered, but the suspension revision advances only
     /// once per continuously held fault period.
@@ -271,7 +272,7 @@ impl RecoveryMonitor {
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
             self.observe(&db, &controller, local_fault).await;
             let leader = controller.is_leader();
-            if leader != std::mem::replace(&mut self.monitor_leadership, leader) {
+            if leader != std::mem::replace(&mut self.monitor_gates.0, leader) {
                 tracing::warn!(leader, "recovery monitor leadership gate changed");
             }
             if !leader {
@@ -289,13 +290,16 @@ impl RecoveryMonitor {
             if inventory.has_terminal_fault() {
                 let reporter = fault_snapshot
                     .iter()
-                    .copied()
                     .find(|fault| fault.is_terminal())
                     .map(|fault| fault.reporter);
                 self.latch_durable_terminal_fault(&db, &controller, reporter);
             }
             let pending = self.unhandled_faults(&fault_snapshot);
             self.hold_for_visible_or_queued_fault(&db, &controller, &pending);
+            let idle = pending.is_empty() && controller.is_recovering();
+            if idle != std::mem::replace(&mut self.monitor_gates.1, idle) {
+                tracing::warn!(idle, "recovery monitor has no unhandled faults");
+            }
 
             // `drive_round` owns every nonterminal local Prepare/Start synchronously. Seeing one
             // here means that owner disappeared or returned early. A stopped Prepare is never
@@ -310,7 +314,10 @@ impl RecoveryMonitor {
                     self.hold_for_unknown_fault_audit(&db, &controller).await;
                     continue;
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "recovery control observation failed");
+                    continue;
+                }
                 Ok(result) => match result {
                     Some(active) if active.round.has_terminal_fault() => {
                         self.latch_durable_terminal_fault(
@@ -320,7 +327,6 @@ impl RecoveryMonitor {
                                 .round
                                 .faults
                                 .iter()
-                                .copied()
                                 .find(|fault| fault.is_terminal())
                                 .map(|fault| fault.reporter),
                         );
@@ -1636,7 +1642,6 @@ impl RecoveryMonitor {
                 round
                     .faults
                     .iter()
-                    .copied()
                     .find(|fault| fault.is_terminal())
                     .map(|fault| fault.reporter),
             );
