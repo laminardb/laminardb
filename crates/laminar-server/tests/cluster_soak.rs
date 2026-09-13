@@ -205,6 +205,12 @@ const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded"
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
 #[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_QUIESCED_LOG: &str = "leader Prepare quiesced";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_QUORUM_LOG: &str = "leader stop quorum reached";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_TARGET_LOG: &str = "leader target selected";
+#[cfg(feature = "kafka")]
 const RECOVERY_START_LOG: &str = "leader announced recovery start";
 #[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_PUBLISHED_LOG: &str = "leader announced recovery release";
@@ -227,7 +233,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 102] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 105] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -305,6 +311,15 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 102] = [
         "coordinated recovery: owner-complete assignment audit failed",
     ),
     ("recovery_prepare", RECOVERY_PREPARE_LOG),
+    ("recovery_prepare_quiesced", RECOVERY_PREPARE_QUIESCED_LOG),
+    (
+        "recovery_prepare_stopped_quorum",
+        RECOVERY_PREPARE_QUORUM_LOG,
+    ),
+    (
+        "recovery_prepare_target_selected",
+        RECOVERY_PREPARE_TARGET_LOG,
+    ),
     (
         "recovery_checkpoint_tails_cancelled",
         "coordinated recovery cancelled fenced checkpoint durable tails",
@@ -9689,11 +9704,17 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         recovery_starts, prepare_sequence.applied_rounds as usize,
         "explicit fault did not produce one Start per applied recovery generation"
     );
-    assert!(
-        logs.iter()
-            .any(|log| log.contains(RECOVERY_RELEASE_PUBLISHED_LOG)),
-        "explicit fault had no successful recovery Release publication"
-    );
+    for marker in [
+        RECOVERY_PREPARE_QUIESCED_LOG,
+        RECOVERY_PREPARE_QUORUM_LOG,
+        RECOVERY_PREPARE_TARGET_LOG,
+        RECOVERY_RELEASE_PUBLISHED_LOG,
+    ] {
+        assert!(
+            logs.iter().any(|log| log.contains(marker)),
+            "explicit fault is missing recovery progress marker: {marker}"
+        );
+    }
     let stopped_reports = logs
         .iter()
         .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
@@ -16026,6 +16047,32 @@ fn public_readiness_request_omits_console_authorization() {
         BoundedHttpAuthorization::ConsoleBearer,
     );
     assert!(console_request.contains("Authorization: Bearer "));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_log_diagnostics_distinguish_prepare_progress_phases() {
+    let mut log = format!("{RECOVERY_PREPARE_LOG}\n");
+    let mut expected_sequence = vec!["recovery_prepare"];
+    for (marker, name) in [
+        (RECOVERY_PREPARE_QUIESCED_LOG, "recovery_prepare_quiesced"),
+        (
+            RECOVERY_PREPARE_QUORUM_LOG,
+            "recovery_prepare_stopped_quorum",
+        ),
+        (
+            RECOVERY_PREPARE_TARGET_LOG,
+            "recovery_prepare_target_selected",
+        ),
+    ] {
+        log.push_str(&format!("{marker} gen=1 token=never-copy-this\n"));
+        expected_sequence.push(name);
+        let diagnostics = recovery_log_diagnostics(&log);
+        assert_eq!(diagnostics.marker_counts.get(name), Some(&1));
+        assert_eq!(diagnostics.marker_counts.len(), expected_sequence.len());
+        assert_eq!(diagnostics.recent_marker_sequence, expected_sequence);
+        assert!(!format!("{diagnostics:?}").contains("never-copy-this"));
+    }
 }
 
 #[cfg(feature = "kafka")]

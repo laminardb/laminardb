@@ -1778,9 +1778,8 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        let target = selected
-            .as_ref()
-            .map_or(GENESIS, |(outcome, _)| outcome.epoch);
+        let selected = selected.as_ref();
+        let target = selected.map_or(GENESIS, |(cut, _)| cut.epoch);
         let ownership = driver_owns_prepare(db, controller, &round).await;
         if ownership != PrepareOwnership::Owned {
             drop(selection_guard);
@@ -1794,6 +1793,7 @@ impl RecoveryMonitor {
             .await;
             return;
         }
+        tracing::warn!(gen = gen_id, "leader target selected");
         db.purge_shuffle_receiver_buffers();
         if let Err(error) = controller.announce_recover_start(&round, target).await {
             drop(selection_guard);
@@ -1809,14 +1809,12 @@ impl RecoveryMonitor {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch: target },
         };
+        let checkpoint_id = selected.map_or(GENESIS, |(cut, _)| cut.checkpoint_id);
+        let participants = selected.map_or(0, |(_, index)| index.participants.len());
         tracing::warn!(
             target_epoch = target,
-            checkpoint_id = selected
-                .as_ref()
-                .map_or(GENESIS, |(outcome, _)| outcome.checkpoint_id),
-            participants = selected
-                .as_ref()
-                .map_or(0, |(_, index)| index.participants.len()),
+            checkpoint_id,
+            participants,
             gen = gen_id,
             "leader announced recovery start"
         );
@@ -2600,11 +2598,11 @@ async fn await_recovery_driver_stop(
             if !recovery_driver_proof_is_current(controller, round) {
                 return DriverStopOutcome::LeadershipLost;
             }
-            return if stopped {
-                DriverStopOutcome::Stopped
-            } else {
-                DriverStopOutcome::Failed
-            };
+            if stopped {
+                tracing::warn!(gen = round.id.generation, "leader Prepare quiesced");
+                return DriverStopOutcome::Stopped;
+            }
+            return DriverStopOutcome::Failed;
         }
     }
 }
@@ -4035,6 +4033,9 @@ async fn wait_stopped_quorum_with_timeout_barrier(
     if let Ok(outcome) =
         tokio::time::timeout_at(deadline, wait_stopped_quorum_until(controller, round)).await
     {
+        if matches!(&outcome, StoppedQuorum::Reached(_)) {
+            tracing::warn!(gen = round.id.generation, "leader stop quorum reached");
+        }
         outcome
     } else {
         after_timeout.await;

@@ -198,6 +198,18 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          snapshot_resources() {
+            printf 'resource_phase=%s\n' "$1"
+            printf 'logical_cpus=%s\n' "$(nproc)"
+            free -m
+            df -m "$GITHUB_WORKSPACE"
+            awk '$1 == "oom_kill" { print }' /proc/vmstat
+          }
+          snapshot_resources before > native-checkpoint-resources.log
+          # Bound sampling to the job's 150-minute limit. No environment or command lines are logged.
+          vmstat -w -t 5 1800 >> native-checkpoint-resources.log &
+          soak_resource_pid=$!
+          trap 'kill "$soak_resource_pid" 2>/dev/null || true; wait "$soak_resource_pid" 2>/dev/null || true; snapshot_resources after >> native-checkpoint-resources.log' EXIT
           cargo test --profile soak -p laminar-server --no-default-features --features "cluster,kafka,$PROVIDER_FEATURE" --test cluster_soak three_node_alo_join_kill9_soak -- --ignored --exact --nocapture --color never 2>&1 | tee native-checkpoint-soak.log
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -301,6 +313,7 @@ jobs:
           path: |
             target/cloud-evidence/*.json
             native-checkpoint-soak.log
+            native-checkpoint-resources.log
           if-no-files-found: error
           retention-days: 30
       - name: Enforce native checkpoint result
