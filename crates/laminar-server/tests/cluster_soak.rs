@@ -211,6 +211,8 @@ const RECOVERY_PREPARE_QUORUM_LOG: &str = "leader stop quorum reached";
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_TARGET_LOG: &str = "leader target selected";
 #[cfg(feature = "kafka")]
+const RECOVERY_MONITOR_LEADERSHIP_LOG: &str = "recovery monitor leadership gate changed";
+#[cfg(feature = "kafka")]
 const RECOVERY_START_LOG: &str = "leader announced recovery start";
 #[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_PUBLISHED_LOG: &str = "leader announced recovery release";
@@ -233,7 +235,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 105] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 106] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -363,6 +365,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 105] = [
     (
         "recovery_quorum_control_timeout",
         "recovery quorum control observation timed out",
+    ),
+    (
+        "recovery_monitor_leadership_changed",
+        RECOVERY_MONITOR_LEADERSHIP_LOG,
     ),
     (
         "recovery_successor_authorized",
@@ -3011,6 +3017,20 @@ impl Node {
 
     fn log_len(&self) -> u64 {
         std::fs::metadata(&self.log_path).map_or(0, |metadata| metadata.len())
+    }
+
+    /// Node-log liveness without copying log content: current size and age of the last write.
+    #[cfg(feature = "kafka")]
+    fn log_write_liveness(&self) -> (u64, Option<u64>) {
+        let Ok(metadata) = std::fs::metadata(&self.log_path) else {
+            return (0, None);
+        };
+        let last_write_age_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age.as_millis() as u64);
+        (metadata.len(), last_write_age_ms)
     }
 
     #[cfg(feature = "kafka")]
@@ -12134,6 +12154,10 @@ fn durable_progress_diagnostics(
         .iter()
         .map(|node| (node.id, node.recovery_log_diagnostics()))
         .collect();
+    let node_log_liveness_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.log_write_liveness()))
+        .collect();
     let ingestion_metrics_by_node: Vec<_> = live_nodes
         .iter()
         .map(|node| (node.id, node.ingestion_diagnostic_metrics()))
@@ -12187,6 +12211,7 @@ fn durable_progress_diagnostics(
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
          recovery_log_diagnostics_by_node={recovery_log_diagnostics_by_node:?}, \
+         node_log_liveness_by_node={node_log_liveness_by_node:?}, \
          ingestion_metrics_by_node={ingestion_metrics_by_node:?}, \
          checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
          durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
@@ -16161,6 +16186,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
                recovery quorum control observation timed out\n\
+               recovery monitor leadership gate changed leader=true token=never-copy-this\n\
                authorized successor assignment from the last committed cluster cut\n\
                coordinated recovery cancelled fenced checkpoint durable tails\n\
                recovery assignment 2 waits for a local vnode transition\n\
@@ -16244,6 +16270,7 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_quorum_control_timeout"), Some(&1));
+    assert_eq!(counts.get("recovery_monitor_leadership_changed"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
     assert_eq!(counts.get("recovery_checkpoint_tails_cancelled"), Some(&1));
     for marker in [

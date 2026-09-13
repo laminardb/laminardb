@@ -136,6 +136,8 @@ struct RecoveryMonitor {
     handled_faults: FxHashMap<NodeId, u64>,
     /// Leader term for which this node has resumed any durable artifact cleanup.
     retention_leader: Option<laminar_core::checkpoint::LeaderProof>,
+    /// Last poll's leadership-gate outcome; only transitions are logged.
+    monitor_leadership: bool,
     /// Whether a visible, unhandled durable fault has already suspended local assignment
     /// authority. The report remains level-triggered, but the suspension revision advances only
     /// once per continuously held fault period.
@@ -268,7 +270,11 @@ impl RecoveryMonitor {
             let local_pending = local_fault.into_iter().collect::<Vec<_>>();
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
             self.observe(&db, &controller, local_fault).await;
-            if !controller.is_leader() {
+            let leader = controller.is_leader();
+            if leader != std::mem::replace(&mut self.monitor_leadership, leader) {
+                tracing::warn!(leader, "recovery monitor leadership gate changed");
+            }
+            if !leader {
                 continue;
             }
             let inventory = match self.fault_inventory(&controller).await {
@@ -297,13 +303,16 @@ impl RecoveryMonitor {
             // Prepare overwrites it directly. A pending Release is retained for its prepare/commit
             // retry, but must not mask a later fault set.
             let mut required_prepare_fence = None;
-            let active =
-                tokio::time::timeout(DECISION_IO_TIMEOUT, controller.observe_recover_control())
-                    .await;
+            let active = observe_recovery_quorum_control_bounded(&controller).await;
             match active {
+                Err(RecoveryControlError::Conflict(error)) => {
+                    tracing::error!(%error, "invalid active recovery intent");
+                    self.hold_for_unknown_fault_audit(&db, &controller).await;
+                    continue;
+                }
                 Err(_) => continue,
                 Ok(result) => match result {
-                    Ok(Some(active)) if active.round.has_terminal_fault() => {
+                    Some(active) if active.round.has_terminal_fault() => {
                         self.latch_durable_terminal_fault(
                             &db,
                             &controller,
@@ -321,7 +330,7 @@ impl RecoveryMonitor {
                         );
                         continue;
                     }
-                    Ok(Some(active)) if matches!(active.phase, RecoverPhase::Prepare) => {
+                    Some(active) if matches!(active.phase, RecoverPhase::Prepare) => {
                         if pending.is_empty() {
                             hold_intake_for_retry(
                                 &db,
@@ -375,7 +384,7 @@ impl RecoveryMonitor {
                             }
                         }
                     }
-                    Ok(Some(active)) if controller.recovery_driver_is_current(&active.round) => {
+                    Some(active) if controller.recovery_driver_is_current(&active.round) => {
                         match active.phase {
                             RecoverPhase::Release { .. }
                                 if active.round.fault_revision() == inventory.revision()
@@ -398,15 +407,7 @@ impl RecoveryMonitor {
                             RecoverPhase::Prepare | RecoverPhase::Start { .. } => continue,
                         }
                     }
-                    Err(
-                        RecoveryControlError::Uncertain(_) | RecoveryControlError::Superseded(_),
-                    ) => continue,
-                    Ok(_) => {}
-                    Err(RecoveryControlError::Conflict(error)) => {
-                        tracing::error!(%error, "invalid active recovery intent");
-                        self.hold_for_unknown_fault_audit(&db, &controller).await;
-                        continue;
-                    }
+                    _ => {}
                 },
             }
             if !pending.is_empty() {
