@@ -6542,11 +6542,9 @@ pub struct LeaderLeaseConfig {
 impl Default for LeaderLeaseConfig {
     fn default() -> Self {
         Self {
-            // Keep one full five-second control-I/O window after the renewal tick: the worst
-            // no-success span is the 2s tick plus a 5s bounded retry (7s), so a single
-            // transport tail cannot expire a live leader. Native recovery must observe a
-            // rival record for one full TTL before takeover, so this TTL also bounds the
-            // leader-failover critical path inside the 90s recovery liveness window.
+            // INVARIANT: one 5s bounded control-I/O retry after the 2s tick still fits inside
+            // the TTL, so a single transport tail cannot expire a live leader. Takeover
+            // observes a rival for a full TTL, so this also bounds failover latency.
             ttl: Duration::from_secs(10),
             renew_interval: Duration::from_secs(2),
         }
