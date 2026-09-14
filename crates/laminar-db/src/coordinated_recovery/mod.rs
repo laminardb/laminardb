@@ -23,12 +23,12 @@ use laminar_core::cluster::control::controller::{
     RecoveryStoppedReport,
 };
 use laminar_core::cluster::control::{
-    ClusterController, RecoverPhase, RecoveryControlError, RecoveryFaultDisposition,
-    RecoveryFaultReportOutcome, ReleaseCommitStatus,
+    AssignmentSnapshot, ClusterController, RecoverPhase, RecoveryControlError,
+    RecoveryFaultDisposition, RecoveryFaultReportOutcome, ReleaseCommitStatus,
 };
 use laminar_core::cluster::discovery::NodeId;
 
-use crate::LaminarDB;
+use crate::{db::DbState, LaminarDB};
 
 /// Healthy-state monitor cadence. Only the leader polls the shared fault inventory; followers use
 /// the replicated recovery intent unless they have a local settlement latch.
@@ -136,6 +136,9 @@ struct RecoveryMonitor {
     handled_faults: FxHashMap<NodeId, u64>,
     /// Leader term for which this node has resumed any durable artifact cleanup.
     retention_leader: Option<laminar_core::checkpoint::LeaderProof>,
+    /// Last poll's monitor gate snapshot: (leadership held, idle with the recovery latch
+    /// held). Only transitions are logged.
+    monitor_gates: (bool, bool),
     /// Whether a visible, unhandled durable fault has already suspended local assignment
     /// authority. The report remains level-triggered, but the suspension revision advances only
     /// once per continuously held fault period.
@@ -268,7 +271,11 @@ impl RecoveryMonitor {
             let local_pending = local_fault.into_iter().collect::<Vec<_>>();
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
             self.observe(&db, &controller, local_fault).await;
-            if !controller.is_leader() {
+            let leader = controller.is_leader();
+            if leader != std::mem::replace(&mut self.monitor_gates.0, leader) {
+                tracing::warn!(leader, "recovery monitor leadership gate changed");
+            }
+            if !leader {
                 continue;
             }
             let inventory = match self.fault_inventory(&controller).await {
@@ -283,13 +290,16 @@ impl RecoveryMonitor {
             if inventory.has_terminal_fault() {
                 let reporter = fault_snapshot
                     .iter()
-                    .copied()
                     .find(|fault| fault.is_terminal())
                     .map(|fault| fault.reporter);
                 self.latch_durable_terminal_fault(&db, &controller, reporter);
             }
             let pending = self.unhandled_faults(&fault_snapshot);
             self.hold_for_visible_or_queued_fault(&db, &controller, &pending);
+            let idle = pending.is_empty() && controller.is_recovering();
+            if idle != std::mem::replace(&mut self.monitor_gates.1, idle) {
+                tracing::warn!(idle, "recovery monitor has no unhandled faults");
+            }
 
             // `drive_round` owns every nonterminal local Prepare/Start synchronously. Seeing one
             // here means that owner disappeared or returned early. A stopped Prepare is never
@@ -297,13 +307,19 @@ impl RecoveryMonitor {
             // Prepare overwrites it directly. A pending Release is retained for its prepare/commit
             // retry, but must not mask a later fault set.
             let mut required_prepare_fence = None;
-            let active =
-                tokio::time::timeout(DECISION_IO_TIMEOUT, controller.observe_recover_control())
-                    .await;
+            let active = observe_recovery_quorum_control_bounded(&controller).await;
             match active {
-                Err(_) => continue,
+                Err(RecoveryControlError::Conflict(error)) => {
+                    tracing::error!(%error, "invalid active recovery intent");
+                    self.hold_for_unknown_fault_audit(&db, &controller).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "recovery control observation failed");
+                    continue;
+                }
                 Ok(result) => match result {
-                    Ok(Some(active)) if active.round.has_terminal_fault() => {
+                    Some(active) if active.round.has_terminal_fault() => {
                         self.latch_durable_terminal_fault(
                             &db,
                             &controller,
@@ -311,7 +327,6 @@ impl RecoveryMonitor {
                                 .round
                                 .faults
                                 .iter()
-                                .copied()
                                 .find(|fault| fault.is_terminal())
                                 .map(|fault| fault.reporter),
                         );
@@ -321,7 +336,7 @@ impl RecoveryMonitor {
                         );
                         continue;
                     }
-                    Ok(Some(active)) if matches!(active.phase, RecoverPhase::Prepare) => {
+                    Some(active) if matches!(active.phase, RecoverPhase::Prepare) => {
                         if pending.is_empty() {
                             hold_intake_for_retry(
                                 &db,
@@ -350,6 +365,7 @@ impl RecoveryMonitor {
                                 );
                             }
                             Ok(None) => {
+                                tracing::warn!("waits to supersede stopped Prepare");
                                 hold_intake_for_retry(
                                     &db,
                                     &controller,
@@ -375,7 +391,7 @@ impl RecoveryMonitor {
                             }
                         }
                     }
-                    Ok(Some(active)) if controller.recovery_driver_is_current(&active.round) => {
+                    Some(active) if controller.recovery_driver_is_current(&active.round) => {
                         match active.phase {
                             RecoverPhase::Release { .. }
                                 if active.round.fault_revision() == inventory.revision()
@@ -398,15 +414,7 @@ impl RecoveryMonitor {
                             RecoverPhase::Prepare | RecoverPhase::Start { .. } => continue,
                         }
                     }
-                    Err(
-                        RecoveryControlError::Uncertain(_) | RecoveryControlError::Superseded(_),
-                    ) => continue,
-                    Ok(_) => {}
-                    Err(RecoveryControlError::Conflict(error)) => {
-                        tracing::error!(%error, "invalid active recovery intent");
-                        self.hold_for_unknown_fault_audit(&db, &controller).await;
-                        continue;
-                    }
+                    _ => {}
                 },
             }
             if !pending.is_empty() {
@@ -1635,7 +1643,6 @@ impl RecoveryMonitor {
                 round
                     .faults
                     .iter()
-                    .copied()
                     .find(|fault| fault.is_terminal())
                     .map(|fault| fault.reporter),
             );
@@ -1778,9 +1785,8 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        let target = selected
-            .as_ref()
-            .map_or(GENESIS, |(outcome, _)| outcome.epoch);
+        let selected = selected.as_ref();
+        let target = selected.map_or(GENESIS, |(cut, _)| cut.epoch);
         let ownership = driver_owns_prepare(db, controller, &round).await;
         if ownership != PrepareOwnership::Owned {
             drop(selection_guard);
@@ -1794,6 +1800,7 @@ impl RecoveryMonitor {
             .await;
             return;
         }
+        tracing::warn!(gen = gen_id, "leader target selected");
         db.purge_shuffle_receiver_buffers();
         if let Err(error) = controller.announce_recover_start(&round, target).await {
             drop(selection_guard);
@@ -1809,14 +1816,12 @@ impl RecoveryMonitor {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch: target },
         };
+        let checkpoint_id = selected.map_or(GENESIS, |(cut, _)| cut.checkpoint_id);
+        let participants = selected.map_or(0, |(_, index)| index.participants.len());
         tracing::warn!(
             target_epoch = target,
-            checkpoint_id = selected
-                .as_ref()
-                .map_or(GENESIS, |(outcome, _)| outcome.checkpoint_id),
-            participants = selected
-                .as_ref()
-                .map_or(0, |(_, index)| index.participants.len()),
+            checkpoint_id,
+            participants,
             gen = gen_id,
             "leader announced recovery start"
         );
@@ -1875,6 +1880,7 @@ impl RecoveryMonitor {
             hold_intake_and_request_retry(db, controller, gen_id, true).await;
             return;
         }
+        tracing::warn!(gen = gen_id, "leader announced recovery release");
         let release = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch: target },
@@ -2547,6 +2553,38 @@ async fn stop_for_recovery(db: &Arc<LaminarDB>) -> bool {
     stop_and_purge(db).await
 }
 
+/// Retire a live graph so an acquired recovery assignment cannot reuse predecessor heap state.
+pub(crate) async fn fault_for_recovery_assignment(db: &Arc<LaminarDB>) -> bool {
+    let lifecycle_timeout = recovery_stop_lifecycle_timeout(db);
+    db.fence_coordinated_recovery_lifecycle();
+    run_lifecycle(db, lifecycle_timeout, |db| async move {
+        db.stop_pipeline_for_coordinated_recovery().await?;
+        db.purge_shuffle_receiver_buffers();
+
+        let mut runtime_shutdown = db.runtime_shutdown.write();
+        let ready = !db.is_closed()
+            && DbState::load(&db.state) == DbState::Created
+            && runtime_shutdown.is_cancelled()
+            && db.cluster_intake_fenced()
+            && db.coordinated_recovery_in_progress()
+            && db.pending_recovery_fault.load(Ordering::Acquire) != 0
+            && db.pending_vnode_transition.lock().is_none()
+            && db.installed_vnode_state.lock().is_none();
+        if !ready {
+            return Err(crate::DbError::Checkpoint(
+                "recovery assignment could not establish a retired local graph boundary".into(),
+            ));
+        }
+
+        // RECOVERY: a naturally faulted generation leaves this token live. Recreate that exact
+        // cold-adoption invariant only after the cancelled runtime has joined and its heap retired.
+        *runtime_shutdown = tokio_util::sync::CancellationToken::new();
+        DbState::Faulted.store(&db.state);
+        Ok(())
+    })
+    .await
+}
+
 fn recovery_driver_proof_is_current(controller: &ClusterController, round: &RecoveryRound) -> bool {
     round.id.driver == controller.instance_id() && controller.proof_is_live(&round.leader_proof)
 }
@@ -2567,11 +2605,11 @@ async fn await_recovery_driver_stop(
             if !recovery_driver_proof_is_current(controller, round) {
                 return DriverStopOutcome::LeadershipLost;
             }
-            return if stopped {
-                DriverStopOutcome::Stopped
-            } else {
-                DriverStopOutcome::Failed
-            };
+            if stopped {
+                tracing::warn!(gen = round.id.generation, "leader Prepare quiesced");
+                return DriverStopOutcome::Stopped;
+            }
+            return DriverStopOutcome::Failed;
         }
     }
 }
@@ -2755,8 +2793,7 @@ where
     }
 }
 
-/// Current owner-complete assignment certificate. Recovery cannot invent a quorum from a
-/// transient membership view; it freezes this already-proven cut instead.
+/// Freeze the current owner-complete certificate rather than inventing a quorum from membership.
 fn current_assignment_fence(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -2782,16 +2819,43 @@ fn current_assignment_fence(
         })
 }
 
-/// Recover the exact current assignment cut after fault fencing has deliberately withdrawn the
-/// active checkpoint certificate. This is a read-only recovery proof: it never republishes the
-/// checkpoint fence, reopens intake, or grants shuffle authority.
-///
-/// The normal fast path retains the already-published certificate. The fallback is admitted only
-/// while coordinated recovery owns the closed data plane, and reconstructs the same certificate
-/// from the authority-audited durable head, exact current process incarnations, and durable
-/// assignment-adoption reports. `vnode_state_ready` is deliberately not required: a faulted owner
-/// must be recoverable after publishing a false readiness report.
-async fn current_recovery_assignment_fence(
+fn recovery_head_fence(head: &AssignmentSnapshot) -> Result<CheckpointAssignmentFence, String> {
+    match (head.draining, head.drain_transition.as_ref()) {
+        (true, Some(transition)) => Ok(transition.predecessor.clone()),
+        (true, None) => Err("draining recovery assignment has no transition".into()),
+        (false, _) => head.assignment_fence().map_err(|error| error.to_string()),
+    }
+}
+
+fn assignment_adoptions_match(
+    fence: &CheckpointAssignmentFence,
+    reported: &FxHashMap<u64, CheckpointAssignmentAdoption>,
+) -> bool {
+    fence.participants.iter().all(|participant| {
+        reported.get(&participant.node_id).is_some_and(|adoption| {
+            adoption.participant == *participant && adoption.matches_fence(fence)
+        })
+    })
+}
+
+async fn read_assignment_adoptions(
+    controller: &ClusterController,
+    deadline: tokio::time::Instant,
+    timeout_context: &str,
+) -> Result<FxHashMap<u64, CheckpointAssignmentAdoption>, String> {
+    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
+        .await
+        .map_err(|_| format!("recovery {timeout_context} adoption-report read timed out"))??;
+    Ok(reports
+        .into_iter()
+        .map(|(node, adoption)| (node.0, adoption))
+        .collect())
+}
+
+/// Reconstruct the withdrawn checkpoint certificate from durable authority, current process
+/// incarnations, and exact adoption while recovery owns the closed data plane. This read-only
+/// fallback neither republishes authority nor requires a faulted owner's stale vnode readiness.
+pub(crate) async fn current_recovery_assignment_fence(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     deadline: tokio::time::Instant,
@@ -2826,12 +2890,15 @@ async fn current_recovery_assignment_fence(
         .map_err(|_| "recovery assignment head read timed out".to_string())?
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "recovery assignment audit has no durable head".to_string())?;
-    tokio::time::timeout_at(
-        deadline,
-        crate::rebalance::audit_assignment_snapshot_authority(&store, Some(controller), &head),
-    )
-    .await
-    .map_err(|_| "recovery assignment authority audit timed out".to_string())??;
+    // RECOVERY: Reject cheap local mismatches before the final remote authority audit.
+    let candidate_fence = recovery_head_fence(&head)?;
+    if !recovery_fence_participants_present(controller, &candidate_fence) {
+        return Ok(None);
+    }
+    let adopted = read_assignment_adoptions(controller, deadline, "assignment audit").await?;
+    if !assignment_adoptions_match(&candidate_fence, &adopted) {
+        return Ok(None);
+    }
     let expected_drain_transition = head.drain_transition.clone();
     let committed = if head.draining {
         let Some(expected) = expected_drain_transition.as_ref() else {
@@ -2873,6 +2940,7 @@ async fn current_recovery_assignment_fence(
             .participant_incarnation(local_id)
             .is_some_and(|incarnation| incarnation != controller.recovery_incarnation())
         || (fence.participant_incarnation(local_id).is_none() && local_owners.contains(&local_id))
+        || !recovery_fence_participants_present(controller, &fence)
     {
         return Ok(None);
     }
@@ -2884,25 +2952,9 @@ async fn current_recovery_assignment_fence(
     )
     .await
     .map_err(|_| "recovery assignment incarnation audit timed out".to_string())??;
-    if incarnations != fence.participants
-        || !recovery_fence_participants_present(controller, &fence)
-    {
+    if incarnations != fence.participants {
         return Ok(None);
     }
-    let adopted = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery assignment adoption audit timed out".to_string())??
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect::<FxHashMap<_, _>>();
-    if fence.participants.iter().any(|participant| {
-        adopted.get(&participant.node_id).is_none_or(|adoption| {
-            adoption.participant != *participant || !adoption.matches_fence(&fence)
-        })
-    }) {
-        return Ok(None);
-    }
-
     let confirmed = tokio::time::timeout_at(deadline, store.load())
         .await
         .map_err(|_| "recovery assignment head recheck timed out".to_string())?
@@ -2960,6 +3012,11 @@ async fn current_recovery_assignment_fence(
     {
         return Ok(None);
     }
+    let confirmed_adopted =
+        read_assignment_adoptions(controller, deadline, "assignment recheck").await?;
+    if !assignment_adoptions_match(&fence, &confirmed_adopted) {
+        return Ok(None);
+    }
     Ok(Some(fence))
 }
 
@@ -2967,21 +3024,13 @@ fn recovery_fence_participants_present(
     controller: &ClusterController,
     fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
 ) -> bool {
-    // A capture-quorum miss quarantines a process from ordinary checkpoint/placement authority,
-    // but it cannot make that exact live boot unrecoverable. This fallback is reachable only with
-    // recovery + intake fenced and separately audits durable incarnations and adoption reports;
-    // the Recovery Prepare/stop/readiness quorums must then re-prove every participant before
-    // Release. Keep requiring current checkpoint-capable membership here, but deliberately do not
-    // apply the ordinary `unresponsive` filter.
-    let available: FxHashSet<u64> = controller
-        .checkpoint_instances()
-        .into_iter()
-        .map(|node| node.0)
-        .collect();
+    // RECOVERY: A quarantined boot remains recoverable behind closed intake and durable audits;
+    // Prepare/stop/readiness re-prove it. Require checkpoint membership, not responsiveness.
+    let available: FxHashSet<_> = controller.checkpoint_instances().into_iter().collect();
     fence
         .participants
         .iter()
-        .all(|participant| available.contains(&participant.node_id))
+        .all(|participant| available.contains(&NodeId(participant.node_id)))
 }
 
 fn clear_stopped_assignment_quarantine(
@@ -3667,19 +3716,8 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
     if live_target_participants != target.participants {
         return Err("materialized assignment target process roster is no longer exact".into());
     }
-    let reports = tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-        .await
-        .map_err(|_| "recovery Prepare retirement adoption-report read timed out".to_string())??;
-    let reported: FxHashMap<u64, _> = reports
-        .into_iter()
-        .map(|(node, adoption)| (node.0, adoption))
-        .collect();
-    let owner_complete = target.participants.iter().all(|participant| {
-        reported.get(&participant.node_id).is_some_and(|adoption| {
-            adoption.participant == *participant && adoption.matches_fence(&target)
-        })
-    });
-    if !owner_complete {
+    let reported = read_assignment_adoptions(controller, deadline, "Prepare retirement").await?;
+    if !assignment_adoptions_match(&target, &reported) {
         return Ok(None);
     }
     if !current_stopped_roster_has_adopted_target(controller, round, &target, &reported, deadline)
@@ -3707,28 +3745,16 @@ pub(crate) async fn recovery_prepare_supersession_fence_after_assignment_settlem
         );
     }
     let confirmed_reports =
-        tokio::time::timeout_at(deadline, controller.read_adopted_assignments())
-            .await
-            .map_err(|_| {
-                "recovery Prepare retirement adoption-report recheck timed out".to_string()
-            })??
-            .into_iter()
-            .map(|(node, adoption)| (node.0, adoption))
-            .collect::<FxHashMap<_, _>>();
-    if target.participants.iter().any(|participant| {
-        confirmed_reports
-            .get(&participant.node_id)
-            .is_none_or(|adoption| {
-                adoption.participant != *participant || !adoption.matches_fence(&target)
-            })
-    }) || !current_stopped_roster_has_adopted_target(
-        controller,
-        round,
-        &target,
-        &confirmed_reports,
-        deadline,
-    )
-    .await?
+        read_assignment_adoptions(controller, deadline, "Prepare retirement recheck").await?;
+    if !assignment_adoptions_match(&target, &confirmed_reports)
+        || !current_stopped_roster_has_adopted_target(
+            controller,
+            round,
+            &target,
+            &confirmed_reports,
+            deadline,
+        )
+        .await?
     {
         return Ok(None);
     }
@@ -4014,6 +4040,9 @@ async fn wait_stopped_quorum_with_timeout_barrier(
     if let Ok(outcome) =
         tokio::time::timeout_at(deadline, wait_stopped_quorum_until(controller, round)).await
     {
+        if matches!(&outcome, StoppedQuorum::Reached(_)) {
+            tracing::warn!(gen = round.id.generation, "leader stop quorum reached");
+        }
         outcome
     } else {
         after_timeout.await;

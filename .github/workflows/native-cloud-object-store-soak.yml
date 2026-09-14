@@ -198,6 +198,18 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          snapshot_resources() {
+            printf 'resource_phase=%s\n' "$1"
+            printf 'logical_cpus=%s\n' "$(nproc)"
+            free -m
+            df -m "$GITHUB_WORKSPACE"
+            awk '$1 == "oom_kill" { print }' /proc/vmstat
+          }
+          snapshot_resources before > native-checkpoint-resources.log
+          # Bound sampling to the job's 150-minute limit. No environment or command lines are logged.
+          vmstat -w -t 5 1800 >> native-checkpoint-resources.log &
+          soak_resource_pid=$!
+          trap 'kill "$soak_resource_pid" 2>/dev/null || true; wait "$soak_resource_pid" 2>/dev/null || true; snapshot_resources after >> native-checkpoint-resources.log' EXIT
           cargo test --profile soak -p laminar-server --no-default-features --features "cluster,kafka,$PROVIDER_FEATURE" --test cluster_soak three_node_alo_join_kill9_soak -- --ignored --exact --nocapture --color never 2>&1 | tee native-checkpoint-soak.log
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -215,6 +227,27 @@ jobs:
           LAMINAR_SOAK_JOIN_KEYS: "65536"
           LAMINAR_SOAK_ZIPF_MILLI: "800"
           LAMINAR_SOAK_KAFKA_SOURCE_BROKERS: 127.0.0.1:19092
+      - name: Collect filtered node logs
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          mkdir -p native-checkpoint-node-logs
+          node_log_dir=$(sed -n 's/^soak: node logs in //p' native-checkpoint-soak.log | head -1)
+          if [ -z "$node_log_dir" ] || [ ! -d "$node_log_dir" ]; then
+            printf 'node log directory %s not found\n' "$node_log_dir" > native-checkpoint-node-logs/unavailable.txt
+          else
+            # WARN/ERROR lines only: killed-node logs stop mid-file, credential-shaped
+            # values are redacted, and each node is capped at 1 MiB.
+            for log in "$node_log_dir"/*; do
+              [ -f "$log" ] || continue
+              grep -aE 'WARN|ERROR' "$log" \
+                | sed -E 's/([a-z_]*(sig|token|secret|credential|password|authorization|account|key)[a-z_]*)=[^ ,"]+/\1=REDACTED/gI' \
+                | tail -c 1048576 \
+                > "native-checkpoint-node-logs/$(basename "$log").warn"
+            done
+          fi
+          ls -l native-checkpoint-node-logs
       - name: Clean interrupted native checkpoint prefix
         id: cleanup
         if: always() && !(steps.process_soak.outcome == 'failure' && inputs.preserve_failed_prefix == true)
@@ -301,6 +334,8 @@ jobs:
           path: |
             target/cloud-evidence/*.json
             native-checkpoint-soak.log
+            native-checkpoint-resources.log
+            native-checkpoint-node-logs/*
           if-no-files-found: error
           retention-days: 30
       - name: Enforce native checkpoint result

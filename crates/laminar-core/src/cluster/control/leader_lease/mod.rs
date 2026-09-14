@@ -5263,49 +5263,6 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         decision: AssignmentRecoveryDecision,
     ) -> Result<RecordAssignmentRecoveryDecisionResult, ClusterCheckpointAuthorityError> {
-        decision.validate()?;
-        if &decision.leader_proof != proof || !proof.is_canonical() {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        let current = self
-            .load_record()
-            .await?
-            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-        if !current.lease.matches_proof(proof) {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        if let Some(floor) = current.assignment_decision_floor.as_ref() {
-            if decision.target_version() < floor.before_target_version {
-                return Err(DecisionError::Conflict(format!(
-                    "assignment decision version {} is below durable retention floor {}",
-                    decision.target_version(),
-                    floor.before_target_version
-                ))
-                .into());
-            }
-        }
-        if let Some(winner) = self
-            .audited_assignment_decisions_from(&current)
-            .await?
-            .into_iter()
-            .find(|winner| winner.target_version() == decision.target_version())
-        {
-            return match winner {
-                AuthorityAssignmentDecision::Recovery(winner) if winner == decision => {
-                    Ok(RecordAssignmentRecoveryDecisionResult::Unchanged(winner))
-                }
-                AuthorityAssignmentDecision::Recovery(winner) => {
-                    Ok(RecordAssignmentRecoveryDecisionResult::Conflict { winner })
-                }
-                AuthorityAssignmentDecision::Drain(winner) => {
-                    Err(DecisionError::Conflict(format!(
-                        "assignment drain decision already settled target version {}",
-                        winner.target_version()
-                    ))
-                    .into())
-                }
-            };
-        }
         match Box::pin(
             self.record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision)),
         )

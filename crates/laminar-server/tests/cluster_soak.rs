@@ -205,7 +205,21 @@ const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded"
 #[cfg(feature = "kafka")]
 const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
 #[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_QUIESCED_LOG: &str = "leader Prepare quiesced";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_QUORUM_LOG: &str = "leader stop quorum reached";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_TARGET_LOG: &str = "leader target selected";
+#[cfg(feature = "kafka")]
+const RECOVERY_MONITOR_LEADERSHIP_LOG: &str = "recovery monitor leadership gate changed";
+#[cfg(feature = "kafka")]
+const RECOVERY_MONITOR_IDLE_LOG: &str = "recovery monitor has no unhandled faults";
+#[cfg(feature = "kafka")]
+const RECOVERY_SUPERSESSION_WAIT_LOG: &str = "waits to supersede stopped Prepare";
+#[cfg(feature = "kafka")]
 const RECOVERY_START_LOG: &str = "leader announced recovery start";
+#[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_PUBLISHED_LOG: &str = "leader announced recovery release";
 #[cfg(feature = "kafka")]
 const RECOVERY_STOPPED_LOG: &str = "stopped for recovery round; awaiting target";
 #[cfg(feature = "kafka")]
@@ -225,7 +239,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 109] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -303,6 +317,15 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
         "coordinated recovery: owner-complete assignment audit failed",
     ),
     ("recovery_prepare", RECOVERY_PREPARE_LOG),
+    ("recovery_prepare_quiesced", RECOVERY_PREPARE_QUIESCED_LOG),
+    (
+        "recovery_prepare_stopped_quorum",
+        RECOVERY_PREPARE_QUORUM_LOG,
+    ),
+    (
+        "recovery_prepare_target_selected",
+        RECOVERY_PREPARE_TARGET_LOG,
+    ),
     (
         "recovery_checkpoint_tails_cancelled",
         "coordinated recovery cancelled fenced checkpoint durable tails",
@@ -347,6 +370,19 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
         "recovery_quorum_control_timeout",
         "recovery quorum control observation timed out",
     ),
+    (
+        "recovery_monitor_leadership_changed",
+        RECOVERY_MONITOR_LEADERSHIP_LOG,
+    ),
+    (
+        "recovery_monitor_idle_without_faults",
+        RECOVERY_MONITOR_IDLE_LOG,
+    ),
+    (
+        "recovery_control_observation_failed",
+        "recovery control observation failed",
+    ),
+    ("recovery_supersession_wait", RECOVERY_SUPERSESSION_WAIT_LOG),
     (
         "recovery_successor_authorized",
         "authorized successor assignment from the last committed cluster cut",
@@ -555,6 +591,7 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 101] = [
         "rebalance failed; retrying after backoff",
     ),
     ("recovery_start", RECOVERY_START_LOG),
+    ("recovery_release_published", RECOVERY_RELEASE_PUBLISHED_LOG),
     ("recovery_release", RECOVERY_RELEASE_LOG),
     (
         "kafka_source_started_fenced",
@@ -2993,6 +3030,20 @@ impl Node {
 
     fn log_len(&self) -> u64 {
         std::fs::metadata(&self.log_path).map_or(0, |metadata| metadata.len())
+    }
+
+    /// Node-log liveness without copying log content: current size and age of the last write.
+    #[cfg(feature = "kafka")]
+    fn log_write_liveness(&self) -> (u64, Option<u64>) {
+        let Ok(metadata) = std::fs::metadata(&self.log_path) else {
+            return (0, None);
+        };
+        let last_write_age_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age.as_millis() as u64);
+        (metadata.len(), last_write_age_ms)
     }
 
     #[cfg(feature = "kafka")]
@@ -9686,6 +9737,17 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         recovery_starts, prepare_sequence.applied_rounds as usize,
         "explicit fault did not produce one Start per applied recovery generation"
     );
+    for marker in [
+        RECOVERY_PREPARE_QUIESCED_LOG,
+        RECOVERY_PREPARE_QUORUM_LOG,
+        RECOVERY_PREPARE_TARGET_LOG,
+        RECOVERY_RELEASE_PUBLISHED_LOG,
+    ] {
+        assert!(
+            logs.iter().any(|log| log.contains(marker)),
+            "explicit fault is missing recovery progress marker: {marker}"
+        );
+    }
     let stopped_reports = logs
         .iter()
         .map(|log| log.matches(RECOVERY_STOPPED_LOG).count())
@@ -12105,6 +12167,10 @@ fn durable_progress_diagnostics(
         .iter()
         .map(|node| (node.id, node.recovery_log_diagnostics()))
         .collect();
+    let node_log_liveness_by_node: Vec<_> = live_nodes
+        .iter()
+        .map(|node| (node.id, node.log_write_liveness()))
+        .collect();
     let ingestion_metrics_by_node: Vec<_> = live_nodes
         .iter()
         .map(|node| (node.id, node.ingestion_diagnostic_metrics()))
@@ -12158,6 +12224,7 @@ fn durable_progress_diagnostics(
          completed_checkpoints={completed:?}, failed_checkpoints={failed:?}, \
          recovery_metrics={recovery_metrics:?}, \
          recovery_log_diagnostics_by_node={recovery_log_diagnostics_by_node:?}, \
+         node_log_liveness_by_node={node_log_liveness_by_node:?}, \
          ingestion_metrics_by_node={ingestion_metrics_by_node:?}, \
          checkpoint_size_bytes_by_node={checkpoint_size_bytes_by_node:?}, \
          durable_checkpoint_by_node={durable_checkpoint_by_node:?}, \
@@ -16022,6 +16089,62 @@ fn public_readiness_request_omits_console_authorization() {
 
 #[cfg(feature = "kafka")]
 #[test]
+fn recovery_log_diagnostics_distinguish_prepare_progress_phases() {
+    let mut log = format!("{RECOVERY_PREPARE_LOG}\n");
+    let mut expected_sequence = vec!["recovery_prepare"];
+    for (marker, name) in [
+        (RECOVERY_PREPARE_QUIESCED_LOG, "recovery_prepare_quiesced"),
+        (
+            RECOVERY_PREPARE_QUORUM_LOG,
+            "recovery_prepare_stopped_quorum",
+        ),
+        (
+            RECOVERY_PREPARE_TARGET_LOG,
+            "recovery_prepare_target_selected",
+        ),
+    ] {
+        log.push_str(&format!("{marker} gen=1 token=never-copy-this\n"));
+        expected_sequence.push(name);
+        let diagnostics = recovery_log_diagnostics(&log);
+        assert_eq!(diagnostics.marker_counts.get(name), Some(&1));
+        assert_eq!(diagnostics.marker_counts.len(), expected_sequence.len());
+        assert_eq!(diagnostics.recent_marker_sequence, expected_sequence);
+        assert!(!format!("{diagnostics:?}").contains("never-copy-this"));
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_log_diagnostics_distinguish_release_publication_from_open_gates() {
+    let published = format!(
+        "{RECOVERY_START_LOG}\n{RECOVERY_RELEASE_PUBLISHED_LOG} gen=1 token=never-copy-this\n"
+    );
+    let diagnostics = recovery_log_diagnostics(&published);
+    assert_eq!(
+        diagnostics.marker_counts.get("recovery_release_published"),
+        Some(&1)
+    );
+    assert!(!diagnostics.marker_counts.contains_key("recovery_release"));
+    assert_eq!(
+        diagnostics.recent_marker_sequence,
+        ["recovery_start", "recovery_release_published"]
+    );
+    assert!(!format!("{diagnostics:?}").contains("never-copy-this"));
+
+    let released = recovery_log_diagnostics(&format!("{published}{RECOVERY_RELEASE_LOG}\n"));
+    assert_eq!(released.marker_counts.get("recovery_release"), Some(&1));
+    assert_eq!(
+        released.recent_marker_sequence,
+        [
+            "recovery_start",
+            "recovery_release_published",
+            "recovery_release"
+        ]
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
 fn recovery_log_diagnostics_are_bounded_and_do_not_copy_log_values() {
     let drain_count = RECOVERY_DIAGNOSTIC_SEQUENCE_MAX + 2;
     let mut log = String::new();
@@ -16076,6 +16199,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                could not acknowledge recovery Prepare\n\
                recovery stop quorum timed out\n\
                recovery quorum control observation timed out\n\
+               recovery monitor leadership gate changed leader=true token=never-copy-this\n\
+               recovery monitor has no unhandled faults idle=true\n\
+               recovery control observation failed: credential=secret\n\
+               waits to supersede stopped Prepare gen=9\n\
                authorized successor assignment from the last committed cluster cut\n\
                coordinated recovery cancelled fenced checkpoint durable tails\n\
                recovery assignment 2 waits for a local vnode transition\n\
@@ -16159,6 +16286,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_stopped_ack_failed"), Some(&1));
     assert_eq!(counts.get("recovery_stop_quorum_timeout"), Some(&1));
     assert_eq!(counts.get("recovery_quorum_control_timeout"), Some(&1));
+    assert_eq!(counts.get("recovery_monitor_leadership_changed"), Some(&1));
+    assert_eq!(counts.get("recovery_monitor_idle_without_faults"), Some(&1));
+    assert_eq!(counts.get("recovery_control_observation_failed"), Some(&1));
+    assert_eq!(counts.get("recovery_supersession_wait"), Some(&1));
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
     assert_eq!(counts.get("recovery_checkpoint_tails_cancelled"), Some(&1));
     for marker in [

@@ -29,12 +29,19 @@ impl laminar_core::cluster::control::ClusterKv for DelayedScanKv {
 struct GetBarrier {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+    path_prefix: Option<&'static str>,
     reads_before_wait: std::sync::atomic::AtomicUsize,
     armed: std::sync::atomic::AtomicBool,
 }
 
 impl GetBarrier {
-    async fn wait_once(&self) {
+    async fn wait_once(&self, location: &object_store::path::Path) {
+        if self
+            .path_prefix
+            .is_some_and(|prefix| !location.as_ref().starts_with(prefix))
+        {
+            return;
+        }
         if self
             .reads_before_wait
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -95,7 +102,7 @@ impl ObjectStore for ReadBarrierStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         if let Some(get) = &self.get {
-            get.wait_once().await;
+            get.wait_once(location).await;
         }
         self.inner.get_opts(location, options).await
     }
@@ -914,6 +921,10 @@ async fn stopped_recovery_successor_fixture(
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[failed]);
 
+    // Keep this fixture at the materialized-but-not-retired boundary so the tests below can
+    // install an exact stopped Prepare themselves.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -923,9 +934,11 @@ async fn stopped_recovery_successor_fixture(
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the live predecessor intentionally lacks the removed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let target = durable
@@ -2462,7 +2475,7 @@ async fn missing_source_drain_receipt_requires_stopped_recovery() {
 }
 
 #[tokio::test]
-async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
+async fn dead_predecessor_retires_the_graph_and_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
     let (
         db,
@@ -2476,21 +2489,22 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    let error = try_rebalance(
-        &db,
-        &controller,
-        &durable,
-        &registry,
-        &[self_id, NodeId(2)],
-        RebalanceConfig::test_defaults(),
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(2),
+        try_rebalance(
+            &db,
+            &controller,
+            &durable,
+            &registry,
+            &[self_id, NodeId(2)],
+            RebalanceConfig::test_defaults(),
+        ),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
-    assert!(
-        error.contains("participant 2 handoff manifest is missing"),
-        "{error}"
-    );
+    .expect("recovery successor retirement exceeded the test deadline")
+    .expect("recovery successor must retire the graph before vnode acquisition");
     let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(successor.version));
     assert_eq!(successor.version, current.version + 1);
     assert!(!successor.draining);
     assert_eq!(successor.participants.len(), 1);
@@ -2528,7 +2542,11 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         )
         .await
         .unwrap());
-    assert_eq!(registry.assignment_version(), current.version);
+    assert_eq!(registry.assignment_version(), successor.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(!db.runtime_shutdown.read().is_cancelled());
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
     assert!(db.cluster_intake_fenced());
     assert!(controller.is_recovering());
     assert!(controller
@@ -2537,6 +2555,158 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         .unwrap()
         .iter()
         .any(|(node, sequence)| *node == controller.instance_id() && *sequence != 0));
+}
+
+#[tokio::test]
+async fn materialized_recovery_fence_audits_authority_once() {
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let adopted = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[NodeId(1), NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect("recovery successor materialization must succeed");
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(successor.version, current.version + 1);
+    let successor_fence = successor.assignment_fence().unwrap();
+    let adoption = db
+        .publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), false)
+        .await
+        .unwrap();
+    assert!(adoption.matches_fence(&successor_fence));
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    *db.assignment_snapshot_store.lock() =
+        Some(Arc::new(AssignmentSnapshotStore::new(bounded_store)));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::coordinated_recovery::current_recovery_assignment_fence(&db, &controller, deadline),
+    )
+    .await
+    .expect("recovery assignment audit exceeded the bounded test timeout")
+    .expect("one assignment-authority audit must fit the recovery decision budget");
+
+    assert_eq!(observed, Some(successor_fence));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "recovery must perform its final assignment-authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "recovery repeated its full assignment-authority audit"
+    );
+    proposal_reads.armed.store(false, Ordering::Release);
+    proposal_reads.release.notify_waiters();
+    db.close();
+}
+
+#[tokio::test]
+async fn recovery_materialization_does_not_repeat_the_settlement_authority_audit() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let local_participant = current
+        .participants
+        .iter()
+        .copied()
+        .find(|participant| participant.node_id == self_id.0)
+        .unwrap();
+    let proposal = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local_participant],
+        )
+        .unwrap();
+    let decision = authorize_recovery_successor(
+        &db,
+        &durable,
+        &controller,
+        &current,
+        proposal,
+        Duration::from_secs(2),
+        "deterministic recovery audit regression",
+    )
+    .await
+    .expect("the successor must be authorized before materialization");
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(2),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    let materialization_store = Arc::new(AssignmentSnapshotStore::new(bounded_store));
+
+    let version = tokio::time::timeout(
+        Duration::from_secs(2),
+        materialize_recovery_decision(
+            &db,
+            &materialization_store,
+            &controller,
+            &registry,
+            decision,
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("recovery materialization exceeded the bounded test timeout")
+    .expect("one settlement authority audit must fit the materialization budget");
+
+    assert_eq!(version, Some(current.version + 1));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "materialization must validate the proposal and perform the settlement authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "a redundant third proposal read exhausted the materialization budget"
+    );
 }
 
 #[tokio::test]
@@ -2601,6 +2771,8 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         }))
     };
     controller.note_unresponsive(&[NodeId(2)]);
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -2610,9 +2782,11 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption still requires the failed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     match follower.await.unwrap() {
@@ -2761,7 +2935,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     let ownerless_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&ownerless_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(ownerless_registry)
+        .vnode_registry(Arc::clone(&ownerless_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2775,6 +2949,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &ownerless_db,
         &durable,
         &ownerless_controller,
+        &ownerless_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -2806,10 +2981,11 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     // shared authority for the report audit but withdraw this controller's local leader proof.
     participant_leadership.send(None).unwrap();
     participant_controller.set_active(true);
+    let participant_registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let participant_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&participant_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .vnode_registry(Arc::clone(&participant_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2823,6 +2999,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &participant_db,
         &durable,
         &participant_controller,
+        &participant_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -3373,6 +3550,8 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -3382,9 +3561,11 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption intentionally lacks the failed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -3400,6 +3581,7 @@ async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_a
     let get = Arc::new(GetBarrier {
         entered: Arc::clone(&entered),
         release: Arc::clone(&release),
+        path_prefix: None,
         // The first read materializes the requested target. Block the audit's independent
         // recovery-materialization read so the generation changes during the authority audit.
         reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
@@ -3459,7 +3641,7 @@ async fn recovery_decision_fault_precedes_graph_execution_drain() {
         controller,
         durable,
         registry,
-        _current,
+        current,
         _process_authority,
         _authority_store,
         _checkpoint_dir,
@@ -3503,15 +3685,14 @@ async fn recovery_decision_fault_precedes_graph_execution_drain() {
     .expect("recovery fault publication waited for the graph execution drain");
 
     drop(execution);
-    let error = tokio::time::timeout(Duration::from_secs(2), rebalancing)
+    let adopted = tokio::time::timeout(Duration::from_secs(2), rebalancing)
         .await
         .expect("recovery assignment materialization did not finish")
         .unwrap()
-        .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
-    assert!(
-        error.contains("participant 2 handoff manifest is missing"),
-        "{error}"
-    );
+        .expect("recovery assignment must retire the graph after the execution fence drains");
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
 }
 
 #[tokio::test]
@@ -3529,8 +3710,10 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    // Materialize v2 through the normal Running path first; the missing handoff manifest leaves
-    // v1 local, exactly as it does before a subsequent retry observes the faulted graph.
+    // Materialize v2 while Running first; cold-bootstrap admission leaves v1 local until a
+    // subsequent retry observes the faulted graph.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -3540,9 +3723,13 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption intentionally lacks the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
+    db.coordinated_recovery_fenced
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -4386,6 +4573,8 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -4395,9 +4584,11 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let recovery = durable.load().await.unwrap().unwrap();
