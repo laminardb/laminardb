@@ -6542,11 +6542,13 @@ pub struct LeaderLeaseConfig {
 impl Default for LeaderLeaseConfig {
     fn default() -> Self {
         Self {
-            // Keep one full five-second control-I/O window after the renewal tick. Native cloud
-            // stores can legitimately consume that window while applying their bounded retry
-            // policy; expiring sooner would turn a transport tail into a needless leader term.
-            ttl: Duration::from_secs(15),
-            renew_interval: Duration::from_secs(5),
+            // Keep one full five-second control-I/O window after the renewal tick: the worst
+            // no-success span is the 2s tick plus a 5s bounded retry (7s), so a single
+            // transport tail cannot expire a live leader. Native recovery must observe a
+            // rival record for one full TTL before takeover, so this TTL also bounds the
+            // leader-failover critical path inside the 90s recovery liveness window.
+            ttl: Duration::from_secs(10),
+            renew_interval: Duration::from_secs(2),
         }
     }
 }

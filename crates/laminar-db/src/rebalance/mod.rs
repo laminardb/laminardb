@@ -65,7 +65,9 @@ impl Default for RebalanceConfig {
     fn default() -> Self {
         Self {
             watcher_poll: Duration::from_secs(2),
-            rebalance_debounce: Duration::from_secs(5),
+            // A churn-quiet period: it only needs to outlast the 1s gossip interval, and it
+            // sits on the post-leadership critical path of dead-leader recovery.
+            rebalance_debounce: Duration::from_secs(2),
             // A healthy pre-rotation drain commits in well under a second; the longer budget
             // absorbs slow external source cuts without weakening the frozen-roster quorum.
             checkpoint_timeout: Duration::from_secs(15),

@@ -24,8 +24,12 @@ pub struct ProcessLeaseConfig {
 impl Default for ProcessLeaseConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(15),
-            renew_interval: Duration::from_secs(5),
+            // Same one-tail margin as the leader lease: 2s tick + 5s bounded retry = 7s
+            // before a live process self-fences. Incarnation revocation observes a rival
+            // for one full TTL, so this also bounds successor authorization inside the
+            // 90s recovery liveness window.
+            ttl: Duration::from_secs(10),
+            renew_interval: Duration::from_secs(2),
         }
     }
 }
