@@ -106,7 +106,9 @@ use laminar_core::cluster::control::{
 };
 
 const NODES: usize = 3;
-const NODE_LOG_TAIL_BYTES: u64 = 64 * 1024;
+// Panic tails must reach past per-request HTTP INFO logging, which floods
+// ~64 KiB in under a minute on a polled three-node soak.
+const NODE_LOG_TAIL_BYTES: u64 = 512 * 1024;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
 const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
@@ -233,13 +235,23 @@ const RECOVERY_PREPARE_HANDOFF_LOG: &str =
 #[cfg(feature = "kafka")]
 const RECOVERY_RETRY_HOLD_LOG: &str = "holding intake shut and requesting a fresh recovery round";
 #[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_WITHOUT_START_LOG: &str =
+    "Release observed without restoring its exact Start";
+#[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_CONSUMED_LOG: &str = "recovery Release consumed; source gate opened";
+#[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_DEADLINE_LOG: &str =
+    "committed recovery Release was not observable before its deadline";
+#[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_AUDIT_LOG: &str = "could not audit recovery Release assignment";
+#[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_LOG_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 109] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 113] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -336,6 +348,13 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 109] = [
         "recovery fault inventory changed after stopped quorum; yielding stale Prepare",
     ),
     ("recovery_retry_hold", RECOVERY_RETRY_HOLD_LOG),
+    (
+        "recovery_release_without_start",
+        RECOVERY_RELEASE_WITHOUT_START_LOG,
+    ),
+    ("recovery_release_consumed", RECOVERY_RELEASE_CONSUMED_LOG),
+    ("recovery_release_deadline", RECOVERY_RELEASE_DEADLINE_LOG),
+    ("recovery_release_audit_failed", RECOVERY_RELEASE_AUDIT_LOG),
     ("recovery_stopped", RECOVERY_STOPPED_LOG),
     ("recovery_driver_lost", RECOVERY_DRIVER_HANDOFF_LOG),
     (
@@ -16203,6 +16222,10 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                recovery monitor has no unhandled faults idle=true\n\
                recovery control observation failed: credential=secret\n\
                waits to supersede stopped Prepare gen=9\n\
+               Release observed without restoring its exact Start; holding intake\n\
+               recovery Release consumed; source gate opened\n\
+               committed recovery Release was not observable before its deadline\n\
+               could not audit recovery Release assignment: credential=secret\n\
                authorized successor assignment from the last committed cluster cut\n\
                coordinated recovery cancelled fenced checkpoint durable tails\n\
                recovery assignment 2 waits for a local vnode transition\n\
@@ -16290,6 +16313,14 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_monitor_idle_without_faults"), Some(&1));
     assert_eq!(counts.get("recovery_control_observation_failed"), Some(&1));
     assert_eq!(counts.get("recovery_supersession_wait"), Some(&1));
+    for marker in [
+        "recovery_release_without_start",
+        "recovery_release_consumed",
+        "recovery_release_deadline",
+        "recovery_release_audit_failed",
+    ] {
+        assert_eq!(counts.get(marker), Some(&1), "missing {marker}");
+    }
     assert_eq!(counts.get("recovery_successor_authorized"), Some(&1));
     assert_eq!(counts.get("recovery_checkpoint_tails_cancelled"), Some(&1));
     for marker in [
