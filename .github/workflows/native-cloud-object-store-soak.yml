@@ -237,14 +237,15 @@ jobs:
           if [ -z "$node_log_dir" ] || [ ! -d "$node_log_dir" ]; then
             printf 'node log directory %s not found\n' "$node_log_dir" > native-checkpoint-node-logs/unavailable.txt
           else
-            # WARN/ERROR lines only: killed-node logs stop mid-file, credential-shaped
-            # values are redacted, and each node is capped at 1 MiB. grep exits 1 on
-            # zero matches, so guard it under -e -o pipefail.
+            # WARN/ERROR lines plus the sparse lifecycle/checkpoint/assignment INFO modules,
+            # which carry the recovery-phase interleaving. Killed-node logs stop mid-file,
+            # credential-shaped values are redacted, and each node is capped at 2 MiB.
+            # grep exits 1 on zero matches, so guard it under -e -o pipefail.
             for log in "$node_log_dir"/*; do
               [ -f "$log" ] || continue
-              { grep -aE 'WARN|ERROR' "$log" || true; } \
+              { grep -aE 'WARN|ERROR|pipeline_lifecycle|streaming_coordinator|checkpoint_coordinator|pipeline_callback|coordinated_recovery|rebalance|assignment_authority|state_recovery' "$log" || true; } \
                 | sed -E 's/([a-z_]*(sig|token|secret|credential|password|authorization|account|key)[a-z_]*)=[^ ,"]+/\1=REDACTED/gI' \
-                | tail -c 1048576 \
+                | tail -c 2097152 \
                 > "native-checkpoint-node-logs/$(basename "$log").warn"
             done
           fi
