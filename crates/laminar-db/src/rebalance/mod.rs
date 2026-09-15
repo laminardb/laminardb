@@ -194,6 +194,7 @@ async fn try_suspend_recovery_assignment_authority(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     deadline: tokio::time::Instant,
+    held: &mut Option<u64>,
 ) -> Result<bool, String> {
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
         .await
@@ -201,7 +202,23 @@ async fn try_suspend_recovery_assignment_authority(
     if db.has_unapplied_vnode_transition() {
         return Ok(false);
     }
+    // Re-asserting an already-held suspension bumps the authority revision every watcher
+    // tick, which starves the recovery monitor's stability audits. Activation and intake
+    // reopening serialize on the adoption lock, so these observables are race-free here.
+    let revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    if *held == Some(revision)
+        && db.cluster_intake_fenced()
+        && controller.checkpoint_assignment_watch().borrow().is_none()
+    {
+        return Ok(true);
+    }
     suspend_local_assignment_authority_locked(db, Some(controller), deadline).await?;
+    *held = Some(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+    );
     Ok(true)
 }
 
@@ -774,6 +791,7 @@ impl SnapshotWatcher {
     }
 
     async fn run(mut self) {
+        let mut recovery_suspension_held: Option<u64> = None;
         loop {
             tokio::select! {
                 biased;
@@ -1018,6 +1036,7 @@ impl SnapshotWatcher {
                                 &self.db,
                                 controller,
                                 head_deadline,
+                                &mut recovery_suspension_held,
                             )
                             .await
                             {

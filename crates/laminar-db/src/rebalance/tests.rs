@@ -4263,6 +4263,41 @@ async fn assignment_suspension_reasserts_closure_after_serialization_race() {
 }
 
 #[tokio::test]
+async fn held_recovery_suspension_does_not_rebump_authority_revision() {
+    let (db, controller, _durable, _registry, _current, _authority, _store, _dir) =
+        dead_predecessor_fixture().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut held = None;
+    let before = db.assignment_authority_revision.load(Ordering::Acquire);
+
+    let suspended =
+        try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+            .await
+            .expect("first recovery suspension must succeed");
+    assert!(suspended);
+    assert!(held.is_some_and(|revision| revision > before));
+
+    let revision = db.assignment_authority_revision.load(Ordering::Acquire);
+    try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+        .await
+        .expect("held recovery suspension must be retained without reassertion");
+    assert_eq!(
+        db.assignment_authority_revision.load(Ordering::Acquire),
+        revision,
+        "a retry tick must not re-bump the authority revision while the suspension holds"
+    );
+
+    db.invalidate_shuffle_assignment_fence();
+    try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+        .await
+        .expect("suspension must reassert after an authority change");
+    assert!(
+        db.assignment_authority_revision.load(Ordering::Acquire) > revision + 1,
+        "a genuine authority change must still trigger a fresh suspension bump"
+    );
+}
+
+#[tokio::test]
 async fn draining_retry_yield_to_recovery_preserves_exact_predecessor_reactivation() {
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
     use uuid::Uuid;

@@ -111,7 +111,7 @@ pub(super) fn prepare_recovery_assignment_adoption<'a>(
     deadline: tokio::time::Instant,
 ) -> futures::future::BoxFuture<'a, Result<(), String>> {
     Box::pin(async move {
-        if !try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
+        if !try_suspend_recovery_assignment_authority(db, controller, deadline, &mut None).await? {
             return Err(format!(
                 "recovery assignment {} waits for a local vnode transition",
                 snapshot.version
