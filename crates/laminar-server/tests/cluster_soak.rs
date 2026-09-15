@@ -217,8 +217,6 @@ const RECOVERY_MONITOR_LEADERSHIP_LOG: &str = "recovery monitor leadership gate 
 #[cfg(feature = "kafka")]
 const RECOVERY_MONITOR_IDLE_LOG: &str = "recovery monitor has no unhandled faults";
 #[cfg(feature = "kafka")]
-const RECOVERY_SUPERSESSION_WAIT_LOG: &str = "waits to supersede stopped Prepare";
-#[cfg(feature = "kafka")]
 const RECOVERY_START_LOG: &str = "leader announced recovery start";
 #[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_PUBLISHED_LOG: &str = "leader announced recovery release";
@@ -251,7 +249,7 @@ const RECOVERY_DIAGNOSTIC_SEQUENCE_MAX: usize = 32;
 #[cfg(feature = "kafka")]
 const RECOVERY_DIAGNOSTIC_DRAIN_SAMPLES_MAX: usize = 8;
 #[cfg(feature = "kafka")]
-const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 113] = [
+const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 112] = [
     ("checkpoint_failure_metric", CHECKPOINT_FAILURE_METRIC_LOG),
     ("checkpoint_attempt_failed", "checkpoint attempt failed"),
     (
@@ -401,7 +399,6 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 113] = [
         "recovery_control_observation_failed",
         "recovery control observation failed",
     ),
-    ("recovery_supersession_wait", RECOVERY_SUPERSESSION_WAIT_LOG),
     (
         "recovery_successor_authorized",
         "authorized successor assignment from the last committed cluster cut",
@@ -16221,7 +16218,6 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
                recovery monitor leadership gate changed leader=true token=never-copy-this\n\
                recovery monitor has no unhandled faults idle=true\n\
                recovery control observation failed: credential=secret\n\
-               waits to supersede stopped Prepare gen=9\n\
                Release observed without restoring its exact Start; holding intake\n\
                recovery Release consumed; source gate opened\n\
                committed recovery Release was not observable before its deadline\n\
@@ -16312,7 +16308,6 @@ fn recovery_log_diagnostics_count_markers_without_copying_log_values() {
     assert_eq!(counts.get("recovery_monitor_leadership_changed"), Some(&1));
     assert_eq!(counts.get("recovery_monitor_idle_without_faults"), Some(&1));
     assert_eq!(counts.get("recovery_control_observation_failed"), Some(&1));
-    assert_eq!(counts.get("recovery_supersession_wait"), Some(&1));
     for marker in [
         "recovery_release_without_start",
         "recovery_release_consumed",
