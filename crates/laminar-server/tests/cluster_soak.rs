@@ -6130,6 +6130,11 @@ fn wait_for_minimum_offset_rate(
     observed.expect("offset-rate wait completed without an observed frontier")
 }
 
+// Native CI runners have delivered up to three spontaneous recoveries inside one
+// durable-progress window (runs 34785105619, 35068174540, 35099393770); each consumes up
+// to the full recovery ceiling.
+const SPONTANEOUS_RECOVERY_ALLOWANCE: u32 = 3;
+
 #[cfg(feature = "kafka")]
 fn recovery_aware_durable_progress_window(
     interval_ms: u64,
@@ -6139,6 +6144,7 @@ fn recovery_aware_durable_progress_window(
 ) -> Duration {
     let checkpoint_cycle = Duration::from_millis(interval_ms).saturating_add(checkpoint_timeout);
     recovery_ceiling
+        .saturating_mul(SPONTANEOUS_RECOVERY_ALLOWANCE)
         .saturating_add(checkpoint_cycle.saturating_mul(required_commits.saturating_add(1)))
 }
 
@@ -18493,7 +18499,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
             Duration::from_secs(90),
             1,
         ),
-        Duration::from_secs(170)
+        Duration::from_secs(350)
     );
     assert_eq!(
         recovery_aware_durable_progress_window(
@@ -18502,7 +18508,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
             Duration::from_secs(90),
             2,
         ),
-        Duration::from_secs(210)
+        Duration::from_secs(390)
     );
     assert_eq!(
         recovery_aware_durable_progress_window(
@@ -18511,7 +18517,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
             Duration::from_secs(90),
             1,
         ),
-        Duration::from_secs(230)
+        Duration::from_secs(410)
     );
     assert_eq!(
         recovery_aware_durable_progress_window(
@@ -18520,7 +18526,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
             Duration::from_secs(90),
             2,
         ),
-        Duration::from_secs(300)
+        Duration::from_secs(480)
     );
     assert_eq!(
         recovery_aware_durable_progress_window(u64::MAX, Duration::MAX, Duration::MAX, u32::MAX),
