@@ -636,10 +636,10 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 112] = [
         "Cluster worker owns no vnodes; data plane remains fenced pending assignment",
     ),
 ];
-// The window caps the per-failure deadline input. Native CI runners measure a
-// 90-120s recovery critical path with ~±20s object-store latency variance, so CI may
-// opt in up to 150s; the 90s default below stays the production SLO.
-const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(150);
+// The window caps the per-failure deadline input. Native CI runners measure up to a
+// 140s recovery critical path plus one ~30s post-recovery checkpoint cycle, so CI may
+// opt in up to 210s; the 90s default below stays the production SLO.
+const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(210);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
 const HARD_KILL_TIMEOUT: Duration = Duration::from_secs(10);
