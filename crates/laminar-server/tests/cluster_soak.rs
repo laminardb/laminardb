@@ -14360,9 +14360,11 @@ fn run_three_node_join_kill9_soak(
             nodes[victim].process_generation
         );
         nodes[victim].arm_checkpoint_kill(victim_role);
+        // Budget one in-flight spontaneous recovery: pipelines stopped for a round expose no
+        // checkpoint to arm until it completes.
         wait_for(
             "selected node to enter its armed checkpoint phase",
-            Duration::from_secs(45),
+            recovery_ceiling.saturating_add(Duration::from_secs(45)),
             || {
                 assert_running_nodes(&mut nodes);
                 producer.assert_running();
