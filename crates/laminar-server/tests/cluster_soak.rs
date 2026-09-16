@@ -652,7 +652,11 @@ const MATRIX_INPUT_PARTITIONS: i32 = 1;
 #[cfg(feature = "kafka")]
 const MUTABLE_INTERVAL_INPUT_PARTITIONS: i32 = 1;
 #[cfg(feature = "kafka")]
-const RECOVERY_CANARY_EVENT_LEAD_MS: u64 = 45 * 60 * 1_000;
+// The lead must exceed the whole soak's recovery-bounded wall-clock budget (ceiling x
+// observation phases plus startup and kill allowances) so canary event times stay ahead of
+// the closed cut; it must also leave room for the closing sentinels inside the configured
+// future-skew guard.
+const RECOVERY_CANARY_EVENT_LEAD_MS: u64 = 55 * 60 * 1_000;
 #[cfg(feature = "kafka")]
 const SOAK_EVENT_MAX_FUTURE_SKEW_MS: u64 = 60 * 60 * 1_000;
 #[cfg(feature = "kafka")]
@@ -19195,7 +19199,7 @@ fn recovery_canary_event_time_holds_ordered_and_window_cuts_open() {
     validate_matrix_recovery_horizon(4, Duration::from_secs(90), 90, DEFAULT_JOIN_INTERVAL_MS);
     assert!(
         std::panic::catch_unwind(|| {
-            validate_mutable_interval_recovery_horizon(9, Duration::from_secs(90));
+            validate_mutable_interval_recovery_horizon(12, Duration::from_secs(90));
         })
         .is_err(),
         "a configured fault schedule beyond the held-open event horizon must fail before intake"
@@ -19203,11 +19207,11 @@ fn recovery_canary_event_time_holds_ordered_and_window_cuts_open() {
     assert!(
         std::panic::catch_unwind(|| {
             validate_matrix_recovery_horizon(
-                6,
+                9,
                 Duration::from_secs(90),
                 90,
                 DEFAULT_JOIN_INTERVAL_MS,
-            );
+            )
         })
         .is_err(),
         "a matrix fault schedule beyond the held-open event horizon must fail before intake"
