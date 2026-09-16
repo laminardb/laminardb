@@ -636,10 +636,11 @@ const RECOVERY_DIAGNOSTIC_MARKERS: [(&str, &str); 112] = [
         "Cluster worker owns no vnodes; data plane remains fenced pending assignment",
     ),
 ];
-// The window caps the per-failure deadline input. Native CI runners measure up to a
-// 140s recovery critical path plus one ~30s post-recovery checkpoint cycle, so CI may
-// opt in up to 210s; the 90s default below stays the production SLO.
-const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(210);
+// The window caps the per-failure deadline input. Native CI runners complete a full
+// kill-recovery chain plus post-recovery durable progress in up to ~230s (run 35134063395
+// missed the final offset commit with 18s left of a 210s budget), so CI may opt in to 235s;
+// the 90s default below stays the production SLO.
+const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(235);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
 const HARD_KILL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -656,7 +657,7 @@ const MUTABLE_INTERVAL_INPUT_PARTITIONS: i32 = 1;
 // observation phases plus startup and kill allowances) so canary event times stay ahead of
 // the closed cut; it must also leave room for the closing sentinels inside the configured
 // future-skew guard.
-const RECOVERY_CANARY_EVENT_LEAD_MS: u64 = 55 * 60 * 1_000;
+const RECOVERY_CANARY_EVENT_LEAD_MS: u64 = 59 * 60 * 1_000;
 #[cfg(feature = "kafka")]
 const SOAK_EVENT_MAX_FUTURE_SKEW_MS: u64 = 60 * 60 * 1_000;
 #[cfg(feature = "kafka")]
