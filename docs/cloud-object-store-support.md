@@ -26,6 +26,17 @@ No native AWS, Azure, or GCS evidence artifact was produced while preparing this
 protected workflow exists for future runs, but an unexecuted or skipped job does not certify its
 provider.
 
+**Azure checkpoint certification status (2026-09-17):** Azure Blob/ADLS checkpoint storage is
+certified by local native runs against Azure Blob, not by CI. Seventeen instrumented native CI
+runs (PRs #521–#537) proved the checkpoint/recovery machinery correct end to end on native
+Azure — including complete kill-recovery rounds with Release publication and consumption — but
+the soak's recovery liveness window cannot be met reliably on 4-CPU hosted runners: a latency
+limit of that runner class, not a correctness gap. The workflow's weekly schedule was removed
+(dispatch it manually for aws/gcs). Local certification: run the three-node checkpoint soak
+with `--features cluster,kafka,azure` against a native Azure container
+(`LAMINAR_NATIVE_CLOUD=1`, `AZURE_USE_AZURE_CLI=true`) and archive the three evidence JSONs
+bound to the tested SHA.
+
 ## Capability matrix
 
 “Native job” means a protected job is implemented but has not established certification for the
@@ -33,7 +44,7 @@ current commit. “ALO” means at-least-once only in cluster mode.
 
 | Consumer | AWS S3 | Azure Blob / ADLS Gen2 | Google Cloud Storage | Local filesystem | S3-compatible endpoint |
 |---|---|---|---|---|---|
-| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; no current native artifact | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; keyless native job enabled; no current native artifact | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
+| Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; local-native certification, no CI artifact (see status note) | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; keyless native job enabled; no current native artifact | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
 | Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; keyless native job enabled; no current native artifact | Supported | MinIO smoke; compatibility tier only |
 | Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |

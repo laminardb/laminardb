@@ -38,8 +38,10 @@ on:
         required: true
         type: boolean
         default: false
-  schedule:
-    - cron: "0 6 * * 1"
+
+# No scheduled runs: the native Azure checkpoint soak cannot meet the recovery
+# liveness window on 4-CPU hosted runners (latency, not correctness — see
+# docs/cloud-object-store-support.md). Dispatch manually for aws/gcs.
 
 permissions:
   contents: read
