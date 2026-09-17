@@ -14100,12 +14100,13 @@ fn run_three_node_join_kill9_soak(
         Instant::now() + Duration::from_secs(10),
         "initial full membership",
     );
-    // A pre-join epoch can burn a full 30s gate timeout before convergence, so allow for it.
+    // A pre-join epoch can burn a full 30s gate timeout, and a spontaneous recovery can stop
+    // the pipelines for a whole round, before first durable progress; budget both.
     let mut latest_checkpoint = assert_progress(
         &mut nodes,
         Some(&mut producer),
         Some(&commit_oracle),
-        Duration::from_secs(90),
+        recovery_ceiling.saturating_add(Duration::from_secs(90)),
         "startup",
         None,
     );
