@@ -29,6 +29,8 @@ use common::{
     wait_for_broker, wait_for_broker_unavailable,
 };
 
+mod kafka_saturation;
+
 const REQUIRE_REDPANDA_ENV: &str = "LAMINAR_REQUIRE_REDPANDA";
 const STOPPED_WRITER_STABILITY: Duration = Duration::from_millis(500);
 static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
@@ -117,13 +119,13 @@ async fn produce_json_range(brokers: &str, topic: &str, range: std::ops::Range<u
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct PartitionWatermarkCut {
     low: i64,
     high_exclusive: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct KafkaHighWatermarkCut {
     partitions: BTreeMap<i32, PartitionWatermarkCut>,
 }

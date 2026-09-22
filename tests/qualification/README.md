@@ -128,3 +128,38 @@ LAMINAR_REQUIRE_REDPANDA=1 LAMINAR_S12_DIAGNOSTICS="$PWD/target/s12-overload" \
 
 Use a new evidence directory each time. The diagnostic retains its uniquely named broker topics,
 local checkpoints, pressure/fault report and independently consumed output rows.
+
+The separate **embedded Kafka ALO saturation diagnostic** fills a graph port
+with two individually valid one-row batches, separately testing count and retained-byte limits.
+A one-nanosecond query budget makes graph deferral
+reproducible; an identity UDF holds the downstream consumer at a bounded test-only scheduling
+gate. The report requires two recorded producer batches in one completed operator invocation.
+Merely exceeding the query budget or rejecting an oversized batch cannot pass this check.
+The byte case calibrates its limit from the seed's two producer batches and disables the count
+limit. Its identity projection retains a bounded 1,024-element backing array per ID column,
+making the downstream charge larger than source intake without changing the visible row.
+Each batch must be smaller than the byte limit, and their sum must equal it exactly.
+
+Under Backpressure, a manual checkpoint must wait, the committed decision must remain unchanged,
+and newly acknowledged input must not advance intake while retained work owns the source cursors.
+Releasing the gate must drain both the retained and successor input and permit a new checkpoint.
+A second worker is killed with another saturated port and a pending checkpoint. Recovery retains
+the same capacity, uses single-message intake and the ordinary query budget, and must deliver
+every acknowledged input plus new canaries. Under Fail, the full downstream port must cause the
+specific capacity fault, checkpointing must be rejected, and the external output must remain at
+the committed prefix. Recovery explicitly increases capacity by 128 times before replay.
+
+```bash
+mkdir -p target/s12-saturation-run
+LAMINAR_REQUIRE_REDPANDA=1 LAMINAR_S12_DIAGNOSTICS="$PWD/target/s12-saturation-run" \
+  cargo test -p laminar-db --features cluster --test kafka_docker_scenarios \
+  kafka_saturation::durable_saturation_checkpoint_restart_ledger \
+  -- --ignored --exact --nocapture
+```
+
+The controller kills and reaps its own child processes and retains their logs, source acknowledgement
+offsets, committed decisions, pressure observations and independent scans of stable source/output
+Kafka cuts. Output duplicates are counted and allowed for ALO. This is a small deterministic
+capacity diagnostic; production load/SLOs, single-node server,
+cluster and exact-delivery compositions still require their own evidence. The UDF gate is part of
+the test executable; no production runtime gate is added.

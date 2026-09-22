@@ -2246,3 +2246,49 @@ from -27.89% to +2.63%; no unexplained regression above 5% remains. Fanout IPC i
 0.69 after, below the 2.0 rule of thumb in both builds. CPU samples retain allocation, Arrow
 concatenation and scheduling costs. Commands, source/binary hashes, failed/passing regressions,
 measurements and profile reports are retained under `target/s12-gradual-replay/`.
+
+### S12 — external-ledger saturation, checkpoint and restart (2026-09-22)
+
+The embedded Kafka → Kafka ALO diagnostic now covers the count- and byte-capacity cases left
+open by the deferred-scheduling entry above. Both Backpressure and Fail fill a graph port with
+two individually admissible one-row batches from one completed producer invocation. Count
+capacity is two batches. Byte capacity is independently calibrated from the seed's retained
+Arrow charge, with count admission disabled: each batch charges 8,592 bytes against a 17,184-byte
+port. A bounded identity UDF retains the backing allocation without changing the visible IDs or
+values. The one-nanosecond query budget forces deferral; another test-only identity UDF holds the
+downstream consumer so checkpoint and process-loss boundaries can be observed deterministically.
+No production runtime hook or admission change was added.
+
+Backpressure holds the original source cursors while two successor records are acknowledged by
+Kafka. A manual checkpoint remains pending and the durable decision stays unchanged. Releasing
+the gate drains both batches and the successors, then permits a new committed cut. A second
+worker is killed with another saturated port and a pending checkpoint. Restart keeps the same
+capacity, restores the committed cut, and uses single-message intake and the ordinary query budget.
+Fail instead reports the specific downstream-capacity fault, rejects checkpointing, and leaves
+the independent sink boundary at the committed prefix. Its explicit recovery configuration
+increases the relevant capacity by 128 times before replay.
+
+Independent Kafka readers audit stopped-writer source and sink cuts, validate every ID and value,
+and count ALO duplicates. Each Backpressure case verifies ten source-acknowledged IDs; each Fail
+case verifies eight, including two post-restart canaries. The final four-case matrix passes three
+times: 108 acknowledged records across twelve cases, with no missing records, incorrect values or
+duplicates. A separate evidence audit verifies all 405 bundle files and 1,151 source-file hashes.
+
+Validation: 6,145 workspace library/server tests pass with one existing ignore. Both Clippy
+configurations, nightly formatting, readability, analytical dependency consistency and whitespace
+checks pass. Final fixture corrections use the repository's existing `parking_lot` dependency,
+place support code below the integration-test root, and reuse the initially validated broker
+address instead of repeatedly invoking the optional test suite's 500 ms availability probe.
+One earlier run stopped at that short probe while the broker remained running and subsequently
+reported healthy; its log and broker inspection are retained. Actual producer and independent
+consumer deadlines and error handling remain enforced. The collector's UTF-8 corrections and
+invalidated intermediate builds are also retained, separately from passing evidence.
+
+The fixture and repeat command are documented in [`tests/qualification/README.md`](../tests/qualification/README.md).
+Final evidence is retained under `target/s12-saturation/complete/`, with the verified result in
+`target/s12-saturation/completion.json`. The bundle includes its source snapshot, build identity,
+worker logs, acknowledgement offsets, committed decisions, pressure reports and independent ledger
+scans. This is native Windows test-profile evidence with Rust 1.98.0 and default features plus
+`cluster`; the runtime mode is embedded. It closes this bounded embedded ALO diagnostic.
+Single-node server, cluster, exact compositions and
+the declared production load/latency/RSS/recovery matrix still require separate qualification.
