@@ -115,6 +115,17 @@ The image ships a default config at `/etc/laminardb/laminardb.toml` (mount your 
 
 Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). Embedded is the primary target.
 
+### Configuration and production sizing
+
+The server reads `laminardb.toml`. Its memory settings are separate per-node, per-port, and
+per-table/view admission limits; none caps total process RSS. The defaults include 256 MiB of
+participating DataFusion reservations, a shared 64 MiB connector source queue, 256 batches per
+graph input port, 256 MiB per local reference table or materialized view, and 512 MiB for a
+participant checkpoint data object. Size the process or container from measured peak RSS under
+load and recovery, with headroom for Arrow, connectors, checkpoint capture, and allocator overhead.
+See the [server README](crates/laminar-server/README.md#memory-limits-and-production-tuning) or
+the [site configuration and production tuning guide](https://laminardb.io/docs/#production-tuning).
+
 ---
 
 ## LaminarDB Console

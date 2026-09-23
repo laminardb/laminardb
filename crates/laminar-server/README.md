@@ -305,6 +305,46 @@ Edit the TOML file while the server is running. The file watcher detects changes
 
 Changes to `[server]` and `[checkpoint]` require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
 
+## Memory limits and production tuning
+
+These defaults apply **per DB/node** unless the scope says per table, view, or graph port.
+They are independent admission budgets, not a process memory limit. Set byte values as integer
+bytes in `laminardb.toml`; the example under [Configuration](#configuration) shows the syntax.
+
+| Setting | Default | Scope |
+|---|---:|---|
+| `server.datafusion_memory_limit_bytes` | 256 MiB | Shared participating DataFusion reservations; DB-owned contexts do not spill to disk. |
+| `server.source_queue_max_bytes` | 64 MiB | Shared connector-to-coordinator Arrow queue, including parked input; each source's waiting batch must also fit. Must be positive and at most `MAX_SOURCE_QUEUE_BYTES`. |
+| `server.pipeline_max_input_buf_batches` | 256 | Each graph input port; `0` disables the count limit. |
+| `server.pipeline_max_input_buf_bytes` | unset | Each graph input port; a configured value must be positive. |
+| `server.reference_table_max_rows` / `server.reference_table_max_bytes` | 1,000,000 / 256 MiB | Each local reference table; both values must be positive. |
+| `server.materialized_view_max_rows` / `server.materialized_view_max_bytes` | 1,000,000 / 256 MiB | Each local materialized view; both values must be positive. |
+| `checkpoint.max_node_data_bytes` | 512 MiB | Maximum participant checkpoint data object and in-flight captured-state admission, separate from live-state limits. |
+
+The engine also defaults to a 256 MiB charged-byte budget for managed operator working state.
+Embedded users can set `pipeline_max_managed_state_bytes` through `LaminarConfig` or the builder;
+the server TOML does not expose this setting. Its accounting is a lower bound and is not RSS.
+Reference tables and materialized views are local only; cluster plans requiring them remain rejected.
+
+For a production deployment, start with a representative peak workload and a durable checkpoint
+location. Record **peak process/container RSS**, source lag, cycle backpressure, graph input bytes,
+managed-state charge, checkpoint size and checkpoint duration during normal load, bursts, and
+recovery. The `/metrics` endpoint exposes `laminardb_cycles_backpressured_total`,
+`laminardb_input_buf_bytes`, `laminardb_managed_state_accounted_bytes`,
+`laminardb_checkpoint_size_bytes`, and checkpoint duration/failure metrics. The managed-state
+metric is a lower-bound charge, so use OS/container RSS for memory sizing.
+
+Set the container memory limit above the measured peak with room for connector decoding, Arrow
+buffers, operator scratch, query results, simultaneous old/new state during restore, checkpoint
+capture/encoding, and allocator overhead. The Helm chart leaves `resources` unset; supply
+workload-specific requests and limits. Reducing one budget does not reduce all other owners.
+If a queue or port saturates, inspect source batch size and downstream capacity before raising
+its cap. An oversized graph result after execution faults the pipeline; an oversized checkpoint
+or restored state can fail recovery. Set `checkpoint.max_node_data_bytes` high enough for the
+largest expected participant artifact, then validate with fault/restart testing. Choose
+`checkpoint.interval` for acceptable replay work and storage traffic, and keep
+`checkpoint.timeout` above observed checkpoint duration (defaults: 10s and 120s).
+
 `server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
 server modes and requires a restart to change. DB-owned contexts share the limit and disable
 disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;
