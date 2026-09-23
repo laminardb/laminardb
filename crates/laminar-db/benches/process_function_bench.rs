@@ -63,7 +63,24 @@ impl NativeProcessFunction for RunningTotal {
     }
 }
 
-fn native_one_row_end_to_end(criterion: &mut Criterion) {
+fn output_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("account", DataType::Utf8, false),
+        Field::new("total", DataType::Int64, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]))
+}
+
+fn native_end_to_end(
+    criterion: &mut Criterion,
+    name: &str,
+    row_count: usize,
+    distinct_keys: usize,
+) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -77,15 +94,7 @@ fn native_one_row_end_to_end(criterion: &mut Criterion) {
         .await
         .unwrap();
         let source = db.source_untyped("events").unwrap();
-        let output_schema = Arc::new(Schema::new(vec![
-            Field::new("account", DataType::Utf8, false),
-            Field::new("total", DataType::Int64, false),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
-                false,
-            ),
-        ]));
+        let output_schema = output_schema();
         db.register_native_process_function(
             "activity",
             "events",
@@ -112,36 +121,95 @@ fn native_one_row_end_to_end(criterion: &mut Criterion) {
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
             .unwrap();
+        let keys = (0..row_count)
+            .map(|row| format!("account-{}", row % distinct_keys))
+            .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(
             source.schema().clone(),
             vec![
-                Arc::new(StringArray::from(vec!["account-a"])),
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000])),
+                Arc::new(StringArray::from(keys)),
+                Arc::new(Int64Array::from(vec![1; row_count])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000; row_count])),
             ],
         )
         .unwrap();
         (db, source, portal, batch)
     });
 
-    criterion.bench_function("native_process_one_row_end_to_end", |bench| {
+    criterion.bench_function(name, |bench| {
         bench.iter(|| {
             runtime.block_on(async {
                 source.push_arrow(batch.clone()).unwrap();
-                loop {
+                let mut received = 0;
+                while received < row_count {
                     match portal.next_frame().await {
                         Some(PortalFrame::Batch { batch, .. }) => {
-                            break black_box(batch.num_rows())
+                            received += batch.num_rows();
                         }
                         Some(PortalFrame::Barrier { .. }) => {}
                         other => panic!("process benchmark output unavailable: {other:?}"),
                     }
                 }
+                assert_eq!(received, row_count);
+                black_box(received)
             })
         });
     });
     runtime.block_on(db.shutdown()).unwrap();
 }
 
-criterion_group!(benches, native_one_row_end_to_end);
+fn native_one_row_end_to_end(criterion: &mut Criterion) {
+    native_end_to_end(criterion, "native_process_one_row_end_to_end", 1, 1);
+}
+
+fn native_batch_end_to_end(criterion: &mut Criterion) {
+    native_end_to_end(criterion, "native_process_64_distinct_keys", 64, 64);
+    native_end_to_end(criterion, "native_process_64_same_key", 64, 1);
+}
+
+fn native_handler_only(criterion: &mut Criterion) {
+    let schema = output_schema();
+    let handler = RunningTotal {
+        output_schema: Arc::clone(&schema),
+    };
+    for (name, row_count) in [
+        ("native_handler_one_row", 1),
+        ("native_handler_64_rows", 64),
+    ] {
+        let keys = (0..row_count)
+            .map(|row| format!("account-{row}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(keys.clone())),
+                Arc::new(Int64Array::from(vec![1; row_count])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_000_000; row_count])),
+            ],
+        )
+        .unwrap();
+        let activations = keys
+            .into_iter()
+            .enumerate()
+            .map(|(row, key_text)| ProcessActivation {
+                id: row as u64,
+                key: Arc::from(vec![row as u8]),
+                key_text,
+                event_time_us: 1_000_000,
+                callback: ProcessCallback::Input(batch.slice(row, 1)),
+                state: ValueState::Value(0),
+            })
+            .collect::<Vec<_>>();
+        criterion.bench_function(name, |bench| {
+            bench.iter(|| black_box(handler.invoke(black_box(&activations)).unwrap()))
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    native_one_row_end_to_end,
+    native_batch_end_to_end,
+    native_handler_only
+);
 criterion_main!(benches);

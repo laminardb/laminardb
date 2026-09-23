@@ -32,6 +32,24 @@
 - `cargo clippy --workspace --all-features --all-targets -- -D warnings`, `cargo clippy --workspace --no-default-features -- -D warnings`, `cargo +nightly fmt --all -- --check`, `cargo run --quiet --manifest-path tools/readability-check/Cargo.toml -- .`, and `git diff --check` passed after the final native edits.
 - `cargo test --workspace --lib --quiet` compiled the cluster path, then `laminar-connectors` passed 1977 and `laminar-core` passed 973. Its `laminar-db` binary failed with Windows `STATUS_STACK_OVERFLOW` in a coordinated-recovery test. An isolated test also overflowed at the default test-thread stack and passed with `RUST_MIN_STACK=8388608`. The full workspace library suite then passed with `RUST_MIN_STACK=8388608 cargo test --workspace --lib -- --test-threads=1` (PowerShell environment assignment preceding the command). The default-stack parallel gate remains red; do not hide it behind the adjusted run.
 
+### Continuation: native conformance and local latency (2026-09-23)
+
+Three new conformance tests cover batch splitting and independent-key permutation, absent/null/unchanged/clear across checkpoint restore, and state isolation for two operators with the same function identity. `cargo test -p laminar-db --lib process_function::tests -- --nocapture` and `cargo test -p laminar-db --no-default-features --lib process_function::tests -- --quiet`: 10 passed in each configuration. No production record-path code changed.
+
+After the continuation, both workspace Clippy gates, nightly formatting, and the readability checker passed. The full workspace library suite passed with `RUST_MIN_STACK=8388608` and `--test-threads=1`; the unadjusted Windows stack failure recorded above remains unresolved.
+
+Criterion baseline: Windows x86_64 MSVC, AMD Ryzen 9 7900X (12 cores, 24 logical), Rust 1.98.0, optimized bench profile with thin LTO and `--no-default-features`. The input has a UTF-8 key, signed 64-bit amount, and UTC microsecond timestamp; the handler uses one signed 64-bit state slot and emits one Arrow row per input, with no timers.
+
+| Workload | Mean | 95% interval |
+|---|---:|---:|
+| One row, source to subscription | 26.398 µs | 26.042–26.781 µs |
+| 64 distinct keys, source to subscription | 107.73 µs/batch | 106.29–109.46 µs |
+| 64 rows for one key, source to subscription | 108.18 µs/batch | 107.23–109.22 µs |
+| Prepared native handler, one row | 423.63 ns | 421.66–425.94 ns |
+| Prepared native handler, 64 rows | 28.589 µs/batch | 28.352–28.894 µs |
+
+Command: `cargo bench -p laminar-db --bench process_function_bench --no-default-features -- <filter> --noplot --sample-size 40 --warm-up-time 5 --measurement-time 10` for the end-to-end rows; handler-only rows used 30 samples, 3-second warm-up, and 7-second measurement. The first one-row run immediately after release compilation measured 40.141 µs; later 30-sample end-to-end means ranged 24.717–25.846 µs (one row), 107.73–108.73 µs (distinct keys), and 105.22–112.13 µs (one key) without production code changes. Handler-only input uses prepared activation snapshots and excludes routing, validation, coordinator handoff, and subscription. These are development-machine latency means, not sustained throughput, target-hardware, p99, or sampled CPU/IPC results.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -45,4 +63,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Add native key-isolation, batch-splitting, and absent/null/clear conformance tests; profile the new record path and set a target-hardware latency baseline. Then implement a versioned language-neutral descriptor and one bounded Arrow IPC/Protobuf remote transport with a Rust reference worker before the Python/PyArrow SDK. After local worker recovery and server invocation are qualified, implement and test cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.
+Run a sampled CPU/IPC profile and representative tail-latency workload on target hardware before using the local Criterion means as a product latency claim. Then implement a versioned language-neutral descriptor and one bounded Arrow IPC/Protobuf remote transport with a Rust reference worker before the Python/PyArrow SDK. After local worker recovery and server invocation are qualified, implement and test cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.

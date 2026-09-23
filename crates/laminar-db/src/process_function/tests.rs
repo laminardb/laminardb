@@ -169,7 +169,10 @@ impl NativeProcessFunction for AccountActivity {
     }
 }
 
-fn build_graph(descriptor: ProcessFunctionDescriptor) -> OperatorGraph {
+fn build_graph(
+    descriptor: ProcessFunctionDescriptor,
+    handler: Arc<dyn NativeProcessFunction>,
+) -> OperatorGraph {
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
     graph.set_query_budget_ns(5_000_000_000);
     graph.register_source_schema("events".into(), input_schema());
@@ -178,7 +181,7 @@ fn build_graph(descriptor: ProcessFunctionDescriptor) -> OperatorGraph {
             output_name: "activity".into(),
             source_name: "events".into(),
             descriptor,
-            handler: Arc::new(AccountActivity),
+            handler,
         })
         .unwrap();
     graph
@@ -236,9 +239,246 @@ fn totals(output: &[RecordBatch]) -> Vec<i64> {
         .collect()
 }
 
+fn activity_rows(output: &[RecordBatch]) -> Vec<(String, String, i64, bool, i64)> {
+    let mut rows = Vec::new();
+    for batch in output {
+        let account = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let kind = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let total = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let crossed = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let time = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                account.value(row).to_string(),
+                kind.value(row).to_string(),
+                total.value(row),
+                crossed.value(row),
+                time.value(row),
+            ));
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn batch_splits_and_independent_key_order_preserve_results() {
+    let ordered = [
+        ("a", 60, 100_000),
+        ("b", 5, 100_000),
+        ("c", 9, 100_000),
+        ("a", 50, 101_000),
+        ("b", 10, 101_000),
+        ("c", 1, 101_000),
+        ("a", 1, 102_000),
+        ("b", 20, 102_000),
+        ("c", 3, 102_000),
+    ];
+    let permuted = [
+        ordered[2], ordered[0], ordered[1], ordered[5], ordered[3], ordered[4], ordered[8],
+        ordered[6], ordered[7],
+    ];
+    let cases = [
+        (vec![input_batch(&ordered)], 256),
+        (
+            vec![input_batch(&ordered[..4]), input_batch(&ordered[4..])],
+            2,
+        ),
+        (permuted.iter().map(|row| input_batch(&[*row])).collect(), 1),
+    ];
+    let mut expected = vec![
+        ("a".into(), "running".into(), 60, false, 100_000),
+        ("a".into(), "running".into(), 110, true, 101_000),
+        ("a".into(), "running".into(), 111, false, 102_000),
+        ("a".into(), "inactive".into(), 111, false, 112_000),
+        ("b".into(), "running".into(), 5, false, 100_000),
+        ("b".into(), "running".into(), 15, false, 101_000),
+        ("b".into(), "running".into(), 35, false, 102_000),
+        ("b".into(), "inactive".into(), 35, false, 112_000),
+        ("c".into(), "running".into(), 9, false, 100_000),
+        ("c".into(), "running".into(), 10, false, 101_000),
+        ("c".into(), "running".into(), 13, false, 102_000),
+        ("c".into(), "inactive".into(), 13, false, 112_000),
+    ];
+    expected.sort_unstable();
+    for (batches, max_batch_rows) in cases {
+        let mut binding = descriptor();
+        binding.limits.max_batch_rows = max_batch_rows;
+        let mut graph = build_graph(binding, Arc::new(AccountActivity))
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        let mut inputs = FxHashMap::default();
+        inputs.insert(Arc::from("events"), batches);
+        let first = graph.execute_cycle(&inputs, 95, None).await.unwrap();
+        let timers = graph
+            .execute_cycle(&FxHashMap::default(), 120, None)
+            .await
+            .unwrap();
+        let mut actual = activity_rows(&first["activity"]);
+        actual.extend(activity_rows(&timers["activity"]));
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "max_batch_rows={max_batch_rows}");
+    }
+}
+
+struct StateEcho;
+
+impl NativeProcessFunction for StateEcho {
+    fn invoke(
+        &self,
+        activations: &[ProcessActivation],
+    ) -> Result<Vec<ProcessActivationResult>, DbError> {
+        activations
+            .iter()
+            .map(|activation| {
+                let ProcessCallback::Input(batch) = &activation.callback else {
+                    return Err(DbError::InvalidOperation("unexpected timer".into()));
+                };
+                let command = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+                let mutation = match command {
+                    1 => ValueMutation::SetNull,
+                    2 => ValueMutation::Unchanged,
+                    3 => ValueMutation::Set(42),
+                    4 => ValueMutation::Clear,
+                    _ => return Err(DbError::InvalidOperation("unknown test command".into())),
+                };
+                let (kind, value) = match activation.state {
+                    ValueState::Absent => ("absent", 0),
+                    ValueState::Null => ("null", 0),
+                    ValueState::Value(value) => ("value", value),
+                };
+                Ok(ProcessActivationResult {
+                    activation_id: activation.id,
+                    output: vec![output_row(
+                        &activation.key_text,
+                        kind,
+                        value,
+                        false,
+                        activation.event_time_us,
+                    )],
+                    value: mutation,
+                    timers: Vec::new(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn absent_null_unchanged_and_clear_survive_restore_without_key_leakage() {
+    let mut binding = descriptor();
+    binding.timer_names.clear();
+    let mut graph = build_graph(binding.clone(), Arc::new(StateEcho))
+        .initialize_managed_state()
+        .await
+        .unwrap();
+    let first = graph
+        .execute_cycle(&source(&[("a", 1, 100_000), ("b", 3, 100_000)]), 100, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        activity_rows(&first["activity"])
+            .into_iter()
+            .map(|row| (row.0, row.1))
+            .collect::<Vec<_>>(),
+        vec![("a".into(), "absent".into()), ("b".into(), "absent".into())]
+    );
+    let (whole, vnodes) = materialize(graph.capture_state(u64::MAX).unwrap());
+    let mut restored = build_graph(binding, Arc::new(StateEcho))
+        .initialize_managed_state()
+        .await
+        .unwrap()
+        .restore_state_frames(&whole, &vnodes, 256)
+        .unwrap()
+        .0;
+    let after = restored
+        .execute_cycle(
+            &source(&[
+                ("a", 2, 101_000),
+                ("b", 2, 101_000),
+                ("a", 4, 102_000),
+                ("b", 4, 102_000),
+                ("a", 2, 103_000),
+                ("b", 2, 103_000),
+            ]),
+            103,
+            None,
+        )
+        .await
+        .unwrap();
+    let actual = activity_rows(&after["activity"])
+        .into_iter()
+        .map(|(key, state, value, _, _)| (key, state, value))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("a".into(), "null".into(), 0),
+            ("b".into(), "value".into(), 42),
+            ("a".into(), "null".into(), 0),
+            ("b".into(), "value".into(), 42),
+            ("a".into(), "absent".into(), 0),
+            ("b".into(), "absent".into(), 0),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn same_function_identity_in_two_pipelines_has_independent_state() {
+    let mut graph = build_graph(descriptor(), Arc::new(AccountActivity));
+    let mut second = descriptor();
+    second.pipeline_state_id = "other_pipeline_v1".into();
+    graph
+        .add_process_function(&ProcessFunctionRegistration {
+            output_name: "other_activity".into(),
+            source_name: "events".into(),
+            descriptor: second,
+            handler: Arc::new(AccountActivity),
+        })
+        .unwrap();
+    let mut graph = graph.initialize_managed_state().await.unwrap();
+    let first = graph
+        .execute_cycle(&source(&[("a", 7, 100_000)]), 95, None)
+        .await
+        .unwrap();
+    assert_eq!(totals(&first["activity"]), vec![7]);
+    assert_eq!(totals(&first["other_activity"]), vec![7]);
+    let second = graph
+        .execute_cycle(&source(&[("a", 5, 101_000)]), 96, None)
+        .await
+        .unwrap();
+    assert_eq!(totals(&second["activity"]), vec![12]);
+    assert_eq!(totals(&second["other_activity"]), vec![12]);
+}
+
 #[tokio::test]
 async fn keyed_state_and_timer_survive_graph_checkpoint_restore() {
-    let mut graph = build_graph(descriptor())
+    let mut graph = build_graph(descriptor(), Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap();
@@ -253,7 +493,7 @@ async fn keyed_state_and_timer_survive_graph_checkpoint_restore() {
     assert_eq!(totals(&first["activity"]), vec![60, 5, 110]);
     let capture = graph.capture_state(u64::MAX).unwrap();
     let (whole, vnodes) = materialize(capture);
-    let restored = build_graph(descriptor())
+    let restored = build_graph(descriptor(), Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap()
@@ -277,7 +517,7 @@ async fn keyed_state_and_timer_survive_graph_checkpoint_restore() {
 async fn due_timers_remain_scheduled_after_callback_limit() {
     let mut binding = descriptor();
     binding.limits.max_timer_callbacks_per_step = 1;
-    let mut graph = build_graph(binding)
+    let mut graph = build_graph(binding, Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap();
@@ -302,7 +542,7 @@ async fn due_timers_remain_scheduled_after_callback_limit() {
 
 #[tokio::test]
 async fn restore_rejects_changed_implementation_binding() {
-    let mut original = build_graph(descriptor())
+    let mut original = build_graph(descriptor(), Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap();
@@ -313,7 +553,7 @@ async fn restore_rejects_changed_implementation_binding() {
     let (whole, vnodes) = materialize(original.capture_state(u64::MAX).unwrap());
     let mut changed = descriptor();
     changed.implementation_digest = "b".repeat(64);
-    let result = build_graph(changed)
+    let result = build_graph(changed, Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap()
@@ -323,7 +563,7 @@ async fn restore_rejects_changed_implementation_binding() {
 
 #[tokio::test]
 async fn restore_rejects_state_over_declared_key_budget() {
-    let mut original = build_graph(descriptor())
+    let mut original = build_graph(descriptor(), Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap();
@@ -334,7 +574,7 @@ async fn restore_rejects_state_over_declared_key_budget() {
     let (whole, vnodes) = materialize(original.capture_state(u64::MAX).unwrap());
     let mut smaller = descriptor();
     smaller.limits.max_keys = 1;
-    let result = build_graph(smaller)
+    let result = build_graph(smaller, Arc::new(AccountActivity))
         .initialize_managed_state()
         .await
         .unwrap()
