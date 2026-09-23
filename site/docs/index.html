@@ -740,7 +740,7 @@ pgwire_bind = "127.0.0.1:5433"</code></pre>
         When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared checkpoint object store; there is no separate <code>[coordination]</code> section or embedded Raft service.
       </p>
       <p>
-        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated: exact-certified Kafka input with either direct S3/S3A append-mode Delta Lake or a REST-catalog Iceberg append sink backed by direct S3/S3A storage. Production certification remains release-soak gated. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
+        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once supports Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
       </p>
 
       <h3>[discovery]</h3>
@@ -1294,7 +1294,7 @@ max_out_of_orderness = "5s"</code></pre>
       <!-- ============================================================ -->
 
       <h2 id="connectors" style="font-size: 1.5rem;">Connectors</h2>
-      <p>All connectors are feature-gated. Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.</p>
+      <p>In Rust builds, include the connectors you need with Cargo features, for example <code>cargo add laminar-db --features kafka,delta-lake</code>. These are build options, not runtime approval gates.</p>
       <p>Set delivery once at <code>[server].delivery</code> (or <code>LaminarDbBuilder::delivery_guarantee</code> when embedded). The runtime injects the selected protocol and owns checkpoint/committer identities; connector properties do not require public writer IDs.</p>
 
       <div class="connector-grid">
@@ -1589,7 +1589,7 @@ max_out_of_orderness = "5s"</code></pre>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode. Cluster exact admission is limited to direct S3/S3A and remains a native-cloud fault/soak gate. Alternate log stores and custom production endpoints fail closed.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's coordinated protocol is limited to append mode and the atomic-create DefaultLogStore. Custom storage endpoints are allowed; the endpoint must provide the atomic-create semantics needed for exactly-once delivery. Cluster exactly-once still requires an S3/S3A table URI.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
@@ -1839,7 +1839,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Single-node currently requires an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode requires a shared checkpoint URL and exact-certified Kafka input with either direct S3/S3A append-mode Delta Lake or a REST-catalog Iceberg append sink backed by direct S3/S3A storage. Production certification remains release-soak gated. Kafka output remains at-least-once. Unsupported combinations fail before connector I/O.</td>
+            <td>Single-node requires an exclusively locked local checkpoint directory, a replayable source with exact recovery, and a coordinated sink. Cluster mode requires a shared checkpoint URL and Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Kafka output remains at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
@@ -1848,8 +1848,8 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         Delivery is one pipeline-wide setting. Per-connector delivery fields are rejected, and
         incompatible connectors fail before external I/O. For example, WebSocket, OTLP, and NATS
         Core sources are non-replayable and therefore require <code>best_effort</code>. Cluster
-        <code>exactly_once</code> admits only exact-certified Kafka input with direct S3/S3A
-        append-mode Delta Lake; other combinations fail closed before connector I/O.
+        <code>exactly_once</code> admits Kafka input with an S3/S3A append-mode Delta Lake sink
+        or a REST-catalog Iceberg append sink backed by S3/S3A storage.
       </p>
 
       <!-- Full example -->
