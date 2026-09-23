@@ -94,7 +94,8 @@ url = "s3://my-bucket/laminardb/checkpoints"
 ```
 
 Change `node_id` and `advertise_host` for each node. Use a shared S3, GCS, or Azure checkpoint
-location, and secure peer traffic with mTLS or a trusted deployment network. See the
+location. Cluster mTLS protects gRPC control and shuffle traffic, but not gossip. With
+`strategy = "gossip"`, keep gossip traffic on a trusted or isolated network. See the
 [cluster setup guide](crates/laminar-server/README.md#cluster-control-plane-tls-mtls),
 [Helm chart](deploy/helm/laminardb/README.md), and
 [cluster SQL limits](docs/SQL_REFERENCE.md#cluster-sql-boundary) before deploying.

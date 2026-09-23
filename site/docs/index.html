@@ -1589,7 +1589,7 @@ max_out_of_orderness = "5s"</code></pre>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's coordinated protocol is limited to append mode and the atomic-create DefaultLogStore. Custom storage endpoints are allowed; the endpoint must provide the atomic-create semantics needed for exactly-once delivery. Cluster exactly-once still requires an S3/S3A table URI.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's coordinated protocol is limited to append mode and the atomic-create DefaultLogStore. Custom S3 endpoints must pass an atomic conditional-create probe at sink startup. Cluster exactly-once still requires an S3/S3A table URI.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>

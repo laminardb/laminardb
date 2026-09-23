@@ -296,6 +296,8 @@ cluster_tls_server_name = "laminar-cluster"       # DNS SAN present in every nod
 
 Every node both serves and dials, so the CA verifies **both** directions. Because peers connect by IP, issue all node certs with one shared DNS SAN and set `cluster_tls_server_name` to it (rather than per-node IP SANs). Enabling mTLS is a **coordinated cutover**: a TLS node cannot talk to a plaintext peer, so roll it out to all nodes at once. Cert rotation currently requires a restart (no hot reload on the control plane).
 
+Gossip discovery uses separate UDP traffic and is not covered by cluster mTLS. With `strategy = "gossip"`, keep the gossip network trusted or isolated.
+
 ## Hot Reload
 
 Edit the TOML file while the server is running. The file watcher detects changes (500ms debounce), diffs the configuration, and applies incremental DDL:

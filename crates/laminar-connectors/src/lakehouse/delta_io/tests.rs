@@ -417,6 +417,26 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let no_environment = |_: &str| None;
     let custom = HashMap::from([("aws_endpoint_url".into(), "http://minio:9000".into())]);
+    assert!(custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &custom,
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "az://container/table",
+        &custom,
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "gs://bucket/table",
+        &custom,
+        &no_environment,
+    ));
     validate_coordinated_storage_preflight_with_env("s3://bucket/table", &custom, &no_environment)
         .unwrap();
     for conditional_put in ["disabled", "dynamo:commits"] {
@@ -437,6 +457,11 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let s3_environment = HashMap::from([("AWS_ENDPOINT_URL", "http://minio:9000")]);
     let s3_environment = |key: &str| s3_environment.get(key).map(ToString::to_string);
+    assert!(custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &s3_environment,
+    ));
     validate_coordinated_storage_preflight_with_env(
         "s3://bucket/table",
         &HashMap::new(),
@@ -519,6 +544,17 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             .unwrap()
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn coordinated_conditional_create_probe_uses_delta_table_store() {
+    let temp_dir = TempDir::new().unwrap();
+    let table = open_or_create_table(temp_dir.path().to_str().unwrap(), HashMap::new(), None)
+        .await
+        .unwrap();
+    verify_custom_s3_conditional_create(&table, test_publication_deadline())
+        .await
+        .unwrap();
 }
 
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {

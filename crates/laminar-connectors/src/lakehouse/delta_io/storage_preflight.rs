@@ -129,6 +129,57 @@ where
 }
 
 #[cfg(feature = "delta-lake")]
+pub(super) fn custom_s3_endpoint_configured_with_env<F>(
+    table_path: &str,
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    StorageProvider::detect_uri(table_path) == Some(StorageProvider::AwsS3)
+        && has_effective_value(
+            options,
+            &[
+                "endpoint",
+                "endpoint_url",
+                "aws_endpoint",
+                "aws_endpoint_url",
+            ],
+            &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
+            environment,
+        )
+}
+
+#[cfg(feature = "delta-lake")]
+pub(in crate::lakehouse) fn custom_s3_endpoint_configured(
+    table_path: &str,
+    options: &HashMap<String, String>,
+) -> bool {
+    custom_s3_endpoint_configured_with_env(table_path, options, &|key| std::env::var(key).ok())
+}
+
+#[cfg(feature = "delta-lake")]
+pub(in crate::lakehouse) async fn verify_custom_s3_conditional_create(
+    table: &DeltaTable,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    validate_coordinated_log_store(table)?;
+    let timeout = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(std::time::Duration::from_secs(10));
+    let store = table.object_store();
+    laminar_core::checkpoint::probe_object_store_conditional_create(store.as_ref(), "", timeout)
+        .await
+        .map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "Delta exactly-once custom S3 endpoint failed atomic conditional-create startup verification"
+                    .into(),
+            )
+        })
+}
+
+#[cfg(feature = "delta-lake")]
 pub(super) fn validate_coordinated_storage_preflight_with_env<F>(
     table_path: &str,
     options: &HashMap<String, String>,
@@ -138,6 +189,7 @@ where
     F: Fn(&str) -> Option<String>,
 {
     match StorageProvider::detect_uri(table_path) {
+        // Custom S3 endpoints also pass the table-scoped conditional-create probe in sink startup.
         Some(StorageProvider::AwsS3) => validate_coordinated_s3_options(options, environment),
         Some(StorageProvider::AzureAdls | StorageProvider::Gcs | StorageProvider::Local) => Ok(()),
         None => match table_path.split_once("://") {
