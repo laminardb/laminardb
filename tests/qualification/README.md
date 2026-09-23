@@ -109,7 +109,7 @@ uniform/Zipf/hot-key combinations. The runner never emits `s12_qualified: true`.
 under load, corrupt cuts, expired replay, G9 Backpressure/Fail saturation/checkpoint/restart
 external-ledger cases, and the intended mode's recovery/topology operations. Tables/MVs,
 stateful SQL, cluster delivery, native cloud boundaries and exact compositions need their own
-declared workloads and independent evidence. See [the execution plan](../../docs/production-hardening-plan.md#s12--qualify-the-integrated-workload-g5).
+declared workloads and independent evidence.
 
 The embedded Kafka ALO overflow diagnostic expands an intermediate projection beyond a
 64 KiB graph-port limit after establishing a durable cut. Both lossless policies must halt without

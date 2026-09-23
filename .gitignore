@@ -65,6 +65,8 @@ AGENTS.md
 .claude/
 docs/architecture/
 docs/adr/
+/docs/private-archive/
+/docs/private-decisions/
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
