@@ -4,6 +4,7 @@
 # with a unique node_id.
 #
 # Start with:
+#   export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 #   laminardb --config laminardb-cluster.toml
 
 node_id = "star-1"
@@ -11,6 +12,7 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"
 key_groups = 256
 

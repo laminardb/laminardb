@@ -3,9 +3,9 @@
 use super::{
     strip_source_row_positions, AlignedCheckpointContext, Arc, BarrierOutcome, CheckpointAttempt,
     CheckpointBarrier, CheckpointCleanupOwner, CycleError, CycleOutcome, CyclePublicationDurations,
-    FxHashMap, FxHashSet, Instant, PendingWatermarkBatch, PipelineCallback, RecordBatch,
-    SourceBatchCursor, SourceCheckpoint, SourceInputMode, SourceMsg, StreamingCoordinator,
-    SOURCE_MUTATION_COLUMN,
+    FxHashMap, FxHashSet, Instant, PendingWatermarkBatch, PipelineCallback, QueuedSourceMsg,
+    RecordBatch, SourceBatchCursor, SourceCheckpoint, SourceInputMode, SourceMsg,
+    StreamingCoordinator, SOURCE_MUTATION_COLUMN,
 };
 
 impl StreamingCoordinator {
@@ -120,12 +120,12 @@ impl StreamingCoordinator {
     /// Process one source message under the exact source-barrier ordering invariant.
     pub(super) fn process_msg(
         &mut self,
-        msg: SourceMsg,
+        msg: QueuedSourceMsg,
         callback: &mut impl PipelineCallback,
         barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
         cycle_events: &mut u64,
     ) -> Result<(), CycleError> {
-        match msg {
+        match msg.message {
             SourceMsg::Batch {
                 source_idx,
                 batch,
@@ -176,11 +176,11 @@ impl StreamingCoordinator {
     /// ignored; they must never affect later open-epoch data.
     pub(super) fn process_shutdown_msg(
         &mut self,
-        msg: SourceMsg,
+        msg: QueuedSourceMsg,
         callback: &mut impl PipelineCallback,
         cycle_events: &mut u64,
     ) -> Option<String> {
-        match msg {
+        match msg.message {
             SourceMsg::Batch {
                 source_idx,
                 batch,

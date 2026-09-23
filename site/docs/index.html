@@ -4,19 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB Docs — Configuration Reference</title>
-  <meta name="description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
+  <meta name="description" content="LaminarDB server configuration, memory limits, production tuning, connectors, checkpoints, and deployment.">
   <meta name="robots" content="index, follow, max-image-preview:large">
   <meta name="theme-color" content="#f8fafc">
   <link rel="canonical" href="https://laminardb.io/docs/">
   <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
 
   <meta property="og:title" content="LaminarDB Docs — Configuration Reference">
-  <meta property="og:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
+  <meta property="og:description" content="LaminarDB server configuration, memory limits, production tuning, connectors, checkpoints, and deployment.">
   <meta property="og:url" content="https://laminardb.io/docs/">
   <meta property="og:type" content="article">
   <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="LaminarDB Docs — Configuration Reference">
-  <meta name="twitter:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment.">
+  <meta name="twitter:description" content="LaminarDB server configuration, memory limits, production tuning, connectors, checkpoints, and deployment.">
 
   <script type="application/ld+json">
   {
@@ -26,10 +26,10 @@
         "@type": "TechArticle",
         "@id": "https://laminardb.io/docs/#article",
         "headline": "LaminarDB Configuration Reference",
-        "description": "Complete configuration reference for the LaminarDB standalone server: TOML fields, REST API endpoints, connector properties, checkpoint configuration, hot reload, Prometheus metrics, and join semantics. Every field verified against the source code.",
+        "description": "Configuration reference for the LaminarDB server: TOML fields, memory limits, production tuning, REST API endpoints, connectors, checkpoints, metrics, and join semantics.",
         "url": "https://laminardb.io/docs/",
         "inLanguage": "en",
-        "dateModified": "2026-05-25",
+        "dateModified": "2026-09-23",
         "isPartOf": { "@id": "https://laminardb.io/#website" },
         "about": { "@id": "https://laminardb.io/#software" },
         "author": { "@id": "https://laminardb.io/#org" },
@@ -37,6 +37,7 @@
         "proficiencyLevel": "Expert",
         "articleSection": [
           "Server Configuration",
+          "Memory Limits and Production Tuning",
           "State Configuration",
           "Checkpoint Configuration",
           "REST API",
@@ -499,6 +500,7 @@
       <a href="#server-config">Server Config</a>
       <a href="#cluster-config">Cluster Config</a>
       <a href="#checkpoint-config">Checkpoints</a>
+      <a href="#production-tuning">Memory &amp; Production Tuning</a>
       <a href="#console-ui-api">Console UI &amp; Control API</a>
       <a href="#rest-api">REST API</a>
       <a href="#hot-reload">Hot Reload</a>
@@ -547,9 +549,10 @@
       <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Standalone Server &amp; Configuration Reference</h1>
       <p style="color: var(--text-dim); margin-bottom: 1rem;">
         The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
-        Every field on this page is verified against
-        <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
-        Last updated: 25 May 2026.
+        Server and checkpoint defaults are checked against
+        <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config/mod.rs" target="_blank" rel="noopener">server config</a>
+        and <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/config.rs" target="_blank" rel="noopener">engine config</a>.
+        Last updated: 23 September 2026.
       </p>
 
       <h3>Install</h3>
@@ -586,7 +589,7 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
       <!-- ============================================================ -->
 
       <h2 id="server-config">[server]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:244</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config/mod.rs" target="_blank" rel="noopener">crates/laminar-server/src/config/mod.rs</a></div>
 
       <p>
         The <code>[server]</code> section configures standalone server behaviors, control plane security, and pgwire network parameters.
@@ -625,11 +628,19 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
             <td class="field-default">true</td>
             <td>Query execution policy: emit dirty-only changelog updates for keyed non-windowed running aggregates.</td>
           </tr>
+          <tr><td class="field-name">datafusion_memory_limit_bytes</td><td class="field-type">usize</td><td class="field-default">268435456 (256 MiB)</td><td>Shared participating DataFusion reservations per DB/node. Positive value required; direct Arrow allocations and process RSS are outside this limit.</td></tr>
+          <tr><td class="field-name">source_queue_max_bytes</td><td class="field-type">usize</td><td class="field-default">67108864 (64 MiB)</td><td>Shared connector-to-coordinator Arrow queue, including parked input. Each source's waiting batch must fit; value must be positive and at most the engine's <code>MAX_SOURCE_QUEUE_BYTES</code>.</td></tr>
+          <tr><td class="field-name">pipeline_max_input_buf_batches</td><td class="field-type">usize</td><td class="field-default">256</td><td>Batch count per graph input port. Set to 0 to disable the count limit.</td></tr>
+          <tr><td class="field-name">pipeline_max_input_buf_bytes</td><td class="field-type">usize</td><td class="field-default">unset</td><td>Optional retained Arrow-byte limit per graph input port; must be positive when set. Fan-out is charged at each port.</td></tr>
+          <tr><td class="field-name">reference_table_max_rows</td><td class="field-type">usize</td><td class="field-default">1000000</td><td>Positive live-row limit for each local reference table.</td></tr>
+          <tr><td class="field-name">reference_table_max_bytes</td><td class="field-type">usize</td><td class="field-default">268435456 (256 MiB)</td><td>Positive retained-memory charge limit for each local reference table. Cluster reference-table plans are restricted.</td></tr>
+          <tr><td class="field-name">materialized_view_max_rows</td><td class="field-type">usize</td><td class="field-default">1000000</td><td>Positive live-row limit for each local materialized view.</td></tr>
+          <tr><td class="field-name">materialized_view_max_bytes</td><td class="field-type">usize</td><td class="field-default">268435456 (256 MiB)</td><td>Positive retained-memory charge limit for each local materialized view. Cluster materialized views are rejected.</td></tr>
           <tr>
             <td class="field-name">console_token</td>
             <td class="field-type">String</td>
             <td class="field-default">none</td>
-            <td>Bearer token gating HTTP control-plane API access and WebSockets. If omitted, API is unauthenticated.</td>
+            <td>Bearer token gating HTTP control-plane API access and WebSockets. Required for non-loopback HTTP binds; omission permits anonymous loopback development access.</td>
           </tr>
           <tr>
             <td class="field-name">console_cors_allowed_origins</td>
@@ -714,9 +725,8 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
         <pre><code class="language-toml">[server]
 mode = "single"
 bind = "0.0.0.0:8080"
-console_token = "supersecret"
-pgwire_bind = "0.0.0.0:5433"
-pgwire_allow_remote = true</code></pre>
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
+pgwire_bind = "127.0.0.1:5433"</code></pre>
       </div>
 
       <!-- ============================================================ -->
@@ -730,7 +740,7 @@ pgwire_allow_remote = true</code></pre>
         When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared checkpoint object store; there is no separate <code>[coordination]</code> section or embedded Raft service.
       </p>
       <p>
-        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once is connector-gated; the current admitted composition is exact-certified Kafka input with direct S3/S3A append-mode Delta Lake, pending the production soak gate. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
+        Cluster mode requires a shared checkpoint URL on S3, GCS, or Azure. At-least-once requires replayable input and a durable sink. Cluster exactly-once supports Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Local paths and <code>file://</code> checkpoints are rejected because peers cannot recover them.
       </p>
 
       <h3>[discovery]</h3>
@@ -781,7 +791,7 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
 
       <!-- CHECKPOINT -->
       <h2 id="checkpoint-config">[checkpoint]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:255</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config/mod.rs" target="_blank" rel="noopener">crates/laminar-server/src/config/mod.rs</a></div>
 
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
@@ -813,8 +823,8 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
           <tr>
             <td class="field-name">max_node_data_bytes</td>
             <td class="field-type">u64</td>
-            <td class="field-default">none</td>
-            <td>Bound on captured state bytes awaiting durable upload (runtime default 512 MiB).</td>
+            <td class="field-default">536870912 (512 MiB)</td>
+            <td>Maximum participant checkpoint data object and in-flight captured-state admission. Positive value required; separate from live-state limits.</td>
           </tr>
         </tbody>
       </table>
@@ -830,6 +840,37 @@ aws_region = "us-east-1"
 aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
 aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </div>
+
+      <h2 id="production-tuning">Memory Limits &amp; Production Tuning</h2>
+      <p>
+        The limits above are independent admission budgets. DataFusion reservations are shared per DB/node;
+        source queue bytes are shared per DB/node; graph input limits apply to each port; reference-table and
+        materialized-view limits apply to each local table or view. They do not sum to a process RSS cap.
+        Connector decoding, direct Arrow allocations, managed state, query results, checkpoint encoding,
+        restore staging and allocator overhead need separate headroom.
+      </p>
+      <p>
+        Managed operator working state has a default 256 MiB charged-byte budget. Embedded users can change
+        <code>pipeline_max_managed_state_bytes</code> through <code>LaminarConfig</code> or the builder; server TOML
+        does not expose it. Its charge is a lower bound, not total resident memory. Local reference tables and
+        materialized views are unavailable in cluster plans that require distributed ownership.
+      </p>
+      <h3>Size a deployment</h3>
+      <ol>
+        <li>Run representative peak input, bursts and a fault/restart cycle with the intended SQL and connectors. Measure peak process or container RSS, source lag and checkpoint duration.</li>
+        <li>Observe <code>/metrics</code>: <code>laminardb_cycles_backpressured_total</code>, <code>laminardb_input_buf_bytes</code>, <code>laminardb_managed_state_accounted_bytes</code>, <code>laminardb_checkpoint_size_bytes</code> and checkpoint failure/duration metrics. Use OS or container RSS for the actual memory envelope.</li>
+        <li>Set container memory requests and limits above the measured peak with room for Arrow and connector scratch, simultaneous old/new state on recovery, and checkpoint capture. The Helm chart defaults to <code>resources: {}</code>; supply workload-specific values.</li>
+        <li>If admission saturates, examine batch size and downstream throughput before raising queue or graph-port limits. A result too large for a port after execution faults the pipeline. Size <code>checkpoint.max_node_data_bytes</code> above the largest expected participant artifact and verify recovery at that setting.</li>
+      </ol>
+      <p>
+        <code>checkpoint.interval</code> defaults to <code>10s</code> and trades replay work against checkpoint
+        traffic. <code>checkpoint.timeout</code> defaults to <code>120s</code>; keep it above observed attempt
+        duration. Changes to <code>[server]</code> and <code>[checkpoint]</code> require a restart. The main I/O
+        runtime uses <code>TOKIO_WORKER_THREADS</code> (logical CPU count by default), while streaming compute
+        uses one dedicated thread. On the default non-MSVC build, jemalloc can be tuned with
+        <code>MALLOC_CONF</code> at process start; see the
+        <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/README.md#tuning-the-allocator-malloc_conf" target="_blank" rel="noopener">allocator guidance</a>.
+      </p>
 
       <!-- CONSOLE UI & CONTROL API -->
       <h2 id="console-ui-api">Console UI &amp; Control API</h2>
@@ -1253,7 +1294,7 @@ max_out_of_orderness = "5s"</code></pre>
       <!-- ============================================================ -->
 
       <h2 id="connectors" style="font-size: 1.5rem;">Connectors</h2>
-      <p>All connectors are feature-gated. Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.</p>
+      <p>In Rust builds, include the connectors you need with Cargo features, for example <code>cargo add laminar-db --features kafka,delta-lake</code>. These are build options, not runtime approval gates.</p>
       <p>Set delivery once at <code>[server].delivery</code> (or <code>LaminarDbBuilder::delivery_guarantee</code> when embedded). The runtime injects the selected protocol and owns checkpoint/committer identities; connector properties do not require public writer IDs.</p>
 
       <div class="connector-grid">
@@ -1548,7 +1589,7 @@ max_out_of_orderness = "5s"</code></pre>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode. Cluster exact admission is limited to direct S3/S3A and remains a native-cloud fault/soak gate. Alternate log stores and custom production endpoints fail closed.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's coordinated protocol is limited to append mode and the atomic-create DefaultLogStore. Custom S3 endpoints must pass an atomic conditional-create probe at sink startup. Cluster exactly-once still requires an S3/S3A table URI.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
@@ -1798,7 +1839,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Single-node currently requires an exclusively locked local checkpoint directory, an exact-certified replayable source, and a coordinated sink. Cluster mode requires a shared checkpoint URL, exact-certified Kafka input, and direct S3/S3A append-mode Delta Lake; production certification remains release-soak gated. Kafka output and Apache Iceberg remain durable at-least-once. Unsupported combinations fail before connector I/O.</td>
+            <td>Single-node requires an exclusively locked local checkpoint directory, a replayable source with exact recovery, and a coordinated sink. Cluster mode requires a shared checkpoint URL and Kafka input with either an S3/S3A append-mode Delta Lake sink or a REST-catalog Iceberg append sink backed by S3/S3A storage. Kafka output remains at-least-once. Unsupported combinations fail before connector I/O.</td>
           </tr>
         </tbody>
       </table>
@@ -1807,8 +1848,8 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         Delivery is one pipeline-wide setting. Per-connector delivery fields are rejected, and
         incompatible connectors fail before external I/O. For example, WebSocket, OTLP, and NATS
         Core sources are non-replayable and therefore require <code>best_effort</code>. Cluster
-        <code>exactly_once</code> admits only exact-certified Kafka input with direct S3/S3A
-        append-mode Delta Lake; other combinations fail closed before connector I/O.
+        <code>exactly_once</code> admits Kafka input with an S3/S3A append-mode Delta Lake sink
+        or a REST-catalog Iceberg append sink backed by S3/S3A storage.
       </p>
 
       <!-- Full example -->

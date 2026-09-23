@@ -1,0 +1,87 @@
+{
+  "owner": "LaminarDB maintainers responsible for PR #540",
+  "approved": "2026-09-21",
+  "expires": "2026-10-21",
+  "exceptions": [
+    {
+      "advisory": "RUSTSEC-2023-0071",
+      "crate": "rsa",
+      "version": "0.9.10",
+      "reason": "Accepted residual timing leakage risk; no patched release, reqsign uses randomized signing for cloud authentication."
+    },
+    {
+      "advisory": "RUSTSEC-2024-0384",
+      "crate": "instant",
+      "version": "0.1.13",
+      "reason": "Accepted unmaintained wider lockfile dependency through reqwest-retry, wasm-timer and old parking_lot."
+    },
+    {
+      "advisory": "RUSTSEC-2024-0436",
+      "crate": "paste",
+      "version": "1.0.15",
+      "reason": "Accepted unmaintained compile-time dependency through DataFusion, Parquet and tokenizers."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0173",
+      "crate": "proc-macro-error2",
+      "version": "2.0.1",
+      "reason": "Accepted unmaintained compile-time dependency through validator_derive in Delta Lake."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0194",
+      "crate": "quick-xml",
+      "version": "0.39.4",
+      "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched attribute-check CPU denial-of-service risk until expiry."
+    },
+    {
+      "advisory": "RUSTSEC-2026-0195",
+      "crate": "quick-xml",
+      "version": "0.39.4",
+      "reason": "Workspace backport is source-verified; registry publication separately accepts the unpatched namespace-allocation denial-of-service risk until expiry."
+    }
+  ],
+  "packages": [
+    {
+      "name": "instant",
+      "version": "0.1.13",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e0242819d153cba4b4b05a5a8f2a7e9bbf97b6055b2a002b395c96b5ff3c0222"
+    },
+    {
+      "name": "paste",
+      "version": "1.0.15",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+    },
+    {
+      "name": "proc-macro-error2",
+      "version": "2.0.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+    },
+    {
+      "name": "quick-xml",
+      "version": "0.39.4"
+    },
+    {
+      "name": "quick-xml",
+      "version": "0.41.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+    },
+    {
+      "name": "rsa",
+      "version": "0.9.10",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
+    }
+  ],
+  "publication": {
+    "advisories": ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"],
+    "reason": "Explicitly accepted on 2026-09-21 through the policy expiry: Cargo does not propagate the workspace XML patch to registry consumers. object_store 0.13.2 still requires quick-xml ^0.39.0; upgrading the analytical dependency generation is outside this repair. Unpatched registry consumers retain CPU and memory denial-of-service exposure when parsing hostile XML."
+  },
+  "backport": {
+    "path": "vendor/quick-xml",
+    "sha256": "cdf0eb6198ab867db45ba6230c8ebe176299488b13fc69744e34f86c243f19b0"
+  }
+}

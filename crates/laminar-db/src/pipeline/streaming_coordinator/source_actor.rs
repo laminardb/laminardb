@@ -750,14 +750,12 @@ impl SourceActorSpawner<'_> {
                             &primary_key_indices,
                             contract.row_positions,
                             input,
-                        ) {
+                        )
+                        .and_then(|batch| task_tx.validate_batch(batch))
+                        {
                             Ok(batch) => batch,
                             Err(error) => {
-                                lifecycle.fault_data_plane();
-                                let _ = task_fault_tx.send(SourceFault {
-                                    source: Arc::from(src_name.as_str()),
-                                    error: error.to_string(),
-                                });
+                                lifecycle.report_fault(&task_fault_tx, &src_name, &error);
                                 break;
                             }
                         };
@@ -1072,14 +1070,12 @@ impl SourceActorSpawner<'_> {
                                 &primary_key_indices,
                                 contract.row_positions,
                                 input,
-                            ) {
+                            )
+                            .and_then(|batch| task_tx.validate_batch(batch))
+                            {
                                 Ok(batch) => batch,
                                 Err(error) => {
-                                    lifecycle.fault_data_plane();
-                                    let _ = task_fault_tx.send(SourceFault {
-                                        source: Arc::from(src_name.as_str()),
-                                        error: error.to_string(),
-                                    });
+                                    lifecycle.report_fault(&task_fault_tx, &src_name, &error);
                                     break;
                                 }
                             };

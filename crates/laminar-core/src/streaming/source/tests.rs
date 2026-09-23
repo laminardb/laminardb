@@ -3,12 +3,30 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use std::sync::Arc;
 
+#[tokio::test]
+async fn oversized_arrow_is_rejected_before_sequence_advances() {
+    let (source, _sink) = create::<TestEvent>(16);
+    let rows = 3 * 1024 * 1024;
+    let batch = RecordBatch::try_new(
+        TestEvent::schema(),
+        vec![
+            Arc::new(Int64Array::from(vec![0; rows])),
+            Arc::new(Float64Array::from(vec![0.0; rows])),
+            Arc::new(Int64Array::from(vec![0; rows])),
+        ],
+    )
+    .unwrap();
+    assert!(source.push_arrow(batch).is_err());
+    assert_eq!(source.sequence(), 0);
+    assert_eq!(source.pending(), 0);
+}
+
 // Test record type
 #[derive(Clone, Debug)]
-struct TestEvent {
-    id: i64,
-    value: f64,
-    timestamp: i64,
+pub(super) struct TestEvent {
+    pub(super) id: i64,
+    pub(super) value: f64,
+    pub(super) timestamp: i64,
 }
 
 impl Record for TestEvent {

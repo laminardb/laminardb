@@ -104,6 +104,11 @@ impl KafkaBlockingTasks {
         }
     }
 
+    pub(super) async fn is_idle(&self) -> bool {
+        self.reap_finished().await;
+        self.handles.lock().await.is_empty()
+    }
+
     pub(super) fn retire(&self) {
         self.retired.store(true, Ordering::Release);
     }

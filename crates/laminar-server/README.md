@@ -39,7 +39,9 @@ cargo install laminar-server
 laminardb --config laminardb.toml
 
 # Docker
-docker run -d -p 8080:8080 -v laminardb-data:/var/lib/laminardb \
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+docker run -d -p 8080:8080 -e LAMINAR_CONSOLE_TOKEN \
+  -v laminardb-data:/var/lib/laminardb \
   ghcr.io/laminardb/laminardb-server:latest
 
 # Check health
@@ -50,11 +52,25 @@ curl http://localhost:8080/health
 
 See the [Configuration Reference](https://laminardb.io/docs/) for every field, or the example below:
 
+Set `LAMINAR_CONSOLE_TOKEN` before starting with this configuration. Non-loopback HTTP binds
+require a console token; loopback development can omit it. Use `Authorization: Bearer <token>`
+for protected routes. HTTP TLS terminates at a trusted proxy; pgwire and cluster TLS settings
+do not protect HTTP. Restrict network access to the public health and metrics endpoints.
+
 ```toml
 [server]
 mode = "single"             # "single" (standalone) or "cluster" (multi-node)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 delivery = "at_least_once"  # pipeline-wide; cluster EO is connector-capability gated
+datafusion_memory_limit_bytes = 268435456 # shared per DB/node; 256 MiB default, must be > 0
+source_queue_max_bytes = 67108864 # shared connector FIFO per DB/node; 64 MiB default
+reference_table_max_rows = 1000000 # independently per local reference table; must be > 0
+reference_table_max_bytes = 268435456 # retained-memory charge per local table; 256 MiB default
+materialized_view_max_rows = 1000000 # per local MV; distinct rows for multiset storage
+materialized_view_max_bytes = 268435456 # retained-memory charge per local MV; must be > 0
+# pipeline_max_input_buf_batches = 256 # per graph input port; 0 disables count limit
+# pipeline_max_input_buf_bytes = 33554432 # optional per-port Arrow bytes; unset disables
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
@@ -62,17 +78,22 @@ pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for S
 # [server.pgwire_users]
 # alice = "${ALICE_PASSWORD}"
 # bob   = "${BOB_PASSWORD}"
-# Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
+# Main I/O runtime worker count uses $TOKIO_WORKER_THREADS (default: logical CPUs).
+# Streaming compute uses one separate single-threaded laminar-compute runtime.
 
 [checkpoint]
-# Provider-neutral object_store URL: file://, s3://, gs://, az://, or abfs(s)://.
+# Provider-neutral object_store URL: absolute file://, s3[a]://, gs/gcs://,
+# az://, abfs[s]://, or wasb[s]://.
 # R2 and MinIO use s3:// with their endpoint option. Credentials come from the
 # standard provider environment or [checkpoint.storage]. Cluster URLs must be
 # visible to every node. Replay-capable single-node delivery currently requires
 # file:// until remote writer fencing lands. Startup verifies conditional puts.
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
-timeout = "120s" # one deadline across fence, capture, durable decision, and completion
+timeout = "120s" # checkpoint deadline and per-phase cluster assignment-recovery bound
+
+# Provider features, accepted aliases, ambient identity, and native evidence:
+# ../../docs/cloud-object-store-support.md
 
 [[source]]
 name = "trades"
@@ -184,11 +205,15 @@ including remote AI — runs normally.
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
 
-- `SUBSCRIBE <name> [WHERE <predicate>]`: streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
+- `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <predicate>]`: local mode streams live output from a materialized view, source, or named stream. Cluster mode exposes committed output only for certified non-windowed keyed aggregate streams. The query stays open until the client disconnects or a terminal error occurs.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
-`WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
+`WHERE` is compiled with DataFusion against the resolved output schema; an unresolved named-stream
+schema is rejected. Local epoch replay uses byte-bounded in-memory history. Cluster replay uses
+verified segments in the checkpoint store and is partition-ordered. There is no atomic
+snapshot-plus-tail attachment or durable named-consumer cursor. See the
+[subscription boundaries](../../docs/SQL_REFERENCE.md#subscribe-over-the-postgres-wire-protocol).
 
 ### Authentication
 
@@ -271,6 +296,8 @@ cluster_tls_server_name = "laminar-cluster"       # DNS SAN present in every nod
 
 Every node both serves and dials, so the CA verifies **both** directions. Because peers connect by IP, issue all node certs with one shared DNS SAN and set `cluster_tls_server_name` to it (rather than per-node IP SANs). Enabling mTLS is a **coordinated cutover**: a TLS node cannot talk to a plaintext peer, so roll it out to all nodes at once. Cert rotation currently requires a restart (no hot reload on the control plane).
 
+Gossip discovery uses separate UDP traffic and is not covered by cluster mTLS. With `strategy = "gossip"`, keep the gossip network trusted or isolated.
+
 ## Hot Reload
 
 Edit the TOML file while the server is running. The file watcher detects changes (500ms debounce), diffs the configuration, and applies incremental DDL:
@@ -279,6 +306,77 @@ Edit the TOML file while the server is running. The file watcher detects changes
 2. Recreates sources, lookups, pipelines, sinks that were added or changed
 
 Changes to `[server]` and `[checkpoint]` require a restart. Disable the file watcher with `LAMINAR_DISABLE_FILE_WATCH=1`.
+
+## Memory limits and production tuning
+
+These defaults apply **per DB/node** unless the scope says per table, view, or graph port.
+They are independent admission budgets, not a process memory limit. Set byte values as integer
+bytes in `laminardb.toml`; the example under [Configuration](#configuration) shows the syntax.
+
+| Setting | Default | Scope |
+|---|---:|---|
+| `server.datafusion_memory_limit_bytes` | 256 MiB | Shared participating DataFusion reservations; DB-owned contexts do not spill to disk. |
+| `server.source_queue_max_bytes` | 64 MiB | Shared connector-to-coordinator Arrow queue, including parked input; each source's waiting batch must also fit. Must be positive and at most `MAX_SOURCE_QUEUE_BYTES`. |
+| `server.pipeline_max_input_buf_batches` | 256 | Each graph input port; `0` disables the count limit. |
+| `server.pipeline_max_input_buf_bytes` | unset | Each graph input port; a configured value must be positive. |
+| `server.reference_table_max_rows` / `server.reference_table_max_bytes` | 1,000,000 / 256 MiB | Each local reference table; both values must be positive. |
+| `server.materialized_view_max_rows` / `server.materialized_view_max_bytes` | 1,000,000 / 256 MiB | Each local materialized view; both values must be positive. |
+| `checkpoint.max_node_data_bytes` | 512 MiB | Maximum participant checkpoint data object and in-flight captured-state admission, separate from live-state limits. |
+
+The engine also defaults to a 256 MiB charged-byte budget for managed operator working state.
+Embedded users can set `pipeline_max_managed_state_bytes` through `LaminarConfig` or the builder;
+the server TOML does not expose this setting. Its accounting is a lower bound and is not RSS.
+Reference tables and materialized views are local only; cluster plans requiring them remain rejected.
+
+For a production deployment, start with a representative peak workload and a durable checkpoint
+location. Record **peak process/container RSS**, source lag, cycle backpressure, graph input bytes,
+managed-state charge, checkpoint size and checkpoint duration during normal load, bursts, and
+recovery. The `/metrics` endpoint exposes `laminardb_cycles_backpressured_total`,
+`laminardb_input_buf_bytes`, `laminardb_managed_state_accounted_bytes`,
+`laminardb_checkpoint_size_bytes`, and checkpoint duration/failure metrics. The managed-state
+metric is a lower-bound charge, so use OS/container RSS for memory sizing.
+
+Set the container memory limit above the measured peak with room for connector decoding, Arrow
+buffers, operator scratch, query results, simultaneous old/new state during restore, checkpoint
+capture/encoding, and allocator overhead. The Helm chart leaves `resources` unset; supply
+workload-specific requests and limits. Reducing one budget does not reduce all other owners.
+If a queue or port saturates, inspect source batch size and downstream capacity before raising
+its cap. An oversized graph result after execution faults the pipeline; an oversized checkpoint
+or restored state can fail recovery. Set `checkpoint.max_node_data_bytes` high enough for the
+largest expected participant artifact, then validate with fault/restart testing. Choose
+`checkpoint.interval` for acceptable replay work and storage traffic, and keep
+`checkpoint.timeout` above observed checkpoint duration (defaults: 10s and 120s).
+
+`server.datafusion_memory_limit_bytes` bounds participating fallible DataFusion reservations in both
+server modes and requires a restart to change. DB-owned contexts share the limit and disable
+disk spilling. It does not cap process RSS, queues, managed state or connector I/O allocations;
+see the [memory scope](../laminar-db/README.md#datafusion-memory-limit).
+
+`server.source_queue_max_bytes` bounds queued connector Arrow storage in both server modes
+and requires a restart to change. It also caps each individual source batch; oversized input
+faults before its cursor is settled. See the [queue ownership scope](../laminar-db/README.md#connector-source-queue-limit)
+for producer scratch, parked messages and downstream retention.
+
+`server.pipeline_max_input_buf_batches` and `server.pipeline_max_input_buf_bytes` configure
+prospective graph-port limits in both server modes. The count default is 256; the byte cap is
+unset by default and must be greater than zero when supplied. Fan-out charges each port
+independently. Output that cannot fit after execution halts before routing; see the
+[graph input contract](../laminar-db/README.md#graph-input-limits). These startup settings are
+not hot-reloaded and do not bound total process RSS.
+
+`server.reference_table_max_rows` and `server.reference_table_max_bytes` bound each local
+reference table's final state. Both must be greater than zero and require a restart to change.
+Over-limit updates, multi-table refreshes and checkpoint restores fail before live installation.
+Cluster reference-table admission remains restricted. See the
+[table accounting and staging scope](../laminar-db/README.md#reference-table-memory-limits)
+for shared Arrow buffers, external ownership, checkpoint captures and memory headroom.
+
+`server.materialized_view_max_rows` and `server.materialized_view_max_bytes` apply to every
+local MV storage mode. Both must be nonzero. Aggregate, upsert and multiset growth fails
+before any affected MV changes or publishes cycle output. Append storage evicts oldest
+complete batches, but rejects a single batch that cannot fit. Restore fails instead of
+truncating committed state. Cluster MV admission remains rejected. See the
+[MV accounting and publication scope](../laminar-db/README.md#materialized-view-memory-limits).
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 
@@ -303,7 +401,7 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:3000,muzzy_d
 
 ### Settings to avoid
 
-- **Do not set `narenas:N` to a small value.** The jemalloc default is `ncpus * 4`, which gives each reactor / sink thread its own arena and eliminates cross-thread contention on `malloc`/`free`. LaminarDB is thread-per-core. Forcing `narenas:4` on an 8-core box means multiple reactors share an arena, and the lock contention shows up directly in the sink commit path. Leave `narenas` unset.
+- **Leave `narenas` unset unless measurements justify changing it.** LaminarDB runs one coordinator on the dedicated single-threaded `laminar-compute` runtime; connector I/O, checkpoint persistence and sink publication use the main work-stealing runtime. Too few allocator arenas can increase contention among those threads. Profile the actual workload before tuning the arena count.
 - **Do not set `tcache:false`.** The per-thread small-allocation cache is load-bearing on any sink that churns Arrow/Parquet buffers.
 
 ### How to set it

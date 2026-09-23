@@ -24,8 +24,9 @@ pub struct ProcessLeaseConfig {
 impl Default for ProcessLeaseConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(15),
-            renew_interval: Duration::from_secs(5),
+            // Same one-tail margin as the leader lease; incarnation revocation waits a full TTL.
+            ttl: Duration::from_secs(10),
+            renew_interval: Duration::from_secs(2),
         }
     }
 }

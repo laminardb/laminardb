@@ -21,7 +21,7 @@ use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 #[cfg(feature = "cluster")]
-use crate::operator::capability::{ClusterExecutionStatus, ManagedStateContract};
+use crate::operator::capability::ClusterExecutionStatus;
 use crate::operator::capability::{OperatorCapability, OperatorImplementation, OperatorStateClass};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
@@ -36,6 +36,9 @@ use laminar_sql::translator::{
 };
 
 mod catalog_context;
+mod input_admission;
+
+use input_admission::retained_input_bytes;
 #[cfg(feature = "cluster")]
 mod execution_poison;
 #[cfg(feature = "cluster")]
@@ -1020,6 +1023,8 @@ pub(crate) struct OperatorGraph {
     input_sources: Vec<Vec<usize>>,
     output_watermarks: Vec<i64>,
     output_idle: Vec<bool>,
+    // Source progress travels with primed input until its passthrough actually executes.
+    source_input_frontiers: Vec<InputFrontier>,
     #[cfg(feature = "cluster")]
     local_source_frontiers: Vec<InputFrontier>,
     /// Decision-bound per-source caps used only by managed temporal joins. Other ordered
@@ -1122,6 +1127,7 @@ impl OperatorGraph {
             input_sources: Vec::new(),
             output_watermarks: Vec::new(),
             output_idle: Vec::new(),
+            source_input_frontiers: Vec::new(),
             #[cfg(feature = "cluster")]
             local_source_frontiers: Vec::new(),
             #[cfg(feature = "cluster")]
@@ -1285,9 +1291,7 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .any(|(node_id, node)| {
-                !node.operator.wants_input()
-                    || (!self.source_node_ids.contains(&node_id)
-                        && self.input_bufs[node_id].iter().any(|port| !port.is_empty()))
+                !node.operator.wants_input() || self.node_has_buffered_input(node_id)
             })
     }
 
@@ -1299,13 +1303,11 @@ impl OperatorGraph {
             .any(|(node_id, node)| {
                 !matches!(self.gate_decision(node_id), GateDecision::Skip)
                     && (node.operator.deferred_work_is_runnable()
-                        || (!self.source_node_ids.contains(&node_id)
-                            && node.operator.wants_input()
-                            && self.input_bufs[node_id].iter().any(|port| !port.is_empty())))
+                        || (node.operator.wants_input() && self.node_has_buffered_input(node_id)))
             })
     }
 
-    /// Logical bytes queued on every live input port. Uses the maintained per-port byte counters
+    /// Conservatively charged retained Arrow bytes on every live input port. Uses the maintained per-port byte counters
     /// rather than walking Arrow batches, so checkpoint drain polling is independent of the number
     /// of buffered batches.
     pub(crate) fn checkpoint_pending_input_bytes(&self) -> usize {
@@ -1639,112 +1641,6 @@ impl OperatorGraph {
             })
     }
 
-    fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
-        let cap = self.max_input_buf_batches;
-        let max_bytes = self.max_input_buf_bytes;
-        if cap == 0 && max_bytes.is_none() {
-            return false;
-        }
-        self.nodes[node_id]
-            .output_routes
-            .iter()
-            .any(|&(target, port)| {
-                let p = port as usize;
-                let over_count = cap > 0 && self.input_bufs[target][p].len() >= cap;
-                let over_bytes =
-                    max_bytes.is_some_and(|max| self.input_buf_bytes[target][p] >= max);
-                over_count || over_bytes
-            })
-    }
-
-    fn shed_to_cap(&mut self, target: usize, port: u8) -> usize {
-        if !matches!(self.backpressure_policy, BackpressurePolicy::ShedOldest) {
-            return 0;
-        }
-        let cap = self.max_input_buf_batches;
-        let max_bytes = self.max_input_buf_bytes;
-        let p = port as usize;
-
-        let mut drop_n = if cap > 0 && self.input_bufs[target][p].len() > cap {
-            self.input_bufs[target][p].len() - cap
-        } else {
-            0
-        };
-        if let Some(max) = max_bytes {
-            let buf = &self.input_bufs[target][p];
-            let mut remaining = self.input_buf_bytes[target][p];
-            for b in buf.iter().take(drop_n) {
-                remaining = remaining.saturating_sub(b.get_array_memory_size());
-            }
-            while remaining > max && drop_n < buf.len() {
-                remaining = remaining.saturating_sub(buf[drop_n].get_array_memory_size());
-                drop_n += 1;
-            }
-        }
-        if drop_n == 0 {
-            return 0;
-        }
-        let mut bytes_removed = 0usize;
-        let rows: usize = self.input_bufs[target][p]
-            .drain(..drop_n)
-            .map(|b| {
-                bytes_removed += b.get_array_memory_size();
-                b.num_rows()
-            })
-            .sum();
-        let slot = &mut self.input_buf_bytes[target][p];
-        *slot = slot.saturating_sub(bytes_removed);
-        rows
-    }
-
-    fn gate_decision(&self, node_id: usize) -> GateDecision {
-        if !self.is_downstream_at_capacity(node_id) {
-            return GateDecision::Run;
-        }
-        match self.backpressure_policy {
-            BackpressurePolicy::Backpressure => GateDecision::Skip,
-            BackpressurePolicy::Fail => GateDecision::Fail,
-            BackpressurePolicy::ShedOldest => GateDecision::Run,
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    fn debug_assert_byte_sums(&self) {
-        for (id, ports) in self.input_bufs.iter().enumerate() {
-            for (port, buf) in ports.iter().enumerate() {
-                let actual: usize = buf.iter().map(RecordBatch::get_array_memory_size).sum();
-                debug_assert_eq!(
-                    self.input_buf_bytes[id][port], actual,
-                    "input_buf_bytes drift at node={} port={}",
-                    &*self.nodes[id].name, port,
-                );
-            }
-        }
-    }
-
-    fn push_to_port(&mut self, target: usize, port: u8, batches: Vec<RecordBatch>, bytes: usize) {
-        let buf = &mut self.input_bufs[target][port as usize];
-        if buf.is_empty() {
-            *buf = batches;
-        } else {
-            buf.extend(batches);
-        }
-        self.input_buf_bytes[target][port as usize] += bytes;
-        self.record_shed(target, port);
-    }
-
-    fn record_shed(&mut self, target: usize, port: u8) {
-        let rows = self.shed_to_cap(target, port);
-        if rows == 0 {
-            return;
-        }
-        if let Some(ref prom) = self.prom {
-            prom.shed_records_total
-                .with_label_values(&[&self.nodes[target].name])
-                .inc_by(rows as u64);
-        }
-    }
-
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
         self.ensure_live_provider(&name, &schema);
         self.source_schemas.insert(name, schema);
@@ -1903,6 +1799,7 @@ impl OperatorGraph {
             self.input_sources[id] = vec![usize::MAX; input_port_count];
             self.output_watermarks[id] = i64::MIN;
             self.output_idle[id] = false;
+            self.source_input_frontiers[id] = InputFrontier::default();
             #[cfg(feature = "cluster")]
             {
                 self.local_source_frontiers[id] = InputFrontier::default();
@@ -1924,6 +1821,7 @@ impl OperatorGraph {
             self.input_sources.push(vec![usize::MAX; input_port_count]);
             self.output_watermarks.push(i64::MIN);
             self.output_idle.push(false);
+            self.source_input_frontiers.push(InputFrontier::default());
             #[cfg(feature = "cluster")]
             self.local_source_frontiers.push(InputFrontier::default());
             self.managed_state_accounting_peaks
@@ -1971,6 +1869,12 @@ impl OperatorGraph {
     }
 
     fn add_edge(&mut self, source: usize, target: usize, target_port: u8) {
+        if self.nodes[source]
+            .output_routes
+            .contains(&(target, target_port))
+        {
+            return;
+        }
         self.edges.push(GraphEdge { source, target });
         self.nodes[source].output_routes.push((target, target_port));
         let port = target_port as usize;
@@ -2071,15 +1975,10 @@ impl OperatorGraph {
             false
         } else {
             let mut depends_on_query = false;
-            for table_ref in table_refs {
+            for (port, table_ref) in table_refs.iter().enumerate() {
+                let port = u8::try_from(port).expect("graph input count validated before wiring");
                 let upstream_id = self.find_node(table_ref).expect("source ensured");
-                let already_connected = self.nodes[upstream_id]
-                    .output_routes
-                    .iter()
-                    .any(|&(t, p)| t == node_id && p == 0);
-                if !already_connected {
-                    self.add_edge(upstream_id, node_id, 0);
-                }
+                self.add_edge(upstream_id, node_id, port);
                 if self.output_map.contains_key(table_ref.as_str()) {
                     depends_on_query = true;
                 }
@@ -2309,15 +2208,15 @@ impl OperatorGraph {
             return;
         }
 
-        // Lookup-enrich reads its table from the registry, not as a graph input.
-        if let Some(cfg) = &lookup_enrich_config {
-            table_refs.remove(&cfg.table_name);
-        }
-        // ChangelogEnrich: only the changelog (left) is a graph input; the dimension is read from
-        // the context, not wired as an edge.
-        if let Some(cfg) = &changelog_enrich_config {
-            table_refs.retain(|t| t == &cfg.changelog_table);
-        }
+        let Some(input_port_count) = self.prepare_query_inputs(
+            &name,
+            &mut table_refs,
+            stream_join_config.is_some() || temporal_config.is_some(),
+            lookup_enrich_config.as_ref(),
+            changelog_enrich_config.as_ref(),
+        ) else {
+            return;
+        };
 
         let operator = match self.create_operator(
             &name,
@@ -2337,12 +2236,6 @@ impl OperatorGraph {
                 return;
             }
         };
-        let input_port_count = if stream_join_config.is_some() || temporal_config.is_some() {
-            2
-        } else {
-            1
-        };
-
         self.ensure_query_source_nodes(
             stream_join_config.as_ref(),
             temporal_config.as_ref(),
@@ -2397,6 +2290,7 @@ impl OperatorGraph {
             self.input_buf_bytes[id] = vec![0; input_port_count];
             self.input_sources[id] = vec![usize::MAX; input_port_count];
             self.output_idle[id] = false;
+            self.source_input_frontiers[id] = InputFrontier::default();
             #[cfg(feature = "cluster")]
             {
                 self.local_source_frontiers[id] = InputFrontier::default();
@@ -2780,6 +2674,7 @@ impl OperatorGraph {
             self.input_sources[id].fill(usize::MAX);
             self.output_watermarks[id] = i64::MIN;
             self.output_idle[id] = false;
+            self.source_input_frontiers[id] = InputFrontier::default();
             #[cfg(feature = "cluster")]
             {
                 self.local_source_frontiers[id] = InputFrontier::default();
@@ -3016,19 +2911,6 @@ impl OperatorGraph {
         Ok(visible_sources)
     }
 
-    fn register_source_tables(&mut self, visible_sources: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
-        for (name, batches) in visible_sources {
-            // Lazily create the provider if register_source_schema wasn't called (e.g. tests).
-            if !self.live_handles.contains_key(name.as_ref()) {
-                let schema = batches[0].schema();
-                self.ensure_live_provider(name, &schema);
-            }
-            if let Some(handle) = self.live_handles.get(name.as_ref()) {
-                handle.swap(batches.clone());
-            }
-        }
-    }
-
     fn finish_cycle(&mut self) {
         for handle in self.live_handles.values() {
             handle.clear();
@@ -3052,49 +2934,11 @@ impl OperatorGraph {
             (Vec::new(), Vec::new())
         };
 
-        let port_count = self.nodes[node_id].input_port_count;
-        #[cfg(feature = "cluster")]
-        let managed_state = self.nodes[node_id].capability.managed_state;
-        #[cfg(feature = "cluster")]
-        let use_local_source_frontier = self.cluster_shuffle.is_some()
-            && matches!(
-                managed_state,
-                Some(
-                    ManagedStateContract::CoreWindowV1
-                        | ManagedStateContract::SqlAggregateV1
-                        | ManagedStateContract::BoundedIntervalJoinV3
-                        | ManagedStateContract::TemporalJoinV1
-                )
-            );
-        #[cfg(feature = "cluster")]
-        let use_temporal_source_frontier =
-            matches!(managed_state, Some(ManagedStateContract::TemporalJoinV1));
-        let frontiers: smallvec::SmallVec<[InputFrontier; 2]> = (0..port_count)
-            .map(|port| {
-                let upstream = self.input_sources[node_id][port];
-                #[cfg(feature = "cluster")]
-                if use_local_source_frontier && self.source_node_ids.contains(&upstream) {
-                    if use_temporal_source_frontier {
-                        return self
-                            .temporal_source_frontiers
-                            .get(&upstream)
-                            .copied()
-                            .unwrap_or(self.local_source_frontiers[upstream]);
-                    }
-                    return self.local_source_frontiers[upstream];
-                }
-                if upstream < self.output_watermarks.len() {
-                    InputFrontier {
-                        watermark: (self.output_watermarks[upstream] != i64::MIN)
-                            .then_some(self.output_watermarks[upstream]),
-                        idle: self.output_idle[upstream],
-                    }
-                } else {
-                    InputFrontier::from_watermark(current_watermark)
-                }
-            })
-            .collect();
+        let frontiers = self.operator_input_frontiers(node_id, current_watermark);
 
+        if accept {
+            self.bind_input_tables(node_id, &inputs);
+        }
         let process_timer = self.prom.as_ref().map(|prom| {
             prom.operator_process_duration
                 .with_label_values(&[&self.nodes[node_id].name, mode.metric_label()])
@@ -3218,25 +3062,35 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Source nodes are pre-seeded in `execute_cycle`, so skip them here.
     fn propagate_operator_frontier(
         &mut self,
         node_id: usize,
         frontiers: &[InputFrontier],
         current_watermark: i64,
     ) {
-        if self.source_node_ids.contains(&node_id) {
-            return;
-        }
-
-        let input = merge_input_frontiers(frontiers, current_watermark);
+        let is_source = self.source_node_ids.contains(&node_id);
+        let input = if is_source {
+            self.source_input_frontiers[node_id]
+        } else {
+            merge_input_frontiers(frontiers, current_watermark)
+        };
         let output = self.nodes[node_id].operator.output_frontier(input);
         let watermark = self.output_watermarks[node_id].max(output.watermark_or_min());
         self.output_watermarks[node_id] = watermark;
         self.output_idle[node_id] = output.idle;
         if let Some(ref prom) = self.prom {
+            let name = if is_source {
+                self.source_list
+                    .iter()
+                    .find(|route| route.node_id == node_id)
+                    .map_or(self.nodes[node_id].name.as_ref(), |route| {
+                        route.name.as_ref()
+                    })
+            } else {
+                self.nodes[node_id].name.as_ref()
+            };
             prom.stream_watermark_ms
-                .with_label_values(&[&self.nodes[node_id].name])
+                .with_label_values(&[name])
                 .set(watermark);
         }
     }
@@ -3274,25 +3128,14 @@ impl OperatorGraph {
                 }
             }
         }
-        let has_routes = !self.nodes[node_id].output_routes.is_empty();
+        let bytes = retained_input_bytes(&batches);
+        self.preflight_output(node_id, batches.len(), bytes)?;
         let is_output = self.output_node_ids.contains(&node_id);
-
-        if has_routes && !self.source_node_ids.contains(&node_id) {
-            let name_ref = node_name.as_ref();
-            if !self.live_handles.contains_key(name_ref) {
-                let schema = batches[0].schema();
-                self.ensure_live_provider(name_ref, &schema);
-            }
-            if let Some(handle) = self.live_handles.get(name_ref) {
-                handle.swap(batches.clone());
-            }
-        }
 
         if is_output {
             results.insert(node_name, batches.clone());
         }
 
-        let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         let route_count = self.nodes[node_id].output_routes.len();
         if route_count == 1 {
             let (target, port) = self.nodes[node_id].output_routes[0];
@@ -3481,13 +3324,12 @@ impl OperatorGraph {
             return Err(error);
         }
 
-        self.register_source_tables(&visible_source_batches);
         self.prime_sources(
             source_batches,
             &visible_source_batches,
             current_watermark,
             source_frontiers,
-        );
+        )?;
 
         let checkpoint_drain_nodes = if mode == GraphExecutionMode::CheckpointDrain {
             Some(self.checkpoint_drain_nodes())
@@ -3711,39 +3553,6 @@ impl OperatorGraph {
             .map(|route| Arc::clone(&route.name))
             .collect();
         self.cycle_deferred_sources.extend(deferred_sources);
-    }
-
-    fn prime_sources(
-        &mut self,
-        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
-        visible_source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
-        current_watermark: i64,
-        source_frontiers: Option<&FxHashMap<Arc<str>, InputFrontier>>,
-    ) {
-        for route in &self.source_list {
-            let batches = match route.view {
-                SourceBatchView::Visible => visible_source_batches.get(&route.name),
-                SourceBatchView::Positioned => source_batches.get(&route.name),
-            };
-            if let Some(batches) = batches {
-                if !batches.is_empty() {
-                    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-                    self.input_bufs[route.node_id][0].extend(batches.iter().cloned());
-                    self.input_buf_bytes[route.node_id][0] += bytes;
-                }
-            }
-            let frontier = source_frontiers
-                .and_then(|frontiers| frontiers.get(&route.name).copied())
-                .unwrap_or_else(|| InputFrontier::from_watermark(current_watermark));
-            let watermark = self.output_watermarks[route.node_id].max(frontier.watermark_or_min());
-            self.output_watermarks[route.node_id] = watermark;
-            self.output_idle[route.node_id] = frontier.idle;
-            if let Some(ref prom) = self.prom {
-                prom.stream_watermark_ms
-                    .with_label_values(&[&route.name])
-                    .set(watermark);
-            }
-        }
     }
 
     /// Round-robin one deferred operator so a budget overrun can't starve the tail.

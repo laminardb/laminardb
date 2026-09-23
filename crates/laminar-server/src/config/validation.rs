@@ -31,6 +31,12 @@ fn collect_http_auth_errors(config: &ServerConfig, errors: &mut Vec<String>) {
         }
     };
 
+    if bind.is_some_and(|bind| !bind.ip().is_loopback()) && config.server.console_token.is_none() {
+        errors.push(
+            "non-loopback server.bind requires server.console_token to be configured".to_string(),
+        );
+    }
+
     let Some(diagnostic_token) = &config.server.diagnostic_read_token else {
         if let Some(console_token) = &config.server.console_token {
             if console_token.len() < MIN_CONSOLE_TOKEN_LEN {
@@ -312,7 +318,7 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
             ));
         }
     } else if config.server.delivery == DeliveryGuarantee::ExactlyOnce {
-        if !config.checkpoint.url.starts_with("file://") {
+        if checkpoint_scope != CheckpointStorageScope::NodeDurable {
             errors.push(
                 "[LDB-0014] embedded/single-node exactly-once currently requires a local \
                  file:// checkpoint namespace protected by an exclusive process lock; shared \
@@ -338,12 +344,20 @@ fn collect_delivery_errors(config: &ServerConfig, errors: &mut Vec<String>) {
 }
 
 fn collect_runtime_limit_errors(config: &ServerConfig, errors: &mut Vec<String>) {
+    if let Err(error) = config.server.validate_memory_limits() {
+        errors.push(format!("server.{error}"));
+    }
     // WHY: zero pauses barrier admission permanently and wedges checkpointing.
     if config.checkpoint.interval.is_zero() {
         errors.push("checkpoint.interval must be > 0".to_string());
     }
     if config.checkpoint.timeout.is_zero() {
         errors.push("checkpoint.timeout must be > 0".to_string());
+    } else if tokio::time::Instant::now()
+        .checked_add(config.checkpoint.timeout)
+        .is_none()
+    {
+        errors.push("checkpoint.timeout exceeds the platform clock range".to_string());
     }
     if config.checkpoint.max_node_data_bytes == Some(0) {
         errors.push("checkpoint.max_node_data_bytes must be > 0".to_string());

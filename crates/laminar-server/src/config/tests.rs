@@ -84,6 +84,18 @@ classify = "finbert"
 complete = "haiku"
 "#;
 
+#[test]
+fn shipped_cluster_example_authenticates_remote_http() {
+    let input = include_str!("../../../../examples/laminardb-cluster.toml")
+        .replace("${LAMINAR_CONSOLE_TOKEN}", "example-console-token");
+    let config: ServerConfig = toml::from_str(&input).unwrap();
+    assert_eq!(
+        config.server.console_token.as_ref().unwrap().expose(),
+        "example-console-token"
+    );
+    validate_http_auth(&config).expect("cluster example must configure remote HTTP authentication");
+}
+
 fn canonical_http_auth_secret(byte: u8) -> Secret {
     Secret::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]))
 }
@@ -419,6 +431,7 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "cluster-console-token"
 delivery = "at_least_once"
 key_groups = 256
 
@@ -476,6 +489,13 @@ fn checkpoint_storage_scope_is_fail_closed() {
         toml::from_str("[server]\ndelivery = \"exactly_once\"\n").unwrap();
     validate_config(&local_exact)
         .expect("the default durable checkpoint URL is sufficient for local exactly-once");
+
+    let uppercase_local_exact: ServerConfig = toml::from_str(
+        "[server]\ndelivery = \"exactly_once\"\n[checkpoint]\nurl = \"FILE:///tmp/checkpoints\"\n",
+    )
+    .unwrap();
+    validate_config(&uppercase_local_exact)
+        .expect("file URL scheme matching is case-insensitive for local exactly-once");
 
     let local_cluster: ServerConfig = toml::from_str(
         r#"
@@ -775,6 +795,7 @@ node_id = "node-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+console_token = "cluster-console-token"
 delivery = "at_least_once"
 
 [checkpoint]
@@ -819,6 +840,7 @@ seeds = ["127.0.0.1:7946"]
         std::fs::write(path, b"test material").unwrap();
     }
     config.server.bind = "0.0.0.0:8080".into();
+    config.server.console_token = Some(Secret::new("cluster-console-token"));
     let discovery = config.discovery.as_mut().unwrap();
     discovery.seeds = vec!["10.0.0.2:7946".into()];
     discovery.cluster_tls_cert = Some(cert);
@@ -1000,6 +1022,91 @@ alice = "short"
 }
 
 #[test]
+fn http_auth_requires_console_token_on_non_loopback_addresses() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in [
+            "0.0.0.0:8080",
+            "192.0.2.1:8080",
+            "[::]:8080",
+            "[2001:db8::1]:8080",
+            "[fe80::1%3]:8080",
+            "[::ffff:0.0.0.0]:8080",
+            "[::ffff:192.0.2.1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            let errors = http_auth_errors(&config);
+            assert!(
+                errors.iter().any(|error| error
+                    .contains("non-loopback server.bind requires server.console_token")),
+                "{mode:?} {bind}: {errors:?}"
+            );
+
+            config.server.console_token = Some(Secret::new("existing-console-token"));
+            validate_http_auth(&config).unwrap_or_else(|error| {
+                panic!("console credentials must permit {mode:?} {bind}: {error}")
+            });
+            config.server.console_token = Some(Secret::new("short"));
+            assert!(http_auth_errors(&config)
+                .iter()
+                .any(|error| error.contains("at least 8 characters")));
+        }
+    }
+}
+
+#[test]
+fn http_auth_allows_anonymous_loopback_addresses() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in ["127.0.0.1:8080", "127.42.0.1:8080", "[::1]:8080"] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            validate_http_auth(&config)
+                .unwrap_or_else(|error| panic!("loopback {mode:?} {bind}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn file_loader_requires_remote_http_console_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("remote-http-auth.toml");
+    for mode in ["single", "cluster"] {
+        let valid = format!(
+            r#"node_id = "node-1"
+
+[server]
+mode = "{mode}"
+bind = "[::]:8080"
+console_token = "existing-console-token"
+delivery = "at_least_once"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+"#
+        );
+        let anonymous = valid.replace("console_token = \"existing-console-token\"\n", "");
+        std::fs::write(&path, anonymous).unwrap();
+        let error = load_config(&path).expect_err("remote anonymous HTTP must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("non-loopback server.bind requires server.console_token"),
+            "{mode}: {error}"
+        );
+
+        std::fs::write(&path, valid).unwrap();
+        load_config(&path).expect("remote HTTP with existing console credentials must pass");
+    }
+}
+
+#[test]
 fn test_validate_short_console_token() {
     let toml = r#"
 [server]
@@ -1146,13 +1253,14 @@ fn diagnostic_token_requires_loopback_http_bind() {
         canonical_http_auth_secret(9),
         Some(canonical_http_auth_secret(10)),
     );
-    config.server.bind = "0.0.0.0:8080".to_string();
-    let errors = http_auth_errors(&config);
-
-    assert!(
-        errors.iter().any(|error| error.contains("loopback")),
-        "errors: {errors:?}"
-    );
+    for bind in ["0.0.0.0:8080", "[::]:8080", "[::ffff:127.0.0.1]:8080"] {
+        config.server.bind = bind.into();
+        let errors = http_auth_errors(&config);
+        assert!(
+            errors.iter().any(|error| error.contains("loopback")),
+            "{bind}: {errors:?}"
+        );
+    }
 }
 
 #[test]
@@ -1313,6 +1421,15 @@ fn test_default_values_applied() {
     assert_eq!(config.server.bind, "127.0.0.1:8080");
     assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
+}
+
+#[test]
+fn checkpoint_timeout_rejects_unrepresentable_deadline() {
+    let mut config: ServerConfig = toml::from_str("").unwrap();
+    config.checkpoint.timeout = Duration::MAX;
+
+    let error = validate_config(&config).unwrap_err().to_string();
+    assert!(error.contains("checkpoint.timeout exceeds the platform clock range"));
 }
 
 #[test]
@@ -1562,4 +1679,148 @@ fn test_config_error_display_messages() {
     let msg = err.to_string();
     assert!(msg.contains("error one"));
     assert!(msg.contains("error two"));
+}
+
+#[test]
+fn datafusion_memory_limit_default_override_and_zero_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(
+        default.server.datafusion_memory_limit_bytes,
+        laminar_db::DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES
+    );
+    let configured: ServerConfig =
+        toml::from_str("[server]\ndatafusion_memory_limit_bytes = 65536").unwrap();
+    assert_eq!(configured.server.datafusion_memory_limit_bytes, 65536);
+    validate_config(&configured).unwrap();
+    let invalid: ServerConfig =
+        toml::from_str("[server]\ndatafusion_memory_limit_bytes = 0").unwrap();
+    assert!(validate_config(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("datafusion_memory_limit_bytes"));
+}
+
+#[test]
+fn source_queue_limit_default_override_and_invalid_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(
+        default.server.source_queue_max_bytes,
+        laminar_db::DEFAULT_SOURCE_QUEUE_MAX_BYTES
+    );
+    let configured: ServerConfig =
+        toml::from_str("[server]\nsource_queue_max_bytes = 65536").unwrap();
+    assert_eq!(configured.server.source_queue_max_bytes, 65536);
+    validate_config(&configured).unwrap();
+    for bytes in [0, laminar_db::MAX_SOURCE_QUEUE_BYTES + 1] {
+        let invalid: ServerConfig =
+            toml::from_str(&format!("[server]\nsource_queue_max_bytes = {bytes}")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("source_queue_max_bytes"));
+    }
+}
+
+#[test]
+fn graph_input_limit_default_override_and_zero_validation() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.pipeline_max_input_buf_bytes, None);
+    assert_eq!(default.server.pipeline_max_input_buf_batches, None);
+    let configured: ServerConfig = toml::from_str(
+        "[server]\npipeline_max_input_buf_bytes = 65536\npipeline_max_input_buf_batches = 32",
+    )
+    .unwrap();
+    assert_eq!(configured.server.pipeline_max_input_buf_bytes, Some(65536));
+    assert_eq!(configured.server.pipeline_max_input_buf_batches, Some(32));
+    validate_config(&configured).unwrap();
+    let invalid: ServerConfig =
+        toml::from_str("[server]\npipeline_max_input_buf_bytes = 0").unwrap();
+    assert!(validate_config(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("pipeline_max_input_buf_bytes"));
+}
+#[tokio::test]
+async fn reference_table_memory_limits_parse_validate_and_reach_database() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.reference_table_max_rows, 1_000_000);
+    assert_eq!(default.server.reference_table_max_bytes, 256 * 1024 * 1024);
+    for field in ["reference_table_max_rows", "reference_table_max_bytes"] {
+        let invalid: ServerConfig = toml::from_str(&format!("[server]\n{field} = 0")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("reference_table"));
+    }
+    let configured: ServerConfig =
+        toml::from_str("[server]\nreference_table_max_rows = 1\nreference_table_max_bytes = 8192")
+            .unwrap();
+    validate_config(&configured).unwrap();
+    let db = configured
+        .server
+        .apply_memory_limits(laminar_db::LaminarDB::builder())
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE TABLE dimensions (id BIGINT PRIMARY KEY)")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.execute("INSERT INTO dimensions VALUES (1), (2)").await,
+        Err(laminar_db::DbError::ReferenceTableQuotaExceeded { max_rows: 1, .. })
+    ));
+}
+
+#[test]
+fn materialized_view_memory_limits_parse_and_validate() {
+    let default: ServerConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.materialized_view_max_rows, 1_000_000);
+    assert_eq!(
+        default.server.materialized_view_max_bytes,
+        256 * 1024 * 1024
+    );
+    for field in ["materialized_view_max_rows", "materialized_view_max_bytes"] {
+        let invalid: ServerConfig = toml::from_str(&format!("[server]\n{field} = 0")).unwrap();
+        assert!(validate_config(&invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("materialized_view"));
+    }
+    let configured: ServerConfig = toml::from_str(
+        "[server]\nmaterialized_view_max_rows = 42\nmaterialized_view_max_bytes = 8192",
+    )
+    .unwrap();
+    validate_config(&configured).unwrap();
+    assert_eq!(configured.server.materialized_view_max_rows, 42);
+    assert_eq!(configured.server.materialized_view_max_bytes, 8192);
+}
+
+#[tokio::test]
+async fn materialized_view_memory_limits_reach_server_database() {
+    let configured: ServerConfig =
+        toml::from_str("[server]\nmaterialized_view_max_bytes = 1").unwrap();
+    let db = configured
+        .server
+        .apply_memory_limits(laminar_db::LaminarDB::builder())
+        .build()
+        .await
+        .unwrap();
+    db.execute("CREATE SOURCE generated (seq BIGINT NOT NULL, ts_ms BIGINT NOT NULL, value VARCHAR NOT NULL) FROM GENERATOR ('rows.per.second' = '1000', 'max.rows' = '1')").await.unwrap();
+    db.execute("CREATE MATERIALIZED VIEW stored AS SELECT seq FROM generated")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while db.last_fault().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("MV quota must reach the production callback");
+    assert!(db.last_fault().unwrap().contains("quota exceeded"));
+    let error = db
+        .shutdown()
+        .await
+        .expect_err("shutdown must report the pipeline fault");
+    assert!(error.to_string().contains("quota exceeded"));
 }

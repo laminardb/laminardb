@@ -12,6 +12,7 @@ use laminar_db::LaminarDB;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer};
 
 use super::{
     Secret, SUBSCRIPTION_CHECKPOINT_COLUMN, SUBSCRIPTION_EPOCH_COLUMN, SUBSCRIPTION_FETCH_WAIT,
@@ -744,7 +745,7 @@ struct MintedClientPki {
 }
 
 fn mint_ca_and_client_leaf(common_name: &str) -> MintedClientPki {
-    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
     let mut ca_params = rcgen::CertificateParams::new(vec!["mtls-test-ca".into()]).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -783,7 +784,7 @@ fn make_client_tls(
     super::ensure_tls_provider();
     let cert_bytes = std::fs::read(server_cert_path).unwrap();
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+    for c in CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     {
@@ -900,6 +901,116 @@ fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::pat
     (dir, cert_path, key_path)
 }
 
+#[test]
+fn tls_load_reports_missing_empty_and_malformed_pem() {
+    let (dir, cert_path, key_path) = self_signed_pem();
+    let cert_pem = std::fs::read_to_string(&cert_path).unwrap();
+    let key_pem = std::fs::read_to_string(&key_path).unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &cert_pem).unwrap();
+    let load = || {
+        super::load_tls_acceptor(super::TlsPaths {
+            cert: &cert_path,
+            key: &key_path,
+            min_version: super::TlsMinVersion::V1_2,
+            client_ca: Some(&ca_path),
+        })
+    };
+
+    for (path, setting, label, empty_error) in [
+        (
+            &cert_path,
+            "pgwire_tls_cert",
+            "CERTIFICATE",
+            "contains no certificates",
+        ),
+        (
+            &key_path,
+            "pgwire_tls_key",
+            "PRIVATE KEY",
+            "contains no private key",
+        ),
+        (
+            &ca_path,
+            "pgwire_tls_client_ca",
+            "CERTIFICATE",
+            "contains no certificates",
+        ),
+    ] {
+        std::fs::remove_file(path).unwrap();
+        let err = load().err().expect("missing file must fail").to_string();
+        assert!(err.contains(&format!("open {setting}:")), "{err}");
+        let other_section = if setting == "pgwire_tls_key" {
+            &cert_pem
+        } else {
+            &key_pem
+        };
+        for (contents, expected) in [
+            (String::new(), empty_error.to_string()),
+            ("not PEM".to_string(), empty_error.to_string()),
+            (other_section.clone(), empty_error.to_string()),
+            (
+                format!("-----BEGIN {label}-----\n"),
+                format!("parse {setting}:"),
+            ),
+            (
+                format!("-----BEGIN {label}-----\n!invalid!\n-----END {label}-----\n"),
+                format!("parse {setting}:"),
+            ),
+        ] {
+            std::fs::write(path, contents).unwrap();
+            let err = load().err().expect("invalid PEM must fail").to_string();
+            assert!(err.contains(setting) && err.contains(&expected), "{err}");
+        }
+        let original = if setting == "pgwire_tls_key" {
+            &key_pem
+        } else {
+            &cert_pem
+        };
+        std::fs::write(path, original).unwrap();
+    }
+}
+
+#[test]
+fn tls_load_skips_unrelated_sections_and_uses_first_key() {
+    let (_dir, cert_path, key_path) = self_signed_pem();
+    let cert_pem = std::fs::read_to_string(&cert_path).unwrap();
+    let key_pem = std::fs::read_to_string(&key_path).unwrap();
+    std::fs::write(&cert_path, format!("{key_pem}{cert_pem}")).unwrap();
+    std::fs::write(
+        &key_path,
+        format!("{cert_pem}{key_pem}-----BEGIN PRIVATE KEY-----\n!invalid!\n"),
+    )
+    .unwrap();
+
+    assert!(super::load_tls_acceptor(super::TlsPaths {
+        cert: &cert_path,
+        key: &key_path,
+        min_version: super::TlsMinVersion::V1_2,
+        client_ca: None,
+    })
+    .is_ok());
+}
+
+#[test]
+fn tls_load_checks_every_certificate_in_bundle() {
+    let (_dir, cert_path, key_path) = self_signed_pem();
+    let (_expired_dir, expired_cert_path, _) = expired_self_signed_pem();
+    let cert_pem = std::fs::read_to_string(&cert_path).unwrap();
+    let expired_pem = std::fs::read_to_string(expired_cert_path).unwrap();
+    std::fs::write(&cert_path, format!("{cert_pem}{expired_pem}")).unwrap();
+
+    let err = super::load_tls_acceptor(super::TlsPaths {
+        cert: &cert_path,
+        key: &key_path,
+        min_version: super::TlsMinVersion::V1_2,
+        client_ca: None,
+    })
+    .err()
+    .expect("an expired non-leaf certificate must fail");
+    assert!(err.to_string().contains("expired"), "{err}");
+}
+
 #[tokio::test]
 async fn tls_load_rejects_expired_cert() {
     let (_dir, cert_path, key_path) = expired_self_signed_pem();
@@ -948,7 +1059,7 @@ async fn tls_min_1_3_rejects_tls_1_2_client() {
 
     let cert_bytes = std::fs::read(&cert_path).unwrap();
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+    for c in CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     {
@@ -1011,7 +1122,7 @@ async fn tls_handshake_succeeds() {
     // Build a client TLS config that trusts the same self-signed cert.
     let cert_bytes = std::fs::read(&cert_path).unwrap();
     let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-    for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+    for c in CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
     {
@@ -1145,12 +1256,16 @@ async fn mtls_rejects_untrusted_client_cert() {
     handle.abort();
 }
 
-/// mTLS: a client cert signed by the configured CA is accepted, and a
+/// mTLS: client certs signed by either CA in the bundle are accepted, and a
 /// SimpleQuery completes over the encrypted+authenticated session.
 #[tokio::test]
 async fn mtls_accepts_trusted_client_cert() {
     let (_dir, cert_path, key_path) = self_signed_pem();
     let pki = mint_ca_and_client_leaf("alice");
+    let second_pki = mint_ca_and_client_leaf("bob");
+    let first_ca = std::fs::read_to_string(&pki.ca_pem_path).unwrap();
+    let second_ca = std::fs::read_to_string(&second_pki.ca_pem_path).unwrap();
+    std::fs::write(&pki.ca_pem_path, format!("{first_ca}{second_ca}")).unwrap();
     let db = LaminarDB::open().expect("db opens");
     db.start().await.expect("db starts");
     let (addr, handle) = super::serve(
@@ -1170,28 +1285,30 @@ async fn mtls_accepts_trusted_client_cert() {
     .await
     .expect("pgwire serve");
 
-    let tls = make_client_tls(
-        &cert_path,
-        Some((pki.leaf_chain.clone(), pki.leaf_key.clone_key())),
-    );
     let conn_str = format!(
         "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
         addr.ip(),
         addr.port(),
     );
-    let (client, conn) = tokio_postgres::connect(&conn_str, tls)
-        .await
-        .expect("mTLS handshake + connect");
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
+    for identity in [&pki, &second_pki] {
+        let tls = make_client_tls(
+            &cert_path,
+            Some((identity.leaf_chain.clone(), identity.leaf_key.clone_key())),
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .expect("mTLS handshake + connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
-    let messages = client
-        .simple_query("SELECT version()")
-        .await
-        .expect("query over mTLS");
-    let v = first_row_value(&messages, 0).expect("row");
-    assert!(v.contains("LaminarDB"), "version: {v}");
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query over mTLS");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+    }
     handle.abort();
 }
 

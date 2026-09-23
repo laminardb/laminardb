@@ -3,7 +3,7 @@
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicU64, atomic::Ordering, Arc};
 use std::time::Duration;
 
 use laminar_connectors::connector::{SourceDrainOutcome, SourceDrainResolution};
@@ -18,8 +18,8 @@ use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentRecoveryDecision,
     AssignmentSnapshot, AssignmentSnapshotStore, CheckpointAssignmentAdoption,
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
-    RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult, RotateOutcome,
-    SnapshotError,
+    LeaderProof, ProcessLeaseFence, RecordAssignmentDrainDecisionResult,
+    RecordAssignmentRecoveryDecisionResult, RotateOutcome, SnapshotError,
 };
 use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{
@@ -28,12 +28,19 @@ use laminar_core::state::{
 #[cfg(test)]
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::{DbState, LaminarDB};
 use crate::engine_metrics::EngineMetrics;
+
+mod recovery_adoption;
+use recovery_adoption::{
+    adopt_materialized_recovery_head, ensure_local_recovery_fault, local_recovery_assignment_scope,
+    prepare_recovery_assignment_adoption, prepare_watched_recovery_adoption,
+    LocalRecoveryAssignmentScope,
+};
 
 /// Tunables for the rebalance control plane.
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +49,8 @@ pub struct RebalanceConfig {
     pub watcher_poll: Duration,
     /// Quiet period before a membership change triggers rotation.
     pub rebalance_debounce: Duration,
-    /// Upper bound on the pre-rotation forced checkpoint.
+    /// Upper bound used for the pre-rotation checkpoint and each serialized recovery-adoption
+    /// phase.
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
@@ -57,7 +65,8 @@ impl Default for RebalanceConfig {
     fn default() -> Self {
         Self {
             watcher_poll: Duration::from_secs(2),
-            rebalance_debounce: Duration::from_secs(5),
+            // Only needs to outlast the 1s gossip interval; sits on the recovery path.
+            rebalance_debounce: Duration::from_secs(2),
             // A healthy pre-rotation drain commits in well under a second; the longer budget
             // absorbs slow external source cuts without weakening the frozen-roster quorum.
             checkpoint_timeout: Duration::from_secs(15),
@@ -86,44 +95,52 @@ impl RebalanceConfig {
 
 async fn close_local_assignment_authority(
     db: &Arc<LaminarDB>,
-    controller: Option<&ClusterController>,
+    controller: &ClusterController,
+    recovery_target: &CheckpointAssignmentFence,
+    removed_processes: &[CheckpointParticipant],
     deadline: tokio::time::Instant,
-) -> Result<(), String> {
+) -> Result<Vec<ProcessLeaseFence>, String> {
     db.set_source_gate(true);
-    if let Some(controller) = controller {
-        controller.publish_checkpoint_assignment_fence(None);
-        controller.publish_checkpoint_drain_transition(None);
-    }
+    controller.publish_checkpoint_assignment_fence(None);
+    controller.publish_checkpoint_drain_transition(None);
     // Cancel first: a compute-cycle read guard may itself be blocked in shuffle admission.
     db.invalidate_shuffle_assignment_fence();
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
         .await
         .map_err(|_| "timed out serializing assignment authority closure".to_string())?;
     // A watcher that already owned the adoption lock could have republished and reopened after
-    // the first cancellation. Reassert the full closure while serialized, before draining it.
+    // the first cancellation. Reassert the full closure and retain serialization through process
+    // fencing, fault publication, and the execution drain.
     db.set_source_gate(true);
-    if let Some(controller) = controller {
-        controller.publish_checkpoint_assignment_fence(None);
-        controller.publish_checkpoint_drain_transition(None);
-    }
+    controller.publish_checkpoint_assignment_fence(None);
+    controller.publish_checkpoint_drain_transition(None);
     db.invalidate_shuffle_assignment_fence();
+    let fence_results = futures::future::join_all(
+        removed_processes
+            .iter()
+            .copied()
+            .map(|participant| controller.fence_process_incarnation(participant, deadline)),
+    )
+    .await;
+    let mut process_fences = Vec::with_capacity(fence_results.len());
+    for result in fence_results {
+        process_fences.push(result?);
+    }
+    // RECOVERY: Prepare cancels graph work, so publish its fault before waiting for that work to
+    // release the execution fence. Process fencing above prevents a live predecessor from causing
+    // a spurious fault, and the serialized local authority is already closed.
+    if recovery_target.participant_incarnation(controller.instance_id().0)
+        == Some(controller.recovery_incarnation())
+    {
+        ensure_local_recovery_fault(db, controller).await?;
+    }
     let _transition = tokio::time::timeout_at(
         deadline,
         Arc::clone(&db.rotation_execution_fence).write_owned(),
     )
     .await
     .map_err(|_| "timed out draining assignment execution after closure".to_string())?;
-    Ok(())
-}
-
-async fn ensure_local_recovery_fault(
-    db: &LaminarDB,
-    controller: &ClusterController,
-) -> Result<(), String> {
-    controller.set_recovering(true);
-    crate::coordinated_recovery::request_local_fault(controller, &db.pending_recovery_fault)
-        .await
-        .map(|_| ())
+    Ok(process_fences)
 }
 
 /// Fail closed for a transient durable snapshot read without forcing a new assignment version.
@@ -177,6 +194,7 @@ async fn try_suspend_recovery_assignment_authority(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     deadline: tokio::time::Instant,
+    held: &mut Option<u64>,
 ) -> Result<bool, String> {
     let _adoption = tokio::time::timeout_at(deadline, db.assignment_adoption_lock.lock())
         .await
@@ -184,53 +202,24 @@ async fn try_suspend_recovery_assignment_authority(
     if db.has_unapplied_vnode_transition() {
         return Ok(false);
     }
+    // Re-asserting an already-held suspension bumps the authority revision every watcher
+    // tick, which starves the recovery monitor's stability audits. Activation and intake
+    // reopening serialize on the adoption lock, so these observables are race-free here.
+    let revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    if *held == Some(revision)
+        && db.cluster_intake_fenced()
+        && controller.checkpoint_assignment_watch().borrow().is_none()
+    {
+        return Ok(true);
+    }
     suspend_local_assignment_authority_locked(db, Some(controller), deadline).await?;
+    *held = Some(
+        db.assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire),
+    );
     Ok(true)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LocalRecoveryAssignmentScope {
-    Participant,
-    Ownerless,
-}
-
-/// Classify this exact process generation against an authority-audited recovery target.
-///
-/// An ownerless process may follow the target topology, but it has no checkpoint or recovery
-/// authority and must not turn the target's recovery provenance into a new cluster-wide fault.
-fn local_recovery_assignment_scope(
-    snapshot: &AssignmentSnapshot,
-    controller: &ClusterController,
-) -> Result<LocalRecoveryAssignmentScope, String> {
-    let fence = snapshot
-        .assignment_fence()
-        .map_err(|error| error.to_string())?;
-    let owners = snapshot
-        .to_vnode_vec(fence.vnode_count)
-        .map_err(|error| error.to_string())?;
-    let owner_ids = owners.iter().map(|owner| owner.0).collect::<Vec<_>>();
-    if !fence.is_canonical() || !fence.matches_owner_map(&owner_ids) {
-        return Err(format!(
-            "recovery assignment {} has no canonical owner-complete target fence",
-            snapshot.version
-        ));
-    }
-
-    let local_id = controller.instance_id().0;
-    match fence.participant_incarnation(local_id) {
-        Some(incarnation) if incarnation == controller.recovery_incarnation() => {
-            Ok(LocalRecoveryAssignmentScope::Participant)
-        }
-        Some(_) => Err(format!(
-            "recovery assignment {} certifies another incarnation of process {local_id}",
-            snapshot.version
-        )),
-        None if owner_ids.contains(&local_id) => Err(format!(
-            "recovery assignment {} gives process {local_id} ownership without checkpoint authority",
-            snapshot.version
-        )),
-        None => Ok(LocalRecoveryAssignmentScope::Ownerless),
-    }
 }
 
 async fn hold_terminal_source_resolution(
@@ -415,12 +404,13 @@ impl SnapshotWatcher {
     async fn publish_authority(
         &mut self,
         mut authority_revision: u64,
-        head_deadline: tokio::time::Instant,
+        operation_timeout: Duration,
     ) {
-        let current_authority_revision = self
-            .db
-            .assignment_authority_revision
-            .load(std::sync::atomic::Ordering::Acquire);
+        // The durable-head audit and authority publication are independently bounded phases.
+        let (head_deadline, current_authority_revision) = (
+            Instant::now() + operation_timeout,
+            AtomicU64::load(&self.db.assignment_authority_revision, Ordering::Acquire),
+        );
         if authority_revision != current_authority_revision {
             // The durable head used above predates an authority closure by another adoption.
             // Keep that closure in force and re-read the head on the next tick.
@@ -625,11 +615,13 @@ impl SnapshotWatcher {
                         }
                         match self
                             .db
-                            .activate_assignment_authority(
+                            .activate_watcher_assignment_authority(
+                                c,
                                 &fence,
                                 drain_transition,
                                 authority_revision,
                                 head_deadline,
+                                operation_timeout,
                             )
                             .await
                         {
@@ -640,8 +632,6 @@ impl SnapshotWatcher {
                             }
                             Ok(_) => self.assignment_authority_dirty = true,
                             Err(error) => {
-                                c.publish_checkpoint_drain_transition(None);
-                                c.publish_checkpoint_assignment_fence(None);
                                 self.installed_fence = None;
                                 self.assignment_authority_dirty = true;
                                 warn!(%error, version, "shuffle assignment certificate install failed");
@@ -801,6 +791,7 @@ impl SnapshotWatcher {
     }
 
     async fn run(mut self) {
+        let mut recovery_suspension_held: Option<u64> = None;
         loop {
             tokio::select! {
                 biased;
@@ -1045,6 +1036,7 @@ impl SnapshotWatcher {
                                 &self.db,
                                 controller,
                                 head_deadline,
+                                &mut recovery_suspension_held,
                             )
                             .await
                             {
@@ -1059,7 +1051,7 @@ impl SnapshotWatcher {
                                             audited_target.as_ref().expect(
                                                 "stable successor was audited before suspension",
                                             ),
-                                            head_deadline,
+                                            Instant::now() + self.config.checkpoint_timeout,
                                         )
                                         .await
                                     {
@@ -1069,8 +1061,11 @@ impl SnapshotWatcher {
                                     // The transition may have been staged before its predecessor
                                     // transport certificate became active. Repair that exact audited
                                     // authority before waiting for the newer durable head.
-                                    self.publish_authority(authority_revision, head_deadline)
-                                        .await;
+                                    self.publish_authority(
+                                        authority_revision,
+                                        self.config.checkpoint_timeout,
+                                    )
+                                    .await;
                                     continue;
                                 }
                                 Err(error) => {
@@ -1085,29 +1080,23 @@ impl SnapshotWatcher {
                             self.durable_snapshot = None;
                             self.durable_drain_transition = None;
                             self.installed_fence = None;
-                            if let Err(error) =
-                                ensure_local_recovery_fault(&self.db, controller).await
-                            {
-                                self.assignment_authority_dirty = true;
-                                warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
-                                continue;
-                            }
-                            if let Err(error) = abort_predecessor_checkpoint_for_recovery(
+                            match prepare_watched_recovery_adoption(
+                                &self.db,
                                 &self.store,
                                 controller,
+                                &self.registry,
                                 &snap,
                                 head_deadline,
                             )
                             .await
                             {
-                                self.assignment_authority_dirty = true;
-                                warn!(%error, version = snap.version, "snapshot watcher: could not settle predecessor checkpoint for recovery");
-                                continue;
+                                Ok(revision) => authority_revision = revision,
+                                Err(error) => {
+                                    self.assignment_authority_dirty = true;
+                                    warn!(%error, version = snap.version, "snapshot watcher: recovery assignment preparation failed");
+                                    continue;
+                                }
                             }
-                            authority_revision = self
-                                .db
-                                .assignment_authority_revision
-                                .load(std::sync::atomic::Ordering::Acquire);
                             self.assignment_authority_dirty = true;
                         } else {
                             debug!(
@@ -1116,16 +1105,12 @@ impl SnapshotWatcher {
                             );
                         }
                     }
-                    let resolved_local = self.registry.assignment_version();
-                    if snap.version > resolved_local {
-                        debug!(
-                            local = resolved_local,
-                            remote = snap.version,
-                            "adopting newer assignment"
-                        );
+                    if snap.version > self.registry.assignment_version() {
+                        debug!(remote = snap.version, "adopting newer assignment");
+                        let recovery_timeout = self.config.checkpoint_timeout;
                         let adoption = if audited_recovery {
                             self.db
-                                .adopt_recovery_assignment_snapshot(snap.clone(), head_deadline)
+                                .adopt_recovery_assignment_snapshot(snap.clone(), recovery_timeout)
                                 .await
                         } else {
                             self.db
@@ -1184,7 +1169,7 @@ impl SnapshotWatcher {
                                         audited_target
                                             .as_ref()
                                             .expect("stable successor was audited before adoption"),
-                                        head_deadline,
+                                        Instant::now() + self.config.checkpoint_timeout,
                                     )
                                     .await
                                 {
@@ -1240,7 +1225,7 @@ impl SnapshotWatcher {
                 }
             }
 
-            self.publish_authority(authority_revision, head_deadline)
+            self.publish_authority(authority_revision, self.config.checkpoint_timeout)
                 .await;
         }
     }
@@ -1425,6 +1410,7 @@ pub(crate) struct AuditedAssignmentAuthority {
     predecessor: Option<CheckpointAssignmentFence>,
     handoff_checkpoint: Option<CommittedCheckpointRef>,
     recovery_checkpoint: Option<AuditedRecoveryCheckpoint>,
+    recovery_leader_proof: Option<LeaderProof>,
     terminal: Option<AuditedDrainOutcome>,
 }
 
@@ -1494,6 +1480,7 @@ impl AuditedAssignmentAuthority {
             predecessor: None,
             handoff_checkpoint: None,
             recovery_checkpoint: None,
+            recovery_leader_proof: None,
             terminal: None,
         }
     }
@@ -1502,6 +1489,7 @@ impl AuditedAssignmentAuthority {
         target_version: u64,
         predecessor: CheckpointAssignmentFence,
         recovery_checkpoint: AuditedRecoveryCheckpoint,
+        recovery_leader_proof: LeaderProof,
     ) -> Self {
         let handoff_checkpoint = recovery_checkpoint.checkpoint().clone();
         Self {
@@ -1509,6 +1497,7 @@ impl AuditedAssignmentAuthority {
             predecessor: Some(predecessor),
             handoff_checkpoint: Some(handoff_checkpoint),
             recovery_checkpoint: Some(recovery_checkpoint),
+            recovery_leader_proof: Some(recovery_leader_proof),
             terminal: None,
         }
     }
@@ -1520,6 +1509,7 @@ impl AuditedAssignmentAuthority {
             predecessor: Some(terminal.transition.predecessor.clone()),
             handoff_checkpoint,
             recovery_checkpoint: None,
+            recovery_leader_proof: None,
             terminal: Some(terminal),
         }
     }
@@ -1550,6 +1540,13 @@ impl AuditedAssignmentAuthority {
         self.recovery_checkpoint
             .as_ref()
             .is_some_and(AuditedRecoveryCheckpoint::pin_is_active)
+    }
+
+    pub(crate) fn active_recovery_leader_proof(&self) -> Option<&LeaderProof> {
+        self.recovery_checkpoint
+            .as_ref()
+            .filter(|checkpoint| checkpoint.pin_is_active())
+            .and(self.recovery_leader_proof.as_ref())
     }
 
     pub(crate) fn recovery_checkpoint_was_consumed(&self) -> bool {
@@ -1779,13 +1776,14 @@ pub(crate) fn audit_assignment_snapshot_authority_outcome<'a>(
             .await
             .map_err(|error| error.to_string())?
         else {
-            let (predecessor, handoff_checkpoint) =
+            let (predecessor, handoff_checkpoint, leader_proof) =
                 audit_materialized_recovery_with_authority(store, authority.as_deref(), snapshot)
                     .await?;
             return Ok(AuditedAssignmentAuthority::recovery(
                 snapshot.version,
                 predecessor,
                 handoff_checkpoint,
+                leader_proof,
             ));
         };
         audit_materialized_drain_transition(store, authority.as_deref(), snapshot, transition)
@@ -1865,29 +1863,29 @@ fn validate_portable_recovery_cut(
     Ok(origin.clone())
 }
 
+type AuditedRecoveryAuthority = (
+    CheckpointAssignmentFence,
+    AuditedRecoveryCheckpoint,
+    LeaderProof,
+);
+
 fn audit_materialized_recovery_with_authority<'a>(
     store: &'a AssignmentSnapshotStore,
     authority: Option<&'a LeaderLeaseStore>,
     snapshot: &'a AssignmentSnapshot,
-) -> futures::future::BoxFuture<
-    'a,
-    Result<(CheckpointAssignmentFence, AuditedRecoveryCheckpoint), String>,
-> {
+) -> futures::future::BoxFuture<'a, Result<AuditedRecoveryAuthority, String>> {
     Box::pin(async move {
+        let version = snapshot.version;
         let authority = authority.ok_or_else(|| {
-            format!(
-                "materialized assignment recovery {} has no cluster authority",
-                snapshot.version
-            )
+            format!("materialized assignment recovery {version} has no cluster authority")
         })?;
         let decision = authority
-            .assignment_recovery_decision(snapshot.version)
+            .assignment_recovery_decision(version)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
                 format!(
-                    "assignment {} has no drain transition or recovery authority decision",
-                    snapshot.version
+                    "assignment {version} has no drain transition or recovery authority decision"
                 )
             })?;
         let proposal = store
@@ -1905,8 +1903,7 @@ fn audit_materialized_recovery_with_authority<'a>(
                 snapshot.version
             ));
         }
-        let predecessor_version = snapshot
-            .version
+        let predecessor_version = version
             .checked_sub(1)
             .ok_or_else(|| "recovery assignment has no predecessor generation".to_string())?;
         let predecessor = store
@@ -1914,10 +1911,7 @@ fn audit_materialized_recovery_with_authority<'a>(
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| {
-                format!(
-                    "recovery assignment {} lost predecessor {predecessor_version}",
-                    snapshot.version
-                )
+                format!("recovery assignment {version} lost predecessor {predecessor_version}")
             })?;
         if predecessor.draining
             || predecessor
@@ -2101,7 +2095,11 @@ fn audit_materialized_recovery_with_authority<'a>(
                 successor: successor.target,
             }
         };
-        Ok((decision.predecessor, recovery_checkpoint))
+        Ok((
+            decision.predecessor,
+            recovery_checkpoint,
+            decision.leader_proof,
+        ))
     })
 }
 
@@ -2139,7 +2137,7 @@ fn abort_predecessor_checkpoint_for_recovery<'a>(
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        let (predecessor, audited_recovery) = tokio::time::timeout_at(
+        let (predecessor, audited_recovery, _) = tokio::time::timeout_at(
             deadline,
             audit_materialized_recovery_with_authority(store, Some(authority.as_ref()), snapshot),
         )
@@ -2396,30 +2394,6 @@ fn settle_audited_recovery_predecessor_checkpoint<'a>(
             "recovery assignment published the predecessor checkpoint Abort"
         );
         Ok(())
-    })
-}
-
-fn prepare_recovery_assignment_adoption<'a>(
-    db: &'a Arc<LaminarDB>,
-    store: &'a AssignmentSnapshotStore,
-    controller: &'a ClusterController,
-    snapshot: &'a AssignmentSnapshot,
-    deadline: tokio::time::Instant,
-) -> futures::future::BoxFuture<'a, Result<(), String>> {
-    Box::pin(async move {
-        if !try_suspend_recovery_assignment_authority(db, controller, deadline).await? {
-            return Err(format!(
-                "recovery assignment {} waits for a local vnode transition",
-                snapshot.version
-            ));
-        }
-        if local_recovery_assignment_scope(snapshot, controller)?
-            == LocalRecoveryAssignmentScope::Ownerless
-        {
-            return Ok(());
-        }
-        ensure_local_recovery_fault(db, controller).await?;
-        abort_predecessor_checkpoint_for_recovery(store, controller, snapshot, deadline).await
     })
 }
 
@@ -3043,12 +3017,15 @@ fn materialize_recovery_decision<'a>(
     db: &'a Arc<LaminarDB>,
     store: &'a Arc<AssignmentSnapshotStore>,
     controller: &'a ClusterController,
+    registry: &'a VnodeRegistry,
     decision: AssignmentRecoveryDecision,
     operation_timeout: Duration,
 ) -> futures::future::BoxFuture<'a, Result<Option<u64>, String>> {
     Box::pin(async move {
         let deadline = tokio::time::Instant::now() + operation_timeout;
-        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        let _process_fences =
+            close_local_assignment_authority(db, controller, &decision.target, &[], deadline)
+                .await?;
         let proposal =
             tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
                 .await
@@ -3063,11 +3040,7 @@ fn materialize_recovery_decision<'a>(
         {
             return Err("recovery authority winner does not match its staged proposal".into());
         }
-        if local_recovery_assignment_scope(&proposal, controller)?
-            == LocalRecoveryAssignmentScope::Participant
-        {
-            ensure_local_recovery_fault(db, controller).await?;
-        }
+        local_recovery_assignment_scope(&proposal, controller)?;
         let authority = controller
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
@@ -3088,17 +3061,10 @@ fn materialize_recovery_decision<'a>(
                 decision.target_version()
             ));
         }
-        tokio::time::timeout_at(
-            deadline,
-            audit_assignment_snapshot_authority(store, Some(controller), &durable),
-        )
-        .await
-        .map_err(|_| {
-            "recovery assignment audit exceeded the materialization deadline".to_string()
-        })??;
-        prepare_recovery_assignment_adoption(db, store, controller, &durable, deadline).await?;
+        prepare_recovery_assignment_adoption(db, store, controller, registry, &durable, deadline)
+            .await?;
         let version = durable.version;
-        db.adopt_recovery_assignment_snapshot(durable, deadline)
+        db.adopt_recovery_assignment_snapshot(durable, operation_timeout)
             .await
             .map_err(|error| error.to_string())?;
         let oldest_retained = version.saturating_sub(1);
@@ -3128,6 +3094,7 @@ async fn reconcile_pending_recovery_decision(
     db: &Arc<LaminarDB>,
     store: &Arc<AssignmentSnapshotStore>,
     controller: &ClusterController,
+    registry: &VnodeRegistry,
     current: &AssignmentSnapshot,
     operation_timeout: Duration,
 ) -> Result<Option<u64>, String> {
@@ -3157,7 +3124,8 @@ async fn reconcile_pending_recovery_decision(
             "pending recovery decision for assignment {target_version} has the wrong predecessor"
         ));
     }
-    materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
+    materialize_recovery_decision(db, store, controller, registry, decision, operation_timeout)
+        .await
 }
 
 fn replaced_predecessor_processes(
@@ -3192,26 +3160,14 @@ fn authorize_recovery_successor<'a>(
             .assignment_fence()
             .map_err(|error| error.to_string())?;
         let deadline = controller.process_fencing_deadline(operation_timeout)?;
-        close_local_assignment_authority(db, Some(controller), deadline).await?;
+        let removed = replaced_predecessor_processes(&predecessor, &target);
+        let process_fences =
+            close_local_assignment_authority(db, controller, &target, &removed, deadline).await?;
         let proposal_ref =
             tokio::time::timeout_at(deadline, store.stage_recovery_proposal(&proposal))
                 .await
                 .map_err(|_| "recovery proposal staging exceeded the fencing deadline".to_string())?
                 .map_err(|error| error.to_string())?;
-
-        let removed = replaced_predecessor_processes(&predecessor, &target);
-        let fence_results = futures::future::join_all(
-            removed
-                .iter()
-                .copied()
-                .map(|participant| controller.fence_process_incarnation(participant, deadline)),
-        )
-        .await;
-        let mut process_fences = Vec::with_capacity(fence_results.len());
-        for result in fence_results {
-            process_fences.push(result?);
-        }
-
         let observed = tokio::time::timeout_at(deadline, store.load())
             .await
             .map_err(|_| "assignment head revalidation exceeded the fencing deadline".to_string())?
@@ -3686,8 +3642,9 @@ fn execute_graceful_rotation_owned(
                     &db,
                     &store,
                     &controller,
+                    &registry,
                     *winner,
-                    tokio::time::Instant::now() + config.checkpoint_timeout,
+                    config.checkpoint_timeout,
                 )
                 .await?;
                 Ok(Some(v))
@@ -3732,21 +3689,12 @@ fn try_rebalance_owned(
             .map_err(|error| error.to_string())?;
 
         let local_assignment = registry.versioned_snapshot();
-        if current.version < local_assignment.version() {
-            return Err(format!(
-                "durable assignment head {} regressed behind local assignment {}",
-                current.version,
-                local_assignment.version()
-            ));
-        }
-        if current.version == local_assignment.version()
-            && current_owners.as_slice() != local_assignment.owners()
-        {
-            return Err(format!(
-                "durable and local assignment {} have different owner maps",
-                current.version
-            ));
-        }
+        validate_local_assignment_head(
+            &current,
+            &current_owners,
+            local_assignment.version(),
+            local_assignment.owners(),
+        )?;
 
         // A propagated pin means D(current + 1) is already durable while `current` remains the
         // materialized assignment head. A faulted graph may cold-bootstrap directly from the
@@ -3764,6 +3712,7 @@ fn try_rebalance_owned(
                 Arc::clone(&db),
                 Arc::clone(&store),
                 Arc::clone(&controller),
+                Arc::clone(&registry),
                 current.clone(),
                 config.checkpoint_timeout,
             )
@@ -3881,19 +3830,17 @@ fn try_rebalance_owned(
             && current_authority.is_recovery()
             && assignment_binds_local_process(&current, &controller)?
         {
-            prepare_recovery_assignment_adoption(&db, &store, &controller, &current, head_deadline)
-                .await?;
-            db.adopt_recovery_assignment_snapshot(current.clone(), head_deadline)
-                .await
-                .map_err(|error| error.to_string())?;
-            let reconciled_version = registry.assignment_version();
-            if reconciled_version < current.version {
-                return Err(format!(
-                    "durable recovery assignment {} was not adopted; local assignment remains {}",
-                    current.version, reconciled_version
-                ));
-            }
-            return Ok(Some(reconciled_version));
+            return adopt_materialized_recovery_head(
+                &db,
+                &store,
+                &controller,
+                &registry,
+                &current,
+                head_deadline,
+                config.checkpoint_timeout,
+            )
+            .await
+            .map(Some);
         }
         if current.version > local_assignment.version() && current_roster_is_live {
             // A writer can fail after its durable CAS succeeds but before local adoption. Adopt
@@ -3919,6 +3866,7 @@ fn try_rebalance_owned(
             Arc::clone(&db),
             Arc::clone(&store),
             Arc::clone(&controller),
+            Arc::clone(&registry),
             current.clone(),
             config.checkpoint_timeout,
         )
@@ -3959,6 +3907,7 @@ fn try_rebalance_owned(
                 Arc::clone(&db),
                 Arc::clone(&store),
                 Arc::clone(&controller),
+                Arc::clone(&registry),
                 current.clone(),
                 proposal,
                 config.checkpoint_timeout,
@@ -3979,6 +3928,27 @@ fn try_rebalance_owned(
         )
         .await
     })
+}
+
+fn validate_local_assignment_head(
+    current: &AssignmentSnapshot,
+    current_owners: &[NodeId],
+    local_version: u64,
+    local_owners: &[NodeId],
+) -> Result<(), String> {
+    if current.version < local_version {
+        return Err(format!(
+            "durable assignment head {} regressed behind local assignment {local_version}",
+            current.version
+        ));
+    }
+    if current.version == local_version && current_owners != local_owners {
+        return Err(format!(
+            "durable and local assignment {} have different owner maps",
+            current.version
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4025,12 +3995,20 @@ fn reconcile_pending_recovery_decision_owned(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     controller: Arc<ClusterController>,
+    registry: Arc<VnodeRegistry>,
     current: AssignmentSnapshot,
     operation_timeout: Duration,
 ) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
     Box::pin(async move {
-        reconcile_pending_recovery_decision(&db, &store, &controller, &current, operation_timeout)
-            .await
+        reconcile_pending_recovery_decision(
+            &db,
+            &store,
+            &controller,
+            &registry,
+            &current,
+            operation_timeout,
+        )
+        .await
     })
 }
 
@@ -4038,6 +4016,7 @@ fn authorize_recovery_successor_owned(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     controller: Arc<ClusterController>,
+    registry: Arc<VnodeRegistry>,
     current: AssignmentSnapshot,
     proposal: AssignmentSnapshot,
     operation_timeout: Duration,
@@ -4054,7 +4033,15 @@ fn authorize_recovery_successor_owned(
             &reason,
         )
         .await?;
-        materialize_recovery_decision(&db, &store, &controller, decision, operation_timeout).await
+        materialize_recovery_decision(
+            &db,
+            &store,
+            &controller,
+            &registry,
+            decision,
+            operation_timeout,
+        )
+        .await
     })
 }
 
@@ -4886,9 +4873,11 @@ async fn adopt_any(
     db: &Arc<LaminarDB>,
     store: &AssignmentSnapshotStore,
     controller: &ClusterController,
+    registry: &VnodeRegistry,
     snap: AssignmentSnapshot,
-    deadline: tokio::time::Instant,
+    operation_timeout: Duration,
 ) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + operation_timeout;
     let audited = tokio::time::timeout_at(
         deadline,
         audit_assignment_snapshot_authority_outcome(store, Some(controller), &snap),
@@ -4899,8 +4888,9 @@ async fn adopt_any(
         db.validate_source_drain_snapshot(&snap)
             .map_err(|error| error.to_string())?;
     } else if audited.is_recovery() {
-        prepare_recovery_assignment_adoption(db, store, controller, &snap, deadline).await?;
-        db.adopt_recovery_assignment_snapshot(snap, deadline)
+        prepare_recovery_assignment_adoption(db, store, controller, registry, &snap, deadline)
+            .await?;
+        db.adopt_recovery_assignment_snapshot(snap, operation_timeout)
             .await
             .map_err(|error| error.to_string())?;
     } else {

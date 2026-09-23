@@ -263,6 +263,8 @@ impl From<crate::DbError> for ApiError {
             DbError::MaterializedView(msg) => {
                 Self::query(format!("Materialized view error: {msg}"))
             }
+            error @ (DbError::MaterializedViewQuotaExceeded { .. }
+            | DbError::ReferenceTableQuotaExceeded { .. }) => Self::query(error.to_string()),
 
             other => Self::internal(other.to_string()),
         }
@@ -353,6 +355,21 @@ mod tests {
             "message should include error code: {}",
             api_err.message()
         );
+    }
+
+    #[test]
+    fn test_reference_table_quota_error_becomes_query() {
+        let db_error = crate::DbError::ReferenceTableQuotaExceeded {
+            table: "customers".into(),
+            rows: 3,
+            bytes: 256,
+            max_rows: 2,
+            max_bytes: 128,
+        };
+        let expected = db_error.to_string();
+        let api_error: ApiError = db_error.into();
+        assert_eq!(api_error.code(), codes::QUERY_FAILED);
+        assert_eq!(api_error.message(), expected);
     }
 
     #[test]

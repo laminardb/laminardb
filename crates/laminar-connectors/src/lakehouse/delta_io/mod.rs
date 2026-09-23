@@ -18,6 +18,8 @@
 mod attempt_error;
 mod catalog;
 mod descriptor;
+#[cfg(feature = "delta-lake-gcs")]
+mod gcs_factory;
 mod merge;
 mod publication;
 mod read;
@@ -39,8 +41,8 @@ pub use table::{get_coordinated_cursor, open_or_create_table};
 #[cfg(feature = "delta-lake")]
 pub(crate) use attempt_error::{
     classify_delta_metadata_error, classify_delta_object_store_metadata_error,
-    delta_error_has_retryable_transport, is_definite_coordinated_nonpublication,
-    DeltaWriteAttemptError,
+    delta_error_category, delta_error_has_retryable_transport,
+    is_definite_coordinated_nonpublication, DeltaWriteAttemptError,
 };
 #[cfg(feature = "delta-lake")]
 pub(crate) use merge::merge_changelog;
@@ -66,7 +68,8 @@ pub(super) use publication::{
 };
 #[cfg(feature = "delta-lake")]
 pub(super) use storage_preflight::{
-    bound_coordinated_storage_options, validate_coordinated_storage_preflight,
+    bound_coordinated_storage_options, custom_s3_endpoint_configured,
+    validate_coordinated_storage_preflight, verify_custom_s3_conditional_create,
 };
 
 #[cfg(feature = "delta-lake")]
@@ -90,10 +93,11 @@ use publication::validate_coordinated_retention;
 use read::{checked_cdf_commit_usage, map_cdf_scan_build_error};
 #[cfg(all(feature = "delta-lake", test))]
 use storage_preflight::{
-    is_certified_coordinated_log_store, validate_coordinated_storage_preflight_with_env,
+    custom_s3_endpoint_configured_with_env, is_certified_coordinated_log_store,
+    validate_coordinated_storage_preflight_with_env,
 };
 #[cfg(all(feature = "delta-lake", test))]
-use table::path_to_url;
+use table::{adapt_delta_location, apply_url_derived_options, path_to_url};
 
 #[cfg(feature = "delta-lake")]
 use std::collections::{BTreeMap, HashMap, HashSet};

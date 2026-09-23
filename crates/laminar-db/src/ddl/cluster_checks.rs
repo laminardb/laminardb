@@ -380,6 +380,13 @@ impl LaminarDB {
         if let Some(true) = self.validate_cluster_join_shape(object_kind, name, query_sql, plan)? {
             return Ok(true);
         }
+        if crate::sql_analysis::extract_table_references(query_sql).len() > 1 {
+            return Err(Self::cluster_state_lifecycle_error(
+                object_kind,
+                name,
+                "ordinary SQL execution requires a single input frontier; multiple sources require a managed join stage",
+            ));
+        }
 
         self.validate_cluster_aggregate_shape(object_kind, name, query_sql, plan)
             .await

@@ -251,8 +251,10 @@ pub(crate) fn validate_persisted_properties(
         )));
     }
     if let Some(key) = properties.keys().find(|key| {
+        let normalized = key.to_ascii_lowercase().replace(['.', '-'], "_");
         crate::security::is_secret_option_key(key)
-            || crate::storage::SecretMasker::is_secret_key(key)
+            || normalized.contains("access_key")
+            || normalized.contains("service_account")
     }) {
         return Err(ConnectorError::ConfigurationError(format!(
             "table.property.{key} cannot persist credential material in Iceberg metadata"
@@ -279,5 +281,38 @@ mod tests {
         assert_eq!("truncate[8]".parse(), Ok(IcebergTransform::Truncate(8)));
         assert!("bucket[0]".parse::<IcebergTransform>().is_err());
         assert!("bucket(16)".parse::<IcebergTransform>().is_err());
+    }
+
+    #[test]
+    fn metadata_identifiers_are_not_confused_with_credential_material() {
+        let properties = HashMap::from([
+            ("tenant_id".to_string(), "tenant-reference".to_string()),
+            ("client_id".to_string(), "client-reference".to_string()),
+            ("profile".to_string(), "analytics".to_string()),
+        ]);
+        validate_persisted_properties(&properties).unwrap();
+    }
+
+    #[test]
+    fn access_keys_remain_forbidden_in_table_metadata() {
+        for key in ["access-key-id", "aws_access_key_id", "secret_access_key"] {
+            let properties = HashMap::from([(key.to_string(), "credential".to_string())]);
+            assert!(validate_persisted_properties(&properties).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn service_account_material_remains_forbidden_in_table_metadata() {
+        for key in [
+            "service_account",
+            "service-account-json",
+            "gcs.service_account_path",
+        ] {
+            let properties =
+                HashMap::from([(key.to_string(), "private-credential-value".to_string())]);
+            let error = validate_persisted_properties(&properties).unwrap_err();
+            assert!(error.to_string().contains(key), "{key}: {error}");
+            assert!(!error.to_string().contains("private-credential-value"));
+        }
     }
 }

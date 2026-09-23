@@ -2,6 +2,7 @@ use super::{
     Arc, DbError, LaminarDB, PipelineRuntimeSetup, PipelineSinkSetup, PipelineWatermarks,
     PreparedPipelineRuntime, RuntimeMode, TrackedSourceRegistration,
 };
+use std::sync::atomic::AtomicBool;
 
 struct CallbackCollections {
     source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>>,
@@ -208,7 +209,7 @@ impl LaminarDB {
             table_store: self.table_store.clone(),
             mv_store_has_any: self.mv_store.read().has_any_handle(),
             mv_store: self.mv_store.clone(),
-            filter_ctx: laminar_sql::create_session_context(),
+            filter_ctx: self.create_auxiliary_context(),
             compiled_sink_filters: Vec::new(),
             pending_sink_filter_compiles,
             delivery_guarantee: config.delivery_guarantee,
@@ -229,6 +230,8 @@ impl LaminarDB {
             vnode_registry,
             #[cfg(feature = "cluster")]
             cluster_controller: callback_controller,
+            #[cfg(feature = "cluster")]
+            coordinated_lifecycle_active: Arc::clone(&self.coordinated_lifecycle_active),
             #[cfg(feature = "cluster")]
             assignment_adoption_lock: Arc::clone(&self.assignment_adoption_lock),
             #[cfg(feature = "cluster")]
@@ -253,9 +256,7 @@ impl LaminarDB {
             checkpoint_tail_runtime: self.control_runtime.handle()?,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            full_vnode_capture_needed: Arc::new(std::sync::atomic::AtomicBool::new(
-                full_vnode_capture_needed,
-            )),
+            full_vnode_capture_needed: Arc::new(AtomicBool::new(full_vnode_capture_needed)),
             epoch_allocator,
             #[cfg(feature = "cluster")]
             quorum_timeout,

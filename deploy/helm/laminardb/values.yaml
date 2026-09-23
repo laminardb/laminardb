@@ -78,7 +78,8 @@ laminardb:
       minVersion: "1.2"
 
   # -- Bearer token for the control-plane (console) HTTP API, read from an
-  # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
+  # -- existing Secret. Required for non-loopback HTTP binds, including the default.
+  # -- An empty value without a console token in configOverride fails server startup.
   consoleToken:
     existingSecret: ""
     secretKey: "token"
@@ -302,13 +303,13 @@ prometheusRule:
   # -- Alert rules
   rules: []
   # Example:
-  # - alert: LaminarDBPipelineDown
-  #   expr: laminardb_pipeline_state_info{state="Stopped"} == 1
+  # - alert: LaminarDBScrapeDown
+  #   expr: up{job="laminardb"} == 0
   #   for: 5m
   #   labels:
   #     severity: critical
   #   annotations:
-  #     summary: "LaminarDB pipeline is down"
+  #     summary: "LaminarDB metrics scrape is failing"
 
 # -- Grafana dashboard ConfigMap
 grafanaDashboard:

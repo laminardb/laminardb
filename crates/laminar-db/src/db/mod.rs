@@ -5,6 +5,13 @@
 mod assignment_authority;
 #[cfg(feature = "cluster")]
 mod cluster_subscription;
+#[cfg(test)]
+mod datafusion_memory_tests;
+mod session;
+#[cfg(feature = "cluster")]
+pub(crate) use assignment_authority::{
+    audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +24,6 @@ use laminar_core::catalog::CatalogObjectKind;
 use laminar_core::streaming;
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use laminar_sql::planner::StreamingPlanner;
-use laminar_sql::register_streaming_functions;
 
 use crate::builder::LaminarDbBuilder;
 use crate::catalog::SourceCatalog;
@@ -1430,81 +1436,6 @@ enum AssignmentAdoptionMode {
     StoppedRecoveryTopology,
 }
 
-#[cfg(feature = "cluster")]
-pub(crate) async fn audited_stopped_terminal_round(
-    controller: &laminar_core::cluster::control::ClusterController,
-    predecessor: &laminar_core::checkpoint::CheckpointAssignmentFence,
-    deadline: tokio::time::Instant,
-) -> Result<Option<laminar_core::cluster::control::RecoveryRound>, DbError> {
-    use laminar_core::cluster::control::{RecoverPhase, RecoveryAnnouncement};
-
-    let active = tokio::time::timeout_at(deadline, controller.observe_recover_control())
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery Prepare authority observation timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery Prepare authority observation failed: {error}"
-            ))
-        })?;
-    let Some(RecoveryAnnouncement {
-        round,
-        phase: RecoverPhase::Prepare,
-    }) = active
-    else {
-        return Ok(None);
-    };
-    let local = controller.instance_id();
-    if round.assignment_fence != *predecessor
-        || !controller.recovery_driver_is_current(&round)
-        || !controller.recovery_round_requires_current_process_stop(&round)
-        || !controller.process_lease_is_live()
-    {
-        return Ok(None);
-    }
-    let reports = tokio::time::timeout_at(deadline, controller.read_stopped(&round, &[local]))
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery local stopped-report read timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery local stopped-report read failed: {error}"
-            ))
-        })?;
-    let expected = laminar_core::checkpoint::CheckpointParticipant {
-        node_id: local.0,
-        boot_incarnation: controller.recovery_incarnation(),
-    };
-    if reports.len() != 1
-        || reports[0].publisher() != expected
-        || reports[0].validate(&round).is_err()
-    {
-        return Ok(None);
-    }
-    let confirmed = tokio::time::timeout_at(deadline, controller.observe_recover_control())
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint("stopped-recovery Prepare authority recheck timed out".into())
-        })?
-        .map_err(|error| {
-            DbError::Checkpoint(format!(
-                "stopped-recovery Prepare authority recheck failed: {error}"
-            ))
-        })?;
-    if confirmed
-        != Some(RecoveryAnnouncement {
-            round: round.clone(),
-            phase: RecoverPhase::Prepare,
-        })
-        || !controller.process_lease_is_live()
-    {
-        return Ok(None);
-    }
-    Ok(Some(round))
-}
-
 /// Result of certifying a clustered process at startup.
 #[cfg(feature = "cluster")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1752,7 +1683,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     pub fn open_with_config(config: LaminarConfig) -> Result<Arc<Self>, DbError> {
         let db = Self::open_with_config_and_vars(config, HashMap::new())?;
         db.connector_registry.freeze();
@@ -1763,7 +1694,7 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns `DbError` if `DataFusion` context creation fails.
+    /// Returns `DbError` if the configuration is invalid or `DataFusion` context creation fails.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn open_with_config_and_vars(
         config: LaminarConfig,
@@ -1791,68 +1722,21 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
-        config.source_idle_timeout =
-            crate::config::source_idle_timeout_ms(config.source_idle_timeout)
-                .map_err(|error| DbError::Config(error.to_string()))?
-                .map(Duration::from_millis);
-        let future_skew_ms =
-            crate::config::event_time_max_future_skew_ms(config.event_time_max_future_skew)
-                .map_err(|error| DbError::Config(error.to_string()))?;
-        config.event_time_max_future_skew = Duration::from_millis(future_skew_ms.unsigned_abs());
-        let max_managed_state_bytes = config
-            .pipeline_max_managed_state_bytes
-            .unwrap_or(crate::config::DEFAULT_MAX_MANAGED_STATE_BYTES);
-        if max_managed_state_bytes == 0 {
-            return Err(DbError::Config(
-                "pipeline_max_managed_state_bytes must be greater than zero".into(),
-            ));
-        }
-        config.pipeline_max_managed_state_bytes = Some(max_managed_state_bytes);
-
-        if let Some(checkpoint) = config.checkpoint.as_mut() {
-            let max_node_data_bytes = checkpoint.max_node_data_bytes.unwrap_or(
-                laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_NODE_DATA_BYTES,
-            );
-            laminar_core::checkpoint::checkpoint_store::validate_max_checkpoint_node_data_bytes(
-                max_node_data_bytes,
-            )
-            .map_err(|error| DbError::Config(format!("checkpoint.max_node_data_bytes: {error}")))?;
-            checkpoint.max_node_data_bytes = Some(max_node_data_bytes);
-        }
+        config.validate_and_normalize()?;
 
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
 
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
-        // Wire the LookupJoinExtensionPlanner so LookupJoinNode → LookupJoinExec.
-        let ctx = {
-            let mut session_config = laminar_sql::datafusion::base_session_config();
-            if let Some(n) = target_partitions {
-                session_config = session_config.with_target_partitions(n);
-            }
-            let extension_planner: Arc<
-                dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
-            > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
-                Arc::clone(&lookup_registry),
-            ));
-            let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
-                Arc::new(LookupQueryPlanner { extension_planner });
-            let mut state_builder = datafusion::execution::SessionStateBuilder::new()
-                .with_config(session_config)
-                .with_default_features()
-                .with_query_planner(query_planner);
-            for rule in extra_optimizer_rules {
-                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
-            }
-            SessionContext::new_with_state(state_builder.build())
-        };
-        register_streaming_functions(&ctx);
+        let ctx = session::create_context(
+            &config,
+            Arc::clone(&lookup_registry),
+            extra_optimizer_rules,
+            target_partitions,
+        )?;
 
-        let catalog = Arc::new(SourceCatalog::new(
-            config.default_buffer_size,
-            config.default_backpressure,
-        ));
+        let catalog = Arc::new(SourceCatalog::from_config(&config));
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry)?;
@@ -1865,7 +1749,6 @@ impl LaminarDB {
             ctx,
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
-            config,
             config_vars: Arc::new(config_vars),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             coordinator: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1875,8 +1758,12 @@ impl LaminarDB {
             connector_registry,
             mv_registry: parking_lot::Mutex::new(laminar_core::mv::MvRegistry::new()),
             table_store: Arc::new(parking_lot::RwLock::new(
-                crate::table_store::TableStore::new(),
+                crate::table_store::TableStore::from_config(&config),
             )),
+            mv_store: Arc::new(parking_lot::RwLock::new(
+                crate::mv_store::MvStore::from_config(&config),
+            )),
+            config,
             state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             last_fault: Arc::new(parking_lot::Mutex::new(None)),
             catalog_cleanup_fenced: std::sync::atomic::AtomicBool::new(false),
@@ -1919,7 +1806,6 @@ impl LaminarDB {
             ai_runtime: None,
             ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
-            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -2099,15 +1985,7 @@ impl LaminarDB {
         let receiver = self.shuffle_receiver.lock().clone();
         let sender = self.shuffle_sender.lock().clone();
         let expected_digest = fence.digest();
-        let receiver_exact = receiver.as_ref().is_none_or(|endpoint| {
-            endpoint.assignment_version() == fence.assignment_version
-                && endpoint.active_assignment_digest() == Some(expected_digest)
-        });
-        let sender_exact = sender.as_ref().is_none_or(|endpoint| {
-            endpoint.assignment_version() == fence.assignment_version
-                && endpoint.active_assignment_digest() == Some(expected_digest)
-        });
-        if receiver_exact && sender_exact {
+        if self.shuffle_assignment_authority_is_exact(fence) {
             if !controller.process_lease_is_live() {
                 self.invalidate_shuffle_assignment_fence();
                 return Err(DbError::Checkpoint(
@@ -2916,23 +2794,34 @@ impl LaminarDB {
     /// Install an authority-sequenced failure-recovery successor. A still-running graph uses the
     /// ordinary live transition. Only an exactly faulted, terminally observed and recovery-fenced
     /// graph selects cold publication without reusing predecessor heap memory.
+    ///
+    /// Waiting for another assignment operation and executing this adoption are independently
+    /// bounded. A competing observer must not consume the durable re-audit and publication budget
+    /// after this caller acquires serialization.
     #[cfg(feature = "cluster")]
     pub(crate) async fn adopt_recovery_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
-        deadline: tokio::time::Instant,
+        operation_timeout: Duration,
     ) -> Result<SnapshotAdoption, DbError> {
         let version = snapshot.version;
-        tokio::time::timeout_at(deadline, async {
-            let _adoption = self.assignment_adoption_lock.lock().await;
-            let mode = if DbState::load(&self.state) == DbState::Faulted {
-                AssignmentAdoptionMode::ColdRecovery
-            } else {
-                AssignmentAdoptionMode::LiveTransition
-            };
-            self.adopt_assignment_snapshot_locked(snapshot, deadline, mode)
-                .await
-        })
+        let _adoption = tokio::time::timeout(operation_timeout, self.assignment_adoption_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "recovery assignment {version} adoption timed out waiting for assignment serialization"
+                ))
+            })?;
+        let deadline = tokio::time::Instant::now() + operation_timeout;
+        let mode = if DbState::load(&self.state) == DbState::Faulted {
+            AssignmentAdoptionMode::ColdRecovery
+        } else {
+            AssignmentAdoptionMode::LiveTransition
+        };
+        tokio::time::timeout_at(
+            deadline,
+            self.adopt_assignment_snapshot_locked(snapshot, deadline, mode),
+        )
         .await
         .unwrap_or_else(|_| {
             Err(DbError::Checkpoint(format!(
@@ -2949,7 +2838,6 @@ impl LaminarDB {
         mode: AssignmentAdoptionMode,
     ) -> futures::future::BoxFuture<'_, Result<SnapshotAdoption, DbError>> {
         Box::pin(async move {
-            let mut mode = mode;
             if snapshot.draining {
                 return Err(DbError::Checkpoint(format!(
                     "assignment {} is a draining generation and cannot publish ownership",
@@ -3042,9 +2930,8 @@ impl LaminarDB {
             let audited_predecessor = audited_target.predecessor().cloned();
             let committed_handoff_checkpoint = audited_target.handoff_checkpoint().cloned();
             let recovery_origin = audited_target.recovery_origin().cloned();
-            let recovery_pin_is_active = audited_target.recovery_pin_is_active();
-            let recovery_checkpoint_was_consumed =
-                audited_target.recovery_checkpoint_was_consumed();
+            let recovery_proof = audited_target.active_recovery_leader_proof().cloned();
+            let recovery_was_consumed = audited_target.recovery_checkpoint_was_consumed();
             let audited_drain = audited_target.into_terminal();
             let terminal_drain_authority = !audited_recovery && audited_drain.is_some();
             let aborted_drain_authority = !audited_recovery
@@ -3064,16 +2951,17 @@ impl LaminarDB {
             // still needs topology publication before a pristine graph can restore that older cut.
             // Reuse the cold-publication path only when the immutable drain audit and exact faulted
             // lifecycle below both hold; neither outcome reuses predecessor heap memory.
-            let faulted_terminal_drain_cold =
-                terminal_drain_authority && DbState::load(&self.state) == DbState::Faulted;
-            if mode == AssignmentAdoptionMode::LiveTransition && faulted_terminal_drain_cold {
-                mode = AssignmentAdoptionMode::ColdRecovery;
-            }
+            // The durable audit above can outlive the compute generation on a remote store. Select
+            // the recovery mode again after that I/O so a graph that faulted meanwhile does not
+            // pay for a known-invalid live transition and a second complete authority audit.
+            let (mut mode, faulted_terminal_drain_cold) = mode
+                .after_authority_audit(self, audited_recovery, terminal_drain_authority, deadline)
+                .await?;
             let target_fence = snapshot
                 .assignment_fence()
                 .map_err(|error| DbError::Checkpoint(error.to_string()))?;
             let recovery_requires_cold = audited_recovery
-                && (recovery_checkpoint_was_consumed
+                && (recovery_was_consumed
                     || recovery_origin.as_ref().is_some_and(|origin| {
                         audited_predecessor.as_ref().is_some_and(|predecessor| {
                             origin.assignment_version < predecessor.assignment_version
@@ -3099,7 +2987,7 @@ impl LaminarDB {
                             snapshot.version
                         ))
                     })?;
-                    if recovery_pin_is_active {
+                    if recovery_proof.is_some() {
                         let pinned = tokio::time::timeout_at(
                             deadline,
                             authority.assignment_handoff_checkpoint(&target_fence),
@@ -3123,7 +3011,7 @@ impl LaminarDB {
                                 snapshot.version
                             )));
                         }
-                    } else if recovery_checkpoint_was_consumed {
+                    } else if recovery_was_consumed {
                         let head = tokio::time::timeout_at(
                             deadline,
                             authority.highest_cluster_committed_outcome(),
@@ -3475,8 +3363,7 @@ impl LaminarDB {
                 && target_fence.participant_incarnation(self_id.0).is_none();
             let stopped_aborted_topology_shape =
                 stopped_aborted_owner_topology_shape || stopped_aborted_ownerless_topology_shape;
-            let stopped_recovery_successor_topology_shape = audited_recovery
-                && recovery_pin_is_active
+            let stopped_recovery_successor_topology_shape = recovery_proof.is_some()
                 && committed_handoff_checkpoint.is_some()
                 && predecessor_fence.is_some();
             let prepared_recovery_fault_is_active = if stopped_recovery_topology_common
@@ -3537,11 +3424,12 @@ impl LaminarDB {
                 };
             let stopped_recovery_successor_round =
                 if stopped_recovery_topology_common && stopped_recovery_successor_topology_shape {
-                    audited_stopped_terminal_round(
+                    audited_stopped_recovery_successor_round(
                         controller.as_ref(),
                         predecessor_fence
                             .as_ref()
                             .expect("recovery successor shape has predecessor"),
+                        recovery_proof.as_ref().expect("audited active proof"),
                         deadline,
                     )
                     .await?
@@ -3867,11 +3755,12 @@ impl LaminarDB {
                 == AssignmentAdoptionMode::StoppedRecoveryTopology
                 && stopped_recovery_successor_topology_shape
             {
-                audited_stopped_terminal_round(
+                audited_stopped_recovery_successor_round(
                     controller.as_ref(),
                     predecessor_fence
                         .as_ref()
                         .expect("recovery successor shape has predecessor"),
+                    recovery_proof.as_ref().expect("audited active proof"),
                     deadline,
                 )
                 .await?
@@ -4413,7 +4302,7 @@ impl LaminarDB {
 
         let _catalog_guard = self.topology_ddl_lock.read().await;
         let provider = self.ctx.table_provider(exact_table_reference(name)).await?;
-        let context = SessionContext::new();
+        let context = self.create_auxiliary_context();
         context.register_table(exact_table_reference(LOCAL_SCAN_NAME), provider)?;
         Ok(context
             .sql(&format!("SELECT * FROM {LOCAL_SCAN_NAME}"))
@@ -4451,7 +4340,11 @@ impl LaminarDB {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry)?;
             laminar_connectors::lakehouse::register_delta_lake_source(registry)?;
         }
-        #[cfg(feature = "iceberg")]
+        #[cfg(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        ))]
         {
             laminar_connectors::lakehouse::register_iceberg_sink(registry)?;
             laminar_connectors::lakehouse::register_iceberg_source(registry)?;
@@ -5763,7 +5656,8 @@ impl LaminarDB {
                     result = stream.next() => {
                         match result {
                             Some(Ok(batch)) => {
-                                if source_clone.push_arrow(batch).is_err() {
+                                // Query output retains its own count-bound ownership, outside input push budgets.
+                                if source_clone.push(crate::catalog::ArrowRecord { batch }).is_err() {
                                     break;
                                 }
                             }

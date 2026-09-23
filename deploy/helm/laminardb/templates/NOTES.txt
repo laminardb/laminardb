@@ -1,6 +1,10 @@
 LaminarDB has been deployed!
 
 Mode: {{ .Values.laminardb.mode }}
+{{- if and (not .Values.laminardb.configOverride) (not (.Values.laminardb.consoleToken | default dict).existingSecret) }}
+HTTP startup requires a console token for non-loopback binds (including the default).
+Set laminardb.consoleToken.existingSecret to a Secret containing the token before starting the server.
+{{- end }}
 {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
 {{- if $isCluster }}
 Replicas: {{ .Values.replicaCount }}
@@ -24,15 +28,19 @@ Replicas: {{ .Values.replicaCount }}
   curl http://localhost:{{ .Values.service.httpPort }}/metrics
 
 4. List pipelines:
-  curl http://localhost:{{ .Values.service.httpPort }}/api/v1/streams
+  # Set LAMINAR_CONSOLE_TOKEN in your shell to the configured console token.
+  curl http://localhost:{{ .Values.service.httpPort }}/api/v1/streams \
+    -H "Authorization: Bearer $LAMINAR_CONSOLE_TOKEN"
 
 5. Execute SQL:
   curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/sql \
+    -H "Authorization: Bearer $LAMINAR_CONSOLE_TOKEN" \
     -H "Content-Type: application/json" \
     -d '{"sql": "SHOW SOURCES"}'
 
 6. Trigger a checkpoint:
-  curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/checkpoint
+  curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/checkpoint \
+    -H "Authorization: Bearer $LAMINAR_CONSOLE_TOKEN"
 
 {{- if $isCluster }}
 {{- $cluster := .Values.laminardb.cluster | default dict }}

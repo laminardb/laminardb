@@ -142,6 +142,114 @@ fn delta_error_is_retryable(
 }
 
 #[cfg(feature = "delta-lake")]
+fn object_store_error_category(error: &deltalake::ObjectStoreError) -> &'static str {
+    match error {
+        deltalake::ObjectStoreError::NotFound { .. } => "object-not-found",
+        deltalake::ObjectStoreError::InvalidPath { .. } => "invalid-object-path",
+        deltalake::ObjectStoreError::NotSupported { .. } => "operation-not-supported",
+        deltalake::ObjectStoreError::AlreadyExists { .. } => "object-already-exists",
+        deltalake::ObjectStoreError::Precondition { .. } => "conditional-conflict",
+        deltalake::ObjectStoreError::NotModified { .. } => "object-not-modified",
+        deltalake::ObjectStoreError::NotImplemented { .. } => "operation-not-implemented",
+        deltalake::ObjectStoreError::PermissionDenied { .. } => "permission-denied",
+        deltalake::ObjectStoreError::Unauthenticated { .. } => "authentication-failed",
+        deltalake::ObjectStoreError::UnknownConfigurationKey { .. } => {
+            "invalid-storage-configuration"
+        }
+        deltalake::ObjectStoreError::Generic { source, .. } => {
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+            let mut saw_provider_response = false;
+            while let Some(current) = cause {
+                if let Some(http) = current.downcast_ref::<object_store::client::HttpError>() {
+                    match http.kind() {
+                        object_store::client::HttpErrorKind::Connect => {
+                            return "transport-connect";
+                        }
+                        object_store::client::HttpErrorKind::Request => {
+                            return "transport-request";
+                        }
+                        object_store::client::HttpErrorKind::Timeout => {
+                            return "transport-timeout";
+                        }
+                        object_store::client::HttpErrorKind::Interrupted => {
+                            return "transport-interrupted";
+                        }
+                        _ => saw_provider_response = true,
+                    }
+                }
+                if let Some(request) = current.downcast_ref::<delta_reqwest::Error>() {
+                    if request.is_timeout() {
+                        return "transport-timeout";
+                    }
+                    if request.is_connect() {
+                        return "transport-connect";
+                    }
+                    if request.is_request() {
+                        return "transport-request";
+                    }
+                    if request.is_body() {
+                        return "transport-body";
+                    }
+                    if request.status().is_some() {
+                        saw_provider_response = true;
+                    }
+                }
+                if current.downcast_ref::<std::io::Error>().is_some() {
+                    return "transport-io";
+                }
+                cause = current.source();
+            }
+            if saw_provider_response {
+                "provider-response"
+            } else {
+                "provider-error"
+            }
+        }
+        _ => "object-store-error",
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+fn kernel_error_category(error: &delta_kernel::error::Error) -> &'static str {
+    match error {
+        delta_kernel::error::Error::Backtraced { source, .. } => kernel_error_category(source),
+        delta_kernel::error::Error::ObjectStore(error) => object_store_error_category(error),
+        _ => "kernel-error",
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+pub(crate) fn delta_error_category(error: &deltalake::DeltaTableError) -> &'static str {
+    match error {
+        deltalake::DeltaTableError::KernelError(error) => kernel_error_category(error),
+        deltalake::DeltaTableError::ObjectStore { source }
+        | deltalake::DeltaTableError::Transaction {
+            source: deltalake::kernel::transaction::TransactionError::ObjectStore { source },
+        }
+        | deltalake::DeltaTableError::Kernel {
+            source: deltalake::kernel::Error::ObjectStore(source),
+        } => object_store_error_category(source),
+        deltalake::DeltaTableError::Transaction { .. }
+        | deltalake::DeltaTableError::VersionAlreadyExists(_)
+        | deltalake::DeltaTableError::VersionMismatch(_, _) => "transaction-conflict",
+        deltalake::DeltaTableError::MissingFeature { .. } => "missing-provider-feature",
+        deltalake::DeltaTableError::InvalidTableLocation(_) => "invalid-table-location",
+        deltalake::DeltaTableError::NotATable(_) => "not-a-delta-table",
+        deltalake::DeltaTableError::NoSchema
+        | deltalake::DeltaTableError::SchemaMismatch { .. } => "schema-error",
+        deltalake::DeltaTableError::InvalidData { .. }
+        | deltalake::DeltaTableError::InvalidJsonLog { .. }
+        | deltalake::DeltaTableError::InvalidStatsJson { .. }
+        | deltalake::DeltaTableError::MetadataError(_) => "invalid-delta-metadata",
+        deltalake::DeltaTableError::Parquet { .. } => "parquet-error",
+        deltalake::DeltaTableError::Arrow { .. } => "arrow-error",
+        deltalake::DeltaTableError::Io { .. } => "local-io-error",
+        deltalake::DeltaTableError::Kernel { .. } => "kernel-error",
+        _ => "delta-error",
+    }
+}
+
+#[cfg(feature = "delta-lake")]
 pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableError) -> bool {
     delta_error_is_retryable(error, DeltaHttpRetryPolicy::ProvenTransport)
 }
@@ -152,9 +260,15 @@ pub(crate) fn classify_delta_metadata_error(
     error: &deltalake::DeltaTableError,
 ) -> ConnectorError {
     if delta_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
-        ConnectorError::ReadError(format!("{context}: {error}"))
+        ConnectorError::ReadError(format!(
+            "{context}: retryable Delta metadata transport failure ({})",
+            delta_error_category(error)
+        ))
     } else {
-        ConnectorError::TransactionError(format!("{context}: {error}"))
+        ConnectorError::TransactionError(format!(
+            "{context}: non-retryable Delta metadata failure ({})",
+            delta_error_category(error)
+        ))
     }
 }
 
@@ -164,9 +278,15 @@ pub(crate) fn classify_delta_object_store_metadata_error(
     error: &deltalake::ObjectStoreError,
 ) -> ConnectorError {
     if object_store_error_is_retryable(error, DeltaHttpRetryPolicy::IdempotentMetadataRead) {
-        ConnectorError::ReadError(format!("{context}: {error}"))
+        ConnectorError::ReadError(format!(
+            "{context}: retryable object-store metadata transport failure ({})",
+            object_store_error_category(error)
+        ))
     } else {
-        ConnectorError::TransactionError(format!("{context}: {error}"))
+        ConnectorError::TransactionError(format!(
+            "{context}: non-retryable object-store metadata failure ({})",
+            object_store_error_category(error)
+        ))
     }
 }
 
@@ -183,4 +303,21 @@ pub(crate) fn is_definite_coordinated_nonpublication(error: &deltalake::DeltaTab
                         | TransactionError::MaxCommitAttempts(_)
                 }
         )
+}
+
+#[cfg(all(test, feature = "delta-lake"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_store_category_finds_concrete_io_causes() {
+        let error = deltalake::ObjectStoreError::Generic {
+            store: "test",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "private transport detail",
+            )),
+        };
+        assert_eq!(object_store_error_category(&error), "transport-io");
+    }
 }

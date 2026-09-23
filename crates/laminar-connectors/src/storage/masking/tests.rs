@@ -54,8 +54,8 @@ fn test_not_secret_region() {
 }
 
 #[test]
-fn test_not_secret_access_key_id() {
-    assert!(!SecretMasker::is_secret_key("aws_access_key_id"));
+fn test_credential_access_key_id_is_redacted() {
+    assert!(SecretMasker::is_secret_key("aws_access_key_id"));
 }
 
 #[test]
@@ -64,8 +64,8 @@ fn test_not_secret_table_path() {
 }
 
 #[test]
-fn test_not_secret_account_name() {
-    assert!(!SecretMasker::is_secret_key("azure_storage_account_name"));
+fn test_account_name_is_redacted() {
+    assert!(SecretMasker::is_secret_key("azure_storage_account_name"));
 }
 
 #[test]
@@ -74,9 +74,8 @@ fn test_not_secret_endpoint() {
 }
 
 #[test]
-fn test_not_secret_service_account_path() {
-    // Path is not secret (it's just a filesystem path to the key file)
-    assert!(!SecretMasker::is_secret_key("google_service_account_path"));
+fn test_service_account_path_is_redacted() {
+    assert!(SecretMasker::is_secret_key("google_service_account_path"));
 }
 
 // ── redact_map tests ──
@@ -94,7 +93,7 @@ fn test_redact_map_replaces_secrets() {
     let redacted = SecretMasker::redact_map(&map);
     assert_eq!(redacted["aws_region"], "us-east-1");
     assert_eq!(redacted["aws_secret_access_key"], "***");
-    assert_eq!(redacted["aws_access_key_id"], "AKID123");
+    assert_eq!(redacted["aws_access_key_id"], "***");
 }
 
 #[test]
@@ -137,4 +136,42 @@ fn test_display_map_empty() {
     let map = HashMap::new();
     let display = SecretMasker::display_map(&map);
     assert!(display.is_empty());
+}
+
+#[test]
+fn endpoints_and_signed_urls_are_described_without_authority_or_query() {
+    let map = HashMap::from([
+        (
+            "aws_endpoint".into(),
+            "http://user:password@minio.internal:9000/base?token=hidden".into(),
+        ),
+        (
+            "table.path".into(),
+            "az://container/path?sv=1&sig=signed-secret".into(),
+        ),
+        (
+            "warehouse".into(),
+            "gs://bucket/path#fragment-secret".into(),
+        ),
+    ]);
+    let display = SecretMasker::display_map(&map);
+    assert!(display.contains("aws_endpoint=<custom-http-endpoint>"));
+    assert!(display.contains("table.path=<redacted-url>"));
+    for secret in [
+        "minio.internal",
+        "password",
+        "signed-secret",
+        "container/path",
+        "fragment-secret",
+    ] {
+        assert!(!display.contains(secret));
+    }
+}
+
+#[test]
+fn malformed_url_fragments_are_redacted() {
+    let map = HashMap::from([("warehouse".into(), "gs://[invalid#fragment-secret".into())]);
+    let display = SecretMasker::display_map(&map);
+    assert_eq!(display, "warehouse=<redacted-url>");
+    assert!(!display.contains("fragment-secret"));
 }

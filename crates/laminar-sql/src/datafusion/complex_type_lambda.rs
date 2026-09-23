@@ -39,6 +39,8 @@ pub fn register_lambda_functions(ctx: &datafusion::prelude::SessionContext) {
 }
 
 thread_local! {
+    // This standalone expression context is outside per-DB reservation accounting;
+    // direct expression/Arrow allocations are not governed by DataFusion's memory pool.
     /// Cached `SessionContext` for lambda evaluation.
     ///
     /// Creating a `SessionContext` is expensive because it registers all

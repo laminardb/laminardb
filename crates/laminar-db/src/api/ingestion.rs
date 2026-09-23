@@ -25,7 +25,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// Returns `ApiError::Ingestion` if the writer is closed, schemas differ, or the channel is full.
+    /// Returns `ApiError::Ingestion` if the writer is closed, schemas differ, the count/byte
+    /// budget is full, or a batch exceeds `LaminarConfig::push_source_max_bytes`.
     pub fn write(&mut self, batch: RecordBatch) -> Result<(), ApiError> {
         if self.closed {
             return Err(ApiError::Ingestion {

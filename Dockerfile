@@ -96,6 +96,7 @@ COPY <<'EOF' /etc/laminardb/laminardb.toml
 [server]
 mode = "single"
 bind = "0.0.0.0:8080"
+console_token = "${LAMINAR_CONSOLE_TOKEN}"
 
 [checkpoint]
 url = "file:///var/lib/laminardb/checkpoints"

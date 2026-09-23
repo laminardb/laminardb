@@ -6,7 +6,10 @@ mod identity;
 mod modes;
 mod registry;
 mod source;
+#[cfg(feature = "iceberg-core")]
+mod storage_diagnostics;
 mod table_definition;
+mod warehouse_location;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -211,7 +214,11 @@ impl IcebergCatalogConfig {
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let catalog_type = parse_or_default(config, "catalog.type")?;
         let catalog_uri = config.require("catalog.uri")?.trim().to_string();
-        let warehouse = required_alias(config, "catalog.warehouse", "warehouse")?.to_string();
+        let warehouse = warehouse_location::canonicalize(required_alias(
+            config,
+            "catalog.warehouse",
+            "warehouse",
+        )?)?;
         let namespace = config.require("namespace")?.trim().to_string();
         let table_name = config.require("table.name")?.trim().to_string();
         for (name, value) in [

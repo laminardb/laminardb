@@ -35,6 +35,9 @@ pub mod durable_fs;
 mod durable_local_store;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
+/// Refreshable Google workload-identity credentials for pinned object-store clients.
+#[cfg(feature = "gcs")]
+pub mod gcs_credentials;
 /// Lookup table types and predicate pushdown.
 pub mod lookup;
 pub mod mv;
@@ -45,6 +48,10 @@ pub mod serialization;
 pub mod shuffle;
 /// Partition-key encoding and virtual-node routing.
 pub mod state;
+/// Non-secret object-store credential-source classification.
+pub mod storage_auth;
+/// Provider-neutral object-store locations and consumer-specific URL adapters.
+pub mod storage_location;
 pub mod streaming;
 pub mod time;
 

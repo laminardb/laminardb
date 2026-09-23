@@ -4,24 +4,81 @@ use std::collections::BTreeMap;
 use object_store::memory::InMemory;
 use object_store::{ObjectStore, ObjectStoreExt};
 
-struct PendingListStore {
-    inner: Arc<dyn ObjectStore>,
+#[derive(Debug)]
+struct DelayedScanKv {
+    inner: laminar_core::cluster::control::InMemoryKv,
+    scan_delay: Duration,
 }
 
-impl std::fmt::Debug for PendingListStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingListStore").finish_non_exhaustive()
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::ClusterKv for DelayedScanKv {
+    async fn write(&self, key: &str, value: String) {
+        self.inner.write(key, value).await;
+    }
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        self.inner.read_from(who, key).await
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        tokio::time::sleep(self.scan_delay).await;
+        self.inner.scan(key).await
     }
 }
 
-impl std::fmt::Display for PendingListStore {
+struct GetBarrier {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    path_prefix: Option<&'static str>,
+    reads_before_wait: std::sync::atomic::AtomicUsize,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl GetBarrier {
+    async fn wait_once(&self, location: &object_store::path::Path) {
+        if self
+            .path_prefix
+            .is_some_and(|prefix| !location.as_ref().starts_with(prefix))
+        {
+            return;
+        }
+        if self
+            .reads_before_wait
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return;
+        }
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
+
+struct ReadBarrierStore {
+    inner: Arc<dyn ObjectStore>,
+    get: Option<Arc<GetBarrier>>,
+    stall_list: bool,
+}
+
+impl std::fmt::Debug for ReadBarrierStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PendingListStore")
+        f.debug_struct("ReadBarrierStore").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ReadBarrierStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReadBarrierStore")
     }
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for PendingListStore {
+impl ObjectStore for ReadBarrierStore {
     async fn put_opts(
         &self,
         location: &object_store::path::Path,
@@ -44,6 +101,9 @@ impl ObjectStore for PendingListStore {
         location: &object_store::path::Path,
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
+        if let Some(get) = &self.get {
+            get.wait_once(location).await;
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -59,9 +119,13 @@ impl ObjectStore for PendingListStore {
 
     fn list(
         &self,
-        _prefix: Option<&object_store::path::Path>,
+        prefix: Option<&object_store::path::Path>,
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        Box::pin(futures::stream::pending())
+        if self.stall_list {
+            Box::pin(futures::stream::pending())
+        } else {
+            self.inner.list(prefix)
+        }
     }
 
     async fn list_with_delimiter(
@@ -857,6 +921,10 @@ async fn stopped_recovery_successor_fixture(
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[failed]);
 
+    // Keep this fixture at the materialized-but-not-retired boundary so the tests below can
+    // install an exact stopped Prepare themselves.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -866,9 +934,11 @@ async fn stopped_recovery_successor_fixture(
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the live predecessor intentionally lacks the removed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let target = durable
@@ -1208,7 +1278,7 @@ async fn stopped_recovery_topology_requires_the_exact_durable_fault_sequence() {
 }
 
 #[tokio::test]
-async fn stopped_recovery_owner_topology_publishes_an_audited_recovery_successor() {
+async fn stopped_recovery_owner_publishes_successor_after_driver_candidacy_loss() {
     let (db, controller, registry, _current, target, round, process_authority, _checkpoint_dir) =
         stopped_recovery_successor_fixture(true).await;
     assert!(controller.recovery_round_requires_current_process_stop(&round));
@@ -1223,12 +1293,11 @@ async fn stopped_recovery_owner_topology_publishes_an_audited_recovery_successor
         .is_none(),
         "Prepare is the only quiescence witness until the exact target roster adopts"
     );
+    controller.set_active(false);
+    assert!(!controller.recovery_driver_is_current(&round));
 
     let adoption = db
-        .adopt_recovery_assignment_snapshot(
-            target.clone(),
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(target.clone(), Duration::from_secs(1))
         .await
         .expect("an exact stopped owner must topology-publish its audited recovery successor");
 
@@ -1321,16 +1390,67 @@ async fn stopped_recovery_owner_topology_publishes_an_audited_recovery_successor
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_adoption_execution_budget_starts_after_serialization() {
+    let (db, controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
+        stopped_recovery_successor_fixture(true).await;
+    controller.set_active(false);
+
+    let operation_timeout = Duration::from_millis(500);
+    let serialization = Arc::clone(&db.assignment_adoption_lock).lock_owned().await;
+    let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+    let adopting_db = Arc::clone(&db);
+    let started = tokio::time::Instant::now();
+    let adoption = tokio::spawn(async move {
+        adopting_db
+            .adopt_recovery_assignment_snapshot(target, operation_timeout)
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    drop(serialization);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(execution);
+
+    let adoption = tokio::time::timeout(Duration::from_secs(2), adoption)
+        .await
+        .expect("recovery adoption remained blocked after both bounded phases")
+        .unwrap()
+        .expect("serialized recovery adoption must retain its full execution budget");
+    assert!(started.elapsed() > operation_timeout);
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+}
+
+#[tokio::test]
+async fn recovery_adoption_serialization_timeout_is_fail_closed() {
+    let (db, controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
+        stopped_recovery_successor_fixture(true).await;
+    controller.set_active(false);
+    let _serialization = Arc::clone(&db.assignment_adoption_lock).lock_owned().await;
+
+    let error = db
+        .adopt_recovery_assignment_snapshot(target, Duration::from_millis(50))
+        .await
+        .expect_err("recovery adoption must not wait indefinitely for assignment serialization");
+
+    assert!(
+        error
+            .to_string()
+            .contains("timed out waiting for assignment serialization"),
+        "{error}"
+    );
+    assert_eq!(registry.assignment_version(), current.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+}
+
 #[tokio::test]
 async fn stopped_recovery_successor_requires_the_exact_local_stopped_report() {
     let (db, _controller, registry, current, target, _round, _process_authority, _checkpoint_dir) =
         stopped_recovery_successor_fixture(false).await;
 
     let error = db
-        .adopt_recovery_assignment_snapshot(
-            target,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(target, Duration::from_secs(1))
         .await
         .expect_err(
             "Prepare without this boot's Stopped report must not publish recovery topology",
@@ -1689,6 +1809,29 @@ async fn faulted_owner_cold_publishes_the_next_committed_drain_topology() {
         ),
         Some(target_fence)
     );
+}
+
+#[tokio::test]
+async fn already_faulted_recovery_adoption_preserves_terminal_drain_authority() {
+    let (db, controller, registry, _current, target, _checkpoint_dir) =
+        stopped_recovery_topology_fixture(true, true, AssignmentDrainVerdict::Commit).await;
+    *db.runtime_shutdown.write() = tokio_util::sync::CancellationToken::new();
+    controller.set_recovering(true);
+    DbState::Faulted.store(&db.state);
+
+    let adoption = db
+        .adopt_recovery_assignment_snapshot(target.clone(), Duration::from_secs(1))
+        .await
+        .expect("an already-cold adoption must retain audited terminal-drain authority");
+
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), target.version);
+    assert_eq!(registry.owner(0), NodeId(2));
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(db.cluster_intake_fenced());
+    assert!(db.coordinated_recovery_in_progress());
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
 }
 
 #[tokio::test]
@@ -2332,7 +2475,7 @@ async fn missing_source_drain_receipt_requires_stopped_recovery() {
 }
 
 #[tokio::test]
-async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
+async fn dead_predecessor_retires_the_graph_and_publishes_an_authorized_recovery_generation() {
     let self_id = NodeId(1);
     let (
         db,
@@ -2346,21 +2489,22 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    let error = try_rebalance(
-        &db,
-        &controller,
-        &durable,
-        &registry,
-        &[self_id, NodeId(2)],
-        RebalanceConfig::test_defaults(),
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(2),
+        try_rebalance(
+            &db,
+            &controller,
+            &durable,
+            &registry,
+            &[self_id, NodeId(2)],
+            RebalanceConfig::test_defaults(),
+        ),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
-    assert!(
-        error.contains("participant 2 handoff manifest is missing"),
-        "{error}"
-    );
+    .expect("recovery successor retirement exceeded the test deadline")
+    .expect("recovery successor must retire the graph before vnode acquisition");
     let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(successor.version));
     assert_eq!(successor.version, current.version + 1);
     assert!(!successor.draining);
     assert_eq!(successor.participants.len(), 1);
@@ -2398,7 +2542,11 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         )
         .await
         .unwrap());
-    assert_eq!(registry.assignment_version(), current.version);
+    assert_eq!(registry.assignment_version(), successor.version);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert!(!db.runtime_shutdown.read().is_cancelled());
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
     assert!(db.cluster_intake_fenced());
     assert!(controller.is_recovering());
     assert!(controller
@@ -2407,6 +2555,158 @@ async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
         .unwrap()
         .iter()
         .any(|(node, sequence)| *node == controller.instance_id() && *sequence != 0));
+}
+
+#[tokio::test]
+async fn materialized_recovery_fence_audits_authority_once() {
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let adopted = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[NodeId(1), NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect("recovery successor materialization must succeed");
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(successor.version, current.version + 1);
+    let successor_fence = successor.assignment_fence().unwrap();
+    let adoption = db
+        .publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), false)
+        .await
+        .unwrap();
+    assert!(adoption.matches_fence(&successor_fence));
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    *db.assignment_snapshot_store.lock() =
+        Some(Arc::new(AssignmentSnapshotStore::new(bounded_store)));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let observed = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::coordinated_recovery::current_recovery_assignment_fence(&db, &controller, deadline),
+    )
+    .await
+    .expect("recovery assignment audit exceeded the bounded test timeout")
+    .expect("one assignment-authority audit must fit the recovery decision budget");
+
+    assert_eq!(observed, Some(successor_fence));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "recovery must perform its final assignment-authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "recovery repeated its full assignment-authority audit"
+    );
+    proposal_reads.armed.store(false, Ordering::Release);
+    proposal_reads.release.notify_waiters();
+    db.close();
+}
+
+#[tokio::test]
+async fn recovery_materialization_does_not_repeat_the_settlement_authority_audit() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    let local_participant = current
+        .participants
+        .iter()
+        .copied()
+        .find(|participant| participant.node_id == self_id.0)
+        .unwrap();
+    let proposal = current
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[self_id, self_id]),
+            vec![local_participant],
+        )
+        .unwrap();
+    let decision = authorize_recovery_successor(
+        &db,
+        &durable,
+        &controller,
+        &current,
+        proposal,
+        Duration::from_secs(2),
+        "deterministic recovery audit regression",
+    )
+    .await
+    .expect("the successor must be authorized before materialization");
+
+    let proposal_reads = Arc::new(GetBarrier {
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+        path_prefix: Some("control/assignment-recovery-proposals/"),
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(2),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let bounded_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(Arc::clone(&proposal_reads)),
+        stall_list: false,
+    });
+    let materialization_store = Arc::new(AssignmentSnapshotStore::new(bounded_store));
+
+    let version = tokio::time::timeout(
+        Duration::from_secs(2),
+        materialize_recovery_decision(
+            &db,
+            &materialization_store,
+            &controller,
+            &registry,
+            decision,
+            Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("recovery materialization exceeded the bounded test timeout")
+    .expect("one settlement authority audit must fit the materialization budget");
+
+    assert_eq!(version, Some(current.version + 1));
+    assert_eq!(
+        proposal_reads.reads_before_wait.load(Ordering::Acquire),
+        0,
+        "materialization must validate the proposal and perform the settlement authority audit"
+    );
+    assert!(
+        proposal_reads.armed.load(Ordering::Acquire),
+        "a redundant third proposal read exhausted the materialization budget"
+    );
 }
 
 #[tokio::test]
@@ -2448,29 +2748,31 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         assignment_fence: Some(current.assignment_fence().unwrap()),
         sink_artifact_intent_protocol: true,
     };
+    let predecessor_proof = controller.capture_leader_proof().unwrap();
     authority
-        .begin_cluster_checkpoint_artifacts(
-            &controller.capture_leader_proof().unwrap(),
-            inventory.clone(),
-        )
+        .begin_cluster_checkpoint_artifacts(&predecessor_proof, inventory.clone())
         .await
         .unwrap();
 
     let follower = {
         let controller = Arc::clone(&controller);
         let predecessor = current.assignment_fence().unwrap();
+        let predecessor_proof = predecessor_proof.clone();
         tokio::spawn(Box::pin(async move {
             crate::checkpoint_coordinator::CheckpointCoordinator::await_follower_decision(
                 &controller,
                 attempt.epoch,
                 attempt.checkpoint_id,
                 &predecessor,
+                &predecessor_proof,
                 Duration::from_secs(5),
             )
             .await
         }))
     };
     controller.note_unresponsive(&[NodeId(2)]);
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -2480,12 +2782,19 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption still requires the failed owner's handoff manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
-    assert!(!follower.await.unwrap().unwrap());
+    match follower.await.unwrap() {
+        Ok(committed) => assert!(!committed),
+        Err(error) => assert!(error
+            .to_string()
+            .contains("leader term was durably superseded")),
+    }
 
     let settlement = authority
         .cluster_attempt_settlement(attempt)
@@ -2519,6 +2828,84 @@ async fn recovery_materialization_aborts_the_unresolved_predecessor_checkpoint()
 }
 
 #[tokio::test]
+async fn follower_stops_waiting_when_checkpoint_commit_authority_is_fenced() {
+    let (
+        _db,
+        controller,
+        _durable,
+        _registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    let authority = controller.checkpoint_authority().unwrap();
+    let committed = authority
+        .highest_cluster_committed_outcome()
+        .await
+        .unwrap()
+        .expect("fixture must publish the predecessor checkpoint");
+    let recovery_index = authority
+        .load_committed_checkpoint(
+            committed
+                .committed_checkpoint
+                .as_ref()
+                .expect("fixture Commit must name its checkpoint index"),
+        )
+        .await
+        .unwrap();
+    let attempt = CheckpointAttempt::canonical(committed.checkpoint_id + 1);
+    let assignment_fence = current.assignment_fence().unwrap();
+    let predecessor_proof = controller.capture_leader_proof().unwrap();
+    authority
+        .begin_cluster_checkpoint_artifacts(
+            &predecessor_proof,
+            CheckpointArtifactInventory {
+                deployment_id: recovery_index.deployment_id,
+                pipeline_identity: recovery_index.pipeline_identity,
+                attempt,
+                assignment_fence: Some(assignment_fence.clone()),
+                sink_artifact_intent_protocol: true,
+            },
+        )
+        .await
+        .unwrap();
+
+    let replacement_owner = laminar_core::cluster::control::LeaderLeaseOwner {
+        node: controller.instance_id(),
+        boot: controller.recovery_incarnation(),
+        process_term: 1,
+    };
+    assert!(matches!(
+        authority
+            .begin_new_term(&replacement_owner, 1)
+            .await
+            .unwrap(),
+        laminar_core::cluster::control::LeaseOutcome::Acquired(_)
+    ));
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::checkpoint_coordinator::CheckpointCoordinator::await_follower_decision(
+            &controller,
+            attempt.epoch,
+            attempt.checkpoint_id,
+            &assignment_fence,
+            &predecessor_proof,
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .expect("fenced follower decision must not consume its settlement timeout")
+    .expect_err("a superseded leader cannot commit its in-doubt checkpoint");
+    assert!(
+        error
+            .to_string()
+            .contains("leader term was durably superseded"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     let owner = CheckpointParticipant {
         node_id: 1,
@@ -2548,7 +2935,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     let ownerless_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&ownerless_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(ownerless_registry)
+        .vnode_registry(Arc::clone(&ownerless_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2562,6 +2949,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &ownerless_db,
         &durable,
         &ownerless_controller,
+        &ownerless_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -2593,10 +2981,11 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
     // shared authority for the report audit but withdraw this controller's local leader proof.
     participant_leadership.send(None).unwrap();
     participant_controller.set_active(true);
+    let participant_registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let participant_db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&participant_controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
+        .vnode_registry(Arc::clone(&participant_registry))
         .assignment_snapshot_store(Arc::clone(&durable))
         .build()
         .await
@@ -2610,6 +2999,7 @@ async fn recovery_adoption_fault_scope_excludes_an_ownerless_process() {
         &participant_db,
         &durable,
         &participant_controller,
+        &participant_registry,
         &target,
         tokio::time::Instant::now() + Duration::from_secs(1),
     )
@@ -3145,6 +3535,166 @@ fn takeover_audits_a_recovery_head_while_its_pin_is_propagated_to_the_next_gener
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_adoption_waits_for_compute_fault_publication_after_authority_audit() {
+    let self_id = NodeId(1);
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
+    let error = try_rebalance(
+        &db,
+        &controller,
+        &durable,
+        &registry,
+        &[self_id, NodeId(2)],
+        RebalanceConfig::test_defaults(),
+    )
+    .await
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
+    assert!(
+        error.contains("must wait for a faulted cold bootstrap"),
+        "{error}"
+    );
+    let successor = durable.load().await.unwrap().unwrap();
+    assert_eq!(
+        crate::db::DbState::load(&db.state),
+        crate::db::DbState::Running
+    );
+    assert!(db.installed_vnode_state.lock().is_some());
+    assert!(db.pending_recovery_fault.load(Ordering::Acquire) != 0);
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let get = Arc::new(GetBarrier {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        path_prefix: None,
+        // The first read materializes the requested target. Block the audit's independent
+        // recovery-materialization read so the generation changes during the authority audit.
+        reads_before_wait: std::sync::atomic::AtomicUsize::new(1),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    });
+    let delayed_store: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner: authority_store,
+        get: Some(get),
+        stall_list: false,
+    });
+    *db.assignment_snapshot_store.lock() =
+        Some(Arc::new(AssignmentSnapshotStore::new(delayed_store)));
+
+    let adopting_db = Arc::clone(&db);
+    let mut adoption = tokio::spawn(async move {
+        adopting_db
+            .adopt_recovery_assignment_snapshot(successor, Duration::from_secs(2))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("recovery adoption did not enter its durable authority audit");
+
+    db.fence_coordinated_recovery_lifecycle();
+    let generation = Arc::clone(&db.rotation_execution_fence).write_owned().await;
+    db.installed_vnode_state.lock().take();
+    drop(generation);
+    release.notify_one();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut adoption)
+            .await
+            .is_err(),
+        "recovery adoption reused retired state before the compute fault was published"
+    );
+    crate::db::DbState::Faulted.store(&db.state);
+
+    let adoption = tokio::time::timeout(Duration::from_secs(3), adoption)
+        .await
+        .expect("recovery adoption remained blocked after the authority audit resumed")
+        .unwrap()
+        .expect("the faulted generation must use cold recovery in the same adoption attempt");
+    assert!(adoption.adopted);
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert!(db.pending_vnode_transition.lock().is_none());
+    assert!(db.installed_vnode_state.lock().is_none());
+    assert_eq!(
+        crate::db::DbState::load(&db.state),
+        crate::db::DbState::Faulted
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_decision_fault_precedes_graph_execution_drain() {
+    let (
+        db,
+        controller,
+        durable,
+        registry,
+        current,
+        _process_authority,
+        _authority_store,
+        _checkpoint_dir,
+    ) = dead_predecessor_fixture().await;
+    controller.note_unresponsive(&[NodeId(2)]);
+    db.set_source_gate(false);
+    assert!(!db.cluster_intake_fenced());
+    let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+
+    let rebalancing_db = Arc::clone(&db);
+    let rebalancing_controller = Arc::clone(&controller);
+    let rebalancing_durable = Arc::clone(&durable);
+    let rebalancing_registry = Arc::clone(&registry);
+    let rebalancing = tokio::spawn(async move {
+        let mut config = RebalanceConfig::test_defaults();
+        config.checkpoint_timeout = Duration::from_secs(3);
+        try_rebalance(
+            &rebalancing_db,
+            &rebalancing_controller,
+            &rebalancing_durable,
+            &rebalancing_registry,
+            &[NodeId(1), NodeId(2)],
+            config,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !db.cluster_intake_fenced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery assignment authority was not closed");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while controller.read_fault_reports().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery fault publication waited for the graph execution drain");
+
+    drop(execution);
+    let adopted = tokio::time::timeout(Duration::from_secs(2), rebalancing)
+        .await
+        .expect("recovery assignment materialization did not finish")
+        .unwrap()
+        .expect("recovery assignment must retire the graph after the execution fence drains");
+    assert_eq!(adopted, Some(current.version + 1));
+    assert_eq!(registry.assignment_version(), current.version + 1);
+    assert_eq!(DbState::load(&db.state), DbState::Faulted);
+}
+
 #[tokio::test]
 async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     let self_id = NodeId(1);
@@ -3160,8 +3710,10 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
-    // Materialize v2 through the normal Running path first; the missing handoff manifest leaves
-    // v1 local, exactly as it does before a subsequent retry observes the faulted graph.
+    // Materialize v2 while Running first; cold-bootstrap admission leaves v1 local until a
+    // subsequent retry observes the faulted graph.
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -3171,9 +3723,13 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("live adoption intentionally lacks the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
+    db.coordinated_recovery_fenced
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let successor = durable.load().await.unwrap().unwrap();
@@ -3182,10 +3738,7 @@ async fn cold_recovery_adoption_requires_the_coordinated_lifecycle_fence() {
     crate::db::DbState::Faulted.store(&db.state);
 
     let error = db
-        .adopt_recovery_assignment_snapshot(
-            successor,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-        )
+        .adopt_recovery_assignment_snapshot(successor, Duration::from_secs(1))
         .await
         .expect_err("cold publication requires coordinated recovery lifecycle ownership");
     assert!(error.to_string().contains("recovery lifecycle fence"));
@@ -3495,7 +4048,11 @@ async fn wait_until_drained_fails_closed_when_no_snapshot() {
 #[tokio::test]
 async fn wait_until_drained_bounds_a_stalled_snapshot_read() {
     let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let blocked: Arc<dyn ObjectStore> = Arc::new(PendingListStore { inner });
+    let blocked: Arc<dyn ObjectStore> = Arc::new(ReadBarrierStore {
+        inner,
+        get: None,
+        stall_list: true,
+    });
     let store = AssignmentSnapshotStore::new(blocked);
 
     let drained = tokio::time::timeout(
@@ -3531,7 +4088,10 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
             boot_incarnation: Uuid::from_u128(22),
         },
     ];
-    let assignment = CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants).unwrap();
+    let assignment =
+        CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants.clone()).unwrap();
+    let closure_target =
+        CheckpointAssignmentFence::from_owner_map(2, &[2, 2], vec![participants[1]]).unwrap();
     let controller = test_cluster_controller(NodeId(1), local_boot, None);
     let process_deadline = controller
         .process_lease_deadline()
@@ -3569,7 +4129,7 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
     let db = LaminarDB::builder()
-        .cluster_controller(controller)
+        .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
@@ -3595,7 +4155,9 @@ async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain()
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let closing = {
         let db = Arc::clone(&db);
-        tokio::spawn(async move { close_local_assignment_authority(&db, None, deadline).await })
+        tokio::spawn(async move {
+            close_local_assignment_authority(&db, &controller, &closure_target, &[], deadline).await
+        })
     };
     tokio::time::timeout_at(deadline, async {
         while sender.assignment_version() != 0 {
@@ -3698,6 +4260,41 @@ async fn assignment_suspension_reasserts_closure_after_serialization_race() {
     assert!(sender
         .install_assignment_fence(&assignment, &[1])
         .expect("suspension must preserve the same-version certificate"));
+}
+
+#[tokio::test]
+async fn held_recovery_suspension_does_not_rebump_authority_revision() {
+    let (db, controller, _durable, _registry, _current, _authority, _store, _dir) =
+        dead_predecessor_fixture().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut held = None;
+    let before = db.assignment_authority_revision.load(Ordering::Acquire);
+
+    let suspended =
+        try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+            .await
+            .expect("first recovery suspension must succeed");
+    assert!(suspended);
+    assert!(held.is_some_and(|revision| revision > before));
+
+    let revision = db.assignment_authority_revision.load(Ordering::Acquire);
+    try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+        .await
+        .expect("held recovery suspension must be retained without reassertion");
+    assert_eq!(
+        db.assignment_authority_revision.load(Ordering::Acquire),
+        revision,
+        "a retry tick must not re-bump the authority revision while the suspension holds"
+    );
+
+    db.invalidate_shuffle_assignment_fence();
+    try_suspend_recovery_assignment_authority(&db, &controller, deadline, &mut held)
+        .await
+        .expect("suspension must reassert after an authority change");
+    assert!(
+        db.assignment_authority_revision.load(Ordering::Acquire) > revision + 1,
+        "a genuine authority change must still trigger a fresh suspension bump"
+    );
 }
 
 #[tokio::test]
@@ -4011,6 +4608,8 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
     ) = dead_predecessor_fixture().await;
     controller.note_unresponsive(&[NodeId(2)]);
 
+    db.coordinated_lifecycle_active
+        .store(true, Ordering::Release);
     let error = try_rebalance(
         &db,
         &controller,
@@ -4020,9 +4619,11 @@ async fn successor_adoption_accepts_a_retained_predecessor_after_ancestry_prunin
         RebalanceConfig::test_defaults(),
     )
     .await
-    .expect_err("the test checkpoint intentionally omits the acquired vnode manifest");
+    .expect_err("vnode acquisition must wait for the running graph to retire");
+    db.coordinated_lifecycle_active
+        .store(false, Ordering::Release);
     assert!(
-        error.contains("participant 2 handoff manifest is missing"),
+        error.contains("must wait for a faulted cold bootstrap"),
         "{error}"
     );
     let recovery = durable.load().await.unwrap().unwrap();
@@ -4258,6 +4859,112 @@ async fn startup_rejects_drain_that_does_not_bind_retained_predecessor() {
         error.contains("does not bind retained predecessor"),
         "{error}"
     );
+}
+
+#[tokio::test]
+async fn watcher_authority_publication_gets_a_fresh_phase_budget() {
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeInfo;
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    use uuid::Uuid;
+
+    let self_id = NodeId(1);
+    let boot = Uuid::from_u128(11);
+    let process = CheckpointParticipant {
+        node_id: self_id.0,
+        boot_incarnation: boot,
+    };
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let seed_store = AssignmentSnapshotStore::new(Arc::clone(&inner));
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(BTreeMap::from([(0, self_id)]), vec![process])
+        .unwrap();
+    seed_store.save_if_absent(&committed).await.unwrap();
+
+    let operation_timeout = Duration::from_millis(200);
+    let delayed: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        Arc::clone(&inner),
+        ThrottleConfig {
+            wait_list_per_call: Duration::from_millis(160),
+            ..ThrottleConfig::default()
+        },
+    ));
+    let durable = Arc::new(AssignmentSnapshotStore::new(delayed));
+    let kv = Arc::new(DelayedScanKv {
+        inner: InMemoryKv::new(self_id),
+        scan_delay: Duration::from_millis(30),
+    });
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        self_id,
+        control,
+        recovery,
+        Some(Arc::clone(&durable)),
+        members_rx,
+        boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(
+            laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+        ))
+        .unwrap();
+    controller.publish_recovery_incarnation().await.unwrap();
+    controller.set_active(true);
+    let _process_authority = install_test_process_authority(&controller, &[process]).await;
+    let _leader_lease = grant_test_leadership(&controller).await;
+
+    let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(self_id.0, "127.0.0.1:0".parse().unwrap(), boot)
+            .await
+            .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(self_id.0, boot));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::clone(&inner))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(Arc::clone(&durable))
+        .shuffle_sender(sender)
+        .shuffle_receiver(receiver)
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(true);
+
+    let shutdown = CancellationToken::new();
+    let config = RebalanceConfig {
+        watcher_poll: Duration::from_secs(5),
+        checkpoint_timeout: operation_timeout,
+        ..RebalanceConfig::test_defaults()
+    };
+    let started = tokio::time::Instant::now();
+    let watcher = spawn_snapshot_watcher(
+        Arc::clone(&db),
+        durable,
+        registry,
+        shutdown.clone(),
+        config,
+        Some(Arc::clone(&controller)),
+    );
+    let publication = tokio::time::timeout(Duration::from_secs(2), async {
+        while controller
+            .checkpoint_assignment_fence(committed.version)
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    shutdown.cancel();
+    watcher.await.unwrap();
+
+    publication.expect("authority publication reused the exhausted durable-head audit deadline");
+    assert!(started.elapsed() > operation_timeout);
+    assert!(!db.cluster_intake_fenced());
 }
 
 #[tokio::test]

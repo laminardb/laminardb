@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.88"
 name = "laminardb-pgwire-replication"
-version = "0.30.0"
+version = "0.31.0"
 authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]
 build = false
 exclude = ["Cargo.lock"]

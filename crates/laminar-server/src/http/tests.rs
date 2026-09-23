@@ -117,6 +117,12 @@ fn diagnostic_read_gate_is_single_flight_and_rate_bounded() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn diagnostic_read_deadline_outlives_object_store_control_io() {
+    assert!(DIAGNOSTIC_READ_DEADLINE > crate::cluster::OBJECT_STORE_CONTROL_IO_TIMEOUT);
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn diagnostic_read_deadline_releases_the_single_flight_permit() {
     let (state, diagnostic) = diagnostic_middleware_state();
@@ -832,6 +838,64 @@ async fn test_auth_with_wrong_bearer_returns_401() {
 }
 
 #[tokio::test]
+async fn test_auth_rejects_missing_invalid_and_duplicate_credentials_on_protected_routes() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    let credential_sets: &[&[&str]] = &[
+        &[],
+        &["Bearer wrong-token"],
+        &["Bearer supersecret-token", "Bearer supersecret-token"],
+        &["Bearer supersecret-token, Bearer supersecret-token"],
+    ];
+    for (method, path) in [
+        ("GET", "/api/v1/sources"),
+        ("GET", "/api/v1/graph"),
+        ("POST", "/api/v1/sql"),
+        ("POST", "/api/v1/reload"),
+        ("POST", "/api/v1/checkpoint"),
+        ("POST", "/api/v1/pipeline/start"),
+        ("POST", "/api/v1/pipeline/stop"),
+        ("GET", "/ws/events"),
+    ] {
+        for credentials in credential_sets {
+            let mut request = Request::builder().method(method).uri(path);
+            for credential in *credentials {
+                request = request.header(axum::http::header::AUTHORIZATION, *credential);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_auth_rejects_duplicate_websocket_query_tokens() {
+    let app = build_router(test_state_with_token("supersecret-token"));
+    for query in [
+        "token=supersecret-token&token=supersecret-token",
+        "token=supersecret-token&token=wrong-token",
+        "token=wrong-token&token=supersecret-token",
+        "token=supersecret-token&token=",
+        "token=supersecret-token&token",
+        "token&token=supersecret-token",
+    ] {
+        let request = Request::builder()
+            .uri(format!("/ws/events?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{query}");
+    }
+}
+
+#[tokio::test]
 async fn test_auth_with_query_token_returns_200() {
     // WebSocket clients can't set the Authorization header, so the token is
     // accepted from the query string — but only on `/ws/` routes. A plain
@@ -841,12 +905,14 @@ async fn test_auth_with_query_token_returns_200() {
     let state = test_state_with_token("supersecret-token");
     let app = build_router(state);
 
-    let req = Request::builder()
-        .uri("/ws/events?token=supersecret-token")
-        .body(Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    for uri in [
+        "/ws/events?token=supersecret-token",
+        "/ws/events?before=value&token=supersecret%2Dtoken&after=value",
+    ] {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test]

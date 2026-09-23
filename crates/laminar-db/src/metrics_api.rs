@@ -221,7 +221,7 @@ impl LaminarDB {
             total_events: entry.source.sequence(),
             pending,
             capacity,
-            is_backpressured: crate::metrics::is_backpressured(pending, capacity),
+            is_backpressured: entry.is_backpressured(),
             watermark: entry.source.current_watermark(),
             utilization: crate::metrics::utilization(pending, capacity),
         })

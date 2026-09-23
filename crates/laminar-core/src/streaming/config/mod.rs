@@ -12,8 +12,8 @@ pub const MAX_BUFFER_SIZE: usize = 1 << 20; // 1M entries
 /// Backpressure strategy when buffer is full.
 ///
 /// Stored in source/sink configs and exposed in SQL DDL (`BACKPRESSURE = '...'`).
-/// The streaming channel always blocks on full; this enum is used by higher-level
-/// layers (e.g., catalog snapshot ring) to decide overflow behavior.
+/// Source pushes are always nonblocking and reject on count or Arrow-byte saturation.
+/// Snapshot history evicts its oldest entries independently of this setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackpressureStrategy {
     /// Block until space is available (default).
@@ -105,12 +105,26 @@ impl ChannelConfig {
 }
 
 /// Configuration for a Source.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SourceConfig {
     /// Channel configuration.
     pub channel: ChannelConfig,
     /// Name of the source (for debugging/metrics).
     pub name: Option<String>,
+    /// Arrow-byte limit shared by cloned producers, the input ring and queued broadcast data.
+    /// Defaults to 64 MiB. Generic `Record<T>` pushes remain count bounded; their arbitrary
+    /// heap storage is not measured. Invalid limits make `push_arrow` return `InvalidConfig`.
+    pub max_queued_bytes: usize,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            channel: ChannelConfig::default(),
+            name: None,
+            max_queued_bytes: super::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
+        }
+    }
 }
 
 impl SourceConfig {
@@ -119,7 +133,7 @@ impl SourceConfig {
     pub fn with_buffer_size(buffer_size: usize) -> Self {
         Self {
             channel: ChannelConfig::with_buffer_size(buffer_size),
-            name: None,
+            ..Self::default()
         }
     }
 
@@ -127,8 +141,8 @@ impl SourceConfig {
     #[must_use]
     pub fn named(name: impl Into<String>) -> Self {
         Self {
-            channel: ChannelConfig::default(),
             name: Some(name.into()),
+            ..Self::default()
         }
     }
 }

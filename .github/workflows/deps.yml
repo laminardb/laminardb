@@ -102,6 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Verify dependency exception policy and security backport
+        run: python3 tools/check_dependency_exceptions.py
       - uses: taiki-e/install-action@cargo-audit
 
       - name: Run security audit

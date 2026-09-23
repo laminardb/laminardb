@@ -56,7 +56,6 @@ impl KafkaSource {
                                     avro_deser.register_schema(cached.id, &cached.schema_str)
                                 {
                                     let error = ConnectorError::Serde(error);
-                                    self.fail_startup();
                                     return Err(error);
                                 }
                                 // Keep the catalog schema pinned — planner
@@ -71,7 +70,6 @@ impl KafkaSource {
                             warn!(%subject, error = %e, "SR unavailable at start(), will resolve lazily");
                         }
                         Ok(Err(e)) => {
-                            self.fail_startup();
                             return Err(e);
                         }
                         Err(_elapsed) => {
@@ -101,6 +99,12 @@ impl KafkaSource {
             resume_input_channels,
             resume_baselines,
         } = self.prepare_start(request)?;
+        self.progress = self
+            .metrics_registry
+            .as_ref()
+            .filter(|_| !self.source_name.is_empty())
+            .map(|registry| super::KafkaProgress::register(registry, &self.source_name))
+            .transpose()?;
         let mut rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
         if delivery != DeliveryGuarantee::BestEffort
             || matches!(
@@ -171,6 +175,7 @@ impl KafkaSource {
         self.prefetch_schema_registry(&kafka_config).await?;
 
         self.state = ConnectorState::Running;
+        self.start_progress();
         info!("Kafka source connector started successfully");
         Ok(())
     }

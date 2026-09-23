@@ -11,11 +11,16 @@ exclude = [
     "tools/*",
     "vendor/pgwire",
     "vendor/pgwire-replication",
+    "vendor/quick-xml",
 ]
 resolver = "2"
 
+[patch.crates-io]
+# Compatible security backport; provenance and review deadline live in security/.
+quick-xml = { path = "vendor/quick-xml" }
+
 [workspace.package]
-version = "0.30.0"
+version = "0.31.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -120,10 +125,14 @@ prometheus = { version = "0.14", features = ["process"] }
 
 # Object store (S3/GCS/Azure/local filesystem) — shared across crates.
 object_store = "=0.13.2"
+# `object_store` 0.13 cannot parse external-account ADC files. Keep its data
+# client pinned and inject Google's refreshable WIF credential provider.
+google-cloud-auth = { version = "=1.16.0", default-features = false, features = ["default-rustls-provider"] }
 
 # Delta 0.32 aligns with Arrow 58, DataFusion 53, and object_store 0.13.
 deltalake = { version = "=0.32.4", default-features = false }
 deltalake-catalog-glue = { version = "=0.16.0", default-features = false }
+aws-sdk-glue = { version = "=1.163.0", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 delta_kernel = { package = "buoyant_kernel", version = "=0.22.2", default-features = false, features = ["arrow-58", "internal-api"] }
 
 # Apache Iceberg
@@ -133,7 +142,7 @@ iceberg-storage-opendal = { version = "=0.10.1", default-features = false }
 apache-avro = "=0.21.0"
 
 # Cluster (distributed mode)
-chitchat = "0.10"
+chitchat = "0.13"
 tokio-util = { version = "0.7", features = ["rt"] }
 # xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
 # bump and updated golden vectors.

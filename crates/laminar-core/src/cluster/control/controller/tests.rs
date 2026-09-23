@@ -3933,6 +3933,40 @@ async fn stale_noncurrent_recovery_slot_does_not_mask_the_current_driver() {
 }
 
 #[tokio::test]
+async fn durable_proof_observation_survives_local_driver_candidacy_loss() {
+    let controller = ctl(1, vec![]);
+    controller.publish_recovery_incarnation().await.unwrap();
+    let (_authority, proof) = install_recovery_authority(&controller, 1_000).await;
+    report_new_local_fault(&controller).await;
+    let round = recovery_round_from_current_faults(&controller, 18, &proof, &[1]).await;
+    controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+    controller.announce_recover_prepare(&round).await.unwrap();
+    let prepare = RecoveryAnnouncement {
+        round,
+        phase: RecoverPhase::Prepare,
+    };
+
+    controller.set_active(false);
+    assert_eq!(controller.observe_recover_control().await.unwrap(), None);
+    assert_eq!(
+        controller
+            .observe_recover_control_for_durable_proof(&proof)
+            .await
+            .unwrap(),
+        Some(prepare)
+    );
+
+    let mut wrong_proof = proof;
+    wrong_proof.fencing_token += 1;
+    assert!(matches!(
+        controller
+            .observe_recover_control_for_durable_proof(&wrong_proof)
+            .await,
+        Err(RecoveryControlError::Superseded(_))
+    ));
+}
+
+#[tokio::test]
 async fn malformed_current_driver_recovery_slot_fails_closed() {
     let self_id = NodeId(2);
     let kv = Arc::new(InMemoryKv::new(self_id));

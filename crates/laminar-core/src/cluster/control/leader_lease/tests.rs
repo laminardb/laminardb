@@ -3654,6 +3654,79 @@ async fn recovery_requires_the_current_cut_and_pins_it_until_the_target_commits(
 }
 
 #[tokio::test]
+async fn recovery_decision_admission_audits_existing_assignment_history_once() {
+    let (raw, store) = blocking_store_at(1_000, OsPath::from("control/never-block"));
+    let incumbent = owner(1, 11, 1);
+    let failed_two = owner(2, 22, 1);
+    let failed_three = owner(3, 33, 1);
+    let replacement_two = owner(2, 222, 2);
+    let replacement_three = owner(3, 333, 2);
+    let LeaseOutcome::Acquired(lease) = store
+        .acquire_or_renew_current_term_for_test(&incumbent, 0)
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let proof = lease.proof();
+    let first = assignment_recovery_decision(
+        &store,
+        1,
+        &[incumbent.clone(), failed_two.clone(), failed_three],
+        &[
+            incumbent.clone(),
+            failed_two.clone(),
+            replacement_three.clone(),
+        ],
+        proof.clone(),
+        1,
+    )
+    .await;
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, first)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert!(matches!(
+        store.materialize_assignment_recovery(2).await.unwrap(),
+        RotateOutcome::Rotated
+    ));
+
+    let second = assignment_recovery_decision(
+        &store,
+        2,
+        &[incumbent.clone(), failed_two, replacement_three.clone()],
+        &[incumbent.clone(), replacement_two, replacement_three],
+        proof.clone(),
+        2,
+    )
+    .await;
+    let prior_decision = store
+        .load_record()
+        .await
+        .unwrap()
+        .unwrap()
+        .assignment_decision_head
+        .unwrap();
+    raw.clear_authority_io_counts();
+
+    assert!(matches!(
+        store
+            .record_assignment_recovery_decision(&proof, second)
+            .await
+            .unwrap(),
+        RecordAssignmentRecoveryDecisionResult::Created(_)
+    ));
+    assert_eq!(
+        raw.get_count(&lease_path(prior_decision.sequence)),
+        2,
+        "recovery admission must read the published decision head and audit its link only once"
+    );
+}
+
+#[tokio::test]
 async fn competing_assignment_recoveries_have_one_same_version_winner() {
     let (raw, store) = blocking_store_at(1_000, lease_path(4));
     let incumbent = owner(1, 11, 1);
@@ -4862,6 +4935,87 @@ async fn delayed_artifact_admission_cannot_reopen_a_durable_abort() {
     assert_eq!(
         store.cluster_checkpoint_artifacts().await.unwrap(),
         Some(inventory)
+    );
+}
+
+#[tokio::test]
+async fn cluster_attempt_status_fences_commit_after_takeover_without_an_outcome() {
+    let store = store(10);
+    let incumbent = owner(1, 1, 1);
+    let successor = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let inventory = begin_checkpoint_artifacts(&store, &proof, &fence, 1).await;
+    assert_eq!(
+        store
+            .cluster_attempt_status(inventory.attempt, &fence, &proof)
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::Pending
+    );
+
+    let observation = store.observe_rival(&successor, &first).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(matches!(
+        store
+            .try_takeover(&successor, &observation, 20)
+            .await
+            .unwrap(),
+        LeaseOutcome::Acquired(_)
+    ));
+    assert_eq!(
+        store
+            .cluster_attempt_status(inventory.attempt, &fence, &proof)
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::CommitFenced
+    );
+    assert!(store
+        .cluster_attempt_settlement(inventory.attempt)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn cluster_attempt_status_retains_commit_when_it_wins_before_takeover() {
+    let store = store(10);
+    let incumbent = owner(1, 1, 1);
+    let successor = owner(2, 2, 1);
+    let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let proof = first.proof();
+    let fence = assignment_fence(&incumbent);
+    let committed = match record_commit(&store, &proof, &fence, 1, 1).await {
+        RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => outcome,
+        RecordOutcomeResult::Conflict { winner } => {
+            panic!("unexpected checkpoint outcome winner: {winner:?}")
+        }
+    };
+
+    let observation = store.observe_rival(&successor, &first).unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(matches!(
+        store
+            .try_takeover(&successor, &observation, 20)
+            .await
+            .unwrap(),
+        LeaseOutcome::Acquired(_)
+    ));
+    assert_eq!(
+        store
+            .cluster_attempt_status(
+                crate::checkpoint::CheckpointAttempt::canonical(1),
+                &fence,
+                &proof,
+            )
+            .await
+            .unwrap(),
+        ClusterAttemptStatus::Settled(Box::new(committed))
     );
 }
 

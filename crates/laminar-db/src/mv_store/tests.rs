@@ -740,10 +740,13 @@ fn upsert_restore_duplicate_key_accounting_tracks_only_replacement() {
 
     store.restore_from_ipc("u", &bytes).unwrap();
     assert_eq!(snapshot_rows(&store, "u"), vec![(1, 20)]);
-    let expected = ScalarValue::Int64(Some(1))
-        .size()
-        .saturating_add(ScalarValue::Int64(Some(20)).size());
-    assert_eq!(store.total_bytes(), expected);
+    let mut single = store.fresh_image().unwrap();
+    single.update("u", &changelog_batch(&[(1, 20, 1)]));
+    assert_eq!(store.total_bytes(), single.total_bytes());
+    assert!(
+        store.total_bytes() > 16,
+        "owned keys and row metadata must also be charged"
+    );
 }
 
 // ── Multiset (Z-set) mode: chained projections/filters over a changelog ──

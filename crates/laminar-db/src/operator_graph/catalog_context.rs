@@ -9,6 +9,32 @@ use crate::error::DbError;
 use crate::operator::sql_query::SqlQueryOperator;
 
 impl OperatorGraph {
+    pub(super) fn prepare_query_inputs(
+        &mut self,
+        name: &str,
+        tables: &mut FxHashSet<String>,
+        ordered_join: bool,
+        lookup: Option<&crate::operator::lookup_enrich::LookupEnrichConfig>,
+        changelog: Option<&crate::sql_analysis::ChangelogEnrichConfig>,
+    ) -> Option<usize> {
+        // Reference/lookup dimensions come from their providers, never from a stream port.
+        tables.retain(|table| !self.reference_tables.contains(table));
+        if let Some(config) = lookup {
+            tables.remove(&config.table_name);
+        }
+        if let Some(config) = changelog {
+            tables.retain(|table| table == &config.changelog_table);
+        }
+        let ports = if ordered_join { 2 } else { tables.len().max(1) };
+        if ports > usize::from(u8::MAX) + 1 {
+            self.build_errors.push(DbError::InvalidOperation(format!(
+                "query '{name}' exceeds the 256 graph input-port limit"
+            )));
+            return None;
+        }
+        Some(ports)
+    }
+
     /// Register the static reference tables available to enrichment operators.
     pub fn set_reference_tables(&mut self, tables: FxHashSet<String>) {
         self.reference_tables = tables;

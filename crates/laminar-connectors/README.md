@@ -9,14 +9,26 @@ External system connectors for LaminarDB. Exactly-once admission requires an exa
 | Connector | Feature Flag | Protocol | Status |
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | Replayable ALO; exact-certified input for coordinated EO pipelines | Implemented |
-| PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | Implemented |
-| MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | Implemented |
+| PostgreSQL CDC | `postgres-cdc` | Raw JSON change envelopes lack canonical primary-keyed row/delete records; initial and resume admission reject before I/O | Not admitted |
+| MongoDB CDC | `mongodb-cdc` | Raw JSON change envelopes lack canonical primary-keyed row/delete records; initial and resume admission reject before I/O | Not admitted |
 | NATS | `nats` | Core or JetStream ingestion; ephemeral because acknowledgements are not checkpoint-owned | Implemented |
 | OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
-| Delta Lake Source | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | Implemented |
+| Delta Lake Source | `delta-lake` | Ephemeral singleton full-changelog reader; ordinary streaming routes, durable delivery and cluster use reject it | Reader only |
 | Iceberg Source | `iceberg` | Bounded snapshot scans or replayable append-lineage reads; changelog fails closed | Implemented |
-| File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
+| File Auto-Loader | `files` | Local directory watch/glob discovery, Parquet/CSV/JSON; remote URLs fail at startup | Implemented |
+
+Feature flags compile connector implementations; startup validates the complete source/SQL/sink
+composition. PostgreSQL and MongoDB CDC remain rejected even when a stored resume position exists.
+See `postgres_cdc_admission_rejects_unexecuted_options_and_reference_use` and
+`mongodb_cdc_admission_uses_runtime_options_and_rejects_removed_ones` in [CDC admission tests](tests/cdc_admission.rs).
+Their lookup connectors and supported sinks are separate capabilities.
+
+Delta's `cdf_contract_is_full_changelog` in [reader tests](src/lakehouse/delta_source/tests.rs)
+checks its reader contract. That contract is not an admitted append-only streaming source:
+`mutation_sources_fail_before_connector_io` in [engine admission tests](../laminar-db/src/pipeline_lifecycle/connector_admission_tests.rs)
+covers the ordinary route's rejection, and the positioned mutable join routes require ordering
+and recovery capabilities that this reader lacks. Finite reference/lookup reads are separate.
 
 ### On-demand lookup sources (partial cache mode)
 
@@ -49,9 +61,13 @@ backpressures rather than dropping rows.
 | Iceberg | `iceberg` | Rolling append writer; direct ALO, coordinated local EO, and REST + direct S3/S3A cluster EO; MOR/COW fail closed | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
-| Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
+| Files | `files` | Local CSV, JSON, Parquet rolling output; remote URLs fail at startup | Implemented |
 
 Iceberg REST supports no authentication, a resolved static bearer token, or OAuth2 client credentials with proactive token refresh. Access delegation, vended storage credentials, and remote signing fail closed. Cluster exactly-once Iceberg admission remains limited to no authentication or static bearer authentication pending an OAuth2 cluster recovery fault matrix. Data-storage credentials for cluster exactly-once belong under `storage.property.*`; secret-bearing `catalog.property.*` values are treated as uncertified catalog authentication.
+
+Backend support and native-provider evidence are tracked independently in the
+[cloud object-store support matrix](../../docs/cloud-object-store-support.md). Azure Iceberg is
+experimental; remote Files source/sink URLs are unsupported.
 
 ### Upsert sinks and changelog collapse
 
@@ -78,8 +94,8 @@ requirements:
 | `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
 | `kafka` | Kafka source/sink, Avro serde, schema registry, partitioner, backpressure |
 | `postgres` | PostgreSQL durable at-least-once sink (COPY BINARY, upsert/changelog) |
-| `cdc/postgres` | Resume-only PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
-| `mongodb` | Replayable change-stream source and durable at-least-once majority-journaled sink |
+| `postgres/cdc` | PostgreSQL replication/decoding implementation; CDC source admission remains rejected |
+| `mongodb` | Change-stream implementation (CDC source rejected), lookup reads and durable at-least-once majority-journaled sink |
 | `otel` | OpenTelemetry OTLP/gRPC receiver for traces, metrics, and logs (tonic server) |
 | `websocket` | WebSocket client source and client/server sinks (fan-out, backpressure, reconnect) |
 | `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog, recovery, schema evolution) and Apache Iceberg source and sink (REST catalog) |
@@ -110,9 +126,9 @@ requirements:
 | Flag | Purpose |
 |------|---------|
 | `kafka` | rdkafka, Avro serde, schema registry (reqwest) |
-| `postgres-cdc` | PostgreSQL CDC via pgwire-replication (also builds the standalone `postgres` lookup source) |
+| `postgres-cdc` | PostgreSQL replication implementation (CDC source rejected); also builds the supported `postgres` lookup source |
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
-| `mongodb-cdc` | MongoDB CDC source and sink via mongodb crate |
+| `mongodb-cdc` | MongoDB sink/lookup and change-stream implementation (CDC source rejected) |
 | `nats` | NATS Core and JetStream source/sink via async-nats |
 | `changelog-collapse` | Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pulled in by `delta-lake`) |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
@@ -122,12 +138,13 @@ requirements:
 | `delta-lake-unity` | Databricks Unity catalog for Delta Lake |
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
 | `iceberg` | Apache Iceberg source and sink with REST, S3, and filesystem support |
+| `iceberg-gcs` / `iceberg-azure` | REST Iceberg with GCS / experimental Azure ADLS storage |
 | `iceberg-catalog-rest` | REST catalog; other typed catalog features currently fail with an explicit capability error |
 | `iceberg-storage-s3` / `iceberg-storage-gcs` / `iceberg-storage-azure` / `iceberg-storage-fs` | Isolated OpenDAL storage backends for Iceberg |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
-| `files` | File source (auto-loader) and sink (rolling files) |
+| `files` | Local file source (auto-loader) and sink (rolling files); remote URLs are rejected |
 
 ## Custom Connectors
 

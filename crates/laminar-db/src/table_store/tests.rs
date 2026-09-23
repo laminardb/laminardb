@@ -557,7 +557,12 @@ fn checkpoint_chunks_large_tables_and_restores_every_row() {
     let archive =
         rkyv::from_bytes::<ReferenceTableCheckpointArchive, rkyv::rancor::Error>(&checkpoint)
             .unwrap();
-    let batches = decode_checkpoint_batches("t", &archive.tables[0].ipc, row_count).unwrap();
+    let mut batches = Vec::new();
+    decode_checkpoint_batches("t", &archive.tables[0].ipc, row_count, |batch| {
+        batches.push(batch);
+        Ok(())
+    })
+    .unwrap();
     assert_eq!(batches.len(), 2);
     assert_eq!(batches[0].num_rows(), REFERENCE_TABLE_CHECKPOINT_CHUNK_ROWS);
     assert_eq!(batches[1].num_rows(), 904);

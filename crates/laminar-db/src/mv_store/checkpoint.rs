@@ -189,9 +189,11 @@ fn multiset_counted_checkpoint_batch(
             "multiset MV contains an invalid checkpoint multiplicity".into(),
         ));
     }
-    let mut arrays = row_converter
-        .convert_rows(counts.iter().map(|(key, _)| key.row()))
-        .map_err(|error| DbError::Storage(format!("multiset MV checkpoint conversion: {error}")))?;
+    let mut arrays = super::multiset::decode_rows(
+        row_converter,
+        schema,
+        counts.iter().map(|(key, _)| key.row()),
+    )?;
     arrays.push(Arc::new(Int64Array::from_iter_values(
         counts.iter().map(|(_, count)| *count),
     )));
@@ -253,7 +255,7 @@ impl MvEntry {
                 }
             }
         }
-        Ok(bytes)
+        Ok(bytes.max(u64::try_from(self.approx_bytes).map_err(|_| capture_size_overflow(name))?))
     }
 }
 
@@ -346,7 +348,7 @@ impl MvStore {
             }
             let mut restored = MultisetState::new(&entry.schema)?;
             for batch in &batches {
-                restored.load_counted_snapshot(batch)?;
+                restored.load_counted_snapshot(name, batch, self.limits)?;
             }
             entry.approx_bytes = restored.approx_bytes;
             entry.multiset = Some(restored);
@@ -364,16 +366,27 @@ impl MvStore {
         if let MvStorageMode::Upsert { key_cols } = &entry.mode {
             let mut restored = UpsertState::new(&entry.schema, key_cols)?;
             for batch in &batches {
-                restored.load_snapshot(batch)?;
+                restored.load_snapshot(name, batch, self.limits)?;
             }
             entry.approx_bytes = restored.approx_bytes;
             entry.upsert = Some(restored);
             return Ok(());
         }
-        let restored_bytes = batches.iter().fold(0usize, |total, batch| {
-            total.saturating_add(batch.get_array_memory_size())
-        });
-        entry.batches = batches.into_iter().collect();
+        let (rows, restored_bytes) = super::admission::batch_usage(batches.iter())?;
+        self.limits.validate(name, rows, restored_bytes)?;
+        // Restore rejects over-limit state instead of silently evicting committed rows.
+        if let MvStorageMode::Append { max_batches } = entry.mode {
+            if batches.iter().filter(|batch| batch.num_rows() > 0).count() > max_batches.max(1) {
+                return Err(DbError::Storage(format!(
+                    "MV '{name}' checkpoint exceeds append batch retention"
+                )));
+            }
+        }
+        entry.batches = batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect();
+        entry.rows = rows;
         entry.approx_bytes = restored_bytes;
         Ok(())
     }

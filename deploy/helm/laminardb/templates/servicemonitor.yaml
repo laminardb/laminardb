@@ -12,6 +12,7 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  jobLabel: app.kubernetes.io/name
   selector:
     matchLabels:
       {{- include "laminardb.selectorLabels" . | nindent 6 }}

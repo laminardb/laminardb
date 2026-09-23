@@ -20,6 +20,7 @@ use laminar_core::state::{KeyGroupCount, PartitionKeyCodecV1};
 
 use crate::db::exact_table_reference;
 use crate::error::DbError;
+use crate::operator::create_cached_physical_plan;
 
 mod accounting;
 mod checkpoints;
@@ -1451,18 +1452,17 @@ impl IncrementalAggState {
         let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &agg_df_schema)?;
 
         // Plan once at init; LiveSourceProvider leaves carry fresh data per execute.
-        let cached_pre_agg_physical =
-            if compiled_projection.is_none() {
-                let logical = ctx.sql(&pre_agg_sql).await.map_err(|e| {
-                    DbError::Pipeline(format!("pre-agg SQL planning failed for aggregate: {e}"))
-                })?;
-                let plan = logical.logical_plan().clone();
-                Some(ctx.state().create_physical_plan(&plan).await.map_err(|e| {
-                    DbError::Pipeline(format!("pre-agg physical planning failed: {e}"))
-                })?)
-            } else {
-                None
-            };
+        let cached_pre_agg_physical = if compiled_projection.is_none() {
+            let logical = ctx.sql(&pre_agg_sql).await.map_err(|e| {
+                DbError::Pipeline(format!("pre-agg SQL planning failed for aggregate: {e}"))
+            })?;
+            let physical = create_cached_physical_plan(ctx, logical.logical_plan())
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-agg physical planning failed: {e}")))?;
+            Some(physical)
+        } else {
+            None
+        };
 
         let sort_fields: Vec<arrow::row::SortField> = group_types
             .iter()

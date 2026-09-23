@@ -67,33 +67,14 @@ pub(super) async fn hydrate_reference_table_sources(
     let mut names = Vec::with_capacity(table_sources.len());
     let mut hydration_error = None;
 
-    for (name, source) in &mut table_sources {
-        let mut batches = Vec::new();
-        loop {
-            match source.poll_snapshot().await {
-                Ok(Some(batch)) => batches.push(batch),
-                Ok(None) => break,
-                Err(error) => {
-                    hydration_error = Some(DbError::Connector(format!(
-                        "Table '{name}' snapshot error: {error}"
-                    )));
-                    break;
-                }
-            }
-        }
-        if hydration_error.is_some() {
-            break;
-        }
-
-        match table_store.read().prepare_snapshot(name, &batches) {
+    for source in &mut table_sources {
+        match hydrate_reference_table(source, table_store).await {
             Ok(snapshot) => {
                 prepared.push(snapshot);
-                names.push(name.clone());
+                names.push(source.0.clone());
             }
             Err(error) => {
-                hydration_error = Some(DbError::Connector(format!(
-                    "Table '{name}' snapshot validation error: {error}"
-                )));
+                hydration_error = Some(error);
                 break;
             }
         }
@@ -108,9 +89,22 @@ pub(super) async fn hydrate_reference_table_sources(
     }
     close_result?;
 
-    table_store
-        .write()
-        .install_prepared_snapshots(prepared)
-        .map_err(|error| DbError::Connector(format!("Table snapshot install error: {error}")))?;
+    table_store.write().install_prepared_snapshots(prepared)?;
     Ok(names)
+}
+
+async fn hydrate_reference_table(
+    (name, source): &mut ReferenceTableRuntimeSource,
+    table_store: &parking_lot::RwLock<crate::table_store::TableStore>,
+) -> Result<crate::table_store::PreparedTableSnapshot, DbError> {
+    let mut snapshot = table_store.read().prepare_snapshot(name, &[])?;
+    // Each poll terminates the snapshot or must fit the finite candidate quota.
+    while let Some(batch) = source
+        .poll_snapshot()
+        .await
+        .map_err(|error| DbError::Connector(format!("Table '{name}' snapshot error: {error}")))?
+    {
+        table_store.read().extend_snapshot(&mut snapshot, &batch)?;
+    }
+    Ok(snapshot)
 }

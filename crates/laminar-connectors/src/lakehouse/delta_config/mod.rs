@@ -11,10 +11,7 @@ use crate::connector::DeliveryGuarantee;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
-use crate::storage::{
-    CloudConfigValidator, ResolvedStorageOptions, SecretMasker, StorageCredentialResolver,
-    StorageProvider,
-};
+use crate::storage::{CloudConfigValidator, SecretMasker, StorageCredentialResolver};
 
 /// Configuration for the Delta Lake sink connector.
 ///
@@ -363,11 +360,8 @@ impl DeltaLakeSinkConfig {
 
         // Validate cloud storage credentials (skip when catalog resolves the path).
         if self.catalog_type == DeltaCatalogType::None {
-            let resolved = ResolvedStorageOptions {
-                provider: StorageProvider::detect(&self.table_path),
-                options: self.storage_options.clone(),
-                env_resolved_keys: Vec::new(),
-            };
+            let resolved =
+                StorageCredentialResolver::resolve(&self.table_path, &self.storage_options);
             let cloud_result = CloudConfigValidator::validate(&resolved);
             if !cloud_result.is_valid() {
                 return Err(ConnectorError::ConfigurationError(

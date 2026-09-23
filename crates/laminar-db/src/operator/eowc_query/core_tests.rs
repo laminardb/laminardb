@@ -58,6 +58,90 @@ fn key_groups() -> KeyGroupCount {
     KeyGroupCount::try_from(8_u32).unwrap()
 }
 
+#[tokio::test]
+async fn cached_plan_window_pre_aggregate_refreshes_subquery_and_releases_metrics() {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use laminar_sql::datafusion::LiveSourceProvider;
+
+    let ctx = laminar_sql::create_session_context();
+    let trades = Arc::new(LiveSourceProvider::new(test_schema()));
+    let trade_handle = trades.handle();
+    ctx.register_table("trades", trades).unwrap();
+    let selected_schema = Arc::new(Schema::new(vec![Field::new(
+        "symbol",
+        DataType::Utf8,
+        false,
+    )]));
+    let selected = Arc::new(LiveSourceProvider::new(selected_schema.clone()));
+    let selected_handle = selected.handle();
+    ctx.register_table("selected", selected).unwrap();
+    let mut operator = EowcQueryOperator::new(
+        "filtered_windows",
+        "SELECT symbol, SUM(price) AS total FROM trades \
+         WHERE symbol IN (SELECT symbol FROM selected) GROUP BY symbol",
+        Some(EmitClause::OnWindowClose),
+        Some(test_window_config()),
+        ctx,
+        key_groups(),
+        None,
+    );
+    for cycle in 0..16 {
+        let (symbol, total) = if cycle % 2 == 0 {
+            ("AAPL", 100.0)
+        } else {
+            ("GOOG", 200.0)
+        };
+        selected_handle.swap(vec![RecordBatch::try_new(
+            selected_schema.clone(),
+            vec![Arc::new(StringArray::from(vec![symbol]))],
+        )
+        .unwrap()]);
+        let batch = test_batch(vec![cycle * 60_000 + 1_000, cycle * 60_000 + 2_000]);
+        trade_handle.swap(vec![batch.clone()]);
+        let output = operator
+            .process(&[vec![batch]], &[(cycle + 1) * 60_000])
+            .await
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let result = output.iter().find(|batch| batch.num_rows() != 0).unwrap();
+        assert_eq!(
+            result
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            symbol
+        );
+        assert_eq!(
+            result
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            total
+        );
+        let state = operator.state.as_ref().unwrap();
+        assert!(state.compiled_projection().is_none());
+        state
+            .cached_pre_agg_physical()
+            .unwrap()
+            .apply(|node| {
+                if let Some(metrics) = node.metrics() {
+                    assert_eq!(
+                        metrics.iter().count(),
+                        0,
+                        "{} retained metrics",
+                        node.name()
+                    );
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+    }
+}
+
 #[cfg(feature = "cluster")]
 async fn cluster_scope(owners: [u64; 8]) -> ClusterShuffleConfig {
     use laminar_core::cluster::control::LeaseDeadline;

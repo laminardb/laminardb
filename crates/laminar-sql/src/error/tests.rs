@@ -113,6 +113,17 @@ fn test_execution_error() {
 }
 
 #[test]
+fn datafusion_memory_exhaustion_is_an_execution_failure() {
+    let error = datafusion_common::DataFusionError::ResourcesExhausted(
+        "Failed to allocate additional 128 KB; 64 KB remain available".into(),
+    );
+    let translated = translate_datafusion_error(&error.to_string());
+    assert_eq!(translated.code, codes::EXECUTION_FAILED);
+    assert!(translated.message.contains("64 KB remain available"));
+    assert!(translated.hint.is_none());
+}
+
+#[test]
 fn test_unknown_fallback() {
     let t = translate_datafusion_error("some totally unknown error");
     assert_eq!(t.code, codes::INTERNAL);

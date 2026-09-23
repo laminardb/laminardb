@@ -45,8 +45,10 @@ docker pull ghcr.io/laminardb/laminardb-server:latest
 docker pull laminardb/laminardb-server:latest
 
 # Run with default config
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
 docker run -d --name laminardb \
   -p 8080:8080 \
+  -e LAMINAR_CONSOLE_TOKEN \
   -v laminardb-data:/var/lib/laminardb \
   ghcr.io/laminardb/laminardb-server:latest
 
@@ -74,12 +76,21 @@ See the root `docker-compose.yml` for a full example with Kafka and PostgreSQL.
 
 ## 3. Helm (Kubernetes)
 
+The default HTTP bind is non-loopback and requires a console token. Create a secret in the
+installation namespace before using any of the commands below:
+
+```bash
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+kubectl create secret generic laminardb-console --from-literal=token="$LAMINAR_CONSOLE_TOKEN"
+```
+
 ### Option A: Install from the LaminarDB Helm repository (Cloud/Internet Connected)
 
 ```bash
 helm repo add laminardb https://laminardb.io/charts
 helm repo update
-helm install my-laminardb laminardb/laminardb
+helm install my-laminardb laminardb/laminardb \
+  --set laminardb.consoleToken.existingSecret=laminardb-console
 ```
 
 ### Option B: Install from Local Files / Local Tarball (Best for On-Prem / Air-Gapped / Custom AKS)
@@ -88,11 +99,13 @@ If your environment restricts accessing external OCI registries:
 
 ```bash
 # 1. Clone the repository locally, then run install from the folder:
-helm install my-laminardb deploy/helm/laminardb
+helm install my-laminardb deploy/helm/laminardb \
+  --set laminardb.consoleToken.existingSecret=laminardb-console
 
 # 2. Or package the chart into a tarball to ship it to air-gapped clusters:
 helm package deploy/helm/laminardb
-helm install my-laminardb laminardb-*.tgz
+helm install my-laminardb laminardb-*.tgz \
+  --set laminardb.consoleToken.existingSecret=laminardb-console
 ```
 
 ### Quick start (standalone single-node mode)
@@ -113,6 +126,7 @@ curl http://localhost:8080/health
 
 # Execute SQL
 curl -X POST http://localhost:8080/api/v1/sql \
+  -H "Authorization: Bearer $LAMINAR_CONSOLE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"sql": "SHOW SOURCES"}'
 ```
@@ -134,6 +148,11 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 - `ci/standalone-values.yaml` - minimal single-node deployment
 - `ci/cluster-values.yaml` - 3-node cluster-mode setup
 - `ci/full-values.yaml` - all features enabled (ingress, monitoring, network policy)
+
+These values reference the `laminardb-console` secret created above. Credentials are injected
+from the secret at runtime; the chart does not store a default token in its ConfigMap.
+With `laminardb.configOverride`, include `server.console_token` in that TOML and supply its secret
+through the pod environment. Non-loopback anonymous configuration fails server startup.
 
 ---
 

@@ -824,10 +824,7 @@ impl CoreWindowState {
                 .sql(&pre_agg_sql)
                 .await
                 .map_err(|e| DbError::Pipeline(format!("pre-agg SQL planning failed: {e}")))?;
-            let logical = df.logical_plan().clone();
-            let physical = ctx
-                .state()
-                .create_physical_plan(&logical)
+            let physical = crate::operator::create_cached_physical_plan(ctx, df.logical_plan())
                 .await
                 .map_err(|e| DbError::Pipeline(format!("pre-agg physical planning failed: {e}")))?;
             Some(physical)

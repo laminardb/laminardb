@@ -225,12 +225,10 @@ fn test_partition_columns_empty_filter() {
 // ── Cloud storage integration tests ──
 
 #[test]
-fn test_s3_path_requires_region() {
+fn test_s3_path_retains_the_downstream_region_chain() {
     let config = make_config(&[("table.path", "s3://my-bucket/trades")]);
-    let result = DeltaLakeSinkConfig::from_config(&config);
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("aws_region"), "error: {err}");
+    let parsed = DeltaLakeSinkConfig::from_config(&config).unwrap();
+    assert!(!parsed.storage_options.contains_key("aws_region"));
 }
 
 #[test]

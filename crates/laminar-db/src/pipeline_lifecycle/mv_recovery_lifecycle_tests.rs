@@ -132,3 +132,32 @@ async fn restart_without_a_coordinator_installs_an_empty_mv_image() {
     assert_eq!(source.source.current_watermark(), i64::MIN);
     db.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn over_quota_mv_recovery_preserves_previous_stores_before_intake() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = LaminarDB::open_with_config(checkpoint_config(dir.path())).unwrap();
+        install_generator_mvs(&db, 0).await;
+        db.start().await.unwrap();
+        update_mv(&db, "committed", vec![10, 20]);
+        let checkpoint = db.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{:?}", checkpoint.error);
+        db.shutdown().await.unwrap();
+    }
+    let mut config = checkpoint_config(dir.path());
+    config.materialized_view_max_rows = 1;
+    let db = LaminarDB::open_with_config(config).unwrap();
+    install_generator_mvs(&db, 0).await;
+    update_mv(&db, "committed", vec![9]);
+    update_mv(&db, "empty_at_cut", vec![7]);
+    let error = db
+        .start()
+        .await
+        .expect_err("selected checkpoint must fail quota validation");
+    assert!(error.to_string().contains("quota exceeded"), "{error}");
+    assert_ne!(db.pipeline_state(), "Running");
+    assert_eq!(mv_values(&db, "committed"), [9]);
+    assert_eq!(mv_values(&db, "empty_at_cut"), [7]);
+    db.shutdown().await.unwrap();
+}

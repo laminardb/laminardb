@@ -29,6 +29,8 @@ use common::{
     wait_for_broker, wait_for_broker_unavailable,
 };
 
+mod kafka_saturation;
+
 const REQUIRE_REDPANDA_ENV: &str = "LAMINAR_REQUIRE_REDPANDA";
 const STOPPED_WRITER_STABILITY: Duration = Duration::from_millis(500);
 static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
@@ -117,13 +119,13 @@ async fn produce_json_range(brokers: &str, topic: &str, range: std::ops::Range<u
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct PartitionWatermarkCut {
     low: i64,
     high_exclusive: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct KafkaHighWatermarkCut {
     partitions: BTreeMap<i32, PartitionWatermarkCut>,
 }
@@ -354,6 +356,172 @@ fn validated_id_counts(
     counts
 }
 
+async fn pressure_database(
+    config: LaminarConfig,
+    brokers: &str,
+    input: &str,
+    output: &str,
+) -> (
+    std::sync::Arc<LaminarDB>,
+    std::sync::Arc<laminar_db::EngineMetrics>,
+) {
+    let db = LaminarDB::open_with_config(config).expect("open pressure database");
+    let metrics = std::sync::Arc::new(laminar_db::EngineMetrics::new(&prometheus::Registry::new()));
+    db.set_engine_metrics(metrics.clone());
+    db.execute(&format!(
+        "CREATE SOURCE input (id BIGINT, value BIGINT) FROM KAFKA (\
+         'bootstrap.servers' = '{brokers}', 'topic' = '{input}', 'group.id' = '{input}', \
+         'startup.mode' = 'earliest', 'max.poll.records' = '1') FORMAT JSON"
+    ))
+    .await
+    .unwrap();
+    for (name, from) in [
+        ("stage0", "input"),
+        ("stage1", "stage0"),
+        ("stage2", "stage1"),
+    ] {
+        let projection = if name == "stage0" {
+            "id, value, REPEAT('x', 131072) AS padding"
+        } else {
+            "id, value"
+        };
+        db.execute(&format!(
+            "CREATE STREAM {name} AS SELECT {projection} FROM {from}"
+        ))
+        .await
+        .unwrap();
+    }
+    db.execute(&format!(
+        "CREATE SINK output FROM stage2 INTO KAFKA \
+         ('bootstrap.servers' = '{brokers}', 'topic' = '{output}') FORMAT JSON"
+    ))
+    .await
+    .unwrap();
+    (db, metrics)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "S12 diagnostic: requires Redpanda and a new LAMINAR_S12_DIAGNOSTICS directory"]
+async fn durable_graph_overflow_and_restart_ledger() {
+    use laminar_db::BackpressurePolicy;
+    let brokers = kafka_test_brokers().expect("S12 requires a reachable broker");
+    let evidence = std::path::PathBuf::from(std::env::var("LAMINAR_S12_DIAGNOSTICS").unwrap());
+    for policy in [BackpressurePolicy::Backpressure, BackpressurePolicy::Fail] {
+        let directory = evidence.join(format!("g9-{policy:?}"));
+        std::fs::create_dir(&directory).unwrap();
+        let storage = directory.join("checkpoints");
+        let input = unique("s12_pressure_in");
+        let output = unique("s12_pressure_out");
+        create_topic(brokers, &input, 1).await;
+        create_topic(brokers, &output, 1).await;
+        let mut config = at_least_once_config(&storage);
+        config.pipeline_backpressure_policy = policy;
+        let (db, _) = pressure_database(config.clone(), brokers, &input, &output).await;
+        db.start().await.unwrap();
+        produce_json_range(brokers, &input, 0..20).await;
+        wait_for_required_ids(
+            brokers,
+            &output,
+            &unique("seed"),
+            0..20,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.unwrap();
+        drop(db);
+
+        // Input fits; the intermediate 128 KiB column cannot fit the 64 KiB graph port.
+        // Both lossless policies must reject this indivisible output before publication.
+        config.pipeline_max_input_buf_bytes = Some(64 * 1024);
+        let (db, metrics) = pressure_database(config.clone(), brokers, &input, &output).await;
+        db.start().await.unwrap();
+        produce_json_range(brokers, &input, 20..40).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while db.last_fault().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("oversized output must fault");
+        let fault = db.last_fault().unwrap();
+        let checkpoint = db.checkpoint().await;
+        std::fs::write(
+            directory.join("pressure.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "policy":format!("{policy:?}"), "input_topic":input, "output_topic":output,
+                "source_id_range_exclusive":[0,40], "fault":fault, "port_byte_capacity":65536,
+                "events_dropped":metrics.events_dropped.get(),
+                "checkpoint":format!("{checkpoint:?}"), "s12_qualified":false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            fault.contains("Graph input budget exceeded at 'stage1'") && fault.contains("65536"),
+            "{fault}"
+        );
+        assert_eq!(metrics.events_dropped.get(), 0);
+        assert!(!checkpoint.is_ok_and(|c| c.success));
+        let _ = db.shutdown().await;
+        drop(db);
+        let before = capture_stopped_writer_cut(brokers, &output).await;
+        let rows = consume_through_cut(
+            brokers,
+            &output,
+            &unique("ledger"),
+            &before,
+            Duration::from_secs(30),
+        )
+        .await;
+        validated_id_counts(&rows, 0..20);
+        std::fs::write(
+            directory.join("output.json"),
+            serde_json::to_vec_pretty(&rows).unwrap(),
+        )
+        .unwrap();
+
+        // Explicitly repair the embedded configuration and replay from the last good cut.
+        config.pipeline_max_input_buf_bytes = None;
+        let (db, _) = pressure_database(config, brokers, &input, &output).await;
+        db.start().await.unwrap();
+        wait_for_required_ids(
+            brokers,
+            &output,
+            &unique("recovered"),
+            0..40,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(db.checkpoint().await.unwrap().success);
+        db.shutdown().await.unwrap();
+        drop(db);
+        let after = capture_stopped_writer_cut(brokers, &output).await;
+        let rows = consume_through_cut(
+            brokers,
+            &output,
+            &unique("final_ledger"),
+            &after,
+            Duration::from_secs(30),
+        )
+        .await;
+        let counts = validated_id_counts(&rows, 0..40);
+        std::fs::write(
+            directory.join("recovered-output.json"),
+            serde_json::to_vec_pretty(&rows).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("restart.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "recovered":true, "verified_ids":40, "duplicates":counts.values().sum::<usize>() - 40,
+                "s12_qualified":false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_1_kafka_roundtrip() {
     let Some(brokers) = kafka_test_brokers() else {

@@ -4,6 +4,8 @@ laminardb:
   mode: cluster
   delivery: at_least_once
   logLevel: info
+  consoleToken:
+    existingSecret: laminardb-console
   checkpoint:
     url: "s3://laminardb-ci/checkpoints"
   cluster:

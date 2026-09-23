@@ -2,11 +2,119 @@ use super::*;
 use laminar_core::checkpoint::{CheckpointAssignmentFence, LeaderProof, LeaderProofOwner};
 use laminar_core::cluster::control::{
     AssignmentDrainDecision, AssignmentSnapshot, AssignmentSnapshotStore, CheckpointParticipant,
-    ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
-    ProcessLeaseAuthority, ProcessLeaseOutcome,
+    ClusterKv, InMemoryKv, LeaderLease, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline,
+    LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
 };
 use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
 use tokio::sync::watch;
+
+struct RecoveryAuthorityReadGateStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Semaphore,
+}
+
+impl RecoveryAuthorityReadGateStore {
+    fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            inner,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::AcqRel),
+            "recovery control read gate is already armed"
+        );
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+}
+
+impl std::fmt::Debug for RecoveryAuthorityReadGateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveryAuthorityReadGateStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for RecoveryAuthorityReadGateStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecoveryAuthorityReadGateStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for RecoveryAuthorityReadGateStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if location.as_ref().starts_with("control/leader-lease/")
+            && self.armed.swap(false, Ordering::AcqRel)
+        {
+            self.entered.add_permits(1);
+            return std::future::pending().await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
 
 #[test]
 fn recovery_timeout_envelope_covers_stop_and_stopped_reporting() {
@@ -92,6 +200,19 @@ async fn install_test_leader_authority(
     controller: &ClusterController,
     authority_store: Arc<dyn object_store::ObjectStore>,
 ) -> Arc<LeaderLeaseStore> {
+    install_test_leader_authority_with_watch(controller, authority_store)
+        .await
+        .0
+}
+
+async fn install_test_leader_authority_with_watch(
+    controller: &ClusterController,
+    authority_store: Arc<dyn object_store::ObjectStore>,
+) -> (
+    Arc<LeaderLeaseStore>,
+    watch::Sender<Option<LeaderLease>>,
+    LeaderLeaseOwner,
+) {
     let process_term =
         install_test_process_authority(controller, Arc::clone(&authority_store)).await;
     let authority = Arc::new(LeaderLeaseStore::new(authority_store, 10_000));
@@ -103,17 +224,17 @@ async fn install_test_leader_authority(
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
         panic!("empty recovery test authority must grant leadership");
     };
-    let (_lease_tx, lease_rx) = watch::channel(Some(lease));
+    let (lease_tx, lease_rx) = watch::channel(Some(lease));
     controller
         .set_leader_lease_watch(
             lease_rx,
-            owner,
+            owner.clone(),
             Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
         )
         .unwrap();
     controller.set_leader_lease_store(Arc::clone(&authority));
     controller.set_active(true);
-    authority
+    (authority, lease_tx, owner)
 }
 
 async fn controller(
@@ -1398,6 +1519,139 @@ async fn recovery_reconstructs_a_suspended_fence_from_exact_durable_adoption() {
 }
 
 #[tokio::test]
+async fn recovery_rejects_an_absent_predecessor_before_durable_incarnation_audit() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let (controller, _members_tx, kv) = controller(Vec::new()).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1, 2]).await;
+    let (assignments, _committed) =
+        initial_assignment_store(&round.assignment_fence, &[NodeId(1), NodeId(2)]).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(Arc::from([StateNodeId(1), StateNodeId(2)]), 1);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(registry)
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    publish_round_roster(&controller, &kv, &round).await;
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        "malformed".into(),
+    );
+    controller.set_recovering(true);
+    db.fence_coordinated_recovery_lifecycle();
+    controller.publish_checkpoint_assignment_fence(None);
+
+    let observed = tokio::time::timeout(
+        Duration::from_millis(100),
+        current_recovery_assignment_fence(
+            &db,
+            &controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("absent predecessor detection must not wait on durable incarnation I/O")
+    .expect("an absent predecessor is unavailable, not an assignment audit failure");
+    assert_eq!(observed, None);
+}
+
+#[tokio::test]
+async fn recovery_rejects_incomplete_adoption_before_assignment_authority_audit() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let authority_gate = Arc::new(RecoveryAuthorityReadGateStore::new(backing));
+    let authority_store: Arc<dyn object_store::ObjectStore> = authority_gate.clone();
+    let (controller, _members_tx, _kv) = controller_on(Vec::new(), authority_store.clone()).await;
+    let controller = Arc::new(controller);
+    let participant = CheckpointParticipant {
+        node_id: controller.instance_id().0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let committed = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[controller.instance_id()]),
+            vec![participant],
+        )
+        .unwrap();
+    let target = committed
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[controller.instance_id()]),
+            vec![participant],
+        )
+        .unwrap();
+    let assignments = Arc::new(AssignmentSnapshotStore::new(authority_store));
+    assignments.save_if_absent(&committed).await.unwrap();
+    assignments
+        .save_if_version(&target, committed.version)
+        .await
+        .unwrap();
+    let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
+    registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), target.version);
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(Arc::clone(&registry))
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let fault = report_test_fault(&controller).await;
+    let mut monitor = RecoveryMonitor::default();
+    monitor.hold_for_pending_fault(&db, &controller, &[fault]);
+    controller.publish_checkpoint_assignment_fence(None);
+
+    authority_gate.arm();
+    let observed = tokio::time::timeout(
+        Duration::from_millis(100),
+        current_recovery_assignment_fence(
+            &db,
+            &controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        ),
+    )
+    .await
+    .expect("missing adoption must reject before durable assignment authority I/O")
+    .expect("missing adoption is unavailable, not an assignment audit failure");
+    assert_eq!(observed, None);
+    assert!(
+        authority_gate.armed.load(Ordering::Acquire),
+        "missing adoption must not consume the durable assignment authority read"
+    );
+
+    let adoption = db
+        .publish_local_vnode_state_report(&controller, &registry.versioned_snapshot(), false)
+        .await
+        .unwrap();
+    assert!(adoption.matches_fence(&target.assignment_fence().unwrap()));
+    let auditing_db = Arc::clone(&db);
+    let auditing_controller = Arc::clone(&controller);
+    let authority_audit = tokio::spawn(async move {
+        current_recovery_assignment_fence(
+            &auditing_db,
+            &auditing_controller,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+    });
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        authority_gate.wait_until_blocked(),
+    )
+    .await
+    .expect("complete adoption must still require the durable assignment authority audit");
+    authority_audit.abort();
+}
+
+#[tokio::test]
 async fn recovery_reconstructs_a_suspended_drain_predecessor_fence() {
     use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
 
@@ -1983,6 +2237,201 @@ async fn recovery_quorum_requires_the_exact_round_and_target() {
 }
 
 #[tokio::test]
+async fn post_start_leadership_loss_retains_control_for_a_successor() {
+    let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
+    let controller = Arc::new(controller);
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        controller.recovery_incarnation().to_string(),
+    );
+    let original_fault = report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    activate_start(&controller, &kv, &round, 4).await;
+    let start = start(round.clone(), 4);
+    controller.announce_recovered(&start).await.unwrap();
+    let retained_start = kv.read_from(NodeId(1), "control:recover").await.unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+        &prometheus::Registry::new(),
+    ));
+    *db.engine_metrics.lock() = Some(Arc::clone(&metrics));
+    controller.set_recovering(true);
+    db.set_source_gate(true);
+    let inventory_before = controller.read_recovery_fault_inventory().await.unwrap();
+    let failures_before = metrics.coordinated_recovery_failures_total.get();
+
+    let wait_controller = Arc::clone(&controller);
+    let wait_start = start.clone();
+    let waiter = tokio::spawn(async move {
+        wait_restored_quorum(&wait_controller, &wait_start, Duration::from_secs(1)).await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "the missing follower acknowledgement must keep the restore quorum pending"
+    );
+    controller.fence_process_lease();
+    let outcome = waiter.await.unwrap();
+
+    assert_eq!(outcome, RecoveryQuorum::LeadershipLost);
+    retain_recovery_control_after_leadership_loss(&db, &controller, &round);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(
+        kv.read_from(NodeId(1), "control:recover").await.as_deref(),
+        Some(retained_start.as_str()),
+        "the published Start must remain available to the successor"
+    );
+    assert_eq!(
+        metrics.coordinated_recovery_failures_total.get(),
+        failures_before,
+        "an expected leadership handoff is not a failed recovery"
+    );
+    assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    assert_eq!(
+        controller.read_local_fault_report_control().await.unwrap(),
+        Some(original_fault.sequence)
+    );
+    assert_eq!(
+        controller.read_recovery_fault_inventory().await.unwrap(),
+        inventory_before,
+        "the original fault remains the successor generation's trigger"
+    );
+}
+
+#[tokio::test]
+async fn post_start_same_node_leader_term_rotation_retains_control_for_a_successor() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, backing).await;
+    let controller = Arc::new(controller);
+    kv.seed(
+        NodeId(2),
+        "control:recovery-incarnation",
+        controller.recovery_incarnation().to_string(),
+    );
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    activate_start(&controller, &kv, &round, 4).await;
+    let start = start(round.clone(), 4);
+    controller.announce_recovered(&start).await.unwrap();
+    let retained_start = kv.read_from(self_id, "control:recover").await.unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .build()
+        .await
+        .unwrap();
+
+    let wait_controller = Arc::clone(&controller);
+    let wait_start = start.clone();
+    let waiter = tokio::spawn(async move {
+        wait_restored_quorum(&wait_controller, &wait_start, Duration::from_secs(1)).await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "the missing follower acknowledgement must keep the restore quorum pending"
+    );
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(controller.is_leader());
+    assert_ne!(
+        controller.capture_leader_proof().as_ref(),
+        Some(&round.leader_proof)
+    );
+
+    let outcome = waiter.await.unwrap();
+    assert_eq!(outcome, RecoveryQuorum::LeadershipLost);
+
+    retain_recovery_control_after_leadership_loss(&db, &controller, &round);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(
+        kv.read_from(self_id, "control:recover").await.as_deref(),
+        Some(retained_start.as_str()),
+        "the published Start must remain available to the successor"
+    );
+}
+
+#[tokio::test]
+async fn leader_stop_wait_yields_on_same_node_leader_term_rotation() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(Vec::new());
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, backing).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1]).await;
+    publish_round_roster(&controller, &kv, &round).await;
+    controller.announce_recover_prepare(&round).await.unwrap();
+    let retained_prepare = kv.read_from(self_id, "control:recover").await.unwrap();
+
+    let (stop_started_tx, stop_started_rx) = tokio::sync::oneshot::channel();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let round = round.clone();
+        async move {
+            let stop = async move {
+                stop_started_tx
+                    .send(())
+                    .expect("the driver stop wait must remain live");
+                std::future::pending().await
+            };
+            await_recovery_driver_stop(&controller, &round, stop).await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), stop_started_rx)
+        .await
+        .expect("the driver must begin awaiting its local stop")
+        .expect("the driver stop wait must remain live");
+    assert!(
+        !waiting.is_finished(),
+        "the unfinished local stop must keep the original driver waiting"
+    );
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(controller.is_leader());
+    assert!(!recovery_driver_proof_is_current(&controller, &round));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("proof rotation must release the old driver's stop wait")
+        .expect("the stop wait task must not panic");
+    assert_eq!(outcome, DriverStopOutcome::LeadershipLost);
+    assert_eq!(
+        kv.read_from(self_id, "control:recover").await.as_deref(),
+        Some(retained_prepare.as_str()),
+        "the successor must inherit the published Prepare"
+    );
+}
+
+#[tokio::test]
 async fn restore_quorum_accepts_an_intentionally_suspended_assignment_certificate() {
     let (controller, _members_tx, kv) = controller(Vec::new()).await;
     report_test_fault(&controller).await;
@@ -2226,6 +2675,166 @@ async fn stopped_prepare_leadership_handoff_retains_fault_without_failure_accoun
         inventory_before,
         "the original unhandled inventory must remain the successor's live trigger"
     );
+}
+
+#[tokio::test]
+async fn late_fault_after_stopped_quorum_yields_stale_prepare_without_retry_churn() {
+    use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+    let (controller, follower, kv) = driver_and_follower().await;
+    let original_fault = report_test_fault(&controller).await;
+    let owner = CheckpointParticipant {
+        node_id: controller.instance_id().0,
+        boot_incarnation: controller.recovery_incarnation(),
+    };
+    let peer = CheckpointParticipant {
+        node_id: follower.instance_id().0,
+        boot_incarnation: follower.recovery_incarnation(),
+    };
+    let assignment_fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[owner.node_id, peer.node_id],
+        vec![owner, peer],
+    )
+    .unwrap();
+    let (assignments, _committed) =
+        initial_assignment_store(&assignment_fence, &[NodeId(1), NodeId(2)]).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(
+        Arc::from([StateNodeId(1), StateNodeId(2)]),
+        assignment_fence.assignment_version,
+    );
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+        .vnode_registry(registry)
+        .assignment_snapshot_store(assignments)
+        .build()
+        .await
+        .unwrap();
+    let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
+        &prometheus::Registry::new(),
+    ));
+    *db.engine_metrics.lock() = Some(Arc::clone(&metrics));
+    controller.publish_recovery_incarnation().await.unwrap();
+    kv.seed(
+        follower.instance_id(),
+        "control:recovery-incarnation",
+        follower.recovery_incarnation().to_string(),
+    );
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence));
+    controller.set_recovering(true);
+    db.set_source_gate(true);
+    db.coordinated_recovery_fenced
+        .store(true, Ordering::Release);
+
+    let initial_inventory = controller.read_recovery_fault_inventory().await.unwrap();
+    let driving = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let db = Arc::clone(&db);
+        let faults = initial_inventory.faults().to_vec();
+        async move {
+            let mut monitor = RecoveryMonitor::default();
+            monitor
+                .drive_round(&db, &controller, initial_inventory.revision(), faults, None)
+                .await;
+        }
+    });
+    let prepare = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(active) = controller.observe_recover_control().await.unwrap() else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if active.phase == RecoverPhase::Prepare
+                && !controller
+                    .read_stopped(&active.round, &[controller.instance_id()])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            {
+                break active;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the driver must publish Prepare and its local stopped report");
+    assert!(!driving.is_finished());
+
+    let late_fault = report_test_fault(&follower).await;
+    let changed_inventory = controller.read_recovery_fault_inventory().await.unwrap();
+    assert_eq!(changed_inventory.faults(), &[original_fault, late_fault]);
+    let peer_stopped = RecoveryStoppedReport::new(&prepare.round, peer).unwrap();
+    kv.seed(
+        follower.instance_id(),
+        "control:recovery-stopped",
+        serde_json::to_string(&peer_stopped).unwrap(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), driving)
+        .await
+        .expect("the stale stopped generation must yield promptly")
+        .expect("the recovery driver must not panic");
+    assert_eq!(
+        controller.observe_recover_control().await.unwrap(),
+        Some(prepare),
+        "the stopped Prepare must remain available for direct handoff"
+    );
+    assert_eq!(
+        controller.read_recovery_fault_inventory().await.unwrap(),
+        changed_inventory,
+        "the newer durable fault already drives the successor generation"
+    );
+    assert_eq!(metrics.coordinated_recovery_failures_total.get(), 0);
+    assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+    assert!(controller.is_recovering());
+    assert!(db.cluster_intake_fenced());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_quorum_control_read_rechecks_leadership_before_the_quorum_deadline() {
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+    let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+    install_test_process_deadline(&controller);
+    let authority_inner: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let authority_gate = Arc::new(RecoveryAuthorityReadGateStore::new(authority_inner));
+    let authority_store: Arc<dyn object_store::ObjectStore> = authority_gate.clone();
+    let (authority, lease_tx, owner) =
+        install_test_leader_authority_with_watch(&controller, authority_store).await;
+    let controller = Arc::new(controller);
+    report_test_fault(&controller).await;
+    let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
+    publish_round_roster(&controller, &kv, &round).await;
+    controller.announce_recover_prepare(&round).await.unwrap();
+    controller.announce_stopped(&round).await.unwrap();
+
+    authority_gate.arm();
+    let waiting = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let round = round.clone();
+        async move { wait_stopped_quorum_until(&controller, &round).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), authority_gate.wait_until_blocked())
+        .await
+        .expect("the gated authority read must be entered");
+
+    let LeaseOutcome::Acquired(rotated) = authority.begin_new_term(&owner, 1).await.unwrap() else {
+        panic!("the current owner must rotate its leader term");
+    };
+    assert_ne!(rotated.proof(), round.leader_proof);
+    lease_tx.send_replace(Some(rotated));
+    assert!(!recovery_driver_proof_is_current(&controller, &round));
+
+    tokio::time::advance(DECISION_IO_TIMEOUT + STOP_QUORUM_INITIAL_POLL).await;
+    let outcome = tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .expect("the bounded observation must yield to the new leader proof")
+        .expect("the quorum task must not panic");
+    assert_eq!(outcome, StoppedQuorum::LeadershipLost);
 }
 
 #[tokio::test]

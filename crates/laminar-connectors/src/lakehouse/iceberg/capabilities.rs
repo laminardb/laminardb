@@ -7,6 +7,7 @@ use crate::lakehouse::iceberg_config::{
     IcebergSchemaEvolutionMode, IcebergSinkConfig, IcebergSourceConfig, IcebergStorageType,
     IcebergWriteMode,
 };
+use crate::storage::StorageProvider;
 
 const MOR_MISSING_ACTIONS: &str =
     "[LDB-ICEBERG-MOR-UNSUPPORTED] iceberg.write.merge-on-read: iceberg-rust 0.10.1 has no public atomic RowDelta action or position-delete writer";
@@ -95,10 +96,7 @@ fn is_sensitive_auth_header(key: &str) -> bool {
 }
 
 fn direct_s3_warehouse(warehouse: &str) -> bool {
-    warehouse.split_once("://").is_some_and(|(scheme, path)| {
-        (scheme.eq_ignore_ascii_case("s3") || scheme.eq_ignore_ascii_case("s3a"))
-            && !path.is_empty()
-    })
+    StorageProvider::is_direct_s3_uri(warehouse)
 }
 
 pub(crate) fn validate_source(config: &IcebergSourceConfig) -> Result<(), ConnectorError> {

@@ -34,6 +34,10 @@ fn embedded_accepts_an_absolute_file_checkpoint_url() {
     assert!(Profile::Embedded
         .validate_config(&config, Some(&url))
         .is_ok());
+    let uppercase_url = url.replacen("file", "FILE", 1);
+    assert!(Profile::Embedded
+        .validate_config(&config, Some(&uppercase_url))
+        .is_ok());
     assert!(Profile::Embedded
         .validate_config(&config, Some("file://./relative"))
         .is_err());
@@ -183,6 +187,45 @@ fn test_from_config_durable_abfss() {
         ..LaminarConfig::default()
     };
     assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+}
+
+#[test]
+fn shared_storage_parser_drives_durable_profile_aliases() {
+    for location in [
+        "S3A://bucket/prefix",
+        "GCS://bucket/prefix",
+        "wasb://container@account.blob.core.windows.net/prefix",
+        "WASBS://container@account.blob.core.windows.net/prefix",
+    ] {
+        let config = LaminarConfig {
+            object_store_url: Some(location.to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(
+            Profile::from_config(&config, false),
+            Profile::Durable,
+            "{location}"
+        );
+    }
+}
+
+#[test]
+fn malformed_or_unsupported_object_store_url_is_not_treated_as_durable() {
+    for location in [
+        "file://relative/checkpoints",
+        "https://example.invalid/checkpoints",
+        "s3n://bucket/checkpoints",
+    ] {
+        let config = LaminarConfig {
+            object_store_url: Some(location.to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(
+            Profile::from_config(&config, false),
+            Profile::BareMetal,
+            "{location}"
+        );
+    }
 }
 
 #[test]

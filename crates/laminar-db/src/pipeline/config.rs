@@ -45,8 +45,13 @@ pub struct PipelineConfig {
     /// Maximum records per `poll_batch()` call.
     pub max_poll_records: usize,
 
-    /// Channel capacity for per-source `mpsc` sender → coordinator.
+    /// Shared channel capacity for all source senders → coordinator.
     pub channel_capacity: usize,
+
+    /// Shared Arrow-byte limit for source messages, including parked input (default 64 MiB).
+    /// Each producer may additionally hold one batch up to this limit while waiting for a
+    /// cursor or capacity. Staged/graph buffers and connector decode scratch are excluded.
+    pub source_queue_max_bytes: usize,
 
     /// Fallback poll interval when a source returns no `data_ready_notify`.
     pub fallback_poll_interval: Duration,
@@ -80,7 +85,9 @@ pub struct PipelineConfig {
     /// Per-input-port batch cap. Default: 256.
     pub max_input_buf_batches: usize,
 
-    /// Per-input-port byte cap. `None` = disabled.
+    /// Per-input-port retained Arrow-byte cap, including source priming. `None` = disabled.
+    /// Shared buffers are charged independently on each port; executed output that would
+    /// exceed a limit halts the pipeline before publication under lossless policies.
     pub max_input_buf_bytes: Option<usize>,
 
     /// What to do when either cap is exceeded.
@@ -101,6 +108,7 @@ impl Default for PipelineConfig {
         Self {
             max_poll_records: 1024,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::config::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Disabled,
             batch_window: Duration::from_millis(5),

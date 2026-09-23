@@ -167,6 +167,29 @@ fn object_store_retryability_uses_typed_positive_allowlist() {
 
 #[cfg(feature = "delta-lake")]
 #[test]
+fn delta_write_attempt_errors_do_not_echo_signed_request_urls() {
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let signed = "https://account.blob.example/table?sig=do-not-disclose";
+    let error = deltalake::DeltaTableError::ObjectStore {
+        source: deltalake::ObjectStoreError::Generic {
+            store: "Azure",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, signed),
+            )),
+        },
+    };
+    let attempt =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(error))
+            .to_string();
+    assert!(attempt.contains("transport-timeout"), "{attempt}");
+    assert!(!attempt.contains("do-not-disclose"), "{attempt}");
+    assert!(!attempt.contains("account.blob.example"), "{attempt}");
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
 fn tracked_delta_future_owns_guard_before_first_poll() {
     let sink = DeltaLakeSink::new(test_config(), None);
     let terminal = sink.terminal_task_tracker().unwrap();
@@ -804,7 +827,8 @@ fn test_debug_output() {
     let sink = DeltaLakeSink::new(test_config(), None);
     let debug = format!("{sink:?}");
     assert!(debug.contains("DeltaLakeSink"));
-    assert!(debug.contains("delta_test_nonexistent_"));
+    assert!(debug.contains("table_path: \"<configured>\""));
+    assert!(!debug.contains("delta_test_nonexistent_"));
 }
 
 // ── End-to-end upsert collapse (aggregating-MV changelog → Delta table) ──

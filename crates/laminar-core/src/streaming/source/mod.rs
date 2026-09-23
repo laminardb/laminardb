@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use tokio::sync::Semaphore;
 
+use super::arrow_admission::QueuedArrowBatch;
 use super::channel::{channel_with_config, Producer};
 use super::config::SourceConfig;
 use super::error::{StreamingError, TryPushError};
@@ -54,7 +56,7 @@ pub(crate) enum SourceMessage<T> {
     Record(T),
 
     /// A batch of Arrow records.
-    Batch(RecordBatch),
+    Batch(Arc<QueuedArrowBatch>),
 }
 
 /// Shared state for watermark tracking.
@@ -110,6 +112,9 @@ struct SourceInner<T: Record> {
     /// Channel producer for sending records.
     producer: Producer<SourceMessage<T>>,
 
+    arrow_budget: Arc<Semaphore>,
+    max_queued_bytes: usize,
+
     /// Watermark state.
     watermark: SourceWatermark,
 
@@ -133,6 +138,9 @@ struct SourceInner<T: Record> {
 }
 
 /// A streaming data source. Cloneable for multi-producer use.
+///
+/// Arrow pushes share a byte budget across the input ring and queued broadcast references.
+/// Generic record pushes are count bounded only; arbitrary `T` heap storage is not measured.
 pub struct Source<T: Record> {
     inner: Arc<SourceInner<T>>,
 }
@@ -147,6 +155,12 @@ impl<T: Record> Source<T> {
 
         let inner = Arc::new(SourceInner {
             producer,
+            // Constructors remain infallible. Invalid byte limits fail Arrow admission,
+            // without passing an unsupported permit count to Tokio's constructor.
+            arrow_budget: Arc::new(Semaphore::new(
+                config.max_queued_bytes.min(super::MAX_SOURCE_QUEUED_BYTES),
+            )),
+            max_queued_bytes: config.max_queued_bytes,
             watermark: SourceWatermark::new(),
             schema: schema.clone(),
             name: config.name,
@@ -165,42 +179,34 @@ impl<T: Record> Source<T> {
     ///
     /// # Errors
     ///
-    /// Returns `StreamingError::ChannelFull` if the buffer is full or the sink was dropped.
+    /// Returns `StreamingError::ChannelFull` if the count buffer is full, or
+    /// `StreamingError::Disconnected` if the drain task has closed.
     pub fn push(&self, record: T) -> Result<(), StreamingError> {
-        if let Some(event_time) = record.event_time() {
-            self.inner.watermark.update(event_time);
-        }
-
-        self.inner
-            .producer
-            .push(SourceMessage::Record(record))
-            .map_err(|_| StreamingError::ChannelFull)?;
-
-        self.inner.sequence.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+        self.try_push(record).map_err(|error| error.error)
     }
 
     /// Pushes a record, returning it on failure.
     ///
     /// # Errors
     ///
-    /// Returns `TryPushError` containing the record if the channel is full.
+    /// Returns `TryPushError` containing the record if the channel is full or disconnected.
     pub fn try_push(&self, record: T) -> Result<(), TryPushError<T>> {
-        if let Some(event_time) = record.event_time() {
-            self.inner.watermark.update(event_time);
-        }
+        let event_time = record.event_time();
 
         self.inner
             .producer
-            .push(SourceMessage::Record(record))
-            .map_err(|msg| match msg {
+            .try_push(SourceMessage::Record(record))
+            .map_err(|error| match error.value {
                 SourceMessage::Record(r) => TryPushError {
                     value: r,
-                    error: StreamingError::ChannelFull,
+                    error: error.error,
                 },
                 SourceMessage::Batch(_) => unreachable!("only Record is pushed here"),
             })?;
 
+        if let Some(event_time) = event_time {
+            self.inner.watermark.update(event_time);
+        }
         self.inner.sequence.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -233,11 +239,16 @@ impl<T: Record> Source<T> {
     ///
     /// This is more efficient than pushing individual records when you
     /// already have data in Arrow format.
+    /// The nonblocking reservation covers retained Arrow storage through broadcast delivery.
+    /// It releases on failed admission, eviction, subscriber drop or transfer to the last
+    /// subscriber. Returned batches and downstream retention have separate owners.
     ///
     /// # Errors
     ///
     /// Returns `StreamingError::SchemaMismatch` if the batch schema doesn't match.
-    /// Returns `StreamingError::ChannelClosed` if the sink has been dropped.
+    /// Returns `StreamingError::BatchTooLarge` if this batch exceeds the whole byte budget,
+    /// `ChannelFull` on count/byte saturation, `Disconnected` if the drain task has closed,
+    /// or `InvalidConfig` for an invalid byte limit. Failures do not advance the sequence.
     pub fn push_arrow(&self, batch: RecordBatch) -> Result<(), StreamingError> {
         // Validate schema matches (skip for type-erased sources with empty schema)
         if !self.inner.schema.fields().is_empty() && batch.schema() != self.inner.schema {
@@ -258,10 +269,15 @@ impl<T: Record> Source<T> {
             });
         }
 
+        if self.is_closed() {
+            return Err(StreamingError::Disconnected);
+        }
+        let queued =
+            QueuedArrowBatch::admit(batch, &self.inner.arrow_budget, self.inner.max_queued_bytes)?;
         self.inner
             .producer
-            .push(SourceMessage::Batch(batch))
-            .map_err(|_| StreamingError::ChannelFull)?;
+            .try_push(SourceMessage::Batch(queued))
+            .map_err(|error| error.error)?;
 
         self.inner.sequence.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -311,7 +327,8 @@ impl<T: Record> Source<T> {
         self.inner.name.as_deref()
     }
 
-    /// Returns true if the sink has been dropped.
+    /// Returns true if the drain task has closed its input receiver.
+    /// Dropping only the sink preserves the drain task for pending subscriptions.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.inner.producer.is_closed()
@@ -327,6 +344,22 @@ impl<T: Record> Source<T> {
     #[must_use]
     pub fn capacity(&self) -> usize {
         self.inner.producer.capacity()
+    }
+
+    /// Charged Arrow bytes retained in the input ring or broadcast, across all producers.
+    /// Generic records and batches already returned to callers are excluded.
+    #[must_use]
+    pub fn queued_arrow_bytes(&self) -> usize {
+        self.inner
+            .max_queued_bytes
+            .min(super::MAX_SOURCE_QUEUED_BYTES)
+            - self.inner.arrow_budget.available_permits()
+    }
+
+    /// Configured Arrow-byte budget for this source.
+    #[must_use]
+    pub fn max_queued_bytes(&self) -> usize {
+        self.inner.max_queued_bytes
     }
 
     /// Returns the current sequence number (total successful pushes).
@@ -393,6 +426,8 @@ impl<T: Record> Clone for Source<T> {
         Self {
             inner: Arc::new(SourceInner {
                 producer,
+                arrow_budget: Arc::clone(&self.inner.arrow_budget),
+                max_queued_bytes: self.inner.max_queued_bytes,
                 watermark: SourceWatermark::from_arc(self.inner.watermark.arc()),
                 schema: Arc::clone(&self.inner.schema),
                 name: self.inner.name.clone(),
@@ -429,3 +464,6 @@ pub fn create_with_config<T: Record>(config: SourceConfig) -> (Source<T>, Sink<T
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admission_tests;

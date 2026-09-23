@@ -250,7 +250,7 @@ pub fn translate_datafusion_error_with_context(
     }
 
     // Execution error
-    if clean.contains("Execution error") {
+    if clean.contains("Execution error") || clean.contains("Resources exhausted") {
         return TranslatedError {
             code: codes::EXECUTION_FAILED,
             message: format!("Query execution failed: {clean}"),

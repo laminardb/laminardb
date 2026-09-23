@@ -115,6 +115,9 @@ pub fn base_session_config() -> SessionConfig {
 ///
 /// Suitable for ad-hoc / non-streaming queries (filters, lookups).
 /// For streaming workloads prefer [`create_streaming_context`].
+/// This standalone factory uses upstream unbounded memory and disk-manager defaults.
+/// It does not share a `LaminarDB` budget; use `SessionContext::new_with_config_rt`
+/// with a caller-owned runtime when reservation limits are required.
 #[must_use]
 pub fn create_session_context() -> SessionContext {
     SessionContext::new_with_config(base_session_config())
@@ -128,6 +131,9 @@ pub fn create_session_context() -> SessionContext {
 /// - Identifier normalization disabled (mixed-case columns work unquoted)
 /// - All streaming UDFs registered (TUMBLE, HOP, SESSION, WATERMARK)
 /// - `StreamingPhysicalValidator` in `Reject` mode (blocks unsafe plans)
+///
+/// This standalone factory retains upstream memory/disk defaults and does not share
+/// a `LaminarDB` reservation budget.
 ///
 /// The watermark UDF is initialized with no watermark set (returns NULL).
 /// Use [`register_streaming_functions_with_watermark`] to provide a live

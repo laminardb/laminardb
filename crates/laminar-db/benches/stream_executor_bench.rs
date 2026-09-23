@@ -1,14 +1,16 @@
 #![allow(clippy::disallowed_types)]
-//! Pipeline micro-benchmark: measures per-cycle SQL overhead through
-//! the `LaminarDB` public API (OperatorGraph execution path).
+//! SQL pipeline benchmarks through the `LaminarDB` public API.
 //!
-//! Compares plain SQL execution (full DataFusion planning each cycle) against
-//! compiled projections and cached logical plans.
+//! The projection, four-group aggregate, sort and query-chain cases measure warmed
+//! push-to-first-output latency, including the shallow input clone, scheduling and
+//! subscription decoding. Each uses one DB; setup and graceful shutdown are untimed.
+//! These are in-process diagnostics, not external visibility or durable-commit latency.
+//! The separate high-cardinality cases retain their per-iteration setup and polling.
 //!
 //! Run with: `cargo bench --bench stream_executor_bench -p laminar-db`
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 
@@ -17,6 +19,72 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
 use laminar_db::LaminarDB;
+
+#[derive(Clone)]
+struct PushPayload(String);
+
+impl laminar_core::streaming::Record for PushPayload {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]))
+    }
+
+    fn to_record_batch(&self) -> RecordBatch {
+        RecordBatch::try_new(
+            Self::schema(),
+            vec![Arc::new(StringArray::from(vec![self.0.as_str()]))],
+        )
+        .unwrap()
+    }
+}
+
+fn bench_embedded_push(c: &mut Criterion) {
+    use laminar_core::streaming::Record;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let mut group = c.benchmark_group("embedded_push");
+    for width in [16, 4096] {
+        let record = PushPayload("x".repeat(width));
+        let batch = record.to_record_batch();
+        for typed in [false, true] {
+            let label = if typed { "typed" } else { "arrow" };
+            group.throughput(criterion::Throughput::Elements(32));
+            group.bench_function(format!("{label}_{width}"), |b| {
+                let db = rt.block_on(async {
+                    let db = LaminarDB::builder().build().await.unwrap();
+                    db.execute("CREATE SOURCE input (payload VARCHAR) WITH ('buffer_size' = '64')")
+                        .await
+                        .unwrap();
+                    db
+                });
+                let source = db.source::<PushPayload>("input").unwrap();
+                b.iter(|| {
+                    for _ in 0..32 {
+                        if typed {
+                            source.push(record.clone()).unwrap();
+                        } else {
+                            source.push_arrow(batch.clone()).unwrap();
+                        }
+                    }
+                    // Drain into the broadcast with no subscribers; snapshot history remains.
+                    rt.block_on(async {
+                        while source.pending() != 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    });
+                });
+            });
+        }
+    }
+    group.finish();
+}
 
 /// Schema: id (Int64), region (Utf8), price (Float64), quantity (Int64), ts (Int64)
 fn bench_schema() -> SchemaRef {
@@ -99,8 +167,8 @@ fn wait_for_output(
     subscription: &mut laminar_db::TypedSubscription<RowCount>,
     timeout: Duration,
 ) {
-    runtime
-        .block_on(tokio::time::timeout(timeout, async {
+    runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
             loop {
                 match subscription.next_frame().await {
                     Ok(Some(laminar_db::TypedSubscriptionFrame::Rows { .. })) => return,
@@ -109,8 +177,10 @@ fn wait_for_output(
                     Err(error) => panic!("benchmark subscription failed: {error}"),
                 }
             }
-        }))
+        })
+        .await
         .expect("benchmark stream did not emit before timeout");
+    });
 }
 
 /// Benchmark: `SELECT id, region, price FROM t WHERE quantity > 10`
@@ -127,48 +197,25 @@ fn bench_plain_select(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("filtered"))
-                    .unwrap();
-                // Warm up: first cycle triggers compilation
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("filtered"))
+            .unwrap();
+        // Warm up: first cycle triggers compilation
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -187,47 +234,24 @@ fn bench_agg_group_by(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows_4_groups", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("agg_result"))
-                    .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("agg_result"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -246,47 +270,24 @@ fn bench_sort_limit(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("1024_rows_top10", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
-                        .await
-                        .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("sorted"))
-                    .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("sorted"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
     });
     group.finish();
 }
@@ -305,51 +306,135 @@ fn bench_query_chain(c: &mut Criterion) {
     let batch = synthetic_batch(1024);
 
     group.bench_function("3_query_chain", |b| {
-        b.iter_batched(
-            || {
-                let db = rt.block_on(async {
-                    let db = LaminarDB::builder()
-                        .register_connector(|registry| {
-                            registry.register_source(
-                                "test",
-                                laminar_connectors::config::ConnectorInfo {
-                                    name: "test".to_string(),
-                                    display_name: "Test Source".to_string(),
-                                    version: "0.1.0".to_string(),
-                                    is_source: true,
-                                    is_sink: false,
-                                    config_keys: vec![],
-                                },
-                                std::sync::Arc::new(|_| Ok(Box::new(laminar_connectors::testing::MockSourceConnector::new()))),
-                            )
-                        })
-                        .build()
+        let db = rt.block_on(async {
+            let db = LaminarDB::builder().build().await.unwrap();
+            db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT)").await.unwrap();
+            db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
+            db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
+            db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
+            db.start().await.unwrap();
+            db
+        });
+        let source = db.source_untyped("trades").unwrap();
+        let mut subscription = rt
+            .block_on(db.subscribe::<RowCount>("step_c"))
+            .unwrap();
+        source.push_arrow(batch.clone()).unwrap();
+        // Wait for the terminal stream
+        wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        b.iter(|| {
+            source.push_arrow(batch.clone()).unwrap();
+            wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
+        });
+        rt.block_on(db.shutdown()).unwrap();
+    });
+    group.finish();
+}
+
+fn push_when_ready(
+    source: &laminar_db::UntypedSourceHandle,
+    batch: &RecordBatch,
+    deadline: Instant,
+) {
+    loop {
+        match source.push_arrow(batch.clone()) {
+            Ok(()) => return,
+            Err(laminar_core::streaming::StreamingError::ChannelFull) => {
+                assert!(Instant::now() < deadline, "source admission timed out");
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("source admission failed: {error}"),
+        }
+    }
+}
+
+/// Exercise source handoff in bursts, including variable-width storage and a shared
+/// channel with four producers. Time admission through complete output consumption.
+fn bench_source_queue(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("source_queue");
+    for (label, width, source_count) in [
+        ("narrow_burst", 16, 1),
+        ("wide_burst", 4096, 1),
+        ("four_sources", 256, 4),
+    ] {
+        let payload = "x".repeat(width);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![payload.as_str(); 256]))],
+        )
+        .unwrap();
+        // Retain a complete wide burst even when tracing delays the output reader.
+        let retention = if width == 4096 {
+            " WITH ('retain_history' = '128mb')"
+        } else {
+            ""
+        };
+        group.throughput(criterion::Throughput::Elements(256 * 64 * source_count));
+        group.bench_function(label, |b| {
+            let db = rt.block_on(async {
+                let db = LaminarDB::builder().build().await.unwrap();
+                for index in 0..source_count {
+                    db.execute(&format!("CREATE SOURCE input_{index} (payload VARCHAR)"))
                         .await
                         .unwrap();
-                    db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) FROM TEST").await.unwrap();
-                    db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
-                    db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
-                    db.execute("CREATE STREAM step_c AS SELECT COUNT(*) AS cnt FROM step_b").await.unwrap();
-                    db.start().await.unwrap();
-                    db
-                });
-                let source = db.source_untyped("trades").unwrap();
-                let mut subscription = rt
-                    .block_on(db.subscribe::<RowCount>("step_c"))
+                    db.execute(&format!(
+                        "CREATE STREAM output_{index} AS SELECT payload FROM input_{index}{retention}"
+                    ))
+                    .await
                     .unwrap();
-                source.push_arrow(batch.clone()).unwrap();
-                // Wait for the terminal stream
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                (db, source, batch.clone(), subscription)
-            },
-            |(db, source, batch, mut subscription)| {
-                source.push_arrow(batch).unwrap();
-                wait_for_output(&rt, &mut subscription, Duration::from_secs(2));
-                std::hint::black_box(&db);
-            },
-            BatchSize::SmallInput,
-        );
-    });
+                }
+                db.start().await.unwrap();
+                db
+            });
+            let sources: Vec<_> = (0..source_count)
+                .map(|index| db.source_untyped(&format!("input_{index}")).unwrap())
+                .collect();
+            let mut subscriptions: Vec<_> = (0..source_count)
+                .map(|index| {
+                    rt.block_on(db.subscribe::<RowCount>(&format!("output_{index}")))
+                        .unwrap()
+                })
+                .collect();
+            let mut burst = || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                for _ in 0..64 {
+                    for source in &sources {
+                        push_when_ready(source, &batch, deadline);
+                    }
+                }
+                rt.block_on(async {
+                    for subscription in &mut subscriptions {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let mut received = 0;
+                            while received < 256 * 64 {
+                                match subscription.next_frame().await.unwrap().unwrap() {
+                                    laminar_db::TypedSubscriptionFrame::Rows { rows, .. } => {
+                                        received += rows.iter().map(|count| count.0).sum::<usize>();
+                                    }
+                                    laminar_db::TypedSubscriptionFrame::Barrier { .. } => {}
+                                }
+                            }
+                            assert_eq!(received, 256 * 64);
+                        })
+                        .await
+                        .expect("source queue burst did not drain");
+                    }
+                });
+            };
+            burst();
+            b.iter(&mut burst);
+            rt.block_on(db.shutdown()).unwrap();
+        });
+    }
     group.finish();
 }
 
@@ -423,6 +508,90 @@ fn bench_agg_high_cardinality(c: &mut Criterion) {
     group.finish();
 }
 
+/// Bounded graph-port admission and shared-buffer fan-out, through complete consumption.
+fn bench_graph_admission(c: &mut Criterion) {
+    use laminar_core::streaming::Record;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("graph_admission");
+    for (label, width, fanout, source_count) in [
+        ("single", 16, 1, 1usize),
+        ("fanout_four", 16, 4, 1),
+        ("wide_fanout_four", 4096, 4, 1),
+        ("two_input_union", 16, 1, 2),
+    ] {
+        let payload = "x".repeat(width);
+        let batch = RecordBatch::try_new(
+            PushPayload::schema(),
+            vec![Arc::new(StringArray::from(vec![payload.as_str(); 256]))],
+        )
+        .unwrap();
+        let expected_rows = 256 * 16 * source_count;
+        group.throughput(criterion::Throughput::Elements(
+            u64::try_from(expected_rows).unwrap(),
+        ));
+        group.bench_function(label, |b| {
+            let db = rt.block_on(async {
+                let db = LaminarDB::builder()
+                    .pipeline_max_input_buf_batches(64)
+                    .pipeline_max_input_buf_bytes(32 * 1024 * 1024)
+                    .build()
+                    .await
+                    .unwrap();
+                for index in 0..source_count {
+                    db.execute(&format!("CREATE SOURCE input_{index} (payload VARCHAR)")).await.unwrap();
+                }
+                let query = (0..source_count).map(|index| format!("SELECT payload FROM input_{index}"))
+                    .collect::<Vec<_>>().join(" UNION ALL ");
+                db.execute(&format!("CREATE STREAM middle AS {query} WITH ('retain_history' = '32mb')"))
+                    .await.unwrap();
+                for index in 0..fanout {
+                    db.execute(&format!(
+                        "CREATE STREAM output_{index} AS SELECT payload FROM middle WITH ('retain_history' = '32mb')"
+                    )).await.unwrap();
+                }
+                db.start().await.unwrap();
+                db
+            });
+            let sources: Vec<_> = (0..source_count).map(|index| db.source_untyped(&format!("input_{index}")).unwrap()).collect();
+            let mut subscriptions: Vec<_> = (0..fanout)
+                .map(|index| rt.block_on(db.subscribe::<RowCount>(&format!("output_{index}"))).unwrap())
+                .collect();
+            let mut burst = || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                for _ in 0..16 {
+                    for source in &sources {
+                        push_when_ready(source, &batch, deadline);
+                    }
+                }
+                rt.block_on(async {
+                    for subscription in &mut subscriptions {
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            let mut received = 0;
+                            while received < expected_rows {
+                                if let laminar_db::TypedSubscriptionFrame::Rows { rows, .. } =
+                                    subscription.next_frame().await.unwrap().unwrap()
+                                {
+                                    received += rows.iter().map(|count| count.0).sum::<usize>();
+                                }
+                            }
+                            assert_eq!(received, expected_rows);
+                        }).await.expect("graph fanout did not drain");
+                    }
+                });
+            };
+            burst();
+            b.iter(&mut burst);
+            rt.block_on(db.shutdown()).unwrap();
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_plain_select,
@@ -430,5 +599,8 @@ criterion_group!(
     bench_agg_high_cardinality,
     bench_sort_limit,
     bench_query_chain,
+    bench_source_queue,
+    bench_embedded_push,
+    bench_graph_admission,
 );
 criterion_main!(benches);

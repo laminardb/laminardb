@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{info, warn};
 
+use laminar_core::storage_location::StorageProvider;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, EngineMetrics, LaminarDB};
 
@@ -170,30 +171,39 @@ pub(crate) async fn wait_for_termination_signal() -> Result<(), ServerError> {
     }
 }
 
-/// Build and start a LaminarDB server from the given configuration.
-pub async fn run_server(
-    config: ServerConfig,
-    config_path: PathBuf,
-) -> Result<ServerHandle, ServerError> {
+fn validate_server_startup(config: &ServerConfig) -> Result<(), ServerError> {
     // Validate independently of config-file loading: cluster startup acquires durable leases and
     // starts discovery before constructing LaminarDB, and programmatic callers can bypass the
     // TOML validator entirely.
-    crate::config::validate_http_auth(&config)
+    crate::config::validate_http_auth(config)
         .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
-    let temporal_join_idle_history_retention = config
+    config
+        .server
+        .validate_memory_limits()
+        .map_err(|error| ServerError::Build(format!("server.{error}")))?;
+    config
         .server
         .validated_temporal_join_idle_history_retention()
         .map_err(|error| ServerError::Build(format!("server.{error}")))?;
-    let source_idle_timeout = config
+    config
         .server
         .validated_source_idle_timeout()
         .map_err(|error| ServerError::Build(format!("server.{error}")))?;
-    let event_time_max_future_skew = config
+    config
         .server
         .validated_event_time_max_future_skew()
         .map_err(|error| ServerError::Build(format!("server.{error}")))?;
     resolved_checkpoint_node_data_bytes(&config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
+    Ok(())
+}
+
+/// Build and start a LaminarDB server from the given configuration.
+pub async fn run_server(
+    config: ServerConfig,
+    config_path: PathBuf,
+) -> Result<ServerHandle, ServerError> {
+    validate_server_startup(&config)?;
 
     // Cluster mode: gated behind the `cluster` feature flag.
     #[cfg(feature = "cluster")]
@@ -226,13 +236,14 @@ pub async fn run_server(
     }
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
-    if let Some(retention) = temporal_join_idle_history_retention {
+    builder = config.server.apply_memory_limits(builder);
+    if let Some(retention) = config.server.temporal_join_idle_history_retention {
         builder = builder.temporal_join_idle_history_retention(retention);
     }
-    if let Some(timeout) = source_idle_timeout {
+    if let Some(timeout) = config.server.source_idle_timeout {
         builder = builder.source_idle_timeout(timeout);
     }
-    builder = builder.event_time_max_future_skew(event_time_max_future_skew);
+    builder = builder.event_time_max_future_skew(config.server.event_time_max_future_skew);
     builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
@@ -381,7 +392,7 @@ pub(crate) fn apply_local_checkpoint_config(
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
 ) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
-    if checkpoint_url.starts_with("file://") {
+    if StorageProvider::detect_uri(checkpoint_url) == Some(StorageProvider::Local) {
         laminar_core::checkpoint::object_store_builder::file_url_path(checkpoint_url)?;
     }
     builder = apply_checkpoint_settings(builder, checkpoint)?;

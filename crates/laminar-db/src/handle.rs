@@ -368,14 +368,17 @@ impl<T: Record> SourceHandle<T> {
     /// Push a single record.
     ///
     /// # Errors
-    /// Returns `StreamingError` if the pipeline is not running.
+    /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
+    /// or a converted Arrow batch exceeding `LaminarConfig::push_source_max_bytes`.
     #[allow(clippy::needless_pass_by_value)]
     pub fn push(&self, record: T) -> Result<(), laminar_core::streaming::StreamingError> {
         let batch = record.to_record_batch();
         self.entry.push_and_buffer(batch)
     }
 
-    /// Push multiple records, returns count successfully sent.
+    /// Push multiple records in conversion chunks of up to 1,024, returning the number
+    /// admitted before the first failed chunk. Conversion scratch precedes byte admission;
+    /// the failed chunk and remaining iterator are dropped without advancing the sequence.
     pub fn push_batch(&self, records: impl IntoIterator<Item = T>) -> usize {
         const BATCH_SIZE: usize = 1024;
         let mut count = 0;
@@ -405,7 +408,8 @@ impl<T: Record> SourceHandle<T> {
     /// Push a raw `RecordBatch` (sent to pipeline and buffered for snapshots).
     ///
     /// # Errors
-    /// Returns `StreamingError` if the pipeline is not running.
+    /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
+    /// or a batch exceeding `LaminarConfig::push_source_max_bytes`.
     pub fn push_arrow(
         &self,
         batch: RecordBatch,
@@ -436,10 +440,10 @@ impl<T: Record> SourceHandle<T> {
         self.entry.source.capacity()
     }
 
-    /// True when buffer is >80% full.
+    /// True when either the count or Arrow-byte budget is >80% full.
     #[must_use]
     pub fn is_backpressured(&self) -> bool {
-        crate::metrics::is_backpressured(self.pending(), self.capacity())
+        self.entry.is_backpressured()
     }
 
     /// Source name.
@@ -488,7 +492,8 @@ impl UntypedSourceHandle {
     /// Push a raw `RecordBatch` (sent to pipeline and buffered for snapshots).
     ///
     /// # Errors
-    /// Returns `StreamingError` if the pipeline is not running.
+    /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
+    /// or a batch exceeding `LaminarConfig::push_source_max_bytes`.
     pub fn push_arrow(
         &self,
         batch: RecordBatch,
@@ -519,10 +524,10 @@ impl UntypedSourceHandle {
         self.entry.source.capacity()
     }
 
-    /// True when buffer is >80% full.
+    /// True when either the count or Arrow-byte budget is >80% full.
     #[must_use]
     pub fn is_backpressured(&self) -> bool {
-        crate::metrics::is_backpressured(self.pending(), self.capacity())
+        self.entry.is_backpressured()
     }
 
     /// Source name.

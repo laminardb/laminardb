@@ -1,5 +1,106 @@
 use super::*;
 
+#[tokio::test]
+async fn mv_quota_failure_in_second_view_preserves_stores_publications_and_metrics() {
+    use crate::mv_store::{MvStorageMode, MvStore};
+    use crate::pipeline::PipelineCallback;
+    use crate::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    for mode in [
+        MvStorageMode::Aggregate,
+        MvStorageMode::append_default(),
+        MvStorageMode::Upsert { key_cols: vec![0] },
+        MvStorageMode::Multiset,
+    ] {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let input = |ids: Vec<i64>| {
+            let rows = ids.len();
+            let mut fields = schema.fields().to_vec();
+            let mut columns: Vec<arrow::array::ArrayRef> = vec![Arc::new(Int64Array::from(ids))];
+            if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset) {
+                fields.push(Arc::new(Field::new("__weight", DataType::Int64, false)));
+                columns.push(Arc::new(Int64Array::from(vec![1; rows])));
+            }
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        };
+        let mut callback = empty_callback_fixture();
+        let mut store = MvStore::from_config(&crate::LaminarConfig {
+            materialized_view_max_rows: 2,
+            ..Default::default()
+        });
+        for name in ["a", "b"] {
+            store
+                .create_mv(name, Arc::clone(&schema), mode.clone())
+                .unwrap();
+            store.update_cycle(name, &[input(vec![1])]).unwrap();
+        }
+        callback.mv_store_has_any = store.has_any_handle();
+        *callback.mv_store.write() = store;
+        let mut portals = ["a", "b"].map(|name| {
+            SubscriptionPortal::open(
+                name,
+                Arc::clone(&schema),
+                callback
+                    .subscription_registry
+                    .subscribe(name, SubscribeStart::Tail)
+                    .unwrap(),
+            )
+        });
+        let mut results = FxHashMap::default();
+        results.insert(Arc::<str>::from("a"), vec![input(vec![2])]);
+        results.insert(Arc::<str>::from("b"), vec![input(vec![2])]);
+        let second = Arc::clone(results.keys().nth(1).unwrap());
+        *results.get_mut(&second).unwrap() = vec![input(vec![3, 4, 5])];
+        let before_bytes = callback.mv_store.read().total_bytes();
+        let error = callback.update_mv_stores(&results).unwrap_err();
+        assert!(
+            matches!(error, crate::pipeline::CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
+        );
+        assert!(callback.checkpoint_fault.lock().is_some());
+        assert_eq!(callback.prom.mv_updates.get(), 0);
+        assert_eq!(callback.mv_store.read().total_bytes(), before_bytes);
+        for name in ["a", "b"] {
+            let snapshot = callback
+                .mv_store
+                .read()
+                .to_record_batch(name)
+                .unwrap()
+                .unwrap();
+            assert_eq!(snapshot.num_rows(), 1);
+            assert_eq!(
+                snapshot
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0),
+                1
+            );
+        }
+        assert!(portals
+            .iter_mut()
+            .all(|portal| portal.try_next_frame().is_none()));
+        *results.get_mut(&second).unwrap() = vec![input(vec![2])];
+        callback.update_mv_stores(&results).unwrap();
+        assert_eq!(callback.prom.mv_updates.get(), 2);
+        for portal in &mut portals {
+            let Some(PortalFrame::Batch { batch, .. }) = portal.try_next_frame() else {
+                panic!("successful cycle must publish plain rows")
+            };
+            assert_eq!(batch.num_columns(), 1);
+            let expected = if matches!(mode, MvStorageMode::Upsert { .. } | MvStorageMode::Multiset)
+            {
+                2
+            } else {
+                1
+            };
+            assert_eq!(batch.num_rows(), expected);
+        }
+    }
+}
+
 #[cfg(feature = "cluster")]
 fn memory_checkpoint_store() -> Box<dyn laminar_core::checkpoint::CheckpointStore> {
     Box::new(laminar_core::checkpoint::ObjectStoreCheckpointStore::new(
@@ -531,6 +632,8 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         shutdown_signal: Arc::new(tokio::sync::Notify::new()),
         #[cfg(feature = "cluster")]
         cluster_controller: None,
+        #[cfg(feature = "cluster")]
+        coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         #[cfg(feature = "cluster")]
         assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(feature = "cluster")]
@@ -1105,6 +1208,42 @@ async fn checkpoint_tail_settlement_waits_for_terminal_task() {
         settlement.await.unwrap();
     }
 
+    assert!(callback.checkpoint_tail_tasks.is_empty());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn coordinated_recovery_cancels_a_fenced_checkpoint_tail() {
+    let mut callback = empty_callback_fixture();
+    let in_flight = Arc::clone(&callback.checkpoint_in_flight);
+    let guard = EpochInFlightGuard::claim(
+        &in_flight,
+        &callback.checkpoint_fault,
+        CheckpointAttempt::canonical(1),
+        std::iter::empty(),
+    )
+    .unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    callback.spawn_checkpoint_tail(async move {
+        let _guard = guard;
+        started_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    started_rx.await.unwrap();
+
+    callback
+        .coordinated_lifecycle_active
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(crate::pipeline::PipelineCallback::cancel_checkpoint_tails_for_recovery(&mut callback));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::pipeline::PipelineCallback::settle_checkpoint_tail_tasks(&mut callback),
+    )
+    .await
+    .expect("a recovery-fenced tail must not hold shutdown")
+    .unwrap();
+
+    assert_eq!(in_flight.load(std::sync::atomic::Ordering::Acquire), 0);
     assert!(callback.checkpoint_tail_tasks.is_empty());
 }
 
@@ -3468,6 +3607,7 @@ fn cluster_callback_fixture(
             checkpoint_admission_recovering: false,
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             cluster_controller: Some(controller),
+            coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             assignment_adoption_lock: Arc::new(tokio::sync::Mutex::new(())),
             shuffle_delivery_loss_incidents: None,
             shuffle_recovered_delivery_loss_incidents: None,
@@ -4109,6 +4249,34 @@ async fn managed_state_budget_exhaustion_halts_and_notifies_shutdown() {
     tokio::time::timeout(Duration::from_millis(50), notify.notified())
         .await
         .expect("managed-state exhaustion must notify shutdown");
+}
+
+#[tokio::test]
+async fn graph_buffer_budget_halts_normal_and_checkpoint_execution() {
+    use crate::pipeline::CycleError;
+    let notify = tokio::sync::Notify::new();
+    let error = DbError::GraphBufferBudgetExceeded {
+        node: "target".into(),
+        port: 1,
+        batches: 2,
+        bytes: 17,
+        max_batches: 4,
+        max_bytes: Some(16),
+    };
+    let normal = ConnectorPipelineCallback::map_graph_error(&error, &notify);
+    assert!(
+        matches!(normal, CycleError::Halt(ref reason) if reason.contains("target") && reason.contains("17"))
+    );
+    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+        .await
+        .unwrap();
+    let drain = ConnectorPipelineCallback::map_checkpoint_drain_error(&error, &notify);
+    assert!(
+        matches!(drain, CycleError::Halt(ref reason) if reason.contains("checkpoint graph drain halted"))
+    );
+    tokio::time::timeout(Duration::from_millis(50), notify.notified())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -6651,8 +6819,23 @@ async fn terminal_hint_without_an_outcome_does_not_release_the_resume_gate() {
     use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
     for phase in [Phase::Commit, Phase::Abort] {
-        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let (kv, controller, leader_id, _members_tx, decision_store) = gate_controller().await;
         let (prepared_fence, identity) = resume_identity(3, 3);
+        controller
+            .checkpoint_authority()
+            .unwrap()
+            .begin_cluster_checkpoint_artifacts(
+                &identity.leader_proof,
+                laminar_core::checkpoint_decision::CheckpointArtifactInventory {
+                    deployment_id: decision_store.load_or_create_deployment_id().await.unwrap(),
+                    pipeline_identity: laminar_core::checkpoint::PipelineIdentity::empty(),
+                    attempt: identity.attempt,
+                    assignment_fence: Some(prepared_fence.clone()),
+                    sink_artifact_intent_protocol: true,
+                },
+            )
+            .await
+            .unwrap();
         let terminal_fence = if phase == Phase::Commit {
             prepared_fence.clone()
         } else {

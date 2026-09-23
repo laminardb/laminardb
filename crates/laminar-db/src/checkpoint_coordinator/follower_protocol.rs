@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::checkpoint::{CheckpointAttempt, CheckpointAttemptRelation, LeaderProof};
-use laminar_core::cluster::control::{BarrierAnnouncement, Phase, QuorumOutcome};
+use laminar_core::cluster::control::{
+    BarrierAnnouncement, ClusterAttemptStatus, LeaderLeaseStore, Phase, QuorumOutcome,
+};
 
 use super::{
     require_canonical_attempt, sink_epoch_admission, CheckpointCoordinator, CheckpointRequest,
@@ -210,7 +212,7 @@ impl CheckpointCoordinator {
         let prepare_outcome = self
             .follower_prepare_acked_until(
                 request,
-                proof,
+                proof.clone(),
                 announcement.epoch,
                 announcement.checkpoint_id,
                 deadline,
@@ -267,6 +269,7 @@ impl CheckpointCoordinator {
             announcement.epoch,
             announcement.checkpoint_id,
             &fence,
+            &proof,
             decision_timeout,
         )
         .await
@@ -296,14 +299,79 @@ impl CheckpointCoordinator {
         result
     }
 
+    async fn verify_follower_settlement(
+        controller: &laminar_core::cluster::control::ClusterController,
+        authority: &LeaderLeaseStore,
+        attempt: CheckpointAttempt,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        settlement: laminar_core::checkpoint_decision::CheckpointOutcome,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, DbError> {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+
+        let settled = CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
+        match settled.relation_to(attempt) {
+            CheckpointAttemptRelation::Exact if settlement.verdict == CheckpointVerdict::Abort => {
+                Ok(false)
+            }
+            CheckpointAttemptRelation::Exact => {
+                let exact = tokio::time::timeout_at(
+                    deadline,
+                    authority.cluster_outcome_with_committed_checkpoint(attempt.epoch),
+                )
+                .await
+                .map_err(|_| DbError::Checkpoint("follower committed-index read timed out".into()))?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!("follower committed-index read failed: {error}"))
+                })?
+                .ok_or_else(|| {
+                    DbError::Checkpoint("Commit outcome has no committed checkpoint index".into())
+                })?;
+                let (outcome, index) = exact;
+                let index = index.ok_or_else(|| {
+                    DbError::Checkpoint("Commit outcome has no committed checkpoint body".into())
+                })?;
+                if outcome != settlement
+                    || outcome.assignment_fence.as_ref() != Some(assignment_fence)
+                    || index.epoch != attempt.epoch
+                    || index.checkpoint_id != attempt.checkpoint_id
+                    || index.assignment_fence.as_ref() != Some(assignment_fence)
+                    || !index
+                        .participants
+                        .iter()
+                        .any(|participant| participant.participant_id == controller.instance_id().0)
+                {
+                    return Err(DbError::Checkpoint(
+                        "follower Commit does not match its prepared participant cut".into(),
+                    ));
+                }
+                index.validate().map_err(DbError::Checkpoint)?;
+                let source_watermarks = index
+                    .effective_source_watermarks()
+                    .map_err(DbError::Checkpoint)?;
+                controller
+                    .publish_committed_checkpoint_progress(
+                        &index.channel_progress,
+                        &source_watermarks,
+                    )
+                    .map_err(DbError::Checkpoint)?;
+                Ok(true)
+            }
+            CheckpointAttemptRelation::Newer => Ok(false),
+            CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => Err(
+                DbError::Checkpoint("follower observed an incompatible terminal checkpoint".into()),
+            ),
+        }
+    }
+
     pub(crate) async fn await_follower_decision(
         controller: &laminar_core::cluster::control::ClusterController,
         epoch: u64,
         checkpoint_id: u64,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        leader_proof: &LeaderProof,
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
-        use laminar_core::checkpoint_decision::CheckpointVerdict;
         let attempt = require_canonical_attempt(
             CheckpointAttempt::new(epoch, checkpoint_id),
             "follower decision",
@@ -315,88 +383,53 @@ impl CheckpointCoordinator {
                 "follower decision has an invalid assignment fence".into(),
             ));
         }
+        if !leader_proof.is_canonical()
+            || assignment_fence.participant_incarnation(leader_proof.owner.node_id)
+                != Some(leader_proof.owner.boot_id)
+        {
+            return Err(DbError::Checkpoint(
+                "follower decision has an invalid leader proof".into(),
+            ));
+        }
         let authority = controller.checkpoint_authority().map_err(|error| {
             DbError::Checkpoint(format!("follower checkpoint authority: {error}"))
         })?;
         let deadline = tokio::time::Instant::now() + decision_timeout;
         loop {
-            let settlement =
-                tokio::time::timeout_at(deadline, authority.cluster_attempt_settlement(attempt))
-                    .await
-                    .map_err(|_| {
-                        DbError::Checkpoint(format!(
-                            "follower decision timed out for checkpoint {checkpoint_id}"
-                        ))
-                    })?
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!("follower decision read failed: {error}"))
-                    })?;
-            if let Some(settlement) = settlement {
-                let settled = CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
-                match settled.relation_to(attempt) {
-                    CheckpointAttemptRelation::Exact
-                        if settlement.verdict == CheckpointVerdict::Abort =>
-                    {
-                        return Ok(false);
-                    }
-                    CheckpointAttemptRelation::Exact => {
-                        let exact = tokio::time::timeout_at(
-                            deadline,
-                            authority.cluster_outcome_with_committed_checkpoint(epoch),
-                        )
-                        .await
-                        .map_err(|_| {
-                            DbError::Checkpoint("follower committed-index read timed out".into())
-                        })?
-                        .map_err(|error| {
-                            DbError::Checkpoint(format!(
-                                "follower committed-index read failed: {error}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            DbError::Checkpoint(
-                                "Commit outcome has no committed checkpoint index".into(),
-                            )
-                        })?;
-                        let (outcome, index) = exact;
-                        let index = index.ok_or_else(|| {
-                            DbError::Checkpoint(
-                                "Commit outcome has no committed checkpoint body".into(),
-                            )
-                        })?;
-                        if outcome != settlement
-                            || outcome.assignment_fence.as_ref() != Some(assignment_fence)
-                            || index.epoch != epoch
-                            || index.checkpoint_id != checkpoint_id
-                            || index.assignment_fence.as_ref() != Some(assignment_fence)
-                            || !index.participants.iter().any(|participant| {
-                                participant.participant_id == controller.instance_id().0
-                            })
-                        {
-                            return Err(DbError::Checkpoint(
-                                "follower Commit does not match its prepared participant cut"
-                                    .into(),
-                            ));
-                        }
-                        index.validate().map_err(DbError::Checkpoint)?;
-                        let source_watermarks = index
-                            .effective_source_watermarks()
-                            .map_err(DbError::Checkpoint)?;
-                        controller
-                            .publish_committed_checkpoint_progress(
-                                &index.channel_progress,
-                                &source_watermarks,
-                            )
-                            .map_err(DbError::Checkpoint)?;
-                        return Ok(true);
-                    }
-                    CheckpointAttemptRelation::Newer => return Ok(false),
-                    CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
-                        return Err(DbError::Checkpoint(
-                            "follower observed an incompatible terminal checkpoint".into(),
-                        ));
-                    }
+            let status = tokio::time::timeout_at(
+                deadline,
+                authority.cluster_attempt_status(attempt, assignment_fence, leader_proof),
+            )
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "follower decision timed out for checkpoint {checkpoint_id}"
+                ))
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("follower decision read failed: {error}"))
+            })?;
+            let settlement = match status {
+                ClusterAttemptStatus::Pending => None,
+                ClusterAttemptStatus::Settled(settlement) => Some(*settlement),
+                ClusterAttemptStatus::CommitFenced => {
+                    return Err(DbError::Checkpoint(format!(
+                        "follower checkpoint {checkpoint_id} leader term was durably superseded \
+                         before a terminal outcome; coordinated recovery must settle the \
+                         in-doubt checkpoint"
+                    )));
                 }
+            };
+            if let Some(settlement) = settlement {
+                return Self::verify_follower_settlement(
+                    controller,
+                    authority.as_ref(),
+                    attempt,
+                    assignment_fence,
+                    settlement,
+                    deadline,
+                )
+                .await;
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {

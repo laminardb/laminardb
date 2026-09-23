@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "laminardb-pgwire"
-version = "0.30.0"
+version = "0.31.0"
 authors = ["Ning Sun <sunng@pm.me>"]
 build = false
 autolib = false

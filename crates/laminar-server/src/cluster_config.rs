@@ -236,6 +236,7 @@ mod tests {
     fn programmatic_remote_cluster_config_accepts_plaintext() {
         let mut config = cluster_config();
         config.server.bind = "0.0.0.0:8080".into();
+        config.server.console_token = Some(crate::config::Secret::new("cluster-console-token"));
         let discovery = config.discovery.as_mut().unwrap();
         discovery.advertise_host = Some("10.0.0.7".into());
         discovery.seeds = vec!["10.0.0.8:7946".into()];

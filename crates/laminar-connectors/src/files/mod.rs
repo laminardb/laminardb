@@ -39,7 +39,7 @@ pub fn register_file_source(
         is_source: true,
         is_sink: false,
         config_keys: vec![
-            ConfigKeySpec::required("path", "Directory path, glob pattern, or cloud storage URL"),
+            ConfigKeySpec::required("path", "Local directory path or glob pattern"),
             ConfigKeySpec::optional(
                 "format",
                 "Data format (csv, tsv, json, jsonl, text, txt, parquet, arrow)",

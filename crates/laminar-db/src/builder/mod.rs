@@ -349,10 +349,29 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Per-source Arrow-byte cap for embedded push queues (default 64 MiB).
+    /// Each source's snapshot history has an independent cap of the same size.
+    /// Typed handles are checked after Arrow conversion. Zero and values above
+    /// [`laminar_core::streaming::MAX_SOURCE_QUEUED_BYTES`] are rejected at build time.
+    #[must_use]
+    pub fn push_source_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.push_source_max_bytes = bytes;
+        self
+    }
+
     /// Source → coordinator channel capacity (default 64).
     #[must_use]
     pub fn pipeline_channel_capacity(mut self, capacity: usize) -> Self {
         self.config.pipeline_channel_capacity = Some(capacity);
+        self
+    }
+
+    /// Shared connector FIFO Arrow-byte budget (default 64 MiB), including parked messages.
+    /// Also caps each producer's waiting batch; excludes decoder scratch and downstream buffers.
+    /// Zero and values above [`crate::MAX_SOURCE_QUEUE_BYTES`] are rejected at build time.
+    #[must_use]
+    pub fn source_queue_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.source_queue_max_bytes = bytes;
         self
     }
 
@@ -377,6 +396,49 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Shared per-DB limit for participating `DataFusion` reservations in bytes (default 256 MiB).
+    ///
+    /// Zero is rejected at build time. DB-owned contexts disable disk spilling.
+    /// This does not bound direct Arrow allocations, managed state, connector I/O or process RSS.
+    #[must_use]
+    pub fn datafusion_memory_limit_bytes(mut self, bytes: usize) -> Self {
+        self.config.datafusion_memory_limit_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum live row count of each local reference table (default 1,000,000).
+    /// Zero is rejected at build time. Over-limit updates and snapshots fail atomically.
+    #[must_use]
+    pub fn reference_table_max_rows(mut self, rows: usize) -> Self {
+        self.config.reference_table_max_rows = rows;
+        self
+    }
+
+    /// Set each local reference table's retained-memory charge limit (default 256 MiB).
+    /// See [`LaminarConfig::reference_table_max_bytes`] for the accounting boundary.
+    /// Zero is rejected at build time.
+    #[must_use]
+    pub fn reference_table_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.reference_table_max_bytes = bytes;
+        self
+    }
+
+    /// Set the live row limit for each local materialized view; must be nonzero.
+    /// Multisets count distinct rows. Defaults to 1,000,000.
+    #[must_use]
+    pub fn materialized_view_max_rows(mut self, rows: usize) -> Self {
+        self.config.materialized_view_max_rows = rows;
+        self
+    }
+
+    /// Set each local MV's retained-memory charge limit; must be nonzero.
+    /// See [`LaminarConfig::materialized_view_max_bytes`] for the accounting boundary.
+    #[must_use]
+    pub fn materialized_view_max_bytes(mut self, bytes: usize) -> Self {
+        self.config.materialized_view_max_bytes = bytes;
+        self
+    }
+
     /// Per-port operator input-buffer cap in batches (default 256).
     #[must_use]
     pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {
@@ -384,7 +446,9 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Per-port operator input-buffer cap in bytes.
+    /// Per-port retained Arrow-byte cap, including source priming (disabled by default).
+    /// Each fan-out port charges shared backing storage independently. An executed result
+    /// that cannot fit halts the pipeline before publication; it is never rerun in place.
     #[must_use]
     pub fn pipeline_max_input_buf_bytes(mut self, bytes: usize) -> Self {
         self.config.pipeline_max_input_buf_bytes = Some(bytes);
@@ -422,7 +486,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Backpressure policy (default `Backpressure`).
+    /// Backpressure policy (default `Backpressure`). `ShedOldest` is `BestEffort` only.
     #[must_use]
     pub fn pipeline_backpressure_policy(
         mut self,
@@ -491,12 +555,10 @@ impl LaminarDbBuilder {
 
         self.config.object_store_url = self.object_store_url.take();
         self.config.object_store_options = std::mem::take(&mut self.object_store_options);
-        if let Some(url) = self
-            .config
-            .object_store_url
-            .as_deref()
-            .filter(|url| url.starts_with("file://"))
-        {
+        if let Some(url) = self.config.object_store_url.as_deref().filter(|url| {
+            laminar_core::storage_location::StorageProvider::detect_uri(url)
+                == Some(laminar_core::storage_location::StorageProvider::Local)
+        }) {
             laminar_core::checkpoint::object_store_builder::file_url_path(url)
                 .map_err(|error| DbError::Config(format!("checkpoint storage URL: {error}")))?;
         }
@@ -566,11 +628,10 @@ impl LaminarDbBuilder {
         if runtime_mode == RuntimeMode::Local
             && self.config.delivery_guarantee
                 != laminar_connectors::connector::DeliveryGuarantee::BestEffort
-            && self
-                .config
-                .object_store_url
-                .as_deref()
-                .is_some_and(|url| !url.starts_with("file://"))
+            && self.config.object_store_url.as_deref().is_some_and(|url| {
+                laminar_core::storage_location::StorageProvider::detect_uri(url)
+                    != Some(laminar_core::storage_location::StorageProvider::Local)
+            })
         {
             return Err(DbError::Config(
                 "[LDB-0014] a local replay-capable deployment with a shared cloud checkpoint namespace is not admitted until its writer lease is term-fenced; use a built-in or file:// local checkpoint directory, or best_effort delivery"
@@ -578,7 +639,7 @@ impl LaminarDbBuilder {
             ));
         }
 
-        Self::validate_backpressure(&self.config)?;
+        self.config.validate_backpressure_policy()?;
         self.validate_vnode_topology(runtime_mode)?;
         if let Some(key_groups) = self
             .key_groups
@@ -734,36 +795,6 @@ impl LaminarDbBuilder {
                     "cluster shuffle sender and receiver must be installed together".into(),
                 ));
             }
-        }
-        Ok(())
-    }
-
-    fn validate_backpressure(config: &LaminarConfig) -> Result<(), DbError> {
-        use crate::config::BackpressurePolicy;
-        use laminar_connectors::connector::DeliveryGuarantee;
-
-        let policy = config.pipeline_backpressure_policy;
-        if policy == BackpressurePolicy::Backpressure {
-            return Ok(());
-        }
-
-        let has_count_cap = config.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
-        let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some_and(|b| b > 0);
-        if !has_count_cap && !has_byte_cap {
-            return Err(DbError::Config(format!(
-                "backpressure_policy={policy:?} requires at least one of \
-                 pipeline_max_input_buf_batches (>0) or pipeline_max_input_buf_bytes"
-            )));
-        }
-
-        if policy == BackpressurePolicy::ShedOldest
-            && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-        {
-            return Err(DbError::Config(
-                "ShedOldest drops data; it is incompatible with exactly-once \
-                 delivery. Use Backpressure or Fail, or downgrade the guarantee."
-                    .into(),
-            ));
         }
         Ok(())
     }

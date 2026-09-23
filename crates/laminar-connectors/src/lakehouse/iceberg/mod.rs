@@ -44,8 +44,6 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 #[cfg(feature = "iceberg-core")]
 use parking_lot::Mutex;
-#[cfg(feature = "iceberg-core")]
-use tracing::info;
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
@@ -53,6 +51,7 @@ use crate::connector::{
     SinkRuntimeContext, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
+use crate::storage::StorageProvider;
 
 use super::iceberg_config::{IcebergSinkConfig, IcebergStorageType};
 #[cfg(feature = "iceberg-core")]
@@ -365,10 +364,15 @@ impl SinkConnector for IcebergSink {
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let config = IcebergSinkConfig::from_config(config)?;
         capabilities::validate_sink(&config)?;
-        let warehouse = config.catalog.warehouse.to_ascii_lowercase();
-        let shared_warehouse = warehouse.starts_with("s3://")
-            || warehouse.starts_with("s3a://")
-            || config.storage.storage_type == Some(IcebergStorageType::S3);
+        let shared_warehouse = config.storage.storage_type.map_or_else(
+            || StorageProvider::is_shared_uri(&config.catalog.warehouse),
+            |storage_type| {
+                matches!(
+                    storage_type,
+                    IcebergStorageType::S3 | IcebergStorageType::Gcs | IcebergStorageType::Azure
+                )
+            },
+        );
         let consistency = if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             SinkConsistency::CheckpointCommittable
         } else {
@@ -473,7 +477,7 @@ impl SinkConnector for IcebergSink {
             self.catalog = Some(catalog);
             self.table = Some(table);
             self.state = ConnectorState::Running;
-            info!(namespace, table = table_name, "Iceberg sink connected");
+            metrics::trace_sink_connected(&self.config, namespace, table_name);
             return Ok(());
         }
 

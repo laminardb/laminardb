@@ -17,6 +17,15 @@ async fn startup_attempt_preserves_every_terminal_error_variant() {
         DbError::BackpressureFail(reason) if reason == "bounded queue"
     ));
     assert!(matches!(
+        roundtrip(DbError::GraphBufferBudgetExceeded {
+            node: "target".into(), port: 1, batches: 2, bytes: 17,
+            max_batches: 4, max_bytes: Some(16),
+        }).await,
+        DbError::GraphBufferBudgetExceeded {
+            node, port: 1, batches: 2, bytes: 17, max_batches: 4, max_bytes: Some(16),
+        } if node == "target"
+    ));
+    assert!(matches!(
         roundtrip(DbError::ShuffleTerminal("invalid owner".into())).await,
         DbError::ShuffleTerminal(reason) if reason == "invalid owner"
     ));

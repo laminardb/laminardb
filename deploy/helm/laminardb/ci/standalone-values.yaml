@@ -3,6 +3,8 @@ replicaCount: 1
 laminardb:
   mode: single
   logLevel: info
+  consoleToken:
+    existingSecret: laminardb-console
 
 persistence:
   checkpoints:

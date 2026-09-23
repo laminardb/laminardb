@@ -3,6 +3,18 @@ use arrow::datatypes::DataType;
 
 use crate::error::DbError;
 
+/// Keep SQL's local input view across independently owned source ports. Single-source plans
+/// borrow their existing batch roster; multi-source cached plans bind each provider separately.
+pub(super) fn local_input_batches(
+    inputs: &[Vec<RecordBatch>],
+) -> std::borrow::Cow<'_, [RecordBatch]> {
+    match inputs {
+        [] => std::borrow::Cow::Borrowed(&[]),
+        [batches] => std::borrow::Cow::Borrowed(batches),
+        _ => std::borrow::Cow::Owned(inputs.iter().flatten().cloned().collect()),
+    }
+}
+
 // Keep batches created here small enough to bound both accumulator work and the temporary
 // old-plus-new Arrow buffers held while concatenating one group.
 pub(super) const LOCAL_AGG_COALESCE_TARGET_BATCH_BYTES: usize = 256 * 1024;

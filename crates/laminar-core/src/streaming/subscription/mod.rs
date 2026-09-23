@@ -111,7 +111,7 @@ impl<T: Record> Subscription<T> {
 fn to_batch<T: Record>(msg: SourceMessage<T>) -> RecordBatch {
     match msg {
         SourceMessage::Record(r) => r.to_record_batch(),
-        SourceMessage::Batch(b) => b,
+        SourceMessage::Batch(b) => b.into_batch(),
     }
 }
 

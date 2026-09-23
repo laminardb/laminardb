@@ -629,7 +629,6 @@ impl LaminarDB {
             recovered_checkpoint_index_version,
             recovered_watermark_frontier,
         )?;
-        let max_poll = self.config.default_buffer_size.min(1024);
         tracing::info!(
             sources = sources.len(),
             sinks = sink_setup.sinks.len(),
@@ -641,8 +640,9 @@ impl LaminarDB {
         let drain_budget_ns = self.config.pipeline_drain_budget_ns.unwrap_or(1_000_000);
         let query_budget_ns = self.config.pipeline_query_budget_ns.unwrap_or(8_000_000);
         let pipeline_config = PipelineConfig {
-            max_poll_records: max_poll,
+            max_poll_records: self.config.default_buffer_size.min(1024),
             channel_capacity: self.config.pipeline_channel_capacity.unwrap_or(64),
+            source_queue_max_bytes: self.config.source_queue_max_bytes,
             fallback_poll_interval: if has_external {
                 std::time::Duration::from_millis(10)
             } else {

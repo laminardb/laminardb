@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chitchat::transport::{Socket, Transport, UdpTransport};
+use chitchat::transport::{RecvOutcome, SendOutcome, Socket, Transport, UdpTransport};
 use object_store::{
     path::Path as OsPath, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload,
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -306,17 +306,25 @@ struct PartitionableSocket {
 
 #[async_trait]
 impl Socket for PartitionableSocket {
-    async fn send(&mut self, to: SocketAddr, msg: chitchat::ChitchatMessage) -> anyhow::Result<()> {
+    fn local_addr(&self) -> anyhow::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    async fn send(
+        &mut self,
+        to: SocketAddr,
+        envelope: chitchat::ChitchatEnvelope,
+    ) -> anyhow::Result<SendOutcome> {
         if self.rules.is_dropped(self.my_addr, to) {
             // Silently drop — simulates a network partition. Chitchat's
             // phi-accrual observes the absence, eventually marks the
             // peer suspected.
-            return Ok(());
+            return Ok(SendOutcome { num_bytes_sent: 0 });
         }
-        self.inner.send(to, msg).await
+        self.inner.send(to, envelope).await
     }
 
-    async fn recv(&mut self) -> anyhow::Result<(SocketAddr, chitchat::ChitchatMessage)> {
+    async fn recv(&mut self) -> anyhow::Result<RecvOutcome> {
         self.inner.recv().await
     }
 }

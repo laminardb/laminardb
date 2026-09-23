@@ -54,12 +54,11 @@ SELECT ..., SUM(vol) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 5 PRECEDING
 
 -- Connector DDL
 CREATE SOURCE ... FROM KAFKA ('bootstrap.servers' = '...', topic = '...') FORMAT JSON
-CREATE SOURCE ... FROM "postgres-cdc" (host = '...', database = '...')
 CREATE SINK ... FROM input INTO KAFKA ('bootstrap.servers' = '...', topic = '...')
 CREATE SINK ... FROM input INTO "delta-lake" ('table.path' = '...')
 
 -- Retain a bounded ring of recent epochs so SUBSCRIBE clients can
--- reconnect without gaps.
+-- replay while their requested epoch remains retained (in memory locally).
 CREATE STREAM trades AS SELECT * FROM events
   WITH ('retain_history' = '64mb')
 
@@ -75,6 +74,14 @@ DECLARE c CURSOR FOR SUBSCRIBE my_stream
 FETCH FORWARD 100 FROM c
 CLOSE c
 ```
+
+Parsing SQL does not establish runtime admission. PostgreSQL/MongoDB CDC source implementations
+currently reject their raw change envelopes before I/O. Cluster SQL and subscriptions have a
+narrower supported surface than local execution; see the
+[cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) and
+[subscription contract](../../docs/SQL_REFERENCE.md#subscribe-over-the-postgres-wire-protocol).
+In particular, the stateless `trades` retention example above is local; cluster subscriptions
+require certified non-windowed keyed aggregates.
 
 ## Custom UDFs Registered with DataFusion
 

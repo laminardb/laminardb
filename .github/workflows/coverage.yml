@@ -10,10 +10,18 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    # Job-scoped least privilege: only this job needs the OIDC scope for
+    # Codecov's tokenless upload fallback.
+    permissions:
+      contents: read
+      id-token: write
     env:
       CARGO_INCREMENTAL: 0
       # Coverage instrumentation grows the same large async recovery test frames exercised by CI.

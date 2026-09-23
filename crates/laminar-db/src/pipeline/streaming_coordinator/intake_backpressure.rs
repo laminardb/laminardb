@@ -1,5 +1,5 @@
 use super::{
-    CoordinatorGates, CoordinatorRunState, CycleError, PipelineCallback, SourceMsg,
+    CoordinatorGates, CoordinatorRunState, CycleError, PipelineCallback, QueuedSourceMsg,
     StreamingCoordinator,
 };
 
@@ -30,7 +30,7 @@ impl StreamingCoordinator {
         &mut self,
         callback: &mut impl PipelineCallback,
         state: &mut CoordinatorRunState,
-        message: Option<SourceMsg>,
+        message: Option<QueuedSourceMsg>,
     ) -> bool {
         if let Some(message) = message {
             if self.parked_source_msg.is_some() {

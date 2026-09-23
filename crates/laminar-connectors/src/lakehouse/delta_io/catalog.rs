@@ -3,6 +3,89 @@
 #[cfg(feature = "delta-lake-glue")]
 use super::info;
 use super::{ConnectorError, HashMap};
+#[cfg(feature = "delta-lake-glue")]
+use laminar_core::storage_location::StorageProvider;
+
+#[cfg(feature = "delta-lake-glue")]
+fn glue_init_error_category(error: &deltalake_catalog_glue::GlueError) -> &'static str {
+    match error {
+        deltalake_catalog_glue::GlueError::MissingMetadata { .. } => "missing-metadata",
+        deltalake_catalog_glue::GlueError::AWSError { source } => aws_glue_error_category(source),
+    }
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn aws_glue_error_category(error: &aws_sdk_glue::Error) -> &'static str {
+    use aws_sdk_glue::Error;
+
+    match error {
+        Error::AccessDeniedException(_)
+        | Error::KmsKeyNotAccessibleFault(_)
+        | Error::PermissionTypeMismatchException(_) => "authorization",
+        Error::EntityNotFoundException(_)
+        | Error::IntegrationNotFoundFault(_)
+        | Error::ResourceNotFoundException(_)
+        | Error::TargetResourceNotFound(_) => "not-found",
+        Error::ConcurrentRunsExceededException(_)
+        | Error::IntegrationQuotaExceededFault(_)
+        | Error::ResourceNumberLimitExceededException(_)
+        | Error::ThrottlingException(_) => "throttled",
+        Error::OperationTimeoutException(_) => "service-timeout",
+        Error::FederationSourceRetryableException(_)
+        | Error::InternalServerException(_)
+        | Error::InternalServiceException(_)
+        | Error::ResourceNotReadyException(_) => "service-unavailable",
+        Error::InvalidInputException(_) | Error::ValidationException(_) => "invalid-request",
+        Error::AlreadyExistsException(_)
+        | Error::ConcurrentModificationException(_)
+        | Error::ConflictException(_)
+        | Error::VersionMismatchException(_) => "catalog-conflict",
+        _ => aws_glue_pre_service_error_category(error).unwrap_or("unclassified-service-error"),
+    }
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn aws_glue_pre_service_error_category(error: &aws_sdk_glue::Error) -> Option<&'static str> {
+    type GetTableSdkError =
+        aws_sdk_glue::error::SdkError<aws_sdk_glue::operation::get_table::GetTableError>;
+
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<aws_sdk_glue::error::BuildError>()
+            .is_some()
+        {
+            return Some("client-input");
+        }
+        if let Some(sdk_error) = current.downcast_ref::<GetTableSdkError>() {
+            return match sdk_error {
+                GetTableSdkError::ConstructionFailure(_) => Some("client-input"),
+                GetTableSdkError::TimeoutError(_) => Some("client-timeout"),
+                GetTableSdkError::DispatchFailure(_) => Some("transport"),
+                GetTableSdkError::ResponseError(_) => Some("invalid-response"),
+                GetTableSdkError::ServiceError(_) => None,
+                _ => Some("unclassified-sdk-error"),
+            };
+        }
+        source = current.source();
+    }
+
+    None
+}
+
+#[cfg(feature = "delta-lake-glue")]
+fn glue_lookup_error_category(error: &deltalake::data_catalog::DataCatalogError) -> &'static str {
+    match error {
+        deltalake::data_catalog::DataCatalogError::Generic { source, .. } => source
+            .downcast_ref::<deltalake_catalog_glue::GlueError>()
+            .map_or("catalog-provider", glue_init_error_category),
+        deltalake::data_catalog::DataCatalogError::InvalidDataCatalog { .. } => "invalid-catalog",
+        deltalake::data_catalog::DataCatalogError::UnknownConfigKey { .. } => {
+            "invalid-catalog-configuration"
+        }
+        deltalake::data_catalog::DataCatalogError::RequestError { .. } => "catalog-request",
+    }
+}
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.
 ///
@@ -37,21 +120,29 @@ pub async fn resolve_catalog_options(
             })?;
             let glue = deltalake_catalog_glue::GlueDataCatalog::from_env()
                 .await
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to init Glue catalog: {e}"))
+                .map_err(|error| {
+                    ConnectorError::ConnectionFailed(
+                        format!(
+                            "failed to initialize Glue catalog using the downstream AWS credential chain ({}); verify AWS region and credential-chain setup",
+                            glue_init_error_category(&error)
+                        ),
+                    )
                 })?;
             let resolved = glue
                 .get_table_storage_location(catalog_name.map(String::from), database, table_path)
                 .await
-                .map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!(
-                        "Glue catalog lookup failed for '{database}.{table_path}': {e}"
-                    ))
+                .map_err(|error| {
+                    ConnectorError::ConnectionFailed(
+                        format!(
+                            "Glue catalog lookup failed ({}); verify catalog identifiers, AWS region, credentials, and glue:GetTable permission",
+                            glue_lookup_error_category(&error)
+                        ),
+                    )
                 })?;
             info!(
                 glue_database = database,
-                table = table_path,
-                resolved_path = %resolved,
+                storage_provider =
+                    StorageProvider::detect_uri(&resolved).map_or("unknown", StorageProvider::name),
                 "resolved table path via Glue catalog"
             );
             Ok((resolved, base_storage_options.clone()))
@@ -89,6 +180,61 @@ pub async fn resolve_catalog_options(
              Build with: cargo build --features delta-lake-unity"
                 .into(),
         )),
+    }
+}
+
+#[cfg(all(test, feature = "delta-lake-glue"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glue_categories_are_actionable_without_provider_details() {
+        let error: deltalake::data_catalog::DataCatalogError =
+            deltalake_catalog_glue::GlueError::MissingMetadata {
+                metadata: "secret-table-location".into(),
+            }
+            .into();
+        assert_eq!(glue_lookup_error_category(&error), "missing-metadata");
+        assert!(!glue_lookup_error_category(&error).contains("secret"));
+
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: aws_sdk_glue::Error::AccessDeniedException(
+                aws_sdk_glue::types::error::AccessDeniedException::builder()
+                    .message("private provider detail")
+                    .build(),
+            ),
+        };
+        assert_eq!(glue_init_error_category(&error), "authorization");
+        assert!(!glue_init_error_category(&error).contains("private"));
+
+        let unhandled = aws_sdk_glue::types::TableInput::builder()
+            .build()
+            .expect_err("missing table name must produce a client-side build error");
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: unhandled.into(),
+        };
+        assert_eq!(glue_init_error_category(&error), "client-input");
+
+        let timeout: aws_sdk_glue::error::SdkError<
+            aws_sdk_glue::operation::get_table::GetTableError,
+        > = aws_sdk_glue::error::SdkError::timeout_error(std::io::Error::other(
+            "private transport detail",
+        ));
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: timeout.into(),
+        };
+        assert_eq!(glue_init_error_category(&error), "client-timeout");
+
+        let no_code_service_error = aws_sdk_glue::operation::get_table::GetTableError::unhandled(
+            std::io::Error::other("private provider response"),
+        );
+        let error = deltalake_catalog_glue::GlueError::AWSError {
+            source: no_code_service_error.into(),
+        };
+        assert_eq!(
+            glue_init_error_category(&error),
+            "unclassified-service-error"
+        );
     }
 }
 

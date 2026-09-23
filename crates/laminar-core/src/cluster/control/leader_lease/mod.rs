@@ -1,8 +1,10 @@
 //! Durable, append-only leader fencing.
 
 mod artifact_admission;
+mod attempt_status;
 mod subscription_replay;
 
+pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
     SubscriptionReplayPin, SubscriptionReplayPinAcquire, SUBSCRIPTION_REPLAY_PIN_RENEW_INTERVAL,
 };
@@ -5261,49 +5263,6 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         decision: AssignmentRecoveryDecision,
     ) -> Result<RecordAssignmentRecoveryDecisionResult, ClusterCheckpointAuthorityError> {
-        decision.validate()?;
-        if &decision.leader_proof != proof || !proof.is_canonical() {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        let current = self
-            .load_record()
-            .await?
-            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-        if !current.lease.matches_proof(proof) {
-            return Err(ClusterCheckpointAuthorityError::Fenced);
-        }
-        if let Some(floor) = current.assignment_decision_floor.as_ref() {
-            if decision.target_version() < floor.before_target_version {
-                return Err(DecisionError::Conflict(format!(
-                    "assignment decision version {} is below durable retention floor {}",
-                    decision.target_version(),
-                    floor.before_target_version
-                ))
-                .into());
-            }
-        }
-        if let Some(winner) = self
-            .audited_assignment_decisions_from(&current)
-            .await?
-            .into_iter()
-            .find(|winner| winner.target_version() == decision.target_version())
-        {
-            return match winner {
-                AuthorityAssignmentDecision::Recovery(winner) if winner == decision => {
-                    Ok(RecordAssignmentRecoveryDecisionResult::Unchanged(winner))
-                }
-                AuthorityAssignmentDecision::Recovery(winner) => {
-                    Ok(RecordAssignmentRecoveryDecisionResult::Conflict { winner })
-                }
-                AuthorityAssignmentDecision::Drain(winner) => {
-                    Err(DecisionError::Conflict(format!(
-                        "assignment drain decision already settled target version {}",
-                        winner.target_version()
-                    ))
-                    .into())
-                }
-            };
-        }
         match Box::pin(
             self.record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision)),
         )
@@ -5919,37 +5878,6 @@ impl LeaderLeaseStore {
         &self,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
         Ok(self.audited_cluster_outcomes().await?.1.last().cloned())
-    }
-
-    /// Return the exact immutable outcome for `attempt`, or the first audited terminal outcome
-    /// known to close that older checkpoint. Compacted continuity anchors are included in the
-    /// audit.
-    ///
-    /// # Errors
-    /// Returns an error for a noncanonical attempt identity or an unavailable or invalid durable
-    /// authority chain.
-    pub async fn cluster_attempt_settlement(
-        &self,
-        attempt: crate::checkpoint::CheckpointAttempt,
-    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        if !attempt.is_canonical() {
-            return Err(DecisionError::Conflict(
-                "cluster checkpoint settlement requires one nonzero canonical checkpoint ID".into(),
-            )
-            .into());
-        }
-        let outcomes = self.audited_cluster_outcomes().await?.1;
-        if let Ok(index) = outcomes.binary_search_by_key(&attempt.epoch, |outcome| outcome.epoch) {
-            return Ok(Some(outcomes[index].clone()));
-        }
-        let Some(highest) = outcomes.last() else {
-            return Ok(None);
-        };
-        if highest.checkpoint_id > attempt.checkpoint_id {
-            Ok(Some(highest.clone()))
-        } else {
-            Ok(None)
-        }
     }
 
     fn cleanup_participant_ids(
@@ -6614,7 +6542,10 @@ pub struct LeaderLeaseConfig {
 impl Default for LeaderLeaseConfig {
     fn default() -> Self {
         Self {
-            ttl: Duration::from_secs(5),
+            // INVARIANT: one 5s bounded control-I/O retry after the 2s tick still fits inside
+            // the TTL, so a single transport tail cannot expire a live leader. Takeover
+            // observes a rival for a full TTL, so this also bounds failover latency.
+            ttl: Duration::from_secs(10),
             renew_interval: Duration::from_secs(2),
         }
     }

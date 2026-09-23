@@ -21,29 +21,7 @@ impl LaminarDB {
 
         #[cfg(not(feature = "cluster"))]
         let _ = pipeline_identity;
-        let ctx = {
-            use datafusion::execution::SessionStateBuilder;
-            let mut session_config = laminar_sql::datafusion::base_session_config();
-            if let Some(n) = self.pipeline_target_partitions {
-                session_config = session_config.with_target_partitions(n);
-            }
-            let query_planner = Arc::clone(self.ctx.state().query_planner());
-            let mut state_builder = SessionStateBuilder::new()
-                .with_config(session_config)
-                .with_default_features()
-                .with_query_planner(query_planner);
-            for rule in self.physical_optimizer_rules.iter() {
-                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
-            }
-            let context =
-                datafusion::prelude::SessionContext::new_with_state(state_builder.build());
-            for rule in self.ctx.state().optimizers() {
-                context.add_optimizer_rule(Arc::clone(rule));
-            }
-            context
-        };
-        laminar_sql::register_streaming_functions(&ctx);
-        self.register_custom_functions_into(&ctx);
+        let ctx = self.create_operator_context();
 
         let lookup_tables: Vec<(String, arrow::datatypes::SchemaRef)> = {
             let ts = self.table_store.read();
@@ -424,5 +402,76 @@ impl LaminarDB {
             }
         }
         Ok(sources)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::execution::memory_pool::MemoryConsumer;
+
+    #[tokio::test]
+    async fn datafusion_memory_connector_graph_shares_query_budget_and_reports_failed_source() {
+        let db = LaminarDB::builder()
+            .datafusion_memory_limit_bytes(1024 * 1024)
+            .build()
+            .await
+            .unwrap();
+        db.execute("CREATE SOURCE events (value BIGINT)")
+            .await
+            .unwrap();
+        db.execute("CREATE STREAM sorted AS SELECT value FROM events ORDER BY value LIMIT 3")
+            .await
+            .unwrap();
+        let streams = db.connector_manager.lock().streams().clone();
+        let make_graph = || {
+            db.build_connector_operator_graph(
+                &streams,
+                &HashMap::new(),
+                &rustc_hash::FxHashSet::default(),
+                &FxHashMap::default(),
+                None,
+            )
+            .unwrap()
+        };
+        let mut graph = make_graph().initialize_managed_state().await.unwrap();
+        let runtime = db.ctx.runtime_env();
+        let reservation =
+            MemoryConsumer::new("concurrent main query").register(&runtime.memory_pool);
+        reservation.try_grow(1024 * 1024).unwrap();
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            db.catalog.get_source("events").unwrap().schema.clone(),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![3, 1, 2]))],
+        )
+        .unwrap();
+        let input = FxHashMap::from_iter([(Arc::from("events"), vec![batch])]);
+        let error = graph
+            .execute_cycle(&input, i64::MIN, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::QueryPipeline { .. }), "{error}");
+        let (failed, sources) = graph.take_cycle_failures();
+        assert!(failed);
+        assert!(
+            sources.contains("events"),
+            "failed input must not settle its cursor"
+        );
+        assert_eq!(runtime.memory_pool.reserved(), 1024 * 1024);
+        assert!(runtime.disk_manager.temp_dir_paths().is_empty());
+        drop(reservation);
+        assert_eq!(runtime.memory_pool.reserved(), 0);
+        let mut recovered = make_graph().initialize_managed_state().await.unwrap();
+        let output = recovered
+            .execute_cycle(&input, i64::MIN, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            output["sorted"]
+                .iter()
+                .map(arrow::record_batch::RecordBatch::num_rows)
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(runtime.memory_pool.reserved(), 0);
     }
 }

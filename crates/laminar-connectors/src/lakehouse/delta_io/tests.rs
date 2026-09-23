@@ -252,6 +252,25 @@ fn delta_metadata_retryability_uses_typed_transport_errors() {
     assert!(!untyped.is_transient());
 }
 
+#[test]
+fn delta_storage_errors_do_not_echo_signed_request_urls() {
+    use object_store::client::{HttpError, HttpErrorKind};
+
+    let signed = "https://account.blob.example/table?sig=do-not-disclose";
+    let error = deltalake::DeltaTableError::ObjectStore {
+        source: deltalake::ObjectStoreError::Generic {
+            store: "Azure",
+            source: Box::new(HttpError::new(
+                HttpErrorKind::Timeout,
+                std::io::Error::new(std::io::ErrorKind::TimedOut, signed),
+            )),
+        },
+    };
+    let metadata = classify_delta_metadata_error("read cursor", &error).to_string();
+    assert!(!metadata.contains("do-not-disclose"), "{metadata}");
+    assert!(!metadata.contains("account.blob.example"), "{metadata}");
+}
+
 #[tokio::test]
 async fn delta_metadata_retryability_reaches_real_s3_transport_chain() {
     use object_store::aws::AmazonS3Builder;
@@ -398,12 +417,28 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let no_environment = |_: &str| None;
     let custom = HashMap::from([("aws_endpoint_url".into(), "http://minio:9000".into())]);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    assert!(custom_s3_endpoint_configured_with_env(
         "s3://bucket/table",
         &custom,
         &no_environment,
-    )
-    .is_err());
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "az://container/table",
+        &custom,
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "gs://bucket/table",
+        &custom,
+        &no_environment,
+    ));
+    validate_coordinated_storage_preflight_with_env("s3://bucket/table", &custom, &no_environment)
+        .unwrap();
     for conditional_put in ["disabled", "dynamo:commits"] {
         let options = HashMap::from([("aws_conditional_put".into(), conditional_put.into())]);
         assert!(validate_coordinated_storage_preflight_with_env(
@@ -422,12 +457,17 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let s3_environment = HashMap::from([("AWS_ENDPOINT_URL", "http://minio:9000")]);
     let s3_environment = |key: &str| s3_environment.get(key).map(ToString::to_string);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    assert!(custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &s3_environment,
+    ));
+    validate_coordinated_storage_preflight_with_env(
         "s3://bucket/table",
         &HashMap::new(),
         &s3_environment,
     )
-    .is_err());
+    .unwrap();
     validate_coordinated_storage_preflight_with_env(
         "file:///tmp/table",
         &HashMap::new(),
@@ -452,12 +492,12 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let azure_environment = HashMap::from([("AZURE_STORAGE_USE_EMULATOR", "true")]);
     let azure_environment = |key: &str| azure_environment.get(key).map(ToString::to_string);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    validate_coordinated_storage_preflight_with_env(
         "abfss://container@account/table",
         &HashMap::new(),
         &azure_environment,
     )
-    .is_err());
+    .unwrap();
     for path in [
         "az://container/table",
         "abfs://container/table",
@@ -470,6 +510,7 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
     }
 
     for options in [
+        HashMap::from([("google_base_url".into(), "http://gcs-emulator".into())]),
         HashMap::from([(
             "google_service_account_key".into(),
             r#"{"gcs_base_url":"http://gcs-emulator"}"#.into(),
@@ -479,12 +520,12 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             "service-account.json".into(),
         )]),
     ] {
-        assert!(validate_coordinated_storage_preflight_with_env(
+        validate_coordinated_storage_preflight_with_env(
             "gs://bucket/table",
             &options,
             &no_environment,
         )
-        .is_err());
+        .unwrap();
     }
     validate_coordinated_storage_preflight_with_env(
         "gs://bucket/table",
@@ -503,6 +544,17 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             .unwrap()
     )
     .is_err());
+}
+
+#[tokio::test]
+async fn coordinated_conditional_create_probe_uses_delta_table_store() {
+    let temp_dir = TempDir::new().unwrap();
+    let table = open_or_create_table(temp_dir.path().to_str().unwrap(), HashMap::new(), None)
+        .await
+        .unwrap();
+    verify_custom_s3_conditional_create(&table, test_publication_deadline())
+        .await
+        .unwrap();
 }
 
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {
@@ -816,6 +868,62 @@ fn test_path_to_url_azure() {
 fn test_path_to_url_gcs() {
     let url = path_to_url("gs://my-bucket/path/to/table").unwrap();
     assert_eq!(url.scheme(), "gs");
+
+    let alias = path_to_url("GCS://my-bucket/path/to/table").unwrap();
+    assert_eq!(alias.scheme(), "gs");
+}
+
+#[test]
+fn delta_azure_adapter_preserves_qualified_authority_as_options() {
+    let adapted =
+        adapt_delta_location("wasbs://container@account.blob.core.chinacloudapi.cn/path/to/table")
+            .unwrap();
+    assert_eq!(adapted.url, "az://container/path/to/table");
+    let mut options = HashMap::new();
+    apply_url_derived_options(&mut options, &adapted).unwrap();
+    assert_eq!(options["azure_storage_account_name"], "account");
+    assert_eq!(options["azure_container_name"], "container");
+    assert_eq!(
+        options["azure_endpoint"],
+        "https://account.blob.core.chinacloudapi.cn"
+    );
+}
+
+#[test]
+fn delta_azure_adapter_rejects_conflicting_authority_options() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([(
+        "azure_storage_account_name".to_string(),
+        "different".to_string(),
+    )]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("conflicts"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
+fn delta_azure_adapter_checks_every_configured_alias() {
+    let adapted =
+        adapt_delta_location("abfss://filesystem@account.dfs.private.example/path/to/table")
+            .unwrap();
+    let mut options = HashMap::from([
+        (
+            "azure_storage_account_name".to_string(),
+            "account".to_string(),
+        ),
+        ("account_name".to_string(), "different".to_string()),
+    ]);
+    let error = apply_url_derived_options(&mut options, &adapted).unwrap_err();
+    assert!(error.to_string().contains("account_name"));
+    assert!(!error.to_string().contains("different"));
+}
+
+#[test]
+fn delta_path_rejects_signed_queries_without_echoing_them() {
+    let error = path_to_url("gs://bucket/table?X-Goog-Signature=secret-value").unwrap_err();
+    assert!(!error.to_string().contains("secret-value"));
 }
 
 // ── End-to-end tests for new functionality ──

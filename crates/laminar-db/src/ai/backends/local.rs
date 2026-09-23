@@ -435,6 +435,93 @@ mod tests {
     }
 
     #[test]
+    fn intrinsic_labels_read_from_an_existing_hub_snapshot() {
+        let cache = tempfile::tempdir().unwrap();
+        // Preserve the on-disk layout used by hf-hub 0.4 across the upgrade.
+        let repo_dir = cache.path().join("models--org--repo");
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let snapshot = repo_dir.join("snapshots").join(revision);
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(repo_dir.join("refs/main"), revision).unwrap();
+        std::fs::write(
+            snapshot.join("config.json"),
+            r#"{"id2label":{"1":"POSITIVE","0":"NEGATIVE"}}"#,
+        )
+        .unwrap();
+
+        let provider = LocalProvider::new(cache.path());
+        assert_eq!(
+            provider.intrinsic_labels("hf:org/repo"),
+            Some(vec!["NEGATIVE".into(), "POSITIVE".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_download_populates_the_label_cache_and_reuses_it() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let cache = tempfile::tempdir().unwrap();
+        let config = r#"{"id2label":{"1":"POSITIVE","0":"NEGATIVE"}}"#;
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let route = "/org/repo/resolve/main/config.json";
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("range", "bytes=0-0"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", "\"config-v1\"")
+                    .insert_header("x-repo-commit", revision)
+                    .insert_header("content-range", format!("bytes 0-0/{}", config.len()))
+                    .set_body_bytes(b"{"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .and(header("range", format!("bytes=0-{}", config.len())))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header(
+                        "content-range",
+                        format!("bytes 0-{}/{}", config.len() - 1, config.len()),
+                    )
+                    .set_body_string(config),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = hf_hub::api::tokio::ApiBuilder::from_cache(hf_hub::Cache::new(
+            cache.path().to_path_buf(),
+        ))
+        .with_endpoint(server.uri())
+        .with_token(None)
+        .with_progress(true)
+        .build()
+        .unwrap();
+        let repo = api.model("org/repo".to_string());
+        let downloaded = tokio::time::timeout(Duration::from_secs(10), repo.get("config.json"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&downloaded).unwrap(), config);
+        assert_eq!(
+            LocalProvider::new(cache.path()).intrinsic_labels("hf:org/repo"),
+            Some(vec!["NEGATIVE".into(), "POSITIVE".into()])
+        );
+        let cached = tokio::time::timeout(Duration::from_secs(10), repo.get("config.json"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached, downloaded);
+        server.verify().await;
+    }
+
+    #[test]
     fn mean_pool_ignores_masked_tokens() {
         // seq=3, hidden=2; token 2 is padding (mask 0).
         let data = [1.0, 2.0, 3.0, 4.0, 100.0, 100.0];

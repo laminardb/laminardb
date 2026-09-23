@@ -24,6 +24,8 @@ mod serving;
 mod shutdown;
 mod startup;
 
+pub(crate) use control_kv::OBJECT_STORE_CONTROL_IO_TIMEOUT;
+
 use std::sync::Arc;
 use std::time::Duration;
 

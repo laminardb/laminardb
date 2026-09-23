@@ -168,6 +168,15 @@
       "fieldConfig": { "defaults": { "unit": "bytes" } }
     },
     {
+      "title": "Successful Checkpoint Completions (5m)",
+      "description": "Observed successful checkpoint progress over five minutes, not the exact age of the last checkpoint. Adjust the window for the configured checkpoint interval and timeout. Keep nodes separate to see stalled participants.",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 19 },
+      "targets": [{ "expr": "increase(laminardb_checkpoints_completed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[5m])", "legendFormat": "{{instance}} / {{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "short", "noValue": "No samples" } }
+    },
+    {
       "title": "Checkpoint Duration (p50 / p99)",
       "type": "timeseries",
       "datasource": "${DS_PROMETHEUS}",
@@ -215,12 +224,13 @@
       "collapsed": true,
       "panels": [
         {
-          "title": "Consumer Lag",
+          "title": "Kafka Reader Offset Lag",
+          "description": "Broker high watermark minus the next offset delivered to the Kafka reader. This is offset distance, not processed rows or committed recovery lag; it can include uncommitted transactions. Unavailable samples and samples older than 30 seconds are hidden, not shown as zero.",
           "type": "timeseries",
           "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
-          "targets": [{ "expr": "laminardb_kafka_source_consumer_lag{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "lag" }],
-          "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+          "targets": [{ "expr": "laminardb_kafka_source_reader_lag_offsets{instance=~\"$instance\",pipeline=~\"$pipeline\"} and (laminardb_kafka_source_lag_sample_available{instance=~\"$instance\",pipeline=~\"$pipeline\"} == 1) and (time() - laminardb_kafka_source_lag_sample_timestamp_seconds{instance=~\"$instance\",pipeline=~\"$pipeline\"} <= 30)", "legendFormat": "{{instance}} / {{source}} / {{topic}}:{{partition}}" }],
+          "fieldConfig": { "defaults": { "unit": "short", "noValue": "Unavailable", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": false } } }
         },
         {
           "title": "Records Polled/sec",
@@ -234,7 +244,8 @@
           "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
         },
         {
-          "title": "Commits & Rebalances",
+          "title": "Broker Advisory Commits & Rebalances",
+          "description": "Broker offset-commit acknowledgements are advisory monitoring progress. LaminarDB recovery authority comes from committed engine checkpoints.",
           "type": "timeseries",
           "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
@@ -243,6 +254,33 @@
             { "expr": "laminardb_kafka_source_rebalances_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "rebalances total" }
           ],
           "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "title": "Kafka Source Delivery Age",
+          "description": "Seconds since a nonempty successful connector poll. An idle producer legitimately increases this age. No sample means no successful batch has been observed; this is not event-time age or sink visibility.",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+          "targets": [{ "expr": "time() - (laminardb_kafka_source_last_batch_timestamp_seconds{instance=~\"$instance\",pipeline=~\"$pipeline\"} > 0)", "legendFormat": "{{instance}} / {{source}}" }],
+          "fieldConfig": { "defaults": { "unit": "s", "noValue": "No sample", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": false } } }
+        },
+        {
+          "title": "Kafka Lag Sample Available",
+          "description": "1 means the last collection produced a usable sample; 0 means unavailable. Check sample age separately: a stalled collector can leave an old available sample.",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+          "targets": [{ "expr": "laminardb_kafka_source_lag_sample_available{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "{{instance}} / {{source}} / {{topic}}:{{partition}}" }],
+          "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "noValue": "No sample", "mappings": [{ "type": "value", "options": { "0": { "text": "Unavailable" }, "1": { "text": "Available" } } }], "custom": { "drawStyle": "line", "spanNulls": false } } }
+        },
+        {
+          "title": "Kafka Lag Sample Age",
+          "description": "Seconds since the last successful lag sample. Collection runs every 10 seconds with a bounded 10-second round; the lag panel hides samples older than 30 seconds. No sample means no successful measurement yet. Timestamp ages require synchronized clocks.",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+          "targets": [{ "expr": "time() - (laminardb_kafka_source_lag_sample_timestamp_seconds{instance=~\"$instance\",pipeline=~\"$pipeline\"} > 0)", "legendFormat": "{{instance}} / {{source}} / {{topic}}:{{partition}}" }],
+          "fieldConfig": { "defaults": { "unit": "s", "noValue": "No sample", "custom": { "drawStyle": "line", "fillOpacity": 10, "spanNulls": false } } }
         }
       ]
     },

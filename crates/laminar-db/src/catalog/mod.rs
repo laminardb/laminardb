@@ -1,8 +1,8 @@
 //! Source and sink catalog for tracking registered streaming objects.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ pub struct ArrowRecord {
 impl laminar_core::streaming::Record for ArrowRecord {
     fn schema() -> SchemaRef {
         // This is a placeholder; the actual schema is on the SourceEntry.
-        // ArrowRecord is only used as a type parameter; push_arrow bypasses this.
+        // Source intake uses push_arrow; the count-bounded query-output bridge uses Record.
         Arc::new(arrow::datatypes::Schema::empty())
     }
 
@@ -81,50 +81,43 @@ impl laminar_core::streaming::Record for ArrowRecord {
     }
 }
 
-/// Bounded ring buffer for snapshot batches.
-///
-/// Concurrent `push()` calls each get a unique slot via atomic `fetch_add`.
-/// Per-slot mutex protects the actual read/write.
+/// Recent snapshot history, independently bounded by count and retained Arrow bytes.
 struct SnapshotRing {
-    slots: Box<[parking_lot::Mutex<Option<RecordBatch>>]>,
-    tail: AtomicUsize,
+    batches: VecDeque<(RecordBatch, usize)>,
+    bytes: usize,
     capacity: usize,
+    max_bytes: usize,
 }
 
 impl SnapshotRing {
-    fn new(capacity: usize) -> Self {
-        let cap = capacity.max(1);
-        let slots: Vec<_> = (0..cap).map(|_| parking_lot::Mutex::new(None)).collect();
+    fn new(capacity: usize, max_bytes: usize) -> Self {
         Self {
-            slots: slots.into_boxed_slice(),
-            tail: AtomicUsize::new(0),
-            capacity: cap,
+            batches: VecDeque::new(),
+            bytes: 0,
+            capacity: capacity.max(1),
+            max_bytes,
         }
     }
 
-    fn push(&self, batch: RecordBatch) {
-        // fetch_add is atomic — concurrent pushers each get a unique slot.
-        let idx = self.tail.fetch_add(1, Ordering::Relaxed) % self.capacity;
-        *self.slots[idx].lock() = Some(batch);
+    fn push(&mut self, batch: RecordBatch) {
+        let bytes = streaming::retained_arrow_bytes(&batch);
+        // INVARIANT: successful source admission already checked this batch against the
+        // same byte limit. Eviction changes history only after queue admission succeeds.
+        debug_assert!(bytes <= self.max_bytes);
+        while self.batches.len() >= self.capacity || self.bytes > self.max_bytes - bytes {
+            if let Some((_, evicted_bytes)) = self.batches.pop_front() {
+                self.bytes -= evicted_bytes;
+            }
+        }
+        self.batches.push_back((batch, bytes));
+        self.bytes += bytes;
     }
 
     fn snapshot(&self) -> Vec<RecordBatch> {
-        let tail = self.tail.load(Ordering::Acquire);
-        let count = tail.min(self.capacity);
-        // Read the most recent `count` slots, oldest first.
-        let start = if tail <= self.capacity {
-            0
-        } else {
-            tail % self.capacity
-        };
-        let mut result = Vec::with_capacity(count);
-        for i in 0..count {
-            let idx = (start + i) % self.capacity;
-            if let Some(batch) = self.slots[idx].lock().as_ref() {
-                result.push(batch.clone());
-            }
-        }
-        result
+        self.batches
+            .iter()
+            .map(|(batch, _)| batch.clone())
+            .collect()
     }
 }
 
@@ -145,7 +138,7 @@ pub struct SourceEntry {
     pub is_processing_time: std::sync::atomic::AtomicBool,
     pub(crate) source: streaming::Source<ArrowRecord>,
     pub(crate) sink: streaming::Sink<ArrowRecord>,
-    buffer: SnapshotRing,
+    buffer: parking_lot::Mutex<SnapshotRing>,
     /// Wakeup handle for `db.insert()` event-driven notification.
     data_notify: Arc<Notify>,
 }
@@ -163,18 +156,30 @@ impl SourceEntry {
             &self.primary_key_indices,
             &batch,
         )?;
+        // Serialize admission and history publication so concurrent producers cannot leave
+        // accepted batches waiting outside either owner or publish snapshots out of order.
+        let mut buffer = self.buffer.lock();
         self.source.push_arrow(batch.clone())?;
-        self.buffer.push(batch);
+        buffer.push(batch);
+        drop(buffer);
         self.data_notify.notify_one();
         Ok(())
     }
 
     pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
-        self.buffer.snapshot()
+        self.buffer.lock().snapshot()
     }
 
     pub(crate) fn data_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.data_notify)
+    }
+
+    pub(crate) fn is_backpressured(&self) -> bool {
+        crate::metrics::is_backpressured(self.source.pending(), self.source.capacity())
+            || crate::metrics::is_backpressured(
+                self.source.queued_arrow_bytes(),
+                self.source.max_queued_bytes(),
+            )
     }
 }
 
@@ -212,6 +217,7 @@ pub struct SourceCatalog {
     next_query_id: AtomicU64,
     default_buffer_size: usize,
     default_backpressure: BackpressureStrategy,
+    push_source_max_bytes: usize,
 }
 
 impl SourceCatalog {
@@ -226,6 +232,14 @@ impl SourceCatalog {
             next_query_id: AtomicU64::new(1),
             default_buffer_size: buffer_size,
             default_backpressure: backpressure,
+            push_source_max_bytes: streaming::DEFAULT_SOURCE_MAX_QUEUED_BYTES,
+        }
+    }
+
+    pub(crate) fn from_config(config: &crate::LaminarConfig) -> Self {
+        Self {
+            push_source_max_bytes: config.push_source_max_bytes,
+            ..Self::new(config.default_buffer_size, config.default_backpressure)
         }
     }
 
@@ -278,6 +292,7 @@ impl SourceCatalog {
                 track_stats: false,
             },
             name: Some(name.to_string()),
+            max_queued_bytes: self.push_source_max_bytes,
         };
 
         let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
@@ -292,7 +307,10 @@ impl SourceCatalog {
             is_processing_time: std::sync::atomic::AtomicBool::new(false),
             source,
             sink,
-            buffer: SnapshotRing::new(buf_size),
+            buffer: parking_lot::Mutex::new(SnapshotRing::new(
+                buf_size,
+                self.push_source_max_bytes,
+            )),
             data_notify: Arc::new(Notify::new()),
         });
 
@@ -454,3 +472,6 @@ impl SourceCatalog {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod admission_tests;

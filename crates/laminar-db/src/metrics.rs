@@ -74,11 +74,11 @@ pub struct SourceMetrics {
     pub pending: usize,
     /// Capacity.
     pub capacity: usize,
-    /// >80% full.
+    /// Either the count or Arrow-byte budget is >80% full.
     pub is_backpressured: bool,
     /// Watermark.
     pub watermark: i64,
-    /// 0.0..1.0.
+    /// Count utilization, 0.0..1.0; does not measure Arrow-byte saturation.
     pub utilization: f64,
 }
 

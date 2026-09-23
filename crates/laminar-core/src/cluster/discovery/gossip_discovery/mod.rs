@@ -491,13 +491,11 @@ impl GossipDiscovery {
             gossip_addr
         };
 
-        let seed_addrs: Vec<String> = self.config.seed_nodes.clone();
-
         tracing::info!(
             "Starting gossip discovery: gossip_addr = {}, advertise_addr = {}, seeds = {:?}",
             gossip_addr,
             advertise_addr,
-            seed_addrs
+            self.config.seed_nodes
         );
 
         let config = chitchat::ChitchatConfig {
@@ -505,7 +503,7 @@ impl GossipDiscovery {
             cluster_id: self.config.cluster_id.clone(),
             gossip_interval: self.config.gossip_interval,
             listen_addr: gossip_addr,
-            seed_nodes: seed_addrs,
+            seed_nodes: self.config.seed_nodes.clone(),
             failure_detector_config: chitchat::FailureDetectorConfig {
                 phi_threshold: self.config.phi_threshold,
                 initial_interval: self.config.gossip_interval,
@@ -517,6 +515,8 @@ impl GossipDiscovery {
             marked_for_deletion_grace_period: self.config.dead_node_grace_period,
             extra_liveness_predicate: None,
             catchup_callback: None,
+            // COMPAT: existing peers use the uncompressed Chitchat wire format.
+            protocol_version: chitchat::ProtocolVersion::V0,
         };
 
         let initial_kvs = Self::local_kvs(&self.config.local_node)?;

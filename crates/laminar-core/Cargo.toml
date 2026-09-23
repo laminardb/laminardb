@@ -19,7 +19,7 @@ cluster = [
     "dep:gethostname",
 ]
 aws = ["object_store/aws"]
-gcs = ["object_store/gcp"]
+gcs = ["object_store/gcp", "dep:google-cloud-auth"]
 azure = ["object_store/azure"]
 
 [dependencies]
@@ -30,6 +30,7 @@ parking_lot = { workspace = true }
 bytes = { workspace = true }
 quick_cache = { workspace = true }
 object_store = { workspace = true }
+google-cloud-auth = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"
 smallvec = { workspace = true }

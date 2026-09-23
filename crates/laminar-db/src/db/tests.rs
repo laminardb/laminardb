@@ -2986,6 +2986,143 @@ async fn assignment_activation_skips_admission_io_while_recovering() {
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn timed_out_watcher_activation_retains_concurrent_recovery_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    fixture.controller.set_recovering(true);
+    fixture.db.set_source_gate(true);
+    let revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let adoption = fixture.db.assignment_adoption_lock.lock().await;
+    let activation_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    let activation = fixture.db.activate_watcher_assignment_authority(
+        &fixture.controller,
+        &fixture.fence,
+        None,
+        revision,
+        activation_deadline,
+        std::time::Duration::from_secs(1),
+    );
+    tokio::pin!(activation);
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(11)).await;
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    fixture
+        .db
+        .install_shuffle_assignment_fence(&fixture.fence)
+        .unwrap();
+    fixture
+        .controller
+        .publish_checkpoint_assignment_fence(Some(fixture.fence.clone()));
+    drop(adoption);
+
+    let retained = activation.await.unwrap();
+    assert!(retained.installed);
+    assert!(!retained.intake_open);
+    assert_eq!(retained.revision, revision);
+    assert!(fixture.db.cluster_intake_fenced());
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        Some(fixture.fence.clone())
+    );
+    assert_eq!(
+        fixture.sender.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+    assert_eq!(
+        fixture.receiver.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn timed_out_watcher_activation_withdraws_non_recovery_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    let initial = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(initial.intake_open);
+    let revision = initial.revision;
+    let adoption = fixture.db.assignment_adoption_lock.lock().await;
+    let activation_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    let activation = fixture.db.activate_watcher_assignment_authority(
+        &fixture.controller,
+        &fixture.fence,
+        None,
+        revision,
+        activation_deadline,
+        std::time::Duration::from_secs(1),
+    );
+    tokio::pin!(activation);
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(11)).await;
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    drop(adoption);
+
+    let error = activation.await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("timed out serializing assignment authority activation"),
+        "{error}"
+    );
+    assert_fault_audit_withdrew_authority(&fixture, revision);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn watcher_reconciliation_timeout_revokes_process_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    let revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let adoption = fixture.db.assignment_adoption_lock.lock().await;
+    let activation_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    let activation = fixture.db.activate_watcher_assignment_authority(
+        &fixture.controller,
+        &fixture.fence,
+        None,
+        revision,
+        activation_deadline,
+        std::time::Duration::from_millis(20),
+    );
+    tokio::pin!(activation);
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(11)).await;
+    assert!(futures::poll!(activation.as_mut()).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(21)).await;
+
+    let error = activation.await.unwrap_err();
+    drop(adoption);
+    let error = error.to_string();
+    assert!(
+        error.contains("timed out serializing assignment authority activation"),
+        "{error}"
+    );
+    assert!(error.contains("process authority revoked"), "{error}");
+    assert!(!fixture.controller.process_lease_is_live());
+    assert!(fixture.db.cluster_intake_fenced());
+    assert_eq!(fixture.sender.assignment_version(), 0);
+    assert_eq!(fixture.receiver.assignment_version(), 0);
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn assignment_activation_does_not_duplicate_an_active_durable_fault() {
     let fixture = fault_audit_activation_fixture().await;
@@ -5469,7 +5606,11 @@ async fn test_connector_registry_accessor() {
         + usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-cdc"))
         + usize::from(cfg!(feature = "delta-lake"))
-        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        )))
         + usize::from(cfg!(feature = "websocket"))
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))
@@ -5478,7 +5619,11 @@ async fn test_connector_registry_accessor() {
     let expected_sinks = usize::from(cfg!(feature = "kafka"))
         + usize::from(cfg!(feature = "postgres-sink"))
         + usize::from(cfg!(feature = "delta-lake"))
-        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(any(
+            feature = "iceberg",
+            feature = "iceberg-gcs",
+            feature = "iceberg-azure"
+        )))
         + usize::from(cfg!(feature = "websocket"))
         + usize::from(cfg!(feature = "mongodb-cdc"))
         + usize::from(cfg!(feature = "files"))
@@ -9939,6 +10084,14 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             )
             .await
             .unwrap();
+            let message = assert_cluster_rejection(
+                &db,
+                "rejected_multi_input_union",
+                "CREATE STREAM rejected_multi_input_union AS \
+                 SELECT id FROM left_events UNION ALL SELECT id FROM right_events",
+            )
+            .await;
+            assert!(message.contains("single input frontier"), "{message}");
             db.execute(
                 "CREATE SOURCE unwatermarked_events (id BIGINT, value DOUBLE, ts TIMESTAMP NOT NULL) \
                  FROM GENERATOR ('max.rows' = '1')",

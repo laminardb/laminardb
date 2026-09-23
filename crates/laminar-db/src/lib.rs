@@ -124,6 +124,14 @@ pub mod subscription;
 mod table_provider;
 mod table_rows;
 mod table_store;
+
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub use table_store::benchmark::ReferenceTableBenchmark;
+
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub use mv_store::benchmark::{MaterializedViewBenchmark, MaterializedViewBenchmarkMode};
 mod temporal_join_state;
 #[cfg(test)]
 mod temporal_test_source;
@@ -153,7 +161,12 @@ pub use checkpoint_coordinator::{
     CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
 pub use config::{
-    BackpressurePolicy, LaminarConfig, RestartPolicy, DEFAULT_MAX_MANAGED_STATE_BYTES,
+    validate_materialized_view_limits, validate_reference_table_limits,
+    validate_source_queue_max_bytes, BackpressurePolicy, LaminarConfig, RestartPolicy,
+    DEFAULT_DATAFUSION_MEMORY_LIMIT_BYTES, DEFAULT_MATERIALIZED_VIEW_MAX_BYTES,
+    DEFAULT_MATERIALIZED_VIEW_MAX_ROWS, DEFAULT_MAX_MANAGED_STATE_BYTES,
+    DEFAULT_REFERENCE_TABLE_MAX_BYTES, DEFAULT_REFERENCE_TABLE_MAX_ROWS,
+    DEFAULT_SOURCE_QUEUE_MAX_BYTES, MAX_SOURCE_QUEUE_BYTES,
 };
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;

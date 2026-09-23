@@ -6,8 +6,10 @@ use std::sync::Arc;
 use super::{
     classify_delta_metadata_error, debug, from_delta_version, info, CommitProperties,
     ConnectorError, CoordinatedCommitCursor, DeltaTable, DeltaWriteAttemptError, HashMap,
-    RecordBatch, SaveMode, SchemaMode, SchemaRef, StorageProvider, Url, SET_TRANSACTION_RETENTION,
+    RecordBatch, SaveMode, SchemaMode, SchemaRef, Url, SET_TRANSACTION_RETENTION,
 };
+#[cfg(feature = "delta-lake")]
+use crate::storage::{AdaptedStorageLocation, StorageConsumer, StorageLocation};
 #[cfg(feature = "delta-lake")]
 use arrow_schema::{DataType, Schema, TimeUnit};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel as _;
@@ -64,8 +66,12 @@ pub(crate) fn widen_batch_millisecond_timestamps(
 pub(super) fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
     // If it already looks like a URL, parse it directly.
     if path.contains("://") {
-        Url::parse(&StorageProvider::canonical_uri(path))
-            .map_err(|e| ConnectorError::ConfigurationError(format!("invalid URL '{path}': {e}")))
+        let adapted = adapt_delta_location(path)?;
+        Url::parse(&adapted.url).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid canonical Delta storage URL: {error}"
+            ))
+        })
     } else {
         // Local path - convert to file URL.
         // First canonicalize if it exists, otherwise use as-is.
@@ -97,6 +103,50 @@ pub(super) fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
     }
 }
 
+#[cfg(feature = "delta-lake")]
+pub(super) fn adapt_delta_location(path: &str) -> Result<AdaptedStorageLocation, ConnectorError> {
+    StorageLocation::parse(path)
+        .and_then(|location| location.adapt(StorageConsumer::Delta))
+        .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn apply_url_derived_options(
+    options: &mut HashMap<String, String>,
+    adapted: &AdaptedStorageLocation,
+) -> Result<(), ConnectorError> {
+    for (key, value) in &adapted.derived_options {
+        let aliases: &[&str] = match key.as_str() {
+            "azure_storage_account_name" => &[
+                "azure_storage_account_name",
+                "azure_account_name",
+                "account_name",
+            ],
+            "azure_container_name" => &["azure_container_name", "container_name"],
+            "azure_endpoint" => &["azure_endpoint", "azure_storage_endpoint", "endpoint"],
+            _ => &[key.as_str()],
+        };
+        let mut configured_alias = false;
+        for (configured_key, configured_value) in options.iter().filter(|(candidate, _)| {
+            aliases
+                .iter()
+                .any(|alias| candidate.eq_ignore_ascii_case(alias))
+        }) {
+            configured_alias = true;
+            if configured_value != value {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "storage option '{configured_key}' conflicts with the Delta table URL authority"
+                )));
+            }
+        }
+        if configured_alias {
+            continue;
+        }
+        options.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
 /// Opens an existing Delta Lake table or creates a new one.
 ///
 /// # Arguments
@@ -116,24 +166,43 @@ pub(super) fn path_to_url(path: &str) -> Result<Url, ConnectorError> {
 #[allow(clippy::implicit_hasher)]
 pub async fn open_or_create_table(
     table_path: &str,
-    storage_options: HashMap<String, String>,
+    mut storage_options: HashMap<String, String>,
     schema: Option<&SchemaRef>,
 ) -> Result<DeltaTable, ConnectorError> {
-    info!(table_path, "opening Delta Lake table");
-
-    let url = path_to_url(table_path)?;
+    let url = if table_path.contains("://") {
+        let adapted = adapt_delta_location(table_path)?;
+        apply_url_derived_options(&mut storage_options, &adapted)?;
+        Url::parse(&adapted.url).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid canonical Delta storage URL: {error}"
+            ))
+        })?
+    } else {
+        path_to_url(table_path)?
+    };
+    #[cfg(feature = "delta-lake-gcs")]
+    if url.scheme() == "gs" {
+        super::gcs_factory::register_laminar_gcs_factory()?;
+    }
+    info!("opening Delta Lake table");
 
     // Try to open or initialize the table. `url` and `storage_options` are
     // not referenced after this call, so move rather than clone; repeated
     // conflict-recovery opens otherwise copy the complete option map.
     let table = DeltaTable::try_from_url_with_storage_options(url, storage_options)
         .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to open table: {e}")))?;
+        .map_err(|error| {
+            ConnectorError::ConnectionFailed(
+                format!(
+                    "failed to open Delta table ({}); verify the redacted provider diagnostics and storage configuration",
+                    super::attempt_error::delta_error_category(&error)
+                ),
+            )
+        })?;
 
     // Check if the table is initialized (has state).
     if table.version().is_some() {
         info!(
-            table_path,
             version = table.version(),
             "opened existing Delta Lake table"
         );
@@ -142,14 +211,11 @@ pub async fn open_or_create_table(
 
     // Table doesn't exist — create if we have a schema, otherwise defer to first write_batch().
     let Some(schema) = schema else {
-        info!(
-            table_path,
-            "table does not exist yet; will create on first write"
-        );
+        info!("table does not exist yet; will create on first write");
         return Ok(table);
     };
 
-    info!(table_path, "creating new Delta Lake table");
+    info!("creating new Delta Lake table");
 
     // Convert Arrow schema to Delta Lake schema using TryIntoKernel.
     let delta_schema: deltalake::kernel::StructType = widen_millisecond_timestamps(schema)
@@ -162,13 +228,16 @@ pub async fn open_or_create_table(
         .create()
         .with_columns(delta_schema.fields().cloned())
         .await
-        .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to create table: {e}")))?;
+        .map_err(|error| {
+            ConnectorError::ConnectionFailed(
+                format!(
+                    "failed to create Delta table ({}); verify provider permissions and conditional-write support",
+                    super::attempt_error::delta_error_category(&error)
+                ),
+            )
+        })?;
 
-    info!(
-        table_path,
-        version = table.version(),
-        "created new Delta Lake table"
-    );
+    info!(version = table.version(), "created new Delta Lake table");
 
     Ok(table)
 }
@@ -257,6 +326,9 @@ pub(crate) async fn write_batches(
         write_builder = write_builder.with_writer_properties(props);
     }
 
+    #[cfg(feature = "testing")]
+    delta_prepublication_fault_boundary().await?;
+
     // Execute the write.
     let table = write_builder.await.map_err(DeltaWriteAttemptError::Delta)?;
 
@@ -266,6 +338,27 @@ pub(crate) async fn write_batches(
     info!(version, total_rows, "committed Delta Lake transaction");
 
     Ok((table, version))
+}
+
+#[cfg(all(feature = "delta-lake", feature = "testing"))]
+async fn delta_prepublication_fault_boundary() -> Result<(), DeltaWriteAttemptError> {
+    if std::env::var("LAMINAR_DELTA_FAULT_WORKER_MODE").as_deref() != Ok("before-publication") {
+        return Ok(());
+    }
+    let signal_directory = std::env::var_os("LAMINAR_DELTA_FAULT_SIGNAL_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            DeltaWriteAttemptError::Local(ConnectorError::ConfigurationError(
+                "Delta test fault boundary requires an absolute signal directory".into(),
+            ))
+        })?;
+    std::fs::write(signal_directory.join("ready"), b"ready").map_err(|_| {
+        DeltaWriteAttemptError::Local(ConnectorError::WriteError(
+            "Delta test fault boundary could not publish its ready signal".into(),
+        ))
+    })?;
+    std::future::pending::<Result<(), DeltaWriteAttemptError>>().await
 }
 
 #[cfg(feature = "delta-lake")]

@@ -1,18 +1,68 @@
 use super::*;
 
+#[tokio::test]
+async fn graph_input_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.pipeline_max_input_buf_bytes = Some(0);
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("pipeline_max_input_buf_bytes"),
+            "{error}"
+        );
+    }
+}
+
 use crate::config::*;
+
+#[tokio::test]
+async fn source_queue_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.source_queue_max_bytes = 0;
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("source_queue_max_bytes"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn datafusion_memory_limit_is_validated_before_server_mode_routing() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        let mut config: ServerConfig = toml::from_str("").unwrap();
+        config.server.mode = mode;
+        config.server.datafusion_memory_limit_bytes = 0;
+        let error = run_server(config, PathBuf::from("unused.toml"))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("datafusion_memory_limit_bytes"),
+            "{error}"
+        );
+    }
+}
 
 #[test]
 fn checkpoint_config_rejects_relative_file_urls() {
-    let result = apply_local_checkpoint_config(
-        LaminarDB::builder(),
-        "file://./relative",
-        &CheckpointSection::default(),
-    );
-    let Err(error) = result else {
-        panic!("relative checkpoint URL was admitted");
-    };
-    assert!(error.to_string().contains("remote host"), "{error}");
+    for url in ["file://./relative", "FILE://./relative"] {
+        let result =
+            apply_local_checkpoint_config(LaminarDB::builder(), url, &CheckpointSection::default());
+        let Err(error) = result else {
+            panic!("relative checkpoint URL was admitted: {url}");
+        };
+        assert!(error.to_string().contains("absolute local path"), "{error}");
+    }
 }
 
 #[test]
@@ -82,6 +132,59 @@ async fn server_entry_rejects_invalid_temporal_retention_in_both_modes() {
             "{error}"
         );
     }
+}
+
+#[tokio::test]
+async fn server_entry_rejects_anonymous_remote_http_before_other_startup_work() {
+    for mode in [ServerMode::Single, ServerMode::Cluster] {
+        for bind in ["0.0.0.0:8080", "[::]:8080", "[::ffff:127.0.0.1]:8080"] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.server.bind = bind.into();
+            // A later validation failure keeps this regression safe even if the auth
+            // guard is removed, without reaching bootstrap or creating a listener.
+            config.checkpoint.max_node_data_bytes = Some(0);
+
+            let result = run_server(config, PathBuf::from("unused.toml")).await;
+            let Err(error) = result else {
+                panic!("remote anonymous HTTP was admitted: {mode:?} {bind}");
+            };
+            let message = error.to_string();
+            assert!(message.contains("HTTP authentication"), "{message}");
+            assert!(
+                message.contains("non-loopback server.bind requires server.console_token"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("checkpoint.max_node_data_bytes"),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_entry_revalidates_cli_admin_bind_after_file_loading() {
+    use clap::Parser as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("loopback.toml");
+    std::fs::write(&config_path, "[server]\nbind = \"127.0.0.1:8080\"\n").unwrap();
+    let mut config = load_config(&config_path).expect("anonymous loopback config must load");
+    let args = crate::Args::try_parse_from(["laminardb", "--admin-bind", "0.0.0.0:8080"]).unwrap();
+    config.server.bind = args.admin_bind.unwrap();
+    config.checkpoint.max_node_data_bytes = Some(0);
+
+    let result = run_server(config, config_path).await;
+    let Err(error) = result else {
+        panic!("CLI bind override bypassed authentication validation");
+    };
+    let message = error.to_string();
+    assert!(message.contains("HTTP authentication"), "{message}");
+    assert!(
+        message.contains("non-loopback server.bind requires server.console_token"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

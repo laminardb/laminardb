@@ -345,15 +345,21 @@ impl StreamingCoordinator {
     /// completion before dropping the claim, so waiting for zero and then draining the channel
     /// preserves exact source acknowledgements, public barriers, and manual replies. The tick
     /// handles tails that legitimately terminate without a completion (cluster followers) and
-    /// avoids relying on a channel event after the atomic reaches zero.
+    /// avoids relying on a channel event after the atomic reaches zero. A coordinated recovery
+    /// lifecycle may cancel predecessor tails only after their durable authority is fenced.
     pub(super) async fn settle_checkpoint_tails(
         &mut self,
         callback: &mut impl PipelineCallback,
     ) -> Option<String> {
         let mut continuation_fault = None;
+        let mut recovery_tails_cancelled = false;
         loop {
             self.drain_manual_requests();
             self.fail_waiting_manual("pipeline is stopping; no new checkpoint can be admitted");
+
+            if !recovery_tails_cancelled {
+                recovery_tails_cancelled = callback.cancel_checkpoint_tails_for_recovery();
+            }
 
             while let Some(completion) = self
                 .checkpoint_complete_rx

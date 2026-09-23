@@ -11,6 +11,196 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 
+fn test_source_channel(capacity: usize) -> (SourceMsgTx, SourceMsgRx) {
+    source_channel::channel(capacity, crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES)
+}
+
+#[tokio::test]
+async fn source_queue_charge_follows_parked_input_until_staging() {
+    let (tx, rx) = source_channel::channel(8, 4096);
+    let payload = vec![0; 3000];
+    let batch = RecordBatch::try_from_iter([(
+        "payload",
+        Arc::new(BinaryArray::from_vec(vec![payload.as_slice()])) as arrow::array::ArrayRef,
+    )])
+    .unwrap();
+    let message = || SourceMsg::Batch {
+        source_idx: 0,
+        batch: batch.clone(),
+        cursor: SourceBatchCursor::Complete(checkpoint_at(1)),
+    };
+    tx.send(message()).await.unwrap();
+    let parked = rx.recv().await.unwrap();
+    let (_control, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = test_coordinator(
+        rx,
+        control_rx,
+        Arc::new(tokio::sync::Notify::new()),
+        DeliveryGuarantee::AtLeastOnce,
+        None,
+    );
+    coordinator.parked_source_msg = Some(parked);
+    assert!(matches!(
+        tx.try_send(message()),
+        Err(source_channel::SourceQueueError::Full)
+    ));
+    let parked = coordinator.parked_source_msg.take().unwrap();
+    let mut events = 0;
+    coordinator
+        .process_msg(
+            parked,
+            &mut MockCallback::new(),
+            &mut Vec::new(),
+            &mut events,
+        )
+        .unwrap();
+    assert_eq!(events, 1);
+    assert!(coordinator.committed_offsets[0].is_none());
+    assert_eq!(coordinator.source_batches_buf["test_source"].len(), 1);
+    // Staging transferred ownership: graph/cycle retention does not retain a queue reservation.
+    tx.try_send(message()).unwrap();
+}
+
+#[tokio::test]
+async fn source_queue_checks_size_before_deferring_cursor_capture() {
+    let state = Arc::new(PendingCheckpointFailureState::default());
+    let runtime = StreamingCoordinatorRuntime::new();
+    let (_control, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+    let mut coordinator = StreamingCoordinator::new(
+        &runtime,
+        vec![SourceRegistration {
+            name: "pending-cursor".into(),
+            connector: Box::new(PendingCheckpointFailureSource {
+                state: Arc::clone(&state),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("mock"),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        }],
+        PipelineConfig {
+            source_queue_max_bytes: 1,
+            ..Default::default()
+        },
+        Arc::new(tokio::sync::Notify::new()),
+        control_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+    coordinator.source_handles[0]
+        .startup_activation
+        .take()
+        .unwrap()
+        .send(());
+    let fault = tokio::time::timeout(Duration::from_secs(2), coordinator.source_fault_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fault.error.contains("source_queue_max_bytes=1"),
+        "{}",
+        fault.error
+    );
+    assert_eq!(state.checkpoint_captures.load(Ordering::SeqCst), 0);
+    assert!(coordinator.rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn source_queue_oversize_fault_does_not_advance_the_recovery_cursor() {
+    let connector = laminar_connectors::testing::MockSourceConnector::with_batches(1, 1024);
+    let committed = connector.committed_epochs_handle();
+    let runtime = StreamingCoordinatorRuntime::new();
+    let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+    let mut coordinator = StreamingCoordinator::new(
+        &runtime,
+        vec![SourceRegistration {
+            name: "oversized".into(),
+            connector: Box::new(connector),
+            config: laminar_connectors::config::ConnectorConfig::new("mock"),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        }],
+        PipelineConfig {
+            source_queue_max_bytes: 1024,
+            ..Default::default()
+        },
+        Arc::new(tokio::sync::Notify::new()),
+        control_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
+    let initial_offsets = coordinator.current_source_offsets();
+    coordinator.source_handles[0]
+        .startup_activation
+        .take()
+        .unwrap()
+        .send(());
+    let fault = tokio::time::timeout(Duration::from_secs(2), coordinator.source_fault_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fault.source.as_ref(), "oversized");
+    assert!(
+        fault.error.contains("source_queue_max_bytes=1024"),
+        "{}",
+        fault.error
+    );
+    assert!(coordinator.rx.try_recv().is_err());
+    assert_eq!(coordinator.current_source_offsets(), initial_offsets);
+    assert!(coordinator.pending_offsets.iter().all(Option::is_none));
+    assert!(committed.lock().is_empty());
+    assert!(
+        coordinator.source_handles[0]
+            .task
+            .wait_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await
+    );
+}
+
+#[tokio::test]
+async fn source_queue_invalid_limit_is_rejected_by_public_coordinator() {
+    for bytes in [0, crate::MAX_SOURCE_QUEUE_BYTES + 1] {
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let result = StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig {
+                source_queue_max_bytes: bytes,
+                ..Default::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DbError::Config(ref message)) if message.contains("source_queue_max_bytes"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_queue_rejects_oversized_batches() {
+    let (tx, _rx) = test_source_channel(64);
+    let payload = vec![0_u8; 64 * 1024 * 1024];
+    let batch = RecordBatch::try_from_iter([(
+        "payload",
+        Arc::new(BinaryArray::from_vec(vec![payload.as_slice()])) as arrow::array::ArrayRef,
+    )])
+    .unwrap();
+    assert!(
+        tx.try_send(SourceMsg::Batch {
+            source_idx: 0,
+            batch,
+            cursor: SourceBatchCursor::Complete(SourceCheckpoint::new()),
+        })
+        .is_err(),
+        "a single batch larger than the byte limit must be refused"
+    );
+}
+
 fn manual_request(reply: crate::db::ForceCheckpointReply) -> ForceCheckpointRequest {
     ForceCheckpointRequest {
         reply,
@@ -94,7 +284,7 @@ fn source_metadata_stays_row_aligned_and_mutations_are_route_admitted() {
     assert!(output.column_by_name(SOURCE_ORDER_KEY_COLUMN).is_some());
     assert!(output.column_by_name(SOURCE_SUB_OFFSET_COLUMN).is_some());
 
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -200,7 +390,7 @@ fn full_changelog_route_bypasses_generic_late_filtering() {
         ],
     )
     .unwrap();
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -233,7 +423,7 @@ fn full_changelog_route_bypasses_generic_late_filtering() {
 
 #[test]
 fn source_preparation_failure_does_not_stage_offset_or_data() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -267,7 +457,7 @@ fn source_preparation_failure_does_not_stage_offset_or_data() {
 #[tokio::test]
 async fn fully_filtered_batch_executes_an_empty_progress_cycle() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -313,7 +503,7 @@ async fn fully_filtered_batch_executes_an_empty_progress_cycle() {
 
 #[tokio::test]
 async fn watermark_extraction_failure_faults_before_cycle_publication() {
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -441,7 +631,7 @@ fn barrier_release_high_watermark_cannot_be_overwritten_by_stale_attempt() {
 
 #[test]
 fn stale_cancelled_barrier_does_not_fence_later_source_data() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let mut coordinator = test_coordinator(
         rx,
@@ -463,7 +653,8 @@ fn stale_cancelled_barrier_does_not_fence_later_source_data() {
                 source_idx: 0,
                 barrier: CheckpointBarrier::new(7, 7),
                 checkpoint: checkpoint_at(7),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut events,
@@ -478,7 +669,8 @@ fn stale_cancelled_barrier_does_not_fence_later_source_data() {
                 source_idx: 0,
                 batch: int_batch(11),
                 cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut events,
@@ -496,7 +688,7 @@ fn stale_cancelled_barrier_does_not_fence_later_source_data() {
 #[tokio::test]
 async fn ready_completion_does_not_drop_the_parked_intake_message() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
     let attempt = CheckpointAttempt::new(7, 7);
@@ -508,11 +700,14 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
         None,
     )
     .with_checkpoint_complete_rx(completion_rx);
-    coordinator.parked_source_msg = Some(SourceMsg::Batch {
-        source_idx: 0,
-        batch: int_batch(42),
-        cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
-    });
+    coordinator.parked_source_msg = Some(
+        SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(42),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
+        }
+        .into(),
+    );
     completion_tx
         .send(CheckpointCompletion::new(
             attempt,
@@ -549,7 +744,7 @@ async fn ready_completion_does_not_drop_the_parked_intake_message() {
 #[tokio::test]
 async fn external_commit_pressure_keeps_completion_live_and_source_queued() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
     let attempt = CheckpointAttempt::new(7, 7);
@@ -743,6 +938,7 @@ struct MockCallback {
     aborted_subscription_cuts: Arc<Mutex<Vec<CheckpointAttempt>>>,
     publish_barrier_error: Arc<Mutex<Option<String>>>,
     publication_error: Arc<Mutex<Option<String>>>,
+    mv_store: Option<Mutex<crate::mv_store::MvStore>>,
     sink_publication_error: Arc<Mutex<Option<String>>>,
     #[cfg(feature = "cluster")]
     subscription_output_commits: Arc<AtomicU64>,
@@ -843,6 +1039,7 @@ impl MockCallback {
             aborted_subscription_cuts: Arc::new(Mutex::new(Vec::new())),
             publish_barrier_error: Arc::new(Mutex::new(None)),
             publication_error: Arc::new(Mutex::new(None)),
+            mv_store: None,
             sink_publication_error: Arc::new(Mutex::new(None)),
             #[cfg(feature = "cluster")]
             subscription_output_commits: Arc::new(AtomicU64::new(0)),
@@ -1190,6 +1387,23 @@ impl PipelineCallback for MockCallback {
         }
     }
 
+    fn update_mv_stores(
+        &self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) -> Result<(), CycleError> {
+        if let Some(store) = &self.mv_store {
+            store
+                .lock()
+                .update_views(
+                    results
+                        .iter()
+                        .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+                )
+                .map_err(|error| CycleError::Recovery(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "cluster")]
     fn commit_subscription_output(&mut self) {
         self.subscription_output_commits
@@ -1400,7 +1614,7 @@ fn empty_connector_task_fences() -> OwnedConnectorTaskFences {
 #[tokio::test]
 async fn coordinator_exit_invalidates_provisional_subscription_delivery() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1424,7 +1638,7 @@ async fn coordinator_exit_invalidates_provisional_subscription_delivery() {
 #[tokio::test(start_paused = true)]
 async fn checkpoint_control_watch_wakes_a_quiet_follower() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1477,7 +1691,7 @@ async fn checkpoint_control_watch_wakes_a_quiet_follower() {
 #[tokio::test(start_paused = true)]
 async fn shuffle_work_wakes_a_quiet_coordinator_before_idle_fallback() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1509,7 +1723,7 @@ async fn shuffle_work_wakes_a_quiet_coordinator_before_idle_fallback() {
 #[tokio::test(start_paused = true)]
 async fn runnable_deferred_replay_does_not_wait_for_notify() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -1535,7 +1749,7 @@ async fn runnable_deferred_replay_does_not_wait_for_notify() {
 #[tokio::test(start_paused = true)]
 async fn blocked_deferred_replay_waits_for_the_idle_fallback() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -1583,7 +1797,7 @@ async fn blocked_deferred_replay_waits_for_the_idle_fallback() {
 #[tokio::test(start_paused = true)]
 async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(1);
     let in_flight = Arc::new(AtomicU64::new(1));
@@ -1648,7 +1862,7 @@ async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop
 #[tokio::test(start_paused = true)]
 async fn pending_checkpoint_control_rechecks_eventless_follower_tail_at_25ms() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let in_flight = Arc::new(AtomicU64::new(1));
     let mut coordinator = test_coordinator(
@@ -1692,7 +1906,7 @@ async fn pending_checkpoint_control_rechecks_eventless_follower_tail_at_25ms() {
 #[tokio::test(start_paused = true)]
 async fn pending_checkpoint_control_rearms_while_intake_is_paused() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1741,7 +1955,7 @@ async fn pending_checkpoint_control_rearms_while_intake_is_paused() {
 #[tokio::test(start_paused = true)]
 async fn checkpoint_control_fault_stops_before_post_fault_batch_executes() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1797,6 +2011,7 @@ fn test_coordinator(
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule,
             delivery_guarantee,
@@ -1857,7 +2072,7 @@ fn checkpoint_at(position: u64) -> SourceCheckpoint {
 #[tokio::test]
 async fn terminal_handoff_capture_fences_post_cut_work_but_intermediate_cut_stays_open() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (source_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -1947,7 +2162,7 @@ fn successful_checkpoint_result(
 #[tokio::test]
 async fn runtime_ready_is_published_after_barrier_control_is_installed() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let coordinator = test_coordinator(
         rx,
@@ -2011,7 +2226,7 @@ async fn source_less_runtime_stays_live_until_explicit_shutdown() {
 
 #[tokio::test]
 async fn configured_source_channel_exhaustion_is_a_fault() {
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (source_tx, rx) = test_source_channel(8);
     drop(source_tx);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let coordinator = test_coordinator(
@@ -2033,7 +2248,7 @@ async fn configured_source_channel_exhaustion_is_a_fault() {
 #[tokio::test]
 async fn recovery_intake_gate_blocks_compute_and_discards_shutdown_open_epoch() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let coordinator = test_coordinator(
         rx,
@@ -2088,7 +2303,7 @@ async fn recovery_intake_gate_blocks_compute_and_discards_shutdown_open_epoch() 
 async fn recovery_intake_reopen_processes_backlog_before_periodic_checkpoint() {
     let interval = Duration::from_millis(100);
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let mut coordinator = test_coordinator(
         rx,
@@ -2204,7 +2419,7 @@ async fn recovery_intake_gate_expires_manual_request_without_checkpoint_admissio
 #[tokio::test(start_paused = true)]
 async fn recovery_intake_gate_allows_control_only_vnode_transition_completion() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -2246,7 +2461,7 @@ async fn recovery_intake_gate_allows_control_only_vnode_transition_completion() 
 #[tokio::test]
 async fn intake_gate_close_after_receive_parks_fifo_message_until_reopen() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let mut coordinator = test_coordinator(
         rx,
@@ -2339,7 +2554,7 @@ fn checkpoint_source_handle(
 }
 
 fn admission_coordinator(source_handles: Vec<SourceHandle>) -> StreamingCoordinator {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let source_names = source_handles
         .iter()
@@ -4066,7 +4281,7 @@ async fn checkpoint_drain_failure_cleans_up_and_keeps_source_held() {
 #[tokio::test]
 async fn checkpoint_drain_halt_cleans_up_and_exits_without_recovery() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, source_rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (source_tx, source_rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         source_rx,
@@ -4389,7 +4604,7 @@ async fn noncommitted_aligned_checkpoint_abandons_exact_attempt_with_correct_cad
     ];
 
     for (outcome, expected_reason, records_failure, advances_cadence) in outcomes {
-        let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+        let (_tx, rx) = test_source_channel(8);
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let mut coordinator = test_coordinator(
             rx,
@@ -4698,7 +4913,7 @@ async fn authoritative_source_less_abort_abandons_without_failure() {
 #[tokio::test]
 async fn alignment_timeout_abandons_the_exact_reserved_attempt() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let mut coordinator = test_coordinator(
         rx,
@@ -5660,7 +5875,7 @@ async fn lease_loss_before_activation_stops_without_later_connector_hooks() {
 async fn process_lease_loss_wakes_a_source_blocked_on_the_bounded_fifo() {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
 
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
@@ -5704,7 +5919,7 @@ async fn process_lease_loss_wakes_a_source_blocked_on_the_bounded_fifo() {
 
 #[tokio::test]
 async fn shutdown_wakes_a_source_blocked_on_the_bounded_fifo_without_cluster_authority() {
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     tx.send(SourceMsg::Batch {
         source_idx: 0,
         batch: int_batch(1),
@@ -5744,7 +5959,7 @@ async fn shutdown_wakes_a_source_blocked_on_the_bounded_fifo_without_cluster_aut
 async fn process_lease_loss_between_drain_and_execute_prevents_cycle_publication() {
     use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
 
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let mut coordinator = test_coordinator(
@@ -5894,7 +6109,9 @@ async fn ready_global_source_drain_holds_polling_but_still_emits_barriers() {
         .await
         .expect("held source did not emit the checkpoint barrier")
         .unwrap();
-    assert!(matches!(received, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier));
+    assert!(
+        matches!(received.message, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier)
+    );
     assert_eq!(state.polls.load(Ordering::SeqCst), polls_at_cut);
 
     drain
@@ -6017,7 +6234,9 @@ async fn barrier_hold_retains_unobserved_begin_until_abort_overwrites_it() {
         .await
         .expect("source did not emit the checkpoint barrier")
         .unwrap();
-    assert!(matches!(received, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier));
+    assert!(
+        matches!(received.message, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier)
+    );
     let polls_at_barrier = state.polls.load(Ordering::SeqCst);
 
     // Synchronize with the first turn inside the nested barrier hold before injecting Begin.
@@ -7721,7 +7940,7 @@ fn bound_batch_cursors_validate_local_and_assignment_scope() {
 
 #[test]
 fn incremental_assignment_cursor_preserves_complete_cut_and_rotation_replaces_it() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -7906,7 +8125,9 @@ async fn emitted_barrier_holds_polling_until_an_applicable_release() {
         .await
         .expect("source did not emit the injected barrier")
         .unwrap();
-    assert!(matches!(received, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier));
+    assert!(
+        matches!(received.message, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier)
+    );
     let polls_at_barrier = state.polls.load(Ordering::SeqCst);
     let control_before_stale = state.control_drives.load(Ordering::SeqCst);
 
@@ -9119,7 +9340,7 @@ async fn best_effort_commit_notification_failure_does_not_claim_recovery() {
 #[tokio::test]
 async fn fatal_cycle_error_faults_exactly_once() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let coordinator = test_coordinator(
@@ -9156,7 +9377,7 @@ async fn fatal_cycle_error_faults_exactly_once() {
 #[tokio::test]
 async fn recovery_cycle_error_faults_best_effort() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let mut coordinator = test_coordinator(
         rx,
@@ -9208,7 +9429,7 @@ async fn recovery_cycle_error_faults_best_effort() {
 
 #[tokio::test]
 async fn halt_cycle_error_exits_cleanly() {
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let coordinator = test_coordinator(
         rx,
@@ -9238,7 +9459,7 @@ async fn halt_cycle_error_exits_cleanly() {
 
 #[tokio::test]
 async fn permanent_halt_skips_shutdown_graph_drain_and_beats_existing_fault() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -9247,11 +9468,14 @@ async fn permanent_halt_skips_shutdown_graph_drain_and_beats_existing_fault() {
         DeliveryGuarantee::ExactlyOnce,
         None,
     );
-    coordinator.parked_source_msg = Some(SourceMsg::Batch {
-        source_idx: 0,
-        batch: int_batch(7),
-        cursor: SourceBatchCursor::Complete(checkpoint_at(7)),
-    });
+    coordinator.parked_source_msg = Some(
+        SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(7),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(7)),
+        }
+        .into(),
+    );
     let mut callback = MockCallback::new();
     callback.fault_on_error = true;
     callback.pipeline_halt = Some("permanent shuffle routing failure".into());
@@ -9278,7 +9502,7 @@ async fn permanent_halt_skips_shutdown_graph_drain_and_beats_existing_fault() {
 #[tokio::test]
 async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_all_modes() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -9310,7 +9534,7 @@ async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_a
         DeliveryGuarantee::ExactlyOnce,
     ] {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (tx, rx) = test_source_channel(1);
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
         let coordinator = test_coordinator(rx, control_rx, shutdown, guarantee, None);
         let callback = MockCallback::new();
@@ -9335,7 +9559,7 @@ async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_a
 
 #[tokio::test]
 async fn sink_publication_failure_does_not_advance_source_cursor() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -9368,10 +9592,69 @@ async fn sink_publication_failure_does_not_advance_source_cursor() {
     assert_eq!(callback.written_rows.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn mv_quota_failure_discards_source_cursors_and_faults_every_delivery_mode() {
+    for guarantee in [
+        DeliveryGuarantee::BestEffort,
+        DeliveryGuarantee::AtLeastOnce,
+        DeliveryGuarantee::ExactlyOnce,
+    ] {
+        let (tx, rx) = test_source_channel(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::new(tokio::sync::Notify::new()),
+            guarantee,
+            None,
+        );
+        coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(7)));
+        let mut callback = MockCallback::new();
+        let mut store = crate::mv_store::MvStore::from_config(&crate::LaminarConfig {
+            materialized_view_max_bytes: 1,
+            ..Default::default()
+        });
+        store
+            .create_mv(
+                "test_source",
+                int_batch(1).schema(),
+                crate::mv_store::MvStorageMode::Aggregate,
+            )
+            .unwrap();
+        callback.mv_store = Some(Mutex::new(store));
+        let written_rows = Arc::clone(&callback.written_rows);
+        let mut results = FxHashMap::default();
+        results.insert(Arc::from("test_source"), vec![int_batch(1)]);
+        let error = coordinator
+            .publish_cycle_outputs(&mut callback, &CycleOutcome::clean(results))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CycleError::Recovery(ref reason) if reason.contains("quota exceeded"))
+        );
+        assert!(coordinator.pending_offsets[0].is_none());
+        assert!(coordinator.committed_offsets[0].is_none());
+        assert_eq!(written_rows.load(Ordering::SeqCst), 0);
+
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            cursor: SourceBatchCursor::Complete(checkpoint_at(7)),
+        })
+        .await
+        .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(callback))
+            .await
+            .expect("MV admission must fault the pipeline");
+        assert!(matches!(exit, ExitReason::Fault(ref reason) if reason.contains("quota exceeded")));
+        assert_eq!(written_rows.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn cursor_settlement_failure_aborts_before_subscription_output_commit() {
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+    let (_tx, rx) = test_source_channel(1);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
     let mut coordinator = test_coordinator(
         rx,
@@ -9398,7 +9681,7 @@ async fn cursor_settlement_failure_aborts_before_subscription_output_commit() {
 #[tokio::test]
 async fn fatal_cycle_error_faults_at_least_once_before_publication() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let coordinator = test_coordinator(
@@ -9447,7 +9730,7 @@ async fn fatal_cycle_error_faults_at_least_once_before_publication() {
 #[test]
 fn source_data_after_barrier_returns_invariant_fault() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (_tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let mut coordinator = test_coordinator(
@@ -9470,7 +9753,8 @@ fn source_data_after_barrier_returns_invariant_fault() {
                 source_idx: 0,
                 batch: int_batch(99),
                 cursor: SourceBatchCursor::Complete(checkpoint_at(8)),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut events,
@@ -9486,7 +9770,7 @@ fn source_data_after_barrier_returns_invariant_fault() {
 #[tokio::test]
 async fn exactly_once_sink_fault_faults_pipeline() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let coordinator = test_coordinator(
@@ -9523,7 +9807,7 @@ async fn exactly_once_sink_fault_faults_pipeline() {
 #[tokio::test]
 async fn test_coordinator_direct_channel() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
 
     // Create coordinator directly (bypassing source spawning).
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
@@ -9532,6 +9816,7 @@ async fn test_coordinator_direct_channel() {
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
@@ -9799,7 +10084,7 @@ fn completion_rejects_result_for_a_different_attempt() {
 #[tokio::test]
 async fn async_completion_publishes_exact_attempt() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
 
@@ -9897,7 +10182,7 @@ async fn one_source_task_panic_faults_while_its_peer_remains_connected() {
 #[tokio::test]
 async fn committed_cut_with_successor_failure_acks_then_faults_before_next_write() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
     let (source, _barrier_poll) = checkpoint_source_handle("test_source");
@@ -9982,7 +10267,7 @@ async fn committed_cut_with_successor_failure_acks_then_faults_before_next_write
 #[tokio::test]
 async fn shutdown_does_not_synthesize_final_checkpoint() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let coordinator = StreamingCoordinator {
@@ -9990,6 +10275,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
@@ -10065,7 +10351,7 @@ async fn shutdown_does_not_synthesize_final_checkpoint() {
 #[tokio::test]
 async fn shutdown_abandons_exact_pending_barrier_and_fails_manual_caller() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (_source_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let mut coordinator = test_coordinator(
         rx,
@@ -10104,7 +10390,7 @@ async fn shutdown_abandons_exact_pending_barrier_and_fails_manual_caller() {
 #[tokio::test]
 async fn shutdown_drain_ignores_barrier_and_processes_following_batch() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (source_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let coordinator = test_coordinator(
         rx,
@@ -10146,7 +10432,7 @@ async fn shutdown_drain_ignores_barrier_and_processes_following_batch() {
 #[tokio::test]
 async fn shutdown_settles_async_tail_before_closing_sinks() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
+    let (_source_tx, rx) = test_source_channel(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
     let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(8);
     let in_flight = Arc::new(AtomicU64::new(1));
@@ -10200,7 +10486,7 @@ async fn shutdown_settles_async_tail_before_closing_sinks() {
 #[tokio::test]
 async fn shutdown_keeps_sink_actor_open_when_epoch_settlement_fails() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let coordinator = test_coordinator(
         rx,
@@ -10225,7 +10511,7 @@ async fn shutdown_keeps_sink_actor_open_when_epoch_settlement_fails() {
 #[tokio::test]
 async fn replay_guarantee_faults_when_sink_shutdown_is_not_acknowledged() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let coordinator = test_coordinator(
         rx,
@@ -10249,7 +10535,7 @@ async fn replay_guarantee_faults_when_sink_shutdown_is_not_acknowledged() {
 #[tokio::test]
 async fn best_effort_reports_sink_shutdown_failure_without_recovery_fault() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (_source_tx, rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let coordinator = test_coordinator(
         rx,
@@ -10281,6 +10567,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
@@ -10294,7 +10581,7 @@ async fn test_barrier_excludes_post_barrier_data() {
             shared_source_isolation: false,
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         },
-        rx: mpsc::bounded_async::<SourceMsg>(64).1, // dummy, not used
+        rx: test_source_channel(64).1, // dummy, not used
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("s0"), Arc::from("s1")],
@@ -10346,7 +10633,8 @@ async fn test_barrier_excludes_post_barrier_data() {
                 source_idx: 0,
                 batch: batch_1,
                 cursor: SourceBatchCursor::Complete(checkpoint_at(10)),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut cycle_events,
@@ -10358,7 +10646,8 @@ async fn test_barrier_excludes_post_barrier_data() {
                 source_idx: 0,
                 barrier,
                 checkpoint: checkpoint_at(10),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut cycle_events,
@@ -10376,7 +10665,8 @@ async fn test_barrier_excludes_post_barrier_data() {
                 source_idx: 1,
                 batch: batch_s1,
                 cursor: SourceBatchCursor::Complete(checkpoint_at(5)),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut cycle_events,
@@ -10388,7 +10678,8 @@ async fn test_barrier_excludes_post_barrier_data() {
                 source_idx: 1,
                 barrier,
                 checkpoint: checkpoint_at(5),
-            },
+            }
+            .into(),
             &mut callback,
             &mut barriers,
             &mut cycle_events,
@@ -10466,6 +10757,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
@@ -10479,7 +10771,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
             shared_source_isolation: false,
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         },
-        rx: mpsc::bounded_async::<SourceMsg>(64).1,
+        rx: test_source_channel(64).1,
         source_fault_rx: empty_source_fault_rx(),
         source_handles: Vec::new(),
         source_names: vec![Arc::from("s0"), Arc::from("s1")],
@@ -10574,7 +10866,7 @@ async fn test_settle_pending_offsets_holds_failed_source() {
 #[tokio::test]
 async fn quiet_source_deferral_retries_before_reading_another_message() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, source_rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, source_rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let coordinator = test_coordinator(
         source_rx,
@@ -10625,7 +10917,7 @@ async fn quiet_source_deferral_retries_before_reading_another_message() {
 #[tokio::test]
 async fn deferred_replay_keeps_its_source_frontier_pin_until_settlement() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (source_tx, source_rx) = mpsc::bounded_async::<SourceMsg>(4);
+    let (source_tx, source_rx) = test_source_channel(4);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
     let coordinator = test_coordinator(
         source_rx,
@@ -10674,6 +10966,63 @@ async fn deferred_replay_keeps_its_source_frontier_pin_until_settlement() {
         &[0, 2],
         "replay must retain the original pin; the clean successor cycle must repin"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_replay_drains_before_admitting_queued_source_input() {
+    for (runnable, manual_wake) in [(true, false), (false, false), (true, true), (false, true)] {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (source_tx, source_rx) = test_source_channel(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            source_rx,
+            control_rx,
+            shutdown,
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.replay_pending = true;
+        coordinator.pending_offsets[0] = Some(SourceBatchCursor::Complete(checkpoint_at(10)));
+        let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointRequest>(1);
+        coordinator = coordinator.with_force_checkpoint_rx(force_rx);
+        let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
+        if manual_wake {
+            force_tx.send(manual_request(reply_tx)).await.unwrap();
+        }
+
+        let mut callback = MockCallback::new();
+        callback.runnable_deferred_input = runnable;
+        callback.shuffle_work_wake = Some(Arc::new(tokio::sync::Notify::new()));
+        callback.retained_results = Some(FxHashMap::from_iter([(
+            Arc::from("test_source"),
+            vec![int_batch(7)],
+        )]));
+        callback.halt_at_cycle = Some(3);
+        let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
+        let written_rows = Arc::clone(&callback.written_rows);
+        let pin_cycles = Arc::clone(&callback.source_frontier_pin_cycles);
+        source_tx
+            .send(SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(8),
+                cursor: SourceBatchCursor::Complete(checkpoint_at(20)),
+            })
+            .await
+            .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), coordinator.run(callback))
+            .await
+            .expect("replay must drain and then admit the queued successor");
+        assert!(matches!(exit, ExitReason::Halt(ref reason)
+            if reason == "injected halt at cycle 3"));
+        assert_eq!(
+            cycle_input_rows.lock().as_slice(),
+            &[0, 1, 0],
+            "runnable={runnable}, manual_wake={manual_wake}"
+        );
+        assert_eq!(written_rows.load(Ordering::Acquire), 2);
+        assert_eq!(pin_cycles.lock().first(), Some(&1));
+    }
 }
 
 struct BackpressuredCallback {
@@ -10839,7 +11188,7 @@ impl PipelineCallback for BackpressuredCallback {
 #[tokio::test]
 async fn test_drain_skip_under_backpressure() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
-    let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+    let (tx, rx) = test_source_channel(64);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
     let coordinator = StreamingCoordinator {
@@ -10847,6 +11196,7 @@ async fn test_drain_skip_under_backpressure() {
             batch_window: Duration::ZERO,
             max_poll_records: 1000,
             channel_capacity: 64,
+            source_queue_max_bytes: crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES,
             fallback_poll_interval: Duration::from_millis(10),
             checkpoint_schedule: CheckpointSchedule::Manual,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,

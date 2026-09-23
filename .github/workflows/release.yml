@@ -311,6 +311,8 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v6
+      - name: Check dependency safety for registry publication
+        run: python3 tools/check_dependency_exceptions.py --publication
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 

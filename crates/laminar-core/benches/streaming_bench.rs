@@ -3,7 +3,7 @@
 use std::hint::black_box;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -64,6 +64,71 @@ fn make_batch(size: usize) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[derive(Clone)]
+struct Payload(String);
+
+impl Record for Payload {
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            DataType::Utf8,
+            true,
+        )]))
+    }
+
+    fn to_record_batch(&self) -> RecordBatch {
+        RecordBatch::try_new(
+            Self::schema(),
+            vec![Arc::new(StringArray::from(vec![self.0.as_str()]))],
+        )
+        .unwrap()
+    }
+}
+
+// Unlike the opportunistic push/poll cases, every iteration admits and consumes
+// all 32 messages. The single-thread runtime also makes the queued burst repeatable.
+fn bench_accepted_push(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let mut group = c.benchmark_group("accepted_push");
+    for width in [16, 4096] {
+        let record = Payload("x".repeat(width));
+        let batch = RecordBatch::try_new(
+            Payload::schema(),
+            vec![Arc::new(StringArray::from(vec![record.0.as_str(); 256]))],
+        )
+        .unwrap();
+        for typed in [false, true] {
+            let label = if typed { "typed" } else { "arrow" };
+            group.throughput(Throughput::Elements(if typed { 32 } else { 32 * 256 }));
+            group.bench_function(format!("{label}_{width}"), |b| {
+                let (source, sink) = streaming::create::<Payload>(64);
+                let mut subscription = sink.subscribe();
+                b.iter(|| {
+                    for _ in 0..32 {
+                        if typed {
+                            source.push(black_box(record.clone())).unwrap();
+                        } else {
+                            source.push_arrow(black_box(batch.clone())).unwrap();
+                        }
+                    }
+                    rt.block_on(async {
+                        for _ in 0..32 {
+                            let output = subscription.recv_async().await.unwrap();
+                            assert_eq!(output.num_rows(), if typed { 1 } else { 256 });
+                            black_box(output);
+                        }
+                    });
+                });
+            });
+        }
+    }
+    group.finish();
 }
 
 // Channel Benchmarks
@@ -255,6 +320,7 @@ criterion_group!(
     bench_source_push,
     bench_source_push_arrow,
     bench_source_push_batch_drain,
+    bench_accepted_push,
 );
 
 criterion_group!(

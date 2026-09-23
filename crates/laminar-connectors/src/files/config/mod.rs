@@ -5,12 +5,13 @@ use std::time::Duration;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
+use crate::storage::{StorageConsumer, StorageLocation, StorageLocationError, StorageProvider};
 use laminar_core::time::parse_duration_str;
 
 /// Parsed configuration for [`super::source::FileSource`].
 #[derive(Debug, Clone)]
 pub struct FileSourceConfig {
-    /// Directory path, glob pattern, or cloud URL.
+    /// Local directory path or glob pattern.
     pub path: String,
 
     /// Data format (`csv`, `json`, `text`, `parquet`). `None` = auto-detect.
@@ -53,8 +54,8 @@ impl FileSourceConfig {
 
         let path = props
             .get("path")
-            .cloned()
-            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))?;
+            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))
+            .and_then(|path| local_files_path(path))?;
 
         let format = props
             .get("format")
@@ -149,8 +150,8 @@ impl FileSinkConfig {
 
         let path = props
             .get("path")
-            .cloned()
-            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))?;
+            .ok_or_else(|| ConnectorError::ConfigurationError("'path' is required".into()))
+            .and_then(|path| local_files_path(path))?;
 
         let format = props
             .get("format")
@@ -225,6 +226,55 @@ impl FileSinkConfig {
             max_buffered_batches,
         })
     }
+}
+
+pub(super) fn local_files_path(path: &str) -> Result<String, ConnectorError> {
+    if path.trim().is_empty() {
+        return Err(ConnectorError::ConfigurationError(
+            "file connector 'path' must not be empty".into(),
+        ));
+    }
+    if std::path::Path::new(path).is_absolute() || !path.contains("://") {
+        return Ok(path.to_string());
+    }
+    let location = match StorageLocation::parse(path) {
+        Ok(location) => location,
+        Err(StorageLocationError::UnsupportedScheme(_)) => return Err(remote_files_error()),
+        Err(error) => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "invalid file connector path: {error}"
+            )))
+        }
+    };
+    if location.provider != StorageProvider::Local {
+        return Err(remote_files_error());
+    }
+    let adapted = location
+        .adapt(StorageConsumer::ObjectStore)
+        .map_err(|error| ConnectorError::ConfigurationError(error.to_string()))?;
+    let url = url::Url::parse(&adapted.url).map_err(|error| {
+        ConnectorError::ConfigurationError(format!("invalid canonical file URL: {error}"))
+    })?;
+    url.to_file_path()
+        .map_err(|()| {
+            ConnectorError::ConfigurationError(
+                "file connector URL must identify an absolute local path".into(),
+            )
+        })?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "file connector path cannot be represented as UTF-8".into(),
+            )
+        })
+}
+
+fn remote_files_error() -> ConnectorError {
+    ConnectorError::FeatureUnsupported(
+        "remote Files connector backends are not enabled; use a local path or absolute file:// URL"
+            .into(),
+    )
 }
 
 /// Supported file formats.

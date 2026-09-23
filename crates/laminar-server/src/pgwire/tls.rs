@@ -296,13 +296,14 @@ pub(super) fn load_tls_acceptor(
     paths: TlsPaths<'_>,
 ) -> Result<tokio_rustls::TlsAcceptor, ServerError> {
     use std::fs::File;
-    use std::io::BufReader;
+
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 
     ensure_tls_provider();
 
     let cert_file = File::open(paths.cert)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_cert: {e}")))?;
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+    let certs = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| ServerError::Http(format!("parse pgwire_tls_cert: {e}")))?;
     if certs.is_empty() {
@@ -318,7 +319,9 @@ pub(super) fn load_tls_acceptor(
     let key_file = File::open(paths.key)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_key: {e}")))?;
     warn_if_key_world_readable(&key_file, paths.key);
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+    let key = PrivateKeyDer::pem_reader_iter(key_file)
+        .next()
+        .transpose()
         .map_err(|e| ServerError::Http(format!("parse pgwire_tls_key: {e}")))?
         .ok_or_else(|| {
             ServerError::Http(format!(
@@ -348,7 +351,8 @@ fn build_client_cert_verifier(
     ca_path: &std::path::Path,
 ) -> Result<Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>, ServerError> {
     use std::fs::File;
-    use std::io::BufReader;
+
+    use tokio_rustls::rustls::pki_types::{pem::PemObject, CertificateDer};
     use tokio_rustls::rustls::server::WebPkiClientVerifier;
     use tokio_rustls::rustls::RootCertStore;
 
@@ -356,7 +360,7 @@ fn build_client_cert_verifier(
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_client_ca: {e}")))?;
     let mut roots = RootCertStore::empty();
     let mut added = 0usize;
-    for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
+    for cert in CertificateDer::pem_reader_iter(file) {
         let cert =
             cert.map_err(|e| ServerError::Http(format!("parse pgwire_tls_client_ca: {e}")))?;
         roots

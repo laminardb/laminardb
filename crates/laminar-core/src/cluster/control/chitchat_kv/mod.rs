@@ -63,7 +63,7 @@ impl ClusterKv for ChitchatKv {
         // must not mask a key the newest generation dropped.
         let mut best: Option<(u64, Option<String>)> = None;
         for (cc_id, state) in guard.node_states() {
-            if cc_id.node_id == target
+            if cc_id.node_id.as_ref() == target.as_str()
                 && best.as_ref().is_none_or(|&(g, _)| cc_id.generation_id > g)
             {
                 best = Some((cc_id.generation_id, state.get(key).map(str::to_string)));

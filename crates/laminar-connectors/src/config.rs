@@ -465,7 +465,8 @@ mod tests {
         let display = config.display_redacted();
         assert!(display.contains("aws_region=us-east-1"));
         assert!(display.contains("aws_secret_access_key=***"));
-        assert!(display.contains("aws_access_key_id=AKID123"));
+        assert!(display.contains("aws_access_key_id=***"));
+        assert!(!display.contains("AKID123"));
         assert!(!display.contains("TOP_SECRET"));
     }
 

@@ -1253,6 +1253,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Set only while the recovery monitor owns a lifecycle operation under a published round.
+    /// At that point predecessor checkpoint authority is fenced and its pending tails are stale.
+    #[cfg(feature = "cluster")]
+    pub(crate) coordinated_lifecycle_active: Arc<std::sync::atomic::AtomicBool>,
     /// Shared assignment/checkpoint admission boundary. The coordinator carries an owned guard
     /// from its exact assignment audit through durable Prepare and source-barrier installation.
     #[cfg(feature = "cluster")]
@@ -1413,26 +1417,6 @@ impl ConnectorPipelineCallback {
         })
     }
 
-    fn reap_checkpoint_tail_tasks(&mut self) {
-        while let Some(result) = self.checkpoint_tail_tasks.try_join_next() {
-            if let Err(error) = result {
-                set_checkpoint_fault(
-                    &self.checkpoint_fault,
-                    format!("checkpoint durable tail terminated unexpectedly: {error}"),
-                );
-            }
-        }
-    }
-
-    fn spawn_checkpoint_tail(
-        &mut self,
-        tail: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
-        self.reap_checkpoint_tail_tasks();
-        self.checkpoint_tail_tasks
-            .spawn_on(tail, &self.checkpoint_tail_runtime);
-    }
-
     #[cfg(feature = "cluster")]
     fn record_checkpoint_alignment_error(&mut self, error: &crate::error::DbError) {
         let reason = error.to_string();
@@ -1468,6 +1452,10 @@ impl ConnectorPipelineCallback {
                 crate::error::DbError::BackpressureFail(msg) => tracing::error!(
                     reason = %msg,
                     "backpressure_policy=Fail tripped; halting pipeline"
+                ),
+                crate::error::DbError::GraphBufferBudgetExceeded { .. } => tracing::error!(
+                    reason = %err,
+                    "graph input budget exceeded; halting pipeline"
                 ),
                 crate::error::DbError::ShuffleTerminal(msg) => tracing::error!(
                     reason = %msg,
@@ -2307,6 +2295,7 @@ impl ConnectorPipelineCallback {
             attempt.epoch,
             attempt.checkpoint_id,
             &assignment_fence,
+            &tail.identity.leader_proof,
             decision_timeout,
         )
         .await?;
@@ -2716,6 +2705,7 @@ impl ConnectorPipelineCallback {
         prepared_wait_timeout: std::time::Duration,
     ) -> Result<(), String> {
         use laminar_core::cluster::control::Phase;
+        use tokio::time::Instant;
 
         // The gate must outlast the leader's quorum wait: a slow-but-successful alignment that lands
         // `Aligned` AFTER the follower resumes would let epoch-N+1 shuffle rows cross a peer's
@@ -2723,7 +2713,7 @@ impl ConnectorPipelineCallback {
         // the durable-Prepared wait so the gate can never expire first (CL-6).
         let resume_gate_timeout = std::time::Duration::from_secs(10)
             .max(prepared_wait_timeout + std::time::Duration::from_secs(5));
-        let resume_gate_deadline = tokio::time::Instant::now() + resume_gate_timeout;
+        let resume_gate_deadline = Instant::now() + resume_gate_timeout;
 
         if !has_cluster_shuffle {
             return Ok(());
@@ -2757,9 +2747,8 @@ impl ConnectorPipelineCallback {
                             Phase::Prepare => false,
                         },
                         CheckpointAttemptRelation::Exact => match a.phase {
-                            // A successor may durably abort an attempt prepared by the old
-                            // leader. The terminal record is only a wake-up hint; durable outcome
-                            // validation owns its authority and performs the rollback.
+                            // A successor may abort an old leader's attempt. The terminal record
+                            // only wakes the follower; durable outcome validation owns rollback.
                             Phase::Abort => a.flags == identity.flags,
                             Phase::Aligned => {
                                 a.flags == identity.flags
@@ -2798,8 +2787,7 @@ impl ConnectorPipelineCallback {
             && released.checkpoint_id == identity.attempt.checkpoint_id
             && matches!(released.phase, Phase::Commit | Phase::Abort)
         {
-            let remaining =
-                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = resume_gate_deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!(
                     "checkpoint {} epoch {} exhausted its shuffle resume deadline before the \
@@ -2812,6 +2800,7 @@ impl ConnectorPipelineCallback {
                 identity.attempt.epoch,
                 identity.attempt.checkpoint_id,
                 assignment_fence,
+                &identity.leader_proof,
                 remaining,
             )
             .await
@@ -2852,8 +2841,7 @@ impl ConnectorPipelineCallback {
                     released.epoch
                 ));
             }
-            let remaining =
-                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = resume_gate_deadline.saturating_duration_since(Instant::now());
             let certified = tokio::time::timeout(
                 remaining,
                 controller.checkpoint_assignment_fence_for_leader(
@@ -5536,6 +5524,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return Ok(());
         }
         let mut store = self.mv_store.write();
+        store
+            .update_views(
+                results
+                    .iter()
+                    .map(|(name, batches)| (name.as_ref(), batches.as_slice())),
+            )
+            .map_err(|error| {
+                let reason = format!("materialized-view cycle preflight failed: {error}");
+                set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+                crate::pipeline::CycleError::Recovery(reason)
+            })?;
         let mut updates = 0u64;
         // Snapshot broadcast is deferred past the write lock (rematerialize is O(rows) and would
         // otherwise block SELECT readers on the store-wide lock).
@@ -5554,18 +5553,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .index_of(laminar_core::changelog::WEIGHT_COLUMN)
                         .is_ok()
             });
-            // Apply the whole cycle's output in one call: an Aggregate-mode MV replaces its
-            // result set per cycle, so a per-batch update would keep only the last chunk of a
-            // multi-batch (>8192-row) output (EX-1).
             let row_batches = batches.iter().filter(|b| b.num_rows() > 0).count() as u64;
             if row_batches > 0 {
-                store.update_cycle(stream_name, batches).map_err(|error| {
-                    let reason = format!(
-                        "materialized-view state update for '{stream_name}' failed: {error}"
-                    );
-                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
-                    crate::pipeline::CycleError::Recovery(reason)
-                })?;
                 updates += row_batches;
                 if !changelog {
                     for batch in batches {
@@ -6158,22 +6147,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .or_else(|| self.graph.execution_poison_reason().map(str::to_owned))
     }
 
+    fn cancel_checkpoint_tails_for_recovery(&mut self) -> bool {
+        self.cancel_fenced_checkpoint_tail_tasks()
+    }
+
     async fn settle_checkpoint_tail_tasks(&mut self) -> Result<(), String> {
-        let mut failures = Vec::new();
-        while let Some(result) = self.checkpoint_tail_tasks.join_next().await {
-            match result {
-                Ok(()) => {}
-                Err(error) => failures.push(error.to_string()),
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "checkpoint durable tail task failure: {}",
-                failures.join("; ")
-            ))
-        }
+        self.settle_spawned_checkpoint_tail_tasks().await
     }
 
     fn record_checkpoint_failure(&mut self, checkpoint_id: u64, reason: &str) {

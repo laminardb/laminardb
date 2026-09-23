@@ -54,6 +54,7 @@ impl<T: Send + 'static> Producer<T> {
     /// # Errors
     ///
     /// Returns `TryPushError` containing the item if the channel is full.
+    #[inline]
     pub fn try_push(&self, item: T) -> Result<(), TryPushError<T>> {
         self.tx.try_send(item).map_err(|e| match e {
             crossfire::TrySendError::Full(v) => TryPushError::full(v),

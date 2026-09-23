@@ -4,18 +4,26 @@ A Helm chart for deploying [LaminarDB](https://laminardb.dev) (Embedded Streamin
 
 ## 🚀 Quick Start (Standalone / Standalone-Durable)
 
-By default, the chart runs in `single` (standalone) mode.
+By default, the chart runs in `single` (standalone) mode and binds HTTP on all interfaces.
+Non-loopback binds require a console token. Create a secret in the installation namespace:
+
+```bash
+export LAMINAR_CONSOLE_TOKEN="$(openssl rand -hex 32)"
+kubectl create secret generic laminardb-console --from-literal=token="$LAMINAR_CONSOLE_TOKEN"
+```
 
 ```bash
 helm repo add laminardb https://laminardb.io/charts
 helm repo update
-helm install my-laminardb laminardb/laminardb
+helm install my-laminardb laminardb/laminardb \
+  --set laminardb.consoleToken.existingSecret=laminardb-console
 ```
 
 For air-gapped / on-prem clusters, install from a local clone or a packaged tarball:
 ```bash
-helm install my-laminardb deploy/helm/laminardb
-# or: helm package deploy/helm/laminardb && helm install my-laminardb laminardb-*.tgz
+helm install my-laminardb deploy/helm/laminardb \
+  --set laminardb.consoleToken.existingSecret=laminardb-console
+# A packaged chart uses the same --set option.
 ```
 
 ---
@@ -29,6 +37,7 @@ Cluster mode is still pre-production while the open security and operability wor
 1. **Set `laminardb.mode` to `"cluster"`**
 2. **Increase `replicaCount` to `3` (or more)**
 3. **Configure a cluster-shared checkpoint URL**
+4. **Supply the console-token secret created above**
 
 Here is an example cluster values file (`cluster-values.yaml`):
 
@@ -40,6 +49,8 @@ laminardb:
   delivery: at_least_once
   logLevel: info
   keyGroups: 256
+  consoleToken:
+    existingSecret: laminardb-console
   
   checkpoint:
     interval: "30s"
@@ -141,6 +152,11 @@ prometheusRule:
         summary: "LaminarDB instance is down on {{ $labels.pod }}"
 ```
 
+`grafanaDashboard.enabled` installs the separate cluster dashboard. Import the
+[overview dashboard](../../../grafana/laminardb.json) as well for Kafka reader lag and freshness
+panels. See the [monitoring notes](../../../grafana/README.md) for metric semantics and opt-in
+checkpoint progress alerts using the existing `prometheusRule.rules` setting.
+
 ---
 
 ## ⚙️ Configuration Reference
@@ -153,7 +169,7 @@ prometheusRule:
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
 | `laminardb.keyGroups` | Stable hash partitions; one node owns all in single mode and clusters distribute them | `256` |
-| `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
+| `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); required for non-loopback HTTP binds | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or capability-gated `exactly_once` | `best_effort` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
@@ -167,3 +183,10 @@ prometheusRule:
 
 For `at_least_once` or `exactly_once`, a local `file://` checkpoint URL requires
 `persistence.checkpoints.enabled=true`; the chart rejects an ephemeral combination at render time.
+
+An empty console-token secret with the default bind fails server startup. The token is resolved
+from `LAMINAR_CONSOLE_TOKEN` in the pod and never written to the ConfigMap. With `configOverride`,
+include `server.console_token` in the custom TOML and supply its secret through the pod environment.
+Use `Authorization: Bearer <token>` for control-plane requests. Terminate HTTP TLS at a trusted
+proxy and restrict network access to public health/metrics routes; cluster and pgwire TLS settings
+do not protect HTTP.

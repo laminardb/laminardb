@@ -44,6 +44,20 @@ pub enum DbError {
     /// Table already exists
     TableAlreadyExists(String),
 
+    /// A local reference-table update or replacement exceeded its live quota before mutation.
+    ReferenceTableQuotaExceeded {
+        /// Table whose final state was rejected.
+        table: String,
+        /// Projected live row count.
+        rows: usize,
+        /// Projected retained-memory charge.
+        bytes: usize,
+        /// Configured per-table row limit.
+        max_rows: usize,
+        /// Configured per-table retained-memory limit.
+        max_bytes: usize,
+    },
+
     /// Insert error
     InsertError(String),
 
@@ -106,6 +120,23 @@ pub enum DbError {
     /// `BackpressurePolicy::Fail` tripped; coordinator halts the pipeline.
     BackpressureFail(String),
 
+    /// Prospective graph input exceeds a port's retained-byte or batch limit. Operator state
+    /// may already have changed, so the generation halts before output publication or retry.
+    GraphBufferBudgetExceeded {
+        /// Destination operator or source name.
+        node: String,
+        /// Destination input port.
+        port: u8,
+        /// Projected retained batch count, including the rejected input.
+        batches: usize,
+        /// Projected retained Arrow charge, including the rejected input.
+        bytes: usize,
+        /// Configured batch limit; zero disables the count limit.
+        max_batches: usize,
+        /// Configured byte limit; `None` disables the byte limit.
+        max_bytes: Option<usize>,
+    },
+
     /// A cross-node shuffle target isn't reachable yet (cluster formation).
     /// Recoverable — `OperatorGraph::execute_single_operator` defers on it.
     ShuffleNotReady(String),
@@ -150,6 +181,20 @@ pub enum DbError {
 
     /// Materialized view error
     MaterializedView(String),
+
+    /// A local materialized-view update or restore exceeded its live or staging quota.
+    MaterializedViewQuotaExceeded {
+        /// View whose projected state was rejected.
+        view: String,
+        /// Projected live or staged row count (distinct rows for multisets).
+        rows: usize,
+        /// Projected retained-memory charge.
+        bytes: usize,
+        /// Effective per-view row limit for the rejected phase.
+        max_rows: usize,
+        /// Effective per-view byte limit for the rejected phase.
+        max_bytes: usize,
+    },
 
     /// Storage backend error.
     Storage(String),
@@ -228,6 +273,7 @@ impl DbError {
             Self::InsertError(_) => error_codes::CONNECTOR_WRITE_ERROR,
             Self::SchemaMismatch(_) => error_codes::SCHEMA_MISMATCH,
             Self::InvalidOperation(_)
+            | Self::ReferenceTableQuotaExceeded { .. }
             | Self::SubscriptionReplayPruned { .. }
             | Self::SubscriptionEpochNotCommitted { .. }
             | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
@@ -239,13 +285,16 @@ impl DbError {
             Self::Pipeline(_)
             | Self::PipelineTerminal(_)
             | Self::BackpressureFail(_)
+            | Self::GraphBufferBudgetExceeded { .. }
             | Self::ShuffleNotReady(_)
             | Self::ShuffleTerminal(_)
             | Self::ShufflePartialSend(_)
             | Self::StatefulOperatorPartialApply(_) => error_codes::PIPELINE_ERROR,
             Self::ManagedStateBudgetExceeded { .. } => error_codes::MANAGED_STATE_BUDGET_EXCEEDED,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
-            Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
+            Self::MaterializedView(_) | Self::MaterializedViewQuotaExceeded { .. } => {
+                error_codes::MATERIALIZED_VIEW_ERROR
+            }
             Self::Storage(_) => error_codes::WAL_ERROR,
             Self::Config(_) => error_codes::INVALID_CONFIG,
         }
@@ -264,6 +313,7 @@ impl DbError {
             self,
             Self::PipelineTerminal(_)
                 | Self::BackpressureFail(_)
+                | Self::GraphBufferBudgetExceeded { .. }
                 | Self::ShuffleTerminal(_)
                 | Self::ManagedStateBudgetExceeded { .. }
         )
@@ -383,6 +433,40 @@ impl std::fmt::Display for DbError {
             Self::ConnectorOp(e) => {
                 write!(f, "[{}] Connector error: {e}", self.code())
             }
+            Self::Pipeline(_)
+            | Self::PipelineTerminal(_)
+            | Self::BackpressureFail(_)
+            | Self::GraphBufferBudgetExceeded { .. }
+            | Self::ShuffleNotReady(_)
+            | Self::ShuffleTerminal(_)
+            | Self::ShufflePartialSend(_)
+            | Self::StatefulOperatorPartialApply(_)
+            | Self::ReferenceTableQuotaExceeded { .. }
+            | Self::MaterializedViewQuotaExceeded { .. }
+            | Self::ManagedStateBudgetExceeded { .. } => self.fmt_execution_error(f),
+            Self::QueryPipeline {
+                context,
+                translated,
+            } => write!(f, "Stream '{context}': {translated}"),
+            Self::MaterializedView(msg) => {
+                write!(f, "[{}] Materialized view error: {msg}", self.code())
+            }
+            Self::Storage(msg) => {
+                write!(f, "[{}] Storage error: {msg}", self.code())
+            }
+            Self::Config(msg) => {
+                write!(f, "[{}] Config error: {msg}", self.code())
+            }
+            Self::Unsupported(msg) => {
+                write!(f, "[{}] Unsupported: {msg}", self.code())
+            }
+        }
+    }
+}
+
+impl DbError {
+    fn fmt_execution_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())
             }
@@ -392,6 +476,13 @@ impl std::fmt::Display for DbError {
             Self::BackpressureFail(msg) => {
                 write!(f, "[{}] Backpressure fail: {msg}", self.code())
             }
+            Self::GraphBufferBudgetExceeded {
+                node, port, batches, bytes, max_batches, max_bytes,
+            } => write!(
+                f,
+                "[{}] Graph input budget exceeded at '{node}' port {port}: projected={batches} batches/{bytes} bytes, limits={max_batches} batches/{max_bytes:?} bytes; reduce batch size or increase graph input limits; terminal fault resolution is required before restarting",
+                self.code()
+            ),
             Self::ShuffleNotReady(msg) => {
                 write!(f, "[{}] Shuffle target not ready: {msg}", self.code())
             }
@@ -417,22 +508,13 @@ impl std::fmt::Display for DbError {
                 "[{}] Managed state budget exceeded during {context}: accounted={accounted_bytes} bytes, limit={limit_bytes} bytes",
                 self.code()
             ),
-            Self::QueryPipeline {
-                context,
-                translated,
-            } => write!(f, "Stream '{context}': {translated}"),
-            Self::MaterializedView(msg) => {
-                write!(f, "[{}] Materialized view error: {msg}", self.code())
-            }
-            Self::Storage(msg) => {
-                write!(f, "[{}] Storage error: {msg}", self.code())
-            }
-            Self::Config(msg) => {
-                write!(f, "[{}] Config error: {msg}", self.code())
-            }
-            Self::Unsupported(msg) => {
-                write!(f, "[{}] Unsupported: {msg}", self.code())
-            }
+            Self::MaterializedViewQuotaExceeded { view, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Materialized-view '{view}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            Self::ReferenceTableQuotaExceeded { table, rows, bytes, max_rows, max_bytes } => write!(
+                f, "[{}] Reference-table '{table}' quota exceeded: projected={rows} rows/{bytes} bytes, limits={max_rows} rows/{max_bytes} bytes", self.code()
+            ),
+            _ => unreachable!("execution formatting is dispatched only for execution errors"),
         }
     }
 }

@@ -46,7 +46,6 @@ impl StreamingCoordinator {
             && (self.manual_handoff_required || callback.has_runnable_deferred_input());
         let parked_ready =
             !self.replay_pending && gates.compute_admitted() && self.parked_source_msg.is_some();
-        let mut retrying_replay = false;
         let mut checkpoint_control_due = false;
 
         let message = tokio::select! {
@@ -115,13 +114,11 @@ impl StreamingCoordinator {
                 }
                 None
             },
-            () = std::future::ready(()), if replay_ready => {
-                retrying_replay = true;
-                None
-            },
+            () = std::future::ready(()), if replay_ready => None,
             () = std::future::ready(()), if parked_ready => self.parked_source_msg.take(),
             msg = self.rx.recv(),
                 if state.source_channel_expected
+                    && !self.replay_pending
                     && gates.compute_admitted() =>
             {
                 if let Ok(message) = msg {
@@ -167,7 +164,6 @@ impl StreamingCoordinator {
 
         CoordinatorWait::cycle(CoordinatorWake {
             message,
-            retrying_replay,
             checkpoint_control_due,
             gates,
         })
@@ -405,7 +401,6 @@ impl StreamingCoordinator {
             }
             let CoordinatorWake {
                 message: msg,
-                retrying_replay,
                 checkpoint_control_due,
                 gates,
             } = wait.wake;
@@ -449,7 +444,7 @@ impl StreamingCoordinator {
 
             self.source_batches_buf.clear();
             self.reset_barrier_seen_for_cycle();
-            if !retrying_replay && !self.replay_pending {
+            if !self.replay_pending {
                 self.discard_pending_offsets();
             }
             state.barriers.clear();
@@ -480,7 +475,7 @@ impl StreamingCoordinator {
                 break;
             }
 
-            // Coalesce additional buffered messages; stop at count, time budget, or backpressure.
+            // Replay keeps its pinned frontiers and cursors; newer input stays in the source FIFO.
             let mut drain_count = 0;
             let drain_budget = Duration::from_nanos(self.config.drain_budget_ns);
             // `is_backpressured()` bumps a counter, so call it only on active wakeups rather than
@@ -489,7 +484,8 @@ impl StreamingCoordinator {
             if backpressured {
                 tracing::debug!("operator graph backpressured — skipping drain");
             }
-            while !backpressured
+            while !self.replay_pending
+                && !backpressured
                 && drain_count < MAX_DRAIN_PER_CYCLE
                 && cycle_start.elapsed() < drain_budget
             {

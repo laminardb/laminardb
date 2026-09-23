@@ -1,6 +1,9 @@
 //! Primary-key-based reference table store for dimension/enrichment tables.
 #![allow(clippy::disallowed_types)] // cold path
 
+#[cfg(feature = "benchmark-internals")]
+pub(crate) mod benchmark;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -11,7 +14,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::row::{RowConverter, SortField};
 
 use crate::error::DbError;
-use crate::table_rows::TableRows;
+use crate::table_rows::{TableLimits, TableRows, TableUpdate};
 
 pub(crate) const REFERENCE_TABLE_CHECKPOINT_KEY: &str = "__laminar_reference_tables";
 const REFERENCE_TABLE_CHECKPOINT_VERSION: u16 = 2;
@@ -216,6 +219,7 @@ pub(crate) struct PreparedTableSnapshot {
 
 pub(crate) struct TableStore {
     tables: HashMap<String, TableState>,
+    limits: TableLimits,
 }
 
 fn checkpoint_capture_size_overflow(name: &str) -> DbError {
@@ -246,7 +250,8 @@ fn decode_checkpoint_batches(
     name: &str,
     ipc: &[u8],
     expected_rows: usize,
-) -> Result<Vec<RecordBatch>, DbError> {
+    mut accept: impl FnMut(RecordBatch) -> Result<(), DbError>,
+) -> Result<(), DbError> {
     if ipc.is_empty() || ipc.len() > MAX_REFERENCE_TABLE_CHECKPOINT_BYTES {
         return Err(DbError::Checkpoint(format!(
             "reference-table '{name}' IPC length {} is invalid",
@@ -261,14 +266,15 @@ fn decode_checkpoint_batches(
     let max_batches = expected_rows
         .div_ceil(REFERENCE_TABLE_CHECKPOINT_CHUNK_ROWS)
         .max(1);
-    let mut batches = Vec::with_capacity(max_batches);
+    let mut batch_count = 0;
+    let mut decoded_rows = 0usize;
     for batch in &mut reader {
         let batch = batch.map_err(|error| {
             DbError::Checkpoint(format!(
                 "reference-table '{name}' IPC batch is invalid: {error}"
             ))
         })?;
-        if batches.len() == max_batches {
+        if batch_count == max_batches {
             return Err(DbError::Checkpoint(format!(
                 "reference-table '{name}' IPC contains more than {max_batches} batches"
             )));
@@ -278,25 +284,43 @@ fn decode_checkpoint_batches(
                 "reference-table '{name}' IPC contains an unexpected empty batch"
             )));
         }
-        batches.push(batch);
+        decoded_rows = decoded_rows.checked_add(batch.num_rows()).ok_or_else(|| {
+            DbError::Checkpoint("reference-table checkpoint row count overflow".into())
+        })?;
+        if decoded_rows > expected_rows {
+            return Err(DbError::Checkpoint(format!(
+                "reference-table '{name}' row count mismatch: archive says {expected_rows}, IPC contains at least {decoded_rows}"
+            )));
+        }
+        accept(batch)?;
+        batch_count += 1;
     }
-    if batches.is_empty() {
+    if batch_count == 0 {
         return Err(DbError::Checkpoint(format!(
             "reference-table '{name}' IPC contains no record batch"
         )));
     }
-    if expected_rows == 0 && (batches.len() != 1 || batches[0].num_rows() != 0) {
+    if decoded_rows != expected_rows {
         return Err(DbError::Checkpoint(format!(
-            "reference-table '{name}' empty checkpoint has an invalid batch inventory"
+            "reference-table '{name}' row count mismatch: archive says {expected_rows}, IPC contains {decoded_rows}"
         )));
     }
-    Ok(batches)
+    Ok(())
 }
 
 impl TableStore {
+    #[cfg(any(test, feature = "benchmark-internals"))]
     pub fn new() -> Self {
+        Self::from_config(&crate::LaminarConfig::default())
+    }
+
+    pub fn from_config(config: &crate::LaminarConfig) -> Self {
         Self {
             tables: HashMap::new(),
+            limits: TableLimits {
+                rows: config.reference_table_max_rows,
+                bytes: config.reference_table_max_bytes,
+            },
         }
     }
 
@@ -412,12 +436,12 @@ impl TableStore {
         for batch in batches {
             validate_batch_contract(name, state, batch)?;
         }
-        let rows = TableRows::from_batches(batches, state.pk_index, &state.key_converter).map_err(
-            |error| {
-                DbError::Storage(format!(
-                    "reference-table '{name}' snapshot key validation failed: {error}"
-                ))
-            },
+        let rows = TableRows::from_batches(
+            name,
+            batches,
+            state.pk_index,
+            &state.key_converter,
+            self.limits,
         )?;
         let row_count = rows.row_count();
 
@@ -439,40 +463,18 @@ impl TableStore {
     ) -> Result<(), DbError> {
         let mut names = HashSet::with_capacity(snapshots.len());
         for snapshot in &snapshots {
+            self.limits.validate(
+                &snapshot.name,
+                snapshot.row_count,
+                snapshot.rows.retained_bytes(),
+            )?;
             if !names.insert(snapshot.name.as_str()) {
                 return Err(DbError::InvalidOperation(format!(
                     "reference-table snapshot '{}' is duplicated",
                     snapshot.name
                 )));
             }
-            let state = self
-                .tables
-                .get(&snapshot.name)
-                .ok_or_else(|| DbError::TableNotFound(snapshot.name.clone()))?;
-            if state.schema.as_ref() != snapshot.schema.as_ref() {
-                return Err(DbError::SchemaMismatch(format!(
-                    "reference-table '{}' changed schema while its snapshot was prepared",
-                    snapshot.name
-                )));
-            }
-            if state.primary_key != snapshot.primary_key {
-                return Err(DbError::SchemaMismatch(format!(
-                    "reference-table '{}' changed primary key while its snapshot was prepared",
-                    snapshot.name
-                )));
-            }
-            if !std::sync::Arc::ptr_eq(&state.identity, &snapshot.table_identity) {
-                return Err(DbError::InvalidOperation(format!(
-                    "reference-table '{}' was replaced while its snapshot was prepared",
-                    snapshot.name
-                )));
-            }
-            if snapshot.rows.row_count() != snapshot.row_count {
-                return Err(DbError::Storage(format!(
-                    "reference-table '{}' prepared snapshot row count is inconsistent",
-                    snapshot.name
-                )));
-            }
+            self.validate_snapshot_contract(snapshot)?;
         }
 
         for snapshot in snapshots {
@@ -485,6 +487,61 @@ impl TableStore {
             state.ready = true;
         }
         Ok(())
+    }
+
+    /// Append a source batch to a bounded candidate without retaining a separate input list.
+    pub(crate) fn extend_snapshot(
+        &self,
+        snapshot: &mut PreparedTableSnapshot,
+        batch: &RecordBatch,
+    ) -> Result<(), DbError> {
+        let state = self.validate_snapshot_contract(snapshot)?;
+        validate_batch_contract(&snapshot.name, state, batch)?;
+        snapshot.rows.apply_batch(
+            &snapshot.name,
+            batch,
+            state.pk_index,
+            &state.key_converter,
+            self.limits,
+            TableUpdate::Snapshot,
+        )?;
+        snapshot.row_count = snapshot.rows.row_count();
+        Ok(())
+    }
+
+    fn validate_snapshot_contract(
+        &self,
+        snapshot: &PreparedTableSnapshot,
+    ) -> Result<&TableState, DbError> {
+        let state = self
+            .tables
+            .get(&snapshot.name)
+            .ok_or_else(|| DbError::TableNotFound(snapshot.name.clone()))?;
+        if state.schema.as_ref() != snapshot.schema.as_ref() {
+            return Err(DbError::SchemaMismatch(format!(
+                "reference-table '{}' changed schema while its snapshot was prepared",
+                snapshot.name
+            )));
+        }
+        if state.primary_key != snapshot.primary_key {
+            return Err(DbError::SchemaMismatch(format!(
+                "reference-table '{}' changed primary key while its snapshot was prepared",
+                snapshot.name
+            )));
+        }
+        if !std::sync::Arc::ptr_eq(&state.identity, &snapshot.table_identity) {
+            return Err(DbError::InvalidOperation(format!(
+                "reference-table '{}' was replaced while its snapshot was prepared",
+                snapshot.name
+            )));
+        }
+        if snapshot.rows.row_count() != snapshot.row_count {
+            return Err(DbError::Storage(format!(
+                "reference-table '{}' prepared snapshot row count is inconsistent",
+                snapshot.name
+            )));
+        }
+        Ok(state)
     }
 
     fn checkpoint_capture_estimated_bytes(&self) -> Result<u64, DbError> {
@@ -691,43 +748,7 @@ impl TableStore {
                     entry.name
                 )));
             }
-            let batches = decode_checkpoint_batches(&entry.name, &entry.ipc, row_count)?;
-            let decoded_rows = batches.iter().try_fold(0usize, |total, batch| {
-                total.checked_add(batch.num_rows()).ok_or_else(|| {
-                    DbError::Checkpoint("reference-table checkpoint row count overflow".into())
-                })
-            })?;
-            if decoded_rows != row_count {
-                return Err(DbError::Checkpoint(format!(
-                    "reference-table '{}' row count mismatch: archive says {row_count}, IPC contains {}",
-                    entry.name,
-                    decoded_rows
-                )));
-            }
-            for batch in &batches {
-                if batch.schema().as_ref() != state.schema.as_ref() {
-                    return Err(DbError::Checkpoint(format!(
-                        "reference-table '{}' checkpoint schema differs from the catalog schema",
-                        entry.name
-                    )));
-                }
-                for (index, field) in state.schema.fields().iter().enumerate() {
-                    if !field.is_nullable() && batch.column(index).null_count() != 0 {
-                        return Err(DbError::Checkpoint(format!(
-                            "reference-table '{}' checkpoint contains NULL values in non-nullable column '{}'",
-                            entry.name,
-                            field.name()
-                        )));
-                    }
-                }
-            }
-            let rows = TableRows::from_batches(&batches, state.pk_index, &state.key_converter)
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "reference-table '{}' checkpoint key validation failed: {error}",
-                        entry.name
-                    ))
-                })?;
+            let rows = restore_rows(&entry.name, &entry.ipc, row_count, state, self.limits)?;
             replacements.insert(entry.name, (rows, row_count));
         }
 
@@ -747,7 +768,7 @@ impl TableStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the table does not exist.
+    /// Returns an error for an unknown table, invalid batch or exceeded live quota.
     pub fn upsert(&mut self, name: &str, batch: &RecordBatch) -> Result<usize, DbError> {
         let state = self
             .tables
@@ -755,26 +776,16 @@ impl TableStore {
             .ok_or_else(|| DbError::TableNotFound(name.to_string()))?;
 
         validate_batch_contract(name, state, batch)?;
-        let pk_col = batch.column(state.pk_index);
-        let keys = state
-            .key_converter
-            .convert_columns(&[std::sync::Arc::clone(pk_col)])
-            .map_err(|error| {
-                DbError::InsertError(format!(
-                    "failed to encode primary key for table '{name}': {error}"
-                ))
-            })?;
-        let count = batch.num_rows();
-
-        for i in 0..count {
-            let row = batch.slice(i, 1);
-            let existed = state.rows.put(keys.row(i).owned(), row);
-            if !existed {
-                state.row_count += 1;
-            }
-        }
-
-        Ok(count)
+        state.rows.apply_batch(
+            name,
+            batch,
+            state.pk_index,
+            &state.key_converter,
+            self.limits,
+            TableUpdate::Upsert,
+        )?;
+        state.row_count = state.rows.row_count();
+        Ok(batch.num_rows())
     }
 
     pub fn to_record_batch(&self, name: &str) -> Result<Option<RecordBatch>, DbError> {
@@ -783,6 +794,35 @@ impl TableStore {
         };
         state.rows.to_record_batch(&state.schema)
     }
+}
+
+fn restore_rows(
+    name: &str,
+    ipc: &[u8],
+    row_count: usize,
+    state: &TableState,
+    limits: TableLimits,
+) -> Result<TableRows, DbError> {
+    limits.validate(name, row_count, 0)?;
+    let mut rows = TableRows::new();
+    decode_checkpoint_batches(name, ipc, row_count, |batch| {
+        validate_batch_contract(name, state, &batch)?;
+        rows.apply_batch(
+            name,
+            &batch,
+            state.pk_index,
+            &state.key_converter,
+            limits,
+            TableUpdate::Snapshot,
+        )
+    })
+    .map_err(|error| match error {
+        DbError::ReferenceTableQuotaExceeded { .. } => error,
+        _ => DbError::Checkpoint(format!(
+            "reference-table '{name}' checkpoint key validation failed: {error}"
+        )),
+    })?;
+    Ok(rows)
 }
 
 fn validate_batch_contract(
@@ -812,3 +852,6 @@ fn validate_batch_contract(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod quota_tests;

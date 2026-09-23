@@ -267,14 +267,56 @@ pub(crate) async fn send_shuffle_plan_retaining(
     (result, retry_plan)
 }
 
-/// Re-execute a cached physical plan without re-planning; source leaves are swapped per cycle.
+/// Prepare a physical plan for repeated execution over live source leaves.
+pub(crate) async fn create_cached_physical_plan(
+    ctx: &SessionContext,
+    logical: &datafusion_expr::LogicalPlan,
+) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::datasource::physical_plan::FileScanConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_plan::recursive_query::RecursiveQueryExec;
+
+    // DataFusion 53.1 cannot reconnect recursive work tables or pushed dynamic filters on reset.
+    let mut state = ctx.state();
+    state.config_mut().options_mut().set(
+        "datafusion.optimizer.enable_dynamic_filter_pushdown",
+        "false",
+    )?;
+    let physical = state.create_physical_plan(logical).await?;
+    physical.apply(|plan| {
+        if plan.as_any().is::<RecursiveQueryExec>() {
+            return datafusion::common::not_impl_err!(
+                "recursive queries cannot use cached streaming execution"
+            );
+        }
+        // DataSourceExec returns itself on reset; file-source metrics would keep accumulating.
+        if plan
+            .as_any()
+            .downcast_ref::<DataSourceExec>()
+            .is_some_and(|scan| scan.data_source().as_any().is::<FileScanConfig>())
+        {
+            return datafusion::common::not_impl_err!(
+                "file scans cannot use cached streaming execution; use a connector source"
+            );
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(physical)
+}
+
+/// Execute a fresh copy of cached plan state; source leaves remain shared across cycles.
 /// Takes a cached `task_ctx` — `SessionContext::task_ctx()` clones the function registries.
 pub(crate) async fn execute_cached_physical(
     task_ctx: Arc<TaskContext>,
     op_name: &str,
     physical: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>, DbError> {
-    datafusion::physical_plan::collect(Arc::clone(physical), task_ctx)
+    // Keep the template unexecuted so metrics and build-side state die with each execution,
+    // including execution errors and cancellation.
+    let plan = datafusion::physical_plan::execution_plan::reset_plan_states(Arc::clone(physical))
+        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
+    datafusion::physical_plan::collect(plan, task_ctx)
         .await
         .map_err(|e| DbError::query_pipeline(op_name, &e))
 }
@@ -333,9 +375,7 @@ impl LiveSqlCache {
             .map_err(|e| DbError::Pipeline(format!("{what} plan: {e}")))?
             .logical_plan()
             .clone();
-        let physical = ctx
-            .state()
-            .create_physical_plan(&logical)
+        let physical = create_cached_physical_plan(ctx, &logical)
             .await
             .map_err(|e| DbError::Pipeline(format!("{what} physical: {e}")))?;
         let task_ctx = ctx.task_ctx();

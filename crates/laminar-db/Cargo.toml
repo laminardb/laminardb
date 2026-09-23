@@ -32,11 +32,13 @@ delta-lake = ["laminar-connectors/delta-lake"]
 websocket = ["laminar-connectors/websocket"]
 mongodb-cdc = ["laminar-connectors/mongodb-cdc"]
 iceberg = ["laminar-connectors/iceberg"]
-delta-lake-s3 = ["laminar-connectors/delta-lake-s3"]
-delta-lake-azure = ["laminar-connectors/delta-lake-azure"]
-delta-lake-gcs = ["laminar-connectors/delta-lake-gcs"]
-delta-lake-unity = ["laminar-connectors/delta-lake-unity"]
-delta-lake-glue = ["laminar-connectors/delta-lake-glue"]
+iceberg-gcs = ["laminar-connectors/iceberg-gcs"]
+iceberg-azure = ["laminar-connectors/iceberg-azure"]
+delta-lake-s3 = ["delta-lake", "laminar-connectors/delta-lake-s3"]
+delta-lake-azure = ["delta-lake", "laminar-connectors/delta-lake-azure"]
+delta-lake-gcs = ["delta-lake", "laminar-connectors/delta-lake-gcs"]
+delta-lake-unity = ["delta-lake", "laminar-connectors/delta-lake-unity"]
+delta-lake-glue = ["delta-lake", "laminar-connectors/delta-lake-glue"]
 delta-lake-all = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue"]
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
@@ -48,13 +50,16 @@ benchmark-internals = ["cluster"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
+checkpoint-aws = ["aws"]
+checkpoint-gcs = ["gcs"]
+checkpoint-azure = ["azure"]
 remote = ["dep:reqwest", "dep:governor"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.30.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.30.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false }
+laminar-core = { path = "../laminar-core", version = "0.31.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.31.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 quick_cache = { workspace = true }
@@ -63,7 +68,7 @@ governor = { version = "0.8", optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
-hf-hub = { version = "0.4", default-features = false, features = [
+hf-hub = { version = "0.5", default-features = false, features = [
     "tokio",
     "rustls-tls",
 ], optional = true }
@@ -145,8 +150,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.30.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.30.0", default-features = false, features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.31.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false, features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -163,6 +168,16 @@ object_store = { workspace = true, features = ["aws"] }
 [[bench]]
 name = "recovery_bench"
 harness = false
+
+[[bench]]
+name = "reference_table_bench"
+harness = false
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "materialized_view_bench"
+harness = false
+required-features = ["benchmark-internals"]
 
 [[bench]]
 name = "stream_executor_bench"

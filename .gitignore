@@ -50,6 +50,9 @@ checkpoints/
 wal/
 /tools/*
 !/tools/check_analytical_dependencies.py
+!/tools/check_dependency_exceptions.py
+!/tools/test_dependency_exceptions.py
+!/tools/run_workload_qualification.py
 !/tools/independent-soak-contract/
 !/tools/kafka-transaction-probe/
 !/tools/readability-check/
@@ -62,6 +65,8 @@ AGENTS.md
 .claude/
 docs/architecture/
 docs/adr/
+/docs/private-archive/
+/docs/private-decisions/
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
@@ -79,12 +84,14 @@ agent_handoff.json
 agent_rules.md
 .subtask3-report.md
 /target_new
+gha-creds-*.json
 
 # Machine-local cargo config (linker overrides etc.)
 /.cargo/config.toml
 
 # Vendored library packages use the workspace lockfile.
 /vendor/*/Cargo.lock
+!/vendor/quick-xml/Cargo.lock
 /examples/binance-ws/target
 /examples/binance-ws/target/debug
 /examples/binance-ws/target

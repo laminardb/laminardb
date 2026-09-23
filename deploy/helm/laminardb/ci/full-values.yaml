@@ -4,6 +4,8 @@ laminardb:
   mode: cluster
   delivery: at_least_once
   logLevel: debug
+  consoleToken:
+    existingSecret: laminardb-console
   checkpoint:
     interval: "30s"
     timeout: "120s"

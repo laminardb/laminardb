@@ -8,6 +8,14 @@ pub enum StreamingError {
     /// Channel is full and backpressure strategy is Error.
     ChannelFull,
 
+    /// A single Arrow batch exceeds the source's entire byte budget.
+    BatchTooLarge {
+        /// Charged retained Arrow bytes.
+        bytes: usize,
+        /// Configured per-source limit.
+        limit: usize,
+    },
+
     /// Channel is closed (all receivers dropped).
     ChannelClosed,
 
@@ -36,6 +44,12 @@ impl fmt::Display for StreamingError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ChannelFull => write!(f, "channel is full"),
+            Self::BatchTooLarge { bytes, limit } => {
+                write!(
+                    f,
+                    "Arrow batch retains {bytes} bytes, exceeding source limit {limit}"
+                )
+            }
             Self::ChannelClosed => write!(f, "channel is closed"),
             Self::Disconnected => write!(f, "channel is disconnected"),
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),

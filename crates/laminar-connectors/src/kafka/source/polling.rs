@@ -54,6 +54,9 @@ impl KafkaSource {
         self.poll_staged_offsets.clear();
 
         self.metrics.record_poll(num_rows as u64, total_bytes);
+        if let Some(progress) = &self.progress {
+            progress.record_batch(num_rows);
+        }
         debug!(
             records = num_rows,
             bytes = total_bytes,

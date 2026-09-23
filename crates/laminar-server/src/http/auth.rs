@@ -8,6 +8,9 @@ use std::sync::Arc;
 #[cfg(feature = "cluster")]
 use std::time::Instant;
 
+#[cfg(feature = "cluster")]
+use crate::cluster::OBJECT_STORE_CONTROL_IO_TIMEOUT;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 #[cfg(feature = "cluster")]
@@ -92,7 +95,10 @@ pub(super) const DIAGNOSTIC_READ_MAX_STARTS_PER_WINDOW: usize = 8;
 pub(super) const DIAGNOSTIC_READ_RATE_WINDOW: std::time::Duration =
     std::time::Duration::from_secs(1);
 #[cfg(feature = "cluster")]
-pub(super) const DIAGNOSTIC_READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+// INVARIANT: a durable local-evidence read may consume the full control-I/O bound. The outer
+// deadline must still leave time for the handler to return its typed unavailable response.
+pub(super) const DIAGNOSTIC_READ_DEADLINE: std::time::Duration =
+    OBJECT_STORE_CONTROL_IO_TIMEOUT.saturating_add(std::time::Duration::from_secs(1));
 
 #[cfg(feature = "cluster")]
 pub(crate) struct DiagnosticRateWindow {
@@ -282,14 +288,17 @@ fn secret_matches(presented: &str, expected: &Secret) -> bool {
     presented.len() == expected.len() && ct_eq(presented, expected)
 }
 
-/// Extract and percent-decode the `token` query parameter, if present. Browser
-/// WebSocket clients URL-encode the value, so it must be decoded before the
-/// constant-time comparison.
+/// Extract and percent-decode exactly one `token` query parameter. Browser WebSocket clients
+/// URL-encode the value, so it must be decoded before the constant-time comparison.
 pub(super) fn query_token(uri: &axum::http::Uri) -> Option<String> {
-    let raw = uri.query()?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
+    let mut tokens = uri.query()?.split('&').filter_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (key == "token").then_some(value)
-    })?;
+    });
+    let raw = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
     Some(
         percent_encoding::percent_decode_str(raw)
             .decode_utf8_lossy()

@@ -99,6 +99,66 @@ fn registration(name: &str) -> TableRegistration {
 }
 
 #[tokio::test]
+async fn over_limit_snapshot_stops_polling_closes_every_source_and_preserves_live_tables() {
+    let mut store = TableStore::from_config(&crate::LaminarConfig {
+        reference_table_max_rows: 1,
+        ..Default::default()
+    });
+    for name in ["a", "b"] {
+        store.create_table(name, schema(), "id").unwrap();
+        store.upsert(name, &batch(9, "old")).unwrap();
+    }
+    store.set_ready("a", true);
+    let store = parking_lot::RwLock::new(store);
+    let polls_a = Arc::new(AtomicUsize::new(0));
+    let polls_b = Arc::new(AtomicUsize::new(0));
+    let closes = Arc::new(AtomicUsize::new(0));
+    let sources = vec![
+        runtime_source(
+            "a",
+            polls_a.clone(),
+            closes.clone(),
+            vec![batch(1, "new")],
+            false,
+            false,
+        ),
+        runtime_source(
+            "b",
+            polls_b.clone(),
+            closes.clone(),
+            vec![
+                batch(2, "first"),
+                batch(3, "overflow"),
+                batch(4, "never polled"),
+            ],
+            false,
+            true,
+        ),
+    ];
+    let error = hydrate_reference_table_sources(sources, &store)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::DbError::ReferenceTableQuotaExceeded { ref table, .. } if table == "b")
+    );
+    assert_eq!(polls_a.load(Ordering::SeqCst), 2);
+    assert_eq!(polls_b.load(Ordering::SeqCst), 2);
+    assert_eq!(closes.load(Ordering::SeqCst), 2);
+    let store = store.read();
+    for name in ["a", "b"] {
+        let snapshot = store.to_record_batch(name).unwrap().unwrap();
+        let values = snapshot
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "old");
+    }
+    assert!(store.is_ready("a"));
+    assert!(!store.is_ready("b"));
+}
+
+#[tokio::test]
 async fn complete_table_restore_skips_source_construction() {
     let mut table_store = TableStore::new();
     table_store.create_table("t", schema(), "id").unwrap();

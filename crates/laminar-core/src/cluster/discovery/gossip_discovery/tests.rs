@@ -418,6 +418,51 @@ async fn zero_process_generation_is_rejected_before_start() {
 }
 
 #[tokio::test]
+async fn gossip_preserves_v0_wire_format_and_cluster_isolation() {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let config = GossipDiscoveryConfig {
+        cluster_id: "compat".into(),
+        gossip_address: "127.0.0.1:0".into(),
+        seed_nodes: vec![peer.local_addr().unwrap().to_string()],
+        gossip_interval: Duration::from_millis(50),
+        ..GossipDiscoveryConfig::default()
+    };
+    let mut discovery = GossipDiscovery::new(config);
+    discovery.start().await.unwrap();
+
+    let mut buffer = [0; 65_507];
+    let (size, sender) = tokio::time::timeout(Duration::from_secs(3), peer.recv_from(&mut buffer))
+        .await
+        .expect("discovery must initiate gossip with its seed")
+        .unwrap();
+    // Chitchat 0.10.1 wire vectors: magic, V0, message kind, empty digest, cluster ID.
+    assert!(size > 4);
+    assert_eq!(&buffer[..4], &[0x53, 0xb0, 0, 0]);
+    for (syn, response_kind) in [
+        (&b"\x53\xb0\x00\x00\x00\x00\x06\x00compat"[..], 1),
+        (&b"\x53\xb0\x00\x00\x00\x00\x05\x00other"[..], 3),
+    ] {
+        peer.send_to(syn, sender).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (size, from) = peer.recv_from(&mut buffer).await.unwrap();
+                assert_eq!(from, sender);
+                assert!(size >= 4);
+                assert_eq!(&buffer[..3], &[0x53, 0xb0, 0]);
+                if buffer[3] == response_kind {
+                    break;
+                }
+                assert_eq!(buffer[3], 0, "only scheduled SYNs may precede the reply");
+            }
+        })
+        .await
+        .expect("discovery must reply in the legacy wire format");
+    }
+    assert!(discovery.peers().await.unwrap().is_empty());
+    discovery.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn drop_cancels_membership_and_chitchat_tasks() {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();

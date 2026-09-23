@@ -4,14 +4,14 @@ use super::source_actor::SourceActorSpawner;
 #[cfg(all(test, feature = "cluster"))]
 use super::OwnedConnectorTaskFences;
 use super::{
-    admit_append_only_source, mpsc, run_source_operation, schema_has_reserved_mutation_columns,
+    admit_append_only_source, run_source_operation, schema_has_reserved_mutation_columns,
     start_source_once, Arc, AtomicU64, CheckpointAttempt, CheckpointBarrier,
     ConnectorCancellationPolicy, ControlMsgRx, DbError, DeliveryGuarantee, Duration, FxHashMap,
     FxHashSet, Instant, OwnedSourceTasks, PendingBarrier, PipelineConfig, PreparedSourceGeneration,
-    SourceCheckpoint, SourceConsistency, SourceInputMode, SourceMsg, SourceOperationOutcome,
-    SourcePosition, SourceRegistration, SourceRowPositionCapability, SourceStart,
-    SourceStartFailure, SourceStartOutcome, SourceTaskLease, StreamingCoordinator,
-    StreamingCoordinatorRuntime, TrackedSourceRegistration,
+    SourceCheckpoint, SourceConsistency, SourceInputMode, SourceOperationOutcome, SourcePosition,
+    SourceRegistration, SourceRowPositionCapability, SourceStart, SourceStartFailure,
+    SourceStartOutcome, SourceTaskLease, StreamingCoordinator, StreamingCoordinatorRuntime,
+    TrackedSourceRegistration,
 };
 #[cfg(feature = "cluster")]
 use super::{
@@ -376,6 +376,8 @@ impl StreamingCoordinator {
                 "[LDB-0010] channel_capacity must be > 0".into(),
             ));
         }
+        crate::config::validate_source_queue_max_bytes(config.source_queue_max_bytes)
+            .map_err(|error| DbError::Config(error.into()))?;
 
         #[cfg(feature = "cluster")]
         if runtime_mode.is_cluster() {
@@ -673,7 +675,8 @@ impl StreamingCoordinator {
         )
         .await?;
         let source_count = prepared_sources.len();
-        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(config.channel_capacity);
+        let (tx, rx) =
+            super::source_channel::channel(config.channel_capacity, config.source_queue_max_bytes);
         let (source_fault_tx, source_fault_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut source_handles = Vec::with_capacity(source_count);
         let mut source_names = Vec::with_capacity(source_count);

@@ -158,3 +158,69 @@ fn test_removed_sink_mode_option_is_rejected() {
         assert!(error.to_string().contains("option 'mode' was removed"));
     }
 }
+
+#[test]
+fn remote_source_and_sink_urls_fail_before_filesystem_io() {
+    for location in [
+        "s3://bucket/path",
+        "s3a://bucket/path",
+        "gs://bucket/path",
+        "gcs://bucket/path",
+        "az://container/path",
+        "abfss://filesystem@account.dfs.core.windows.net/path",
+        "wasbs://container@account.blob.core.windows.net/path",
+        "https://storage.example/path",
+    ] {
+        let mut source = ConnectorConfig::new("files");
+        source.set("path", location);
+        source.set("format", "json");
+        let source_error = FileSourceConfig::from_connector_config(&source).unwrap_err();
+        assert!(source_error
+            .to_string()
+            .contains("remote Files connector backends are not enabled"));
+
+        let mut sink = ConnectorConfig::new("files");
+        sink.set("path", location);
+        sink.set("format", "parquet");
+        let sink_error = FileSinkConfig::from_connector_config(&sink).unwrap_err();
+        assert!(sink_error
+            .to_string()
+            .contains("remote Files connector backends are not enabled"));
+    }
+}
+
+#[test]
+fn signed_remote_file_url_is_rejected_without_echoing_query_material() {
+    let mut config = ConnectorConfig::new("files");
+    config.set(
+        "path",
+        "az://container/path?sv=1&sig=do-not-echo-signed-secret",
+    );
+    config.set("format", "json");
+    let error = FileSourceConfig::from_connector_config(&config).unwrap_err();
+    assert!(!error.to_string().contains("do-not-echo-signed-secret"));
+    assert!(error.to_string().contains("query parameters"));
+}
+
+#[test]
+fn absolute_file_url_is_normalized_to_a_local_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let file_url = url::Url::from_directory_path(directory.path())
+        .unwrap()
+        .to_string();
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", &file_url);
+    config.set("format", "csv");
+    let parsed = FileSourceConfig::from_connector_config(&config).unwrap();
+    assert_eq!(std::path::Path::new(&parsed.path), directory.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn absolute_local_path_with_url_like_component_remains_local() {
+    let mut config = ConnectorConfig::new("files");
+    config.set("path", "/tmp/url://component/data");
+    config.set("format", "json");
+    let parsed = FileSourceConfig::from_connector_config(&config).unwrap();
+    assert_eq!(parsed.path, "/tmp/url://component/data");
+}

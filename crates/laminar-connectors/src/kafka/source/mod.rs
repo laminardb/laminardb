@@ -51,6 +51,7 @@ mod drain;
 mod lifecycle;
 mod metadata;
 mod polling;
+mod progress;
 mod reader;
 mod startup;
 
@@ -83,6 +84,7 @@ use metadata::{
     fetch_explicit_topic_metadata, fetch_partition_low_watermarks, fetch_partition_watermarks,
     resolve_timestamp_offsets,
 };
+use progress::KafkaProgress;
 
 /// Kafka source connector that consumes messages and produces Arrow batches.
 ///
@@ -111,6 +113,8 @@ pub struct KafkaSource {
     offsets: OffsetTracker,
     state: ConnectorState,
     metrics: KafkaSourceMetrics,
+    metrics_registry: Option<prometheus::Registry>,
+    progress: Option<KafkaProgress>,
     schema: SchemaRef,
     channel_len: Arc<AtomicUsize>,
     rebalance_state: Arc<Mutex<RebalanceState>>,
@@ -204,6 +208,9 @@ pub struct KafkaSource {
 
 impl KafkaSource {
     /// Creates a new Kafka source connector with explicit schema.
+    ///
+    /// Named progress telemetry requires a registry and `laminar.source.name` in the fully
+    /// resolved startup configuration. The database supplies this identity automatically.
     #[must_use]
     pub fn new(
         schema: SchemaRef,
@@ -276,6 +283,8 @@ impl KafkaSource {
             offsets: OffsetTracker::new(),
             state: ConnectorState::Created,
             metrics: KafkaSourceMetrics::new(registry),
+            metrics_registry: registry.cloned(),
+            progress: None,
             schema,
             channel_len,
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
@@ -347,6 +356,7 @@ impl KafkaSource {
 
     fn fail_startup(&mut self) {
         self.state = ConnectorState::Failed;
+        self.progress = None;
         self.blocking_tasks.retire();
         self.blocking_tasks.ensure_reaper();
         if let Some(consumer) = self.consumer.take() {
@@ -461,6 +471,7 @@ impl KafkaSource {
 
 impl Drop for KafkaSource {
     fn drop(&mut self) {
+        self.progress = None;
         if let Some(shutdown) = self.reader_shutdown.take() {
             let _ = shutdown.send(true);
         }

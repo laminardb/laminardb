@@ -5571,7 +5571,7 @@ async fn checkpoint_drain_bypasses_query_budget_and_emits_each_row_once() {
     graph.set_query_budget_ns(1);
 
     let batch = test_batch();
-    let expected_edge_bytes = batch.get_array_memory_size();
+    let expected_edge_bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
     let mut sources = FxHashMap::default();
     sources.insert(Arc::from("trades"), vec![batch]);
 
@@ -5643,7 +5643,7 @@ async fn checkpoint_drain_accounting_includes_deferred_source_ports() {
     graph.set_query_budget_ns(1);
 
     let batch = test_batch();
-    let batch_bytes = batch.get_array_memory_size();
+    let batch_bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
     let mut sources = FxHashMap::default();
     sources.insert(Arc::from("source_a"), vec![batch.clone()]);
     sources.insert(Arc::from("source_b"), vec![batch]);
@@ -5651,6 +5651,11 @@ async fn checkpoint_drain_accounting_includes_deferred_source_ports() {
     let normal = graph.execute_cycle(&sources, 10, None).await.unwrap();
     assert!(normal.is_empty());
     assert_eq!(graph.input_bufs[source_b][0].len(), 1);
+    assert_eq!(
+        graph.output_watermarks[source_b],
+        i64::MIN,
+        "the time-budget deferral must retain the source frontier with its input"
+    );
     assert_eq!(
         graph.checkpoint_pending_input_bytes(),
         batch_bytes.saturating_mul(2),
@@ -5683,9 +5688,10 @@ async fn checkpoint_drain_quiescence_detects_zero_byte_row_batch() {
         RecordBatch::try_new_with_options(Arc::new(Schema::empty()), Vec::new(), &options).unwrap();
     assert_eq!(zero_byte_rows.num_rows(), 3);
     assert_eq!(zero_byte_rows.get_array_memory_size(), 0);
+    let retained = laminar_core::streaming::retained_arrow_bytes(&zero_byte_rows);
     prefill_port(&mut graph, output, 0, vec![zero_byte_rows]);
 
-    assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+    assert_eq!(graph.checkpoint_pending_input_bytes(), retained);
     assert!(!graph.checkpoint_is_quiescent());
 
     let drained = graph
@@ -5792,7 +5798,10 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
     graph.set_max_input_buf_batches(1);
 
     let pending_before = graph.checkpoint_pending_input_bytes();
-    assert_eq!(pending_before, 2 * test_batch().get_array_memory_size());
+    assert_eq!(
+        pending_before,
+        2 * laminar_core::streaming::retained_arrow_bytes(&test_batch())
+    );
     assert!(!graph.checkpoint_is_quiescent());
 
     graph.set_backpressure_policy(BackpressurePolicy::Fail);
@@ -6179,11 +6188,13 @@ async fn test_credit_gate_defers_producer_when_downstream_full() {
     let before_len = graph.input_bufs[downstream_id][0].len();
     let mut source = FxHashMap::default();
     source.insert(Arc::from("trades"), vec![test_batch()]);
-    let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+    let output = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+    assert!(graph.input_bufs[downstream_id][0].is_empty());
+    assert_eq!(total_rows(&output, "downstream"), before_len * 2);
     assert_eq!(
-        graph.input_bufs[downstream_id][0].len(),
-        before_len,
-        "deferred producer must not have extended a full downstream buffer"
+        graph.input_bufs[proj_id][0].len(),
+        1,
+        "the deferred producer must retain its input while the old downstream input drains"
     );
 }
 
@@ -6424,9 +6435,522 @@ async fn test_self_join_prefilter_end_to_end() {
 }
 
 fn prefill_port(graph: &mut OperatorGraph, node: usize, port: usize, batches: Vec<RecordBatch>) {
-    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+    let bytes = retained_input_bytes(&batches);
     graph.input_bufs[node][port] = batches;
     graph.input_buf_bytes[node][port] = bytes;
+}
+
+#[tokio::test]
+async fn source_priming_rejects_an_oversized_batch_before_retaining_it() {
+    let mut graph = test_graph();
+    let source = graph.ensure_source_node("trades");
+    graph.set_max_input_buf_bytes(Some(1));
+    let error = graph
+        .execute_cycle(&trades_source(), 100, None)
+        .await
+        .expect_err("source priming must enforce the byte limit on an empty port");
+    assert!(error.requires_pipeline_halt());
+    assert!(graph.input_bufs[source][0].is_empty());
+    assert_eq!(graph.output_watermarks[source], i64::MIN);
+}
+
+#[test]
+fn output_admission_rejects_near_full_fanout_before_any_publication() {
+    let mut graph = test_graph();
+    let producer = graph
+        .place_operator_node("producer", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    let first = graph
+        .place_operator_node("first", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    let second = graph
+        .place_operator_node("second", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(producer, first, 0);
+    graph.add_edge(producer, second, 0);
+    graph.output_map.insert(Arc::from("producer"), producer);
+    graph.compute_topo_order();
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    graph.set_max_input_buf_bytes(Some(bytes * 2 - 1));
+    prefill_port(&mut graph, second, 0, vec![batch.clone()]);
+    let mut results = FxHashMap::default();
+    let error = graph
+        .route_output(producer, vec![batch], &mut results)
+        .expect_err("all fanout destinations must fit before any output is published");
+    assert!(error.requires_pipeline_halt());
+    assert!(results.is_empty());
+    assert!(graph.input_bufs[first][0].is_empty());
+    assert_eq!(graph.input_bufs[second][0].len(), 1);
+    assert!(!graph.live_handles.contains_key("producer"));
+}
+
+#[tokio::test]
+async fn graph_source_admission_is_atomic_across_sources_and_views() {
+    let mut graph = test_graph();
+    let first = graph.ensure_source_node("first");
+    let second = graph.ensure_source_node("second");
+    let positioned = graph.ensure_positioned_source_node("second");
+    graph.set_max_input_buf_batches(1);
+    let sources = FxHashMap::from_iter([
+        (Arc::from("first"), vec![test_batch()]),
+        (Arc::from("second"), vec![test_batch(), test_batch()]),
+    ]);
+    let error = graph.execute_cycle(&sources, 123, None).await.unwrap_err();
+    assert!(matches!(
+        error,
+        DbError::GraphBufferBudgetExceeded { batches: 2, .. }
+    ));
+    for node in [first, second, positioned] {
+        assert!(graph.input_bufs[node][0].is_empty());
+        assert_eq!(graph.input_buf_bytes[node][0], 0);
+        assert_eq!(graph.output_watermarks[node], i64::MIN);
+    }
+    assert!(graph.live_handles.is_empty());
+}
+
+#[tokio::test]
+async fn graph_source_admission_counts_retained_wide_slices_and_views() {
+    use arrow::array::{ArrayRef, ListArray, StringViewArray};
+    use arrow::datatypes::Int64Type;
+
+    let wide = "x".repeat(64 * 1024);
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(vec!["small", wide.as_str()]).slice(0, 1)),
+        Arc::new(StringViewArray::from(vec![wide.as_str()]).slice(0, 1)),
+        Arc::new(
+            ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+                Some(vec![Some(1)]),
+                Some(vec![Some(1); 8192]),
+            ])
+            .slice(0, 1),
+        ),
+    ];
+    for array in arrays {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "payload",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        let mut graph = test_graph();
+        let source = graph.ensure_source_node("input");
+        graph.set_max_input_buf_bytes(Some(4096));
+        let sources = FxHashMap::from_iter([(Arc::from("input"), vec![batch])]);
+        let error = graph.execute_cycle(&sources, 0, None).await.unwrap_err();
+        assert!(matches!(error, DbError::GraphBufferBudgetExceeded { bytes, .. } if bytes > 4096));
+        assert!(graph.input_bufs[source][0].is_empty());
+    }
+}
+
+#[test]
+fn graph_output_admission_charges_each_fanout_port_at_the_exact_limit() {
+    let mut graph = test_graph();
+    let producer = graph.ensure_source_node("input");
+    let downstream = graph
+        .place_operator_node("join", Box::new(SourcePassthrough), 2)
+        .unwrap();
+    graph.add_edge(producer, downstream, 0);
+    graph.add_edge(producer, downstream, 1);
+    let batch = test_batch();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&batch);
+    graph.set_max_input_buf_bytes(Some(bytes));
+    graph.set_max_input_buf_batches(1);
+    graph
+        .route_output(producer, vec![batch], &mut FxHashMap::default())
+        .unwrap();
+    assert_eq!(graph.input_buf_bytes[downstream], vec![bytes, bytes]);
+    assert_eq!(graph.checkpoint_pending_input_bytes(), bytes * 2);
+    assert!(graph.input_bufs[downstream]
+        .iter()
+        .all(|port| port.len() == 1));
+}
+
+#[test]
+fn graph_output_admission_enforces_prospective_count_limits() {
+    for byte_limit in [None, Some(usize::MAX)] {
+        let mut graph = test_graph();
+        let producer = graph.ensure_source_node("input");
+        let target = graph
+            .place_operator_node("target", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(producer, target, 0);
+        graph.set_max_input_buf_batches(1);
+        graph.set_max_input_buf_bytes(byte_limit);
+        let error = graph
+            .route_output(
+                producer,
+                vec![test_batch(), test_batch()],
+                &mut FxHashMap::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::GraphBufferBudgetExceeded { batches: 2, .. }
+        ));
+        assert!(graph.input_bufs[target][0].is_empty());
+    }
+}
+
+#[test]
+fn graph_output_admission_rejects_oversized_output_even_on_an_empty_port() {
+    for policy in [BackpressurePolicy::Backpressure, BackpressurePolicy::Fail] {
+        let mut graph = test_graph();
+        let producer = graph.ensure_source_node("input");
+        let target = graph
+            .place_operator_node("target", Box::new(SourcePassthrough), 1)
+            .unwrap();
+        graph.add_edge(producer, target, 0);
+        graph.set_backpressure_policy(policy);
+        graph.set_max_input_buf_bytes(Some(1));
+        let error = graph
+            .route_output(producer, vec![test_batch()], &mut FxHashMap::default())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DbError::GraphBufferBudgetExceeded {
+                max_bytes: Some(1),
+                ..
+            }
+        ));
+        assert!(error.requires_pipeline_halt());
+        assert!(!error.requires_pipeline_recovery());
+        assert!(graph.input_bufs[target][0].is_empty());
+    }
+}
+
+#[tokio::test]
+async fn graph_prospective_source_gate_retains_input_frontier_and_cached_sql_retry() {
+    let mut graph = test_graph();
+    graph.add_query(
+        "sorted".into(),
+        "SELECT * FROM trades ORDER BY price".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let source = graph.source_map["trades"];
+    let sorted = graph.output_map["sorted"];
+    let old = test_batch();
+    let new = RecordBatch::try_new(
+        test_schema(),
+        vec![
+            Arc::new(StringArray::from(vec!["MSFT", "AMZN"])),
+            Arc::new(Float64Array::from(vec![400.0, 200.0])),
+            Arc::new(Int64Array::from(vec![3000, 4000])),
+        ],
+    )
+    .unwrap();
+    let limit = laminar_core::streaming::retained_arrow_bytes(&old)
+        + laminar_core::streaming::retained_arrow_bytes(&new)
+        - 1;
+    graph.set_max_input_buf_bytes(Some(limit));
+    prefill_port(&mut graph, sorted, 0, vec![old]);
+    let sources = FxHashMap::from_iter([(Arc::from("trades"), vec![new])]);
+    let first = graph.execute_cycle(&sources, 100, None).await.unwrap();
+    assert_eq!(total_rows(&first, "sorted"), 2);
+    assert_eq!(graph.input_bufs[source][0].len(), 1);
+    assert_eq!(graph.output_watermarks[source], i64::MIN);
+    let (deferred, names) = graph.take_cycle_deferrals();
+    assert!(deferred && names.contains(&Arc::from("trades")));
+    assert!(!graph.checkpoint_is_quiescent());
+    assert!(graph.has_deferred_work());
+    assert!(graph.has_runnable_deferred_work());
+    let second = graph
+        .execute_cycle(&FxHashMap::default(), 100, None)
+        .await
+        .unwrap();
+    let symbols: Vec<_> = second["sorted"]
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|value| value.unwrap().to_string())
+        })
+        .collect();
+    assert_eq!(symbols, vec!["AMZN", "MSFT"]);
+    assert!(graph.checkpoint_is_quiescent());
+    assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+    assert_eq!(graph.output_watermarks[source], 100);
+    assert!(!graph.has_deferred_work());
+    assert!(!graph.has_runnable_deferred_work());
+    let third = graph
+        .execute_checkpoint_drain_cycle(100, None)
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&third, "sorted"), 0);
+}
+
+#[tokio::test]
+async fn graph_source_priming_cannot_overwrite_already_deferred_input() {
+    let mut graph = test_graph();
+    let source = graph.ensure_source_node("trades");
+    graph.set_max_input_buf_batches(1);
+    prefill_port(&mut graph, source, 0, vec![test_batch()]);
+    let expected = graph.input_bufs[source][0].clone();
+    let bytes = graph.input_buf_bytes[source][0];
+    let error = graph
+        .execute_cycle(&trades_source(), 100, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DbError::GraphBufferBudgetExceeded { .. }));
+    assert_eq!(graph.input_bufs[source][0], expected);
+    assert_eq!(graph.input_buf_bytes[source][0], bytes);
+}
+
+#[tokio::test]
+async fn graph_deferred_union_keeps_each_sources_provider_input_distinct() {
+    let mut graph = test_graph();
+    let schema = bid_batch(0.0).schema();
+    graph.register_source_schema("left_input".into(), Arc::clone(&schema));
+    graph.register_source_schema("right_input".into(), schema);
+    graph.add_query(
+        "combined".into(),
+        "SELECT bid FROM left_input UNION ALL SELECT bid FROM right_input ORDER BY bid".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    graph.take_build_errors().unwrap();
+    let combined = graph.output_map["combined"];
+    let left = graph.source_map["left_input"];
+    assert_eq!(graph.nodes[combined].input_port_count, 2);
+    let left_port = graph.input_sources[combined]
+        .iter()
+        .position(|source| *source == left)
+        .unwrap();
+    let bytes = laminar_core::streaming::retained_arrow_bytes(&bid_batch(0.0));
+    graph.set_max_input_buf_bytes(Some(bytes * 2 - 1));
+    prefill_port(&mut graph, combined, left_port, vec![bid_batch(1.0)]);
+    let sources = FxHashMap::from_iter([
+        (Arc::from("left_input"), vec![bid_batch(2.0)]),
+        (Arc::from("right_input"), vec![bid_batch(3.0)]),
+    ]);
+    let mut values = Vec::new();
+    let mut results = vec![graph.execute_cycle(&sources, 0, None).await.unwrap()];
+    assert_eq!(graph.input_bufs[left][0].len(), 1);
+    results.push(graph.execute_checkpoint_drain_cycle(0, None).await.unwrap());
+    for result in results {
+        for batch in &result["combined"] {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            values.extend(column.values().iter().copied());
+        }
+    }
+    values.sort_by(f64::total_cmp);
+    assert_eq!(values, vec![1.0, 2.0, 3.0]);
+    assert!(graph.checkpoint_is_quiescent());
+}
+
+#[tokio::test]
+async fn graph_empty_port_clears_another_branches_accepted_provider_input() {
+    let mut graph = test_graph();
+    for source in ["left_input", "right_input"] {
+        graph.register_source_schema(source.into(), bid_batch(0.0).schema());
+    }
+    for name in ["first", "second"] {
+        graph.add_query(
+            name.into(),
+            "SELECT bid FROM left_input UNION ALL SELECT bid FROM right_input ORDER BY bid".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+    }
+    graph.take_build_errors().unwrap();
+    graph.compute_topo_order();
+    let first = graph.output_map["first"];
+    let second = graph.output_map["second"];
+    let right = graph.source_map["right_input"];
+    for node in [first, second] {
+        for port in 0..2 {
+            if graph.input_sources[node][port] == right {
+                if node == first {
+                    prefill_port(&mut graph, node, port, vec![bid_batch(1.0)]);
+                }
+            } else {
+                prefill_port(&mut graph, node, port, vec![bid_batch(2.0)]);
+            }
+        }
+    }
+    let mut results = FxHashMap::default();
+    for node in [first, second] {
+        graph
+            .execute_single_operator(node, 0, &mut results, GraphExecutionMode::Normal)
+            .await
+            .unwrap();
+    }
+    assert_eq!(total_rows(&results, "first"), 2);
+    assert_eq!(results["second"], vec![bid_batch(2.0)]);
+    assert!(graph.checkpoint_is_quiescent());
+}
+
+#[tokio::test]
+async fn graph_duplicate_edge_registration_delivers_input_once() {
+    let mut graph = test_graph();
+    let source = graph.ensure_source_node("trades");
+    let target = graph
+        .place_operator_node("target", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(source, target, 0);
+    graph.add_edge(source, target, 0);
+    graph.set_max_input_buf_batches(1);
+    graph.output_map.insert(Arc::from("target"), target);
+    let result = graph
+        .execute_cycle(&trades_source(), 0, None)
+        .await
+        .unwrap();
+    assert_eq!(total_rows(&result, "target"), 2);
+    assert_eq!(graph.nodes[source].output_routes.len(), 1);
+    assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+}
+
+#[tokio::test]
+async fn graph_shedding_discards_oldest_before_retaining_source_and_output_batches() {
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    let mut graph = test_graph();
+    let source = graph.ensure_source_node("quotes");
+    let target = graph
+        .place_operator_node("target", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(source, target, 0);
+    graph.output_map.insert(Arc::from("target"), target);
+    graph.set_metrics(Arc::clone(&prom));
+    graph.set_backpressure_policy(BackpressurePolicy::ShedOldest);
+    graph.set_max_input_buf_bytes(Some(laminar_core::streaming::retained_arrow_bytes(
+        &bid_batch(0.0),
+    )));
+    let sources =
+        FxHashMap::from_iter([(Arc::from("quotes"), vec![bid_batch(1.0), bid_batch(2.0)])]);
+    let result = graph.execute_cycle(&sources, 0, None).await.unwrap();
+    assert_eq!(result["target"], vec![bid_batch(2.0)]);
+    assert_eq!(
+        prom.shed_records_total.with_label_values(&["quotes"]).get(),
+        1
+    );
+    assert_eq!(graph.checkpoint_pending_input_bytes(), 0);
+
+    prefill_port(&mut graph, target, 0, vec![bid_batch(3.0)]);
+    graph
+        .route_output(
+            source,
+            vec![bid_batch(4.0), bid_batch(5.0)],
+            &mut FxHashMap::default(),
+        )
+        .unwrap();
+    assert_eq!(graph.input_bufs[target][0], vec![bid_batch(5.0)]);
+    assert_eq!(
+        prom.shed_records_total.with_label_values(&["target"]).get(),
+        2
+    );
+    graph.set_max_input_buf_bytes(Some(1));
+    graph
+        .route_output(source, vec![bid_batch(6.0)], &mut FxHashMap::default())
+        .unwrap();
+    assert!(graph.input_bufs[target][0].is_empty());
+    assert_eq!(graph.input_buf_bytes[target][0], 0);
+    assert_eq!(
+        prom.shed_records_total.with_label_values(&["target"]).get(),
+        4
+    );
+}
+
+async fn graph_admission_sum_graph() -> OperatorGraph {
+    let mut graph = test_graph();
+    graph.register_source_schema("trades".into(), test_schema());
+    graph.add_query(
+        "agg".into(),
+        "SELECT SUM(price) AS total FROM trades".into(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    let target = graph
+        .place_operator_node("target", Box::new(SourcePassthrough), 1)
+        .unwrap();
+    graph.add_edge(graph.output_map["agg"], target, 0);
+    graph.topo_dirty = true;
+    graph.initialize_managed_state().await.unwrap()
+}
+
+#[tokio::test]
+async fn graph_post_mutation_admission_failure_fences_retry_and_restores_prior_cut() {
+    let mut graph = graph_admission_sum_graph().await;
+    graph
+        .execute_cycle(&trades_source(), 0, None)
+        .await
+        .unwrap();
+    assert!(graph.checkpoint_is_quiescent());
+    let (whole, vnodes) = full_state_frames(graph.capture_state(u64::MAX).unwrap());
+    let target = graph
+        .nodes
+        .iter()
+        .position(|node| node.name.as_ref() == "target")
+        .unwrap();
+    let pending = bid_batch(0.0);
+    let pending_bytes = laminar_core::streaming::retained_arrow_bytes(&pending);
+    let source_bytes = laminar_core::streaming::retained_arrow_bytes(&test_batch());
+    let count = source_bytes / pending_bytes + 1;
+    let limit = pending_bytes * count + 1;
+    graph.set_max_input_buf_bytes(Some(limit));
+    prefill_port(&mut graph, target, 0, vec![pending; count]);
+    let error = graph
+        .execute_cycle(&trades_source(), 0, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, DbError::GraphBufferBudgetExceeded { ref node, .. } if node == "target")
+    );
+    assert_eq!(graph.input_bufs[target][0].len(), count);
+    assert!(graph.capture_state(u64::MAX).is_err());
+    let retry = graph
+        .execute_cycle(&trades_source(), 0, None)
+        .await
+        .unwrap_err();
+    assert_graph_execution_poison(&retry);
+    let drain = graph
+        .execute_checkpoint_drain_cycle(0, None)
+        .await
+        .unwrap_err();
+    assert_graph_execution_poison(&drain);
+
+    let (mut restored, _) = graph_admission_sum_graph()
+        .await
+        .restore_state_frames(
+            &whole,
+            &vnodes,
+            u32::from(laminar_core::state::DEFAULT_KEY_GROUP_COUNT.get()),
+        )
+        .unwrap();
+    restored.set_max_input_buf_bytes(Some(limit));
+    let result = restored
+        .execute_cycle(&trades_source(), 0, None)
+        .await
+        .unwrap();
+    let total = result["agg"][0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 2.0 * (150.0 + 2800.0));
+    assert!(restored.checkpoint_is_quiescent());
 }
 
 fn producer_consumer_graph(policy: BackpressurePolicy, cap: usize) -> (OperatorGraph, usize) {
@@ -6465,15 +6989,13 @@ fn trades_source() -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
 #[tokio::test]
 async fn test_backpressure_policy_defers_without_shedding() {
     let (mut graph, consumer_id) = producer_consumer_graph(BackpressurePolicy::Backpressure, 2);
-    let _ = graph
+    let output = graph
         .execute_cycle(&trades_source(), i64::MAX, None)
         .await
         .unwrap();
-    assert_eq!(
-        graph.input_bufs[consumer_id][0].len(),
-        2,
-        "consumer input stays at cap — producer must have been deferred"
-    );
+    assert!(graph.input_bufs[consumer_id][0].is_empty());
+    assert_eq!(total_rows(&output, "consumer"), 4);
+    assert_eq!(graph.input_bufs[graph.output_map["producer"]][0].len(), 1);
 }
 
 #[tokio::test]
