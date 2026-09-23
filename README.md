@@ -8,8 +8,8 @@
 
 LaminarDB turns live data into continuously updated results with SQL. For example, it can read
 trades from Kafka, calculate totals every minute, and send the results to a table or application.
-Use it inside a Rust program or run it as a standalone server. You can start with one process;
-a cluster is optional.
+Use it inside a Rust, Python, Node.js, or Java application, or run it as a standalone server.
+You can start with one process; a cluster is optional.
 
 The basic flow is **source → SQL query → result**. A source brings in data, a stream updates the
 query result as new data arrives, and a sink or subscription delivers that result.
@@ -53,16 +53,20 @@ In another terminal, check that it is running:
 curl http://localhost:8080/health
 ```
 
-To use LaminarDB inside an application, install the [Rust crate](https://crates.io/crates/laminar-db)
-with `cargo add laminar-db`, or install the [Python package](https://pypi.org/project/laminardb/)
-with `pip install laminardb`. The [Rust API docs](https://docs.rs/laminar-db) and
-[Python repository](https://github.com/laminardb/laminardb-python) have language-specific examples.
+To use LaminarDB inside an application, choose a client library:
+
+| Language | Get started |
+|---|---|
+| Rust | `cargo add laminar-db` · [API docs](https://docs.rs/laminar-db) |
+| Python | `pip install laminardb` · [examples](https://github.com/laminardb/laminardb-python) |
+| Node.js / TypeScript | `npm install @laminardb/node` · [examples](https://github.com/laminardb/laminardb-nodejs) |
+| Java | [Maven setup and examples](https://github.com/laminardb/laminardb-java) |
 
 ## Modes
 
 | Mode | When to use it |
 |---|---|
-| Embedded | Run LaminarDB inside a Rust application. |
+| Embedded | Run LaminarDB inside a Rust, Python, Node.js, or Java application. |
 | Single-node server | Run one server with HTTP, optional Postgres-compatible connections, and local checkpoints. |
 | Cluster | Run multiple servers with a shared checkpoint store. Cluster SQL and connector support are narrower than single-node support. |
 
