@@ -77,9 +77,11 @@ CLOSE c
 
 Parsing SQL does not establish runtime admission. PostgreSQL/MongoDB CDC source implementations
 currently reject their raw change envelopes before I/O. Cluster SQL and subscriptions have a
-narrower supported surface than local execution; see the [mode and delivery boundaries](../../README.md#supported-sql-and-delivery-boundaries)
-and [subscription contract](../../README.md#ddl). In particular, the stateless `trades` retention
-example above is local; cluster subscriptions require certified non-windowed keyed aggregates.
+narrower supported surface than local execution; see the
+[cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) and
+[subscription contract](../../docs/SQL_REFERENCE.md#subscribe-over-the-postgres-wire-protocol).
+In particular, the stateless `trades` retention example above is local; cluster subscriptions
+require certified non-windowed keyed aggregates.
 
 ## Custom UDFs Registered with DataFusion
 

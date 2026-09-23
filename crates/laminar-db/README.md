@@ -32,9 +32,9 @@ One `StreamingCoordinator` task executes on the dedicated single-threaded `lamin
 runtime. Connector I/O, checkpoint persistence and sink publication run on the main runtime.
 This model applies to embedded, single-node and cluster execution.
 
-See the [SQL and delivery boundaries](../../README.md#supported-sql-and-delivery-boundaries) for
-mode-specific admission and executable contract examples. Cluster plans deliberately reject local
-materialized views and reference-table enrichment; managed direct-source final windows and
+See the [cluster SQL boundary](../../docs/SQL_REFERENCE.md#cluster-sql-boundary) for
+mode-specific admission. Cluster plans deliberately reject local materialized views and
+reference-table enrichment; managed direct-source final windows and
 certified interval/temporal joins have their own admitted paths. Feature flags and checkpoints
 alone do not imply exactly-once delivery.
 
@@ -42,7 +42,8 @@ Local subscriptions use in-memory replay history; cluster subscriptions expose c
 partition-ordered output only for certified non-windowed keyed aggregates. Neither a separate
 snapshot query followed by a subscription nor a client cursor establishes an atomic
 snapshot-plus-tail or transactional external-consumer guarantee. See the
-[subscription boundaries](../../README.md#ddl) and linked replay tests before designing consumers.
+[subscription boundaries](../../docs/SQL_REFERENCE.md#subscribe-over-the-postgres-wire-protocol)
+before designing consumers.
 
 ## DataFusion memory limit
 

@@ -213,7 +213,7 @@ When `[server].pgwire_bind` is set, the server also listens for Postgres clients
 schema is rejected. Local epoch replay uses byte-bounded in-memory history. Cluster replay uses
 verified segments in the checkpoint store and is partition-ordered. There is no atomic
 snapshot-plus-tail attachment or durable named-consumer cursor. See the
-[subscription boundaries and tests](../../README.md#ddl).
+[subscription boundaries](../../docs/SQL_REFERENCE.md#subscribe-over-the-postgres-wire-protocol).
 
 ### Authentication
 
