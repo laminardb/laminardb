@@ -7,7 +7,6 @@ use arrow_schema::DataType;
 use laminar_core::state::PartitionKeyCodecV1;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
@@ -44,10 +43,7 @@ struct RegisteredTimer {
 #[derive(Deserialize, Serialize)]
 struct OperatorFrame {
     codec: u32,
-    function_id: String,
-    pipeline_state_id: String,
-    implementation_digest: String,
-    schema_sha256: String,
+    descriptor_sha256: String,
     partitioning_abi: u16,
     vnode_count: u32,
     next_activation_id: u64,
@@ -86,7 +82,7 @@ struct StagedResponse {
 /// rejected until this participant has assignment-fenced transfer and shuffle semantics.
 pub(crate) struct ProcessFunctionOperator {
     descriptor: ProcessFunctionDescriptor,
-    schema_sha256: String,
+    descriptor_sha256: String,
     handler: Arc<dyn NativeProcessFunction>,
     key_codec: PartitionKeyCodecV1,
     key_indices: Vec<usize>,
@@ -114,18 +110,13 @@ impl ProcessFunctionOperator {
             .ok_or_else(|| DbError::Config("process function requires nonzero vnodes".into()))?;
         let (key_codec, key_indices, time_index, output_time_index) =
             validate_descriptor(&descriptor)?;
-        let schema_binding = serde_json::to_vec(&(
-            super::canonical_fields(&descriptor.input_schema)?,
-            super::canonical_fields(&descriptor.output_schema)?,
-        ))
-        .map_err(|error| DbError::Config(format!("process schema binding: {error}")))?;
-        let schema_sha256 = format!("{:x}", Sha256::digest(schema_binding));
+        let descriptor_sha256 = descriptor.binding_sha256()?;
         let count = usize::try_from(vnode_count.get()).map_err(|_| {
             DbError::Config("process function vnode count exceeds addressable memory".into())
         })?;
         Ok(Self {
             descriptor,
-            schema_sha256,
+            descriptor_sha256,
             handler,
             key_codec,
             key_indices,

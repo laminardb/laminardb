@@ -50,6 +50,14 @@ Criterion baseline: Windows x86_64 MSVC, AMD Ryzen 9 7900X (12 cores, 24 logical
 
 Command: `cargo bench -p laminar-db --bench process_function_bench --no-default-features -- <filter> --noplot --sample-size 40 --warm-up-time 5 --measurement-time 10` for the end-to-end rows; handler-only rows used 30 samples, 3-second warm-up, and 7-second measurement. The first one-row run immediately after release compilation measured 40.141 µs; later 30-sample end-to-end means ranged 24.717–25.846 µs (one row), 107.73–108.73 µs (distinct keys), and 105.22–112.13 µs (one key) without production code changes. Handler-only input uses prepared activation snapshots and excludes routing, validation, coordinator handoff, and subscription. These are development-machine latency means, not sustained throughput, target-hardware, p99, or sampled CPU/IPC results.
 
+### Continuation: portable native descriptor (2026-09-23)
+
+The validated native descriptor now has a bounded, canonical JSON manifest with structural Arrow fields, explicit v1 runtime/protocol/key ABI/state codec and append-only/late-event policies. `from_manifest_json` rejects unknown fields, unsupported types or policy changes, invalid decimal parameters and input over 64 KiB. The implementation digest is still caller-supplied trusted-build identity; the manifest does not package or attest native code, and its protocol version does not mean a remote worker transport exists.
+
+Pipeline identity and the operator checkpoint now bind the SHA-256 of the complete canonical manifest. This replaces the checkpoint's narrower schema-only digest and the pipeline identity's duplicate field serialization. State codec version 2 deliberately rejects checkpoints produced by the earlier development slice; no migration path is implemented. The record path and native handler ABI did not change, so the earlier Criterion measurements remain the local baseline for this increment.
+
+The focused native suite has 13 tests in both default and no-default-feature builds, including manifest type round trips, malformed/incompatible manifest rejection, and rejection of a changed timer contract on restore. The final no-default-feature focused run passed after the last code edit. The final workspace library suite passed with `RUST_MIN_STACK=8388608 cargo test --workspace --lib -- --test-threads=1`: 1,977 connector, 973 core, 1,984 database, and 870 SQL tests passed; derive had no library tests. The unadjusted default-stack Windows gate remains red for the pre-existing coordinated-recovery overflow recorded above. Both workspace Clippy gates, nightly formatting, the readability checker, and `git diff --check` passed after the final code edit.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -63,4 +71,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Run a sampled CPU/IPC profile and representative tail-latency workload on target hardware before using the local Criterion means as a product latency claim. Then implement a versioned language-neutral descriptor and one bounded Arrow IPC/Protobuf remote transport with a Rust reference worker before the Python/PyArrow SDK. After local worker recovery and server invocation are qualified, implement and test cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.
+Run a sampled CPU/IPC profile and representative tail-latency workload on target hardware before using the local Criterion means as a product latency claim. Next implement and test one bounded Arrow IPC/Protobuf remote transport with a Rust reference worker against this descriptor, then add the Python/PyArrow SDK. After local worker recovery and server invocation are qualified, implement and test cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.

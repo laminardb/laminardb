@@ -11,15 +11,16 @@ use arrow_schema::SchemaRef;
 
 use crate::error::DbError;
 
+mod descriptor;
 mod operator;
 mod registration;
 mod schema;
 
 pub(crate) use operator::ProcessFunctionOperator;
 pub(crate) use schema::canonical_fields;
-pub(crate) use schema::CanonicalField;
 
-pub(crate) const STATE_CODEC_VERSION: u32 = 1;
+// RECOVERY: v2 binds the complete descriptor; v1 carried only a schema digest.
+pub(crate) const STATE_CODEC_VERSION: u32 = 2;
 
 /// Immutable, versioned binding for one native process function. The initial state codec is an
 /// optional signed 64-bit value; a present null is distinct from absent state.
@@ -52,7 +53,8 @@ pub struct ProcessFunctionDescriptor {
 }
 
 /// Per-function bounds, enforced before accepting a native response.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessFunctionLimits {
     /// Maximum distinct keys with state or timers.
     pub max_keys: usize,

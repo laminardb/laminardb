@@ -77,19 +77,7 @@ struct CanonicalStream {
 struct CanonicalProcess {
     output_name: String,
     source_name: String,
-    function_id: String,
-    pipeline_state_id: String,
-    implementation_digest: String,
-    descriptor_version: u32,
-    state_codec_version: u32,
-    input_fields: Vec<crate::process_function::CanonicalField>,
-    output_fields: Vec<crate::process_function::CanonicalField>,
-    key_columns: Vec<String>,
-    event_time_column: String,
-    output_event_time_column: String,
-    value_state_name: String,
-    timer_names: Vec<String>,
-    limits: crate::process_function::ProcessFunctionLimits,
+    descriptor_sha256: String,
 }
 
 #[derive(Serialize)]
@@ -357,25 +345,10 @@ fn canonical_processes(
         .process_functions
         .values()
         .map(|registration| {
-            let descriptor = &registration.descriptor;
             Ok(CanonicalProcess {
                 output_name: registration.output_name.clone(),
                 source_name: registration.source_name.clone(),
-                function_id: descriptor.function_id.clone(),
-                pipeline_state_id: descriptor.pipeline_state_id.clone(),
-                implementation_digest: descriptor.implementation_digest.clone(),
-                descriptor_version: descriptor.version,
-                state_codec_version: crate::process_function::STATE_CODEC_VERSION,
-                input_fields: crate::process_function::canonical_fields(&descriptor.input_schema)?,
-                output_fields: crate::process_function::canonical_fields(
-                    &descriptor.output_schema,
-                )?,
-                key_columns: descriptor.key_columns.clone(),
-                event_time_column: descriptor.event_time_column.clone(),
-                output_event_time_column: descriptor.output_event_time_column.clone(),
-                value_state_name: descriptor.value_state_name.clone(),
-                timer_names: descriptor.timer_names.clone(),
-                limits: descriptor.limits,
+                descriptor_sha256: registration.descriptor.binding_sha256()?,
             })
         })
         .collect::<Result<Vec<_>, DbError>>()?;

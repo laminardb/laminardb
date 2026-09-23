@@ -5,8 +5,8 @@ use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::catalog::CatalogObjectKind;
 
 use super::{
-    operator::validate_descriptor, NativeProcessFunction, ProcessFunctionDescriptor,
-    ProcessFunctionInfo, ProcessFunctionRegistration,
+    NativeProcessFunction, ProcessFunctionDescriptor, ProcessFunctionInfo,
+    ProcessFunctionRegistration,
 };
 use crate::db::{exact_table_reference, DbState, LaminarDB};
 use crate::error::DbError;
@@ -93,7 +93,7 @@ impl LaminarDB {
                 "native process functions currently require a direct in-memory source".into(),
             ));
         }
-        validate_descriptor(&descriptor)?;
+        descriptor.to_manifest_json()?;
         let reservation = self
             .reserve_catalog_name(output_name, CatalogObjectKind::Stream, false)?
             .ok_or_else(|| DbError::InvalidOperation("process output already exists".into()))?;

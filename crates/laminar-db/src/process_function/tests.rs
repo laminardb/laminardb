@@ -8,8 +8,8 @@ use rustc_hash::FxHashMap;
 
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
-    ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessFunctionRegistration, TimerOperation,
-    ValueMutation, ValueState,
+    ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessFunctionOperator,
+    ProcessFunctionRegistration, TimerOperation, ValueMutation, ValueState,
 };
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, GraphStateCapture, InputFrontier, OperatorGraph};
@@ -57,6 +57,122 @@ fn descriptor() -> ProcessFunctionDescriptor {
         timer_names: vec!["inactive".into()],
         limits: ProcessFunctionLimits::default(),
     }
+}
+
+#[test]
+fn manifest_round_trips_supported_arrow_types_and_binds_semantics() {
+    let mut descriptor = descriptor();
+    descriptor.output_schema = Arc::new(Schema::new(vec![
+        Field::new("boolean", DataType::Boolean, true),
+        Field::new("int8", DataType::Int8, true),
+        Field::new("int16", DataType::Int16, true),
+        Field::new("int32", DataType::Int32, true),
+        Field::new("int64", DataType::Int64, true),
+        Field::new("float32", DataType::Float32, true),
+        Field::new("float64", DataType::Float64, true),
+        Field::new("utf8", DataType::Utf8, true),
+        Field::new("binary", DataType::Binary, true),
+        Field::new("decimal", DataType::Decimal128(20, 4), true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let bytes = descriptor.to_manifest_json().unwrap();
+    let restored = ProcessFunctionDescriptor::from_manifest_json(&bytes).unwrap();
+    assert_eq!(restored.input_schema, descriptor.input_schema);
+    assert_eq!(restored.output_schema, descriptor.output_schema);
+    assert_eq!(restored.to_manifest_json().unwrap(), bytes);
+    assert_eq!(
+        restored.binding_sha256().unwrap(),
+        descriptor.binding_sha256().unwrap()
+    );
+
+    let mut changed = restored.clone();
+    changed.timer_names.push("another_timer".into());
+    assert_ne!(
+        changed.binding_sha256().unwrap(),
+        descriptor.binding_sha256().unwrap()
+    );
+    changed = restored;
+    changed.limits.max_output_rows -= 1;
+    assert_ne!(
+        changed.binding_sha256().unwrap(),
+        descriptor.binding_sha256().unwrap()
+    );
+}
+
+#[test]
+fn manifest_rejects_unknown_or_incompatible_contracts() {
+    let bytes = descriptor().to_manifest_json().unwrap();
+    let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut cases = Vec::new();
+    for (field, replacement) in [
+        ("protocol_version", serde_json::json!(2)),
+        ("runtime", serde_json::json!("remote_python")),
+        ("partitioning_abi", serde_json::json!(999)),
+        ("state_codec_version", serde_json::json!(999)),
+        ("late_event_policy", serde_json::json!("accept")),
+    ] {
+        let mut value = original.clone();
+        value[field] = replacement;
+        cases.push(value);
+    }
+    for value in cases {
+        assert!(ProcessFunctionDescriptor::from_manifest_json(
+            &serde_json::to_vec(&value).unwrap()
+        )
+        .is_err());
+    }
+    let mut unknown = original.clone();
+    unknown["unrecognised"] = serde_json::json!(true);
+    assert!(
+        ProcessFunctionDescriptor::from_manifest_json(&serde_json::to_vec(&unknown).unwrap())
+            .is_err()
+    );
+    let mut unsupported_type = original;
+    unsupported_type["output_schema"][0]["data_type"] = serde_json::json!({"type":"list"});
+    assert!(ProcessFunctionDescriptor::from_manifest_json(
+        &serde_json::to_vec(&unsupported_type).unwrap()
+    )
+    .is_err());
+    let mut duplicate_field = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+    duplicate_field["output_schema"][0]["name"] = serde_json::json!("kind");
+    assert!(ProcessFunctionDescriptor::from_manifest_json(
+        &serde_json::to_vec(&duplicate_field).unwrap()
+    )
+    .is_err());
+    let mut invalid_decimal = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+    invalid_decimal["output_schema"][0]["data_type"] =
+        serde_json::json!({"type":"decimal128", "precision":40, "scale":2});
+    assert!(ProcessFunctionDescriptor::from_manifest_json(
+        &serde_json::to_vec(&invalid_decimal).unwrap()
+    )
+    .is_err());
+    assert!(ProcessFunctionDescriptor::from_manifest_json(&vec![b' '; 64 * 1024 + 1]).is_err());
+    let mut oversized = descriptor();
+    oversized.output_schema = Arc::new(Schema::new(vec![
+        Field::new("x".repeat(64 * 1024), DataType::Int64, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    assert!(oversized.to_manifest_json().is_err());
+}
+
+#[test]
+fn checkpoint_rejects_changed_descriptor_contract() {
+    let mut first =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    let checkpoint = first.checkpoint().unwrap().unwrap();
+    let mut changed = descriptor();
+    changed.timer_names.push("second_timer".into());
+    let mut replacement =
+        ProcessFunctionOperator::new(changed, Arc::new(AccountActivity), 4).unwrap();
+    assert!(replacement.restore(checkpoint).is_err());
 }
 
 fn input_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {

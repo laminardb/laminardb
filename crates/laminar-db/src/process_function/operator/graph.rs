@@ -119,10 +119,7 @@ impl GraphOperator for ProcessFunctionOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         let frame = OperatorFrame {
             codec: STATE_CODEC_VERSION,
-            function_id: self.descriptor.function_id.clone(),
-            pipeline_state_id: self.descriptor.pipeline_state_id.clone(),
-            implementation_digest: self.descriptor.implementation_digest.clone(),
-            schema_sha256: self.schema_sha256.clone(),
+            descriptor_sha256: self.descriptor_sha256.clone(),
             partitioning_abi: PARTITIONING_ABI_VERSION,
             vnode_count: self.vnode_count.get(),
             next_activation_id: self.next_activation_id,
@@ -138,10 +135,7 @@ impl GraphOperator for ProcessFunctionOperator {
         let frame: OperatorFrame = serde_json::from_slice(&checkpoint.data)
             .map_err(|error| DbError::Checkpoint(format!("decode process checkpoint: {error}")))?;
         if frame.codec != STATE_CODEC_VERSION
-            || frame.function_id != self.descriptor.function_id
-            || frame.pipeline_state_id != self.descriptor.pipeline_state_id
-            || frame.implementation_digest != self.descriptor.implementation_digest
-            || frame.schema_sha256 != self.schema_sha256
+            || frame.descriptor_sha256 != self.descriptor_sha256
             || frame.partitioning_abi != PARTITIONING_ABI_VERSION
             || frame.vnode_count != self.vnode_count.get()
         {
