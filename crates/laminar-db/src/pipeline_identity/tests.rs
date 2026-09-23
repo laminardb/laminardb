@@ -26,6 +26,7 @@ fn canonical_source_digest(
             processing_time: false,
         }],
         streams: Vec::new(),
+        process_functions: Vec::new(),
         tables: Vec::new(),
         sinks: Vec::new(),
     };
@@ -48,6 +49,7 @@ fn canonical_identity_digest_changes_with_root_execution_config() {
         event_time_max_future_skew_ms,
         sources: Vec::new(),
         streams: Vec::new(),
+        process_functions: Vec::new(),
         tables: Vec::new(),
         sinks: Vec::new(),
     };

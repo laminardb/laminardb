@@ -1291,7 +1291,9 @@ impl OperatorGraph {
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .any(|(node_id, node)| {
-                !node.operator.wants_input() || self.node_has_buffered_input(node_id)
+                node.operator.deferred_work_is_runnable()
+                    || !node.operator.wants_input()
+                    || self.node_has_buffered_input(node_id)
             })
     }
 
@@ -2418,6 +2420,29 @@ impl OperatorGraph {
         }
         self.output_map.insert(Arc::from(name), node_id);
         self.topo_dirty = true;
+    }
+
+    pub(crate) fn add_process_function(
+        &mut self,
+        registration: &crate::process_function::ProcessFunctionRegistration,
+    ) -> Result<(), DbError> {
+        let operator = crate::process_function::ProcessFunctionOperator::new(
+            registration.descriptor.clone(),
+            Arc::clone(&registration.handler),
+            u32::from(self.key_group_count),
+        )?;
+        let source = self.ensure_source_node(&registration.source_name);
+        let node =
+            self.place_prepared_operator_node(&registration.output_name, Box::new(operator), 1);
+        self.add_edge(source, node, 0);
+        self.output_map
+            .insert(Arc::from(registration.output_name.as_str()), node);
+        self.register_intermediate_schema(
+            &registration.output_name,
+            &registration.descriptor.output_schema,
+        );
+        self.topo_dirty = true;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

@@ -455,6 +455,29 @@ impl LaminarDB {
         Ok(())
     }
 
+    fn install_stream_schemas(&self, resolved: &HashMap<String, arrow_schema::SchemaRef>) {
+        let process_schemas = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .map(|registration| {
+                (
+                    registration.output_name.clone(),
+                    Arc::clone(&registration.descriptor.output_schema),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut schemas = self.stream_schemas.write();
+        schemas.clear();
+        schemas.extend(
+            resolved
+                .iter()
+                .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
+        );
+        schemas.extend(process_schemas);
+    }
+
     pub(super) async fn start_connector_pipeline(
         &self,
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -527,15 +550,7 @@ impl LaminarDB {
         )
         .await?;
         let stream_output_schemas = &resolved_stream_outputs.schemas;
-        {
-            let mut schemas = self.stream_schemas.write();
-            schemas.clear();
-            schemas.extend(
-                stream_output_schemas
-                    .iter()
-                    .map(|(name, schema)| (name.clone(), Arc::clone(schema))),
-            );
-        }
+        self.install_stream_schemas(stream_output_schemas);
 
         let mut graph = self.build_connector_operator_graph(
             &stream_regs,

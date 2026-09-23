@@ -623,12 +623,20 @@ impl LaminarDB {
         let participant = self.checkpoint_participant();
         let bound_pipeline_identity =
             if self.config.checkpoint.is_some() || startup_runtime == RuntimeMode::Cluster {
+                let process_regs = self
+                    .connector_manager
+                    .lock()
+                    .process_functions()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let identity_registrations = crate::pipeline_identity::PipelineRegistrations::new(
                     source_regs.values(),
                     sink_regs.values(),
                     stream_regs.values(),
                     table_regs.values(),
-                );
+                )
+                .with_process_functions(process_regs.iter());
                 let identity_context = crate::pipeline_identity::PipelineIdentityContext::new(
                     &self.config,
                     &self.catalog,

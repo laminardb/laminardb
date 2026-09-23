@@ -108,6 +108,7 @@ pub mod pipeline;
 mod pipeline_callback;
 mod pipeline_identity;
 mod pipeline_lifecycle;
+pub mod process_function;
 /// Deployment profiles.
 pub mod profile;
 /// Dynamic vnode rebalance control plane.

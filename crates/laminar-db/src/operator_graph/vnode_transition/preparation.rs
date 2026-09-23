@@ -369,21 +369,36 @@ impl OperatorGraph {
         Ok(())
     }
 
-    fn canonical_managed_operator_indices(&self) -> Vec<usize> {
-        let mut indices: Vec<usize> = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| !node.removed && node.capability.managed_state.is_some())
-            .map(|(node_idx, _)| node_idx)
-            .collect();
+    fn validated_transition_operator_indices(&self) -> Result<Vec<usize>, DbError> {
+        let mut indices = Vec::new();
+        for (node_idx, node) in self.nodes.iter().enumerate() {
+            if node.removed {
+                continue;
+            }
+            match node.capability.managed_state {
+                None => {}
+                Some(
+                    ManagedStateContract::SqlAggregateV1
+                    | ManagedStateContract::CoreWindowV1
+                    | ManagedStateContract::BoundedIntervalJoinV3
+                    | ManagedStateContract::TemporalJoinV1,
+                ) => indices.push(node_idx),
+                Some(ManagedStateContract::ProcessFunctionV1) => {
+                    return Err(DbError::Unsupported(
+                        "process function vnode transfer is not cluster-qualified".into(),
+                    ));
+                }
+                #[cfg(test)]
+                Some(ManagedStateContract::TestVnodeStateV1) => indices.push(node_idx),
+            }
+        }
         indices.sort_unstable_by(|left, right| {
             self.nodes[*left]
                 .name
                 .cmp(&self.nodes[*right].name)
                 .then_with(|| left.cmp(right))
         });
-        indices
+        Ok(indices)
     }
 
     pub(super) fn prepare_managed_operators(
@@ -397,7 +412,7 @@ impl OperatorGraph {
     ) -> Result<PreparedManagedOperators, DbError> {
         let payload_bytes = self.transition_payload_bytes(state_frames)?;
         self.validate_transition_state_budget(payload_bytes, "vnode transition staged payload")?;
-        let node_indices = self.canonical_managed_operator_indices();
+        let node_indices = self.validated_transition_operator_indices()?;
         let projected = self.project_transition_frames(&node_indices, state_frames)?;
         let mut attempted = Vec::new();
         for (node_idx, frames) in node_indices.into_iter().zip(projected) {
@@ -405,13 +420,9 @@ impl OperatorGraph {
                 .capability
                 .managed_state
                 .expect("managed operator inventory was filtered above");
-            match contract {
-                ManagedStateContract::SqlAggregateV1
-                | ManagedStateContract::CoreWindowV1
-                | ManagedStateContract::BoundedIntervalJoinV3
-                | ManagedStateContract::TemporalJoinV1 => {}
-                #[cfg(test)]
-                ManagedStateContract::TestVnodeStateV1 => continue,
+            #[cfg(test)]
+            if contract == ManagedStateContract::TestVnodeStateV1 {
+                continue;
             }
             let relevant_revoked = match self.relevant_revoked_vnodes(node_idx, revoked) {
                 Ok(relevant) => relevant,

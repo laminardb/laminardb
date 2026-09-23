@@ -37,6 +37,8 @@ struct CanonicalPipeline {
     event_time_max_future_skew_ms: i64,
     sources: Vec<CanonicalSource>,
     streams: Vec<CanonicalStream>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    process_functions: Vec<CanonicalProcess>,
     tables: Vec<CanonicalTable>,
     sinks: Vec<CanonicalSink>,
 }
@@ -69,6 +71,25 @@ struct CanonicalStream {
     incremental: bool,
     subscription_output: Option<crate::subscription::distribution::PlannedSubscriptionOutput>,
     subscription_retention_bytes: u64,
+}
+
+#[derive(Serialize)]
+struct CanonicalProcess {
+    output_name: String,
+    source_name: String,
+    function_id: String,
+    pipeline_state_id: String,
+    implementation_digest: String,
+    descriptor_version: u32,
+    state_codec_version: u32,
+    input_fields: Vec<crate::process_function::CanonicalField>,
+    output_fields: Vec<crate::process_function::CanonicalField>,
+    key_columns: Vec<String>,
+    event_time_column: String,
+    output_event_time_column: String,
+    value_state_name: String,
+    timer_names: Vec<String>,
+    limits: crate::process_function::ProcessFunctionLimits,
 }
 
 #[derive(Serialize)]
@@ -115,6 +136,7 @@ pub(crate) struct PipelineRegistrations<'a> {
     sources: FxHashMap<&'a str, &'a SourceRegistration>,
     sinks: FxHashMap<&'a str, &'a SinkRegistration>,
     streams: FxHashMap<&'a str, &'a StreamRegistration>,
+    process_functions: FxHashMap<&'a str, &'a crate::process_function::ProcessFunctionRegistration>,
     tables: FxHashMap<&'a str, &'a TableRegistration>,
 }
 
@@ -130,8 +152,19 @@ impl<'a> PipelineRegistrations<'a> {
             sources: sources.map(|reg| (reg.name.as_str(), reg)).collect(),
             sinks: sinks.map(|reg| (reg.name.as_str(), reg)).collect(),
             streams: streams.map(|reg| (reg.name.as_str(), reg)).collect(),
+            process_functions: FxHashMap::default(),
             tables: tables.map(|reg| (reg.name.as_str(), reg)).collect(),
         }
+    }
+
+    pub(crate) fn with_process_functions(
+        mut self,
+        functions: impl Iterator<Item = &'a crate::process_function::ProcessFunctionRegistration>,
+    ) -> Self {
+        self.process_functions = functions
+            .map(|reg| (reg.output_name.as_str(), reg))
+            .collect();
+        self
     }
 }
 
@@ -186,6 +219,7 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
             &context.registrations,
         )?,
         streams: canonical_streams(context.config, &context.registrations)?,
+        process_functions: canonical_processes(&context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
     };
@@ -314,6 +348,39 @@ fn canonical_streams(
         .collect::<Result<_, DbError>>()?;
     streams.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(streams)
+}
+
+fn canonical_processes(
+    registrations: &PipelineRegistrations<'_>,
+) -> Result<Vec<CanonicalProcess>, DbError> {
+    let mut functions = registrations
+        .process_functions
+        .values()
+        .map(|registration| {
+            let descriptor = &registration.descriptor;
+            Ok(CanonicalProcess {
+                output_name: registration.output_name.clone(),
+                source_name: registration.source_name.clone(),
+                function_id: descriptor.function_id.clone(),
+                pipeline_state_id: descriptor.pipeline_state_id.clone(),
+                implementation_digest: descriptor.implementation_digest.clone(),
+                descriptor_version: descriptor.version,
+                state_codec_version: crate::process_function::STATE_CODEC_VERSION,
+                input_fields: crate::process_function::canonical_fields(&descriptor.input_schema)?,
+                output_fields: crate::process_function::canonical_fields(
+                    &descriptor.output_schema,
+                )?,
+                key_columns: descriptor.key_columns.clone(),
+                event_time_column: descriptor.event_time_column.clone(),
+                output_event_time_column: descriptor.output_event_time_column.clone(),
+                value_state_name: descriptor.value_state_name.clone(),
+                timer_names: descriptor.timer_names.clone(),
+                limits: descriptor.limits,
+            })
+        })
+        .collect::<Result<Vec<_>, DbError>>()?;
+    functions.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
+    Ok(functions)
 }
 
 fn canonical_tables(

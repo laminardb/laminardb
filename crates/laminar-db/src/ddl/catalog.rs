@@ -152,8 +152,11 @@ impl LaminarDB {
                             "could not verify lookup provider for '{name}': {error}"
                         ))
                     })?),
-            CatalogObjectKind::Stream => Ok(self.catalog.get_stream_entry(name).is_some()
-                && self.connector_manager.lock().streams().contains_key(name)),
+            CatalogObjectKind::Stream => Ok(self.catalog.get_stream_entry(name).is_some() && {
+                let manager = self.connector_manager.lock();
+                manager.streams().contains_key(name)
+                    || manager.process_functions().contains_key(name)
+            }),
             CatalogObjectKind::MaterializedView => Ok(self.mv_registry.lock().get(name).is_some()
                 && self.connector_manager.lock().streams().contains_key(name)
                 && self.mv_store.read().has_mv(name)
@@ -404,7 +407,8 @@ impl LaminarDB {
                 ConnectorPresence {
                     source: manager.sources().contains_key(name),
                     sink: manager.sinks().contains_key(name),
-                    stream: manager.streams().contains_key(name),
+                    stream: manager.streams().contains_key(name)
+                        || manager.process_functions().contains_key(name),
                     table: manager.tables().contains_key(name),
                 },
             )

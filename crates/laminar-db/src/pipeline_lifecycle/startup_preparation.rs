@@ -26,7 +26,7 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
 
-        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
+        let (source_regs, sink_regs, stream_regs, table_regs, has_external, has_process_functions) = {
             let mgr = self.connector_manager.lock();
             (
                 mgr.sources().clone(),
@@ -34,6 +34,7 @@ impl LaminarDB {
                 mgr.streams().clone(),
                 mgr.tables().clone(),
                 mgr.has_external_connectors(),
+                !mgr.process_functions().is_empty(),
             )
         };
 
@@ -119,7 +120,7 @@ impl LaminarDB {
             );
         }
 
-        if has_external || !stream_regs.is_empty() {
+        if has_external || !stream_regs.is_empty() || has_process_functions {
             tracing::info!(
                 sources = source_regs.len(),
                 sinks = sink_regs.len(),

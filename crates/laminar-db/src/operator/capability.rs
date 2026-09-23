@@ -35,6 +35,8 @@ pub(crate) enum ManagedStateContract {
     BoundedIntervalJoinV3,
     /// Vnode-local version history, probes, frontiers, and timers for temporal joins.
     TemporalJoinV1,
+    /// Native process-function state and event-time timers, partitioned by canonical key.
+    ProcessFunctionV1,
     #[cfg(test)]
     TestVnodeStateV1,
 }
@@ -86,6 +88,7 @@ pub(crate) enum OperatorImplementation {
     Rejecting,
     TemporalJoin,
     WindowFrame,
+    ProcessFunction,
     #[cfg(test)]
     TestProbe,
 }
@@ -209,6 +212,12 @@ impl OperatorCapability {
                 State::LocalOnly,
                 "retained analytic-frame history has no vnode ownership lifecycle",
             ),
+            Implementation::ProcessFunction => Self::rejected(
+                implementation,
+                State::VnodeKeyed,
+                "process functions have no assignment-fenced cluster transfer contract",
+            )
+            .with_managed_state(ManagedStateContract::ProcessFunctionV1),
             Implementation::SqlQuery => Self::rejected(
                 implementation,
                 State::LocalOnly,

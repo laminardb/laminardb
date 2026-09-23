@@ -136,6 +136,31 @@ impl LaminarDB {
 
         Ok(())
     }
+    fn validated_stream_entries(
+        &self,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+    ) -> Result<Vec<Arc<crate::catalog::StreamEntry>>, DbError> {
+        let manager = self.connector_manager.lock();
+        self.catalog
+            .list_streams()
+            .into_iter()
+            .map(|name| {
+                if !stream_regs.contains_key(&name)
+                    && !manager.process_functions().contains_key(&name)
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "catalog stream '{name}' has no executable registration"
+                    )));
+                }
+                self.catalog.get_stream_entry(&name).ok_or_else(|| {
+                    DbError::Pipeline(format!(
+                        "catalog stream '{name}' disappeared during startup"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn prepare_pipeline_watermarks(
         &self,
         sources: &[TrackedSourceRegistration],
@@ -149,23 +174,7 @@ impl LaminarDB {
         recovered_checkpoint_index_version: Option<u32>,
         recovered_watermark_frontier: Option<i64>,
     ) -> Result<PipelineWatermarks, DbError> {
-        let stream_entries: Vec<_> = self
-            .catalog
-            .list_streams()
-            .into_iter()
-            .map(|name| {
-                if !stream_regs.contains_key(&name) {
-                    return Err(DbError::Pipeline(format!(
-                        "catalog stream '{name}' has no executable registration"
-                    )));
-                }
-                self.catalog.get_stream_entry(&name).ok_or_else(|| {
-                    DbError::Pipeline(format!(
-                        "catalog stream '{name}' disappeared during startup"
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        let stream_entries = self.validated_stream_entries(stream_regs)?;
 
         let future_skew_ms =
             crate::config::event_time_max_future_skew_ms(self.config.event_time_max_future_skew)

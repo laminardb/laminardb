@@ -5745,13 +5745,21 @@ impl LaminarDB {
     /// List registered streams.
     pub fn streams(&self) -> Vec<crate::handle::StreamInfo> {
         let mgr = self.connector_manager.lock();
-        mgr.streams()
+        let mut streams = mgr
+            .streams()
             .iter()
             .map(|(name, reg)| crate::handle::StreamInfo {
                 name: name.clone(),
                 sql: Some(reg.query_sql.clone()),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        streams.extend(mgr.process_functions().values().map(|registration| {
+            crate::handle::StreamInfo {
+                name: registration.output_name.clone(),
+                sql: None,
+            }
+        }));
+        streams
     }
 
     /// Build the pipeline topology graph (nodes + edges) from registered sources, streams, and sinks.

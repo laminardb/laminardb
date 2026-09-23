@@ -106,6 +106,19 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         self.ensure_topology_ddl_allowed("DROP STREAM")?;
         let name_str = canonical_object_name(name)?;
+        if self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .contains_key(&name_str)
+        {
+            self.ensure_offline_topology_ddl_allowed("DROP PROCESS STREAM")?;
+            if self.config.checkpoint.is_some() {
+                return Err(DbError::Unsupported(
+                    "process stream removal requires a reset checkpoint namespace".into(),
+                ));
+            }
+        }
         if !self.require_catalog_kind(&name_str, CatalogObjectKind::Stream, if_exists)? {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "DROP STREAM".to_string(),
@@ -189,6 +202,11 @@ impl LaminarDB {
                     .contains(name)
                 {
                     names.insert(stream_name.clone());
+                }
+            }
+            for registration in manager.process_functions().values() {
+                if registration.source_name == name {
+                    names.insert(registration.output_name.clone());
                 }
             }
         }

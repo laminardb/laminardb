@@ -129,6 +129,18 @@ impl LaminarDB {
         // Seed changelog producers up front so consumer admission is independent of build order.
         graph.set_changelog_tables(changelog_carrying.clone());
 
+        let mut process_functions = self
+            .connector_manager
+            .lock()
+            .process_functions()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        process_functions.sort_unstable_by(|left, right| left.output_name.cmp(&right.output_name));
+        for registration in &process_functions {
+            graph.add_process_function(registration)?;
+        }
+
         let mut ordered_streams: Vec<_> = stream_regs.values().collect();
         ordered_streams.sort_by(|left, right| left.name.cmp(&right.name));
         for reg in ordered_streams {
