@@ -417,12 +417,28 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let no_environment = |_: &str| None;
     let custom = HashMap::from([("aws_endpoint_url".into(), "http://minio:9000".into())]);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    assert!(custom_s3_endpoint_configured_with_env(
         "s3://bucket/table",
         &custom,
         &no_environment,
-    )
-    .is_err());
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "az://container/table",
+        &custom,
+        &no_environment,
+    ));
+    assert!(!custom_s3_endpoint_configured_with_env(
+        "gs://bucket/table",
+        &custom,
+        &no_environment,
+    ));
+    validate_coordinated_storage_preflight_with_env("s3://bucket/table", &custom, &no_environment)
+        .unwrap();
     for conditional_put in ["disabled", "dynamo:commits"] {
         let options = HashMap::from([("aws_conditional_put".into(), conditional_put.into())]);
         assert!(validate_coordinated_storage_preflight_with_env(
@@ -441,12 +457,17 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let s3_environment = HashMap::from([("AWS_ENDPOINT_URL", "http://minio:9000")]);
     let s3_environment = |key: &str| s3_environment.get(key).map(ToString::to_string);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    assert!(custom_s3_endpoint_configured_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &s3_environment,
+    ));
+    validate_coordinated_storage_preflight_with_env(
         "s3://bucket/table",
         &HashMap::new(),
         &s3_environment,
     )
-    .is_err());
+    .unwrap();
     validate_coordinated_storage_preflight_with_env(
         "file:///tmp/table",
         &HashMap::new(),
@@ -471,12 +492,12 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
 
     let azure_environment = HashMap::from([("AZURE_STORAGE_USE_EMULATOR", "true")]);
     let azure_environment = |key: &str| azure_environment.get(key).map(ToString::to_string);
-    assert!(validate_coordinated_storage_preflight_with_env(
+    validate_coordinated_storage_preflight_with_env(
         "abfss://container@account/table",
         &HashMap::new(),
         &azure_environment,
     )
-    .is_err());
+    .unwrap();
     for path in [
         "az://container/table",
         "abfs://container/table",
@@ -499,12 +520,12 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
             "service-account.json".into(),
         )]),
     ] {
-        assert!(validate_coordinated_storage_preflight_with_env(
+        validate_coordinated_storage_preflight_with_env(
             "gs://bucket/table",
             &options,
             &no_environment,
         )
-        .is_err());
+        .unwrap();
     }
     validate_coordinated_storage_preflight_with_env(
         "gs://bucket/table",
@@ -525,42 +546,15 @@ fn coordinated_provider_and_retention_scope_fail_closed() {
     .is_err());
 }
 
-#[test]
-fn coordinated_emulator_override_is_debug_soak_only() {
-    let azure_options = HashMap::from([(
-        "azure_storage_endpoint".into(),
-        "http://127.0.0.1:10000/devstoreaccount1".into(),
-    )]);
-    let azure_environment =
-        |key: &str| (key == "LAMINAR_SOAK_ALLOW_AZURE_EMULATOR").then(|| "1".to_string());
-    let azure = validate_coordinated_storage_preflight_with_env(
-        "az://container/table",
-        &azure_options,
-        &azure_environment,
-    );
-
-    let gcs_options = HashMap::from([
-        ("google_base_url".into(), "http://127.0.0.1:4443".into()),
-        (
-            "google_service_account_key".into(),
-            r#"{"disable_oauth":true}"#.into(),
-        ),
-    ]);
-    let gcs_environment =
-        |key: &str| (key == "LAMINAR_SOAK_ALLOW_GCS_EMULATOR").then(|| "true".to_string());
-    let gcs = validate_coordinated_storage_preflight_with_env(
-        "gs://bucket/table",
-        &gcs_options,
-        &gcs_environment,
-    );
-
-    if cfg!(debug_assertions) {
-        azure.unwrap();
-        gcs.unwrap();
-    } else {
-        assert!(azure.is_err());
-        assert!(gcs.is_err());
-    }
+#[tokio::test]
+async fn coordinated_conditional_create_probe_uses_delta_table_store() {
+    let temp_dir = TempDir::new().unwrap();
+    let table = open_or_create_table(temp_dir.path().to_str().unwrap(), HashMap::new(), None)
+        .await
+        .unwrap();
+    verify_custom_s3_conditional_create(&table, test_publication_deadline())
+        .await
+        .unwrap();
 }
 
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {

@@ -158,6 +158,11 @@ impl DeltaLakeSink {
             delta_io::open_or_create_table(&resolved_path, merged_options.clone(), None)
         })
         .await?;
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && delta_io::custom_s3_endpoint_configured(&resolved_path, &merged_options)
+        {
+            delta_io::verify_custom_s3_conditional_create(&table, deadline).await?;
+        }
         if table.version().is_none() && self.schema.is_some() {
             table = tokio::time::timeout_at(
                 deadline,

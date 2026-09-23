@@ -1,4 +1,4 @@
-//! Fail-closed coordinated-storage configuration and log-store certification.
+//! Coordinated-storage configuration and log-store validation.
 
 use super::{
     ConnectorError, DeltaTable, HashMap, StorageProvider, COORDINATED_CONNECT_TIMEOUT,
@@ -84,14 +84,6 @@ fn is_truthy(value: &str) -> bool {
 }
 
 #[cfg(feature = "delta-lake")]
-fn debug_emulator_soak_enabled<F>(environment: &F, marker: &str) -> bool
-where
-    F: Fn(&str) -> Option<String>,
-{
-    cfg!(debug_assertions) && environment(marker).as_deref().is_some_and(is_truthy)
-}
-
-#[cfg(feature = "delta-lake")]
 fn validate_coordinated_s3_options<F>(
     options: &HashMap<String, String>,
     environment: &F,
@@ -99,24 +91,6 @@ fn validate_coordinated_s3_options<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let custom_endpoint = has_effective_value(
-        options,
-        &[
-            "endpoint",
-            "endpoint_url",
-            "aws_endpoint",
-            "aws_endpoint_url",
-        ],
-        &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
-        environment,
-    );
-    let soak_emulator = debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_S3_EMULATOR");
-    if custom_endpoint && !soak_emulator {
-        return Err(ConnectorError::ConfigurationError(
-            "Delta exactly-once does not admit custom S3 endpoints until their atomic-create behavior passes the release fault suite"
-                .into(),
-        ));
-    }
     let conditional_put = effective_values(
         options,
         &["conditional_put", "aws_conditional_put"],
@@ -155,97 +129,54 @@ where
 }
 
 #[cfg(feature = "delta-lake")]
-fn validate_coordinated_azure_options<F>(
+pub(super) fn custom_s3_endpoint_configured_with_env<F>(
+    table_path: &str,
     options: &HashMap<String, String>,
     environment: &F,
-) -> Result<(), ConnectorError>
+) -> bool
 where
     F: Fn(&str) -> Option<String>,
 {
-    let custom_endpoint = has_effective_value(
-        options,
-        &["endpoint", "azure_endpoint", "azure_storage_endpoint"],
-        &["AZURE_ENDPOINT", "AZURE_STORAGE_ENDPOINT"],
-        environment,
-    ) || effective_values(
-        options,
-        &[
-            "use_emulator",
-            "azure_use_emulator",
-            "azure_storage_use_emulator",
-        ],
-        &["AZURE_USE_EMULATOR", "AZURE_STORAGE_USE_EMULATOR"],
-        environment,
-    )
-    .iter()
-    .any(|value| is_truthy(value));
-    let soak_emulator =
-        debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_AZURE_EMULATOR");
-    if custom_endpoint && !soak_emulator {
-        return Err(ConnectorError::ConfigurationError(
-            "Delta exactly-once does not admit custom Azure endpoints or emulators until their atomic-create behavior passes the release fault suite"
-                .into(),
-        ));
-    }
-    Ok(())
+    StorageProvider::detect_uri(table_path) == Some(StorageProvider::AwsS3)
+        && has_effective_value(
+            options,
+            &[
+                "endpoint",
+                "endpoint_url",
+                "aws_endpoint",
+                "aws_endpoint_url",
+            ],
+            &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
+            environment,
+        )
 }
 
 #[cfg(feature = "delta-lake")]
-fn validate_coordinated_gcs_options<F>(
+pub(in crate::lakehouse) fn custom_s3_endpoint_configured(
+    table_path: &str,
     options: &HashMap<String, String>,
-    environment: &F,
-) -> Result<(), ConnectorError>
-where
-    F: Fn(&str) -> Option<String>,
-{
-    let soak_emulator = debug_emulator_soak_enabled(environment, "LAMINAR_SOAK_ALLOW_GCS_EMULATOR");
-    let custom_endpoint = has_effective_value(
-        options,
-        &["google_base_url", "base_url"],
-        &["GOOGLE_BASE_URL", "GOOGLE_ENDPOINT_URL"],
-        environment,
-    );
-    if custom_endpoint && !soak_emulator {
-        return Err(ConnectorError::ConfigurationError(
-            "Delta exactly-once does not admit a custom GCS endpoint until its atomic-create behavior passes the release fault suite"
-                .into(),
-        ));
-    }
-    if has_effective_value(
-        options,
-        &[
-            "google_service_account",
-            "google_service_account_path",
-            "service_account",
-            "service_account_path",
-        ],
-        &["GOOGLE_SERVICE_ACCOUNT", "GOOGLE_SERVICE_ACCOUNT_PATH"],
-        environment,
-    ) {
-        return Err(ConnectorError::ConfigurationError(
-            "Delta exactly-once does not admit GCS service-account path files because they can override the storage endpoint; use workload identity, application-default credentials, or an inline key"
-                .into(),
-        ));
-    }
-    for key in effective_values(
-        options,
-        &["google_service_account_key", "service_account_key"],
-        &["GOOGLE_SERVICE_ACCOUNT_KEY"],
-        environment,
-    ) {
-        let document: serde_json::Value = serde_json::from_str(&key).map_err(|error| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid GCS service-account key for Delta exactly-once: {error}"
-            ))
-        })?;
-        if document.get("gcs_base_url").is_some() && !soak_emulator {
-            return Err(ConnectorError::ConfigurationError(
-                "Delta exactly-once does not admit a custom gcs_base_url until its atomic-create behavior passes the release fault suite"
+) -> bool {
+    custom_s3_endpoint_configured_with_env(table_path, options, &|key| std::env::var(key).ok())
+}
+
+#[cfg(feature = "delta-lake")]
+pub(in crate::lakehouse) async fn verify_custom_s3_conditional_create(
+    table: &DeltaTable,
+    deadline: tokio::time::Instant,
+) -> Result<(), ConnectorError> {
+    validate_coordinated_log_store(table)?;
+    let timeout = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(std::time::Duration::from_secs(10));
+    let store = table.object_store();
+    laminar_core::checkpoint::probe_object_store_conditional_create(store.as_ref(), "", timeout)
+        .await
+        .map_err(|_| {
+            ConnectorError::ConfigurationError(
+                "Delta exactly-once custom S3 endpoint failed atomic conditional-create startup verification"
                     .into(),
-            ));
-        }
-    }
-    Ok(())
+            )
+        })
 }
 
 #[cfg(feature = "delta-lake")]
@@ -258,12 +189,9 @@ where
     F: Fn(&str) -> Option<String>,
 {
     match StorageProvider::detect_uri(table_path) {
+        // Custom S3 endpoints also pass the table-scoped conditional-create probe in sink startup.
         Some(StorageProvider::AwsS3) => validate_coordinated_s3_options(options, environment),
-        Some(StorageProvider::AzureAdls) => {
-            validate_coordinated_azure_options(options, environment)
-        }
-        Some(StorageProvider::Gcs) => validate_coordinated_gcs_options(options, environment),
-        Some(StorageProvider::Local) => Ok(()),
+        Some(StorageProvider::AzureAdls | StorageProvider::Gcs | StorageProvider::Local) => Ok(()),
         None => match table_path.split_once("://") {
             None => Ok(()),
             Some((scheme, _)) if scheme.eq_ignore_ascii_case("uc") => Ok(()),

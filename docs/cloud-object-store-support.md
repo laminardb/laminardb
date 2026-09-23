@@ -1,6 +1,6 @@
 # Cloud object-store support
 
-**Status:** current implementation boundary, 2026-09-02
+**Status:** current implementation boundary, 2026-09-23
 
 Cloud storage is a backend capability, not a file or table format. This page records support for
 each storage consumer separately. It also separates code/configuration support from evidence: a
@@ -46,7 +46,7 @@ current commit. “ALO” means at-least-once only in cluster mode.
 |---|---|---|---|---|---|
 | Checkpoint/recovery | URI/config; native capability + fault jobs; no current artifact | URI/config; Azurite Blob conditional/CAS/fault smoke job; native capability + fault jobs; local-native certification, no CI artifact (see status note) | URI/config; GCS-emulator basic I/O/restart smoke only; no emulator multipart/CAS/fault evidence; keyless native job enabled; no current native artifact | Supported through the built-in local directory; only absolute `file://` URLs classify as node-durable | URI/config; MinIO smoke coverage; compatibility tier only |
 | Delta source | URI/config; MinIO smoke; native job; local/embedded source semantics | URI/config; Azurite read/reopen smoke job; native job; no current native artifact | URI/config; GCS-emulator read/reopen smoke job; keyless native job enabled; no current native artifact | Supported | MinIO smoke; compatibility tier only |
-| Delta sink | URI/config; MinIO smoke; native job; direct S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; cluster ALO only |
+| Delta sink | URI/config; MinIO smoke; native job; S3/S3A cluster exact admission retained | URI/config; coordinated-publication emulator smoke job; native job; cluster ALO only | URI/config; emulator append/read/reopen smoke at ALO only; keyless native job enabled; no current native artifact; cluster ALO only | Supported; local coordinated delivery rules apply | MinIO smoke; S3/S3A cluster exact requires native ETag conditional put and a successful atomic conditional-create startup probe. Any configured `s3_locking_provider` and enabled unsafe-rename mode are rejected; a lock provider is not required. |
 | Iceberg source | REST + S3/file wiring; MinIO smoke; native job | **Experimental** `iceberg-azure`; native job; no current artifact | `iceberg-gcs`; native job; no current artifact | Supported by `iceberg` | MinIO smoke; compatibility tier only |
 | Iceberg sink | REST + S3/file wiring; existing direct-S3 admission retained; native job | **Experimental** `iceberg-azure`; ALO only; no current artifact | `iceberg-gcs`; ALO only; no current artifact | Supported; local coordinated delivery rules apply | MinIO smoke; no native certification claim |
 | Files source (Parquet/CSV/JSON) | Unsupported remote URL | Unsupported remote URL | Unsupported remote URL | Supported | Unsupported remote URL |
@@ -57,10 +57,10 @@ operation and return an actionable error. No object-store sink was added because
 needs deterministic keys, conditional publication, content validation on retry, and a durable
 visibility manifest; POSIX rename semantics are not emulated over object storage.
 
-Cluster exact-delivery admission is unchanged. It remains limited to the compositions documented
-by the runtime admission checks: Kafka input with the certified direct S3/S3A append-mode Delta
-sink, or the certified REST-catalog Iceberg append sink backed by direct S3/S3A storage. Custom S3
-endpoints, Azure, and GCS do not inherit that admission.
+Cluster exact-delivery admission remains limited to Kafka input with an S3/S3A append-mode Delta
+sink, or a REST-catalog Iceberg append sink backed by S3/S3A storage. Sink startup probes a custom
+S3 endpoint's atomic conditional create before new table creation; failure closes admission. Azure
+and GCS remain at-least-once in cluster mode.
 
 ## Locations and canonicalisation
 
@@ -165,9 +165,7 @@ container/bucket, and emits artifacts that are explicitly classified as emulator
 
 The Azure job executes the shared conditional-create, stale-CAS, fresh-client, cleanup, and
 checkpoint fault-boundary contracts. It also exercises Delta's coordinated descriptor publication,
-conflicting-cut rejection, idempotent retry, read, and fresh-client cursor recovery. Coordinated
-emulator endpoints are admitted only behind explicit debug/soak markers; release builds remain
-fail-closed.
+conflicting-cut rejection, idempotent retry, read, and fresh-client cursor recovery.
 
 The GCS job is deliberately narrower. The fake server used by pinned `object_store 0.13.2` does not
 implement XML multipart upload or honor `ifGenerationMatch`, so it runs basic put/get/range/head,
@@ -177,7 +175,7 @@ Its evidence records conditional-create, stale-CAS, and multipart as unproven (`
 Azurite covers the Azure Blob protocol only and does not emulate ADLS Gen2 hierarchical namespace
 behavior. The GCS-compatible container does not establish native generation, identity, retry, or
 service behavior. Artifacts from this workflow therefore say `native_or_emulator=emulator` and are
-never eligible to promote delivery admission.
+do not establish native-provider behavior.
 
 ## Native evidence workflow
 

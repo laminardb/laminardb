@@ -50,9 +50,7 @@
 //! - `LAMINAR_SOAK_CHECKPOINT_URL`  required cluster-shared checkpoint prefix
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  checkpoint storage
 //! - `LAMINAR_SOAK_DELTA_BUCKET`  existing bucket for unique EO output tables
-//! - `LAMINAR_SOAK_ALLOW_S3_EMULATOR=1`  debug/soak-only MinIO protocol validation; this does not
-//!   certify an emulator or custom endpoint for production; EO emulator runs use a bounded 60s
-//!   checkpoint-operation timeout
+//! - Custom S3 endpoint EO runs use a bounded 60s checkpoint-operation timeout
 //! - `LAMINAR_SOAK_ALO_VISIBILITY_MS`  maximum Kafka output visibility latency (default 10000)
 //! - `LAMINAR_SOAK_EO_VISIBILITY_MS`  maximum frozen-input-to-Delta visibility latency (default 10000)
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
@@ -192,7 +190,7 @@ const CLUSTER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(30);
 // one emulator. Give that non-certifying profile one bounded slow-storage allowance without
 // changing the production-store timeout or the recovery liveness ceiling.
 #[cfg(feature = "kafka")]
-const CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
+const CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(feature = "kafka")]
 const MIN_CONTINUOUS_AGGREGATE_STATE_BYTES: u64 = 64 * 1_024;
 #[cfg(feature = "kafka")]
@@ -2284,11 +2282,6 @@ impl Node {
             .env_remove(SOAK_LAMINARDB_SHA256_ENV)
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log));
-        if std::env::var("LAMINAR_SOAK_ALLOW_S3_EMULATOR").as_deref() == Ok("1") {
-            cmd.env("LAMINAR_SOAK_ALLOW_S3_EMULATOR", "1");
-        } else {
-            cmd.env_remove("LAMINAR_SOAK_ALLOW_S3_EMULATOR");
-        }
         match &self.fault_trigger_path {
             Some(path) => {
                 cmd.env("LAMINAR_FAULT_INJECT_TRIGGER_FILE", path);
@@ -10022,7 +10015,7 @@ impl JoinDelivery {
 #[cfg(feature = "kafka")]
 fn cluster_checkpoint_timeout(
     delivery: JoinDelivery,
-    s3_emulator: bool,
+    custom_s3_endpoint: bool,
     configured: Option<Duration>,
 ) -> Duration {
     if let Some(configured) = configured {
@@ -10032,15 +10025,18 @@ fn cluster_checkpoint_timeout(
         );
         return configured;
     }
-    if delivery == JoinDelivery::ExactlyOnce && s3_emulator {
-        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+    if delivery == JoinDelivery::ExactlyOnce && custom_s3_endpoint {
+        CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT
     } else {
         CLUSTER_CHECKPOINT_TIMEOUT
     }
 }
 
 #[cfg(feature = "kafka")]
-fn configured_cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bool) -> Duration {
+fn configured_cluster_checkpoint_timeout(
+    delivery: JoinDelivery,
+    custom_s3_endpoint: bool,
+) -> Duration {
     let configured = std::env::var("LAMINAR_SOAK_CHECKPOINT_TIMEOUT_MS")
         .ok()
         .map(|value| {
@@ -10049,12 +10045,12 @@ fn configured_cluster_checkpoint_timeout(delivery: JoinDelivery, s3_emulator: bo
             });
             Duration::from_millis(milliseconds)
         });
-    cluster_checkpoint_timeout(delivery, s3_emulator, configured)
+    cluster_checkpoint_timeout(delivery, custom_s3_endpoint, configured)
 }
 
 #[cfg(feature = "kafka")]
-fn s3_emulator_enabled() -> bool {
-    std::env::var("LAMINAR_SOAK_ALLOW_S3_EMULATOR").as_deref() == Ok("1")
+fn custom_s3_endpoint_configured() -> bool {
+    std::env::var("LAMINAR_SOAK_S3_ENDPOINT").is_ok()
 }
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -10068,15 +10064,6 @@ struct DeltaSoakStorage {
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
 impl DeltaSoakStorage {
     fn from_environment() -> Self {
-        assert!(
-            cfg!(debug_assertions),
-            "EO MinIO soaks require cargo test --profile soak; release builds keep custom S3 endpoints fail-closed"
-        );
-        assert_eq!(
-            std::env::var("LAMINAR_SOAK_ALLOW_S3_EMULATOR").as_deref(),
-            Ok("1"),
-            "EO MinIO soaks require LAMINAR_SOAK_ALLOW_S3_EMULATOR=1; this debug-only gate validates the protocol under faults, not production S3 semantics"
-        );
         eprintln!(
             "soak: MinIO EO mode validates recovery/publication protocol only; it is not cloud-provider certification"
         );
@@ -13795,7 +13782,8 @@ fn run_three_node_join_kill9_soak(
     );
     validate_retained_state_profile(soak_secs, retained_interval_ms, minimum_live_state_bytes);
     let recovery_ceiling = recovery_ceiling();
-    let checkpoint_timeout = configured_cluster_checkpoint_timeout(delivery, s3_emulator_enabled());
+    let checkpoint_timeout =
+        configured_cluster_checkpoint_timeout(delivery, custom_s3_endpoint_configured());
     validate_checkpoint_liveness(interval_ms, checkpoint_timeout, recovery_ceiling);
     let durable_output_window = recovery_aware_durable_progress_window(
         interval_ms,
@@ -18520,7 +18508,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
     assert_eq!(
         recovery_aware_durable_progress_window(
             10_000,
-            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT,
             Duration::from_secs(90),
             1,
         ),
@@ -18529,7 +18517,7 @@ fn durable_progress_window_covers_failed_and_restored_checkpoint_cycles() {
     assert_eq!(
         recovery_aware_durable_progress_window(
             10_000,
-            CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT,
+            CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT,
             Duration::from_secs(90),
             2,
         ),
@@ -18915,7 +18903,7 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
     );
     assert_eq!(
         cluster_checkpoint_timeout(JoinDelivery::ExactlyOnce, true, None),
-        CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT
+        CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT
     );
     assert_eq!(
         cluster_checkpoint_timeout(
@@ -18926,7 +18914,7 @@ fn cluster_soak_config_bounds_checkpoint_timeout_within_liveness_window() {
         Duration::from_secs(60)
     );
     assert!(CLUSTER_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
-    assert!(CLUSTER_EMULATOR_EO_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
+    assert!(CLUSTER_CUSTOM_S3_EO_CHECKPOINT_TIMEOUT < RECOVERY_LIVENESS_WINDOW);
 
     let directory = tempfile::tempdir().unwrap();
     let path = write_config(

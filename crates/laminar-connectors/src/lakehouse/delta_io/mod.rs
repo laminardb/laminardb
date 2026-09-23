@@ -68,7 +68,8 @@ pub(super) use publication::{
 };
 #[cfg(feature = "delta-lake")]
 pub(super) use storage_preflight::{
-    bound_coordinated_storage_options, validate_coordinated_storage_preflight,
+    bound_coordinated_storage_options, custom_s3_endpoint_configured,
+    validate_coordinated_storage_preflight, verify_custom_s3_conditional_create,
 };
 
 #[cfg(feature = "delta-lake")]
@@ -92,7 +93,8 @@ use publication::validate_coordinated_retention;
 use read::{checked_cdf_commit_usage, map_cdf_scan_build_error};
 #[cfg(all(feature = "delta-lake", test))]
 use storage_preflight::{
-    is_certified_coordinated_log_store, validate_coordinated_storage_preflight_with_env,
+    custom_s3_endpoint_configured_with_env, is_certified_coordinated_log_store,
+    validate_coordinated_storage_preflight_with_env,
 };
 #[cfg(all(feature = "delta-lake", test))]
 use table::{adapt_delta_location, apply_url_derived_options, path_to_url};
