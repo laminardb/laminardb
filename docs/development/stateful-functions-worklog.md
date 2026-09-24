@@ -1,6 +1,6 @@
 # Stateful Process Functions worklog
 
-**Status/date:** Active implementation, 2026-09-23. This is a resumable engineering log, not a support claim.
+**Status/date:** Active implementation, 2026-09-24. This is a resumable engineering log, not a support claim.
 
 ## Baseline
 
@@ -58,6 +58,18 @@ Pipeline identity and the operator checkpoint now bind the SHA-256 of the comple
 
 The focused native suite has 13 tests in both default and no-default-feature builds, including manifest type round trips, malformed/incompatible manifest rejection, and rejection of a changed timer contract on restore. The final no-default-feature focused run passed after the last code edit. The final workspace library suite passed with `RUST_MIN_STACK=8388608 cargo test --workspace --lib -- --test-threads=1`: 1,977 connector, 973 core, 1,984 database, and 870 SQL tests passed; derive had no library tests. The unadjusted default-stack Windows gate remains red for the pre-existing coordinated-recovery overflow recorded above. Both workspace Clippy gates, nightly formatting, the readability checker, and `git diff --check` passed after the final code edit.
 
+### Continuation: bounded Rust remote reference transport (2026-09-24)
+
+The `process-remote` feature now contains one versioned bidirectional gRPC service with Protobuf control frames and self-contained Arrow IPC streams for input and output batches. The manifest binds `trusted_native_rust`, `remote_rust`, or `remote_python` as distinct runtimes; native registration still requires the native runtime. Host activations carry canonical key, independent logical ID, per-activation event time and state existence/value. Invocation scope carries operator/vnode, owner and recovery generations, separate batch/attempt IDs, input watermark, and deadline. Results carry activation IDs, explicit state mutations and timer operations, zero-to-many output sections, and a completion count. The Rust reference worker accepts only a loopback listener and executes handlers in a bounded blocking pool. Client and worker use admission credits; a cancelled blocking handler keeps its worker credit until it finishes.
+
+Selection: [Arrow Flight `DoExchange`](https://arrow.apache.org/docs/format/Flight.html) supports bidirectional data and metadata, but [PyArrow's high-level Flight writer](https://arrow.apache.org/docs/python/generated/pyarrow.flight.FlightStreamWriter.html) begins with one schema. The function contract needs independent input/output schemas and typed state/timer sections. Explicit gRPC frames keep those sections and completion validation visible without building a Flight metadata multiplexing layer. This is an architectural inference from the documented APIs, not a Python interoperability result. Python/PyArrow interoperability is the next test.
+
+The prototype caps each IPC frame at 8 MiB and request/response wire payloads at 32 MiB, rejects compressed, dictionary and noncanonical IPC, checks decoded schema/rows/bytes, and retains no authoritative worker state. The client returns a complete staged result for host validation; no result is applied by the transport. `cargo test -p laminar-db --no-default-features --features process-remote --lib process_function:: -- --quiet` passed 19 tests on the final code: live TCP zero/multiple outputs, null/absent state, timer callback, descriptor mismatch, truncated IPC, cancelled-call credit retention, scalar type/decimal/timestamp round trip, and malformed-byte property cases. The remote client and reference worker are not yet wired into `LaminarDB` registration or the operator graph; this is a transport boundary, not remote pipeline support. The current feature is loopback only and does not claim authenticated nonlocal deployment, Python support, restart recovery, or cluster support.
+
+The native record path is unchanged apart from an offline runtime admission check, so the coordinator/core-operator before/after benchmark gate is not triggered by this increment. The remote path still needs its own sampled CPU/IPC and p99 measurements after graph integration. Native development checkpoints retain codec v2 and the same canonical manifest for `trusted_native_rust`.
+
+The full workspace library suite passed with `RUST_MIN_STACK=8388608 cargo test --workspace --lib -- --test-threads=1`: 1,977 connector, 973 core, 1,984 database (1 ignored), and 870 SQL tests. The unadjusted Windows stack failure remains the known baseline caveat. `cargo clippy --workspace --all-features --all-targets -- -D warnings`, `cargo clippy --workspace --no-default-features -- -D warnings`, and feature-specific remote Clippy all passed after the final code edit. Nightly formatting and the readability checker passed after the last code changes.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -71,4 +83,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Run a sampled CPU/IPC profile and representative tail-latency workload on target hardware before using the local Criterion means as a product latency claim. Next implement and test one bounded Arrow IPC/Protobuf remote transport with a Rust reference worker against this descriptor, then add the Python/PyArrow SDK. After local worker recovery and server invocation are qualified, implement and test cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.
+Run a sampled CPU/IPC profile and representative tail-latency workload on target hardware before using the local Criterion means as a product latency claim. Next add a Python/PyArrow worker for the selected Protobuf/gRPC contract and cross-language conformance tests, then connect the remote client through bounded asynchronous operator scheduling and supervised local worker lifecycle. Qualify local recovery and server invocation before cluster one-owner admission, then distributed handoff. Do not enable either cluster form from capability metadata alone.

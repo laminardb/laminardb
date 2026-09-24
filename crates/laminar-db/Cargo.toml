@@ -54,6 +54,7 @@ checkpoint-aws = ["aws"]
 checkpoint-gcs = ["gcs"]
 checkpoint-azure = ["azure"]
 remote = ["dep:reqwest", "dep:governor"]
+process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
@@ -106,7 +107,7 @@ sqlparser = { workspace = true }
 # Async
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 async-trait = { workspace = true }
 trait-variant = { workspace = true }
 indexmap = { workspace = true }
@@ -130,6 +131,9 @@ prometheus = { workspace = true }
 
 # Zero-copy byte buffers used by checkpoint payloads.
 bytes = { workspace = true }
+tonic = { version = "0.14", optional = true, features = ["tls-aws-lc"] }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
 
 uuid = { workspace = true }
 
@@ -164,6 +168,10 @@ futures-util = { version = "0.3" }
 # S3-compatible object store client used by the MinIO-backed integration
 # test. Workspace feature set + aws for the AmazonS3 builder.
 object_store = { workspace = true, features = ["aws"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protoc-bin-vendored = "3"
 
 [[bench]]
 name = "recovery_bench"

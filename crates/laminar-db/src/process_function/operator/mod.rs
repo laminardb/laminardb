@@ -106,6 +106,11 @@ impl ProcessFunctionOperator {
         handler: Arc<dyn NativeProcessFunction>,
         vnode_count: u32,
     ) -> Result<Self, DbError> {
+        if descriptor.runtime != super::ProcessRuntime::NativeRust {
+            return Err(DbError::Unsupported(
+                "native process operator requires the trusted native Rust runtime".into(),
+            ));
+        }
         let vnode_count = NonZeroU32::new(vnode_count)
             .ok_or_else(|| DbError::Config("process function requires nonzero vnodes".into()))?;
         let (key_codec, key_indices, time_index, output_time_index) =
@@ -617,7 +622,7 @@ pub(super) fn validate_descriptor(
         || descriptor.input_schema.field(key_indices[0]).data_type() != &DataType::Utf8
     {
         return Err(DbError::Unsupported(
-            "native process functions currently require one UTF-8 key column".into(),
+            "process functions currently require one UTF-8 key column".into(),
         ));
     }
     let time_index = validate_time_column(&descriptor.input_schema, &descriptor.event_time_column)?;

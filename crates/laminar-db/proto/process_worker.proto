@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package laminar.process.v1;
+
+// One Exchange carries one bounded, key-distinct, single-vnode invocation.
+// The connection is reused across invocations. The host alone owns state.
+service ProcessWorker {
+  rpc Exchange(stream HostFrame) returns (stream WorkerFrame);
+}
+
+message HostFrame {
+  oneof kind {
+    Open open = 1;
+    Activation activation = 2;
+    End end = 3;
+  }
+}
+
+message Open {
+  uint32 protocol_version = 1;
+  bytes descriptor_sha256 = 2;
+  string operator_id = 3;
+  uint32 vnode = 4;
+  uint64 owner_generation = 5;
+  uint64 recovery_generation = 6;
+  bytes batch_id = 7;
+  bytes attempt_id = 8;
+  optional int64 input_watermark_us = 9;
+  uint64 deadline_unix_ms = 10;
+  uint32 vnode_count = 11;
+}
+
+message Activation {
+  uint64 id = 1;
+  bytes canonical_key = 2;
+  string key_text = 3;
+  int64 event_time_us = 4;
+  oneof callback {
+    bytes input_ipc = 5;
+    string timer_name = 6;
+  }
+  oneof state {
+    bool absent = 7;
+    bool null_value = 8;
+    int64 value = 9;
+  }
+}
+
+message End {
+  uint32 count = 1;
+}
+
+message WorkerFrame {
+  oneof kind {
+    OpenAck ack = 1;
+    Result result = 2;
+    Output output = 3;
+    Complete complete = 4;
+    Failure failure = 5;
+  }
+}
+
+message OpenAck {
+  uint32 protocol_version = 1;
+  bytes descriptor_sha256 = 2;
+  bytes attempt_id = 3;
+}
+
+message Result {
+  uint64 activation_id = 1;
+  uint32 output_count = 2;
+  oneof mutation {
+    bool unchanged = 3;
+    bool clear = 4;
+    bool set_null = 5;
+    int64 set_value = 6;
+  }
+  repeated TimerOperation timers = 7;
+}
+
+message TimerOperation {
+  oneof kind {
+    TimerSet set = 1;
+    string cancel = 2;
+  }
+}
+
+message TimerSet {
+  string name = 1;
+  int64 at_us = 2;
+}
+
+message Output {
+  uint64 activation_id = 1;
+  bytes arrow_ipc = 2;
+}
+
+message Complete {
+  uint32 result_count = 1;
+  uint32 output_count = 2;
+}
+
+message Failure {
+  string message = 1;
+}

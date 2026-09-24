@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
     ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessFunctionOperator,
-    ProcessFunctionRegistration, TimerOperation, ValueMutation, ValueState,
+    ProcessFunctionRegistration, ProcessRuntime, TimerOperation, ValueMutation, ValueState,
 };
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, GraphStateCapture, InputFrontier, OperatorGraph};
@@ -45,6 +45,7 @@ fn output_schema() -> SchemaRef {
 fn descriptor() -> ProcessFunctionDescriptor {
     ProcessFunctionDescriptor {
         version: 1,
+        runtime: ProcessRuntime::NativeRust,
         function_id: "account_activity".into(),
         pipeline_state_id: "test_pipeline_v1".into(),
         implementation_digest: "a".repeat(64),
@@ -101,6 +102,19 @@ fn manifest_round_trips_supported_arrow_types_and_binds_semantics() {
         changed.binding_sha256().unwrap(),
         descriptor.binding_sha256().unwrap()
     );
+    let mut remote = descriptor.clone();
+    remote.runtime = ProcessRuntime::RemoteRust;
+    let remote_bytes = remote.to_manifest_json().unwrap();
+    assert_eq!(
+        ProcessFunctionDescriptor::from_manifest_json(&remote_bytes)
+            .unwrap()
+            .runtime,
+        ProcessRuntime::RemoteRust
+    );
+    assert_ne!(
+        remote.binding_sha256().unwrap(),
+        descriptor.binding_sha256().unwrap()
+    );
 }
 
 #[test]
@@ -110,7 +124,7 @@ fn manifest_rejects_unknown_or_incompatible_contracts() {
     let mut cases = Vec::new();
     for (field, replacement) in [
         ("protocol_version", serde_json::json!(2)),
-        ("runtime", serde_json::json!("remote_python")),
+        ("runtime", serde_json::json!("unsupported_runtime")),
         ("partitioning_abi", serde_json::json!(999)),
         ("state_codec_version", serde_json::json!(999)),
         ("late_event_policy", serde_json::json!("accept")),

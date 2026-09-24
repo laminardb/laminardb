@@ -4,7 +4,8 @@ use sha2::{Digest, Sha256};
 
 use super::schema::{schema_from_canonical_fields, CanonicalField};
 use super::{
-    canonical_fields, ProcessFunctionDescriptor, ProcessFunctionLimits, STATE_CODEC_VERSION,
+    canonical_fields, ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessRuntime,
+    STATE_CODEC_VERSION,
 };
 use crate::error::DbError;
 
@@ -41,7 +42,12 @@ impl Manifest {
         Ok(Self {
             version: descriptor.version,
             protocol_version: PROTOCOL_VERSION,
-            runtime: "trusted_native_rust".into(),
+            runtime: match descriptor.runtime {
+                ProcessRuntime::NativeRust => "trusted_native_rust",
+                ProcessRuntime::RemoteRust => "remote_rust",
+                ProcessRuntime::RemotePython => "remote_python",
+            }
+            .into(),
             function_id: descriptor.function_id.clone(),
             pipeline_state_id: descriptor.pipeline_state_id.clone(),
             implementation_digest: descriptor.implementation_digest.clone(),
@@ -65,7 +71,6 @@ impl Manifest {
     fn into_descriptor(self) -> Result<ProcessFunctionDescriptor, DbError> {
         if self.version != 1
             || self.protocol_version != PROTOCOL_VERSION
-            || self.runtime != "trusted_native_rust"
             || self.partitioning_abi != PARTITIONING_ABI_VERSION
             || self.late_event_policy != "reject"
             || self.input_changelog != "append_only"
@@ -77,8 +82,19 @@ impl Manifest {
                 "unsupported process function manifest contract".into(),
             ));
         }
+        let runtime = match self.runtime.as_str() {
+            "trusted_native_rust" => ProcessRuntime::NativeRust,
+            "remote_rust" => ProcessRuntime::RemoteRust,
+            "remote_python" => ProcessRuntime::RemotePython,
+            _ => {
+                return Err(DbError::Unsupported(
+                    "unsupported process function runtime".into(),
+                ))
+            }
+        };
         let descriptor = ProcessFunctionDescriptor {
             version: self.version,
+            runtime,
             function_id: self.function_id,
             pipeline_state_id: self.pipeline_state_id,
             implementation_digest: self.implementation_digest,

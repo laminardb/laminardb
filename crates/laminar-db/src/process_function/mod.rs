@@ -1,8 +1,9 @@
-//! Trusted native keyed process functions.
+//! Keyed process functions with engine-owned state and timers.
 //!
 //! The engine owns every value and timer. A handler receives immutable activation snapshots and
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
-//! on the compute thread and must be trusted, bounded, and nonblocking.
+//! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
+//! transport is a loopback reference boundary and is not yet admitted into database pipelines.
 
 use std::sync::Arc;
 
@@ -14,6 +15,8 @@ use crate::error::DbError;
 mod descriptor;
 mod operator;
 mod registration;
+#[cfg(feature = "process-remote")]
+pub mod remote;
 mod schema;
 
 pub(crate) use operator::ProcessFunctionOperator;
@@ -22,12 +25,25 @@ pub(crate) use schema::canonical_fields;
 // RECOVERY: v2 binds the complete descriptor; v1 carried only a schema digest.
 pub(crate) const STATE_CODEC_VERSION: u32 = 2;
 
-/// Immutable, versioned binding for one native process function. The initial state codec is an
+/// Execution boundary bound by the function manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessRuntime {
+    /// Trusted Rust code running on the compute thread.
+    NativeRust,
+    /// Rust code in a separate worker process; only the reference transport exists today.
+    RemoteRust,
+    /// Python worker contract; pipeline admission awaits the Python SDK and worker.
+    RemotePython,
+}
+
+/// Immutable, versioned binding for one process function. The initial state codec is an
 /// optional signed 64-bit value; a present null is distinct from absent state.
 #[derive(Clone, Debug)]
 pub struct ProcessFunctionDescriptor {
     /// Descriptor format version. Currently only 1 is admitted.
     pub version: u32,
+    /// Runtime that executes the immutable implementation.
+    pub runtime: ProcessRuntime,
     /// Stable function identity, independent of the output stream name.
     pub function_id: String,
     /// Stable pipeline state identity. Two pipelines must use different identities.
@@ -52,7 +68,7 @@ pub struct ProcessFunctionDescriptor {
     pub limits: ProcessFunctionLimits,
 }
 
-/// Per-function bounds, enforced before accepting a native response.
+/// Per-function bounds, enforced before accepting a handler response.
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessFunctionLimits {

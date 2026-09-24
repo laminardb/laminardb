@@ -6,7 +6,7 @@ use laminar_core::catalog::CatalogObjectKind;
 
 use super::{
     NativeProcessFunction, ProcessFunctionDescriptor, ProcessFunctionInfo,
-    ProcessFunctionRegistration,
+    ProcessFunctionRegistration, ProcessRuntime,
 };
 use crate::db::{exact_table_reference, DbState, LaminarDB};
 use crate::error::DbError;
@@ -56,6 +56,11 @@ impl LaminarDB {
             return Err(DbError::Unsupported(
                 "native process functions currently require an offline local best-effort pipeline"
                     .into(),
+            ));
+        }
+        if descriptor.runtime != ProcessRuntime::NativeRust {
+            return Err(DbError::Unsupported(
+                "native registration requires the trusted native Rust runtime".into(),
             ));
         }
         if !valid_name(output_name) || !valid_name(source_name) || output_name == source_name {

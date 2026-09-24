@@ -99,6 +99,7 @@ fn native_end_to_end(
             "activity",
             "events",
             ProcessFunctionDescriptor {
+                runtime: laminar_db::process_function::ProcessRuntime::NativeRust,
                 version: 1,
                 function_id: "running_total".into(),
                 pipeline_state_id: "native_latency_v1".into(),
