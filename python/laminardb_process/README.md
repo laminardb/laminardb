@@ -22,10 +22,33 @@ complete user function. The Rust example checks the manifest and handler digest,
 starts the Python child, registers its connected client, prints totals `60` and
 `110`, then stops the database and worker. Set `LAMINAR_PROCESS_PYTHON` when the
 Python executable is not named `python`. The worker accepts only an explicit
-loopback IP because plaintext nonlocal
-transport is not admitted. Each client RPC must carry a deadline of at most
+loopback IP because plaintext nonlocal transport is not admitted. Each client
+RPC must carry a deadline of at most
 30 seconds so an incomplete request cannot occupy a worker slot indefinitely.
 Local worker concurrency is capped at 32 calls per process.
+
+To see state survive a database and Python worker restart, use a new checkpoint
+directory and run these as two separate commands from the repository root:
+
+```bash
+checkpoint_dir="$(mktemp -d)"
+cargo run -p laminar-db --no-default-features --features process-remote --example process_python -- checkpoint "$checkpoint_dir"
+cargo run -p laminar-db --no-default-features --features process-remote --example process_python -- resume "$checkpoint_dir"
+```
+
+On PowerShell:
+
+```powershell
+$checkpointDir = Join-Path $env:TEMP ("laminardb-process-" + [guid]::NewGuid())
+cargo run -p laminar-db --no-default-features --features process-remote --example process_python -- checkpoint $checkpointDir
+cargo run -p laminar-db --no-default-features --features process-remote --example process_python -- resume $checkpointDir
+```
+
+The first command prints `key=a total=60` and commits a local checkpoint. The
+second starts a new database and worker, restores the checkpoint, and prints
+`key=a total=110`. Both commands use a direct in-memory source, so input that
+was not checkpointed cannot be replayed after a crash. The local recovery test
+also checks that a saved event-time timer fires after restart.
 
 To exercise the real Rust host client against this Python worker, set
 `LAMINAR_PROCESS_PYTHON` to the Python executable that has the dependencies and

@@ -945,6 +945,7 @@ async fn native_function_restores_from_database_checkpoint() {
 
 #[cfg(feature = "process-remote")]
 mod remote_pipeline {
+    use std::path::Path;
     use std::time::Duration;
 
     use tokio::net::TcpListener;
@@ -954,6 +955,7 @@ mod remote_pipeline {
     use crate::process_function::remote::{
         LocalPythonWorker, LocalPythonWorkerConfig, RemoteProcessClient, RustReferenceWorker,
     };
+    use crate::subscription::SubscriptionPortal;
 
     async fn worker_client(
         descriptor: ProcessFunctionDescriptor,
@@ -1043,6 +1045,68 @@ mod remote_pipeline {
         }
     }
 
+    fn python_input(key: &str, amount: i64, at_us: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            input_schema_for_python(),
+            vec![
+                Arc::new(StringArray::from(vec![key])),
+                Arc::new(Int64Array::from(vec![amount])),
+                Arc::new(TimestampMicrosecondArray::from(vec![at_us])),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn next_python_total(portal: &mut SubscriptionPortal) -> i64 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match portal.next_frame().await {
+                    Some(PortalFrame::Batch { batch, .. }) => {
+                        assert_eq!(batch.num_rows(), 1);
+                        return batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .value(0);
+                    }
+                    Some(PortalFrame::Barrier { .. }) => {}
+                    other => panic!("Python process output unavailable: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn checkpointed_python_database(
+        path: &Path,
+        worker: &LocalPythonWorker,
+    ) -> Arc<LaminarDB> {
+        let db = LaminarDB::builder()
+            .storage_dir(path)
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
+            .build()
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.register_remote_process_function(
+            "activity",
+            "events",
+            worker.client().descriptor().clone(),
+            worker.client(),
+        )
+        .await
+        .unwrap();
+        db.start().await.unwrap();
+        db
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn remote_graph_serializes_keys_and_drains_before_checkpoint() {
         let mut binding = descriptor();
@@ -1092,6 +1156,51 @@ mod remote_pipeline {
                 ("b".into(), "inactive".into(), 5, false, 110_000),
             ]
         );
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_graph_restore_replays_saved_timer_and_state() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let mut original = remote_graph(
+            binding.clone(),
+            Arc::clone(&client),
+            tokio::runtime::Handle::current(),
+        )
+        .initialize_managed_state()
+        .await
+        .unwrap();
+        original
+            .execute_cycle(&source(&[("a", 60, 100_000)]), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(totals(&drain(&mut original, 100).await), vec![60]);
+        let (whole, vnodes) = materialize(original.capture_state(u64::MAX).unwrap());
+        drop(original);
+
+        let mut restored = remote_graph(binding, client, tokio::runtime::Handle::current())
+            .initialize_managed_state()
+            .await
+            .unwrap()
+            .restore_state_frames(&whole, &vnodes, 256)
+            .unwrap()
+            .0;
+        restored
+            .execute_cycle(&FxHashMap::default(), 112, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&drain(&mut restored, 112).await),
+            vec![("a".into(), "inactive".into(), 60, false, 110_000)]
+        );
+        restored
+            .execute_cycle(&source(&[("a", 50, 120_000)]), 120, None)
+            .await
+            .unwrap();
+        assert_eq!(totals(&drain(&mut restored, 120).await), vec![110]);
         shutdown.cancel();
         worker.await.unwrap().unwrap();
     }
@@ -1291,20 +1400,112 @@ mod remote_pipeline {
         worker.shutdown().await.unwrap();
     }
 
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn supervisor_detects_python_process_crash() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn python_worker_restart_restores_state_and_timer_from_database_checkpoint() {
         let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
             return;
         };
-        let worker = LocalPythonWorker::start(python_config(python))
+        let directory = tempfile::tempdir().unwrap();
+        let first_worker = LocalPythonWorker::start(python_config(python.clone()))
             .await
             .unwrap();
-        let status = std::process::Command::new("kill")
-            .args(["-KILL", &worker.process_id().to_string()])
-            .status()
+        let first = checkpointed_python_database(directory.path(), &first_worker).await;
+        let mut first_portal = first
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
             .unwrap();
-        assert!(status.success());
+        first
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 60, 100_000))
+            .unwrap();
+        assert_eq!(next_python_total(&mut first_portal).await, 60);
+        first
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("c", 7, 100_000))
+            .unwrap();
+        assert_eq!(next_python_total(&mut first_portal).await, 7);
+        first.checkpoint().await.unwrap();
+        first.shutdown().await.unwrap();
+        drop(first_portal);
+        drop(first);
+        first_worker.shutdown().await.unwrap();
+
+        let second_worker = LocalPythonWorker::start(python_config(python))
+            .await
+            .unwrap();
+        let restored = checkpointed_python_database(directory.path(), &second_worker).await;
+        let mut portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        restored
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 50, 100_050))
+            .unwrap();
+        assert_eq!(next_python_total(&mut portal).await, 110);
+        restored
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("b", 1, 101_000))
+            .unwrap();
+        assert_eq!(next_python_total(&mut portal).await, 1);
+        restored.checkpoint().await.unwrap();
+        restored
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("c", 1, 102_000))
+            .unwrap();
+        assert_eq!(next_python_total(&mut portal).await, 1);
+        restored.shutdown().await.unwrap();
+        second_worker.shutdown().await.unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    fn kill_python_worker(process_id: u32) {
+        #[cfg(unix)]
+        let output = std::process::Command::new("kill")
+            .args(["-KILL", &process_id.to_string()])
+            .output()
+            .unwrap();
+        #[cfg(windows)]
+        let output = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &process_id.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "kill Python worker: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn crashed_python_worker_restores_database_checkpoint() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let worker = LocalPythonWorker::start(python_config(python.clone()))
+            .await
+            .unwrap();
+        let first = checkpointed_python_database(directory.path(), &worker).await;
+        let mut portal = first
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        first
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 60, 100_000))
+            .unwrap();
+        assert_eq!(next_python_total(&mut portal).await, 60);
+        first.checkpoint().await.unwrap();
+
+        kill_python_worker(worker.process_id());
         tokio::time::timeout(Duration::from_secs(5), async {
             while worker.is_alive() {
                 tokio::task::yield_now().await;
@@ -1314,6 +1515,26 @@ mod remote_pipeline {
         .unwrap();
         let error = worker.shutdown().await.err().unwrap();
         assert!(error.to_string().contains("exited unexpectedly"), "{error}");
+        first.shutdown().await.unwrap();
+        drop(portal);
+        drop(first);
+
+        let replacement = LocalPythonWorker::start(python_config(python))
+            .await
+            .unwrap();
+        let restored = checkpointed_python_database(directory.path(), &replacement).await;
+        let mut restored_portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        restored
+            .source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 50, 100_050))
+            .unwrap();
+        assert_eq!(next_python_total(&mut restored_portal).await, 110);
+        restored.shutdown().await.unwrap();
+        replacement.shutdown().await.unwrap();
     }
 
     #[tokio::test]

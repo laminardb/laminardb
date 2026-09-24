@@ -39,7 +39,7 @@ pub struct LocalPythonWorker {
     cancel: CancellationToken,
     alive: Arc<AtomicBool>,
     supervisor: Option<tokio::task::JoinHandle<Result<(), DbError>>>,
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     process_id: u32,
 }
 
@@ -186,7 +186,7 @@ impl LocalPythonWorker {
         };
         let cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         let process_id = child.id().unwrap_or(0);
         let supervisor = tokio::spawn(supervise(child, cancel.clone(), Arc::clone(&alive)));
         Ok(Self {
@@ -194,7 +194,7 @@ impl LocalPythonWorker {
             cancel,
             alive,
             supervisor: Some(supervisor),
-            #[cfg(all(test, unix))]
+            #[cfg(test)]
             process_id,
         })
     }
@@ -211,7 +211,7 @@ impl LocalPythonWorker {
         self.alive.load(Ordering::Acquire)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) const fn process_id(&self) -> u32 {
         self.process_id
     }
