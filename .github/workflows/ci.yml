@@ -115,6 +115,21 @@ jobs:
           key: ${{ matrix.os }}
       - uses: taiki-e/install-action@nextest
 
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.13'
+
+      - name: Install Python process worker
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install -r python/laminardb_process/requirements.lock
+          python -m pip install --no-deps ./python/laminardb_process
+
+      - name: Python process worker tests
+        if: runner.os == 'Linux'
+        run: python -m unittest discover -s python/laminardb_process/tests -p 'test_*.py'
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
@@ -134,6 +149,7 @@ jobs:
           # larger bounded stack scoped to test processes on resource-constrained runners.
           RUST_MIN_STACK: 4194304
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+          LAMINAR_PROCESS_PYTHON: python3
 
       # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)

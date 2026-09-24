@@ -32,7 +32,7 @@ pub enum ProcessRuntime {
     NativeRust,
     /// Rust code in a separate worker process; only the reference transport exists today.
     RemoteRust,
-    /// Python worker contract; pipeline admission awaits the Python SDK and worker.
+    /// Python worker transport; pipeline admission awaits remote scheduling and lifecycle.
     RemotePython,
 }
 

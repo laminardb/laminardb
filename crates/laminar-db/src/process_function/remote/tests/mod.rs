@@ -463,3 +463,5 @@ proptest::proptest! {
         let _ = decode_batch(&bytes, &output_schema(), 2, 1024);
     }
 }
+
+mod python;

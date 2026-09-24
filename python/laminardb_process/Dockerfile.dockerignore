@@ -1,0 +1,11 @@
+**
+!python/
+!python/laminardb_process/
+!python/laminardb_process/requirements.lock
+!python/laminardb_process/pyproject.toml
+!python/laminardb_process/laminardb_process/
+!python/laminardb_process/laminardb_process/*.py
+!examples/
+!examples/process_python/
+!examples/process_python/handler.py
+!examples/process_python/manifest.json

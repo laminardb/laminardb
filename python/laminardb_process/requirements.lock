@@ -1,0 +1,7 @@
+# Runtime and build dependencies for Python 3.13.
+grpcio==1.84.0
+protobuf==7.36.2
+pyarrow==20.0.0
+numpy==2.4.0
+typing-extensions==4.16.0
+setuptools==84.0.0
