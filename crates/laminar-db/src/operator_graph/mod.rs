@@ -1065,6 +1065,8 @@ pub(crate) struct OperatorGraph {
     ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     // Must be the main multi-threaded runtime; Ring-1 workers (AI, lookup-enrich) spawn here.
     main_runtime_handle: Option<tokio::runtime::Handle>,
+    #[cfg(feature = "process-remote")]
+    process_work_wake: Option<Arc<tokio::sync::Notify>>,
     // Lookup table name → column names; routes lookup-enrich joins to the async operator.
     partial_lookup_tables: FxHashMap<String, Vec<String>>,
     // Changelog-producing intermediates used for consumer admission and changelog enrichment.
@@ -1170,6 +1172,8 @@ impl OperatorGraph {
             live_handles: FxHashMap::default(),
             ai_runtime: None,
             main_runtime_handle: None,
+            #[cfg(feature = "process-remote")]
+            process_work_wake: None,
             partial_lookup_tables: FxHashMap::default(),
             changelog_tables: FxHashSet::default(),
             reference_tables: FxHashSet::default(),
@@ -2426,11 +2430,33 @@ impl OperatorGraph {
         &mut self,
         registration: &crate::process_function::ProcessFunctionRegistration,
     ) -> Result<(), DbError> {
-        let operator = crate::process_function::ProcessFunctionOperator::new(
-            registration.descriptor.clone(),
-            Arc::clone(&registration.handler),
-            u32::from(self.key_group_count),
-        )?;
+        let operator = match &registration.handler {
+            crate::process_function::ProcessHandler::Native(handler) => {
+                crate::process_function::ProcessFunctionOperator::new(
+                    registration.descriptor.clone(),
+                    Arc::clone(handler),
+                    u32::from(self.key_group_count),
+                )?
+            }
+            #[cfg(feature = "process-remote")]
+            crate::process_function::ProcessHandler::Remote(client) => {
+                let runtime = self.main_runtime_handle.clone().ok_or_else(|| {
+                    DbError::Config("process worker requires a main runtime handle".into())
+                })?;
+                let wake = Arc::clone(
+                    self.process_work_wake
+                        .get_or_insert_with(|| Arc::new(tokio::sync::Notify::new())),
+                );
+                crate::process_function::ProcessFunctionOperator::new_remote(
+                    registration.descriptor.clone(),
+                    client,
+                    runtime,
+                    wake,
+                    registration.output_name.clone(),
+                    u32::from(self.key_group_count),
+                )?
+            }
+        };
         let source = self.ensure_source_node(&registration.source_name);
         let node =
             self.place_prepared_operator_node(&registration.output_name, Box::new(operator), 1);
@@ -2443,6 +2469,12 @@ impl OperatorGraph {
         );
         self.topo_dirty = true;
         Ok(())
+    }
+
+    /// Wake for completed remote process calls retained by this graph.
+    #[cfg(feature = "process-remote")]
+    pub(crate) fn process_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.process_work_wake.clone()
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

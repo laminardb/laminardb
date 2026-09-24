@@ -12,6 +12,8 @@ use crate::operator_graph::{
     CapturedVnodeState, GraphOperator, InputFrontier, ManagedStateAccountingSnapshot,
     OperatorCheckpoint, StateFrameCapture,
 };
+#[cfg(feature = "process-remote")]
+use crate::process_function::ProcessHandler;
 use crate::process_function::STATE_CODEC_VERSION;
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
@@ -56,6 +58,10 @@ impl GraphOperator for ProcessFunctionOperator {
         inputs: &[Vec<RecordBatch>],
         frontiers: &[InputFrontier],
     ) -> Result<Vec<RecordBatch>, DbError> {
+        #[cfg(feature = "process-remote")]
+        if matches!(&self.handler, ProcessHandler::Remote(_)) {
+            return self.process_remote(inputs, frontiers);
+        }
         if inputs.len() > 1 || frontiers.len() != 1 {
             return Err(DbError::InvalidOperation(
                 "process function requires exactly one input frontier".into(),
@@ -95,6 +101,14 @@ impl GraphOperator for ProcessFunctionOperator {
 
     fn output_frontier(&self, input: InputFrontier) -> InputFrontier {
         let mut output = input;
+        #[cfg(feature = "process-remote")]
+        if let Some(held_time_us) = self
+            .remote
+            .as_ref()
+            .and_then(super::remote::RemoteExecution::held_time_us)
+        {
+            output = output.held_at(Some(held_time_us.saturating_sub(1).div_euclid(1_000)));
+        }
         if let Some((at_us, ..)) = self.due.first() {
             if *at_us <= self.watermark_us {
                 output.watermark = output
@@ -107,9 +121,31 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn deferred_work_is_runnable(&self) -> bool {
-        self.due
+        let due_now = self
+            .due
             .first()
-            .is_some_and(|timer| timer.0 <= self.watermark_us)
+            .is_some_and(|timer| timer.0 <= self.watermark_us);
+        #[cfg(feature = "process-remote")]
+        if let Some(remote) = &self.remote {
+            return remote.is_runnable(due_now);
+        }
+        due_now
+    }
+
+    fn wants_input(&self) -> bool {
+        #[cfg(feature = "process-remote")]
+        if let Some(remote) = &self.remote {
+            return !remote.is_pending();
+        }
+        true
+    }
+
+    fn checkpoint_drain_pending(&self) -> bool {
+        #[cfg(feature = "process-remote")]
+        if let Some(remote) = &self.remote {
+            return remote.is_pending();
+        }
+        false
     }
 
     fn advances_frontier_without_input(&self) -> bool {
@@ -117,6 +153,11 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        if self.checkpoint_drain_pending() {
+            return Err(DbError::Checkpoint(
+                "process worker invocation must drain before checkpoint capture".into(),
+            ));
+        }
         let frame = OperatorFrame {
             codec: STATE_CODEC_VERSION,
             descriptor_sha256: self.descriptor_sha256.clone(),
@@ -155,6 +196,11 @@ impl GraphOperator for ProcessFunctionOperator {
         vnode_count: u32,
         max_capture_bytes: u64,
     ) -> Result<Option<Vec<CapturedVnodeState>>, DbError> {
+        if self.checkpoint_drain_pending() {
+            return Err(DbError::Checkpoint(
+                "process worker invocation must drain before vnode capture".into(),
+            ));
+        }
         if vnode_count != self.vnode_count.get() {
             return Err(DbError::Checkpoint("process vnode domain changed".into()));
         }

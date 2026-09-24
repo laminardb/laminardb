@@ -199,6 +199,11 @@ harness = false
 name = "process_function_bench"
 harness = false
 
+[[example]]
+name = "process_python"
+path = "examples/process_python.rs"
+required-features = ["process-remote"]
+
 [[bench]]
 name = "cluster_subscription_bench"
 harness = false

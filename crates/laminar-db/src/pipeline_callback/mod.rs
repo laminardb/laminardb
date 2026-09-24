@@ -6462,6 +6462,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
+        #[cfg(feature = "process-remote")]
+        if let Some(wake) = self.graph.process_work_wake() {
+            // Local remote functions and cluster shuffle are mutually exclusive at admission.
+            return Some(wake);
+        }
         #[cfg(feature = "cluster")]
         {
             self.graph

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
-    ProcessFunctionDescriptor, TimerOperation, ValueMutation, ValueState,
+    ProcessFunctionDescriptor, ProcessHandler, TimerOperation, ValueMutation, ValueState,
 };
 use crate::error::DbError;
 
@@ -83,7 +83,9 @@ struct StagedResponse {
 pub(crate) struct ProcessFunctionOperator {
     descriptor: ProcessFunctionDescriptor,
     descriptor_sha256: String,
-    handler: Arc<dyn NativeProcessFunction>,
+    handler: ProcessHandler,
+    #[cfg(feature = "process-remote")]
+    remote: Option<remote::RemoteExecution>,
     key_codec: PartitionKeyCodecV1,
     key_indices: Vec<usize>,
     time_index: usize,
@@ -111,6 +113,42 @@ impl ProcessFunctionOperator {
                 "native process operator requires the trusted native Rust runtime".into(),
             ));
         }
+        Self::build(descriptor, ProcessHandler::Native(handler), vnode_count)
+    }
+
+    #[cfg(feature = "process-remote")]
+    pub(crate) fn new_remote(
+        descriptor: ProcessFunctionDescriptor,
+        client: &Arc<crate::process_function::remote::RemoteProcessClient>,
+        runtime: tokio::runtime::Handle,
+        wake: Arc<tokio::sync::Notify>,
+        operator_id: String,
+        vnode_count: u32,
+    ) -> Result<Self, DbError> {
+        if descriptor.runtime == super::ProcessRuntime::NativeRust {
+            return Err(DbError::InvalidOperation(
+                "remote process operator requires a remote runtime".into(),
+            ));
+        }
+        let mut operator = Self::build(
+            descriptor,
+            ProcessHandler::Remote(Arc::clone(client)),
+            vnode_count,
+        )?;
+        operator.remote = Some(remote::RemoteExecution::new(
+            runtime,
+            wake,
+            operator_id,
+            client.max_in_flight(),
+        ));
+        Ok(operator)
+    }
+
+    fn build(
+        descriptor: ProcessFunctionDescriptor,
+        handler: ProcessHandler,
+        vnode_count: u32,
+    ) -> Result<Self, DbError> {
         let vnode_count = NonZeroU32::new(vnode_count)
             .ok_or_else(|| DbError::Config("process function requires nonzero vnodes".into()))?;
         let (key_codec, key_indices, time_index, output_time_index) =
@@ -123,6 +161,8 @@ impl ProcessFunctionOperator {
             descriptor,
             descriptor_sha256,
             handler,
+            #[cfg(feature = "process-remote")]
+            remote: None,
             key_codec,
             key_indices,
             time_index,
@@ -263,7 +303,15 @@ impl ProcessFunctionOperator {
         output_rows: &mut usize,
         output_bytes: &mut usize,
     ) -> Result<(), DbError> {
-        let response = self.handler.invoke(activations)?;
+        let response = match &self.handler {
+            ProcessHandler::Native(handler) => handler.invoke(activations)?,
+            #[cfg(feature = "process-remote")]
+            ProcessHandler::Remote(_) => {
+                return Err(DbError::Pipeline(
+                    "remote process invocation entered native execution".into(),
+                ));
+            }
+        };
         if response.len() != activations.len() {
             return Err(DbError::InvalidOperation(
                 "process function response count differs from activation count".into(),
@@ -660,3 +708,5 @@ fn validate_time_column(schema: &arrow_schema::Schema, name: &str) -> Result<usi
 }
 
 mod graph;
+#[cfg(feature = "process-remote")]
+mod remote;

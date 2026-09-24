@@ -13,7 +13,10 @@ use tonic::Request;
 use super::codec::encode_activation;
 use super::response::read_response;
 use super::wire::{self, host_frame, worker_frame};
-use super::{RemoteInvocationScope, MAX_FRAME_BYTES, MAX_INVOCATION_WIRE_BYTES, PROTOCOL_VERSION};
+use super::{
+    RemoteInvocationScope, MAX_FRAME_BYTES, MAX_INVOCATION_WIRE_BYTES, MAX_IN_FLIGHT,
+    PROTOCOL_VERSION,
+};
 use crate::error::DbError;
 use crate::process_function::{
     ProcessActivation, ProcessActivationResult, ProcessFunctionDescriptor, ProcessRuntime,
@@ -27,10 +30,23 @@ pub struct RemoteProcessClient {
     descriptor: Arc<ProcessFunctionDescriptor>,
     digest: [u8; 32],
     credits: Arc<Semaphore>,
+    max_in_flight: usize,
     timeout: Duration,
 }
 
 impl RemoteProcessClient {
+    /// Immutable descriptor negotiated when this client connected.
+    #[must_use]
+    pub fn descriptor(&self) -> &ProcessFunctionDescriptor {
+        &self.descriptor
+    }
+
+    /// Number of invocation credits shared by clones of this client.
+    #[must_use]
+    pub const fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
     /// Connect to a reference worker over an explicit loopback address.
     ///
     /// # Errors
@@ -49,12 +65,14 @@ impl RemoteProcessClient {
                 DbError::Unsupported("process worker plaintext endpoint must be loopback".into())
             })?;
         if max_in_flight == 0
+            || max_in_flight > MAX_IN_FLIGHT
             || timeout < Duration::from_millis(1)
             || timeout > Duration::from_secs(30)
             || descriptor.runtime == ProcessRuntime::NativeRust
         {
             return Err(DbError::InvalidOperation(
-                "remote process client requires a remote runtime and positive bounds".into(),
+                "remote process client requires a remote runtime, deadline, and 1..=32 credits"
+                    .into(),
             ));
         }
         let manifest = descriptor.to_manifest_json()?;
@@ -71,6 +89,7 @@ impl RemoteProcessClient {
             descriptor: Arc::new(descriptor),
             digest,
             credits: Arc::new(Semaphore::new(max_in_flight)),
+            max_in_flight,
             timeout,
         })
     }
@@ -148,19 +167,19 @@ impl RemoteProcessClient {
                     "process invocation has another vnode, repeated key, or repeated ID".into(),
                 ));
             }
-            if let crate::process_function::ProcessCallback::Input(batch) = &activation.callback {
+            let encoded = encode_activation(activation, &self.descriptor)?;
+            if let Some(wire::activation::Callback::InputIpc(ipc)) = &encoded.callback {
+                // A one-row Arrow slice can retain the parent batch's full buffers. Charge the
+                // bytes actually sent rather than multiplying that allocation by row count.
                 input_bytes = input_bytes
-                    .checked_add(batch.get_array_memory_size())
+                    .checked_add(ipc.len())
                     .filter(|bytes| *bytes <= self.descriptor.limits.max_input_bytes)
                     .ok_or_else(|| {
-                        DbError::BackpressureFail("process input byte limit exceeded".into())
+                        DbError::BackpressureFail("process input IPC byte limit exceeded".into())
                     })?;
             }
             frames.push(wire::HostFrame {
-                kind: Some(host_frame::Kind::Activation(encode_activation(
-                    activation,
-                    &self.descriptor,
-                )?)),
+                kind: Some(host_frame::Kind::Activation(encoded)),
             });
         }
         frames.push(wire::HostFrame {

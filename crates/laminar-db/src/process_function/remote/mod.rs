@@ -1,11 +1,11 @@
 //! Bounded Arrow IPC over a versioned gRPC control stream.
 //!
-//! This local transport is an independent reference boundary. The database does not yet
-//! register remote workers or admit them into a pipeline. Only explicit loopback endpoints are
-//! accepted until authenticated deployment and lifecycle integration are implemented.
+//! Local best-effort pipelines can use connected loopback workers. Authenticated nonlocal
+//! deployment and cluster ownership remain outside this transport's admission profile.
 
 mod client;
 mod codec;
+mod local_python;
 mod response;
 mod worker;
 
@@ -13,6 +13,7 @@ mod worker;
 mod tests;
 
 pub use client::RemoteProcessClient;
+pub use local_python::{LocalPythonWorker, LocalPythonWorkerConfig};
 pub use worker::RustReferenceWorker;
 
 #[allow(clippy::doc_markdown, clippy::default_trait_access)] // Generated tonic stubs.
@@ -23,6 +24,7 @@ pub(crate) mod wire {
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INVOCATION_WIRE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IN_FLIGHT: usize = 32;
 
 /// Host-assigned invocation scope. Logical activation IDs remain independent of both UUIDs.
 /// A retry retains activation IDs and batch ID but receives a new attempt ID.

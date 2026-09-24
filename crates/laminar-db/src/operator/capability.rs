@@ -35,7 +35,7 @@ pub(crate) enum ManagedStateContract {
     BoundedIntervalJoinV3,
     /// Vnode-local version history, probes, frontiers, and timers for temporal joins.
     TemporalJoinV1,
-    /// Native process-function state and event-time timers, partitioned by canonical key.
+    /// Process-function state and event-time timers, partitioned by canonical key.
     ProcessFunctionV1,
     #[cfg(test)]
     TestVnodeStateV1,

@@ -744,7 +744,7 @@ pub trait PipelineCallback: Send + 'static {
         None
     }
 
-    /// Wake the coordinator when inbound data or deferred shuffle work becomes ready.
+    /// Wake the coordinator when deferred external operator work becomes ready.
     fn shuffle_work_wake(&self) -> Option<Arc<tokio::sync::Notify>> {
         None
     }

@@ -3,7 +3,7 @@
 //! The engine owns every value and timer. A handler receives immutable activation snapshots and
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
-//! transport is a loopback reference boundary and is not yet admitted into database pipelines.
+//! transport is currently restricted to local best-effort pipelines over loopback.
 
 use std::sync::Arc;
 
@@ -30,9 +30,9 @@ pub(crate) const STATE_CODEC_VERSION: u32 = 2;
 pub enum ProcessRuntime {
     /// Trusted Rust code running on the compute thread.
     NativeRust,
-    /// Rust code in a separate worker process; only the reference transport exists today.
+    /// Rust code in a separate worker process over the local reference transport.
     RemoteRust,
-    /// Python worker transport; pipeline admission awaits remote scheduling and lifecycle.
+    /// Python worker over the local loopback transport.
     RemotePython,
 }
 
@@ -216,10 +216,17 @@ pub(crate) struct ProcessFunctionRegistration {
     pub(crate) output_name: String,
     pub(crate) source_name: String,
     pub(crate) descriptor: ProcessFunctionDescriptor,
-    pub(crate) handler: Arc<dyn NativeProcessFunction>,
+    pub(crate) handler: ProcessHandler,
 }
 
-/// Registered native function and its input/output stream binding.
+#[derive(Clone)]
+pub(crate) enum ProcessHandler {
+    Native(Arc<dyn NativeProcessFunction>),
+    #[cfg(feature = "process-remote")]
+    Remote(Arc<remote::RemoteProcessClient>),
+}
+
+/// Registered function and its input/output stream binding.
 #[derive(Clone, Debug)]
 pub struct ProcessFunctionInfo {
     /// Output stream name.

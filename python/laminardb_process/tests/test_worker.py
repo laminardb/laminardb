@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import grpc
 import pyarrow as pa
@@ -44,10 +48,24 @@ def manifest_bytes() -> bytes:
 
 
 class WorkerBoundaryTests(unittest.TestCase):
+    def test_worker_rejects_handler_from_another_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_bytes(manifest_bytes())
+            result = subprocess.run(
+                [sys.executable, "-m", "laminardb_process.worker", "--manifest", str(manifest),
+                 "--handler", "laminardb_process.worker:main", "--handler-file", __file__],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("loaded handler module differs", result.stderr)
+
     def test_manifest_rejects_wrong_runtime_and_duplicate_timer(self) -> None:
         raw = manifest_bytes()
         manifest = Manifest.from_bytes(raw)
         self.assertEqual(len(manifest.digest), 32)
+        self.assertEqual(Manifest.from_bytes(raw + b"\n").digest, manifest.digest)
+        self.assertEqual(Manifest.from_bytes(raw + b"\r\n").digest, manifest.digest)
         invalid = json.loads(raw)
         invalid["runtime"] = "trusted_native_rust"
         with self.assertRaises(ValueError):

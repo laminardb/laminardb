@@ -273,7 +273,7 @@ def serve(manifest: Manifest, handler: Handler, bind: str, max_in_flight: int = 
     if not address.is_loopback:
         raise ValueError("plaintext process worker must bind to loopback")
     port = int(port_text)
-    if not 0 <= port <= 65535 or not 1 <= max_in_flight <= 64:
+    if not 0 <= port <= 65535 or not 1 <= max_in_flight <= 32:
         raise ValueError("invalid worker port or concurrency")
     pa.set_cpu_count(max_in_flight)
     pa.set_io_thread_count(max_in_flight)
@@ -305,6 +305,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LaminarDB loopback Python process worker")
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--handler", required=True, help="module:callable")
+    parser.add_argument("--handler-file", type=Path, help="verified local handler module file")
     parser.add_argument("--bind", default="127.0.0.1:0")
     parser.add_argument("--max-in-flight", type=int, default=2)
     args = parser.parse_args()
@@ -312,7 +313,12 @@ def main() -> None:
     if not separator or not module_name or not name:
         parser.error("handler must be module:callable")
     manifest = Manifest.from_bytes(args.manifest.read_bytes())
-    handler = getattr(importlib.import_module(module_name), name)
+    module = importlib.import_module(module_name)
+    if args.handler_file is not None:
+        loaded_file = getattr(module, "__file__", None)
+        if loaded_file is None or not Path(loaded_file).samefile(args.handler_file):
+            parser.error("loaded handler module differs from verified handler file")
+    handler = getattr(module, name)
     if not callable(handler):
         parser.error("handler is not callable")
     serve(manifest, handler, args.bind, args.max_in_flight)

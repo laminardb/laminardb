@@ -129,6 +129,9 @@ class Manifest:
     def from_bytes(cls, raw: bytes) -> Manifest:
         if not raw or len(raw) > 64 * 1024:
             raise ValueError("process manifest must be at most 64 KiB")
+        # A checked-in manifest may have one platform line ending. The host binds the
+        # canonical JSON bytes, which do not include that terminator.
+        raw = raw.removesuffix(b"\r\n").removesuffix(b"\n")
         data = json.loads(raw)
         fields = {
             "version", "protocol_version", "runtime", "function_id", "pipeline_state_id",

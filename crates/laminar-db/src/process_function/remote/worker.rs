@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 
 use super::codec::{decode_activation, encode_batch, encode_mutation, encode_timer};
 use super::wire::{self, host_frame, worker_frame};
-use super::{MAX_FRAME_BYTES, MAX_INVOCATION_WIRE_BYTES, PROTOCOL_VERSION};
+use super::{MAX_FRAME_BYTES, MAX_INVOCATION_WIRE_BYTES, MAX_IN_FLIGHT, PROTOCOL_VERSION};
 use crate::error::DbError;
 use crate::process_function::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessFunctionDescriptor,
@@ -42,9 +42,12 @@ impl RustReferenceWorker {
         handler: Arc<dyn NativeProcessFunction>,
         max_in_flight: usize,
     ) -> Result<Self, DbError> {
-        if descriptor.runtime != ProcessRuntime::RemoteRust || max_in_flight == 0 {
+        if descriptor.runtime != ProcessRuntime::RemoteRust
+            || max_in_flight == 0
+            || max_in_flight > MAX_IN_FLIGHT
+        {
             return Err(DbError::InvalidOperation(
-                "reference worker requires remote Rust and positive concurrency".into(),
+                "reference worker requires remote Rust and 1..=32 concurrent calls".into(),
             ));
         }
         let manifest = descriptor.to_manifest_json()?;

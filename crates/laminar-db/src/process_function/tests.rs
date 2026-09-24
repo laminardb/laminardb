@@ -9,7 +9,8 @@ use rustc_hash::FxHashMap;
 use super::{
     NativeProcessFunction, ProcessActivation, ProcessActivationResult, ProcessCallback,
     ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessFunctionOperator,
-    ProcessFunctionRegistration, ProcessRuntime, TimerOperation, ValueMutation, ValueState,
+    ProcessFunctionRegistration, ProcessHandler, ProcessRuntime, TimerOperation, ValueMutation,
+    ValueState,
 };
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, GraphStateCapture, InputFrontier, OperatorGraph};
@@ -311,7 +312,7 @@ fn build_graph(
             output_name: "activity".into(),
             source_name: "events".into(),
             descriptor,
-            handler,
+            handler: ProcessHandler::Native(handler),
         })
         .unwrap();
     graph
@@ -588,7 +589,7 @@ async fn same_function_identity_in_two_pipelines_has_independent_state() {
             output_name: "other_activity".into(),
             source_name: "events".into(),
             descriptor: second,
-            handler: Arc::new(AccountActivity),
+            handler: ProcessHandler::Native(Arc::new(AccountActivity)),
         })
         .unwrap();
     let mut graph = graph.initialize_managed_state().await.unwrap();
@@ -782,7 +783,7 @@ async fn native_function_emits_through_running_database() {
     )
     .await
     .unwrap();
-    assert_eq!(db.native_process_functions().len(), 1);
+    assert_eq!(db.process_functions().len(), 1);
     db.start().await.unwrap();
     let mut portal = db
         .open_subscription("activity", None, SubscribeStart::Tail)
@@ -940,4 +941,414 @@ async fn native_function_restores_from_database_checkpoint() {
     });
     assert_eq!(totals(&[timer]), vec![110]);
     restored.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "process-remote")]
+mod remote_pipeline {
+    use std::time::Duration;
+
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::process_function::remote::{
+        LocalPythonWorker, LocalPythonWorkerConfig, RemoteProcessClient, RustReferenceWorker,
+    };
+
+    async fn worker_client(
+        descriptor: ProcessFunctionDescriptor,
+    ) -> (
+        Arc<RemoteProcessClient>,
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), DbError>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker =
+            RustReferenceWorker::new(descriptor.clone(), Arc::new(AccountActivity), 4).unwrap();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(worker.serve_loopback(listener, shutdown.clone()));
+        let client = RemoteProcessClient::connect_loopback(
+            &format!("http://{address}"),
+            descriptor,
+            4,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        (Arc::new(client), shutdown, task)
+    }
+
+    fn remote_graph(
+        binding: ProcessFunctionDescriptor,
+        client: Arc<RemoteProcessClient>,
+        runtime: tokio::runtime::Handle,
+    ) -> OperatorGraph {
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.set_runtime_handle(runtime);
+        graph.set_query_budget_ns(5_000_000_000);
+        graph.register_source_schema("events".into(), input_schema());
+        graph
+            .add_process_function(&ProcessFunctionRegistration {
+                output_name: "activity".into(),
+                source_name: "events".into(),
+                descriptor: binding,
+                handler: ProcessHandler::Remote(client),
+            })
+            .unwrap();
+        graph
+    }
+
+    async fn drain(graph: &mut OperatorGraph, watermark_ms: i64) -> Vec<RecordBatch> {
+        let wake = graph.process_work_wake().unwrap();
+        let mut output = Vec::new();
+        for _ in 0..32 {
+            if !graph.has_runnable_deferred_work() {
+                tokio::time::timeout(Duration::from_secs(3), wake.notified())
+                    .await
+                    .unwrap();
+            }
+            let mut result = graph
+                .execute_cycle(&FxHashMap::default(), watermark_ms, None)
+                .await
+                .unwrap();
+            output.extend(result.remove("activity").unwrap_or_default());
+            if graph.checkpoint_is_quiescent() && !graph.has_runnable_deferred_work() {
+                return output;
+            }
+        }
+        panic!("remote graph did not drain within 32 completion steps");
+    }
+
+    fn python_config(python: String) -> LocalPythonWorkerConfig {
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let example = repository.join("examples/process_python");
+        let mut python_paths = vec![repository.join("python/laminardb_process")];
+        if let Some(dependencies) = std::env::var_os("LAMINAR_PROCESS_PYTHON_DEPS") {
+            let path = std::path::PathBuf::from(dependencies);
+            python_paths.push(if path.is_absolute() {
+                path
+            } else {
+                repository.join(path)
+            });
+        }
+        LocalPythonWorkerConfig {
+            python: python.into(),
+            manifest: example.join("manifest.json"),
+            handler_file: example.join("handler.py"),
+            function: "handle".into(),
+            python_paths,
+            max_in_flight: 2,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_graph_serializes_keys_and_drains_before_checkpoint() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        binding.limits.max_batch_rows = 2;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let mut graph = remote_graph(binding, client, tokio::runtime::Handle::current())
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        let first = graph
+            .execute_cycle(
+                &source(&[("a", 60, 100_000), ("b", 5, 100_000), ("a", 50, 101_000)]),
+                95,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(first.get("activity").is_none_or(Vec::is_empty));
+        assert!(!graph.checkpoint_is_quiescent());
+        let (deferred, sources) = graph.take_cycle_deferrals();
+        assert!(deferred);
+        assert!(sources.contains("events"));
+        let mut actual = activity_rows(&drain(&mut graph, 95).await);
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            vec![
+                ("a".into(), "running".into(), 60, false, 100_000),
+                ("a".into(), "running".into(), 110, true, 101_000),
+                ("b".into(), "running".into(), 5, false, 100_000),
+            ]
+        );
+        assert!(graph.checkpoint_is_quiescent());
+
+        let first_timer = graph
+            .execute_cycle(&FxHashMap::default(), 112, None)
+            .await
+            .unwrap();
+        assert!(first_timer.get("activity").is_none_or(Vec::is_empty));
+        let mut timers = activity_rows(&drain(&mut graph, 112).await);
+        timers.sort_unstable();
+        assert_eq!(
+            timers,
+            vec![
+                ("a".into(), "inactive".into(), 110, false, 111_000),
+                ("b".into(), "inactive".into(), 5, false, 110_000),
+            ]
+        );
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lost_worker_fences_unaccepted_remote_result() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let mut graph = remote_graph(binding, client, tokio::runtime::Handle::current())
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        worker.abort();
+        assert!(worker.await.is_err());
+        graph
+            .execute_cycle(&source(&[("a", 7, 100_000)]), 95, None)
+            .await
+            .unwrap();
+        assert!(!graph.checkpoint_is_quiescent());
+        let wake = graph.process_work_wake().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .unwrap();
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), 95, None)
+            .await
+            .unwrap_err();
+        assert!(error.requires_pipeline_recovery(), "{error}");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn invalid_remote_input_halts_before_dispatch() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let mut operator = ProcessFunctionOperator::new_remote(
+            binding,
+            &client,
+            tokio::runtime::Handle::current(),
+            Arc::new(tokio::sync::Notify::new()),
+            "activity".into(),
+            4,
+        )
+        .unwrap();
+        let wrong_schema = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let error = operator
+            .process_with_frontiers(
+                &[vec![wrong_schema]],
+                &[InputFrontier {
+                    watermark: None,
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.requires_pipeline_halt(), "{error}");
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_worker_runtime_wakes_graph_with_recovery_fault() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let mut graph = remote_graph(binding, client, handle)
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        graph
+            .execute_cycle(&source(&[("a", 7, 100_000)]), 95, None)
+            .await
+            .unwrap();
+        let wake = graph.process_work_wake().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), wake.notified())
+            .await
+            .unwrap();
+        let error = graph
+            .execute_cycle(&FxHashMap::default(), 95, None)
+            .await
+            .unwrap_err();
+        assert!(error.requires_pipeline_recovery(), "{error}");
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_function_emits_through_running_database() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.register_remote_process_function("activity", "events", binding, client)
+            .await
+            .unwrap();
+        assert_eq!(db.process_functions().len(), 1);
+        db.start().await.unwrap();
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(input_batch(&[("a", 60, 100_000), ("a", 50, 101_000)]))
+            .unwrap();
+        let mut values = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while values.len() < 2 {
+                match portal.next_frame().await {
+                    Some(PortalFrame::Batch { batch, .. }) => values.extend(totals(&[batch])),
+                    Some(PortalFrame::Barrier { .. }) => {}
+                    other => panic!("remote process output unavailable: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(values, vec![60, 110]);
+        db.shutdown().await.unwrap();
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn supervised_python_worker_emits_through_running_database() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let worker = LocalPythonWorker::start(python_config(python))
+            .await
+            .unwrap();
+        assert!(worker.is_alive());
+        let descriptor = worker.client().descriptor().clone();
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.register_remote_process_function("activity", "events", descriptor, worker.client())
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            input_schema_for_python(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "a"])),
+                Arc::new(Int64Array::from(vec![60, 50])),
+                Arc::new(TimestampMicrosecondArray::from(vec![100_000, 101_000])),
+            ],
+        )
+        .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(batch)
+            .unwrap();
+        let mut values = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while values.len() < 2 {
+                match portal.next_frame().await {
+                    Some(PortalFrame::Batch { batch, .. }) => {
+                        let total = batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap();
+                        values.extend((0..total.len()).map(|row| total.value(row)));
+                    }
+                    Some(PortalFrame::Barrier { .. }) => {}
+                    other => panic!("Python process output unavailable: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(values, vec![60, 110]);
+        db.shutdown().await.unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_detects_python_process_crash() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let worker = LocalPythonWorker::start(python_config(python))
+            .await
+            .unwrap();
+        let status = std::process::Command::new("kill")
+            .args(["-KILL", &worker.process_id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.is_alive() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = worker.shutdown().await.err().unwrap();
+        assert!(error.to_string().contains("exited unexpectedly"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn local_python_worker_rejects_changed_handler_before_spawn() {
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let example = repository.join("examples/process_python");
+        let directory = tempfile::tempdir().unwrap();
+        let changed = directory.path().join("handler.py");
+        let mut bytes = std::fs::read(example.join("handler.py")).unwrap();
+        bytes.extend_from_slice(b"\n# changed after packaging\n");
+        std::fs::write(&changed, bytes).unwrap();
+        let error = LocalPythonWorker::start(LocalPythonWorkerConfig {
+            python: "python".into(),
+            manifest: example.join("manifest.json"),
+            handler_file: changed,
+            function: "handle".into(),
+            python_paths: Vec::new(),
+            max_in_flight: 1,
+            timeout: Duration::from_secs(1),
+        })
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("digest differs"), "{error}");
+    }
+
+    fn input_schema_for_python() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]))
+    }
 }

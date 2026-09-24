@@ -6,15 +6,15 @@ use laminar_core::catalog::CatalogObjectKind;
 
 use super::{
     NativeProcessFunction, ProcessFunctionDescriptor, ProcessFunctionInfo,
-    ProcessFunctionRegistration, ProcessRuntime,
+    ProcessFunctionRegistration, ProcessHandler, ProcessRuntime,
 };
 use crate::db::{exact_table_reference, DbState, LaminarDB};
 use crate::error::DbError;
 
 impl LaminarDB {
-    /// Inspect native process functions registered on this database instance.
+    /// Inspect process functions registered on this database instance.
     #[must_use]
-    pub fn native_process_functions(&self) -> Vec<ProcessFunctionInfo> {
+    pub fn process_functions(&self) -> Vec<ProcessFunctionInfo> {
         let manager = self.connector_manager.lock();
         let mut functions = manager
             .process_functions()
@@ -47,20 +47,67 @@ impl LaminarDB {
         descriptor: ProcessFunctionDescriptor,
         handler: Arc<dyn NativeProcessFunction>,
     ) -> Result<(), DbError> {
+        if descriptor.runtime != ProcessRuntime::NativeRust {
+            return Err(DbError::Unsupported(
+                "native registration requires the trusted native Rust runtime".into(),
+            ));
+        }
+        self.register_local_process_function(
+            output_name,
+            source_name,
+            descriptor,
+            ProcessHandler::Native(handler),
+        )
+        .await
+    }
+
+    /// Register a connected loopback Rust or Python worker for a local best-effort pipeline.
+    /// The caller owns the worker process lifecycle and must keep it available until shutdown.
+    ///
+    /// # Errors
+    /// Rejects mismatched descriptors, unsupported modes, schemas, or resource limits.
+    #[cfg(feature = "process-remote")]
+    pub async fn register_remote_process_function(
+        &self,
+        output_name: &str,
+        source_name: &str,
+        descriptor: ProcessFunctionDescriptor,
+        client: Arc<super::remote::RemoteProcessClient>,
+    ) -> Result<(), DbError> {
+        if descriptor.runtime == ProcessRuntime::NativeRust {
+            return Err(DbError::InvalidOperation(
+                "remote registration requires a remote runtime".into(),
+            ));
+        }
+        if descriptor.to_manifest_json()? != client.descriptor().to_manifest_json()? {
+            return Err(DbError::InvalidOperation(
+                "connected process worker descriptor differs from registration".into(),
+            ));
+        }
+        self.register_local_process_function(
+            output_name,
+            source_name,
+            descriptor,
+            ProcessHandler::Remote(client),
+        )
+        .await
+    }
+
+    async fn register_local_process_function(
+        &self,
+        output_name: &str,
+        source_name: &str,
+        descriptor: ProcessFunctionDescriptor,
+        handler: ProcessHandler,
+    ) -> Result<(), DbError> {
         let _topology = self.topology_ddl_lock.write().await;
-        self.ensure_topology_ddl_allowed("REGISTER NATIVE PROCESS FUNCTION")?;
+        self.ensure_topology_ddl_allowed("REGISTER PROCESS FUNCTION")?;
         if self.is_cluster_runtime()
             || DbState::load(&self.state) != DbState::Created
             || self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
         {
             return Err(DbError::Unsupported(
-                "native process functions currently require an offline local best-effort pipeline"
-                    .into(),
-            ));
-        }
-        if descriptor.runtime != ProcessRuntime::NativeRust {
-            return Err(DbError::Unsupported(
-                "native registration requires the trusted native Rust runtime".into(),
+                "process functions currently require an offline local best-effort pipeline".into(),
             ));
         }
         if !valid_name(output_name) || !valid_name(source_name) || output_name == source_name {
@@ -95,7 +142,7 @@ impl LaminarDB {
             .is_some_and(|reg| reg.connector_type.is_some())
         {
             return Err(DbError::Unsupported(
-                "native process functions currently require a direct in-memory source".into(),
+                "process functions currently require a direct in-memory source".into(),
             ));
         }
         descriptor.to_manifest_json()?;
