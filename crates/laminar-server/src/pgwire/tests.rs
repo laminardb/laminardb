@@ -133,6 +133,30 @@ fn subscription_open_errors_keep_distinct_sqlstates() {
             "22023",
         ),
         (
+            laminar_db::DbError::SubscriptionReplayPruned {
+                name: "s".into(),
+                requested: 1,
+                earliest_retained: 2,
+            },
+            "22023",
+        ),
+        (
+            laminar_db::DbError::SubscriptionEpochNotCommitted {
+                name: "s".into(),
+                requested: 7,
+                latest_committed: None,
+            },
+            "22023",
+        ),
+        (
+            laminar_db::DbError::SubscriptionSequencePruned {
+                name: "s".into(),
+                requested_sequence: 0,
+                earliest_retained_sequence: 2,
+            },
+            "22023",
+        ),
+        (
             laminar_db::DbError::Pipeline("subscriber cap".into()),
             "53300",
         ),

@@ -29,17 +29,18 @@ async fn portal_forwards_batch_and_barrier() {
     registry.send_batch("mv", batch(vec![1, 2])).unwrap();
     registry.broadcast_barrier(7, 7);
 
+    // Portal frames carry shared-log sequences, which are 1-based.
     assert!(matches!(
         portal.next_frame().await,
-        Some(PortalFrame::Batch { batch, sequence: 0, .. }) if batch.num_rows() == 2
+        Some(PortalFrame::Batch { batch, sequence: 1, .. }) if batch.num_rows() == 2
     ));
     assert!(matches!(
         portal.next_frame().await,
         Some(PortalFrame::Barrier {
-            sequence: 1,
+            sequence: 2,
             epoch: 7,
             checkpoint_id: 7,
-            through_sequence: 1,
+            through_sequence: 2,
         })
     ));
 }
@@ -54,15 +55,15 @@ fn portal_try_next_is_non_blocking_and_ordered() {
     registry.broadcast_barrier(3, 3);
     assert!(matches!(
         portal.try_next_frame(),
-        Some(PortalFrame::Batch { batch, sequence: 0, .. }) if batch.num_rows() == 1
+        Some(PortalFrame::Batch { batch, sequence: 1, .. }) if batch.num_rows() == 1
     ));
     assert!(matches!(
         portal.try_next_frame(),
         Some(PortalFrame::Barrier {
-            sequence: 1,
+            sequence: 2,
             epoch: 3,
             checkpoint_id: 3,
-            through_sequence: 1,
+            through_sequence: 2,
         })
     ));
     assert!(portal.try_next_frame().is_none());

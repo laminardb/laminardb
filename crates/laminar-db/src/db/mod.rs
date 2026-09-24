@@ -5335,9 +5335,12 @@ impl LaminarDB {
                     crate::subscription::SubscriptionOpenError::ReplayPruned {
                         earliest_retained,
                     } => {
+                        // Epoch pruning is produced only by the `AsOfEpoch`
+                        // resolver; the sequence coordinate reports separately.
                         let requested = match start {
                             crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
-                            crate::subscription::SubscribeStart::Tail => 0,
+                            crate::subscription::SubscribeStart::AfterSequence(_)
+                            | crate::subscription::SubscribeStart::Tail => 0,
                         };
                         DbError::SubscriptionReplayPruned {
                             name: name.to_string(),
@@ -5345,6 +5348,14 @@ impl LaminarDB {
                             earliest_retained,
                         }
                     }
+                    crate::subscription::SubscriptionOpenError::SequencePruned {
+                        requested,
+                        earliest_retained,
+                    } => DbError::SubscriptionSequencePruned {
+                        name: name.to_string(),
+                        requested_sequence: requested,
+                        earliest_retained_sequence: earliest_retained,
+                    },
                     crate::subscription::SubscriptionOpenError::EpochNotCommitted {
                         requested,
                         latest_committed,

@@ -2232,15 +2232,16 @@ async fn ws_emits_committed_checkpoint_progress() {
     assert_eq!(frames.len(), 2, "data must precede its progress cut");
     assert_eq!(frames[0]["type"], "data");
     assert_eq!(frames[0]["sequence"], "0");
-    assert_eq!(frames[0]["log_sequence"], "0");
+    // Shared-log sequences are 1-based; delivery sequence stays 0-based.
+    assert_eq!(frames[0]["log_sequence"], "1");
     let progress = &frames[1];
     assert_eq!(progress["epoch"], committed.epoch.to_string());
     assert_eq!(
         progress["checkpoint_id"],
         committed.checkpoint_id.to_string()
     );
-    assert_eq!(progress["log_sequence"], "1");
-    assert_eq!(progress["through_log_sequence"], "1");
+    assert_eq!(progress["log_sequence"], "2");
+    assert_eq!(progress["through_log_sequence"], "2");
     assert_eq!(progress["sequence"], "1");
 }
 

@@ -52,7 +52,8 @@ pub(super) fn subscription_open_error(name: &str, error: laminar_db::DbError) ->
         laminar_db::DbError::Unsupported(_) => "0A000",
         laminar_db::DbError::InvalidOperation(_)
         | laminar_db::DbError::SubscriptionReplayPruned { .. }
-        | laminar_db::DbError::SubscriptionEpochNotCommitted { .. } => "22023",
+        | laminar_db::DbError::SubscriptionEpochNotCommitted { .. }
+        | laminar_db::DbError::SubscriptionSequencePruned { .. } => "22023",
         laminar_db::DbError::Pipeline(_) => "53300",
         laminar_db::DbError::Subscription(error) => match error {
             laminar_db::subscription::ClusterSubscriptionError::UnsupportedPlan { .. } => "0A000",

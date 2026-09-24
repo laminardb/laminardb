@@ -16,7 +16,7 @@ use laminar_core::cluster::control::LeaderLeaseStore;
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
-use authority::GatewayCursor;
+use authority::{unsupported_sequence_start, GatewayCursor};
 use gateway::run_gateway;
 use pin::{acquire_replay_pin, release_replay_pin, GatewayReplayPin};
 
@@ -170,8 +170,10 @@ fn validate_replay_start(
     certificate: &OutputDistributionCertificate,
     start: SubscribeStart,
 ) -> Result<(), DbError> {
-    let SubscribeStart::AsOfEpoch(requested) = start else {
-        return Ok(());
+    let requested = match start {
+        SubscribeStart::Tail => return Ok(()),
+        SubscribeStart::AfterSequence(_) => return Err(unsupported_sequence_start()),
+        SubscribeStart::AsOfEpoch(requested) => requested,
     };
     if requested == 0 {
         return Err(ClusterSubscriptionError::EpochNotCommitted { requested }.into());

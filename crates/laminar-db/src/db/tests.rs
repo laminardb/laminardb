@@ -13021,3 +13021,52 @@ async fn open_subscription_as_of_uncommitted_returns_structured_error() {
     assert_eq!(err.code(), laminar_core::error_codes::INVALID_OPERATION);
     assert!(err.to_string().contains("not committed"), "msg: {err}");
 }
+
+#[tokio::test]
+async fn open_subscription_after_sequence_pruned_reports_sequence_coordinate() {
+    use crate::subscription::SubscribeStart;
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '256b')")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    // Drive the registry directly so the retained prefix is smaller than the
+    // requested sequence. This tests the DB-level pruned diagnostic, not DDL.
+    let reg = &db.subscription_registry;
+    let schema = db.source_untyped("trades").unwrap().schema().clone();
+    for _ in 0..3 {
+        let symbols = vec!["AAPL".to_string(); 64];
+        let batch = arrow_array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::StringArray::from(symbols))],
+        )
+        .unwrap();
+        reg.send_batch("all_trades", batch).unwrap();
+    }
+
+    let err = db
+        .open_subscription("all_trades", None, SubscribeStart::AfterSequence(0))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        DbError::SubscriptionSequencePruned {
+            ref name,
+            requested_sequence: 0,
+            earliest_retained_sequence,
+        } if name == "all_trades" && earliest_retained_sequence > 0
+    ));
+    assert_eq!(err.code(), laminar_core::error_codes::INVALID_OPERATION);
+    let message = err.to_string();
+    assert!(message.contains("Sequence 0"), "msg: {message}");
+    assert!(
+        !message.contains("Epoch"),
+        "sequence pruning must not be reported as an epoch: {message}"
+    );
+}

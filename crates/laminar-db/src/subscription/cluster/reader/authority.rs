@@ -54,6 +54,11 @@ impl GatewayCursor {
                     .attach_as_of(authority, store, certificate, epoch)
                     .await?;
             }
+            // Cluster replay is checkpoint-epoch scoped; a bare shared-log
+            // sequence has no cluster-history coordinate to replay from.
+            SubscribeStart::AfterSequence(_) => {
+                return Err(unsupported_sequence_start());
+            }
         }
         Ok(cursor)
     }
@@ -223,6 +228,13 @@ async fn load_index_for_outcome(
         ));
     }
     Ok(loaded)
+}
+
+pub(super) fn unsupported_sequence_start() -> DbError {
+    ClusterSubscriptionError::UnsupportedPlan {
+        reason: "shared-log sequence start-after is unsupported for cluster subscriptions".into(),
+    }
+    .into()
 }
 
 fn initial_frontiers(
