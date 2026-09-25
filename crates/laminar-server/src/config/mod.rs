@@ -777,13 +777,13 @@ pub struct SinkConfig {
     pub properties: toml::Table,
 }
 
-/// `[[process_function]]` binds a direct source to an immutable Python manifest.
+/// `[[process_function]]` binds one SQL source to a Python process manifest.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessFunctionConfig {
     pub source: String,
     pub output: String,
-    /// `CREATE SOURCE` without a connector; executed before worker registration.
+    /// One `CREATE SOURCE` statement, executed before worker registration.
     pub source_sql: String,
     pub manifest: std::path::PathBuf,
     pub handler_file: std::path::PathBuf,

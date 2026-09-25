@@ -55,7 +55,7 @@ To exercise the real Rust host client against this Python worker, set
 run:
 
 ```bash
-cargo test -p laminar-db --no-default-features --features process-remote --lib process_function::tests::remote_pipeline
+cargo test -p laminar-db --no-default-features --features process-remote,files --lib process_function::tests::remote_pipeline
 ```
 
 The local Rust API can register a connected loopback Rust or Python worker into
@@ -64,8 +64,12 @@ running database. Embedded registration also accepts an append-only connector
 source. When that connector can resume from a committed cursor, a fresh database
 and worker can replay input that was pending at worker exit. The focused
 `replayable_source_replays_pending_input_after_python_worker_exit` test exercises
-this with a deterministic local connector. The admission level remains
-`best_effort`; this test does not certify a production connector or sink.
+this with a deterministic local connector. A separate test uses the production
+`FILES` source and durable file sink, exits a real Python worker during a
+pending call, and verifies replay and both published outputs. A Rust reference
+worker test terminates the whole host process during a pending file input and
+checks fresh-host recovery. These paths remain admitted as `best_effort`;
+stronger delivery requires its own admission and recovery qualification.
 
 ## Single-node server
 

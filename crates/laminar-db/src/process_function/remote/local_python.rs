@@ -15,6 +15,7 @@ use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
 
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
 /// callers must pin any imported code or data separately before claiming replay equivalence.
+#[derive(Clone)]
 pub struct LocalPythonWorkerConfig {
     /// Python executable or a trusted executable name resolved by the host environment.
     pub python: PathBuf,

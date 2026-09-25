@@ -969,6 +969,8 @@ mod remote_pipeline {
 
     async fn worker_client(
         descriptor: ProcessFunctionDescriptor,
+        handler: Arc<dyn NativeProcessFunction>,
+        timeout: Duration,
     ) -> (
         Arc<RemoteProcessClient>,
         CancellationToken,
@@ -976,15 +978,14 @@ mod remote_pipeline {
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let worker =
-            RustReferenceWorker::new(descriptor.clone(), Arc::new(AccountActivity), 4).unwrap();
+        let worker = RustReferenceWorker::new(descriptor.clone(), handler, 4).unwrap();
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(worker.serve_loopback(listener, shutdown.clone()));
         let client = RemoteProcessClient::connect_loopback(
             &format!("http://{address}"),
             descriptor,
             4,
-            Duration::from_secs(3),
+            timeout,
         )
         .await
         .unwrap();
@@ -1065,6 +1066,60 @@ mod remote_pipeline {
             ],
         )
         .unwrap()
+    }
+
+    fn crash_on_second_python_config(
+        python: &str,
+        directory: &Path,
+    ) -> (LocalPythonWorkerConfig, std::path::PathBuf) {
+        let crash_marker = directory.join("crash-on-second-input");
+        std::fs::write(&crash_marker, []).unwrap();
+        let marker_literal = serde_json::to_string(&crash_marker.to_string_lossy()).unwrap();
+        let handler = format!(
+            r#"import os
+import pyarrow as pa
+from laminardb_process import ActivationResult, Mutation
+
+OUTPUT_SCHEMA = pa.schema([
+    pa.field("key", pa.utf8(), nullable=False),
+    pa.field("total", pa.int64(), nullable=False),
+    pa.field("ts", pa.timestamp("us"), nullable=False),
+])
+
+def handle(activations):
+    results = []
+    for activation in activations:
+        amount = activation.input.column(1)[0].as_py()
+        if amount == 50 and os.path.exists({marker_literal}):
+            os.remove({marker_literal})
+            os._exit(47)
+        total = (activation.state.value or 0) + amount
+        output = pa.record_batch([
+            pa.array([activation.key_text], type=pa.utf8()),
+            pa.array([total], type=pa.int64()),
+            pa.array([activation.event_time_us], type=pa.timestamp("us")),
+        ], schema=OUTPUT_SCHEMA)
+        results.append(ActivationResult(
+            activation.id, output=(output,), mutation=Mutation.set(total)
+        ))
+    return tuple(results)
+"#
+        );
+        let handler_path = directory.join("replay_handler.py");
+        std::fs::write(&handler_path, &handler).unwrap();
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        descriptor.implementation_digest = format!("{:x}", Sha256::digest(handler.as_bytes()));
+        let manifest_path = directory.join("manifest.json");
+        std::fs::write(&manifest_path, descriptor.to_manifest_json().unwrap()).unwrap();
+        let mut config = python_config(python.to_string());
+        config.manifest = manifest_path;
+        config.handler_file = handler_path;
+        config.timeout = Duration::from_secs(15);
+        (config, crash_marker)
     }
 
     const REPLAY_SOURCE: &str = "process-replay-test";
@@ -1220,14 +1275,160 @@ mod remote_pipeline {
         db
     }
 
-    async fn next_python_total(portal: &mut SubscriptionPortal) -> i64 {
+    #[cfg(feature = "files")]
+    async fn file_process_database(
+        checkpoint_dir: &Path,
+        input_dir: &Path,
+        output_dir: &Path,
+        key_column: &str,
+        client: Arc<RemoteProcessClient>,
+    ) -> Arc<LaminarDB> {
+        let db = LaminarDB::builder()
+            .storage_dir(checkpoint_dir)
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let input_path = input_dir.display().to_string().replace('\\', "/");
+        db.execute(&format!(
+            "CREATE SOURCE events ({key_column} VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+             FROM FILES ('path' = '{input_path}', 'glob_pattern' = '*.json', \
+             'stabilisation_delay' = '100ms') FORMAT JSON"
+        ))
+        .await
+        .unwrap();
+        db.register_remote_process_function(
+            "activity",
+            "events",
+            client.descriptor().clone(),
+            client,
+        )
+        .await
+        .unwrap();
+        let output_path = output_dir.display().to_string().replace('\\', "/");
+        db.execute(&format!(
+            "CREATE SINK activity_files FROM activity INTO FILES ('path' = '{output_path}') FORMAT JSON"
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    #[cfg(feature = "files")]
+    fn publish_file_input(staging: &Path, input_dir: &Path, name: &str, row: serde_json::Value) {
+        let staged = staging.join(name);
+        let mut json = serde_json::to_vec(&row).unwrap();
+        json.push(b'\n');
+        std::fs::write(&staged, json).unwrap();
+        std::fs::rename(staged, input_dir.join(name)).unwrap();
+    }
+
+    #[cfg(feature = "files")]
+    fn published_file_totals(output_dir: &Path) -> Vec<i64> {
+        let mut totals = Vec::new();
+        for entry in std::fs::read_dir(output_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                totals.push(value["total"].as_i64().unwrap());
+            }
+        }
+        totals.sort_unstable();
+        totals
+    }
+
+    #[cfg(feature = "files")]
+    struct PauseSecondFile {
+        entered: std::path::PathBuf,
+    }
+
+    #[cfg(feature = "files")]
+    impl NativeProcessFunction for PauseSecondFile {
+        fn invoke(
+            &self,
+            activations: &[ProcessActivation],
+        ) -> Result<Vec<ProcessActivationResult>, DbError> {
+            for activation in activations {
+                let ProcessCallback::Input(batch) = &activation.callback else {
+                    continue;
+                };
+                let amount = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0);
+                if amount == 50 {
+                    std::fs::write(&self.entered, []).map_err(|error| {
+                        DbError::Pipeline(format!("mark pending process invocation: {error}"))
+                    })?;
+                    std::thread::sleep(Duration::from_secs(25));
+                }
+            }
+            AccountActivity.invoke(activations)
+        }
+    }
+
+    #[cfg(feature = "files")]
+    async fn run_host_failure_child(root: &Path) {
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let checkpoint_dir = root.join("checkpoint");
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, _shutdown, _worker) = worker_client(
+            binding,
+            Arc::new(PauseSecondFile {
+                entered: root.join("invocation-entered"),
+            }),
+            Duration::from_secs(30),
+        )
+        .await;
+        let db = file_process_database(&checkpoint_dir, &input_dir, &output_dir, "account", client)
+            .await;
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+        publish_file_input(
+            root,
+            &input_dir,
+            "first.json",
+            serde_json::json!({"account": "a", "amount": 60, "ts": 100_000}),
+        );
+        assert_eq!(next_process_total(&mut portal).await, 60);
+        assert!(db.checkpoint().await.unwrap().success);
+        assert_eq!(published_file_totals(&output_dir), vec![60]);
+        publish_file_input(
+            root,
+            &input_dir,
+            "second.json",
+            serde_json::json!({"account": "a", "amount": 50, "ts": 100_005}),
+        );
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        panic!("host failure test child was not terminated during the pending invocation");
+    }
+
+    async fn next_process_total(portal: &mut SubscriptionPortal) -> i64 {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match portal.next_frame().await {
                     Some(PortalFrame::Batch { batch, .. }) => {
                         assert_eq!(batch.num_rows(), 1);
+                        let total_column = batch.schema().index_of("total").unwrap();
                         return batch
-                            .column(1)
+                            .column(total_column)
                             .as_any()
                             .downcast_ref::<Int64Array>()
                             .unwrap()
@@ -1275,7 +1476,12 @@ mod remote_pipeline {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
         binding.limits.max_batch_rows = 2;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let mut graph = remote_graph(binding, client, tokio::runtime::Handle::current())
             .initialize_managed_state()
             .await
@@ -1327,7 +1533,12 @@ mod remote_pipeline {
     async fn remote_graph_restore_replays_saved_timer_and_state() {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let mut original = remote_graph(
             binding.clone(),
             Arc::clone(&client),
@@ -1372,7 +1583,12 @@ mod remote_pipeline {
     async fn lost_worker_fences_unaccepted_remote_result() {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let mut graph = remote_graph(binding, client, tokio::runtime::Handle::current())
             .initialize_managed_state()
             .await
@@ -1400,7 +1616,12 @@ mod remote_pipeline {
     async fn invalid_remote_input_halts_before_dispatch() {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let mut operator = ProcessFunctionOperator::new_remote(
             binding,
             &client,
@@ -1430,7 +1651,12 @@ mod remote_pipeline {
     async fn stopped_worker_runtime_wakes_graph_with_recovery_fault() {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1462,7 +1688,12 @@ mod remote_pipeline {
     async fn remote_function_emits_through_running_database() {
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, shutdown, worker) = worker_client(binding.clone()).await;
+        let (client, shutdown, worker) = worker_client(
+            binding.clone(),
+            Arc::new(AccountActivity),
+            Duration::from_secs(3),
+        )
+        .await;
         let db = LaminarDB::open().unwrap();
         db.execute(
             "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
@@ -1582,13 +1813,13 @@ mod remote_pipeline {
             .unwrap()
             .push_arrow(python_input("a", 60, 100_000))
             .unwrap();
-        assert_eq!(next_python_total(&mut first_portal).await, 60);
+        assert_eq!(next_process_total(&mut first_portal).await, 60);
         first
             .source_untyped("events")
             .unwrap()
             .push_arrow(python_input("c", 7, 100_000))
             .unwrap();
-        assert_eq!(next_python_total(&mut first_portal).await, 7);
+        assert_eq!(next_process_total(&mut first_portal).await, 7);
         first.checkpoint().await.unwrap();
         first.shutdown().await.unwrap();
         drop(first_portal);
@@ -1608,20 +1839,20 @@ mod remote_pipeline {
             .unwrap()
             .push_arrow(python_input("a", 50, 100_050))
             .unwrap();
-        assert_eq!(next_python_total(&mut portal).await, 110);
+        assert_eq!(next_process_total(&mut portal).await, 110);
         restored
             .source_untyped("events")
             .unwrap()
             .push_arrow(python_input("b", 1, 101_000))
             .unwrap();
-        assert_eq!(next_python_total(&mut portal).await, 1);
+        assert_eq!(next_process_total(&mut portal).await, 1);
         restored.checkpoint().await.unwrap();
         restored
             .source_untyped("events")
             .unwrap()
             .push_arrow(python_input("c", 1, 102_000))
             .unwrap();
-        assert_eq!(next_python_total(&mut portal).await, 1);
+        assert_eq!(next_process_total(&mut portal).await, 1);
         restored.shutdown().await.unwrap();
         second_worker.shutdown().await.unwrap();
     }
@@ -1665,7 +1896,7 @@ mod remote_pipeline {
             .unwrap()
             .push_arrow(python_input("a", 60, 100_000))
             .unwrap();
-        assert_eq!(next_python_total(&mut portal).await, 60);
+        assert_eq!(next_process_total(&mut portal).await, 60);
         first.checkpoint().await.unwrap();
 
         kill_python_worker(worker.process_id());
@@ -1692,7 +1923,7 @@ mod remote_pipeline {
             .unwrap()
             .push_arrow(python_input("a", 50, 100_050))
             .unwrap();
-        assert_eq!(next_python_total(&mut restored_portal).await, 110);
+        assert_eq!(next_process_total(&mut restored_portal).await, 110);
         restored.shutdown().await.unwrap();
         replacement.shutdown().await.unwrap();
     }
@@ -1703,66 +1934,20 @@ mod remote_pipeline {
             return;
         };
         let directory = tempfile::tempdir().unwrap();
-        let crash_marker = directory.path().join("crash-on-second-input");
-        std::fs::write(&crash_marker, []).unwrap();
-        let marker_literal = serde_json::to_string(&crash_marker.to_string_lossy()).unwrap();
-        let handler = format!(
-            r#"import os
-import pyarrow as pa
-from laminardb_process import ActivationResult, Mutation
-
-OUTPUT_SCHEMA = pa.schema([
-    pa.field("key", pa.utf8(), nullable=False),
-    pa.field("total", pa.int64(), nullable=False),
-    pa.field("ts", pa.timestamp("us"), nullable=False),
-])
-
-def handle(activations):
-    results = []
-    for activation in activations:
-        amount = activation.input.column(1)[0].as_py()
-        if amount == 50 and os.path.exists({marker_literal}):
-            os.remove({marker_literal})
-            os._exit(47)
-        total = (activation.state.value or 0) + amount
-        output = pa.record_batch([
-            pa.array([activation.key_text], type=pa.utf8()),
-            pa.array([total], type=pa.int64()),
-            pa.array([activation.event_time_us], type=pa.timestamp("us")),
-        ], schema=OUTPUT_SCHEMA)
-        results.append(ActivationResult(
-            activation.id, output=(output,), mutation=Mutation.set(total)
-        ))
-    return tuple(results)
-"#
-        );
-        let handler_path = directory.path().join("replay_handler.py");
-        std::fs::write(&handler_path, &handler).unwrap();
-        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(
-            &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
-        )
-        .unwrap();
-        descriptor.implementation_digest = format!("{:x}", Sha256::digest(handler.as_bytes()));
-        let manifest_path = directory.path().join("manifest.json");
-        std::fs::write(&manifest_path, descriptor.to_manifest_json().unwrap()).unwrap();
-        let worker_config = || {
-            let mut config = python_config(python.clone());
-            config.manifest = manifest_path.clone();
-            config.handler_file = handler_path.clone();
-            config.timeout = Duration::from_secs(15);
-            config
-        };
+        let (worker_config, crash_marker) =
+            crash_on_second_python_config(&python, directory.path());
 
         let source = ReplaySourceControl::new();
-        let worker = LocalPythonWorker::start(worker_config()).await.unwrap();
+        let worker = LocalPythonWorker::start(worker_config.clone())
+            .await
+            .unwrap();
         let first = replayable_python_database(directory.path(), &source, &worker).await;
         let mut portal = first
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
             .unwrap();
         source.release();
-        assert_eq!(next_python_total(&mut portal).await, 60);
+        assert_eq!(next_process_total(&mut portal).await, 60);
         let checkpoint = first.checkpoint().await.unwrap();
         assert!(checkpoint.success, "{checkpoint:?}");
 
@@ -1796,18 +1981,177 @@ def handle(activations):
         drop(portal);
         drop(first);
 
-        let replacement = LocalPythonWorker::start(worker_config()).await.unwrap();
+        let replacement = LocalPythonWorker::start(worker_config).await.unwrap();
         let restored = replayable_python_database(directory.path(), &source, &replacement).await;
         assert_eq!(source.starts.lock().as_slice(), &[0, 1]);
         let mut restored_portal = restored
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
             .unwrap();
-        assert_eq!(next_python_total(&mut restored_portal).await, 110);
+        assert_eq!(next_process_total(&mut restored_portal).await, 110);
         let checkpoint = restored.checkpoint().await.unwrap();
         assert!(checkpoint.success, "{checkpoint:?}");
         restored.shutdown().await.unwrap();
         replacement.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_source_and_sink_replay_pending_python_input_after_worker_exit() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let input_dir = directory.path().join("input");
+        let output_dir = directory.path().join("output");
+        let checkpoint_dir = directory.path().join("checkpoint");
+        std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
+        let (worker_config, crash_marker) =
+            crash_on_second_python_config(&python, directory.path());
+
+        let worker = LocalPythonWorker::start(worker_config.clone())
+            .await
+            .unwrap();
+        let first = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "key",
+            worker.client(),
+        )
+        .await;
+        let mut portal = first
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        first.start().await.unwrap();
+        publish_file_input(
+            directory.path(),
+            &input_dir,
+            "first.json",
+            serde_json::json!({"key": "a", "amount": 60, "ts": 100_000}),
+        );
+        assert_eq!(next_process_total(&mut portal).await, 60);
+        let checkpoint = first.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{checkpoint:?}");
+        assert_eq!(published_file_totals(&output_dir), vec![60]);
+
+        publish_file_input(
+            directory.path(),
+            &input_dir,
+            "second.json",
+            serde_json::json!({"key": "a", "amount": 50, "ts": 100_050}),
+        );
+        tokio::time::timeout(Duration::from_secs(10), worker.wait_for_exit())
+            .await
+            .expect("Python worker did not exit during the pending file input");
+        assert!(!crash_marker.exists());
+        assert!(worker.shutdown().await.is_err());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first.last_fault().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("database did not observe the failed worker invocation");
+        assert!(first.shutdown().await.is_err());
+        drop(portal);
+        drop(first);
+
+        let replacement = LocalPythonWorker::start(worker_config).await.unwrap();
+        let restored = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "key",
+            replacement.client(),
+        )
+        .await;
+        let mut restored_portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        restored.start().await.unwrap();
+        assert_eq!(next_process_total(&mut restored_portal).await, 110);
+        let checkpoint = restored.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{checkpoint:?}");
+        restored.shutdown().await.unwrap();
+        replacement.shutdown().await.unwrap();
+        assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_source_and_sink_recover_pending_input_after_host_termination() {
+        const CHILD_ENV: &str = "LAMINAR_PROCESS_HOST_FAILURE_TEST_CHILD";
+        if let Some(root) = std::env::var_os(CHILD_ENV) {
+            run_host_failure_child(Path::new(&root)).await;
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let checkpoint_dir = root.join("checkpoint");
+        std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "process_function::tests::remote_pipeline::file_source_and_sink_recover_pending_input_after_host_termination",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = child.spawn().unwrap();
+        let entered = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                if root.join("invocation-entered").exists() {
+                    return;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("host failure child exited before pending invocation: {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if entered.is_err() {
+            child.start_kill().unwrap();
+            let _ = child.wait().await;
+            panic!("host failure child did not enter the pending invocation");
+        }
+        child.start_kill().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(published_file_totals(&output_dir), vec![60]);
+
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (client, shutdown, worker) =
+            worker_client(binding, Arc::new(AccountActivity), Duration::from_secs(5)).await;
+        let restored =
+            file_process_database(&checkpoint_dir, &input_dir, &output_dir, "account", client)
+                .await;
+        let mut portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        restored.start().await.unwrap();
+        assert_eq!(next_process_total(&mut portal).await, 110);
+        assert!(restored.checkpoint().await.unwrap().success);
+        restored.shutdown().await.unwrap();
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+        assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
     }
 
     #[tokio::test]
