@@ -29,13 +29,14 @@ impl LaminarDB {
         functions
     }
 
-    /// Register a trusted native keyed process function over one direct in-memory source.
+    /// Register a trusted native keyed process function over one append-only source.
     /// Registration is offline: call it after creating the source and before `start()`. The
     /// caller must register the same immutable implementation when constructing a replacement
     /// database instance that restores an existing checkpoint.
     ///
     /// The current admission profile is local best-effort execution. Checkpointed state can be
-    /// restored, but an in-memory source cannot replay uncommitted input after a crash.
+    /// restored. Uncommitted input may be replayed when the source connector supports it;
+    /// a direct in-memory source cannot replay after a crash.
     /// Native code runs in the compute process and must be trusted and nonblocking.
     ///
     /// # Errors
@@ -132,17 +133,6 @@ impl LaminarDB {
             return Err(DbError::Unsupported(
                 "process source requires an append-only event-time watermark on the declared column"
                     .into(),
-            ));
-        }
-        if self
-            .connector_manager
-            .lock()
-            .sources()
-            .get(source_name)
-            .is_some_and(|reg| reg.connector_type.is_some())
-        {
-            return Err(DbError::Unsupported(
-                "process functions currently require a direct in-memory source".into(),
             ));
         }
         descriptor.to_manifest_json()?;

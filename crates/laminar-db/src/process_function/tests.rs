@@ -948,6 +948,16 @@ mod remote_pipeline {
     use std::path::Path;
     use std::time::Duration;
 
+    use async_trait::async_trait;
+    use laminar_connectors::checkpoint::SourceCheckpoint;
+    use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+    use laminar_connectors::connector::{
+        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceInputMode,
+        SourcePosition, SourceStart, SourceTopology,
+    };
+    use laminar_connectors::error::ConnectorError;
+    use laminar_connectors::registry::ConnectorRegistry;
+    use sha2::{Digest, Sha256};
     use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
 
@@ -1055,6 +1065,159 @@ mod remote_pipeline {
             ],
         )
         .unwrap()
+    }
+
+    const REPLAY_SOURCE: &str = "process-replay-test";
+
+    #[derive(Clone)]
+    struct ReplaySourceControl {
+        ready: tokio::sync::watch::Sender<usize>,
+        starts: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl ReplaySourceControl {
+        fn new() -> Self {
+            let (ready, _) = tokio::sync::watch::channel(0);
+            Self {
+                ready,
+                starts: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn release(&self) {
+            self.ready.send_modify(|cut| *cut += 1);
+        }
+
+        fn register(&self, registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
+            let ready = self.ready.subscribe();
+            let starts = Arc::clone(&self.starts);
+            registry.register_source(
+                REPLAY_SOURCE,
+                ConnectorInfo {
+                    name: REPLAY_SOURCE.into(),
+                    display_name: "Process replay test source".into(),
+                    version: "1".into(),
+                    is_source: true,
+                    is_sink: false,
+                    config_keys: Vec::new(),
+                },
+                Arc::new(move |_| {
+                    Ok(Box::new(ReplaySource {
+                        cursor: 0,
+                        ready: ready.clone(),
+                        starts: Arc::clone(&starts),
+                    }))
+                }),
+            )
+        }
+    }
+
+    struct ReplaySource {
+        cursor: usize,
+        ready: tokio::sync::watch::Receiver<usize>,
+        starts: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl ReplaySource {
+        fn checkpoint_at(&self) -> SourceCheckpoint {
+            let mut checkpoint = SourceCheckpoint::new();
+            checkpoint.set_offset("cursor", self.cursor.to_string());
+            checkpoint
+                .set_input_channels(vec![b"events".to_vec()])
+                .unwrap();
+            checkpoint
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for ReplaySource {
+        fn contract(&self, _: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+            Ok(SourceContract::new(
+                SourceConsistency::Replayable,
+                SourceTopology::Singleton,
+                SourceInputMode::AppendOnly,
+            ))
+        }
+
+        async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+            let (_, position, _) = request.into_parts();
+            self.cursor = match position {
+                SourcePosition::Initial => 0,
+                SourcePosition::Resume { checkpoint, .. } => checkpoint
+                    .get_offset("cursor")
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .filter(|cursor| *cursor <= 2)
+                    .ok_or_else(|| {
+                        ConnectorError::ConfigurationError(
+                            "process replay checkpoint has no valid cursor".into(),
+                        )
+                    })?,
+            };
+            self.starts.lock().push(self.cursor);
+            Ok(())
+        }
+
+        async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
+            if *self.ready.borrow() <= self.cursor {
+                return Ok(None);
+            }
+            let batch = match self.cursor {
+                0 => python_input("a", 60, 100_000),
+                1 => python_input("a", 50, 100_050),
+                _ => return Ok(None),
+            };
+            self.cursor += 1;
+            Ok(Some(
+                SourceBatch::new(batch).with_checkpoint(self.checkpoint_at()),
+            ))
+        }
+
+        fn schema(&self) -> SchemaRef {
+            input_schema_for_python()
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            self.checkpoint_at()
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    async fn replayable_python_database(
+        path: &Path,
+        source: &ReplaySourceControl,
+        worker: &LocalPythonWorker,
+    ) -> Arc<LaminarDB> {
+        let source = source.clone();
+        let db = LaminarDB::builder()
+            .storage_dir(path)
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                interval_ms: None,
+                ..Default::default()
+            })
+            .register_connector(move |registry| source.register(registry))
+            .build()
+            .await
+            .unwrap();
+        db.execute(&format!(
+            "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+             FROM \"{REPLAY_SOURCE}\""
+        ))
+        .await
+        .unwrap();
+        db.register_remote_process_function(
+            "activity",
+            "events",
+            worker.client().descriptor().clone(),
+            worker.client(),
+        )
+        .await
+        .unwrap();
+        db.start().await.unwrap();
+        db
     }
 
     async fn next_python_total(portal: &mut SubscriptionPortal) -> i64 {
@@ -1530,6 +1693,119 @@ mod remote_pipeline {
             .push_arrow(python_input("a", 50, 100_050))
             .unwrap();
         assert_eq!(next_python_total(&mut restored_portal).await, 110);
+        restored.shutdown().await.unwrap();
+        replacement.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replayable_source_replays_pending_input_after_python_worker_exit() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let crash_marker = directory.path().join("crash-on-second-input");
+        std::fs::write(&crash_marker, []).unwrap();
+        let marker_literal = serde_json::to_string(&crash_marker.to_string_lossy()).unwrap();
+        let handler = format!(
+            r#"import os
+import pyarrow as pa
+from laminardb_process import ActivationResult, Mutation
+
+OUTPUT_SCHEMA = pa.schema([
+    pa.field("key", pa.utf8(), nullable=False),
+    pa.field("total", pa.int64(), nullable=False),
+    pa.field("ts", pa.timestamp("us"), nullable=False),
+])
+
+def handle(activations):
+    results = []
+    for activation in activations:
+        amount = activation.input.column(1)[0].as_py()
+        if amount == 50 and os.path.exists({marker_literal}):
+            os.remove({marker_literal})
+            os._exit(47)
+        total = (activation.state.value or 0) + amount
+        output = pa.record_batch([
+            pa.array([activation.key_text], type=pa.utf8()),
+            pa.array([total], type=pa.int64()),
+            pa.array([activation.event_time_us], type=pa.timestamp("us")),
+        ], schema=OUTPUT_SCHEMA)
+        results.append(ActivationResult(
+            activation.id, output=(output,), mutation=Mutation.set(total)
+        ))
+    return tuple(results)
+"#
+        );
+        let handler_path = directory.path().join("replay_handler.py");
+        std::fs::write(&handler_path, &handler).unwrap();
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        descriptor.implementation_digest = format!("{:x}", Sha256::digest(handler.as_bytes()));
+        let manifest_path = directory.path().join("manifest.json");
+        std::fs::write(&manifest_path, descriptor.to_manifest_json().unwrap()).unwrap();
+        let worker_config = || {
+            let mut config = python_config(python.clone());
+            config.manifest = manifest_path.clone();
+            config.handler_file = handler_path.clone();
+            config.timeout = Duration::from_secs(15);
+            config
+        };
+
+        let source = ReplaySourceControl::new();
+        let worker = LocalPythonWorker::start(worker_config()).await.unwrap();
+        let first = replayable_python_database(directory.path(), &source, &worker).await;
+        let mut portal = first
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        source.release();
+        assert_eq!(next_python_total(&mut portal).await, 60);
+        let checkpoint = first.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{checkpoint:?}");
+
+        source.release();
+        tokio::time::timeout(Duration::from_secs(10), worker.wait_for_exit())
+            .await
+            .expect("Python worker did not exit during the uncheckpointed invocation");
+        assert!(!crash_marker.exists());
+        assert!(worker.shutdown().await.is_err());
+        let fault = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(fault) = first.last_fault() {
+                    break fault;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("database did not observe the failed worker invocation");
+        assert!(
+            fault.contains("process worker invocation failed"),
+            "{fault}"
+        );
+        let shutdown_error = first.shutdown().await.unwrap_err();
+        assert!(
+            shutdown_error
+                .to_string()
+                .contains("process worker invocation failed"),
+            "{shutdown_error}"
+        );
+        drop(portal);
+        drop(first);
+
+        let replacement = LocalPythonWorker::start(worker_config()).await.unwrap();
+        let restored = replayable_python_database(directory.path(), &source, &replacement).await;
+        assert_eq!(source.starts.lock().as_slice(), &[0, 1]);
+        let mut restored_portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        assert_eq!(next_python_total(&mut restored_portal).await, 110);
+        let checkpoint = restored.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{checkpoint:?}");
         restored.shutdown().await.unwrap();
         replacement.shutdown().await.unwrap();
     }

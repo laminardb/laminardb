@@ -231,7 +231,7 @@ pub(crate) enum ProcessHandler {
 pub struct ProcessFunctionInfo {
     /// Output stream name.
     pub output_name: String,
-    /// Direct input source name.
+    /// Input source name.
     pub source_name: String,
     /// Validated immutable descriptor.
     pub descriptor: ProcessFunctionDescriptor,

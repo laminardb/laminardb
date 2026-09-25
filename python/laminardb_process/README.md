@@ -60,7 +60,12 @@ cargo test -p laminar-db --no-default-features --features process-remote --lib p
 
 The local Rust API can register a connected loopback Rust or Python worker into
 an embedded best-effort pipeline. The example uses the Python supervisor and a
-running database.
+running database. Embedded registration also accepts an append-only connector
+source. When that connector can resume from a committed cursor, a fresh database
+and worker can replay input that was pending at worker exit. The focused
+`replayable_source_replays_pending_input_after_python_worker_exit` test exercises
+this with a deterministic local connector. The admission level remains
+`best_effort`; this test does not certify a production connector or sink.
 
 ## Single-node server
 
