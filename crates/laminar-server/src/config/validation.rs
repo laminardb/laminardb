@@ -108,6 +108,7 @@ pub(super) fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> 
     let mut errors = Vec::new();
 
     collect_connector_graph_errors(config, &mut errors);
+    collect_process_function_errors(config, &mut errors);
     collect_http_auth_errors(config, &mut errors);
     collect_pgwire_errors(config, &mut errors);
     collect_cors_errors(config, &mut errors);
@@ -120,6 +121,62 @@ pub(super) fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> 
         Ok(())
     } else {
         Err(ConfigError::ValidationErrors { errors })
+    }
+}
+
+pub(crate) fn validate_process_functions(config: &ServerConfig) -> Result<(), ConfigError> {
+    let mut errors = Vec::new();
+    collect_process_function_errors(config, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationErrors { errors })
+    }
+}
+
+fn collect_process_function_errors(config: &ServerConfig, errors: &mut Vec<String>) {
+    if config.process_functions.is_empty() {
+        return;
+    }
+    if config.process_functions.len() > 32 {
+        errors.push("at most 32 process functions may be configured per server".to_string());
+    }
+    if config.server.mode != ServerMode::Single {
+        errors.push("process functions require single-node server mode".to_string());
+    }
+    if config.server.delivery != DeliveryGuarantee::BestEffort {
+        errors.push("process functions currently require best_effort delivery".to_string());
+    }
+    if !cfg!(feature = "process-remote") {
+        errors.push("process functions require the server process-remote feature".to_string());
+    }
+    let mut outputs = HashSet::new();
+    let mut sources = HashSet::new();
+    for entry in &config.process_functions {
+        if !outputs.insert(&entry.output) {
+            errors.push(format!("duplicate process output: '{}'", entry.output));
+        }
+        if !sources.insert(&entry.source) {
+            errors.push(format!("duplicate process source: '{}'", entry.source));
+        }
+        if entry.source_sql.trim().is_empty() {
+            errors.push(format!(
+                "process output '{}': source_sql is empty",
+                entry.output
+            ));
+        }
+        if entry.max_in_flight == 0 || entry.max_in_flight > 32 {
+            errors.push(format!(
+                "process output '{}': max_in_flight must be 1..=32",
+                entry.output
+            ));
+        }
+        if entry.timeout < Duration::from_millis(1) || entry.timeout > Duration::from_secs(30) {
+            errors.push(format!(
+                "process output '{}': timeout must be 1ms..=30s",
+                entry.output
+            ));
+        }
     }
 }
 

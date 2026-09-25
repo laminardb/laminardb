@@ -239,7 +239,7 @@ fn validate_insert_literal(
     expr: &sqlparser::ast::Expr,
     field: &arrow::datatypes::Field,
 ) -> Result<(), DbError> {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
 
     if is_null_literal(expr) {
         return if field.is_nullable() {
@@ -261,6 +261,7 @@ fn validate_insert_literal(
             expr_to_f64(Some(expr)).is_some_and(f64::is_finite)
         }
         DataType::Utf8 => expr_to_string(Some(expr)).is_some(),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => expr_to_i64(Some(expr)).is_some(),
         unsupported => {
             return Err(DbError::InsertError(format!(
                 "INSERT VALUES does not support {unsupported} column '{}'",
@@ -293,9 +294,9 @@ pub fn sql_values_to_record_batch(
 ) -> Result<arrow::array::RecordBatch, DbError> {
     use arrow::array::{
         Array, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
-        Int8Array, RecordBatch, StringArray,
+        Int8Array, RecordBatch, StringArray, TimestampMicrosecondArray,
     };
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
 
     for (row_index, row) in values.iter().enumerate() {
         if row.len() != schema.fields().len() {
@@ -379,6 +380,15 @@ pub fn sql_values_to_record_batch(
                     .map(|row| expr_to_string(row.get(col_idx)))
                     .collect();
                 let arr: StringArray = strs.iter().map(|s| s.as_deref()).collect();
+                columns.push(std::sync::Arc::new(arr));
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                let arr = TimestampMicrosecondArray::from(
+                    values
+                        .iter()
+                        .map(|row| expr_to_i64(row.get(col_idx)))
+                        .collect::<Vec<_>>(),
+                );
                 columns.push(std::sync::Arc::new(arr));
             }
             unsupported => unreachable!("validated unsupported INSERT type {unsupported}"),
@@ -553,6 +563,41 @@ mod tests {
         )]));
         let error = sql_values_to_record_batch(&schema, &[vec![value]]).unwrap_err();
         assert!(matches!(error, DbError::InsertError(_)));
+    }
+
+    #[test]
+    fn insert_microsecond_timestamp_uses_signed_epoch_literal() {
+        use arrow::array::{Array, TimestampMicrosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let lit = |sql: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let batch = sql_values_to_record_batch(
+            &schema,
+            &[vec![lit("100000")], vec![lit("-1")], vec![lit("NULL")]],
+        )
+        .unwrap();
+        let times = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(times.value(0), 100_000);
+        assert_eq!(times.value(1), -1);
+        assert!(times.is_null(2));
+        assert!(sql_values_to_record_batch(&schema, &[vec![lit("'100000'")]]).is_err());
     }
 
     #[test]

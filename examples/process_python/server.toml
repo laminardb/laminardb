@@ -1,0 +1,22 @@
+[server]
+bind = "127.0.0.1:8080"
+delivery = "best_effort"
+
+[[process_function]]
+source = "events"
+output = "activity"
+source_sql = """
+CREATE SOURCE events (
+    key VARCHAR NOT NULL,
+    amount BIGINT NOT NULL,
+    ts TIMESTAMP NOT NULL,
+    WATERMARK FOR ts AS ts - INTERVAL '0' SECOND
+)
+"""
+manifest = "manifest.json"
+handler_file = "handler.py"
+function = "handle"
+python = "${LAMINAR_PROCESS_PYTHON:-python}"
+python_paths = ["../../python/laminardb_process"]
+max_in_flight = 2
+timeout = "15s"

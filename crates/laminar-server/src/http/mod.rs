@@ -14,6 +14,7 @@ mod cluster_admin;
 mod cluster_evidence;
 mod json_encoding;
 mod ops;
+mod process_functions;
 mod router;
 mod state;
 mod ws;

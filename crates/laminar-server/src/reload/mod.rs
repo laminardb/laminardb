@@ -136,6 +136,10 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("[supervision] section changed — requires restart".to_string());
     }
+    if old.process_functions != new.process_functions {
+        diff.warnings
+            .push("[[process_function]] sections changed — requires restart".to_string());
+    }
     if old.node_id != new.node_id {
         diff.warnings
             .push("node_id changed — requires restart".to_string());

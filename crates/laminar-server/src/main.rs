@@ -11,6 +11,8 @@ mod config;
 mod http;
 mod metrics;
 mod pgwire;
+#[cfg(feature = "process-remote")]
+mod process_functions;
 mod reload;
 mod server;
 mod watcher;

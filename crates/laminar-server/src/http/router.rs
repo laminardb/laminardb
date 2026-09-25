@@ -33,6 +33,7 @@ use super::cluster_admin::{
 use super::cluster_evidence::{cluster_local_checkpoint_barrier_timings, cluster_local_evidence};
 use super::error_response;
 use super::ops::{handle_reload, health_check, prometheus_metrics, readiness_check};
+use super::process_functions::list_process_functions;
 use super::state::AppState;
 use super::ws::ws_upgrade;
 
@@ -53,6 +54,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
+        .route("/api/v1/process-functions", get(list_process_functions))
         .route("/api/v1/streams/{name}", get(get_stream))
         .route("/api/v1/mvs", get(list_mvs))
         .route("/api/v1/connectors", get(list_connectors))

@@ -45,6 +45,12 @@ CDC) may use a different precision (nanosecond for OTel's
 `_laminar_received_at`, millisecond for CDC's `_ts_ms`); all precisions
 compose correctly with `INTERVAL` arithmetic and window functions.
 
+For a direct source, `INSERT INTO ... VALUES` accepts a signed integer Unix
+epoch microsecond literal for a `TIMESTAMP` column. For example,
+`INSERT INTO events VALUES ('a', 60, 100000)` inserts an event at 0.1 seconds
+after the epoch. String timestamp literals are not accepted by this insertion
+path.
+
 **Rust side:**
 ```rust
 #[derive(Record)]

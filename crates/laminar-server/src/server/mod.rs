@@ -23,6 +23,8 @@ use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 
+mod single_database;
+
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub struct ServerHandle {
     runtime: ServerRuntime,
@@ -36,6 +38,8 @@ enum ServerRuntime {
 
 struct SingleServerRuntime {
     db: Arc<LaminarDB>,
+    #[cfg(feature = "process-remote")]
+    process_workers: Vec<laminar_db::process_function::remote::LocalPythonWorker>,
     db_shutdown_complete: bool,
     serving_gate: Arc<http::ServingGate>,
     api_handle: tokio::task::JoinHandle<()>,
@@ -98,11 +102,22 @@ impl SingleServerRuntime {
 
         let shutdown_result = self.db.shutdown().await;
         self.db_shutdown_complete = shutdown_result.is_ok();
-        shutdown_result.map_err(|error| ServerError::Shutdown(error.to_string()))?;
+        #[cfg(feature = "process-remote")]
+        let worker_shutdown =
+            crate::process_functions::shutdown(std::mem::take(&mut self.process_workers)).await;
+        let mut shutdown_errors = Vec::new();
+        if let Err(error) = shutdown_result {
+            shutdown_errors.push(format!("database: {error}"));
+        }
+        #[cfg(feature = "process-remote")]
+        if let Err(error) = worker_shutdown {
+            shutdown_errors.push(format!("process workers: {error}"));
+        }
         if !(watcher_stopped && pgwire_stopped && api_stopped) {
-            return Err(ServerError::Shutdown(
-                "one or more server tasks did not terminate cleanly".into(),
-            ));
+            shutdown_errors.push("one or more server tasks did not terminate cleanly".into());
+        }
+        if !shutdown_errors.is_empty() {
+            return Err(ServerError::Shutdown(shutdown_errors.join("; ")));
         }
 
         info!("Shutdown complete");
@@ -177,6 +192,8 @@ fn validate_server_startup(config: &ServerConfig) -> Result<(), ServerError> {
     // TOML validator entirely.
     crate::config::validate_http_auth(config)
         .map_err(|error| ServerError::Build(format!("HTTP authentication: {error}")))?;
+    crate::config::validate_process_functions(config)
+        .map_err(|error| ServerError::Build(format!("process functions: {error}")))?;
     config
         .server
         .validate_memory_limits()
@@ -196,6 +213,31 @@ fn validate_server_startup(config: &ServerConfig) -> Result<(), ServerError> {
     resolved_checkpoint_node_data_bytes(&config.checkpoint)
         .map_err(|error| ServerError::Build(format!("checkpoint.max_node_data_bytes: {error}")))?;
     Ok(())
+}
+
+async fn cleanup_failed_single_start(
+    db: &LaminarDB,
+    #[cfg(feature = "process-remote")] workers: Vec<
+        laminar_db::process_function::remote::LocalPythonWorker,
+    >,
+    primary: ServerError,
+) -> ServerError {
+    let mut cleanup = Vec::new();
+    if let Err(error) = db.shutdown().await {
+        cleanup.push(format!("database: {error}"));
+    }
+    #[cfg(feature = "process-remote")]
+    if let Err(error) = crate::process_functions::shutdown(workers).await {
+        cleanup.push(format!("process workers: {error}"));
+    }
+    if cleanup.is_empty() {
+        primary
+    } else {
+        ServerError::Start(format!(
+            "{primary}; startup cleanup: {}",
+            cleanup.join("; ")
+        ))
+    }
 }
 
 /// Build and start a LaminarDB server from the given configuration.
@@ -228,42 +270,7 @@ pub async fn run_server(
         ));
     }
 
-    // Build LaminarDB via builder API
-    let mut builder = LaminarDB::builder();
-    builder = builder.delivery_guarantee(config.server.delivery);
-    if let Some(ref token) = config.server.console_token {
-        builder = builder.http_auth_token(token.expose());
-    }
-    builder = builder.restart_policy(config.supervision.to_policy());
-    builder = builder.incremental_emit(config.server.incremental_emit);
-    builder = config.server.apply_memory_limits(builder);
-    if let Some(retention) = config.server.temporal_join_idle_history_retention {
-        builder = builder.temporal_join_idle_history_retention(retention);
-    }
-    if let Some(timeout) = config.server.source_idle_timeout {
-        builder = builder.source_idle_timeout(timeout);
-    }
-    builder = builder.event_time_max_future_skew(config.server.event_time_max_future_skew);
-    builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
-        .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
-
-    let key_groups = config.server.resolved_key_groups();
-    let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
-        u32::from(key_groups),
-        laminar_core::state::LOCAL_NODE_ID,
-    ));
-    builder = builder.vnode_registry(vnode_registry);
-
-    // Build the AI subsystem from `[ai]`/`[models]` and install it. Without
-    // configured models this is a no-op and `ai_*` functions fail at plan time.
-    if let Some(ai_runtime) = crate::ai::build_ai_runtime(&config)? {
-        builder = builder.ai(ai_runtime);
-    }
-
-    let db = builder
-        .build()
-        .await
-        .map_err(|e| ServerError::Build(e.to_string()))?;
+    let db = single_database::build(&config).await?;
     // Auto-recover from a fatal cycle fault by restarting from the last checkpoint.
     db.enable_supervision();
 
@@ -283,11 +290,32 @@ pub async fn run_server(
     db.set_prometheus_registry(Arc::clone(&registry))
         .map_err(|error| ServerError::Start(error.to_string()))?;
 
-    execute_config_ddl(&db, &config, false).await?;
+    #[cfg(feature = "process-remote")]
+    let process_workers = match crate::process_functions::install(&db, &config, &config_path).await
+    {
+        Ok(workers) => workers,
+        Err(error) => return Err(cleanup_failed_single_start(&db, Vec::new(), error).await),
+    };
 
-    db.start()
-        .await
-        .map_err(|e| ServerError::Start(e.to_string()))?;
+    if let Err(error) = execute_config_ddl(&db, &config, false).await {
+        return Err(cleanup_failed_single_start(
+            &db,
+            #[cfg(feature = "process-remote")]
+            process_workers,
+            error,
+        )
+        .await);
+    }
+
+    if let Err(error) = db.start().await {
+        return Err(cleanup_failed_single_start(
+            &db,
+            #[cfg(feature = "process-remote")]
+            process_workers,
+            ServerError::Start(error.to_string()),
+        )
+        .await);
+    }
     info!("Pipeline started");
 
     let pgwire_bind = config.server.pgwire_bind.clone();
@@ -314,8 +342,13 @@ pub async fn run_server(
     let (app_state, mut api_handle) = match http_runtime {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = db.shutdown().await;
-            return Err(error);
+            return Err(cleanup_failed_single_start(
+                &db,
+                #[cfg(feature = "process-remote")]
+                process_workers,
+                error,
+            )
+            .await);
         }
     };
     let mut watcher_handle = spawn_config_watcher(&app_state, config_path);
@@ -353,8 +386,13 @@ pub async fn run_server(
                     },
                     abort_and_join_server_task(&mut api_handle, "HTTP API server"),
                 );
-                let _ = db.shutdown().await;
-                return Err(e);
+                return Err(cleanup_failed_single_start(
+                    &db,
+                    #[cfg(feature = "process-remote")]
+                    process_workers,
+                    e,
+                )
+                .await);
             }
         }
     } else {
@@ -364,6 +402,8 @@ pub async fn run_server(
     Ok(ServerHandle {
         runtime: ServerRuntime::Single(SingleServerRuntime {
             db,
+            #[cfg(feature = "process-remote")]
+            process_workers,
             db_shutdown_complete: false,
             serving_gate: Arc::clone(&app_state.serving_gate),
             api_handle,

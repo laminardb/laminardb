@@ -146,6 +146,7 @@ mod tests {
             lookups: vec![],
             pipelines: vec![],
             sinks: vec![],
+            process_functions: vec![],
             discovery: None,
             node_id: None,
             sql: None,

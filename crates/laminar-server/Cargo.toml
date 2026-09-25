@@ -152,6 +152,7 @@ serde_json = { workspace = true }
 [features]
 # Cross-platform defaults.
 default = [
+    "process-remote",
     "jemalloc",
     "mimalloc",
     "kafka",
@@ -170,6 +171,7 @@ default = [
     "gcs",
     "azure",
 ]
+process-remote = ["laminar-db/process-remote"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Connector features (forwarded to laminar-db → laminar-connectors)

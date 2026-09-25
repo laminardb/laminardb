@@ -1410,6 +1410,7 @@ fn test_default_values_applied() {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         discovery: None,
         node_id: None,
         sql: None,
@@ -1823,4 +1824,51 @@ async fn materialized_view_memory_limits_reach_server_database() {
         .await
         .expect_err("shutdown must report the pipeline fault");
     assert!(error.to_string().contains("quota exceeded"));
+}
+
+#[test]
+fn process_function_config_is_local_and_bounded() {
+    let mut config: ServerConfig = toml::from_str(
+        r#"
+[server]
+delivery = "best_effort"
+
+[[process_function]]
+source = "events"
+output = "activity"
+source_sql = "CREATE SOURCE events (key VARCHAR NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)"
+manifest = "manifest.json"
+handler_file = "handler.py"
+function = "handle"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.process_functions[0].max_in_flight, 2);
+    assert_eq!(config.process_functions[0].timeout, Duration::from_secs(15));
+    if cfg!(feature = "process-remote") {
+        assert!(validate_process_functions(&config).is_ok());
+    } else {
+        assert!(validate_process_functions(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("process-remote"));
+    }
+
+    config.server.mode = ServerMode::Cluster;
+    assert!(validate_process_functions(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("single-node"));
+    config.server.mode = ServerMode::Single;
+    config.server.delivery = DeliveryGuarantee::AtLeastOnce;
+    assert!(validate_process_functions(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("best_effort"));
+    config.server.delivery = DeliveryGuarantee::BestEffort;
+    config.process_functions[0].max_in_flight = 33;
+    assert!(validate_process_functions(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("max_in_flight"));
 }

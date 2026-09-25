@@ -1044,6 +1044,7 @@ async fn occupied_http_port_fails_before_local_cluster_activation() {
         lookups: Vec::new(),
         pipelines: Vec::new(),
         sinks: Vec::new(),
+        process_functions: Vec::new(),
         sql: None,
         discovery: None,
         node_id: None,

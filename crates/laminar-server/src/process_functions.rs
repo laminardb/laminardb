@@ -1,0 +1,244 @@
+//! Offline Python process-function bindings for the single-node server.
+
+use std::path::{Path, PathBuf};
+
+use laminar_db::process_function::remote::{LocalPythonWorker, LocalPythonWorkerConfig};
+use laminar_db::{ExecuteResult, LaminarDB};
+
+use crate::config::{ProcessFunctionConfig, ServerConfig};
+use crate::server::ServerError;
+
+pub(crate) async fn install(
+    db: &LaminarDB,
+    config: &ServerConfig,
+    config_path: &Path,
+) -> Result<Vec<LocalPythonWorker>, ServerError> {
+    if config.process_functions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config_dir = config_path
+        .canonicalize()
+        .map_err(|error| ServerError::Build(format!("resolve process config file: {error}")))?
+        .parent()
+        .ok_or_else(|| ServerError::Build("process config file has no parent".into()))?
+        .to_path_buf();
+    let mut workers = Vec::with_capacity(config.process_functions.len());
+    for entry in &config.process_functions {
+        match install_one(db, entry, &config_dir).await {
+            Ok(worker) => workers.push(worker),
+            Err(primary) => {
+                return match shutdown(workers).await {
+                    Ok(()) => Err(primary),
+                    Err(cleanup) => Err(ServerError::Build(format!(
+                        "{primary}; process worker cleanup: {cleanup}"
+                    ))),
+                };
+            }
+        }
+    }
+    Ok(workers)
+}
+
+async fn install_one(
+    db: &LaminarDB,
+    entry: &ProcessFunctionConfig,
+    config_dir: &Path,
+) -> Result<LocalPythonWorker, ServerError> {
+    // One statement prevents a config binding from running unrelated DDL before validation.
+    let source_sql = entry.source_sql.trim().trim_end_matches(';').trim();
+    if source_sql.contains(';') {
+        return Err(ServerError::Build(format!(
+            "process output '{}': source_sql must contain one CREATE SOURCE statement",
+            entry.output
+        )));
+    }
+    let source = db
+        .execute(source_sql)
+        .await
+        .map_err(|source| ServerError::Ddl {
+            section: "process source".into(),
+            name: entry.source.clone(),
+            source: Box::new(source),
+        })?;
+    match source {
+        ExecuteResult::Ddl(info)
+            if info.statement_type == "CREATE SOURCE" && info.object_name == entry.source => {}
+        _ => {
+            return Err(ServerError::Build(format!(
+                "process output '{}': source_sql must create source '{}'",
+                entry.output, entry.source
+            )));
+        }
+    }
+
+    let python = if entry.python.components().count() == 1 {
+        entry.python.clone()
+    } else {
+        resolve(config_dir, &entry.python)
+    };
+    let worker = LocalPythonWorker::start(LocalPythonWorkerConfig {
+        python,
+        manifest: resolve(config_dir, &entry.manifest),
+        handler_file: resolve(config_dir, &entry.handler_file),
+        function: entry.function.clone(),
+        python_paths: entry
+            .python_paths
+            .iter()
+            .map(|path| resolve(config_dir, path))
+            .collect(),
+        max_in_flight: entry.max_in_flight,
+        timeout: entry.timeout,
+    })
+    .await
+    .map_err(|error| ServerError::Build(format!("process output '{}': {error}", entry.output)))?;
+    let descriptor = worker.client().descriptor().clone();
+    let registration = db
+        .register_remote_process_function(&entry.output, &entry.source, descriptor, worker.client())
+        .await;
+    if let Err(primary) = registration {
+        let cleanup = worker.shutdown().await;
+        return match cleanup {
+            Ok(()) => Err(ServerError::Build(format!(
+                "process output '{}': {primary}",
+                entry.output
+            ))),
+            Err(cleanup) => Err(ServerError::Build(format!(
+                "process output '{}': {primary}; worker cleanup: {cleanup}",
+                entry.output
+            ))),
+        };
+    }
+    Ok(worker)
+}
+
+fn resolve(config_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    }
+}
+
+pub(crate) async fn shutdown(workers: Vec<LocalPythonWorker>) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for worker in workers {
+        if let Err(error) = worker.shutdown().await {
+            errors.push(error.to_string());
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use arrow_array::{Array, Int64Array};
+    use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
+    use laminar_db::subscription::{PortalFrame, SubscribeStart};
+    use laminar_db::DeliveryGuarantee;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn configured_python_function_accepts_sql_input() {
+        let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config_path = repository.join("examples/process_python/server.toml");
+        let mut config = crate::config::load_config(&config_path).unwrap();
+        config.process_functions[0].python = python.into();
+        if let Some(dependencies) = std::env::var_os("LAMINAR_PROCESS_PYTHON_DEPS") {
+            let path = PathBuf::from(dependencies);
+            config.process_functions[0]
+                .python_paths
+                .push(if path.is_absolute() {
+                    path
+                } else {
+                    repository.join(path)
+                });
+        }
+        let storage = tempfile::tempdir().unwrap();
+        for (amount, event_time, expected) in [(60, 100_000, 60), (50, 100_050, 110)] {
+            let db = LaminarDB::builder()
+                .storage_dir(storage.path())
+                .checkpoint(StreamCheckpointConfig::default())
+                .delivery_guarantee(DeliveryGuarantee::BestEffort)
+                .build()
+                .await
+                .unwrap();
+            let workers = install(&db, &config, &config_path).await.unwrap();
+            assert_eq!(db.process_functions().len(), 1);
+            db.start().await.unwrap();
+            let mut portal = db
+                .open_subscription("activity", None, SubscribeStart::Tail)
+                .await
+                .unwrap();
+            db.execute(&format!(
+                "INSERT INTO events VALUES ('a', {amount}, {event_time})"
+            ))
+            .await
+            .unwrap();
+            let total = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match portal.next_frame().await {
+                        Some(PortalFrame::Batch { batch, .. }) => {
+                            let values = batch.column(1).as_any().downcast_ref::<Int64Array>()?;
+                            if !values.is_empty() {
+                                return Some(values.value(0));
+                            }
+                        }
+                        Some(PortalFrame::Barrier { .. }) => {}
+                        Some(PortalFrame::Error { .. }) | Some(PortalFrame::Lagged(_)) | None => {
+                            return None;
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(total, Some(expected));
+            db.checkpoint().await.unwrap();
+            db.shutdown().await.unwrap();
+            shutdown(workers).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn process_source_sql_must_create_the_bound_source() {
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/process_python/server.toml")).unwrap();
+        config.process_functions[0].source = "other".into();
+        let db = LaminarDB::builder()
+            .delivery_guarantee(DeliveryGuarantee::BestEffort)
+            .build()
+            .await
+            .unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/process_python/server.toml");
+        let error = install(&db, &config, &path).await.err().unwrap();
+        assert!(error.to_string().contains("must create source 'other'"));
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_source_sql_rejects_multiple_statements_before_ddl() {
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../../../examples/process_python/server.toml")).unwrap();
+        config.process_functions[0]
+            .source_sql
+            .push_str("; CREATE SOURCE extra (id BIGINT)");
+        let db = LaminarDB::open().unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/process_python/server.toml");
+        let error = install(&db, &config, &path).await.err().unwrap();
+        assert!(error.to_string().contains("one CREATE SOURCE statement"));
+        assert!(db.sources().is_empty());
+        db.shutdown().await.unwrap();
+    }
+}

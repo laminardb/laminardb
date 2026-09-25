@@ -222,6 +222,7 @@ async fn cancelling_http_start_does_not_detach_the_listener() {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         sql: None,
         discovery: None,
         node_id: None,
@@ -288,6 +289,8 @@ async fn dropping_single_server_handle_fences_and_aborts_owned_tasks() {
     let handle = ServerHandle {
         runtime: ServerRuntime::Single(SingleServerRuntime {
             db: Arc::clone(&db),
+            #[cfg(feature = "process-remote")]
+            process_workers: vec![],
             db_shutdown_complete: false,
             serving_gate: Arc::clone(&serving_gate),
             api_handle,
@@ -463,6 +466,7 @@ async fn execute_config_ddl_columnless_otel_with_watermark_succeeds() {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         sql: None,
         discovery: None,
         node_id: None,
@@ -499,6 +503,7 @@ async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         sql: None,
         discovery: None,
         node_id: None,
@@ -533,6 +538,7 @@ async fn cluster_config_rejects_expanded_connector_secret_before_manifest_write(
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         sql: None,
         discovery: None,
         node_id: None,
@@ -560,6 +566,7 @@ async fn empty_cluster_config_still_seals_an_empty_inventory() {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         sql: None,
         discovery: None,
         node_id: None,

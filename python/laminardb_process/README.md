@@ -60,7 +60,60 @@ cargo test -p laminar-db --no-default-features --features process-remote --lib p
 
 The local Rust API can register a connected loopback Rust or Python worker into
 an embedded best-effort pipeline. The example uses the Python supervisor and a
-running database. Single-node server and cluster registration are still closed.
+running database.
+
+## Single-node server
+
+The server can register the same Python package at startup from
+[`examples/process_python/server.toml`](../../examples/process_python/server.toml).
+Install the locked Python requirements above, then run from the repository root:
+
+```bash
+cargo run -p laminar-server --no-default-features --features process-remote --bin laminardb -- --config examples/process_python/server.toml
+```
+
+The config creates a direct `events` source, verifies the immutable manifest and
+handler file, starts the loopback worker, and registers the `activity` output
+before other pipeline DDL. Paths in `[[process_function]]` are relative to the
+config file. In a second terminal, inspect the binding and insert one event:
+
+```bash
+curl http://127.0.0.1:8080/api/v1/process-functions
+curl -X POST http://127.0.0.1:8080/api/v1/sql \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{"sql":"INSERT INTO events VALUES ('a', 60, 100000)"}
+JSON
+```
+
+On PowerShell, use `Invoke-RestMethod` with the same endpoints:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/api/v1/process-functions
+Invoke-RestMethod http://127.0.0.1:8080/api/v1/sql -Method Post `
+  -ContentType 'application/json' `
+  -Body '{"sql":"INSERT INTO events VALUES (''a'', 60, 100000)"}'
+```
+
+The integer timestamp is signed microseconds since the Unix epoch. Subscribe
+to `ws://127.0.0.1:8080/ws/activity` before inserting to observe the result;
+for example, a browser console can use:
+
+```javascript
+const ws = new WebSocket("ws://127.0.0.1:8080/ws/activity");
+ws.onmessage = event => console.log(event.data);
+```
+
+Use a dedicated local `[checkpoint].url` for a restartable deployment. On
+restart, the same config and immutable artifacts must be present so the
+checkpoint binding can be verified. A committed state/timer checkpoint can be
+restored by a new server and worker; the direct source cannot replay input
+that was not committed. This route admits only single-node `best_effort`
+execution. Worker loss during a call faults the pipeline; an idle worker loss
+is observed when the next call fails. There is no in-place worker replacement.
+Cluster mode remains rejected. The HTTP control API uses the
+existing console bearer token policy; configure `server.console_token` before
+binding it beyond loopback.
 
 The v1 manifest fixes schema, key, timer names, resource limits, runtime and an
 implementation digest. The worker checks the canonical manifest digest on every

@@ -10,6 +10,7 @@ fn empty_config() -> ServerConfig {
         lookups: vec![],
         pipelines: vec![],
         sinks: vec![],
+        process_functions: vec![],
         discovery: None,
         node_id: None,
         sql: None,
@@ -433,4 +434,28 @@ async fn test_apply_warnings_passed_through() {
     assert!(result.success);
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("[server]"));
+}
+
+#[test]
+fn process_function_binding_changes_require_restart() {
+    let old = empty_config();
+    let mut changed = old.clone();
+    changed.process_functions = toml::from_str::<ServerConfig>(
+        r#"
+[[process_function]]
+source = "events"
+output = "activity"
+source_sql = "CREATE SOURCE events (id BIGINT)"
+manifest = "manifest.json"
+handler_file = "handler.py"
+function = "handle"
+"#,
+    )
+    .unwrap()
+    .process_functions;
+    let diff = diff_configs(&old, &changed);
+    assert!(diff.is_empty());
+    assert!(diff.warnings.iter().any(|warning| {
+        warning.contains("[[process_function]]") && warning.contains("requires restart")
+    }));
 }
