@@ -319,6 +319,113 @@ async fn dropping_single_server_handle_fences_and_aborts_owned_tasks() {
     db.shutdown().await.unwrap();
 }
 
+#[cfg(feature = "process-remote")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn python_worker_exit_stops_the_server_when_idle_or_in_flight() {
+    use sha2::{Digest, Sha256};
+
+    let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+        return;
+    };
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let config_path = repository.join("examples/process_python/server.toml");
+    for in_flight in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let exit_marker = directory.path().join("exit-worker");
+        let started_marker = directory.path().join("call-started");
+        let exit_literal = serde_json::to_string(&exit_marker.to_string_lossy()).unwrap();
+        let started_literal = serde_json::to_string(&started_marker.to_string_lossy()).unwrap();
+        let invocation = if in_flight {
+            format!(
+                "def handle(activations):\n    open({started_literal}, 'wb').close()\n    exit_on_signal()\n"
+            )
+        } else {
+            "threading.Thread(target=exit_on_signal, daemon=True).start()\ndef handle(activations):\n    return ()\n"
+                .to_string()
+        };
+        let handler = format!(
+            r#"import os
+import threading
+import time
+
+def exit_on_signal():
+    while not os.path.exists({exit_literal}):
+        time.sleep(0.01)
+    os._exit(47)
+
+{invocation}"#
+        );
+        let handler_path = directory.path().join("crash_handler.py");
+        std::fs::write(&handler_path, &handler).unwrap();
+        let mut descriptor =
+            laminar_db::process_function::ProcessFunctionDescriptor::from_manifest_json(
+                &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
+            )
+            .unwrap();
+        descriptor.implementation_digest = format!("{:x}", Sha256::digest(handler.as_bytes()));
+        let manifest_path = directory.path().join("manifest.json");
+        std::fs::write(&manifest_path, descriptor.to_manifest_json().unwrap()).unwrap();
+
+        let mut config = crate::config::load_config(&config_path).unwrap();
+        config.server.bind = "127.0.0.1:0".into();
+        config.process_functions[0].python = python.clone().into();
+        config.process_functions[0].handler_file = handler_path;
+        config.process_functions[0].manifest = manifest_path;
+        if let Some(dependencies) = std::env::var_os("LAMINAR_PROCESS_PYTHON_DEPS") {
+            config.process_functions[0]
+                .python_paths
+                .push(PathBuf::from(dependencies));
+        }
+        let checkpoint_path = directory.path().join("checkpoints");
+        let checkpoint_path = checkpoint_path.to_string_lossy().replace('\\', "/");
+        config.checkpoint.url = if checkpoint_path.starts_with('/') {
+            format!("file://{checkpoint_path}")
+        } else {
+            format!("file:///{checkpoint_path}")
+        };
+
+        let handle = run_server(config, config_path.clone()).await.unwrap();
+        let runtime = match &handle.runtime {
+            ServerRuntime::Single(runtime) => runtime,
+            #[cfg(feature = "cluster")]
+            ServerRuntime::Cluster(_) => {
+                panic!("process function test requires single-node server")
+            }
+        };
+        assert!(runtime.process_workers[0].is_alive());
+        let gate = Arc::clone(&runtime.serving_gate);
+        let db = Arc::clone(&runtime.db);
+        if in_flight {
+            db.execute("INSERT INTO events VALUES ('a', 7, 100000)")
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !started_marker.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("Python handler did not start its in-flight call");
+        }
+        let shutdown = tokio::spawn(handle.wait_for_shutdown());
+        std::fs::write(&exit_marker, []).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), shutdown)
+            .await
+            .expect("server did not stop after Python worker exit")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("process worker 0 exited"),
+            "{error}"
+        );
+        assert!(db.is_closed());
+        assert_eq!(
+            gate.rejection_message(),
+            Some("server serving authority is fenced")
+        );
+    }
+}
+
 fn make_source(name: &str, connector: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_string(),

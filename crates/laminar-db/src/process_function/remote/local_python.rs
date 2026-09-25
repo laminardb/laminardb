@@ -37,6 +37,7 @@ pub struct LocalPythonWorkerConfig {
 pub struct LocalPythonWorker {
     client: Arc<RemoteProcessClient>,
     cancel: CancellationToken,
+    exited: CancellationToken,
     alive: Arc<AtomicBool>,
     supervisor: Option<tokio::task::JoinHandle<Result<(), DbError>>>,
     #[cfg(test)]
@@ -185,13 +186,20 @@ impl LocalPythonWorker {
             }
         };
         let cancel = CancellationToken::new();
+        let exited = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         #[cfg(test)]
         let process_id = child.id().unwrap_or(0);
-        let supervisor = tokio::spawn(supervise(child, cancel.clone(), Arc::clone(&alive)));
+        let supervisor = tokio::spawn(supervise(
+            child,
+            cancel.clone(),
+            exited.clone(),
+            Arc::clone(&alive),
+        ));
         Ok(Self {
             client,
             cancel,
+            exited,
             alive,
             supervisor: Some(supervisor),
             #[cfg(test)]
@@ -214,6 +222,12 @@ impl LocalPythonWorker {
     #[cfg(test)]
     pub(crate) const fn process_id(&self) -> u32 {
         self.process_id
+    }
+
+    /// Wait until the supervisor has observed and reaped the worker process.
+    /// A caller that still owns the worker should treat this as a terminal event.
+    pub async fn wait_for_exit(&self) {
+        self.exited.cancelled().await;
     }
 
     /// Stop the worker and wait for process exit after the database pipeline has stopped.
@@ -293,6 +307,7 @@ async fn stop_after_start_error(child: &mut Child, primary: DbError) -> DbError 
 async fn supervise(
     mut child: Child,
     cancel: CancellationToken,
+    exited: CancellationToken,
     alive: Arc<AtomicBool>,
 ) -> Result<(), DbError> {
     let outcome = tokio::select! {
@@ -312,5 +327,6 @@ async fn supervise(
         }
     };
     alive.store(false, Ordering::Release);
+    exited.cancel();
     outcome
 }

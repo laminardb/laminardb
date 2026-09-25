@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::signal;
-use tracing::{info, warn};
+use tracing::info;
 
 use laminar_core::storage_location::StorageProvider;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
@@ -24,6 +24,9 @@ use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 
 mod single_database;
+mod single_lifecycle;
+
+use single_lifecycle::abort_and_join_server_task;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub struct ServerHandle {
@@ -45,108 +48,6 @@ struct SingleServerRuntime {
     api_handle: tokio::task::JoinHandle<()>,
     pgwire_handle: Option<tokio::task::JoinHandle<()>>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-const SERVER_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-async fn abort_and_join_server_task<T>(
-    task: &mut tokio::task::JoinHandle<T>,
-    task_name: &'static str,
-) -> bool {
-    task.abort();
-    match tokio::time::timeout(SERVER_TASK_SHUTDOWN_TIMEOUT, task).await {
-        Ok(Ok(_)) => true,
-        Ok(Err(error)) if error.is_cancelled() => true,
-        Ok(Err(error)) => {
-            warn!(task = task_name, %error, "Server task failed during shutdown");
-            false
-        }
-        Err(_) => {
-            warn!(
-                task = task_name,
-                timeout = ?SERVER_TASK_SHUTDOWN_TIMEOUT,
-                "Server task did not stop within the shutdown bound"
-            );
-            false
-        }
-    }
-}
-
-impl SingleServerRuntime {
-    async fn wait_for_shutdown(&mut self) -> Result<(), ServerError> {
-        wait_for_termination_signal().await?;
-
-        info!("Received shutdown signal, shutting down...");
-        self.serving_gate.fence();
-
-        let watcher_handle = &mut self.watcher_handle;
-        let pgwire_handle = &mut self.pgwire_handle;
-        let api_handle = &mut self.api_handle;
-        let (watcher_stopped, pgwire_stopped, api_stopped) = tokio::join!(
-            async {
-                if let Some(handle) = watcher_handle.as_mut() {
-                    abort_and_join_server_task(handle, "configuration watcher").await
-                } else {
-                    true
-                }
-            },
-            async {
-                if let Some(handle) = pgwire_handle.as_mut() {
-                    abort_and_join_server_task(handle, "PostgreSQL wire server").await
-                } else {
-                    true
-                }
-            },
-            abort_and_join_server_task(api_handle, "HTTP API server"),
-        );
-
-        let shutdown_result = self.db.shutdown().await;
-        self.db_shutdown_complete = shutdown_result.is_ok();
-        #[cfg(feature = "process-remote")]
-        let worker_shutdown =
-            crate::process_functions::shutdown(std::mem::take(&mut self.process_workers)).await;
-        let mut shutdown_errors = Vec::new();
-        if let Err(error) = shutdown_result {
-            shutdown_errors.push(format!("database: {error}"));
-        }
-        #[cfg(feature = "process-remote")]
-        if let Err(error) = worker_shutdown {
-            shutdown_errors.push(format!("process workers: {error}"));
-        }
-        if !(watcher_stopped && pgwire_stopped && api_stopped) {
-            shutdown_errors.push("one or more server tasks did not terminate cleanly".into());
-        }
-        if !shutdown_errors.is_empty() {
-            return Err(ServerError::Shutdown(shutdown_errors.join("; ")));
-        }
-
-        info!("Shutdown complete");
-        Ok(())
-    }
-}
-
-impl Drop for SingleServerRuntime {
-    fn drop(&mut self) {
-        self.serving_gate.fence();
-        if !self.db_shutdown_complete {
-            self.db.close();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let db = Arc::clone(&self.db);
-                drop(runtime.spawn(async move {
-                    if let Err(error) = db.shutdown().await {
-                        warn!(%error, "Database cleanup after server handle drop failed");
-                    }
-                }));
-            }
-        }
-        if let Some(handle) = &self.watcher_handle {
-            handle.abort();
-        }
-        if let Some(handle) = &self.pgwire_handle {
-            handle.abort();
-        }
-        self.api_handle.abort();
-    }
 }
 
 impl ServerHandle {
@@ -271,8 +172,11 @@ pub async fn run_server(
     }
 
     let db = single_database::build(&config).await?;
-    // Auto-recover from a fatal cycle fault by restarting from the last checkpoint.
-    db.enable_supervision();
+    // A failed local process worker has no in-place replacement. Generic graph supervision
+    // would restart against the same dead client and could reopen direct source intake.
+    if config.process_functions.is_empty() {
+        db.enable_supervision();
+    }
 
     // Prometheus registry — must be set before start().
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();

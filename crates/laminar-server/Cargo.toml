@@ -144,6 +144,7 @@ rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 [dev-dependencies]
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
+sha2 = { workspace = true }
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"

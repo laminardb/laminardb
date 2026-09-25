@@ -110,7 +110,10 @@ checkpoint binding can be verified. A committed state/timer checkpoint can be
 restored by a new server and worker; the direct source cannot replay input
 that was not committed. This route admits only single-node `best_effort`
 execution. Worker loss during a call faults the pipeline; an idle worker loss
-is observed when the next call fails. There is no in-place worker replacement.
+is observed by the server even without another call. The server revokes serving,
+stops the database and exits with an error after either loss. A process manager
+can restart the entire server with the same checkpoint and artifacts. There is
+no in-place worker replacement, and uncommitted direct-source input is lost.
 Cluster mode remains rejected. The HTTP control API uses the
 existing console bearer token policy; configure `server.console_token` before
 binding it beyond loopback.

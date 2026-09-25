@@ -1506,13 +1506,10 @@ mod remote_pipeline {
         first.checkpoint().await.unwrap();
 
         kill_python_worker(worker.process_id());
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while worker.is_alive() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker.wait_for_exit())
+            .await
+            .unwrap();
+        assert!(!worker.is_alive());
         let error = worker.shutdown().await.err().unwrap();
         assert!(error.to_string().contains("exited unexpectedly"), "{error}");
         first.shutdown().await.unwrap();
