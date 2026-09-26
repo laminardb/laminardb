@@ -5933,6 +5933,131 @@ impl LaminarDB {
         self.checkpoint_with_timeout(timeout).await
     }
 
+    /// Trigger one native checkpoint and require it to cover a source admission receipt.
+    ///
+    /// Runs the existing manual checkpoint machinery, then verifies that the
+    /// committed native checkpoint captured this exact source instance at an
+    /// offset covering the receipt. The receipt's instance is never fabricated;
+    /// it comes from [`crate::UntypedSourceHandle::push_arrow_receipted`].
+    ///
+    /// # Errors
+    /// Returns a typed [`crate::SourceAdmissionError`] when checkpointing is
+    /// unavailable, the instance is absent from the committed roster, or the
+    /// committed offset does not yet cover the receipt. A covering failure is a
+    /// retryable exact request, not a success.
+    pub async fn checkpoint_through(
+        &self,
+        receipt: &crate::source_admission::SourceAdmissionReceipt,
+    ) -> Result<
+        crate::source_admission::CommittedSourceBarrier,
+        crate::source_admission::SourceAdmissionError,
+    > {
+        self.commit_native_source_checkpoint().await?;
+        let barrier = self
+            .committed_source_barrier(receipt.source_instance())
+            .await?;
+        if !barrier
+            .ordered_input_offset()
+            .covers(receipt.ordered_input_offset())
+        {
+            return Err(
+                crate::source_admission::SourceAdmissionError::OffsetNotCovered {
+                    required: receipt.ordered_input_offset().value(),
+                    committed: barrier.ordered_input_offset().value(),
+                },
+            );
+        }
+        Ok(barrier)
+    }
+
+    /// Trigger one native checkpoint and require it to capture the exact current instance.
+    ///
+    /// Used for empty-source initialization: offset zero is valid only when the
+    /// real committed native checkpoint captured this instance. Callers must not
+    /// construct a zero receipt by hand.
+    ///
+    /// # Errors
+    /// Returns a typed [`crate::SourceAdmissionError`] when checkpointing is
+    /// unavailable or no committed checkpoint captured this instance.
+    pub async fn checkpoint_current(
+        &self,
+        source_instance: &crate::source_admission::SourceInstance,
+    ) -> Result<
+        crate::source_admission::CommittedSourceBarrier,
+        crate::source_admission::SourceAdmissionError,
+    > {
+        self.commit_native_source_checkpoint().await?;
+        self.committed_source_barrier(source_instance).await
+    }
+
+    async fn commit_native_source_checkpoint(
+        &self,
+    ) -> Result<(), crate::source_admission::SourceAdmissionError> {
+        let result = self.checkpoint().await.map_err(|error| {
+            crate::source_admission::SourceAdmissionError::CheckpointUnavailable(error.to_string())
+        })?;
+        if !result.success {
+            return Err(
+                crate::source_admission::SourceAdmissionError::CheckpointUnavailable(
+                    result
+                        .error
+                        .unwrap_or_else(|| "checkpoint reported failure".to_string()),
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    async fn committed_source_barrier(
+        &self,
+        source_instance: &crate::source_admission::SourceInstance,
+    ) -> Result<
+        crate::source_admission::CommittedSourceBarrier,
+        crate::source_admission::SourceAdmissionError,
+    > {
+        let guard = self.coordinator.lock().await;
+        let coordinator = guard.as_ref().ok_or_else(|| {
+            crate::source_admission::SourceAdmissionError::CheckpointUnavailable(
+                "checkpoint coordinator is not running".to_string(),
+            )
+        })?;
+        let manifest = coordinator.last_committed_manifest().ok_or_else(|| {
+            crate::source_admission::SourceAdmissionError::CheckpointUnavailable(
+                "no committed checkpoint manifest is available".to_string(),
+            )
+        })?;
+        let captured = manifest
+            .source_offsets
+            .values()
+            .find(|checkpoint| {
+                checkpoint
+                    .metadata
+                    .get(crate::source_admission::SOURCE_INSTANCE_METADATA_KEY)
+                    .map(String::as_str)
+                    == Some(source_instance.as_str())
+            })
+            .ok_or_else(|| {
+                crate::source_admission::SourceAdmissionError::SourceNotManaged(
+                    source_instance.as_str().to_string(),
+                )
+            })?;
+        let offset = captured
+            .metadata
+            .get(crate::source_admission::ORDERED_INPUT_OFFSET_METADATA_KEY)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                crate::source_admission::SourceAdmissionError::CheckpointUnavailable(
+                    "committed checkpoint did not capture a managed input offset".to_string(),
+                )
+            })?;
+        Ok(crate::source_admission::CommittedSourceBarrier::new(
+            source_instance.clone(),
+            crate::source_admission::OrderedInputOffset::new(offset),
+            manifest.checkpoint_id,
+            manifest.epoch,
+        ))
+    }
+
     /// Trigger one manual checkpoint within a caller-provided relative budget.
     ///
     /// The budget is capped by the configured checkpoint timeout. It bounds admission and attempt

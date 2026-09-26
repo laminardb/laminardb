@@ -117,6 +117,8 @@ pub mod rebalance;
 pub mod recovery_manager;
 mod show_commands;
 mod sink_task;
+/// Native managed-source admission receipts and committed checkpoint correlation.
+pub mod source_admission;
 mod sql_analysis;
 mod sql_utils;
 /// External named-subscription substrate: byte-bounded shared logs and cursor portals.
@@ -181,6 +183,10 @@ pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
+pub use source_admission::{
+    CommittedSourceBarrier, OrderedInputOffset, SourceAdmissionError, SourceAdmissionReceipt,
+    SourceInstance,
+};
 pub use subscription::ClusterSubscriptionError;
 
 /// Criterion-only access to the real committed cluster-subscription gateway.

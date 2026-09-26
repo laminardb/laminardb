@@ -491,6 +491,9 @@ impl UntypedSourceHandle {
 
     /// Push a raw `RecordBatch` (sent to pipeline and buffered for snapshots).
     ///
+    /// Compatibility delegate: it discards the native admission receipt. Use
+    /// [`Self::push_arrow_receipted`] when the admission coordinate is required.
+    ///
     /// # Errors
     /// Returns `StreamingError` on invalid data, a closed queue, count/byte saturation,
     /// or a batch exceeding `LaminarConfig::push_source_max_bytes`.
@@ -498,7 +501,46 @@ impl UntypedSourceHandle {
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
-        self.entry.push_and_buffer(batch)
+        self.push_arrow_receipted(batch).map(|_| ())
+    }
+
+    /// Push a raw `RecordBatch` and return its native admission receipt.
+    ///
+    /// A receipt is produced only after the native source accepted the batch; a
+    /// rejected or backpressured enqueue returns `Err` and no receipt.
+    ///
+    /// # Errors
+    /// Returns `StreamingError` if the pipeline is not running.
+    pub fn push_arrow_receipted(
+        &self,
+        batch: RecordBatch,
+    ) -> Result<
+        crate::source_admission::SourceAdmissionReceipt,
+        laminar_core::streaming::StreamingError,
+    > {
+        let offset = self.entry.admit_arrow(batch)?;
+        Ok(
+            crate::source_admission::SourceAdmissionReceipt::from_native_admission(
+                self.entry.source_instance().clone(),
+                offset,
+            ),
+        )
+    }
+
+    /// Native-issued identity of this source instance.
+    #[must_use]
+    pub fn source_instance(&self) -> &crate::source_admission::SourceInstance {
+        self.entry.source_instance()
+    }
+
+    /// Declare this source as a managed push source owned by a context layer.
+    ///
+    /// The first successful [`Self::push_arrow_receipted`] declares the source
+    /// automatically. An owner that must checkpoint an empty source before its
+    /// first push calls this explicitly so the exact native instance can be
+    /// captured. Declaring fabricates no progress.
+    pub fn declare_managed_source(&self) {
+        self.entry.declare_managed_push();
     }
 
     /// Emit a watermark.
