@@ -767,6 +767,7 @@ pub struct PipelineConfig {
 #[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     pub name: String,
+    /// SQL pipeline or process-function output stream to publish.
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,

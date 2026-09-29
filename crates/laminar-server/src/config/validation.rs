@@ -181,11 +181,21 @@ fn collect_process_function_errors(config: &ServerConfig, errors: &mut Vec<Strin
 }
 
 fn collect_connector_graph_errors(config: &ServerConfig, errors: &mut Vec<String>) {
-    let pipeline_names: HashSet<&str> = config.pipelines.iter().map(|p| p.name.as_str()).collect();
+    let sink_inputs: HashSet<&str> = config
+        .pipelines
+        .iter()
+        .map(|pipeline| pipeline.name.as_str())
+        .chain(
+            config
+                .process_functions
+                .iter()
+                .map(|process| process.output.as_str()),
+        )
+        .collect();
     for sink in &config.sinks {
-        if !pipeline_names.contains(sink.pipeline.as_str()) {
+        if !sink_inputs.contains(sink.pipeline.as_str()) {
             errors.push(format!(
-                "sink '{}' references unknown pipeline '{}'",
+                "sink '{}' references unknown pipeline or process output '{}'",
                 sink.name, sink.pipeline
             ));
         }

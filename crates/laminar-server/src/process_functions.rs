@@ -165,6 +165,26 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "files")]
+    fn file_totals(directory: &Path) -> Vec<i64> {
+        let mut totals = Vec::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_none_or(|extension| extension != "jsonl")
+            {
+                continue;
+            }
+            for line in std::fs::read_to_string(path).unwrap().lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                totals.push(value["total"].as_i64().unwrap());
+            }
+        }
+        totals.sort_unstable();
+        totals
+    }
+
     #[tokio::test]
     async fn configured_python_function_accepts_sql_input() {
         let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
@@ -214,7 +234,7 @@ mod tests {
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn configured_python_function_restores_file_source_cursor() {
+    async fn configured_python_function_restarts_with_file_source_and_sink() {
         let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
             return;
         };
@@ -234,8 +254,10 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let input_dir = directory.path().join("input");
+        let output_dir = directory.path().join("output");
         let checkpoint_dir = directory.path().join("checkpoint");
         std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
         let input_path = input_dir.display().to_string().replace('\\', "/");
         config.process_functions[0].source_sql = format!(
             "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
@@ -243,11 +265,23 @@ mod tests {
              FROM FILES ('path' = '{input_path}', 'glob_pattern' = '*.json', \
              'stabilisation_delay' = '100ms') FORMAT JSON"
         );
+        let mut sink_properties = toml::Table::new();
+        sink_properties.insert(
+            "path".into(),
+            toml::Value::String(output_dir.display().to_string().replace('\\', "/")),
+        );
+        config.sinks.push(crate::config::SinkConfig {
+            name: "activity_files".into(),
+            pipeline: "activity".into(),
+            connector: "files".into(),
+            format: Some("json".into()),
+            properties: sink_properties,
+        });
         crate::config::validate_process_functions(&config).unwrap();
 
-        for (name, amount, timestamp, expected) in [
-            ("first.json", 60, 100_000, 60),
-            ("second.json", 50, 100_050, 110),
+        for (name, amount, timestamp, expected, expected_files) in [
+            ("first.json", 60, 100_000, 60, &[60][..]),
+            ("second.json", 50, 100_050, 110, &[60, 110][..]),
         ] {
             let db = LaminarDB::builder()
                 .storage_dir(&checkpoint_dir)
@@ -260,6 +294,9 @@ mod tests {
                 .await
                 .unwrap();
             let workers = install(&db, &config, &config_path).await.unwrap();
+            crate::server::execute_config_ddl(&db, &config, false)
+                .await
+                .unwrap();
             let mut portal = db
                 .open_subscription("activity", None, SubscribeStart::Tail)
                 .await
@@ -275,6 +312,13 @@ mod tests {
             std::fs::rename(staged, input_dir.join(name)).unwrap();
             assert_eq!(next_total(&mut portal).await, Some(expected));
             assert!(db.checkpoint().await.unwrap().success);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while file_totals(&output_dir).as_slice() != expected_files {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("configured process sink did not publish the expected files");
             db.shutdown().await.unwrap();
             shutdown(workers).await.unwrap();
         }

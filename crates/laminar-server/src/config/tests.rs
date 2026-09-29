@@ -1854,6 +1854,29 @@ function = "handle"
             .contains("process-remote"));
     }
 
+    config.sinks.push(SinkConfig {
+        name: "activity_output".into(),
+        pipeline: "activity".into(),
+        connector: "stdout".into(),
+        format: None,
+        properties: Default::default(),
+    });
+    let sink_binding = validate_config(&config);
+    if cfg!(feature = "process-remote") {
+        assert!(sink_binding.is_ok(), "{sink_binding:?}");
+    } else {
+        assert!(!sink_binding
+            .unwrap_err()
+            .to_string()
+            .contains("unknown pipeline"));
+    }
+    config.sinks[0].pipeline = "missing".into();
+    assert!(validate_config(&config)
+        .unwrap_err()
+        .to_string()
+        .contains("unknown pipeline"));
+    config.sinks.clear();
+
     config.server.mode = ServerMode::Cluster;
     assert!(validate_process_functions(&config)
         .unwrap_err()
