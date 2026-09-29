@@ -58,6 +58,13 @@ struct VnodeFrame {
     entries: Vec<(Vec<u8>, KeyState)>,
 }
 
+#[derive(Serialize)]
+struct VnodeCapture<'a> {
+    codec: u32,
+    vnode: u32,
+    entries: Vec<(&'a Vec<u8>, &'a KeyState)>,
+}
+
 type DueTimer = (i64, Vec<u8>, String, u64);
 
 struct StagedKey {

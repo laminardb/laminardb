@@ -755,6 +755,56 @@ async fn restore_rejects_state_over_declared_key_budget() {
     assert!(result.is_err());
 }
 
+#[tokio::test]
+async fn vnode_restore_accepts_escaped_key_with_tight_state_budget() {
+    let mut binding = descriptor();
+    binding.timer_names.clear();
+    binding.limits.max_state_bytes = 256;
+    let key = "\u{0001}".repeat(64);
+    let mut original =
+        ProcessFunctionOperator::new(binding.clone(), Arc::new(StateEcho), 4).unwrap();
+    original
+        .process_with_frontiers(
+            &[vec![input_batch(&[(key.as_str(), 3, 100_000)])]],
+            &[InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let whole = original.checkpoint().unwrap().unwrap();
+    let frames = original
+        .checkpoint_vnodes(&[0, 1, 2, 3], 4, u64::MAX)
+        .unwrap()
+        .unwrap();
+    let mut restored = ProcessFunctionOperator::new(binding, Arc::new(StateEcho), 4).unwrap();
+    restored.restore(whole).unwrap();
+    for frame in frames {
+        let mut staged_bytes = 0;
+        let bytes = frame
+            .state
+            .unwrap()
+            .materialize(&mut staged_bytes, u64::MAX)
+            .unwrap();
+        restored.restore_vnode(frame.vnode, 4, &bytes).unwrap();
+    }
+    assert_eq!(
+        restored.managed_state_accounting(),
+        original.managed_state_accounting()
+    );
+}
+
+#[test]
+fn vnode_restore_rejects_oversized_frame_before_decoding() {
+    let mut binding = descriptor();
+    binding.limits.max_state_bytes = 1;
+    let mut operator = ProcessFunctionOperator::new(binding, Arc::new(AccountActivity), 4).unwrap();
+    let error = operator.restore_vnode(0, 4, &[b' '; 135]).unwrap_err();
+    assert!(error.to_string().contains("frame exceeds state budget"));
+    assert_eq!(operator.managed_state_accounting().unwrap().live, 0);
+}
+
 struct InvalidSecondResponse;
 
 impl NativeProcessFunction for InvalidSecondResponse {
