@@ -191,6 +191,28 @@ fn checkpoint_rejects_changed_descriptor_contract() {
     assert!(replacement.restore(checkpoint).is_err());
 }
 
+#[test]
+fn checkpoint_restore_rejects_oversized_metadata_before_decode() {
+    let mut original =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    let checkpoint = original.checkpoint().unwrap().unwrap();
+    let mut frame: serde_json::Value = serde_json::from_slice(&checkpoint.data).unwrap();
+    frame["next_activation_id"] = serde_json::json!(55);
+    frame["next_timer_generation"] = serde_json::json!(77);
+    frame["watermark_us"] = serde_json::json!(1_000);
+    let mut oversized = serde_json::to_vec(&frame).unwrap();
+    oversized.resize(4_096, b' ');
+
+    let mut replacement =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    let before = replacement.checkpoint().unwrap().unwrap().data;
+    let error = replacement
+        .restore(crate::operator_graph::OperatorCheckpoint { data: oversized })
+        .unwrap_err();
+    assert!(error.to_string().contains("metadata frame exceeds"));
+    assert_eq!(replacement.checkpoint().unwrap().unwrap().data, before);
+}
+
 fn input_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
     RecordBatch::try_new(
         input_schema(),

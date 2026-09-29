@@ -16,6 +16,10 @@ use crate::operator_graph::{
 #[cfg(feature = "process-remote")]
 use crate::process_function::ProcessHandler;
 use crate::process_function::STATE_CODEC_VERSION;
+
+// V1 metadata has fixed fields, a 64-byte SHA-256 digest, and bounded integer widths.
+const MAX_OPERATOR_FRAME_BYTES: usize = 512;
+
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
     fn cluster_capability(&self) -> OperatorCapability {
@@ -170,10 +174,20 @@ impl GraphOperator for ProcessFunctionOperator {
         };
         let data = serde_json::to_vec(&frame)
             .map_err(|error| DbError::Checkpoint(format!("encode process checkpoint: {error}")))?;
+        if data.len() > MAX_OPERATOR_FRAME_BYTES {
+            return Err(DbError::Checkpoint(
+                "process metadata frame exceeds its size bound".into(),
+            ));
+        }
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        if checkpoint.data.len() > MAX_OPERATOR_FRAME_BYTES {
+            return Err(DbError::Checkpoint(
+                "process metadata frame exceeds its size bound".into(),
+            ));
+        }
         let frame: OperatorFrame = serde_json::from_slice(&checkpoint.data)
             .map_err(|error| DbError::Checkpoint(format!("decode process checkpoint: {error}")))?;
         if frame.codec != STATE_CODEC_VERSION
@@ -345,9 +359,23 @@ impl GraphOperator for ProcessFunctionOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::{VnodeCapture, VnodeFrame};
-    use crate::process_function::operator::KeyState;
+    use super::{VnodeCapture, VnodeFrame, MAX_OPERATOR_FRAME_BYTES};
+    use crate::process_function::operator::{KeyState, OperatorFrame};
     use crate::process_function::{ValueState, STATE_CODEC_VERSION};
+
+    #[test]
+    fn metadata_frame_bound_covers_maximum_field_widths() {
+        let frame = OperatorFrame {
+            codec: u32::MAX,
+            descriptor_sha256: "f".repeat(64),
+            partitioning_abi: u16::MAX,
+            vnode_count: u32::MAX,
+            next_activation_id: u64::MAX,
+            next_timer_generation: u64::MAX,
+            watermark_us: i64::MIN,
+        };
+        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_OPERATOR_FRAME_BYTES);
+    }
 
     #[test]
     fn vnode_capture_preserves_frame_encoding() {

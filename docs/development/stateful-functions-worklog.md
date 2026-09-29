@@ -195,6 +195,12 @@ The production `FILES` source/sink host-loss fixture now exercises the admitted 
 
 The existing remote published-cut test passed before editing. The four Rust FILES host-loss cases passed after the final fixture change. The Python-enabled `process_function::` suite passed 51 tests with `--no-default-features --features process-remote,files`, excluding the existing Windows `taskkill` case previously verified with local test permission. The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial tests: 1,977 connectors, 973 core, 2,024 database (one ignored), and 870 SQL tests passed. Both workspace Clippy gates with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The existing Windows default-stack caveat remains. This test-only change does not trigger the coordinator/core before-and-after Criterion gate; target-hardware p99, CPU/IPC, and sustained process RSS remain unmeasured.
 
+### Continuation: bounded process metadata restore (2026-09-29)
+
+The process operator's whole-checkpoint metadata frame now has a 512-byte v1 limit on capture and before JSON decode on restore. Its fixed fields, 64-character binding digest, and widest integer values fit within that limit. A valid frame padded to 4 KiB was previously accepted and applied altered counters; the new regression first reproduced that behavior, then verified rejection leaves the operator unchanged. Vnode state frames retain their separate state-budget bound. This closes one restore-time allocation path, not a sustained process-RSS qualification. The change touches checkpoint capture/restore only, so the coordinator-cycle and core-operator before/after Criterion gate does not apply.
+
+Validation: the focused no-default-feature process suite passed 21 tests. The Python-enabled `process_function::` suite passed 53 selected tests with `--no-default-features --features process-remote,files`, excluding the existing Windows `taskkill` case previously verified with local test permission. `cargo test --workspace --lib -- --test-threads=1 --quiet` passed with `RUST_MIN_STACK=8388608`: core 973, database 2,026 (one ignored), SQL 870, and the connector library passed. Both workspace Clippy gates with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. Target-hardware p99, CPU/IPC, and sustained RSS remain unmeasured.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
