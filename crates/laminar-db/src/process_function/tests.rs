@@ -714,6 +714,74 @@ async fn due_timers_remain_scheduled_after_callback_limit() {
 }
 
 #[tokio::test]
+async fn native_state_and_timer_budget_stays_bounded_across_churn_and_restore() {
+    let mut binding = descriptor();
+    binding.limits.max_keys = 64;
+    binding.limits.max_timers = 64;
+    binding.limits.max_state_bytes = 16 * 1024;
+    let keys = (0..64)
+        .map(|index| format!("account_{index}"))
+        .collect::<Vec<_>>();
+    let mut operator =
+        ProcessFunctionOperator::new(binding.clone(), Arc::new(AccountActivity), 4).unwrap();
+
+    for round in 0..64 {
+        let time_us = 100_000 + round * 1_000;
+        let rows = keys
+            .iter()
+            .map(|key| (key.as_str(), 1, time_us))
+            .collect::<Vec<_>>();
+        let output = operator
+            .process_with_frontiers(
+                &[vec![input_batch(&rows)]],
+                &[InputFrontier {
+                    watermark: Some(time_us / 1_000),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(totals(&output), vec![round + 1; keys.len()]);
+        assert!(operator.managed_state_accounting().unwrap().live <= 16 * 1024);
+
+        if (round + 1) % 16 == 0 {
+            let whole = operator.checkpoint().unwrap().unwrap();
+            let frames = operator
+                .checkpoint_vnodes(&[0, 1, 2, 3], 4, 64 * 1024)
+                .unwrap()
+                .unwrap();
+            let mut replacement =
+                ProcessFunctionOperator::new(binding.clone(), Arc::new(AccountActivity), 4)
+                    .unwrap();
+            replacement.restore(whole).unwrap();
+            for frame in frames {
+                let bytes = frame.state.unwrap().materialize(&mut 0, u64::MAX).unwrap();
+                replacement.restore_vnode(frame.vnode, 4, &bytes).unwrap();
+            }
+            assert_eq!(
+                replacement.managed_state_accounting(),
+                operator.managed_state_accounting()
+            );
+            operator = replacement;
+        }
+    }
+
+    let callbacks = operator
+        .process_with_frontiers(
+            &[Vec::new()],
+            &[InputFrontier {
+                watermark: Some(173),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(totals(&callbacks), vec![64; keys.len()]);
+    assert!(operator.managed_state_accounting().unwrap().live <= 16 * 1024);
+    assert!(!operator.deferred_work_is_runnable());
+}
+
+#[tokio::test]
 async fn restore_rejects_changed_implementation_binding() {
     let mut original = build_graph(descriptor(), Arc::new(AccountActivity))
         .initialize_managed_state()
@@ -793,6 +861,59 @@ async fn vnode_restore_accepts_escaped_key_with_tight_state_budget() {
         restored.managed_state_accounting(),
         original.managed_state_accounting()
     );
+}
+
+#[tokio::test]
+async fn vnode_capture_budget_failure_preserves_live_state() {
+    let mut binding = descriptor();
+    binding.timer_names.clear();
+    let key = "x".repeat(8 * 1024);
+    let mut operator = ProcessFunctionOperator::new(binding, Arc::new(StateEcho), 4).unwrap();
+    operator
+        .process_with_frontiers(
+            &[vec![input_batch(&[(key.as_str(), 3, 100_000)])]],
+            &[InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let before = operator.managed_state_accounting();
+    let baseline = operator
+        .checkpoint_vnodes(&[0, 1, 2, 3], 4, u64::MAX)
+        .unwrap()
+        .unwrap();
+    let populated_vnode = baseline
+        .iter()
+        .max_by_key(|frame| frame.state.as_ref().unwrap().retained_bytes())
+        .unwrap()
+        .vnode;
+    let original_bytes = baseline
+        .into_iter()
+        .find(|frame| frame.vnode == populated_vnode)
+        .unwrap()
+        .state
+        .unwrap()
+        .materialize(&mut 0, u64::MAX)
+        .unwrap();
+    let error = operator
+        .checkpoint_vnodes(&[populated_vnode], 4, 128)
+        .unwrap_err();
+    assert!(error.to_string().contains("capture budget exceeded"));
+    assert_eq!(operator.managed_state_accounting(), before);
+    let retry = operator
+        .checkpoint_vnodes(&[populated_vnode], 4, u64::MAX)
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .state
+        .unwrap()
+        .materialize(&mut 0, u64::MAX)
+        .unwrap();
+    assert_eq!(original_bytes, retry);
 }
 
 #[test]

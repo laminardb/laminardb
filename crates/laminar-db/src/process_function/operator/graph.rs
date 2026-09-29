@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
 use async_trait::async_trait;
+use laminar_core::serialization::BoundedBytesWriter;
 use laminar_core::state::PARTITIONING_ABI_VERSION;
 use rustc_hash::FxHashMap;
 
@@ -212,12 +213,20 @@ impl GraphOperator for ProcessFunctionOperator {
             })?;
             let mut entries = state.iter().collect::<Vec<_>>();
             entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
-            let bytes = serde_json::to_vec(&VnodeCapture {
-                codec: STATE_CODEC_VERSION,
-                vnode,
-                entries,
-            })
-            .map_err(|error| DbError::Checkpoint(format!("encode process vnode: {error}")))?;
+            let mut writer =
+                BoundedBytesWriter::new(usize::try_from(remaining).unwrap_or(usize::MAX));
+            serde_json::to_writer(
+                &mut writer,
+                &VnodeCapture {
+                    codec: STATE_CODEC_VERSION,
+                    vnode,
+                    entries,
+                },
+            )
+            .map_err(|error| {
+                DbError::Checkpoint(format!("process vnode capture budget exceeded: {error}"))
+            })?;
+            let bytes = writer.into_vec();
             remaining = remaining
                 .checked_sub(u64::try_from(bytes.capacity()).unwrap_or(u64::MAX))
                 .ok_or_else(|| {
