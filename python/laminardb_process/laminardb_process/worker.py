@@ -5,10 +5,14 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import importlib
+import importlib.util
+from hashlib import sha256
 import ipaddress
 from pathlib import Path
+import sys
 import threading
 import time
+from types import ModuleType
 from typing import Callable, Iterator, Sequence
 
 import grpc
@@ -301,6 +305,29 @@ def serve(manifest: Manifest, handler: Handler, bind: str, max_in_flight: int = 
         server.wait_for_termination()
 
 
+def _load_bound_module(module_name: str, handler_file: Path, digest: bytes) -> ModuleType:
+    if handler_file.suffix != ".py" or module_name.rpartition(".")[2] != handler_file.stem:
+        raise ValueError("handler module differs from verified handler file")
+    if module_name in sys.modules:
+        raise ValueError("handler module was loaded before verification")
+    source = handler_file.read_bytes()
+    if sha256(source).digest() != digest:
+        raise ValueError("handler file digest differs from process manifest")
+    spec = importlib.util.spec_from_file_location(module_name, handler_file)
+    if spec is None or spec.loader is None:
+        raise ValueError("handler file is not a Python source module")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        # Execute the exact bytes just hashed; importlib may otherwise reuse stale .pyc code.
+        exec(compile(source, str(handler_file), "exec"), module.__dict__)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            del sys.modules[module_name]
+        raise
+    return module
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LaminarDB loopback Python process worker")
     parser.add_argument("--manifest", required=True, type=Path)
@@ -313,11 +340,13 @@ def main() -> None:
     if not separator or not module_name or not name:
         parser.error("handler must be module:callable")
     manifest = Manifest.from_bytes(args.manifest.read_bytes())
-    module = importlib.import_module(module_name)
-    if args.handler_file is not None:
-        loaded_file = getattr(module, "__file__", None)
-        if loaded_file is None or not Path(loaded_file).samefile(args.handler_file):
-            parser.error("loaded handler module differs from verified handler file")
+    if args.handler_file is None:
+        module = importlib.import_module(module_name)
+    else:
+        try:
+            module = _load_bound_module(module_name, args.handler_file, manifest.implementation_digest)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     handler = getattr(module, name)
     if not callable(handler):
         parser.error("handler is not callable")

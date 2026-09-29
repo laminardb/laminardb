@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
+import os
+import py_compile
 import subprocess
 import sys
 import tempfile
@@ -13,7 +16,7 @@ import grpc
 import pyarrow as pa
 
 from laminardb_process import Manifest
-from laminardb_process.worker import ProtocolError, _decode_batch, _encode_batch, serve
+from laminardb_process.worker import ProtocolError, _decode_batch, _encode_batch, _load_bound_module, serve
 
 
 def manifest_bytes() -> bytes:
@@ -58,7 +61,36 @@ class WorkerBoundaryTests(unittest.TestCase):
                 capture_output=True, text=True, timeout=5, check=False,
             )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("loaded handler module differs", result.stderr)
+        self.assertIn("handler module differs", result.stderr)
+
+    def test_worker_rejects_changed_handler_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_bytes(manifest_bytes())
+            handler = Path(directory) / "handler.py"
+            handler.write_text("def handle(_):\n    return ()\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-m", "laminardb_process.worker", "--manifest", str(manifest),
+                 "--handler", "handler:handle", "--handler-file", str(handler)],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("handler file digest differs", result.stderr)
+
+    def test_bound_handler_executes_verified_source_even_with_stale_bytecode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            handler = Path(directory) / "bound_handler_fixture.py"
+            handler.write_bytes(b"VALUE = 1\n")
+            timestamp = handler.stat()
+            py_compile.compile(str(handler), doraise=True)
+            source = b"VALUE = 2\n"
+            handler.write_bytes(source)
+            os.utime(handler, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+            try:
+                module = _load_bound_module(handler.stem, handler, sha256(source).digest())
+                self.assertEqual(module.VALUE, 2)
+            finally:
+                sys.modules.pop(handler.stem, None)
 
     def test_manifest_rejects_wrong_runtime_and_duplicate_timer(self) -> None:
         raw = manifest_bytes()

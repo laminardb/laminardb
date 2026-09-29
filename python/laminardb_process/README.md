@@ -130,9 +130,10 @@ binding it beyond loopback.
 The v1 manifest fixes schema, key, timer names, resource limits, runtime and an
 implementation digest. The worker checks the canonical manifest digest on every
 invocation; one final file newline is ignored. `LocalPythonWorker` verifies the
-direct handler file before launch. Imported modules and data still need an
-immutable package binding before replay claims. One invocation contains distinct
-keys from one vnode. Results may emit
+direct handler file before launch. The child checks the same digest and executes
+the verified source bytes, including when a stale Python bytecode cache exists.
+Imported modules and data still need an immutable package binding before replay
+claims. One invocation contains distinct keys from one vnode. Results may emit
 zero or more Arrow batches and propose state/timer changes, but the host applies
 only a complete validated response.
 

@@ -177,6 +177,12 @@ A native test replaces one timer on each of 64 keys for 64 rounds under a 16 KiB
 
 Validation: both new focused tests and the Python-enabled `process_function::` suite passed (48 selected tests; the existing Windows `taskkill` case was excluded and was previously verified with local test permission). `cargo test --workspace --lib -- --test-threads=1 --quiet` passed with `RUST_MIN_STACK=8388608`: 2,021 database tests passed (one ignored), 870 SQL tests passed, and connector/core libraries passed. The all-features Clippy gate first found a redundant conversion in the new test; it passed after removal. The no-default-features Clippy gate also passed. Nightly formatting, the readability checker, and `git diff --check` passed.
 
+### Continuation: Python child verifies direct handler source (2026-09-29)
+
+The supervised Python child now reads its declared handler file, compares those bytes with the manifest's implementation digest, and compiles and executes those same bytes. This closes the launch gap between the host's pre-spawn hash check and the code the child runs, including stale `.pyc` files with matching source timestamps and sizes. It rejects a handler module name that differs from the file or was loaded before verification. The Python boundary suite covers changed source and stale bytecode. Imported modules, package installations, data files, and later dynamic file access remain outside this binding; Python `AtLeastOnce` admission stays closed. No coordinator-cycle or core-operator record path changed.
+
+Validation: the Python unit suite passed six tests. The no-default-feature process-function suite passed 43 selected tests. The all-feature suite first failed the unrelated Rust worker-loss test; that test passed alone, and the full selected suite passed 48 tests on rerun. Both suite runs excluded the existing Windows `taskkill` test, previously passed with elevated local permission. `cargo test --workspace --lib -- --test-threads=1 --quiet` passed with `RUST_MIN_STACK=8388608`: 2,021 database tests passed (one ignored), 870 SQL tests passed, and connector/core libraries passed. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |

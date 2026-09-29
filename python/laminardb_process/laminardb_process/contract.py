@@ -114,9 +114,10 @@ def _schema(fields: list[dict]) -> pa.Schema:
 
 @dataclass(frozen=True)
 class Manifest:
-    """Exact canonical descriptor bytes bind each invocation to one worker package."""
+    """Canonical descriptor bytes bind each invocation and the direct handler source."""
 
     digest: bytes
+    implementation_digest: bytes
     input_schema: pa.Schema
     output_schema: pa.Schema
     key_column: str
@@ -193,6 +194,7 @@ class Manifest:
         needed = ("max_batch_rows", "max_input_bytes", "max_output_rows", "max_output_bytes", "max_timers")
         return cls(
             digest=sha256(raw).digest(),
+            implementation_digest=bytes.fromhex(digest),
             input_schema=input_schema,
             output_schema=output_schema,
             key_column=key_column,
