@@ -1147,8 +1147,17 @@ def handle(activations):
     return tuple(results)
 "#
         );
+        let config = python_test_handler_config(python, directory, &handler);
+        (config, crash_marker)
+    }
+
+    fn python_test_handler_config(
+        python: &str,
+        directory: &Path,
+        handler: &str,
+    ) -> LocalPythonWorkerConfig {
         let handler_path = directory.join("replay_handler.py");
-        std::fs::write(&handler_path, &handler).unwrap();
+        std::fs::write(&handler_path, handler).unwrap();
         let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(
             &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
@@ -1161,7 +1170,43 @@ def handle(activations):
         config.manifest = manifest_path;
         config.handler_file = handler_path;
         config.timeout = Duration::from_secs(15);
-        (config, crash_marker)
+        config
+    }
+
+    #[cfg(feature = "files")]
+    fn pending_invocation_python_config(python: &str, directory: &Path) -> LocalPythonWorkerConfig {
+        let entered =
+            serde_json::to_string(&directory.join("invocation-entered").to_string_lossy()).unwrap();
+        let release =
+            serde_json::to_string(&directory.join("release-invocation").to_string_lossy()).unwrap();
+        let handler = format!(
+            r#"from pathlib import Path
+import time
+from handler import handle as account_activity
+
+ENTERED = Path({entered})
+RELEASE = Path({release})
+
+def handle(activations):
+    for activation in activations:
+        if activation.input is None or activation.input.column(1)[0].as_py() != 50:
+            continue
+        with ENTERED.open("a", encoding="utf-8") as ids:
+            ids.write(str(activation.id) + "\n")
+        deadline = time.monotonic() + 25
+        while not RELEASE.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("pending invocation was not released")
+            time.sleep(0.01)
+    return account_activity(activations)
+"#
+        );
+        let mut config = python_test_handler_config(python, directory, &handler);
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        config
+            .python_paths
+            .push(repository.join("examples/process_python"));
+        config
     }
 
     const REPLAY_SOURCE: &str = "process-replay-test";
@@ -2335,11 +2380,15 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    async fn run_python_host_loss_child(root: &Path, endpoint: &str) {
-        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let manifest =
-            std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap();
-        let descriptor = ProcessFunctionDescriptor::from_manifest_json(&manifest).unwrap();
+    async fn run_python_host_loss_child(
+        root: &Path,
+        endpoint: &str,
+        manifest: &Path,
+        cut: HostFailureCut,
+    ) {
+        let descriptor =
+            ProcessFunctionDescriptor::from_manifest_json(&std::fs::read(manifest).unwrap())
+                .unwrap();
         let client =
             RemoteProcessClient::connect_loopback(endpoint, descriptor, 2, Duration::from_secs(15))
                 .await
@@ -2376,27 +2425,31 @@ def handle(activations):
             "second.json",
             serde_json::json!({"key": "a", "amount": 50, "ts": 100_050}),
         );
-        assert_eq!(next_process_total(&mut portal).await, 110);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while published_file_totals(&output_dir) != [60, 110] {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("second Python output was not durably published");
-        std::fs::write(root.join("output-published"), b"ready").unwrap();
+        if matches!(cut, HostFailureCut::PublishedOutput) {
+            assert_eq!(next_process_total(&mut portal).await, 110);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while published_file_totals(&output_dir) != [60, 110] {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("second Python output was not durably published");
+            std::fs::write(root.join("output-published"), b"ready").unwrap();
+        }
         tokio::time::sleep(Duration::from_secs(30)).await;
         panic!("Python host loss test child was not terminated");
     }
 
     #[cfg(feature = "files")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn python_file_sink_replays_after_separately_supervised_host_loss() {
+    async fn assert_python_replay_after_host_termination(cut: HostFailureCut, test_name: &str) {
         const CHILD_ENV: &str = "LAMINAR_PROCESS_PYTHON_HOST_LOSS_CHILD";
         const ENDPOINT_ENV: &str = "LAMINAR_PROCESS_PYTHON_HOST_LOSS_ENDPOINT";
+        const MANIFEST_ENV: &str = "LAMINAR_PROCESS_PYTHON_HOST_LOSS_MANIFEST";
         if let Some(root) = std::env::var_os(CHILD_ENV) {
             let endpoint = std::env::var(ENDPOINT_ENV).unwrap();
-            run_python_host_loss_child(Path::new(&root), &endpoint).await;
+            let manifest = std::env::var_os(MANIFEST_ENV).unwrap();
+            run_python_host_loss_child(Path::new(&root), &endpoint, Path::new(&manifest), cut)
+                .await;
             return;
         }
         let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
@@ -2410,38 +2463,45 @@ def handle(activations):
         std::fs::create_dir(&input_dir).unwrap();
         std::fs::create_dir(&output_dir).unwrap();
 
-        let mut config = python_config(python.clone());
-        config.timeout = Duration::from_secs(15);
+        let config = match cut {
+            HostFailureCut::PendingInvocation => pending_invocation_python_config(&python, root),
+            HostFailureCut::PublishedOutput => {
+                let mut config = python_config(python);
+                config.timeout = Duration::from_secs(15);
+                config
+            }
+        };
         let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
         child
-            .args([
-                "--exact",
-                "process_function::tests::remote_pipeline::python_file_sink_replays_after_separately_supervised_host_loss",
-                "--nocapture",
-            ])
+            .args(["--exact", test_name, "--nocapture"])
             .env(CHILD_ENV, root)
             .env(ENDPOINT_ENV, worker.loopback_endpoint())
+            .env(MANIFEST_ENV, &config.manifest)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
         let mut child = child.spawn().unwrap();
-        let published = tokio::time::timeout(Duration::from_secs(20), async {
+        let marker = match cut {
+            HostFailureCut::PendingInvocation => "invocation-entered",
+            HostFailureCut::PublishedOutput => "output-published",
+        };
+        let reached = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if root.join("output-published").exists() {
+                if root.join(marker).exists() {
                     return;
                 }
                 if let Some(status) = child.try_wait().unwrap() {
-                    panic!("Python host loss child exited before output publication: {status}");
+                    panic!("Python host loss child exited before {marker}: {status}");
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await;
-        if published.is_err() {
+        if reached.is_err() {
             child.start_kill().unwrap();
             let _ = child.wait().await;
-            panic!("Python host loss child did not publish the second output");
+            panic!("Python host loss child did not reach {marker}");
         }
         child.start_kill().unwrap();
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -2450,8 +2510,24 @@ def handle(activations):
             .unwrap();
         assert!(!status.success());
         assert!(worker.is_alive());
-        assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
+        let expected_before_replay = match cut {
+            HostFailureCut::PendingInvocation => vec![60],
+            HostFailureCut::PublishedOutput => vec![60, 110],
+        };
+        assert_eq!(published_file_totals(&output_dir), expected_before_replay);
+        if matches!(cut, HostFailureCut::PendingInvocation) {
+            assert_eq!(
+                std::fs::read_to_string(root.join("invocation-entered"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["1"]
+            );
+        }
         worker.shutdown().await.unwrap();
+        if matches!(cut, HostFailureCut::PendingInvocation) {
+            std::fs::write(root.join("release-invocation"), b"ready").unwrap();
+        }
 
         let replacement = LocalPythonWorker::start(config).await.unwrap();
         let restored = file_process_database(
@@ -2472,7 +2548,40 @@ def handle(activations):
         assert!(restored.checkpoint().await.unwrap().success);
         restored.shutdown().await.unwrap();
         replacement.shutdown().await.unwrap();
-        assert_eq!(published_file_totals(&output_dir), vec![60, 110, 110]);
+        let expected_after_replay = match cut {
+            HostFailureCut::PendingInvocation => vec![60, 110],
+            HostFailureCut::PublishedOutput => vec![60, 110, 110],
+        };
+        assert_eq!(published_file_totals(&output_dir), expected_after_replay);
+        if matches!(cut, HostFailureCut::PendingInvocation) {
+            assert_eq!(
+                std::fs::read_to_string(root.join("invocation-entered"))
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["1", "1"]
+            );
+        }
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn python_file_sink_replays_after_separately_supervised_host_loss() {
+        assert_python_replay_after_host_termination(
+            HostFailureCut::PublishedOutput,
+            "process_function::tests::remote_pipeline::python_file_sink_replays_after_separately_supervised_host_loss",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn python_pending_invocation_replays_after_separately_supervised_host_loss() {
+        assert_python_replay_after_host_termination(
+            HostFailureCut::PendingInvocation,
+            "process_function::tests::remote_pipeline::python_pending_invocation_replays_after_separately_supervised_host_loss",
+        )
+        .await;
     }
 
     #[tokio::test]
