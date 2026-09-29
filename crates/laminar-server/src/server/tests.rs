@@ -426,6 +426,226 @@ def exit_on_signal():
     }
 }
 
+#[cfg(all(feature = "process-remote", feature = "files"))]
+fn process_sink_totals(directory: &std::path::Path) -> Vec<i64> {
+    let mut totals = Vec::new();
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "jsonl")
+        {
+            continue;
+        }
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            totals.push(value["total"].as_i64().unwrap());
+        }
+    }
+    totals.sort_unstable();
+    totals
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+async fn wait_for_process_sink(directory: &std::path::Path, expected: &[i64]) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while process_sink_totals(directory).as_slice() != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "configured process sink did not publish {expected:?}; observed {:?}",
+            process_sink_totals(directory)
+        )
+    });
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+fn publish_process_file(root: &std::path::Path, name: &str, amount: i64, timestamp: i64) {
+    let mut row = serde_json::to_vec(&serde_json::json!({
+        "key": "a", "amount": amount, "ts": timestamp
+    }))
+    .unwrap();
+    row.push(b'\n');
+    let staged = root.join("staged.json");
+    std::fs::write(&staged, row).unwrap();
+    std::fs::rename(staged, root.join("input").join(name)).unwrap();
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+fn process_failure_handler(
+    root: &std::path::Path,
+    repository: &std::path::Path,
+) -> (PathBuf, PathBuf) {
+    use sha2::{Digest, Sha256};
+
+    let fail_literal = serde_json::to_string(&root.join("fail-second").to_string_lossy()).unwrap();
+    let exit_literal = serde_json::to_string(&root.join("exit-worker").to_string_lossy()).unwrap();
+    let entered_literal =
+        serde_json::to_string(&root.join("second-entered").to_string_lossy()).unwrap();
+    let base =
+        std::fs::read_to_string(repository.join("examples/process_python/handler.py")).unwrap();
+    let handler = format!(
+        r#"{base}
+import os as _os
+import threading as _threading
+import time as _time
+from pathlib import Path as _Path
+_fail = _Path({fail_literal})
+_exit = _Path({exit_literal})
+_entered = _Path({entered_literal})
+def _watch_exit():
+    while not _exit.exists():
+        _time.sleep(0.01)
+    _os._exit(47)
+_threading.Thread(target=_watch_exit, daemon=True).start()
+_original_handle = handle
+def handle(activations):
+    if _fail.exists() and any(
+        a.input is not None and a.input.column(1)[0].as_py() == 50
+        for a in activations
+    ):
+        _entered.write_text(str(activations[0].id))
+        _os._exit(47)
+    return _original_handle(activations)
+"#
+    );
+    let handler_path = root.join("crash_handler.py");
+    std::fs::write(&handler_path, &handler).unwrap();
+    let mut descriptor =
+        laminar_db::process_function::ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap(),
+        )
+        .unwrap();
+    descriptor.implementation_digest = format!("{:x}", Sha256::digest(handler.as_bytes()));
+    let manifest_path = root.join("manifest.json");
+    std::fs::write(&manifest_path, descriptor.to_manifest_json().unwrap()).unwrap();
+    (handler_path, manifest_path)
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+fn file_process_server_config(
+    root: &std::path::Path,
+    repository: &std::path::Path,
+    python: PathBuf,
+) -> ServerConfig {
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    std::fs::create_dir(&input_dir).unwrap();
+    std::fs::create_dir(&output_dir).unwrap();
+    let (handler_path, manifest_path) = process_failure_handler(root, repository);
+    let mut config =
+        crate::config::load_config(&repository.join("examples/process_python/server.toml"))
+            .unwrap();
+    config.server.bind = "127.0.0.1:0".into();
+    config.process_functions[0].python = python;
+    config.process_functions[0].handler_file = handler_path;
+    config.process_functions[0].manifest = manifest_path;
+    if let Some(dependencies) = std::env::var_os("LAMINAR_PROCESS_PYTHON_DEPS") {
+        let path = PathBuf::from(dependencies);
+        config.process_functions[0]
+            .python_paths
+            .push(if path.is_absolute() {
+                path
+            } else {
+                repository.join(path)
+            });
+    }
+    let input_path = input_dir.display().to_string().replace('\\', "/");
+    config.process_functions[0].source_sql = format!(
+        "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+         ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+         FROM FILES ('path' = '{input_path}', 'glob_pattern' = '*.json', \
+         'stabilisation_delay' = '100ms') FORMAT JSON"
+    );
+    let mut properties = toml::Table::new();
+    properties.insert(
+        "path".into(),
+        toml::Value::String(output_dir.display().to_string().replace('\\', "/")),
+    );
+    config.sinks.push(SinkConfig {
+        name: "activity_files".into(),
+        pipeline: "activity".into(),
+        connector: "files".into(),
+        format: Some("json".into()),
+        properties,
+    });
+    let checkpoint_path = root
+        .join("checkpoints")
+        .to_string_lossy()
+        .replace('\\', "/");
+    config.checkpoint.url = if checkpoint_path.starts_with('/') {
+        format!("file://{checkpoint_path}")
+    } else {
+        format!("file:///{checkpoint_path}")
+    };
+    config.checkpoint.interval = std::time::Duration::from_secs(3_600);
+    config
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_file_process_recovers_after_in_flight_worker_exit() {
+    let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+        return;
+    };
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let config_path = repository.join("examples/process_python/server.toml");
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let output_dir = root.join("output");
+    let fail = root.join("fail-second");
+    let exit = root.join("exit-worker");
+    let entered = root.join("second-entered");
+    let config = file_process_server_config(root, &repository, python.into());
+
+    let first = run_server(config.clone(), config_path.clone())
+        .await
+        .unwrap();
+    let db = match &first.runtime {
+        ServerRuntime::Single(runtime) => Arc::clone(&runtime.db),
+        #[cfg(feature = "cluster")]
+        ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
+    };
+    publish_process_file(root, "first.json", 60, 100_000);
+    wait_for_process_sink(&output_dir, &[60]).await;
+    assert!(db.checkpoint().await.unwrap().success);
+    let stopped = tokio::spawn(first.wait_for_shutdown());
+    std::fs::write(&fail, []).unwrap();
+    publish_process_file(root, "second.json", 50, 100_050);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+        .await
+        .expect("server did not stop after in-flight worker loss")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("process worker 0 exited"));
+    assert!(entered.exists());
+    assert!(db.is_closed());
+    assert_eq!(process_sink_totals(&output_dir), vec![60]);
+    std::fs::remove_file(&fail).unwrap();
+
+    let second = run_server(config, config_path).await.unwrap();
+    let restored = match &second.runtime {
+        ServerRuntime::Single(runtime) => Arc::clone(&runtime.db),
+        #[cfg(feature = "cluster")]
+        ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
+    };
+    wait_for_process_sink(&output_dir, &[60, 110]).await;
+    assert!(restored.checkpoint().await.unwrap().success);
+    let stopped = tokio::spawn(second.wait_for_shutdown());
+    std::fs::write(&exit, []).unwrap();
+    let error = tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+        .await
+        .expect("server did not stop after idle worker exit")
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("process worker 0 exited"));
+    assert!(restored.is_closed());
+    assert_eq!(process_sink_totals(&output_dir), vec![60, 110]);
+}
+
 fn make_source(name: &str, connector: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_string(),
