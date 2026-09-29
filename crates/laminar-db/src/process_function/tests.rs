@@ -1534,13 +1534,11 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    async fn file_process_database(
+    async fn file_source_database(
         checkpoint_dir: &Path,
         input_dir: &Path,
-        output_dir: &Path,
         key_column: &str,
         delivery: DeliveryGuarantee,
-        client: Arc<RemoteProcessClient>,
     ) -> Arc<LaminarDB> {
         let db = LaminarDB::builder()
             .storage_dir(checkpoint_dir)
@@ -1561,6 +1559,29 @@ def handle(activations):
         ))
         .await
         .unwrap();
+        db
+    }
+
+    #[cfg(feature = "files")]
+    async fn add_file_sink(db: &LaminarDB, output_dir: &Path) {
+        let output_path = output_dir.display().to_string().replace('\\', "/");
+        db.execute(&format!(
+            "CREATE SINK activity_files FROM activity INTO FILES ('path' = '{output_path}') FORMAT JSON"
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "files")]
+    async fn file_remote_process_database(
+        checkpoint_dir: &Path,
+        input_dir: &Path,
+        output_dir: &Path,
+        key_column: &str,
+        delivery: DeliveryGuarantee,
+        client: Arc<RemoteProcessClient>,
+    ) -> Arc<LaminarDB> {
+        let db = file_source_database(checkpoint_dir, input_dir, key_column, delivery).await;
         db.register_remote_process_function(
             "activity",
             "events",
@@ -1569,12 +1590,28 @@ def handle(activations):
         )
         .await
         .unwrap();
-        let output_path = output_dir.display().to_string().replace('\\', "/");
-        db.execute(&format!(
-            "CREATE SINK activity_files FROM activity INTO FILES ('path' = '{output_path}') FORMAT JSON"
-        ))
-        .await
-        .unwrap();
+        add_file_sink(&db, output_dir).await;
+        db
+    }
+
+    #[cfg(feature = "files")]
+    async fn file_native_process_database(
+        checkpoint_dir: &Path,
+        input_dir: &Path,
+        output_dir: &Path,
+        handler: Arc<dyn NativeProcessFunction>,
+    ) -> Arc<LaminarDB> {
+        let db = file_source_database(
+            checkpoint_dir,
+            input_dir,
+            "account",
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .await;
+        db.register_native_process_function("activity", "events", descriptor(), handler)
+            .await
+            .unwrap();
+        add_file_sink(&db, output_dir).await;
         db
     }
 
@@ -1612,6 +1649,13 @@ def handle(activations):
     enum HostFailureCut {
         PendingInvocation,
         PublishedOutput,
+    }
+
+    #[cfg(feature = "files")]
+    #[derive(Clone, Copy)]
+    enum FileHostRuntime {
+        NativeRust,
+        RemoteRust,
     }
 
     #[cfg(feature = "files")]
@@ -1672,30 +1716,35 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    async fn run_host_failure_child(root: &Path, cut: HostFailureCut) {
+    async fn run_host_failure_child(root: &Path, cut: HostFailureCut, runtime: FileHostRuntime) {
         let input_dir = root.join("input");
         let output_dir = root.join("output");
         let checkpoint_dir = root.join("checkpoint");
-        let mut binding = descriptor();
-        binding.runtime = ProcessRuntime::RemoteRust;
-        let (client, _shutdown, _worker) = worker_client(
-            binding,
-            Arc::new(MarkSecondFile {
-                entered: root.join("invocation-entered"),
-                cut,
-            }),
-            Duration::from_secs(30),
-        )
-        .await;
-        let db = file_process_database(
-            &checkpoint_dir,
-            &input_dir,
-            &output_dir,
-            "account",
-            DeliveryGuarantee::AtLeastOnce,
-            client,
-        )
-        .await;
+        let handler: Arc<dyn NativeProcessFunction> = Arc::new(MarkSecondFile {
+            entered: root.join("invocation-entered"),
+            cut,
+        });
+        let worker = match runtime {
+            FileHostRuntime::RemoteRust => {
+                let mut binding = descriptor();
+                binding.runtime = ProcessRuntime::RemoteRust;
+                Some(worker_client(binding, Arc::clone(&handler), Duration::from_secs(30)).await)
+            }
+            FileHostRuntime::NativeRust => None,
+        };
+        let db = if let Some((client, _, _)) = &worker {
+            file_remote_process_database(
+                &checkpoint_dir,
+                &input_dir,
+                &output_dir,
+                "account",
+                DeliveryGuarantee::AtLeastOnce,
+                Arc::clone(client),
+            )
+            .await
+        } else {
+            file_native_process_database(&checkpoint_dir, &input_dir, &output_dir, handler).await
+        };
         let mut portal = db
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
@@ -1746,7 +1795,7 @@ def handle(activations):
                             .value(0);
                     }
                     Some(PortalFrame::Barrier { .. }) => {}
-                    other => panic!("Python process output unavailable: {other:?}"),
+                    other => panic!("process output unavailable: {other:?}"),
                 }
             }
         })
@@ -2364,7 +2413,7 @@ def handle(activations):
         let worker = LocalPythonWorker::start(worker_config.clone())
             .await
             .unwrap();
-        let first = file_process_database(
+        let first = file_remote_process_database(
             &checkpoint_dir,
             &input_dir,
             &output_dir,
@@ -2412,7 +2461,7 @@ def handle(activations):
         drop(first);
 
         let replacement = LocalPythonWorker::start(worker_config).await.unwrap();
-        let restored = file_process_database(
+        let restored = file_remote_process_database(
             &checkpoint_dir,
             &input_dir,
             &output_dir,
@@ -2435,10 +2484,14 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    async fn assert_file_replay_after_host_termination(cut: HostFailureCut, test_name: &str) {
+    async fn assert_file_replay_after_host_termination(
+        cut: HostFailureCut,
+        runtime: FileHostRuntime,
+        test_name: &str,
+    ) {
         const CHILD_ENV: &str = "LAMINAR_PROCESS_HOST_FAILURE_TEST_CHILD";
         if let Some(root) = std::env::var_os(CHILD_ENV) {
-            run_host_failure_child(Path::new(&root), cut).await;
+            run_host_failure_child(Path::new(&root), cut, runtime).await;
             return;
         }
 
@@ -2495,23 +2548,31 @@ def handle(activations):
             .unwrap();
         assert_eq!(pending_id, 1);
 
-        let mut binding = descriptor();
-        binding.runtime = ProcessRuntime::RemoteRust;
         let replayed_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let handler = Arc::new(CaptureInputIds {
+        let handler: Arc<dyn NativeProcessFunction> = Arc::new(CaptureInputIds {
             ids: Arc::clone(&replayed_ids),
         });
-        let (client, shutdown, worker) =
-            worker_client(binding, handler, Duration::from_secs(5)).await;
-        let restored = file_process_database(
-            &checkpoint_dir,
-            &input_dir,
-            &output_dir,
-            "account",
-            DeliveryGuarantee::AtLeastOnce,
-            client,
-        )
-        .await;
+        let worker = match runtime {
+            FileHostRuntime::RemoteRust => {
+                let mut binding = descriptor();
+                binding.runtime = ProcessRuntime::RemoteRust;
+                Some(worker_client(binding, Arc::clone(&handler), Duration::from_secs(5)).await)
+            }
+            FileHostRuntime::NativeRust => None,
+        };
+        let restored = if let Some((client, _, _)) = &worker {
+            file_remote_process_database(
+                &checkpoint_dir,
+                &input_dir,
+                &output_dir,
+                "account",
+                DeliveryGuarantee::AtLeastOnce,
+                Arc::clone(client),
+            )
+            .await
+        } else {
+            file_native_process_database(&checkpoint_dir, &input_dir, &output_dir, handler).await
+        };
         let mut portal = restored
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
@@ -2520,8 +2581,10 @@ def handle(activations):
         assert_eq!(next_process_total(&mut portal).await, 110);
         assert!(restored.checkpoint().await.unwrap().success);
         restored.shutdown().await.unwrap();
-        shutdown.cancel();
-        worker.await.unwrap().unwrap();
+        if let Some((_, shutdown, worker)) = worker {
+            shutdown.cancel();
+            worker.await.unwrap().unwrap();
+        }
         let after_replay = match cut {
             HostFailureCut::PendingInvocation => vec![60, 110],
             HostFailureCut::PublishedOutput => vec![60, 110, 110],
@@ -2535,6 +2598,7 @@ def handle(activations):
     async fn at_least_once_file_source_and_sink_replay_same_activation_after_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PendingInvocation,
+            FileHostRuntime::RemoteRust,
             "process_function::tests::remote_pipeline::at_least_once_file_source_and_sink_replay_same_activation_after_host_termination",
         )
         .await;
@@ -2545,7 +2609,30 @@ def handle(activations):
     async fn at_least_once_file_sink_republishes_after_uncheckpointed_host_termination() {
         assert_file_replay_after_host_termination(
             HostFailureCut::PublishedOutput,
+            FileHostRuntime::RemoteRust,
             "process_function::tests::remote_pipeline::at_least_once_file_sink_republishes_after_uncheckpointed_host_termination",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_least_once_native_replays_pending_file_after_host_termination() {
+        assert_file_replay_after_host_termination(
+            HostFailureCut::PendingInvocation,
+            FileHostRuntime::NativeRust,
+            "process_function::tests::remote_pipeline::at_least_once_native_replays_pending_file_after_host_termination",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_least_once_native_republishes_file_after_host_termination() {
+        assert_file_replay_after_host_termination(
+            HostFailureCut::PublishedOutput,
+            FileHostRuntime::NativeRust,
+            "process_function::tests::remote_pipeline::at_least_once_native_republishes_file_after_host_termination",
         )
         .await;
     }
@@ -2567,7 +2654,7 @@ def handle(activations):
         let input_dir = root.join("input");
         let output_dir = root.join("output");
         let checkpoint_dir = root.join("checkpoint");
-        let db = file_process_database(
+        let db = file_remote_process_database(
             &checkpoint_dir,
             &input_dir,
             &output_dir,
@@ -2701,7 +2788,7 @@ def handle(activations):
         }
 
         let replacement = LocalPythonWorker::start(config).await.unwrap();
-        let restored = file_process_database(
+        let restored = file_remote_process_database(
             &checkpoint_dir,
             &input_dir,
             &output_dir,
