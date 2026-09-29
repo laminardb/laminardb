@@ -34,9 +34,9 @@ impl LaminarDB {
     /// caller must register the same immutable implementation when constructing a replacement
     /// database instance that restores an existing checkpoint.
     ///
-    /// The current admission profile is local best-effort execution. Checkpointed state can be
-    /// restored. Uncommitted input may be replayed when the source connector supports it;
-    /// a direct in-memory source cannot replay after a crash.
+    /// Local at-least-once execution requires a replayable connector source and checkpointing.
+    /// Source and sink contracts are verified before startup I/O. A direct in-memory source is
+    /// available only with best-effort delivery.
     /// Native code runs in the compute process and must be trusted and nonblocking.
     ///
     /// # Errors
@@ -62,7 +62,9 @@ impl LaminarDB {
         .await
     }
 
-    /// Register a connected loopback Rust or Python worker for a local best-effort pipeline.
+    /// Register a connected loopback Rust or Python worker for a local pipeline. At-least-once
+    /// delivery currently admits the Rust worker only; Python dependencies are not yet bound to
+    /// the worker package identity.
     /// The caller owns the worker process lifecycle and must keep it available until shutdown.
     ///
     /// # Errors
@@ -103,12 +105,22 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         let _topology = self.topology_ddl_lock.write().await;
         self.ensure_topology_ddl_allowed("REGISTER PROCESS FUNCTION")?;
-        if self.is_cluster_runtime()
-            || DbState::load(&self.state) != DbState::Created
-            || self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+        if self.is_cluster_runtime() || DbState::load(&self.state) != DbState::Created {
+            return Err(DbError::Unsupported(
+                "process functions currently require an offline local pipeline".into(),
+            ));
+        }
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            return Err(DbError::Unsupported(
+                "process functions do not support exactly-once delivery".into(),
+            ));
+        }
+        if self.config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce
+            && descriptor.runtime == ProcessRuntime::RemotePython
         {
             return Err(DbError::Unsupported(
-                "process functions currently require an offline local best-effort pipeline".into(),
+                "at-least-once Python process functions require immutable dependency binding"
+                    .into(),
             ));
         }
         if !valid_name(output_name) || !valid_name(source_name) || output_name == source_name {
@@ -119,6 +131,18 @@ impl LaminarDB {
         let source = self.catalog.get_source(source_name).ok_or_else(|| {
             DbError::InvalidOperation(format!("process source '{source_name}' does not exist"))
         })?;
+        if self.config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce
+            && self
+                .connector_manager
+                .lock()
+                .sources()
+                .get(source_name)
+                .is_none_or(|registration| registration.connector_type.is_none())
+        {
+            return Err(DbError::Unsupported(
+                "at-least-once process functions require a replayable connector source".into(),
+            ));
+        }
         if source.schema.as_ref() != descriptor.input_schema.as_ref() {
             return Err(DbError::InvalidOperation(
                 "process descriptor input schema differs from its source".into(),

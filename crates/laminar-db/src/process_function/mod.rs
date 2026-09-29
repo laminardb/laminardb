@@ -3,7 +3,8 @@
 //! The engine owns every value and timer. A handler receives immutable activation snapshots and
 //! returns proposed changes; its private memory is never authoritative. Native handlers execute
 //! on the compute thread and must be trusted, bounded, and nonblocking. The optional remote
-//! transport is currently restricted to local best-effort pipelines over loopback.
+//! transport is restricted to local loopback pipelines. At-least-once delivery currently admits
+//! trusted native Rust and remote Rust with replayable sources; Python remains best-effort.
 
 use std::sync::Arc;
 

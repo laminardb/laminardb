@@ -4,6 +4,7 @@ use arrow::array::{
     Array, BooleanArray, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use laminar_connectors::connector::DeliveryGuarantee;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -206,6 +207,47 @@ fn input_batch(rows: &[(&str, i64, i64)]) -> RecordBatch {
         ],
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn stronger_delivery_rejects_direct_process_source_and_exactly_once() {
+    for (delivery, expected) in [
+        (
+            DeliveryGuarantee::AtLeastOnce,
+            "replayable connector source",
+        ),
+        (
+            DeliveryGuarantee::ExactlyOnce,
+            "do not support exactly-once",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let db = LaminarDB::builder()
+            .storage_dir(directory.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
+            .delivery_guarantee(delivery)
+            .build()
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE SOURCE events (account VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .register_native_process_function(
+                "activity",
+                "events",
+                descriptor(),
+                Arc::new(AccountActivity),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(db.process_functions().is_empty());
+        db.shutdown().await.unwrap();
+    }
 }
 
 fn output_row(account: &str, kind: &str, total: i64, crossed: bool, ts: i64) -> RecordBatch {
@@ -1281,10 +1323,12 @@ def handle(activations):
         input_dir: &Path,
         output_dir: &Path,
         key_column: &str,
+        delivery: DeliveryGuarantee,
         client: Arc<RemoteProcessClient>,
     ) -> Arc<LaminarDB> {
         let db = LaminarDB::builder()
             .storage_dir(checkpoint_dir)
+            .delivery_guarantee(delivery)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
                 interval_ms: None,
                 ..Default::default()
@@ -1369,12 +1413,34 @@ def handle(activations):
                     .unwrap()
                     .value(0);
                 if amount == 50 {
-                    std::fs::write(&self.entered, []).map_err(|error| {
+                    std::fs::write(&self.entered, activation.id.to_string()).map_err(|error| {
                         DbError::Pipeline(format!("mark pending process invocation: {error}"))
                     })?;
                     std::thread::sleep(Duration::from_secs(25));
                 }
             }
+            AccountActivity.invoke(activations)
+        }
+    }
+
+    #[cfg(feature = "files")]
+    struct CaptureInputIds {
+        ids: Arc<parking_lot::Mutex<Vec<u64>>>,
+    }
+
+    #[cfg(feature = "files")]
+    impl NativeProcessFunction for CaptureInputIds {
+        fn invoke(
+            &self,
+            activations: &[ProcessActivation],
+        ) -> Result<Vec<ProcessActivationResult>, DbError> {
+            let mut ids = self.ids.lock();
+            for activation in activations {
+                if matches!(&activation.callback, ProcessCallback::Input(_)) {
+                    ids.push(activation.id);
+                }
+            }
+            drop(ids);
             AccountActivity.invoke(activations)
         }
     }
@@ -1394,8 +1460,15 @@ def handle(activations):
             Duration::from_secs(30),
         )
         .await;
-        let db = file_process_database(&checkpoint_dir, &input_dir, &output_dir, "account", client)
-            .await;
+        let db = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "account",
+            DeliveryGuarantee::AtLeastOnce,
+            client,
+        )
+        .await;
         let mut portal = db
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
@@ -1732,6 +1805,46 @@ def handle(activations):
         worker.await.unwrap().unwrap();
     }
 
+    #[tokio::test]
+    async fn python_at_least_once_requires_bound_dependencies() {
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let worker = LocalPythonWorker::start(python_config(python))
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let db = LaminarDB::builder()
+            .storage_dir(directory.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .build()
+            .await
+            .unwrap();
+        db.execute(
+            "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        let error = db
+            .register_remote_process_function(
+                "activity",
+                "events",
+                worker.client().descriptor().clone(),
+                worker.client(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("immutable dependency binding"),
+            "{error}"
+        );
+        assert!(db.process_functions().is_empty());
+        db.shutdown().await.unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn supervised_python_worker_emits_through_running_database() {
         let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
@@ -2018,6 +2131,7 @@ def handle(activations):
             &input_dir,
             &output_dir,
             "key",
+            DeliveryGuarantee::BestEffort,
             worker.client(),
         )
         .await;
@@ -2065,6 +2179,7 @@ def handle(activations):
             &input_dir,
             &output_dir,
             "key",
+            DeliveryGuarantee::BestEffort,
             replacement.client(),
         )
         .await;
@@ -2083,7 +2198,7 @@ def handle(activations):
 
     #[cfg(feature = "files")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn file_source_and_sink_recover_pending_input_after_host_termination() {
+    async fn at_least_once_file_source_and_sink_replay_same_activation_after_host_termination() {
         const CHILD_ENV: &str = "LAMINAR_PROCESS_HOST_FAILURE_TEST_CHILD";
         if let Some(root) = std::env::var_os(CHILD_ENV) {
             run_host_failure_child(Path::new(&root)).await;
@@ -2101,7 +2216,7 @@ def handle(activations):
         child
             .args([
                 "--exact",
-                "process_function::tests::remote_pipeline::file_source_and_sink_recover_pending_input_after_host_termination",
+                "process_function::tests::remote_pipeline::at_least_once_file_source_and_sink_replay_same_activation_after_host_termination",
                 "--nocapture",
             ])
             .env(CHILD_ENV, root)
@@ -2133,14 +2248,29 @@ def handle(activations):
             .unwrap();
         assert!(!status.success());
         assert_eq!(published_file_totals(&output_dir), vec![60]);
+        let pending_id = std::fs::read_to_string(root.join("invocation-entered"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(pending_id, 1);
 
         let mut binding = descriptor();
         binding.runtime = ProcessRuntime::RemoteRust;
+        let replayed_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let handler = Arc::new(CaptureInputIds {
+            ids: Arc::clone(&replayed_ids),
+        });
         let (client, shutdown, worker) =
-            worker_client(binding, Arc::new(AccountActivity), Duration::from_secs(5)).await;
-        let restored =
-            file_process_database(&checkpoint_dir, &input_dir, &output_dir, "account", client)
-                .await;
+            worker_client(binding, handler, Duration::from_secs(5)).await;
+        let restored = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "account",
+            DeliveryGuarantee::AtLeastOnce,
+            client,
+        )
+        .await;
         let mut portal = restored
             .open_subscription("activity", None, SubscribeStart::Tail)
             .await
@@ -2152,6 +2282,7 @@ def handle(activations):
         shutdown.cancel();
         worker.await.unwrap().unwrap();
         assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
+        assert_eq!(replayed_ids.lock().as_slice(), &[pending_id]);
     }
 
     #[tokio::test]
