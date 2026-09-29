@@ -2334,6 +2334,147 @@ def handle(activations):
         .await;
     }
 
+    #[cfg(feature = "files")]
+    async fn run_python_host_loss_child(root: &Path, endpoint: &str) {
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest =
+            std::fs::read(repository.join("examples/process_python/manifest.json")).unwrap();
+        let descriptor = ProcessFunctionDescriptor::from_manifest_json(&manifest).unwrap();
+        let client =
+            RemoteProcessClient::connect_loopback(endpoint, descriptor, 2, Duration::from_secs(15))
+                .await
+                .unwrap();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let checkpoint_dir = root.join("checkpoint");
+        let db = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "key",
+            DeliveryGuarantee::BestEffort,
+            Arc::new(client),
+        )
+        .await;
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+        publish_file_input(
+            root,
+            &input_dir,
+            "first.json",
+            serde_json::json!({"key": "a", "amount": 60, "ts": 100_000}),
+        );
+        assert_eq!(next_process_total(&mut portal).await, 60);
+        assert!(db.checkpoint().await.unwrap().success);
+        assert_eq!(published_file_totals(&output_dir), vec![60]);
+        publish_file_input(
+            root,
+            &input_dir,
+            "second.json",
+            serde_json::json!({"key": "a", "amount": 50, "ts": 100_050}),
+        );
+        assert_eq!(next_process_total(&mut portal).await, 110);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while published_file_totals(&output_dir) != [60, 110] {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("second Python output was not durably published");
+        std::fs::write(root.join("output-published"), b"ready").unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        panic!("Python host loss test child was not terminated");
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn python_file_sink_replays_after_separately_supervised_host_loss() {
+        const CHILD_ENV: &str = "LAMINAR_PROCESS_PYTHON_HOST_LOSS_CHILD";
+        const ENDPOINT_ENV: &str = "LAMINAR_PROCESS_PYTHON_HOST_LOSS_ENDPOINT";
+        if let Some(root) = std::env::var_os(CHILD_ENV) {
+            let endpoint = std::env::var(ENDPOINT_ENV).unwrap();
+            run_python_host_loss_child(Path::new(&root), &endpoint).await;
+            return;
+        }
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let input_dir = root.join("input");
+        let output_dir = root.join("output");
+        let checkpoint_dir = root.join("checkpoint");
+        std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
+
+        let mut config = python_config(python.clone());
+        config.timeout = Duration::from_secs(15);
+        let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "process_function::tests::remote_pipeline::python_file_sink_replays_after_separately_supervised_host_loss",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, root)
+            .env(ENDPOINT_ENV, worker.loopback_endpoint())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        let mut child = child.spawn().unwrap();
+        let published = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if root.join("output-published").exists() {
+                    return;
+                }
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("Python host loss child exited before output publication: {status}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if published.is_err() {
+            child.start_kill().unwrap();
+            let _ = child.wait().await;
+            panic!("Python host loss child did not publish the second output");
+        }
+        child.start_kill().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        assert!(worker.is_alive());
+        assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
+        worker.shutdown().await.unwrap();
+
+        let replacement = LocalPythonWorker::start(config).await.unwrap();
+        let restored = file_process_database(
+            &checkpoint_dir,
+            &input_dir,
+            &output_dir,
+            "key",
+            DeliveryGuarantee::BestEffort,
+            replacement.client(),
+        )
+        .await;
+        let mut portal = restored
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        restored.start().await.unwrap();
+        assert_eq!(next_process_total(&mut portal).await, 110);
+        assert!(restored.checkpoint().await.unwrap().success);
+        restored.shutdown().await.unwrap();
+        replacement.shutdown().await.unwrap();
+        assert_eq!(published_file_totals(&output_dir), vec![60, 110, 110]);
+    }
+
     #[tokio::test]
     async fn local_python_worker_rejects_changed_handler_before_spawn() {
         let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

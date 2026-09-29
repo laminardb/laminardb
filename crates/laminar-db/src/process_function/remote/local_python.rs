@@ -43,6 +43,8 @@ pub struct LocalPythonWorker {
     supervisor: Option<tokio::task::JoinHandle<Result<(), DbError>>>,
     #[cfg(test)]
     process_id: u32,
+    #[cfg(test)]
+    endpoint: String,
 }
 
 struct VerifiedBinding {
@@ -205,6 +207,8 @@ impl LocalPythonWorker {
             supervisor: Some(supervisor),
             #[cfg(test)]
             process_id,
+            #[cfg(test)]
+            endpoint,
         })
     }
 
@@ -223,6 +227,11 @@ impl LocalPythonWorker {
     #[cfg(test)]
     pub(crate) const fn process_id(&self) -> u32 {
         self.process_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loopback_endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Wait until the supervisor has observed and reaped the worker process.
