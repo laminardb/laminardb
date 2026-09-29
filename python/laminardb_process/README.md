@@ -8,11 +8,23 @@ not managed state.
 
 ## Local worker quickstart
 
-Use Python 3.13. From the repository root:
+Use Python 3.13 in a virtual environment. From the repository root on Bash:
 
 ```bash
-python -m pip install -r python/laminardb_process/requirements.lock
-python -m pip install --no-deps ./python/laminardb_process
+python3.13 -m venv .venv
+export LAMINAR_PROCESS_PYTHON="$PWD/.venv/bin/python"
+"$LAMINAR_PROCESS_PYTHON" -m pip install -r python/laminardb_process/requirements.lock
+"$LAMINAR_PROCESS_PYTHON" -m pip install --no-deps ./python/laminardb_process
+cargo run -p laminar-db --no-default-features --features process-remote --example process_python
+```
+
+On PowerShell:
+
+```powershell
+py -3.13 -m venv .venv
+$env:LAMINAR_PROCESS_PYTHON = (Resolve-Path .venv/Scripts/python.exe).Path
+& $env:LAMINAR_PROCESS_PYTHON -m pip install -r python/laminardb_process/requirements.lock
+& $env:LAMINAR_PROCESS_PYTHON -m pip install --no-deps ./python/laminardb_process
 cargo run -p laminar-db --no-default-features --features process-remote --example process_python
 ```
 
@@ -133,7 +145,11 @@ invocation; one final file newline is ignored. `LocalPythonWorker` verifies the
 direct handler file before launch. The child checks the same digest and executes
 the verified source bytes, including when a stale Python bytecode cache exists.
 Imported modules and data still need an immutable package binding before replay
-claims. One invocation contains distinct keys from one vnode. Results may emit
+claims. The supervised child uses the handler directory and configured
+`python_paths`; it ignores the host's `PYTHONPATH`, Python user site, implicit
+current-directory imports, and `PYTHONHOME`. Install dependencies into the
+selected virtual environment or provide explicit import roots. One invocation
+contains distinct keys from one vnode. Results may emit
 zero or more Arrow batches and propose state/timer changes, but the host applies
 only a complete validated response.
 

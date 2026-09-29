@@ -25,7 +25,8 @@ pub struct LocalPythonWorkerConfig {
     pub handler_file: PathBuf,
     /// Function name exported by `handler_file`.
     pub function: String,
-    /// Additional import roots, used for a local SDK installation or locked dependencies.
+    /// Explicit import roots for the SDK and handler dependencies. The child does not inherit
+    /// the host's `PYTHONPATH` or Python user site.
     pub python_paths: Vec<PathBuf>,
     /// Maximum simultaneous worker calls. The process and client use the same limit.
     pub max_in_flight: usize,
@@ -135,13 +136,11 @@ impl LocalPythonWorker {
                 DbError::Config(format!("resolve Python import root: {error}"))
             })?);
         }
-        if let Some(existing) = std::env::var_os("PYTHONPATH") {
-            paths.extend(std::env::split_paths(&existing));
-        }
         let python_path = std::env::join_paths(paths)
             .map_err(|error| DbError::Config(format!("Python import path: {error}")))?;
         let mut command = Command::new(&config.python);
         command
+            .args(["-s", "-P"])
             .current_dir(handler_directory)
             .args(["-m", "laminardb_process.worker", "--manifest"])
             .arg(&binding.manifest)
@@ -154,6 +153,7 @@ impl LocalPythonWorker {
             .args(["--bind", "127.0.0.1:0", "--max-in-flight"])
             .arg(config.max_in_flight.to_string())
             .env("PYTHONPATH", python_path)
+            .env_remove("PYTHONHOME")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);

@@ -2779,6 +2779,67 @@ def handle(activations):
         assert!(error.to_string().contains("digest differs"), "{error}");
     }
 
+    #[tokio::test]
+    async fn local_python_worker_ignores_ambient_pythonpath() {
+        const CHILD_ROOT: &str = "LAMINAR_PROCESS_AMBIENT_PATH_CHILD";
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let handler_dir = Path::new(&root).join("handler");
+            let baseline = python_test_handler_config(
+                &python,
+                &handler_dir,
+                "def handle(_activations):\n    return ()\n",
+            );
+            LocalPythonWorker::start(baseline)
+                .await
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+            let imported = python_test_handler_config(
+                &python,
+                &handler_dir,
+                "import laminar_process_ambient_path_fixture\n\ndef handle(_activations):\n    return ()\n",
+            );
+            assert!(LocalPythonWorker::start(imported).await.is_err());
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let handler_dir = directory.path().join("handler");
+        let ambient_dir = directory.path().join("ambient");
+        std::fs::create_dir(&handler_dir).unwrap();
+        std::fs::create_dir(&ambient_dir).unwrap();
+        std::fs::write(
+            ambient_dir.join("laminar_process_ambient_path_fixture.py"),
+            "VALUE = 1\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_function::tests::remote_pipeline::local_python_worker_ignores_ambient_pythonpath",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, directory.path())
+            .env("PYTHONPATH", ambient_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("No module named 'laminar_process_ambient_path_fixture'"),
+            "unexpected child stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     fn input_schema_for_python() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("key", DataType::Utf8, false),
