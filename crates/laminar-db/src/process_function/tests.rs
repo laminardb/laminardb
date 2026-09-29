@@ -1392,12 +1392,20 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    struct PauseSecondFile {
-        entered: std::path::PathBuf,
+    #[derive(Clone, Copy)]
+    enum HostFailureCut {
+        PendingInvocation,
+        PublishedOutput,
     }
 
     #[cfg(feature = "files")]
-    impl NativeProcessFunction for PauseSecondFile {
+    struct MarkSecondFile {
+        entered: std::path::PathBuf,
+        cut: HostFailureCut,
+    }
+
+    #[cfg(feature = "files")]
+    impl NativeProcessFunction for MarkSecondFile {
         fn invoke(
             &self,
             activations: &[ProcessActivation],
@@ -1416,7 +1424,9 @@ def handle(activations):
                     std::fs::write(&self.entered, activation.id.to_string()).map_err(|error| {
                         DbError::Pipeline(format!("mark pending process invocation: {error}"))
                     })?;
-                    std::thread::sleep(Duration::from_secs(25));
+                    if matches!(self.cut, HostFailureCut::PendingInvocation) {
+                        std::thread::sleep(Duration::from_secs(25));
+                    }
                 }
             }
             AccountActivity.invoke(activations)
@@ -1446,7 +1456,7 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    async fn run_host_failure_child(root: &Path) {
+    async fn run_host_failure_child(root: &Path, cut: HostFailureCut) {
         let input_dir = root.join("input");
         let output_dir = root.join("output");
         let checkpoint_dir = root.join("checkpoint");
@@ -1454,8 +1464,9 @@ def handle(activations):
         binding.runtime = ProcessRuntime::RemoteRust;
         let (client, _shutdown, _worker) = worker_client(
             binding,
-            Arc::new(PauseSecondFile {
+            Arc::new(MarkSecondFile {
                 entered: root.join("invocation-entered"),
+                cut,
             }),
             Duration::from_secs(30),
         )
@@ -1489,8 +1500,19 @@ def handle(activations):
             "second.json",
             serde_json::json!({"account": "a", "amount": 50, "ts": 100_005}),
         );
+        if matches!(cut, HostFailureCut::PublishedOutput) {
+            assert_eq!(next_process_total(&mut portal).await, 110);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while published_file_totals(&output_dir) != [60, 110] {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("second file output was not durably published");
+            std::fs::write(root.join("output-published"), b"ready").unwrap();
+        }
         tokio::time::sleep(Duration::from_secs(20)).await;
-        panic!("host failure test child was not terminated during the pending invocation");
+        panic!("host failure test child was not terminated at the selected cut");
     }
 
     async fn next_process_total(portal: &mut SubscriptionPortal) -> i64 {
@@ -2197,11 +2219,10 @@ def handle(activations):
     }
 
     #[cfg(feature = "files")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn at_least_once_file_source_and_sink_replay_same_activation_after_host_termination() {
+    async fn assert_file_replay_after_host_termination(cut: HostFailureCut, test_name: &str) {
         const CHILD_ENV: &str = "LAMINAR_PROCESS_HOST_FAILURE_TEST_CHILD";
         if let Some(root) = std::env::var_os(CHILD_ENV) {
-            run_host_failure_child(Path::new(&root)).await;
+            run_host_failure_child(Path::new(&root), cut).await;
             return;
         }
 
@@ -2214,23 +2235,23 @@ def handle(activations):
         std::fs::create_dir(&output_dir).unwrap();
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
         child
-            .args([
-                "--exact",
-                "process_function::tests::remote_pipeline::at_least_once_file_source_and_sink_replay_same_activation_after_host_termination",
-                "--nocapture",
-            ])
+            .args(["--exact", test_name, "--nocapture"])
             .env(CHILD_ENV, root)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
         let mut child = child.spawn().unwrap();
+        let marker = match cut {
+            HostFailureCut::PendingInvocation => "invocation-entered",
+            HostFailureCut::PublishedOutput => "output-published",
+        };
         let entered = tokio::time::timeout(Duration::from_secs(12), async {
             loop {
-                if root.join("invocation-entered").exists() {
+                if root.join(marker).exists() {
                     return;
                 }
                 if let Some(status) = child.try_wait().unwrap() {
-                    panic!("host failure child exited before pending invocation: {status}");
+                    panic!("host failure child exited before {marker}: {status}");
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -2239,7 +2260,7 @@ def handle(activations):
         if entered.is_err() {
             child.start_kill().unwrap();
             let _ = child.wait().await;
-            panic!("host failure child did not enter the pending invocation");
+            panic!("host failure child did not reach {marker}");
         }
         child.start_kill().unwrap();
         let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -2247,7 +2268,11 @@ def handle(activations):
             .unwrap()
             .unwrap();
         assert!(!status.success());
-        assert_eq!(published_file_totals(&output_dir), vec![60]);
+        let before_replay = match cut {
+            HostFailureCut::PendingInvocation => vec![60],
+            HostFailureCut::PublishedOutput => vec![60, 110],
+        };
+        assert_eq!(published_file_totals(&output_dir), before_replay);
         let pending_id = std::fs::read_to_string(root.join("invocation-entered"))
             .unwrap()
             .parse::<u64>()
@@ -2281,8 +2306,32 @@ def handle(activations):
         restored.shutdown().await.unwrap();
         shutdown.cancel();
         worker.await.unwrap().unwrap();
-        assert_eq!(published_file_totals(&output_dir), vec![60, 110]);
+        let after_replay = match cut {
+            HostFailureCut::PendingInvocation => vec![60, 110],
+            HostFailureCut::PublishedOutput => vec![60, 110, 110],
+        };
+        assert_eq!(published_file_totals(&output_dir), after_replay);
         assert_eq!(replayed_ids.lock().as_slice(), &[pending_id]);
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_least_once_file_source_and_sink_replay_same_activation_after_host_termination() {
+        assert_file_replay_after_host_termination(
+            HostFailureCut::PendingInvocation,
+            "process_function::tests::remote_pipeline::at_least_once_file_source_and_sink_replay_same_activation_after_host_termination",
+        )
+        .await;
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_least_once_file_sink_republishes_after_uncheckpointed_host_termination() {
+        assert_file_replay_after_host_termination(
+            HostFailureCut::PublishedOutput,
+            "process_function::tests::remote_pipeline::at_least_once_file_sink_republishes_after_uncheckpointed_host_termination",
+        )
+        .await;
     }
 
     #[tokio::test]
