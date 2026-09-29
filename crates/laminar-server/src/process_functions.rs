@@ -139,10 +139,31 @@ mod tests {
 
     use arrow_array::{Array, Int64Array};
     use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
-    use laminar_db::subscription::{PortalFrame, SubscribeStart};
+    use laminar_db::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
     use laminar_db::DeliveryGuarantee;
 
     use super::*;
+
+    async fn next_total(portal: &mut SubscriptionPortal) -> Option<i64> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match portal.next_frame().await {
+                    Some(PortalFrame::Batch { batch, .. }) => {
+                        let values = batch.column(1).as_any().downcast_ref::<Int64Array>()?;
+                        if !values.is_empty() {
+                            return Some(values.value(0));
+                        }
+                    }
+                    Some(PortalFrame::Barrier { .. }) => {}
+                    Some(PortalFrame::Error { .. }) | Some(PortalFrame::Lagged(_)) | None => {
+                        return None;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn configured_python_function_accepts_sql_input() {
@@ -184,26 +205,76 @@ mod tests {
             ))
             .await
             .unwrap();
-            let total = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match portal.next_frame().await {
-                        Some(PortalFrame::Batch { batch, .. }) => {
-                            let values = batch.column(1).as_any().downcast_ref::<Int64Array>()?;
-                            if !values.is_empty() {
-                                return Some(values.value(0));
-                            }
-                        }
-                        Some(PortalFrame::Barrier { .. }) => {}
-                        Some(PortalFrame::Error { .. }) | Some(PortalFrame::Lagged(_)) | None => {
-                            return None;
-                        }
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(total, Some(expected));
+            assert_eq!(next_total(&mut portal).await, Some(expected));
             db.checkpoint().await.unwrap();
+            db.shutdown().await.unwrap();
+            shutdown(workers).await.unwrap();
+        }
+    }
+
+    #[cfg(feature = "files")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn configured_python_function_restores_file_source_cursor() {
+        let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config_path = repository.join("examples/process_python/server.toml");
+        let mut config = crate::config::load_config(&config_path).unwrap();
+        config.process_functions[0].python = python.into();
+        if let Some(dependencies) = std::env::var_os("LAMINAR_PROCESS_PYTHON_DEPS") {
+            let path = PathBuf::from(dependencies);
+            config.process_functions[0]
+                .python_paths
+                .push(if path.is_absolute() {
+                    path
+                } else {
+                    repository.join(path)
+                });
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let input_dir = directory.path().join("input");
+        let checkpoint_dir = directory.path().join("checkpoint");
+        std::fs::create_dir(&input_dir).unwrap();
+        let input_path = input_dir.display().to_string().replace('\\', "/");
+        config.process_functions[0].source_sql = format!(
+            "CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, \
+             ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND) \
+             FROM FILES ('path' = '{input_path}', 'glob_pattern' = '*.json', \
+             'stabilisation_delay' = '100ms') FORMAT JSON"
+        );
+        crate::config::validate_process_functions(&config).unwrap();
+
+        for (name, amount, timestamp, expected) in [
+            ("first.json", 60, 100_000, 60),
+            ("second.json", 50, 100_050, 110),
+        ] {
+            let db = LaminarDB::builder()
+                .storage_dir(&checkpoint_dir)
+                .checkpoint(StreamCheckpointConfig {
+                    interval_ms: None,
+                    ..Default::default()
+                })
+                .delivery_guarantee(DeliveryGuarantee::BestEffort)
+                .build()
+                .await
+                .unwrap();
+            let workers = install(&db, &config, &config_path).await.unwrap();
+            let mut portal = db
+                .open_subscription("activity", None, SubscribeStart::Tail)
+                .await
+                .unwrap();
+            db.start().await.unwrap();
+            let staged = directory.path().join("staged.json");
+            let mut row = serde_json::to_vec(&serde_json::json!({
+                "key": "a", "amount": amount, "ts": timestamp
+            }))
+            .unwrap();
+            row.push(b'\n');
+            std::fs::write(&staged, row).unwrap();
+            std::fs::rename(staged, input_dir.join(name)).unwrap();
+            assert_eq!(next_total(&mut portal).await, Some(expected));
+            assert!(db.checkpoint().await.unwrap().success);
             db.shutdown().await.unwrap();
             shutdown(workers).await.unwrap();
         }
