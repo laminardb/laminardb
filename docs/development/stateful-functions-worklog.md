@@ -245,6 +245,12 @@ On the same Windows AMD Ryzen 9 7900X development host, the debug-profile test e
 
 Validation: the focused normal test and the ignored manual stress test passed. The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial execution: 1,977 connectors, 973 core, 2,026 database (two ignored, including the manual stress), and 870 SQL tests. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The known unadjusted Windows test-stack failure remains.
 
+### Continuation: configured Python worker saturation and input-byte admission (2026-09-30)
+
+A single-node `run_server` regression sets the Python binding to one in-flight call and the manifest to one activation per transport batch. The handler holds the first FILES JSON record while 31 more distinct-key files arrive; after a 500 ms saturated interval, only one worker invocation has entered and no sink output is visible. Releasing it yields 32 output files. The server config binds a 512 KiB source FIFO and graph input buffer, while the function manifest caps each input step at 32 rows and 128 KiB. A later valid JSON file with a 256 KiB key causes an input-budget fault before another handler call; the 32 published outputs remain unchanged. The test then exits the worker and observes whole-server shutdown. Each FILES JSON input is one complete JSON object per file; a newline-delimited multi-object file is not this connector's format contract. This verifies configured worker-slot and function input-byte admission under one bounded backlog, not sustained worker RSS, actual source FIFO occupancy, target tail latency, or Python `AtLeastOnce`. No production or coordinator-cycle code changed.
+
+Validation: the focused test and the full Python-enabled `--no-default-features --features process-remote,files` server binary suite passed (268 tests). The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial execution: 1,977 connectors, 973 core, 2,026 database (two ignored), and 870 SQL tests. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The known unadjusted Windows test-stack failure remains.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -258,4 +264,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Qualify single-node server process-function admission budgets under load, including worker saturation and bounded pending bytes. Bind Python's interpreter, SDK, PyArrow, gRPC, and imported dependency closure immutably before considering `AtLeastOnce`. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.
+Sample server and Python worker RSS through prolonged saturation and measure pending source/graph bytes against configured limits. Bind Python's interpreter, SDK, PyArrow, gRPC, and imported dependency closure immutably before considering `AtLeastOnce`. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.

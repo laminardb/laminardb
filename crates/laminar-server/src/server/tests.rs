@@ -495,9 +495,10 @@ fn process_failure_handler(
         serde_json::to_string(&root.join("worker-exiting").to_string_lossy()).unwrap();
     let entered_literal =
         serde_json::to_string(&root.join("second-entered").to_string_lossy()).unwrap();
-    let hold_literal = serde_json::to_string(&root.join("hold-second").to_string_lossy()).unwrap();
+    let hold_literal =
+        serde_json::to_string(&root.join("hold-invocation").to_string_lossy()).unwrap();
     let release_literal =
-        serde_json::to_string(&root.join("release-second").to_string_lossy()).unwrap();
+        serde_json::to_string(&root.join("release-invocation").to_string_lossy()).unwrap();
     let base =
         std::fs::read_to_string(repository.join("examples/process_python/handler.py")).unwrap();
     let handler = format!(
@@ -531,7 +532,8 @@ def handle(activations):
         if _hold.exists():
             while not _release.exists():
                 _time.sleep(0.01)
-            _exit_now()
+            if _exit.exists():
+                _exit_now()
         if _fail.exists():
             _exit_now()
     return _original_handle(activations)
@@ -753,7 +755,7 @@ async fn assert_configured_process_recovery_after_host_loss(
     let cut_result: anyhow::Result<()> = async {
         wait_for_server_host_marker(&mut host, &root.join("first-checkpointed")).await?;
         if matches!(cut, ServerHostLossCut::PendingInvocation) {
-            std::fs::write(root.join("hold-second"), [])?;
+            std::fs::write(root.join("hold-invocation"), [])?;
         }
         publish_process_file(root, "second.json", 50, 100_050)?;
         wait_for_server_host_marker(&mut host, &root.join(cut_marker)).await
@@ -762,7 +764,7 @@ async fn assert_configured_process_recovery_after_host_loss(
     let kill_result = host.start_kill();
     // Abrupt host termination bypasses its worker supervisor.
     let exit_signal = std::fs::write(root.join("exit-worker"), []);
-    let release_signal = std::fs::write(root.join("release-second"), []);
+    let release_signal = std::fs::write(root.join("release-invocation"), []);
     let host_status = tokio::time::timeout(Duration::from_secs(5), host.wait()).await;
     let worker_exit = tokio::time::timeout(Duration::from_secs(10), async {
         while !root.join("worker-exiting").exists() {
@@ -790,10 +792,10 @@ async fn assert_configured_process_recovery_after_host_loss(
         ["1"]
     );
     std::fs::remove_file(root.join("exit-worker")).unwrap();
-    std::fs::remove_file(root.join("release-second")).unwrap();
+    std::fs::remove_file(root.join("release-invocation")).unwrap();
     std::fs::remove_file(root.join("worker-exiting")).unwrap();
     if matches!(cut, ServerHostLossCut::PendingInvocation) {
-        std::fs::remove_file(root.join("hold-second")).unwrap();
+        std::fs::remove_file(root.join("hold-invocation")).unwrap();
     }
 
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -861,6 +863,127 @@ async fn configured_file_process_republishes_uncheckpointed_output_after_server_
         "server::tests::configured_file_process_republishes_uncheckpointed_output_after_server_host_loss",
     )
     .await;
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_python_process_limits_worker_slots_and_input_bytes() {
+    let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let config_path = repository.join("examples/process_python/server.toml");
+    let mut config = file_process_server_config(root, &repository, python.into());
+    config.process_functions[0].max_in_flight = 1;
+    config.server.source_queue_max_bytes = 512 * 1024;
+    config.server.pipeline_max_input_buf_bytes = Some(512 * 1024);
+    let manifest = &config.process_functions[0].manifest;
+    let mut descriptor =
+        laminar_db::process_function::ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(manifest).unwrap(),
+        )
+        .unwrap();
+    descriptor.limits.max_batch_rows = 1;
+    descriptor.limits.max_input_rows = 32;
+    descriptor.limits.max_input_bytes = 128 * 1024;
+    std::fs::write(manifest, descriptor.to_manifest_json().unwrap()).unwrap();
+
+    let hold = root.join("hold-invocation");
+    let release = root.join("release-invocation");
+    let entered = root.join("second-entered");
+    std::fs::write(&hold, []).unwrap();
+    let server = run_server(config, config_path).await.unwrap();
+    let db = match &server.runtime {
+        ServerRuntime::Single(runtime) => Arc::clone(&runtime.db),
+        #[cfg(feature = "cluster")]
+        ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
+    };
+    publish_process_file(root, "first.json", 50, 100_000).unwrap();
+    let entered_call = tokio::time::timeout(Duration::from_secs(10), async {
+        while !entered.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if entered_call.is_err() {
+        let fault = db.last_fault();
+        let stopped = tokio::spawn(server.wait_for_shutdown());
+        std::fs::write(root.join("exit-worker"), []).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stopped).await;
+        panic!("Python worker did not enter the held invocation; fault: {fault:?}");
+    }
+    for index in 1..32 {
+        let row = serde_json::json!({
+            "key": format!("key_{index}"), "amount": 50, "ts": 100_000
+        });
+        let staged = root.join("staged.json");
+        std::fs::write(&staged, format!("{row}\n")).unwrap();
+        std::fs::rename(
+            staged,
+            root.join("input").join(format!("more_{index}.json")),
+        )
+        .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held_calls = std::fs::read_to_string(&entered).unwrap().lines().count();
+    let held_output = process_sink_totals(&root.join("output"));
+    let held_fault = db.last_fault();
+
+    std::fs::write(release, []).unwrap();
+    let published = tokio::time::timeout(Duration::from_secs(10), async {
+        while process_sink_totals(&root.join("output")) != vec![50; 32] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if published.is_err() {
+        let fault = db.last_fault();
+        let totals = process_sink_totals(&root.join("output"));
+        let entered_count = std::fs::read_to_string(&entered).unwrap().lines().count();
+        let stopped = tokio::spawn(server.wait_for_shutdown());
+        std::fs::write(root.join("exit-worker"), []).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), stopped).await;
+        panic!("queued calls did not publish; fault: {fault:?}, totals: {totals:?}, entered: {entered_count}");
+    }
+    let drained_calls = std::fs::read_to_string(&entered).unwrap().lines().count();
+    let oversized = serde_json::json!({
+        "key": "x".repeat(256 * 1024), "amount": 1, "ts": 100_050
+    });
+    let staged = root.join("staged.json");
+    std::fs::write(&staged, format!("{oversized}\n")).unwrap();
+    std::fs::rename(staged, root.join("input/oversized.json")).unwrap();
+    let fault = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(fault) = db.last_fault() {
+                break fault;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    let stopped = tokio::spawn(server.wait_for_shutdown());
+    std::fs::write(root.join("exit-worker"), []).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), stopped)
+        .await
+        .expect("server did not stop after worker exit")
+        .unwrap();
+    assert_eq!(held_calls, 1);
+    assert!(held_output.is_empty());
+    assert!(held_fault.is_none(), "{held_fault:?}");
+    assert_eq!(drained_calls, 32);
+    let fault = fault.expect("oversized input did not fault the process pipeline");
+    assert!(fault.contains("process input budget exceeded"), "{fault}");
+    assert_eq!(process_sink_totals(&root.join("output")), vec![50; 32]);
+    assert_eq!(
+        std::fs::read_to_string(&entered).unwrap().lines().count(),
+        32
+    );
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("process worker 0 exited"));
+    assert!(db.is_closed());
 }
 
 fn make_source(name: &str, connector: &str) -> SourceConfig {
