@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -19,6 +20,7 @@ use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
 /// an optional environment binding checks deployment drift without certifying replay equivalence.
 /// On Windows, bound launches also retain read-share handles to inventoried files.
+/// Bound launches compile filesystem source modules without reading their bytecode caches.
 #[derive(Clone)]
 pub struct LocalPythonWorkerConfig {
     /// Python executable or a trusted executable name resolved by the host environment.
@@ -159,8 +161,14 @@ impl VerifiedBinding {
             let paths = serde_json::to_string(&self.environment.import_roots).map_err(|error| {
                 DbError::Config(format!("encode bound Python import paths: {error}"))
             })?;
+            // A regular-file prefix makes source cache paths unresolvable, including imports
+            // before bootstrap. The inventoried executable is already guarded on Windows.
+            let mut cache_prefix = OsString::from("pycache_prefix=");
+            cache_prefix.push(&self.environment.python);
             command
-                .args(["-I", "-S", "-B", "-c"])
+                .args(["-I", "-S", "-B", "-X"])
+                .arg(cache_prefix)
+                .arg("-c")
                 .arg(include_str!("python_environment/bootstrap.py"))
                 .arg(root)
                 .arg(paths)

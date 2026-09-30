@@ -2461,6 +2461,159 @@ def handle(activations):
     }
 
     #[cfg(windows)]
+    fn bytecode_test_runtime(
+        python: &str,
+        runtime: &Path,
+        destination: &Path,
+    ) -> std::path::PathBuf {
+        let script = r#"
+from pathlib import Path
+import os
+import py_compile
+import shutil
+import sys
+
+runtime, executable, destination = map(Path, sys.argv[1:])
+destination.mkdir()
+shutil.copy2(executable, destination / executable.name)
+for library in runtime.glob('*.dll'):
+    shutil.copy2(library, destination / library.name)
+for name in ('Lib', 'DLLs'):
+    shutil.copytree(runtime / name, destination / name,
+                    ignore=shutil.ignore_patterns('site-packages', '__pycache__'))
+
+# encodings is imported before the interpreter executes -c or our bootstrap.
+source = destination / 'Lib' / 'encodings' / '__init__.py'
+original = source.read_bytes()
+poison = b"raise RuntimeError('early timestamp cache executed')\n"
+source.write_bytes(poison.ljust(len(original), b'\n'))
+os.utime(source, (1500000000, 1500000000))
+py_compile.compile(str(source), doraise=True,
+                   invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+source.write_bytes(original)
+os.utime(source, (1500000000, 1500000000))
+"#;
+        let output = std::process::Command::new(python)
+            .args(["-I", "-S", "-B", "-c", script])
+            .arg(runtime)
+            .arg(python)
+            .arg(destination)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        destination.join(Path::new(python).file_name().unwrap())
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn environment_bound_python_ignores_source_caches_before_and_after_startup() {
+        let (Ok(python), Some(runtime)) = (
+            std::env::var("LAMINAR_PROCESS_PYTHON"),
+            std::env::var_os("LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT"),
+        ) else {
+            return;
+        };
+        let package = tempfile::tempdir().unwrap();
+        let runtime_copy = package.path().join("runtime");
+        let copied_python = bytecode_test_runtime(&python, Path::new(&runtime), &runtime_copy);
+        let control = std::process::Command::new(&copied_python)
+            .args(["-I", "-S", "-B", "-c", "pass"])
+            .output()
+            .unwrap();
+        assert!(!control.status.success());
+        assert!(String::from_utf8_lossy(&control.stderr).contains("early timestamp cache executed"));
+
+        let config = environment_bound_python_config(
+            copied_python.to_str().unwrap(),
+            &runtime_copy,
+            package.path(),
+        );
+        let handlers = config.handler_file.parent().unwrap();
+        let lazy = handlers.join("lazy_module.py");
+        let script = r#"
+from pathlib import Path
+import os
+import py_compile
+import sys
+
+root = Path(sys.argv[1])
+helper = root / 'environment_helper.py'
+original = helper.read_bytes()
+helper.write_bytes(b"raise RuntimeError('eager timestamp cache executed')\n"
+                  .ljust(len(original), b'\n'))
+os.utime(helper, (1500000000, 1500000000))
+py_compile.compile(str(helper), doraise=True,
+                   invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+helper.write_bytes(original)
+os.utime(helper, (1500000000, 1500000000))
+
+for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
+                   ('unchecked_module', py_compile.PycInvalidationMode.UNCHECKED_HASH)]:
+    source = root / (name + '.py')
+    source.write_bytes(b'VALUE = 9\n')
+    os.utime(source, (1500000000, 1500000000))
+    py_compile.compile(str(source), doraise=True, invalidation_mode=mode)
+    source.write_bytes(b'VALUE = 1\n')
+    os.utime(source, (1500000001, 1500000001))
+"#;
+        let setup = std::process::Command::new(&python)
+            .args(["-I", "-S", "-B", "-c", script])
+            .arg(handlers)
+            .output()
+            .unwrap();
+        assert!(setup.status.success(), "{setup:?}");
+        let mut source = std::fs::read_to_string(&config.handler_file).unwrap();
+        source.push_str("\nimport unchecked_module\nassert unchecked_module.VALUE == 1\nbase_handle = handle\ndef handle(activations):\n    import lazy_module\n    assert lazy_module.VALUE == 1\n    return base_handle(activations)\n");
+        std::fs::write(&config.handler_file, source).unwrap();
+        repackage_python_environment(&config);
+        let descriptor = ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(&config.manifest).unwrap(),
+        )
+        .unwrap();
+        let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_500_000_000);
+        let attributes = std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(&lazy)
+            .unwrap();
+        attributes
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&lazy).unwrap().modified().unwrap(),
+            modified
+        );
+        let mut roots = vec![handlers.to_path_buf()];
+        roots.extend(config.python_paths.iter().cloned());
+        let expected = descriptor.python_environment.unwrap();
+        let recaptured = super::super::PythonEnvironmentBinding::capture(
+            &runtime_copy,
+            &copied_python,
+            &expected.handler,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(expected, recaptured);
+
+        let storage = tempfile::tempdir().unwrap();
+        let db = checkpointed_python_database(storage.path(), &worker).await;
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 60, 100_000))
+            .unwrap();
+        assert_eq!(next_process_total(&mut portal).await, 60);
+        db.shutdown().await.unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
+    #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn environment_bound_python_blocks_file_edits_through_shutdown() {
         let (Ok(python), Some(runtime)) = (

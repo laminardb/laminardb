@@ -144,7 +144,7 @@ class WorkerBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             code = f"import sys\nsys.path.append({directory!r})\n" + bootstrap.read_text(encoding="utf-8")
             result = subprocess.run(
-                [sys.executable, "-I", "-S", "-B", "-c", code,
+                [sys.executable, "-I", "-S", "-B", "-X", f"pycache_prefix={sys.executable}", "-c", code,
                  str(Path(sys.executable).resolve().parent), "[]", "laminardb_process.worker"],
                 capture_output=True, text=True, timeout=5, check=False,
             )

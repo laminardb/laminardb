@@ -168,11 +168,18 @@ in order. A changed, added or missing file changes the binding. Checkpoints and
 pipeline identity include it, so rebuilding dependencies requires a new binding
 and cannot restore state from the previous package.
 
-Use a self-contained Python 3.13 installation. Bound startup uses `-I -S -B`,
+Use a self-contained CPython 3.13 installation. Bound startup uses `-I -S -B`,
 checks that the interpreter's standard-library paths remain inside `runtime_root`,
 then adds only the declared import roots. Virtual environments whose standard
 library lives outside that root are rejected. Site initialization and bytecode
-writes are disabled; existing bytecode is included in the inventory. See the
+writes are disabled. `-X pycache_prefix` points to the interpreter file, so paths
+beneath it cannot contain source caches. This applies before bootstrap, including
+the initial `encodings` import. Filesystem source modules compile from source;
+neither timestamp nor hash caches in `__pycache__` can override it. The launcher
+uses the already inventoried executable, adding no file handles. Frozen modules,
+sourceless `.pyc` modules and ZIP imports keep their interpreter behavior and
+their containing files remain in the bound inventory. See
+[CPython's cache-prefix behavior](https://docs.python.org/3.13/library/sys.html#sys.pycache_prefix) and the
 [Python 3.13 command-line controls](https://docs.python.org/3.13/using/cmdline.html).
 
 The packaging command writes a new canonical manifest from an existing function
@@ -229,10 +236,10 @@ the manifest; process, socket and unrelated engine handles are additional.
 Other operating systems retain startup drift checking without enforced sharing.
 
 The deployment must still be quiescent and trusted. Directory additions,
-ancestor paths and metadata are not sealed. Timestamps can affect selection of
-[existing Python bytecode](https://docs.python.org/3.13/reference/import.html#cached-bytecode-invalidation).
+ancestor paths and metadata are not sealed. Mutable filesystem timestamps no
+longer select source bytecode caches under the standard filesystem importer.
 Abrupt host termination releases the guards.
-Handler-created import paths, external data and libraries loaded
+Handler changes to import controls, external data and libraries loaded
 from outside the declared trees are not protected. This does not establish the
 complete immutable dependency closure. Python remains `BestEffort` in embedded
 and single-node modes; `AtLeastOnce`, `ExactlyOnce` and both cluster forms remain

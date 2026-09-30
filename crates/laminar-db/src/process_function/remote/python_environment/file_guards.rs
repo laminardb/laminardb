@@ -127,7 +127,7 @@ mod tests {
         );
         assert!(std::fs::remove_file(&path).is_err());
         assert!(std::fs::rename(&path, root.path().join("moved.py")).is_err());
-        // Sharing does not seal attributes. Timestamp-based bytecode selection remains a gap.
+        // Sharing does not seal attributes; bytecode selection needs a separate launch policy.
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
         let attributes = OpenOptions::new()

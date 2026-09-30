@@ -1,9 +1,13 @@
 """Start a bound worker with only declared imports and runtime-owned stdlib paths."""
 
+import sys
+
+if sys.pycache_prefix is None or not sys.dont_write_bytecode:
+    raise ValueError("bound Python requires disabled source bytecode caches")
+
 import json
 from pathlib import Path
 import runpy
-import sys
 
 runtime_root = Path(sys.argv[1]).resolve(strict=True)
 
@@ -17,6 +21,8 @@ def within_runtime(path: str) -> bool:
 
 if not within_runtime(sys.executable):
     raise ValueError("Python executable is outside the runtime root")
+if not Path(sys.pycache_prefix).samefile(sys.executable):
+    raise ValueError("Python bytecode cache prefix must be the interpreter file")
 if any(not within_runtime(path) for path in sys.path):
     raise ValueError("Python standard-library path is outside the runtime root")
 sys.path[:0] = json.loads(sys.argv[2])
