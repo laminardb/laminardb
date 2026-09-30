@@ -23,6 +23,12 @@ struct PreparedSourceSet {
     committed_offsets: Vec<Option<SourceCheckpoint>>,
 }
 impl StreamingCoordinator {
+    pub(crate) fn observe_source_queue_metrics(&self, metrics: &crate::EngineMetrics) {
+        metrics
+            .source_queue
+            .observe(&self.rx, self.config.source_queue_max_bytes);
+    }
+
     pub(super) fn admit_public_source_shapes(
         sources: &[TrackedSourceRegistration],
     ) -> Result<(), DbError> {

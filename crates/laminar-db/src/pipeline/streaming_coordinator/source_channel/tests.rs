@@ -22,6 +22,48 @@ fn charged_bytes() -> usize {
 }
 
 #[tokio::test]
+async fn scrape_tracks_parked_and_partial_reservations_then_replacement() {
+    let registry = prometheus::Registry::new();
+    let metrics = metrics::SourceQueueMetrics::register(&registry).unwrap();
+    let reserved = || {
+        let families = registry.gather();
+        families[0].get_metric()[0].get_gauge().value()
+    };
+    assert_eq!(reserved(), 0.0);
+    let bytes = charged_bytes();
+    let limit = bytes + bytes / 2;
+    let charged = f64::from(u32::try_from(bytes).unwrap());
+    let full = f64::from(u32::try_from(limit).unwrap());
+    let (tx, rx) = channel(8, limit);
+    metrics.observe(&rx, limit);
+    tx.send(message(0)).await.unwrap();
+    let parked = rx.recv().await.unwrap();
+    assert_eq!(reserved(), charged);
+    {
+        let waiting = tx.send(message(1));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(reserved(), full);
+    }
+    assert_eq!(reserved(), charged);
+    drop(parked);
+    assert_eq!(reserved(), 0.0);
+    tx.send(message(0)).await.unwrap();
+    let (replacement_tx, replacement_rx) = channel(8, limit);
+    metrics.observe(&replacement_rx, limit);
+    assert_eq!(reserved(), 0.0);
+    replacement_tx.send(message(1)).await.unwrap();
+    assert_eq!(reserved(), charged);
+    drop(replacement_tx);
+    drop(replacement_rx);
+    assert_eq!(reserved(), 0.0);
+}
+
+#[tokio::test]
 async fn parked_message_keeps_shared_bytes_until_staging_or_discard() {
     let bytes = charged_bytes();
     let (tx, rx) = channel(8, bytes);

@@ -9,6 +9,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use super::SourceMsg;
 
+pub(super) mod metrics;
+
 pub(super) struct QueuedSourceMsg {
     pub(super) message: SourceMsg,
     // Retained through dequeue/parking; staging transfers Arrow ownership to the cycle/graph.

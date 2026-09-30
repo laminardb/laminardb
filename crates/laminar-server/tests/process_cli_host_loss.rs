@@ -31,6 +31,8 @@ fn write_handler(root: &Path, repository: &Path) -> Result<(PathBuf, PathBuf)> {
     let entered = quoted(&path_string(&root.join("second-entered")));
     let hold = quoted(&path_string(&root.join("hold-second")));
     let release = quoted(&path_string(&root.join("release-second")));
+    let pid = quoted(&path_string(&root.join("worker-pid")));
+    let delay = quoted(&path_string(&root.join("invocation-delay")));
     let handler = format!(
         r#"{base}
 import os as _os
@@ -42,6 +44,8 @@ _ack = _Path({ack})
 _entered = _Path({entered})
 _hold = _Path({hold})
 _release = _Path({release})
+_Path({pid}).write_text(str(_os.getpid()))
+_delay = _Path({delay})
 def _exit_now():
     _ack.write_text(str(_os.getpid()))
     _os._exit(47)
@@ -52,13 +56,16 @@ def _watch_exit():
 _threading.Thread(target=_watch_exit, daemon=True).start()
 _original_handle = handle
 def handle(activations):
+    if _delay.exists():
+        _time.sleep(float(_delay.read_text()))
     if any(a.input is not None and a.input.column(1)[0].as_py() == 50 for a in activations):
         with _entered.open('a') as marker:
             marker.write(f"{{activations[0].id}}\n")
         if _hold.exists():
             while not _release.exists():
                 _time.sleep(0.01)
-            _exit_now()
+            if _exit.exists():
+                _exit_now()
     return _original_handle(activations)
 "#
     );
@@ -345,4 +352,183 @@ fn standalone_server_replays_pending_python_file_after_host_loss() -> Result<()>
 #[test]
 fn standalone_server_republishes_uncheckpointed_python_file_after_host_loss() -> Result<()> {
     run_host_loss_cut(HostLossCut::PublishedOutput)
+}
+
+const SATURATION_FIFO_BYTES: usize = 128 * 1024;
+const SATURATION_GRAPH_BYTES: usize = 2 * 1024 * 1024;
+const SATURATION_KEYS: usize = 64;
+
+fn prepare_saturation(root: &Path, port: u16, python: &str, records: usize) -> Result<PathBuf> {
+    let config_path = write_config(root, port, python)?;
+    let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let server = config
+        .get_mut("server")
+        .and_then(toml::Value::as_table_mut)
+        .context("saturation config did not contain a server table")?;
+    server.insert(
+        "source_queue_max_bytes".into(),
+        i64::try_from(SATURATION_FIFO_BYTES)?.into(),
+    );
+    server.insert(
+        "pipeline_max_input_buf_bytes".into(),
+        i64::try_from(SATURATION_GRAPH_BYTES)?.into(),
+    );
+    server.insert("pipeline_max_input_buf_batches".into(), 256.into());
+    config["process_function"][0]["max_in_flight"] = 1.into();
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let manifest = root.join("manifest.json");
+    let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(&std::fs::read(&manifest)?)?;
+    descriptor.limits.max_batch_rows = 1;
+    descriptor.limits.max_input_rows = 256;
+    descriptor.limits.max_input_bytes = SATURATION_GRAPH_BYTES;
+    descriptor.limits.max_keys = SATURATION_KEYS;
+    descriptor.limits.max_timers = SATURATION_KEYS;
+    descriptor.limits.max_state_bytes = 8 * 1024 * 1024;
+    std::fs::write(manifest, descriptor.to_manifest_json()?)?;
+    std::fs::write(root.join("invocation-delay"), "0.05")?;
+    let suffix = "x".repeat(4 * 1024);
+    for index in 0..records {
+        let row = serde_json::json!({
+            "key": format!("key_{:02}_{suffix}", index % SATURATION_KEYS),
+            "amount": 50,
+            "ts": 100_000,
+        });
+        std::fs::write(
+            root.join("input").join(format!("{index:05}.json")),
+            serde_json::to_vec(&row)?,
+        )?;
+    }
+    Ok(config_path)
+}
+
+fn maximum_metric(metrics: &str, name: &str) -> Result<usize> {
+    let prefix = format!("laminardb_{name}");
+    let mut maximum: Option<usize> = None;
+    for line in metrics.lines() {
+        let Some(suffix) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !suffix.starts_with(['{', ' ']) {
+            continue;
+        }
+        let value = line
+            .rsplit_once(' ')
+            .context("metric did not contain a value")?
+            .1
+            .parse::<usize>()
+            .context("metric value was not a nonnegative integer")?;
+        maximum = Some(maximum.unwrap_or(0).max(value));
+    }
+    maximum.with_context(|| format!("missing {name} metric"))
+}
+
+fn sample_saturation(host: &mut Child, root: &Path, port: u16, records: usize) -> Result<()> {
+    std::fs::write(root.join("host-pid"), host.id().to_string())?;
+    wait_until(host, "readiness", || {
+        Ok(http_request(port, "GET", "/ready").is_ok())
+    })
+    .with_context(|| {
+        format!(
+            "server status during startup: {}",
+            http_request(port, "GET", "/api/v1/pipeline/status")
+                .unwrap_or_else(|error| format!("{error:#}"))
+        )
+    })?;
+    wait_until(host, "buffer metric publication", || {
+        Ok(maximum_metric(&http_request(port, "GET", "/metrics")?, "input_buf_bytes").is_ok())
+    })?;
+    let mut samples = std::fs::File::create(root.join("queue-samples.csv"))?;
+    writeln!(
+        samples,
+        "elapsed_seconds,source_reserved_bytes,max_graph_input_bytes,emitted_rows"
+    )?;
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(360);
+    let mut saturated = 0usize;
+    let mut peak_graph = 0usize;
+    loop {
+        if let Some(status) = host.try_wait()? {
+            anyhow::bail!("server exited during saturation: {status}");
+        }
+        let metrics = http_request(port, "GET", "/metrics")?;
+        let reserved = maximum_metric(&metrics, "source_queue_reserved_bytes")?;
+        let graph = maximum_metric(&metrics, "input_buf_bytes")?;
+        let emitted = maximum_metric(&metrics, "events_emitted_total")?;
+        anyhow::ensure!(
+            reserved <= SATURATION_FIFO_BYTES,
+            "FIFO charge exceeded limit: {reserved}"
+        );
+        anyhow::ensure!(
+            graph <= SATURATION_GRAPH_BYTES,
+            "graph charge exceeded limit: {graph}"
+        );
+        anyhow::ensure!(emitted <= records, "unexpected output row count: {emitted}");
+        saturated += usize::from(reserved == SATURATION_FIFO_BYTES);
+        peak_graph = peak_graph.max(graph);
+        writeln!(
+            samples,
+            "{:.3},{reserved},{graph},{emitted}",
+            started.elapsed().as_secs_f64()
+        )?;
+        if emitted == records {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "saturation workload did not drain"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(saturated > 0, "the FIFO never reached its byte limit");
+    println!(
+        "saturation: {} seconds, {saturated} full-FIFO samples, peak graph {peak_graph} bytes",
+        started.elapsed().as_secs_f64()
+    );
+    let mut expected = (1..=records / SATURATION_KEYS)
+        .flat_map(|round| std::iter::repeat_n(50 * round as i64, SATURATION_KEYS))
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    wait_until(host, "durable sink output", || {
+        Ok(sink_totals(&root.join("output"))? == expected)
+    })?;
+    Ok(())
+}
+
+fn run_saturation(records: usize) -> Result<()> {
+    let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+        return Ok(());
+    };
+    let directory = tempfile::tempdir()?;
+    let resource_directory = std::env::var_os("LAMINAR_PROCESS_RESOURCE_DIR").map(PathBuf::from);
+    let root = resource_directory.as_deref().unwrap_or(directory.path());
+    std::fs::create_dir_all(root)?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    let config = prepare_saturation(root, port, &python.to_string_lossy(), records)?;
+    let mut host = spawn_server(&config)?;
+    let result = sample_saturation(&mut host, root, port, records);
+    let stopped = stop_host_and_worker(&mut host, root);
+    match (result, stopped) {
+        (Err(primary), Err(cleanup)) => {
+            Err(primary.context(format!("saturation cleanup: {cleanup:#}")))
+        }
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), stopped) => stopped,
+    }
+}
+
+#[test]
+fn standalone_server_samples_bounded_python_saturation() -> Result<()> {
+    run_saturation(128)
+}
+
+#[test]
+#[ignore = "manual server and Python worker RSS sampling"]
+fn standalone_server_python_saturation_resource_stress() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("LAMINAR_PROCESS_PYTHON").is_some(),
+        "Python interpreter is required for resource sampling"
+    );
+    run_saturation(4096)
 }

@@ -49,6 +49,7 @@ use crate::catalog::{schema_has_reserved_mutation_columns, validate_source_batch
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
+pub(crate) use source_channel::metrics::SourceQueueMetrics;
 use source_channel::{QueuedSourceMsg, SourceMsgRx, SourceMsgTx};
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointRequest = crate::db::ForceCheckpointRequest;

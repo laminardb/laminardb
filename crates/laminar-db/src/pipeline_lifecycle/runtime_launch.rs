@@ -14,15 +14,18 @@ use super::{
 };
 
 impl LaminarDB {
-    pub(super) async fn launch_pipeline_runtime(
+    async fn prepare_streaming_coordinator(
         &self,
         setup: PipelineRuntimeSetup,
         shutdown: Arc<tokio::sync::Notify>,
         runtime_shutdown: tokio_util::sync::CancellationToken,
-        #[cfg(feature = "cluster")] mut startup_generation_fence: Option<
-            tokio::sync::OwnedRwLockWriteGuard<()>,
-        >,
-    ) -> Result<(), DbError> {
+    ) -> Result<
+        (
+            crate::pipeline::StreamingCoordinator,
+            crate::pipeline_callback::ConnectorPipelineCallback,
+        ),
+        DbError,
+    > {
         let PipelineRuntimeSetup {
             sources,
             config: pipeline_config,
@@ -45,7 +48,7 @@ impl LaminarDB {
         let coordinator = crate::pipeline::StreamingCoordinator::new_with_tracked_source_registry(
             sources,
             pipeline_config,
-            Arc::clone(&shutdown),
+            shutdown,
             control_rx,
             source_gate,
             #[cfg(feature = "cluster")]
@@ -54,10 +57,30 @@ impl LaminarDB {
             runtime_mode,
         )
         .await?
-        .with_terminal_shutdown(runtime_shutdown.clone())
+        .with_terminal_shutdown(runtime_shutdown)
         .with_force_checkpoint_rx(force_ckpt_rx)
         .with_checkpoint_complete_rx(checkpoint_complete_rx)
         .with_checkpoint_admission(checkpoint_in_flight);
+        if let Some(metrics) = self.engine_metrics() {
+            coordinator.observe_source_queue_metrics(&metrics);
+        }
+        Ok((coordinator, callback))
+    }
+
+    pub(super) async fn launch_pipeline_runtime(
+        &self,
+        setup: PipelineRuntimeSetup,
+        shutdown: Arc<tokio::sync::Notify>,
+        runtime_shutdown: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "cluster")] mut startup_generation_fence: Option<
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        >,
+    ) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        let runtime_mode = setup.runtime_mode;
+        let (coordinator, callback) = self
+            .prepare_streaming_coordinator(setup, Arc::clone(&shutdown), runtime_shutdown.clone())
+            .await?;
 
         let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
         let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
