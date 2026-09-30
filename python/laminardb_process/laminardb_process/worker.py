@@ -340,6 +340,8 @@ def main() -> None:
     if not separator or not module_name or not name:
         parser.error("handler must be module:callable")
     manifest = Manifest.from_bytes(args.manifest.read_bytes())
+    if manifest.environment_handler is not None and (args.handler != manifest.environment_handler or args.handler_file is None):
+        parser.error("environment-bound worker requires the declared handler and verified handler file")
     if args.handler_file is None:
         module = importlib.import_module(module_name)
     else:

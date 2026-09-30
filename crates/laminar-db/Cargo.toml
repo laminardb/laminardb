@@ -204,6 +204,11 @@ name = "process_python"
 path = "examples/process_python.rs"
 required-features = ["process-remote"]
 
+[[example]]
+name = "package_process_python"
+path = "examples/package_process_python.rs"
+required-features = ["process-remote"]
+
 [[bench]]
 name = "cluster_subscription_bench"
 harness = false

@@ -1,24 +1,30 @@
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
+use super::python_environment::{self, VerifiedEnvironment};
 use super::{RemoteProcessClient, MAX_IN_FLIGHT};
 use crate::error::DbError;
+use crate::process_function::descriptor::{valid_python_identifier, MAX_MANIFEST_BYTES};
 use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
 
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
-/// callers must pin any imported code or data separately before claiming replay equivalence.
+/// an optional environment binding checks deployment drift without certifying replay equivalence.
 #[derive(Clone)]
 pub struct LocalPythonWorkerConfig {
     /// Python executable or a trusted executable name resolved by the host environment.
+    /// Environment-bound launches require a file path inside `runtime_root`.
     pub python: PathBuf,
+    /// Complete interpreter installation to check against the descriptor's environment binding.
+    /// Supply this together with `python_environment`; exclude the function manifest from it.
+    pub runtime_root: Option<PathBuf>,
     /// Canonical descriptor manifest consumed by the worker.
     pub manifest: PathBuf,
     /// Top-level Python module file containing the handler function.
@@ -31,7 +37,8 @@ pub struct LocalPythonWorkerConfig {
     /// Maximum simultaneous worker calls. The process and client use the same limit.
     /// The launcher sets `OMP_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` before imports.
     pub max_in_flight: usize,
-    /// Startup and per-call deadline, between 1 millisecond and 30 seconds.
+    /// Worker readiness and per-call deadline, between 1 millisecond and 30 seconds.
+    /// Filesystem binding verification precedes the readiness deadline.
     pub timeout: Duration,
 }
 
@@ -54,6 +61,7 @@ struct VerifiedBinding {
     handler_file: PathBuf,
     module: String,
     descriptor: ProcessFunctionDescriptor,
+    environment: VerifiedEnvironment,
 }
 
 impl VerifiedBinding {
@@ -62,7 +70,7 @@ impl VerifiedBinding {
             || config.max_in_flight > MAX_IN_FLIGHT
             || config.timeout < Duration::from_millis(1)
             || config.timeout > Duration::from_secs(30)
-            || !valid_identifier(&config.function)
+            || !valid_python_identifier(&config.function)
         {
             return Err(DbError::InvalidOperation(
                 "invalid local process worker limits or handler function".into(),
@@ -79,14 +87,21 @@ impl VerifiedBinding {
         let module = handler_file
             .file_stem()
             .and_then(|name| name.to_str())
-            .filter(|name| valid_identifier(name))
+            .filter(|name| valid_python_identifier(name))
             .ok_or_else(|| DbError::InvalidOperation("invalid Python handler filename".into()))?;
         if handler_file.extension().and_then(|ext| ext.to_str()) != Some("py") {
             return Err(DbError::InvalidOperation(
                 "local Python handler must be a .py file".into(),
             ));
         }
-        let manifest_bytes = std::fs::read(&manifest)
+        let mut manifest_bytes = Vec::new();
+        let manifest_limit = u64::try_from(MAX_MANIFEST_BYTES)
+            .map_err(|error| DbError::Config(format!("process manifest size limit: {error}")))?;
+        std::fs::File::open(&manifest)
+            .and_then(|file| {
+                file.take(manifest_limit + 3)
+                    .read_to_end(&mut manifest_bytes)
+            })
             .map_err(|error| DbError::Config(format!("read process manifest: {error}")))?;
         let canonical = manifest_bytes
             .strip_suffix(b"\r\n")
@@ -103,20 +118,65 @@ impl VerifiedBinding {
                 "local Python worker requires a Python process descriptor".into(),
             ));
         }
-        let code = std::fs::read(&handler_file)
-            .map_err(|error| DbError::Config(format!("read process handler: {error}")))?;
-        if format!("{:x}", Sha256::digest(&code)) != descriptor.implementation_digest {
+        if python_environment::file_sha256(&handler_file)? != descriptor.implementation_digest {
             return Err(DbError::InvalidOperation(
                 "Python handler file digest differs from its manifest".into(),
             ));
         }
         let module = module.to_string();
+        let handler_directory = handler_file
+            .parent()
+            .ok_or_else(|| DbError::InvalidOperation("Python handler has no parent".into()))?;
+        let environment =
+            python_environment::verify(config, &descriptor, handler_directory, &manifest, &module)?;
         Ok(Self {
             manifest,
             handler_file,
             module,
             descriptor,
+            environment,
         })
+    }
+
+    fn command(&self, config: &LocalPythonWorkerConfig) -> Result<Command, DbError> {
+        let mut command = Command::new(&self.environment.python);
+        if let Some(root) = &self.environment.runtime_root {
+            let paths = serde_json::to_string(&self.environment.import_roots).map_err(|error| {
+                DbError::Config(format!("encode bound Python import paths: {error}"))
+            })?;
+            command
+                .args(["-I", "-S", "-B", "-c"])
+                .arg(include_str!("python_environment/bootstrap.py"))
+                .arg(root)
+                .arg(paths)
+                .arg("laminardb_process.worker")
+                .env_remove("PYTHONPATH");
+        } else {
+            let paths = std::env::join_paths(&self.environment.import_roots)
+                .map_err(|error| DbError::Config(format!("Python import path: {error}")))?;
+            command
+                .args(["-s", "-P", "-m", "laminardb_process.worker"])
+                .env("PYTHONPATH", paths);
+        }
+        command
+            .current_dir(&self.environment.import_roots[0])
+            .arg("--manifest")
+            .arg(&self.manifest)
+            .args([
+                "--handler",
+                &format!("{}:{}", self.module, config.function),
+                "--handler-file",
+            ])
+            .arg(&self.handler_file)
+            .args(["--bind", "127.0.0.1:0", "--max-in-flight"])
+            .arg(config.max_in_flight.to_string())
+            .env_remove("PYTHONHOME")
+            .env("OMP_NUM_THREADS", "1")
+            .env("OPENBLAS_NUM_THREADS", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+        Ok(command)
     }
 }
 
@@ -126,41 +186,14 @@ impl LocalPythonWorker {
     /// # Errors
     /// Rejects invalid paths, mismatched artifacts, malformed readiness, or startup failure.
     pub async fn start(config: LocalPythonWorkerConfig) -> Result<Self, DbError> {
-        let binding = VerifiedBinding::verify(&config)?;
-        let handler_directory = binding
-            .handler_file
-            .parent()
-            .ok_or_else(|| DbError::InvalidOperation("Python handler has no parent".into()))?;
-        let mut paths = vec![handler_directory.to_path_buf()];
-        for path in &config.python_paths {
-            paths.push(path.canonicalize().map_err(|error| {
-                DbError::Config(format!("resolve Python import root: {error}"))
-            })?);
-        }
-        let python_path = std::env::join_paths(paths)
-            .map_err(|error| DbError::Config(format!("Python import path: {error}")))?;
-        let mut command = Command::new(&config.python);
-        command
-            .args(["-s", "-P"])
-            .current_dir(handler_directory)
-            .args(["-m", "laminardb_process.worker", "--manifest"])
-            .arg(&binding.manifest)
-            .args([
-                "--handler",
-                &format!("{}:{}", binding.module, config.function),
-                "--handler-file",
-            ])
-            .arg(&binding.handler_file)
-            .args(["--bind", "127.0.0.1:0", "--max-in-flight"])
-            .arg(config.max_in_flight.to_string())
-            .env("PYTHONPATH", python_path)
-            .env_remove("PYTHONHOME")
-            .env("OMP_NUM_THREADS", "1")
-            .env("OPENBLAS_NUM_THREADS", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = command
+        let (config, binding) = tokio::task::spawn_blocking(move || {
+            let binding = VerifiedBinding::verify(&config)?;
+            Ok::<_, DbError>((config, binding))
+        })
+        .await
+        .map_err(|error| DbError::Pipeline(format!("verify Python process binding: {error}")))??;
+        let mut child = binding
+            .command(&config)?
             .spawn()
             .map_err(|error| DbError::Pipeline(format!("start Python process worker: {error}")))?;
         let ready = tokio::time::timeout(config.timeout, read_ready(&mut child)).await;
@@ -264,12 +297,6 @@ impl Drop for LocalPythonWorker {
         // completion and reports unexpected exits; this signal covers an abandoned local owner.
         self.cancel.cancel();
     }
-}
-
-fn valid_identifier(value: &str) -> bool {
-    let mut bytes = value.bytes();
-    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 async fn read_ready(child: &mut Child) -> Result<u16, DbError> {

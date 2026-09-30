@@ -157,6 +157,79 @@ contains distinct keys from one vnode. Results may emit
 zero or more Arrow batches and propose state/timer changes, but the host applies
 only a complete validated response.
 
+## Environment binding
+
+An optional `python_environment` in the function manifest binds the selected
+interpreter, `module:function` entry point, complete runtime tree and ordered
+import trees. `LocalPythonWorkerConfig.runtime_root` and the server's
+`[[process_function]].runtime_root` enable verification before spawning the worker.
+The handler directory is the first import tree; `python_paths` supplies the rest
+in order. A changed, added or missing file changes the binding. Checkpoints and
+pipeline identity include it, so rebuilding dependencies requires a new binding
+and cannot restore state from the previous package.
+
+Use a self-contained Python 3.13 installation. Bound startup uses `-I -S -B`,
+checks that the interpreter's standard-library paths remain inside `runtime_root`,
+then adds only the declared import roots. Virtual environments whose standard
+library lives outside that root are rejected. Site initialization and bytecode
+writes are disabled; existing bytecode is included in the inventory. See the
+[Python 3.13 command-line controls](https://docs.python.org/3.13/using/cmdline.html).
+
+The packaging command writes a new canonical manifest from an existing function
+contract. Keep the output outside every hashed tree to avoid a self-reference.
+For example, on PowerShell with Python installed at `C:/Python313`:
+
+```powershell
+$runtimeRoot = 'C:/Python313'
+$python = Join-Path $runtimeRoot 'python.exe'
+$package = Join-Path (Resolve-Path target).Path 'process-package'
+$handlers = Join-Path $package 'handlers'
+$dependencies = Join-Path $package 'deps'
+New-Item -ItemType Directory -Path $handlers | Out-Null
+Copy-Item examples/process_python/handler.py $handlers
+& $python -m pip install --target $dependencies -r python/laminardb_process/requirements.lock
+& $python -m pip install --target $dependencies --no-deps ./python/laminardb_process
+cargo run -p laminar-db --no-default-features --features process-remote --example package_process_python -- `
+  examples/process_python/manifest.json (Join-Path $package 'manifest.json') `
+  $runtimeRoot $python (Join-Path $handlers 'handler.py') handle $dependencies
+```
+
+For embedded use, pass the generated manifest, handler file, interpreter,
+`runtime_root`, and dependency directory to `LocalPythonWorker::start`. For a
+server config saved in the package directory, set these fields in its existing
+`[[process_function]]` entry:
+
+```toml
+manifest = "manifest.json"
+handler_file = "handlers/handler.py"
+function = "handle"
+python = "C:/Python313/python.exe"
+runtime_root = "C:/Python313"
+python_paths = ["deps"]
+```
+
+The inventory accepts at most 16 import roots, 32,768 total file/directory entries,
+4 GiB total file bytes and 512 MiB per file; overlapping trees consume the budget
+again. Paths must be UTF-8 and at most 1,024 bytes relative to their root. Links,
+Windows reparse points and special files are rejected. All files, data and empty
+directories are included. Hashing runs on a blocking startup task, with no new
+per-record work. Identical trees may move while retaining their identity.
+
+This is a deployment drift check for quiescent, trusted files. It neither resolves
+the dependency closure nor prevents writes between verification and import or
+while the worker runs. Handler-created import paths, external data and libraries
+loaded from outside the declared trees are not protected. Python therefore
+remains `BestEffort` in embedded and single-node modes; `AtLeastOnce`,
+`ExactlyOnce` and both cluster forms remain rejected.
+
+To run the environment-bound Rust regressions, set `LAMINAR_PROCESS_PYTHON` to
+an explicit interpreter file and `LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT` to its
+installation root. Set `LAMINAR_PROCESS_PYTHON_DEPS` to the explicit dependency
+directory when packages are not installed in the SDK import root. Bound workers
+do not use global site packages. The database test verifies matching-package
+recovery, rejection of dependency drift, and checkpoint rejection after a
+dependency rebuild; the configured server test exercises SQL input and recovery.
+
 ## Container image
 
 From the repository root, build the same pinned package and example:

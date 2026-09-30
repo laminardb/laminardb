@@ -114,7 +114,7 @@ def _schema(fields: list[dict]) -> pa.Schema:
 
 @dataclass(frozen=True)
 class Manifest:
-    """Canonical descriptor bytes bind each invocation and the direct handler source."""
+    """Canonical descriptor bytes bind invocations, source and optional environment identity."""
 
     digest: bytes
     implementation_digest: bytes
@@ -125,6 +125,7 @@ class Manifest:
     output_event_time_column: str
     timer_names: frozenset[str]
     limits: dict[str, int]
+    environment_handler: str | None = None
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> Manifest:
@@ -141,8 +142,10 @@ class Manifest:
             "late_event_policy", "input_changelog", "output_changelog", "value_state_name",
             "state_codec_version", "timer_names", "determinism", "limits",
         }
-        if not isinstance(data, dict) or set(data) != fields:
+        if not isinstance(data, dict) or set(data) not in (fields, fields | {"python_environment"}):
             raise ValueError("process manifest fields mismatch")
+        if "python_environment" in data:
+            _validate_environment(data["python_environment"])
         if type(data["version"]) is not int or data["version"] != 1:
             raise ValueError("unsupported process manifest version")
         if (type(data["protocol_version"]) is not int or data["protocol_version"] != 1
@@ -195,6 +198,7 @@ class Manifest:
         return cls(
             digest=sha256(raw).digest(),
             implementation_digest=bytes.fromhex(digest),
+            environment_handler=data.get("python_environment", {}).get("handler"),
             input_schema=input_schema,
             output_schema=output_schema,
             key_column=key_column,
@@ -203,3 +207,26 @@ class Manifest:
             timer_names=frozenset(timers),
             limits={name: limits[name] for name in needed},
         )
+
+
+def _validate_environment(environment: dict) -> None:
+    if (not isinstance(environment, dict)
+            or set(environment) != {"version", "executable", "handler", "runtime_sha256", "import_roots_sha256"}
+            or type(environment["version"]) is not int or environment["version"] != 1):
+        raise ValueError("invalid Python environment binding")
+    handler = environment["handler"]
+    if (not isinstance(handler, str) or handler.count(":") != 1
+            or any(not name.isascii() or not name.isidentifier() for name in handler.split(":"))):
+        raise ValueError("invalid Python environment handler")
+    executable = environment["executable"]
+    if (not isinstance(executable, str) or not executable or len(executable.encode("utf-8")) > 1024
+            or any(character in executable for character in ("\\", ":", "\0"))
+            or any(part in ("", ".", "..") for part in executable.split("/"))):
+        raise ValueError("invalid Python environment executable")
+    roots = environment["import_roots_sha256"]
+    if not isinstance(roots, list) or not 1 <= len(roots) <= 16:
+        raise ValueError("invalid Python environment import roots")
+    for digest in (environment["runtime_sha256"], *roots):
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)):
+            raise ValueError("invalid Python environment tree digest")

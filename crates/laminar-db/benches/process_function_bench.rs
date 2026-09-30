@@ -104,6 +104,7 @@ fn native_end_to_end(
                 function_id: "running_total".into(),
                 pipeline_state_id: "native_latency_v1".into(),
                 implementation_digest: "a".repeat(64),
+                python_environment: None,
                 input_schema: source.schema().clone(),
                 output_schema: Arc::clone(&output_schema),
                 key_columns: vec!["account".into()],

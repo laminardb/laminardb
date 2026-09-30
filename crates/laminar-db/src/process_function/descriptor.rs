@@ -5,12 +5,13 @@ use sha2::{Digest, Sha256};
 use super::schema::{schema_from_canonical_fields, CanonicalField};
 use super::{
     canonical_fields, ProcessFunctionDescriptor, ProcessFunctionLimits, ProcessRuntime,
-    STATE_CODEC_VERSION,
+    PythonEnvironmentBinding, STATE_CODEC_VERSION,
 };
 use crate::error::DbError;
 
-const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const MAX_PYTHON_IMPORT_ROOTS: usize = 16;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +22,12 @@ struct Manifest {
     function_id: String,
     pipeline_state_id: String,
     implementation_digest: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "decode_python_environment"
+    )]
+    python_environment: Option<PythonEnvironmentBinding>,
     input_schema: Vec<CanonicalField>,
     output_schema: Vec<CanonicalField>,
     key_columns: Vec<String>,
@@ -51,6 +58,7 @@ impl Manifest {
             function_id: descriptor.function_id.clone(),
             pipeline_state_id: descriptor.pipeline_state_id.clone(),
             implementation_digest: descriptor.implementation_digest.clone(),
+            python_environment: descriptor.python_environment.clone(),
             input_schema: canonical_fields(&descriptor.input_schema)?,
             output_schema: canonical_fields(&descriptor.output_schema)?,
             key_columns: descriptor.key_columns.clone(),
@@ -98,6 +106,7 @@ impl Manifest {
             function_id: self.function_id,
             pipeline_state_id: self.pipeline_state_id,
             implementation_digest: self.implementation_digest,
+            python_environment: self.python_environment,
             input_schema: schema_from_canonical_fields(self.input_schema)?,
             output_schema: schema_from_canonical_fields(self.output_schema)?,
             key_columns: self.key_columns,
@@ -110,6 +119,62 @@ impl Manifest {
         super::operator::validate_descriptor(&descriptor)?;
         Ok(descriptor)
     }
+}
+
+impl PythonEnvironmentBinding {
+    pub(crate) fn validate(&self) -> Result<(), DbError> {
+        if self.version != 1
+            || !valid_relative_python_path(&self.executable)
+            || !valid_python_handler(&self.handler)
+            || !valid_sha256(&self.runtime_sha256)
+            || self.import_roots_sha256.is_empty()
+            || self.import_roots_sha256.len() > MAX_PYTHON_IMPORT_ROOTS
+            || !self
+                .import_roots_sha256
+                .iter()
+                .all(|digest| valid_sha256(digest))
+        {
+            return Err(DbError::InvalidOperation(
+                "invalid Python environment binding".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn valid_relative_python_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.bytes().any(|byte| matches!(byte, b'\\' | b':' | 0))
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+}
+
+pub(crate) fn valid_python_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+pub(crate) fn valid_python_handler(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(module, function)| {
+        valid_python_identifier(module) && valid_python_identifier(function)
+    })
+}
+
+fn valid_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_python_environment<'de, D>(
+    deserializer: D,
+) -> Result<Option<PythonEnvironmentBinding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    PythonEnvironmentBinding::deserialize(deserializer).map(Some)
 }
 
 impl ProcessFunctionDescriptor {

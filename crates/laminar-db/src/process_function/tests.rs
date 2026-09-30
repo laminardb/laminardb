@@ -51,6 +51,7 @@ fn descriptor() -> ProcessFunctionDescriptor {
         function_id: "account_activity".into(),
         pipeline_state_id: "test_pipeline_v1".into(),
         implementation_digest: "a".repeat(64),
+        python_environment: None,
         input_schema: input_schema(),
         output_schema: output_schema(),
         key_columns: vec!["account".into()],
@@ -189,6 +190,80 @@ fn checkpoint_rejects_changed_descriptor_contract() {
     let mut replacement =
         ProcessFunctionOperator::new(changed, Arc::new(AccountActivity), 4).unwrap();
     assert!(replacement.restore(checkpoint).is_err());
+}
+
+#[test]
+fn manifest_binds_python_environment_and_rejects_invalid_inventory_identity() {
+    let mut binding = descriptor();
+    let legacy = binding.to_manifest_json().unwrap();
+    assert!(!serde_json::from_slice::<serde_json::Value>(&legacy)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("python_environment"));
+    binding.runtime = ProcessRuntime::RemotePython;
+    binding.python_environment = Some(super::PythonEnvironmentBinding {
+        version: 1,
+        executable: "bin/python3.13".into(),
+        handler: "handler:handle".into(),
+        runtime_sha256: "b".repeat(64),
+        import_roots_sha256: vec!["c".repeat(64), "d".repeat(64)],
+    });
+    let raw = binding.to_manifest_json().unwrap();
+    let restored = ProcessFunctionDescriptor::from_manifest_json(&raw).unwrap();
+    assert_eq!(restored.python_environment, binding.python_environment);
+    let original: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    for (field, value) in [
+        ("version", serde_json::json!(2)),
+        ("executable", serde_json::json!("../outside")),
+        ("executable", serde_json::json!("/absolute")),
+        ("executable", serde_json::json!("C:\\python.exe")),
+        ("executable", serde_json::json!("a//b")),
+        ("executable", serde_json::json!("a/./b")),
+        ("handler", serde_json::json!("handler")),
+        ("handler", serde_json::json!("handler:1invalid")),
+        ("handler", serde_json::json!("nested.module:handle")),
+        ("runtime_sha256", serde_json::json!("B".repeat(64))),
+        ("runtime_sha256", serde_json::json!("x".repeat(64))),
+        ("import_roots_sha256", serde_json::json!([])),
+        (
+            "import_roots_sha256",
+            serde_json::json!(vec!["d".repeat(64); 17]),
+        ),
+        ("unexpected", serde_json::json!(true)),
+    ] {
+        let mut invalid = original.clone();
+        invalid["python_environment"][field] = value;
+        assert!(
+            ProcessFunctionDescriptor::from_manifest_json(&serde_json::to_vec(&invalid).unwrap())
+                .is_err(),
+            "{field}"
+        );
+    }
+    let mut invalid = original;
+    invalid["python_environment"] = serde_json::Value::Null;
+    assert!(
+        ProcessFunctionDescriptor::from_manifest_json(&serde_json::to_vec(&invalid).unwrap())
+            .is_err()
+    );
+    let mut changed = binding.clone();
+    changed
+        .python_environment
+        .as_mut()
+        .unwrap()
+        .import_roots_sha256
+        .swap(0, 1);
+    assert_ne!(
+        changed.binding_sha256().unwrap(),
+        binding.binding_sha256().unwrap()
+    );
+    changed.python_environment.as_mut().unwrap().executable = "bin/other-python".into();
+    assert_ne!(
+        changed.binding_sha256().unwrap(),
+        binding.binding_sha256().unwrap()
+    );
+    changed.runtime = ProcessRuntime::RemoteRust;
+    assert!(changed.to_manifest_json().is_err());
 }
 
 #[test]
@@ -1314,6 +1389,7 @@ mod remote_pipeline {
         }
         LocalPythonWorkerConfig {
             python: python.into(),
+            runtime_root: None,
             manifest: example.join("manifest.json"),
             handler_file: example.join("handler.py"),
             function: "handle".into(),
@@ -2330,6 +2406,166 @@ def handle(activations):
         );
     }
 
+    fn environment_bound_python_config(
+        python: &str,
+        runtime: &Path,
+        directory: &Path,
+    ) -> LocalPythonWorkerConfig {
+        let handler_directory = directory.join("handlers");
+        std::fs::create_dir(&handler_directory).unwrap();
+        let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut source =
+            std::fs::read_to_string(repository.join("examples/process_python/handler.py")).unwrap();
+        source.push_str("\nfrom environment_helper import check_runtime\ncheck_runtime()\n");
+        std::fs::write(handler_directory.join("environment_helper.py"),
+            "import sys\ndef check_runtime():\n    assert sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode\n").unwrap();
+        std::fs::write(
+            handler_directory.join("sitecustomize.py"),
+            "raise RuntimeError('site imports are forbidden')\n",
+        )
+        .unwrap();
+        let mut config = python_test_handler_config(python, &handler_directory, &source);
+        let manifest = directory.join("manifest.json");
+        std::fs::rename(&config.manifest, &manifest).unwrap();
+        config.manifest = manifest;
+        config.runtime_root = Some(runtime.to_path_buf());
+        repackage_python_environment(&config);
+        config
+    }
+
+    fn repackage_python_environment(config: &LocalPythonWorkerConfig) {
+        let mut descriptor = ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(&config.manifest).unwrap(),
+        )
+        .unwrap();
+        let mut roots = vec![config.handler_file.parent().unwrap().to_path_buf()];
+        roots.extend(config.python_paths.iter().cloned());
+        descriptor.python_environment = Some(
+            super::super::PythonEnvironmentBinding::capture(
+                config.runtime_root.as_ref().unwrap(),
+                &config.python,
+                &format!(
+                    "{}:{}",
+                    config.handler_file.file_stem().unwrap().to_str().unwrap(),
+                    config.function
+                ),
+                &roots,
+            )
+            .unwrap(),
+        );
+        std::fs::write(&config.manifest, descriptor.to_manifest_json().unwrap()).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn environment_bound_python_restores_and_rejects_dependency_drift() {
+        let (Ok(python), Some(runtime)) = (
+            std::env::var("LAMINAR_PROCESS_PYTHON"),
+            std::env::var_os("LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT"),
+        ) else {
+            return;
+        };
+        let package = tempfile::tempdir().unwrap();
+        let config = environment_bound_python_config(&python, Path::new(&runtime), package.path());
+        let storage = tempfile::tempdir().unwrap();
+        for (amount, expected) in [(60, 60), (50, 110)] {
+            let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
+            let db = checkpointed_python_database(storage.path(), &worker).await;
+            let mut portal = db
+                .open_subscription("activity", None, SubscribeStart::Tail)
+                .await
+                .unwrap();
+            db.source_untyped("events")
+                .unwrap()
+                .push_arrow(python_input("a", amount, 100_000))
+                .unwrap();
+            assert_eq!(next_process_total(&mut portal).await, expected);
+            db.checkpoint().await.unwrap();
+            db.shutdown().await.unwrap();
+            drop(portal);
+            drop(db);
+            worker.shutdown().await.unwrap();
+        }
+        assert!(!config
+            .handler_file
+            .parent()
+            .unwrap()
+            .join("__pycache__")
+            .exists());
+        let original = ProcessFunctionDescriptor::from_manifest_json(
+            &std::fs::read(&config.manifest).unwrap(),
+        )
+        .unwrap();
+        let helper = config
+            .handler_file
+            .parent()
+            .unwrap()
+            .join("environment_helper.py");
+        let mut source = std::fs::read(&helper).unwrap();
+        source.extend_from_slice(b"\n# Dependency rebuild\n");
+        std::fs::write(helper, source).unwrap();
+        let error = LocalPythonWorker::start(config.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("environment differs"), "{error}");
+        repackage_python_environment(&config);
+        let worker = LocalPythonWorker::start(config).await.unwrap();
+        assert_eq!(
+            original.implementation_digest,
+            worker.client().descriptor().implementation_digest
+        );
+        assert_ne!(
+            original.python_environment,
+            worker.client().descriptor().python_environment
+        );
+        let db = LaminarDB::builder()
+            .storage_dir(storage.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
+            .build()
+            .await
+            .unwrap();
+        db.execute("CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)").await.unwrap();
+        db.register_remote_process_function(
+            "activity",
+            "events",
+            worker.client().descriptor().clone(),
+            worker.client(),
+        )
+        .await
+        .unwrap();
+        let error = db.start().await.unwrap_err();
+        assert!(
+            error.to_string().contains("checkpoint pipeline identity"),
+            "{error}"
+        );
+        db.shutdown().await.unwrap();
+        drop(db);
+        let stronger = tempfile::tempdir().unwrap();
+        let db = LaminarDB::builder()
+            .storage_dir(stronger.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig::default())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .build()
+            .await
+            .unwrap();
+        db.execute("CREATE SOURCE events (key VARCHAR NOT NULL, amount BIGINT NOT NULL, ts TIMESTAMP NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)").await.unwrap();
+        let error = db
+            .register_remote_process_function(
+                "activity",
+                "events",
+                worker.client().descriptor().clone(),
+                worker.client(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("immutable dependency binding"),
+            "{error}"
+        );
+        db.shutdown().await.unwrap();
+        worker.shutdown().await.unwrap();
+    }
+
     #[cfg(any(unix, windows))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn crashed_python_worker_restores_database_checkpoint() {
@@ -2906,6 +3142,7 @@ def handle(activations):
         bytes.extend_from_slice(b"\n# changed after packaging\n");
         std::fs::write(&changed, bytes).unwrap();
         let error = LocalPythonWorker::start(LocalPythonWorkerConfig {
+            runtime_root: None,
             python: "python".into(),
             manifest: example.join("manifest.json"),
             handler_file: changed,

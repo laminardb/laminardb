@@ -54,6 +54,7 @@ fn descriptor() -> ProcessFunctionDescriptor {
         function_id: "remote_reference".into(),
         pipeline_state_id: "remote_test_pipeline".into(),
         implementation_digest: "b".repeat(64),
+        python_environment: None,
         input_schema: input_schema(),
         output_schema: output_schema(),
         key_columns: vec!["key".into()],

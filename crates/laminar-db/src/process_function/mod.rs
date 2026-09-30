@@ -51,6 +51,9 @@ pub struct ProcessFunctionDescriptor {
     pub pipeline_state_id: String,
     /// Hex SHA-256 of the trusted native build or other immutable implementation identity.
     pub implementation_digest: String,
+    /// Optional Python runtime and import-tree identity checked by the local supervisor.
+    /// File hashes detect deployment drift; they do not enforce lifetime immutability.
+    pub python_environment: Option<PythonEnvironmentBinding>,
     /// Exact input schema admitted from one direct source.
     pub input_schema: SchemaRef,
     /// Exact append-only output schema.
@@ -67,6 +70,23 @@ pub struct ProcessFunctionDescriptor {
     pub timer_names: Vec<String>,
     /// Hard execution and retained-state limits.
     pub limits: ProcessFunctionLimits,
+}
+
+/// Versioned file-tree binding for a supervised Python deployment. Absolute installation
+/// paths are excluded so an identical package can move without changing checkpoint identity.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonEnvironmentBinding {
+    /// Tree fingerprint format. Currently only 1 is admitted.
+    pub version: u32,
+    /// Selected interpreter's UTF-8 path relative to the runtime root, using `/` separators.
+    pub executable: String,
+    /// Exact top-level handler module and callable, written as `module:function`.
+    pub handler: String,
+    /// Lowercase hex SHA-256 of the complete runtime tree, including bytecode and native files.
+    pub runtime_sha256: String,
+    /// Ordered tree digests: handler directory first, then the configured import roots.
+    pub import_roots_sha256: Vec<String>,
 }
 
 /// Per-function bounds, enforced before accepting a handler response.

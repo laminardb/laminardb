@@ -63,8 +63,8 @@ impl LaminarDB {
     }
 
     /// Register a connected loopback Rust or Python worker for a local pipeline. At-least-once
-    /// delivery currently admits the Rust worker only; Python dependencies are not yet bound to
-    /// the worker package identity.
+    /// delivery currently admits the Rust worker only; Python file-tree hashes do not enforce
+    /// an immutable environment throughout the worker's lifetime.
     /// The caller owns the worker process lifecycle and must keep it available until shutdown.
     ///
     /// # Errors

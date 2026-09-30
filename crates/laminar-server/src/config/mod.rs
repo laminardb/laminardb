@@ -791,6 +791,9 @@ pub struct ProcessFunctionConfig {
     pub function: String,
     #[serde(default = "default_process_python")]
     pub python: std::path::PathBuf,
+    /// Interpreter installation for an environment-bound process manifest.
+    #[serde(default)]
+    pub runtime_root: Option<std::path::PathBuf>,
     #[serde(default)]
     pub python_paths: Vec<std::path::PathBuf>,
     #[serde(default = "default_process_max_in_flight")]

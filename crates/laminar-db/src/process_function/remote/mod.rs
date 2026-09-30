@@ -6,6 +6,7 @@
 mod client;
 mod codec;
 mod local_python;
+mod python_environment;
 mod response;
 mod worker;
 

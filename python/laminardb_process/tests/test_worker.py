@@ -116,6 +116,59 @@ class WorkerBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             serve(manifest, lambda _: (), "0.0.0.0:0")
 
+    def test_manifest_binds_optional_python_environment_and_rejects_invalid_fields(self) -> None:
+        original = json.loads(manifest_bytes())
+        original["python_environment"] = {
+            "version": 1, "executable": "python.exe", "handler": "handler:handle", "runtime_sha256": "b" * 64,
+            "import_roots_sha256": ["c" * 64, "d" * 64],
+        }
+        bound = Manifest.from_bytes(json.dumps(original).encode())
+        self.assertNotEqual(bound.digest, Manifest.from_bytes(manifest_bytes()).digest)
+        self.assertEqual(bound.environment_handler, "handler:handle")
+        for field, value in (("version", True), ("version", 2), ("executable", "../python"),
+                             ("executable", "/python"), ("executable", "C:\\python.exe"),
+                             ("handler", "handler:1invalid"), ("handler", "handler"),
+                             ("runtime_sha256", "B" * 64), ("import_roots_sha256", []),
+                             ("import_roots_sha256", ["c" * 64] * 17), ("unexpected", True)):
+            invalid = json.loads(json.dumps(original))
+            invalid["python_environment"][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                Manifest.from_bytes(json.dumps(invalid).encode())
+        original["python_environment"] = None
+        with self.assertRaises(ValueError):
+            Manifest.from_bytes(json.dumps(original).encode())
+
+    def test_environment_bootstrap_rejects_uncontained_standard_library_path(self) -> None:
+        repository = Path(__file__).resolve().parents[3]
+        bootstrap = repository / "crates/laminar-db/src/process_function/remote/python_environment/bootstrap.py"
+        with tempfile.TemporaryDirectory() as directory:
+            code = f"import sys\nsys.path.append({directory!r})\n" + bootstrap.read_text(encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-B", "-c", code,
+                 str(Path(sys.executable).resolve().parent), "[]", "laminardb_process.worker"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("standard-library path is outside", result.stderr)
+
+    def test_environment_bound_worker_requires_declared_entrypoint_and_source_file(self) -> None:
+        data = json.loads(manifest_bytes())
+        data["python_environment"] = {
+            "version": 1, "executable": "python.exe", "handler": "handler:handle",
+            "runtime_sha256": "b" * 64, "import_roots_sha256": ["c" * 64],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_bytes(json.dumps(data).encode())
+            for arguments in (("--handler", "handler:different", "--handler-file", __file__),
+                              ("--handler", "handler:handle")):
+                result = subprocess.run(
+                    [sys.executable, "-m", "laminardb_process.worker", "--manifest", str(manifest),
+                     *arguments], capture_output=True, text=True, timeout=5, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires the declared handler and verified handler file", result.stderr)
+
     def test_ipc_accepts_one_exact_batch_and_rejects_truncation(self) -> None:
         schema = Manifest.from_bytes(manifest_bytes()).input_schema
         batch = pa.record_batch([

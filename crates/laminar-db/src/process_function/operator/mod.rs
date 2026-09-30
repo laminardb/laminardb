@@ -642,6 +642,14 @@ pub(super) fn validate_descriptor(
         ));
     }
     let limits = descriptor.limits;
+    if let Some(environment) = &descriptor.python_environment {
+        if descriptor.runtime != super::ProcessRuntime::RemotePython {
+            return Err(DbError::Unsupported(
+                "environment binding requires the Python runtime".into(),
+            ));
+        }
+        environment.validate()?;
+    }
     if limits.max_batch_rows == 0
         || limits.max_input_rows == 0
         || limits.max_input_bytes == 0

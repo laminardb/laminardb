@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_or_else(|| PathBuf::from("python"), PathBuf::from);
     let worker = LocalPythonWorker::start(LocalPythonWorkerConfig {
         python,
+        runtime_root: None,
         manifest: example.join("manifest.json"),
         handler_file: example.join("handler.py"),
         function: "handle".into(),
