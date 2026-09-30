@@ -735,12 +735,12 @@ async fn due_timers_remain_scheduled_after_callback_limit() {
     assert!(!graph.has_deferred_work());
 }
 
-#[tokio::test]
-async fn native_state_and_timer_budget_stays_bounded_across_churn_and_restore() {
+async fn assert_native_state_and_timer_budget_across_churn() {
     let mut binding = descriptor();
     binding.limits.max_keys = 64;
     binding.limits.max_timers = 64;
     binding.limits.max_state_bytes = 16 * 1024;
+    binding.limits.max_input_rows = 64;
     let keys = (0..64)
         .map(|index| format!("account_{index}"))
         .collect::<Vec<_>>();
@@ -801,6 +801,38 @@ async fn native_state_and_timer_budget_stays_bounded_across_churn_and_restore() 
     assert_eq!(totals(&callbacks), vec![64; keys.len()]);
     assert!(operator.managed_state_accounting().unwrap().live <= 16 * 1024);
     assert!(!operator.deferred_work_is_runnable());
+
+    let overload_rows = keys
+        .iter()
+        .map(|key| (key.as_str(), 1, 174_000))
+        .chain(std::iter::once(("extra", 1, 174_000)))
+        .collect::<Vec<_>>();
+    let before = operator.managed_state_accounting();
+    let error = operator
+        .process_with_frontiers(
+            &[vec![input_batch(&overload_rows)]],
+            &[InputFrontier {
+                watermark: Some(174),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("process input budget exceeded"));
+    assert_eq!(operator.managed_state_accounting(), before);
+}
+
+#[tokio::test]
+async fn native_state_and_timer_budget_stays_bounded_across_churn_and_restore() {
+    assert_native_state_and_timer_budget_across_churn().await;
+}
+
+#[tokio::test]
+#[ignore = "manual sustained resource qualification"]
+async fn native_state_and_timer_budget_resource_stress() {
+    for _ in 0..2_700 {
+        assert_native_state_and_timer_budget_across_churn().await;
+    }
 }
 
 #[tokio::test]

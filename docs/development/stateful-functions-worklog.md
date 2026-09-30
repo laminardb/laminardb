@@ -237,6 +237,14 @@ The standalone `laminardb` binary now has two integration regressions for the sa
 
 Validation: both focused `process_cli_host_loss` integration tests passed with real Python dependencies and `--no-default-features --features process-remote,files`. The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial tests: 1,977 connectors, 973 core, 2,026 database (one ignored), and 870 SQL tests. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The known unadjusted Windows stack failure remains. No production code or coordinator-cycle path changed.
 
+### Continuation: sampled native timer/checkpoint churn and overload (2026-09-30)
+
+The existing 64-key native operator test now caps one input step at 64 rows and verifies that a 65-row batch is rejected without changing managed-state accounting. An ignored, manual resource test repeats that same bounded cycle 2,700 times in one process. Each cycle processes 64 rounds of 64 input rows, replaces keyed event-time timers, captures and restores whole-operator and vnode state every 16 rounds, fires the final 64 callbacks, and rejects one overload batch. The normal focused test passed. The manual test passed after 141.16 seconds: 172,800 input rounds, 11,059,200 input activations, 10,800 checkpoint/restore rounds, and 2,700 rejected overload batches.
+
+On the same Windows AMD Ryzen 9 7900X development host, the debug-profile test executable was sampled once per second with `Get-Process` into ignored `target/process-resource-churn-20260930/samples.csv` (138 samples; 140.24 seconds at the last sample). Peak working set was 16.875 MiB. Across samples after 30 seconds, working set ranged 16.359–16.875 MiB, private bytes 4.910–5.434 MiB, and the fitted working-set slope was 0.046 KiB/s. The last sampled process CPU was 139.91 seconds, close to one busy core over this test run. This demonstrates bounded memory for one fixed 64-key state shape with repeated timer, checkpoint, restore, and input-row-overload work. It is not an optimized throughput or p99 benchmark, full server/worker RSS qualification, a growing-cardinality test, or target-hardware CPU/IPC evidence. No production or coordinator-cycle code changed.
+
+Validation: the focused normal test and the ignored manual stress test passed. The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial execution: 1,977 connectors, 973 core, 2,026 database (two ignored, including the manual stress), and 870 SQL tests. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The known unadjusted Windows test-stack failure remains.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -250,4 +258,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Extend local Rust resource evidence to checkpoint/timer churn and overload, then qualify server admission budgets under load. Bind Python's interpreter, SDK, PyArrow, gRPC, and imported dependency closure immutably before considering `AtLeastOnce`. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.
+Qualify single-node server process-function admission budgets under load, including worker saturation and bounded pending bytes. Bind Python's interpreter, SDK, PyArrow, gRPC, and imported dependency closure immutably before considering `AtLeastOnce`. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.
