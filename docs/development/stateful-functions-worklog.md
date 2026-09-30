@@ -1,6 +1,6 @@
 # Stateful Process Functions worklog
 
-**Status/date:** Active implementation, 2026-09-29. This is a resumable engineering log, not a support claim.
+**Status/date:** Active implementation, 2026-09-30. This is a resumable engineering log, not a support claim.
 
 ## Baseline
 
@@ -225,12 +225,18 @@ A full single-node `run_server` regression uses the configured FILES JSON source
 
 Validation: the focused full-server regression passed before and after test-fixture cleanup. The final Python-enabled `--no-default-features --features process-remote,files` server binary suite passed 265 tests. The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial execution: database 2,026 tests passed (one ignored), SQL 870, and connector/core libraries passed. Both workspace Clippy gates with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed.
 
+### Continuation: configured server host-process loss (2026-09-30)
+
+Two subprocess regressions now run the single-node `run_server` startup path with the TOML-loaded Python function, production FILES JSON source, and configured FILES JSON sink. The child server host commits the first file and process state with output 60. For the pending cut, the second Python invocation records logical activation ID 1 and remains inside the handler while the parent kills the server host; only 60 has reached the sink. For the published cut, the sink durably contains 60 and 110 before the parent kills the host without another checkpoint. A test marker releases and exits the orphaned Python child, then a fresh server and worker restore the committed cut. The pending case publishes 110 once; the published case republishes 110, leaving sink totals 60, 110, 110. Both replayed invocations retain logical activation ID 1. These tests execute the server runtime in a test subprocess, not the standalone CLI entry point. Python remains `BestEffort`; imported dependency code is still mutable, and no cluster admission changed.
+
+Validation: the three focused configured FILES server tests and the full Python-enabled server binary suite passed (267 tests). The workspace library gate passed with `RUST_MIN_STACK=8388608` and serial tests: 1,977 connectors, 973 core, 2,026 database (one ignored), and 870 SQL tests. Both workspace Clippy modes with `-D warnings`, nightly formatting, the readability checker, and `git diff --check` passed. The known unadjusted Windows test-stack failure remains. No production or coordinator-cycle code changed, so the hot-path before/after Criterion gate does not apply.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
 |---|---|---|
 | Embedded local | Trusted native or connected loopback Rust/Python worker, direct or append-only connector source, `BestEffort`; native and loopback Rust with replayable connector source, durable checkpoint and sink under `AtLeastOnce`; bounded vnode capture and guarded restore with per-entry validation; production file source/sink replay pending and durably published uncheckpointed activations after native or remote Rust host termination; a separately supervised Python worker survives both cuts under `BestEffort` | Python dependency binding, sustained process-RSS qualification, and target-hardware profiling before wider admission or latency claims |
-| Single-node server | Startup-bound Python manifest/worker in TOML, direct in-memory or FILES JSON source via `source_sql`, SQL input and WebSocket output, configured FILES JSON sink from process output, console-policy binding inspection, `BestEffort`; committed FILES cursor and process state restore with sink publication through the startup binding; in-flight worker exit triggers fenced whole-server shutdown and pending FILES replay after restart | Host-process loss and published-but-uncheckpointed sink cuts, admission-budget qualification, immutable dependency bundle, and target-hardware latency evidence before stronger delivery |
+| Single-node server | Startup-bound Python manifest/worker in TOML, direct in-memory or FILES JSON source via `source_sql`, SQL input and WebSocket output, configured FILES JSON sink from process output, console-policy binding inspection, `BestEffort`; committed FILES cursor and process state restore with sink publication through the startup binding; in-flight worker exit triggers fenced whole-server shutdown; server-runtime subprocess host loss replays pending input and republishes uncheckpointed sink output | Standalone CLI kill coverage, admission-budget qualification, immutable dependency bundle, and target-hardware latency evidence before stronger delivery |
 | Cluster with one node | Rejected at registration and operator capability | Shared-checkpoint binding, assignment-fenced vnode state/timers, shuffle provenance, one-owner loss/restart and stale-attempt tests |
 | Distributed cluster | Rejected | All one-node gates plus cross-node shuffle ordering, vnode acquisition/revocation, timer/pending-work transfer, rescale and node-loss tests |
 
@@ -238,4 +244,4 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Exercise host-process loss at pending and durably published FILES cuts through the configured Python source/sink route, retaining `BestEffort` until imported dependencies are bound immutably. Extend local Rust resource evidence to checkpoint/timer churn and overload. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.
+Exercise the same pending and published FILES cuts through the standalone `laminardb` CLI bootstrap to cover config-file and control API behavior at abrupt host loss. Extend local Rust resource evidence to checkpoint/timer churn and overload. Bind Python's interpreter, SDK, PyArrow, gRPC, and imported dependency closure immutably before considering `AtLeastOnce`. Run sampled CPU/IPC and representative tail latency on target hardware before product latency claims. Certify one-owner cluster recovery and assignment fencing before distributed handoff. Do not enable either cluster form from capability metadata alone.

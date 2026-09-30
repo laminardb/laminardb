@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(all(feature = "process-remote", feature = "files"))]
+use std::time::Duration;
+
 #[tokio::test]
 async fn graph_input_limit_is_validated_before_server_mode_routing() {
     for mode in [ServerMode::Single, ServerMode::Cluster] {
@@ -463,15 +466,20 @@ async fn wait_for_process_sink(directory: &std::path::Path, expected: &[i64]) {
 }
 
 #[cfg(all(feature = "process-remote", feature = "files"))]
-fn publish_process_file(root: &std::path::Path, name: &str, amount: i64, timestamp: i64) {
+fn publish_process_file(
+    root: &std::path::Path,
+    name: &str,
+    amount: i64,
+    timestamp: i64,
+) -> std::io::Result<()> {
     let mut row = serde_json::to_vec(&serde_json::json!({
         "key": "a", "amount": amount, "ts": timestamp
     }))
     .unwrap();
     row.push(b'\n');
     let staged = root.join("staged.json");
-    std::fs::write(&staged, row).unwrap();
-    std::fs::rename(staged, root.join("input").join(name)).unwrap();
+    std::fs::write(&staged, row)?;
+    std::fs::rename(staged, root.join("input").join(name))
 }
 
 #[cfg(all(feature = "process-remote", feature = "files"))]
@@ -483,8 +491,13 @@ fn process_failure_handler(
 
     let fail_literal = serde_json::to_string(&root.join("fail-second").to_string_lossy()).unwrap();
     let exit_literal = serde_json::to_string(&root.join("exit-worker").to_string_lossy()).unwrap();
+    let exit_ack_literal =
+        serde_json::to_string(&root.join("worker-exiting").to_string_lossy()).unwrap();
     let entered_literal =
         serde_json::to_string(&root.join("second-entered").to_string_lossy()).unwrap();
+    let hold_literal = serde_json::to_string(&root.join("hold-second").to_string_lossy()).unwrap();
+    let release_literal =
+        serde_json::to_string(&root.join("release-second").to_string_lossy()).unwrap();
     let base =
         std::fs::read_to_string(repository.join("examples/process_python/handler.py")).unwrap();
     let handler = format!(
@@ -495,20 +508,32 @@ import time as _time
 from pathlib import Path as _Path
 _fail = _Path({fail_literal})
 _exit = _Path({exit_literal})
+_exit_ack = _Path({exit_ack_literal})
 _entered = _Path({entered_literal})
+_hold = _Path({hold_literal})
+_release = _Path({release_literal})
+def _exit_now():
+    _exit_ack.write_text(str(_os.getpid()))
+    _os._exit(47)
 def _watch_exit():
     while not _exit.exists():
         _time.sleep(0.01)
-    _os._exit(47)
+    _exit_now()
 _threading.Thread(target=_watch_exit, daemon=True).start()
 _original_handle = handle
 def handle(activations):
-    if _fail.exists() and any(
+    if any(
         a.input is not None and a.input.column(1)[0].as_py() == 50
         for a in activations
     ):
-        _entered.write_text(str(activations[0].id))
-        _os._exit(47)
+        with _entered.open('a') as marker:
+            marker.write(f"{{activations[0].id}}\n")
+        if _hold.exists():
+            while not _release.exists():
+                _time.sleep(0.01)
+            _exit_now()
+        if _fail.exists():
+            _exit_now()
     return _original_handle(activations)
 "#
     );
@@ -533,8 +558,8 @@ fn file_process_server_config(
 ) -> ServerConfig {
     let input_dir = root.join("input");
     let output_dir = root.join("output");
-    std::fs::create_dir(&input_dir).unwrap();
-    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::create_dir_all(&input_dir).unwrap();
+    std::fs::create_dir_all(&output_dir).unwrap();
     let (handler_path, manifest_path) = process_failure_handler(root, repository);
     let mut config =
         crate::config::load_config(&repository.join("examples/process_python/server.toml"))
@@ -609,12 +634,12 @@ async fn configured_file_process_recovers_after_in_flight_worker_exit() {
         #[cfg(feature = "cluster")]
         ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
     };
-    publish_process_file(root, "first.json", 60, 100_000);
+    publish_process_file(root, "first.json", 60, 100_000).unwrap();
     wait_for_process_sink(&output_dir, &[60]).await;
     assert!(db.checkpoint().await.unwrap().success);
     let stopped = tokio::spawn(first.wait_for_shutdown());
     std::fs::write(&fail, []).unwrap();
-    publish_process_file(root, "second.json", 50, 100_050);
+    publish_process_file(root, "second.json", 50, 100_050).unwrap();
     let error = tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
         .await
         .expect("server did not stop after in-flight worker loss")
@@ -644,6 +669,198 @@ async fn configured_file_process_recovers_after_in_flight_worker_exit() {
     assert!(error.to_string().contains("process worker 0 exited"));
     assert!(restored.is_closed());
     assert_eq!(process_sink_totals(&output_dir), vec![60, 110]);
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+#[derive(Clone, Copy)]
+enum ServerHostLossCut {
+    PendingInvocation,
+    PublishedOutput,
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+async fn wait_for_server_host_marker(
+    child: &mut tokio::process::Child,
+    marker: &std::path::Path,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("server host exited before {}: {status}", marker.display());
+            }
+            if marker.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("server host did not reach {}", marker.display()))?
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+async fn run_configured_process_host_child(root: &std::path::Path, cut: ServerHostLossCut) {
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let python = PathBuf::from(std::env::var_os("LAMINAR_PROCESS_PYTHON").unwrap());
+    let config = file_process_server_config(root, &repository, python);
+    let config_path = repository.join("examples/process_python/server.toml");
+    let handle = run_server(config, config_path).await.unwrap();
+    let db = match &handle.runtime {
+        ServerRuntime::Single(runtime) => Arc::clone(&runtime.db),
+        #[cfg(feature = "cluster")]
+        ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
+    };
+    publish_process_file(root, "first.json", 60, 100_000).unwrap();
+    wait_for_process_sink(&root.join("output"), &[60]).await;
+    assert!(db.checkpoint().await.unwrap().success);
+    std::fs::write(root.join("first-checkpointed"), []).unwrap();
+    if matches!(cut, ServerHostLossCut::PublishedOutput) {
+        wait_for_process_sink(&root.join("output"), &[60, 110]).await;
+        std::fs::write(root.join("output-published"), []).unwrap();
+    }
+    let result = handle.wait_for_shutdown().await;
+    panic!("server host stopped before forced termination: {result:?}");
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+async fn assert_configured_process_recovery_after_host_loss(
+    cut: ServerHostLossCut,
+    test_name: &str,
+) {
+    const CHILD_ENV: &str = "LAMINAR_PROCESS_SERVER_HOST_LOSS_CHILD";
+    if let Some(root) = std::env::var_os(CHILD_ENV) {
+        run_configured_process_host_child(std::path::Path::new(&root), cut).await;
+        return;
+    }
+    let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let output_dir = root.join("output");
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_ENV, root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    let mut host = command.spawn().unwrap();
+    let cut_marker = match cut {
+        ServerHostLossCut::PendingInvocation => "second-entered",
+        ServerHostLossCut::PublishedOutput => "output-published",
+    };
+    let cut_result: anyhow::Result<()> = async {
+        wait_for_server_host_marker(&mut host, &root.join("first-checkpointed")).await?;
+        if matches!(cut, ServerHostLossCut::PendingInvocation) {
+            std::fs::write(root.join("hold-second"), [])?;
+        }
+        publish_process_file(root, "second.json", 50, 100_050)?;
+        wait_for_server_host_marker(&mut host, &root.join(cut_marker)).await
+    }
+    .await;
+    let kill_result = host.start_kill();
+    // Abrupt host termination bypasses its worker supervisor.
+    let exit_signal = std::fs::write(root.join("exit-worker"), []);
+    let release_signal = std::fs::write(root.join("release-second"), []);
+    let host_status = tokio::time::timeout(Duration::from_secs(5), host.wait()).await;
+    let worker_exit = tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.join("worker-exiting").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    cut_result.unwrap();
+    kill_result.unwrap();
+    assert!(!host_status.unwrap().unwrap().success());
+    exit_signal.unwrap();
+    release_signal.unwrap();
+    worker_exit.expect("Python worker did not acknowledge exit after host loss");
+
+    let before_replay = match cut {
+        ServerHostLossCut::PendingInvocation => vec![60],
+        ServerHostLossCut::PublishedOutput => vec![60, 110],
+    };
+    assert_eq!(process_sink_totals(&output_dir), before_replay);
+    assert_eq!(
+        std::fs::read_to_string(root.join("second-entered"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["1"]
+    );
+    std::fs::remove_file(root.join("exit-worker")).unwrap();
+    std::fs::remove_file(root.join("release-second")).unwrap();
+    std::fs::remove_file(root.join("worker-exiting")).unwrap();
+    if matches!(cut, ServerHostLossCut::PendingInvocation) {
+        std::fs::remove_file(root.join("hold-second")).unwrap();
+    }
+
+    let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let config_path = repository.join("examples/process_python/server.toml");
+    let config = file_process_server_config(root, &repository, python.into());
+    let replacement = run_server(config, config_path).await.unwrap();
+    let restored_db = match &replacement.runtime {
+        ServerRuntime::Single(runtime) => Arc::clone(&runtime.db),
+        #[cfg(feature = "cluster")]
+        ServerRuntime::Cluster(_) => panic!("process test requires single-node server"),
+    };
+    let after_replay = match cut {
+        ServerHostLossCut::PendingInvocation => vec![60, 110],
+        ServerHostLossCut::PublishedOutput => vec![60, 110, 110],
+    };
+    let replay = tokio::time::timeout(Duration::from_secs(15), async {
+        while process_sink_totals(&output_dir) != after_replay {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let checkpoint = if replay.is_ok() {
+        Some(restored_db.checkpoint().await)
+    } else {
+        None
+    };
+    let stopped = tokio::spawn(replacement.wait_for_shutdown());
+    let stop_signal = std::fs::write(root.join("exit-worker"), []);
+    let stop_result = tokio::time::timeout(Duration::from_secs(10), stopped).await;
+    assert!(
+        replay.is_ok(),
+        "configured process sink did not publish {after_replay:?}; observed {:?}",
+        process_sink_totals(&output_dir)
+    );
+    assert!(checkpoint.unwrap().unwrap().success);
+    stop_signal.unwrap();
+    let error = stop_result.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("process worker 0 exited"));
+    assert!(restored_db.is_closed());
+    assert_eq!(process_sink_totals(&output_dir), after_replay);
+    assert_eq!(
+        std::fs::read_to_string(root.join("second-entered"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["1", "1"]
+    );
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_file_process_replays_pending_after_server_host_loss() {
+    assert_configured_process_recovery_after_host_loss(
+        ServerHostLossCut::PendingInvocation,
+        "server::tests::configured_file_process_replays_pending_after_server_host_loss",
+    )
+    .await;
+}
+
+#[cfg(all(feature = "process-remote", feature = "files"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_file_process_republishes_uncheckpointed_output_after_server_host_loss() {
+    assert_configured_process_recovery_after_host_loss(
+        ServerHostLossCut::PublishedOutput,
+        "server::tests::configured_file_process_republishes_uncheckpointed_output_after_server_host_loss",
+    )
+    .await;
 }
 
 fn make_source(name: &str, connector: &str) -> SourceConfig {
