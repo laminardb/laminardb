@@ -9,9 +9,13 @@ mod cluster_subscription;
 mod datafusion_memory_tests;
 mod session;
 #[cfg(feature = "cluster")]
+mod topology;
+#[cfg(feature = "cluster")]
 pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
 };
+#[cfg(feature = "cluster")]
+pub use topology::ClusterTopologyStatus;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -423,6 +427,10 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
+    /// Version loaded by exact catalog replay; runtime activation requires Running and release.
+    #[cfg(feature = "cluster")]
+    pub(crate) replayed_topology_version:
+        parking_lot::Mutex<Option<laminar_core::cluster::control::TopologyVersion>>,
     /// Pre-built shared checkpoint namespace installed during cluster construction.
     #[cfg(feature = "cluster")]
     cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -1854,6 +1862,8 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             catalog_manifest_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
+            replayed_topology_version: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
             cluster_checkpoint_object_store: None,
             #[cfg(feature = "cluster")]
             pending_vnode_transition: Arc::new(parking_lot::Mutex::new(None)),
@@ -2625,7 +2635,7 @@ impl LaminarDB {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return Ok(None);
         };
-        let Some(manifest) = store.load().await.map_err(|error| {
+        let Some((manifest, topology)) = store.load_with_topology().await.map_err(|error| {
             DbError::Pipeline(format!(
                 "[{}] catalog manifest load failed: {error}",
                 laminar_core::error_codes::RECOVERY_FAILED
@@ -2758,6 +2768,12 @@ impl LaminarDB {
             )));
         }
         replay_guard.sealed();
+        *self.replayed_topology_version.lock() = match topology {
+            laminar_core::cluster::control::TopologyCatalogState::Versioned { baseline } => {
+                Some(baseline.topology_version)
+            }
+            _ => None,
+        };
         Ok(Some(manifest))
     }
 

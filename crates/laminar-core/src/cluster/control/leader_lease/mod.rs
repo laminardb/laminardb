@@ -3,6 +3,7 @@
 mod artifact_admission;
 mod attempt_status;
 mod subscription_replay;
+mod topology;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
@@ -54,6 +55,7 @@ const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
 const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
 const AUTHORITY_RECORD_VERSION: u32 = 12;
+const TOPOLOGY_AUTHORITY_RECORD_VERSION: u32 = 13;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1054,6 +1056,9 @@ struct LeaderAuthorityRecord {
     recovery_release_commit: Option<AuthorityRecoveryReleaseCommit>,
     /// Latest admitted recovery release, preserved by every later authority mutation.
     recovery_release_head: Option<RecoveryReleaseLink>,
+    /// Explicit baseline, present only after the coordinated authority-format upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology_baseline: Option<super::topology::LegacyTopologyBaseline>,
 }
 
 impl LeaderLease {
@@ -1257,12 +1262,13 @@ impl LeaderAuthorityRecord {
             recovery_fault_slots: Vec::new(),
             recovery_release_commit: None,
             recovery_release_head: None,
+            topology_baseline: None,
         }
     }
 
     fn preserve_with_lease(&self, lease: LeaderLease) -> Self {
         Self {
-            version: AUTHORITY_RECORD_VERSION,
+            version: self.version,
             lease,
             checkpoint_outcome: None,
             previous_outcome: None,
@@ -1285,17 +1291,21 @@ impl LeaderAuthorityRecord {
             recovery_fault_slots: self.recovery_fault_slots.clone(),
             recovery_release_commit: None,
             recovery_release_head: self.recovery_release_head.clone(),
+            topology_baseline: self.topology_baseline.clone(),
         }
     }
 
     fn validate(&self) -> Result<(), LeaseError> {
-        if self.version != AUTHORITY_RECORD_VERSION {
+        if self.version != AUTHORITY_RECORD_VERSION
+            && self.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
+        {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
                 self.version
             )));
         }
         self.lease.validate()?;
+        self.validate_topology_baseline()?;
         for link in [
             self.previous_outcome,
             self.outcome_head,
@@ -2620,6 +2630,10 @@ impl LeaderLeaseStore {
         };
         let head_sequence = head.lease.seq;
         let mut retained = BTreeSet::from([head_sequence]);
+        if let Some(baseline) = head.topology_baseline.as_ref() {
+            authority.audit_topology_adoption(baseline).await?;
+            retained.insert(baseline.authority_sequence);
+        }
         if let Some(previous) = head_sequence
             .checked_sub(1)
             .filter(|sequence| *sequence != 0)
@@ -3406,6 +3420,7 @@ impl LeaderLeaseStore {
                 )));
             }
             Some(head) if head.record.lease.seq.checked_add(1) == Some(candidate.lease.seq) => {
+                head.record.validate_topology_successor(candidate)?;
                 Some(&head.pointer)
             }
             Some(head) => {

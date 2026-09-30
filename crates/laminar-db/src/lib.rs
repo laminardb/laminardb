@@ -190,6 +190,8 @@ pub use subscription::cluster::benchmark::{
     ClusterSubscriptionGatewayBenchmark, GatewayReplayObservation, SlowReaderFootprint,
 };
 
+#[cfg(feature = "cluster")]
+pub use db::ClusterTopologyStatus;
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};

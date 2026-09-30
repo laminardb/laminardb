@@ -10,6 +10,7 @@ mod lease_deadline;
 mod namespace_proof;
 pub mod process_lease;
 pub mod snapshot;
+pub mod topology;
 
 pub use crate::checkpoint::{
     CheckpointAssignmentAdoption, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
@@ -59,6 +60,10 @@ pub use process_lease::{
 pub use snapshot::{
     AssignmentSnapshot, AssignmentSnapshotRef, AssignmentSnapshotStore, RotateOutcome,
     SnapshotError,
+};
+pub use topology::{
+    LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
+    TopologyOperationId, TopologyVersion, TOPOLOGY_PROTOCOL_VERSION,
 };
 
 #[cfg(feature = "cluster")]

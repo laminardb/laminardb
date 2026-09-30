@@ -2509,6 +2509,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/cluster/vnodes"),
         ("GET", "/api/v1/cluster/leader"),
         ("GET", "/api/v1/cluster/checkpoints"),
+        ("GET", "/api/v1/cluster/topology"),
         ("GET", "/api/v1/pipeline/status"),
         ("GET", "/ws/events"),
         ("POST", "/api/v1/checkpoint"),
@@ -3533,6 +3534,198 @@ async fn test_cluster_leader_404_when_not_cluster() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn topology_status_404_when_not_cluster_and_requires_console_authorization() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/topology")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = build_router(test_state_with_token("topology-console"))
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/topology")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_activation() {
+    use laminar_core::cluster::control::{
+        prove_shared_object_store_namespaces, CatalogManifest, CatalogManifestEntry,
+        CatalogManifestStore, CatalogObjectKind, CheckpointDecisionStore, ClusterController,
+        ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+        TopologyCatalogState,
+    };
+    use laminar_core::cluster::discovery::NodeId;
+    use object_store::{ObjectStore, ObjectStoreExt};
+
+    async fn read_status(app: Router, token: &str) -> serde_json::Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/topology")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    let node = NodeId(51);
+    let boot = uuid::Uuid::from_u128(51);
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
+    let owner = LeaderLeaseOwner {
+        node,
+        boot,
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        panic!("empty namespace must admit the test leader");
+    };
+    let catalog = Arc::new(CatalogManifestStore::new(authority));
+    let snapshot_store = Arc::new(
+        laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&objects)),
+    );
+    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let participant = laminar_core::checkpoint::CheckpointParticipant {
+        node_id: node.0,
+        boot_incarnation: boot,
+    };
+    let namespaces = prove_shared_object_store_namespaces(
+        participant,
+        &[participant],
+        Arc::clone(&control),
+        Arc::clone(&objects),
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        Arc::clone(&control),
+        control,
+        Some(Arc::clone(&snapshot_store)),
+        members_rx.clone(),
+        boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        )))
+        .unwrap();
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .verified_cluster_namespaces(namespaces)
+        .catalog_manifest_store(Arc::clone(&catalog))
+        .build()
+        .await
+        .unwrap();
+    let token = canonical_auth_token(51);
+    let mut state = test_state_with_token(&token);
+    let mutable_state = Arc::get_mut(&mut state).unwrap();
+    mutable_state.db = db;
+    mutable_state.cluster = Some(ClusterComponents {
+        controller,
+        snapshot_store,
+        membership_rx: members_rx,
+    });
+    let app = build_router(Arc::clone(&state));
+
+    let uninitialized = read_status(app.clone(), &token).await;
+    assert_eq!(uninitialized["catalog"]["state"], "uninitialized");
+    assert!(uninitialized["committed_version"].is_null());
+    assert!(uninitialized["locally_active_version"].is_null());
+
+    let manifest = CatalogManifest::new(vec![CatalogManifestEntry {
+        canonical_name: "existing".into(),
+        kind: CatalogObjectKind::Source,
+        catalog_generation: 7,
+        ddl: "CREATE SOURCE existing (id BIGINT)".into(),
+    }])
+    .unwrap();
+    catalog.seal(&manifest, &lease.proof()).await.unwrap();
+    let TopologyCatalogState::LegacySealed {
+        manifest: reference,
+    } = catalog.topology_state().await.unwrap()
+    else {
+        panic!("sealed inventory must be explicitly unversioned");
+    };
+    let legacy = read_status(app.clone(), &token).await;
+    assert_eq!(legacy["catalog"]["state"], "legacy_sealed");
+    assert_eq!(
+        legacy["catalog"]["manifest"],
+        serde_json::to_value(&reference).unwrap()
+    );
+    assert!(legacy["committed_version"].is_null());
+    assert!(legacy["locally_active_version"].is_null());
+
+    let deployment = CheckpointDecisionStore::new(Arc::clone(&objects))
+        .load_or_create_deployment_id()
+        .await
+        .unwrap();
+    catalog
+        .adopt_legacy_topology(
+            &lease.proof(),
+            uuid::Uuid::from_u128(42).try_into().unwrap(),
+            &reference,
+            &deployment,
+        )
+        .await
+        .unwrap();
+    let adopted = read_status(app.clone(), &token).await;
+    assert_eq!(adopted["catalog"]["state"], "versioned");
+    assert_eq!(adopted["committed_version"], 1);
+    assert!(adopted["locally_active_version"].is_null());
+    assert_eq!(
+        adopted["catalog"]["baseline"]["manifest"],
+        legacy["catalog"]["manifest"]
+    );
+    assert_eq!(adopted["catalog"]["baseline"]["deployment_id"], deployment);
+
+    objects
+        .delete(&object_store::path::Path::from(format!(
+            "control/catalog-manifest/v1/{}.json",
+            reference.sha256
+        )))
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/topology")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("LDB-6060"));
 }
 
 #[tokio::test]

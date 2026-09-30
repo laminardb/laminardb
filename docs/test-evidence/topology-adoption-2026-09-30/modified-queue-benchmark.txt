@@ -1,0 +1,16 @@
+   Compiling laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Finished `bench` profile [optimized] target(s) in 1m 07s
+     Running benches\streaming_bench.rs (target/topology-benchmark-target\release\deps\streaming_bench-efa6e9d226b2bba8.exe)
+Gnuplot not found, using plotters backend
+Benchmarking accepted_push/arrow_16
+Benchmarking accepted_push/arrow_16: Warming up for 1.0000 s
+Benchmarking accepted_push/arrow_16: Collecting 30 samples in estimated 2.0018 s (321k iterations)
+Benchmarking accepted_push/arrow_16: Analyzing
+accepted_push/arrow_16  time:   [6.1694 µs 6.2107 µs 6.2767 µs]
+                        thrpt:  [1.3051 Gelem/s 1.3190 Gelem/s 1.3278 Gelem/s]
+                 change:
+                        time:   [−2.7019% −0.2923% +1.8246%] (p = 0.82 > 0.05)
+                        thrpt:  [−1.7919% +0.2931% +2.7769%]
+                        No change in performance detected.
+Found 3 outliers among 30 measurements (10.00%)
+  3 (10.00%) high severe

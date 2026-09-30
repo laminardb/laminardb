@@ -248,23 +248,62 @@ impl CatalogManifestStore {
         Self { authority }
     }
 
+    /// Read explicit logical topology metadata from the same catalog/leader authority.
+    ///
+    /// # Errors
+    /// Fails closed when the authority or referenced catalog/deployment is invalid.
+    pub async fn topology_state(
+        &self,
+    ) -> Result<super::topology::TopologyCatalogState, super::topology::TopologyError> {
+        self.authority.topology_catalog_state().await
+    }
+
+    /// Load the catalog and its topology metadata from one immutable authority snapshot.
+    ///
+    /// # Errors
+    /// Fails closed on missing/corrupt content or inconsistent adoption/deployment authority.
+    pub async fn load_with_topology(
+        &self,
+    ) -> Result<
+        Option<(CatalogManifest, super::topology::TopologyCatalogState)>,
+        super::topology::TopologyError,
+    > {
+        self.authority.catalog_with_topology().await
+    }
+
+    /// Explicitly adopt a sealed legacy inventory without changing the processing graph.
+    ///
+    /// Requires a coordinated binary upgrade; this is not runtime migration admission.
+    ///
+    /// # Errors
+    /// Rejects stale leader proof, divergent reference/deployment, invalid data or authority I/O.
+    pub async fn adopt_legacy_topology(
+        &self,
+        proof: &LeaderProof,
+        operation_id: super::topology::TopologyOperationId,
+        expected_manifest: &CatalogManifestRef,
+        expected_deployment: &str,
+    ) -> Result<super::topology::TopologyAdoptionOutcome, super::topology::TopologyError> {
+        self.authority
+            .adopt_legacy_topology(proof, operation_id, expected_manifest, expected_deployment)
+            .await
+    }
+
     /// Load the sealed catalog, or `None` before the first successful seal.
     ///
     /// # Errors
     /// Fails on object-store I/O, malformed JSON, or an invalid inventory.
     pub async fn load(&self) -> Result<Option<CatalogManifest>, CatalogManifestError> {
-        let Some(reference) = self
-            .authority
-            .load()
-            .await?
-            .and_then(|lease| lease.catalog_manifest)
-        else {
-            return Ok(None);
-        };
-        self.authority
-            .load_catalog_manifest(&reference)
+        self.load_with_topology()
             .await
-            .map(Some)
+            .map(|snapshot| snapshot.map(|(manifest, _)| manifest))
+            .map_err(|error| match error {
+                super::topology::TopologyError::Authority(error) => {
+                    CatalogManifestError::Authority(error)
+                }
+                super::topology::TopologyError::Catalog(error) => error,
+                error => CatalogManifestError::Invalid(error.to_string()),
+            })
     }
 
     /// CAS-append the first inventory under an exact leader proof.

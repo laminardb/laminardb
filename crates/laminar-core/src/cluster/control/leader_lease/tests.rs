@@ -3152,6 +3152,9 @@ fn catalog(name: &str) -> CatalogManifest {
     .unwrap()
 }
 
+#[path = "topology_tests.rs"]
+mod topology;
+
 #[tokio::test]
 async fn committed_recovery_release_survives_renewal_and_takeover() {
     let store = Arc::new(store(1));

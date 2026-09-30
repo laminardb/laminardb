@@ -90,6 +90,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology.rs"]
+mod topology_adoption;
+#[cfg(feature = "kafka")]
 mod workload_qualification;
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -13735,6 +13738,13 @@ fn three_node_alo_join_kill9_soak() {
 }
 
 #[test]
+#[ignore = "spawns 3 real processes with Kafka/S3, adopts legacy authority, and restarts all nodes"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_legacy_topology_adoption_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(JoinDelivery::AtLeastOnce, false, None, true);
+}
+
+#[test]
 #[ignore = "spawns 3 real laminardb processes with a durable WebSocket subscription"]
 #[cfg(feature = "kafka")]
 fn three_node_alo_cluster_subscription_kill9_soak() {
@@ -13760,6 +13770,21 @@ fn run_three_node_join_kill9_soak(
     delivery: JoinDelivery,
     subscription_soak: bool,
     forced_fault_role: Option<&str>,
+) {
+    run_three_node_join_kill9_soak_with_adoption(
+        delivery,
+        subscription_soak,
+        forced_fault_role,
+        false,
+    );
+}
+
+#[cfg(feature = "kafka")]
+fn run_three_node_join_kill9_soak_with_adoption(
+    delivery: JoinDelivery,
+    subscription_soak: bool,
+    forced_fault_role: Option<&str>,
+    adopt_legacy: bool,
 ) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
@@ -14108,6 +14133,8 @@ fn run_three_node_join_kill9_soak(
         cluster_metric(&nodes, "laminardb_events_ingested_total"),
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
+    let adopted_topology = adopt_legacy
+        .then(|| topology_adoption::adopt_inventory(&checkpoint_url, &mut nodes, recovery_ceiling));
     exact_timing_evidence.capture_nodes_unbound(
         &nodes,
         Instant::now() + Duration::from_secs(10),
@@ -14576,6 +14603,56 @@ fn run_three_node_join_kill9_soak(
         );
     }
 
+    if let Some(baseline) = adopted_topology.as_ref() {
+        let restart_fence = local_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("pre-restart converged assignment is canonical");
+        for node in &nodes {
+            let evidence = local_convergence
+                .evidence_by_node
+                .get(&node.id)
+                .unwrap_or_else(|| panic!("pre-restart authority omitted node{}", node.id));
+            let timing_authority = checkpoint_barrier_timing_authority(evidence, &restart_fence)
+                .unwrap_or_else(|error| {
+                    panic!("pre-restart node{} timing authority: {error}", node.id)
+                });
+            exact_timing_evidence
+                .finalize_node(
+                    node,
+                    timing_authority,
+                    &mut latency_evidence,
+                    Instant::now() + Duration::from_secs(10),
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "pre-restart node{} timing evidence did not stabilize: {error}",
+                        node.id
+                    )
+                });
+        }
+        topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+        latest_checkpoint = assert_progress(
+            &mut nodes,
+            Some(&mut producer),
+            Some(&commit_oracle),
+            recovery_ceiling,
+            "full restart after legacy topology adoption",
+            Some(latest_checkpoint),
+        );
+        local_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            Instant::now() + recovery_ceiling,
+            "local assignment after adopted-catalog full restart",
+        );
+        exact_timing_evidence.capture_nodes_bound(
+            &nodes,
+            &local_convergence,
+            Instant::now() + Duration::from_secs(10),
+            "adopted-catalog full restart",
+        );
+    }
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);
     while remaining_at(steady_deadline, Instant::now()).is_some() {
         round += 1;
