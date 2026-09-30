@@ -218,26 +218,30 @@ python_paths = ["deps"]
 The inventory accepts at most 16 import roots, 32,768 total file/directory entries,
 4 GiB total file bytes and 512 MiB per file; overlapping trees consume the budget
 again. Paths must be UTF-8 and at most 1,024 bytes relative to their root. Links,
-Windows reparse points and special files are rejected. All files, data and empty
-directories are included. Hashing runs on a blocking startup task, with no new
+Windows reparse points (including configured path ancestors) and special files
+are rejected. Configured paths allow at most 128 ancestors. All files, data and
+empty directories are included. Hashing runs on a blocking startup task, with no new
 per-record work. Identical trees may move while retaining their identity.
 
 On Windows, bound supervision opens inventoried files with read sharing only,
 hashes those handles, and retains them during startup and execution. It also
-retains the manifest and inventoried directory handles. Existing writers reject
-startup; later edits, deletion and replacement of held entries fail with a
+retains the manifest, inventoried directories and configured path ancestors.
+Ancestors are opened from the filesystem root downward before canonicalization
+can erase a link. Read access to those directories is required. Existing writers
+reject startup; later edits, deletion and replacement of held entries fail with a
 sharing violation. Read access remains available for imports and native loaders.
 Normal shutdown, failed readiness and cancelled startup reap the child before
 releasing the handles. Packaging releases its temporary handles when capture
 returns. See [Windows file sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
 
-The tree limits bound this retention to 32,786 handles, including 17 roots and
-the manifest; process, socket and unrelated engine handles are additional.
-Other operating systems retain startup drift checking without enforced sharing.
+The tree and path-depth limits bound this retention to fewer than 38,000 handles;
+process, socket and unrelated engine handles are additional. Other operating
+systems validate ancestors and retain startup drift checking without enforced
+sharing.
 
-The deployment must still be quiescent and trusted. Directory additions,
-ancestor paths and metadata are not sealed. Mutable filesystem timestamps no
-longer select source bytecode caches under the standard filesystem importer.
+The deployment must still be quiescent and trusted. Directory additions and
+metadata are not sealed. Mutable filesystem timestamps no longer select source
+bytecode caches under the standard filesystem importer.
 Abrupt host termination releases the guards.
 Handler changes to import controls, external data and libraries loaded
 from outside the declared trees are not protected. This does not establish the
@@ -254,7 +258,9 @@ recovery, rejection of dependency drift, and checkpoint rejection after a
 dependency rebuild; the configured server test exercises SQL input and recovery.
 Windows regressions also verify denied edits, successful lazy imports, and child
 cleanup with guard release after shutdown, startup cancellation, readiness
-timeout and handler initialization failure.
+timeout and handler initialization failure. A configured path beneath a junction
+ancestor is rejected, and deployment-directory renaming remains blocked through
+worker execution and succeeds after cleanup.
 
 ## Container image
 

@@ -2623,13 +2623,34 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
             return;
         };
         let package = tempfile::tempdir().unwrap();
-        let config = environment_bound_python_config(&python, Path::new(&runtime), package.path());
+        let deployment = package.path().join("deployment");
+        std::fs::create_dir(&deployment).unwrap();
+        let config = environment_bound_python_config(&python, Path::new(&runtime), &deployment);
         let lazy_module = config.handler_file.parent().unwrap().join("lazy_module.py");
         std::fs::write(&lazy_module, b"VALUE = 1\n").unwrap();
         let mut source = std::fs::read_to_string(&config.handler_file).unwrap();
         source.push_str("\nbase_handle = handle\ndef handle(activations):\n    import lazy_module\n    assert lazy_module.VALUE == 1\n    return base_handle(activations)\n");
         std::fs::write(&config.handler_file, &source).unwrap();
         repackage_python_environment(&config);
+
+        let alias = package.path().join("alias");
+        let link = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&deployment)
+            .output()
+            .unwrap();
+        assert!(link.status.success());
+        let mut linked_manifest = config.clone();
+        linked_manifest.manifest = alias.join("manifest.json");
+        let mut linked_handler = config.clone();
+        linked_handler.handler_file = alias
+            .join("handlers")
+            .join(config.handler_file.file_name().unwrap());
+        for linked in [linked_manifest, linked_handler] {
+            let error = LocalPythonWorker::start(linked).await.err().unwrap();
+            assert!(error.to_string().contains("unsupported"), "{error}");
+        }
 
         let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
         for file in [&config.handler_file, &config.manifest, &lazy_module] {
@@ -2644,6 +2665,8 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
             package.path().join("moved_handlers")
         )
         .is_err());
+        let moved = package.path().join("moved");
+        assert!(std::fs::rename(&deployment, &moved).is_err());
         let storage = tempfile::tempdir().unwrap();
         let db = checkpointed_python_database(storage.path(), &worker).await;
         let mut portal = db
@@ -2664,6 +2687,7 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
             .write(true)
             .open(&config.manifest)
             .unwrap();
+        std::fs::rename(&deployment, &moved).unwrap();
     }
 
     #[cfg(windows)]
@@ -2689,8 +2713,10 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
             PythonStartupFailure::HandlerError,
         ] {
             let package = tempfile::tempdir().unwrap();
+            let deployment = package.path().join("deployment");
+            std::fs::create_dir(&deployment).unwrap();
             let mut config =
-                environment_bound_python_config(&python, Path::new(&runtime), package.path());
+                environment_bound_python_config(&python, Path::new(&runtime), &deployment);
             let (timeout, action, expected) = match failure {
                 PythonStartupFailure::ReadinessTimeout => (
                     Duration::from_secs(5),
@@ -2768,6 +2794,7 @@ for name, mode in [('lazy_module', py_compile.PycInvalidationMode.TIMESTAMP),
                 .write(true)
                 .open(&config.manifest)
                 .unwrap();
+            std::fs::rename(&deployment, package.path().join("released")).unwrap();
         }
     }
 

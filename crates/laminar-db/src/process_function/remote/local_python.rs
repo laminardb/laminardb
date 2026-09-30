@@ -19,7 +19,8 @@ use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
 
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
 /// an optional environment binding checks deployment drift without certifying replay equivalence.
-/// On Windows, bound launches also retain read-share handles to inventoried files.
+/// Bound paths reject links in their ancestry before canonicalization. On Windows, bound launches
+/// also retain read-share handles to inventoried files and configured path ancestors.
 /// Bound launches compile filesystem source modules without reading their bytecode caches.
 #[derive(Clone)]
 pub struct LocalPythonWorkerConfig {
@@ -28,7 +29,7 @@ pub struct LocalPythonWorkerConfig {
     pub python: PathBuf,
     /// Complete interpreter installation to check against the descriptor's environment binding.
     /// Supply this together with `python_environment`; exclude the function manifest from it.
-    /// On Windows, existing files remain guarded while the supervisor owns the child.
+    /// On Windows, existing files and configured path ancestors remain guarded during supervision.
     pub runtime_root: Option<PathBuf>,
     /// Canonical descriptor manifest consumed by the worker.
     pub manifest: PathBuf,
@@ -84,14 +85,22 @@ impl VerifiedBinding {
                 "invalid local process worker limits or handler function".into(),
             ));
         }
-        let manifest = config
-            .manifest
-            .canonicalize()
-            .map_err(|error| DbError::Config(format!("resolve process manifest: {error}")))?;
-        let handler_file = config
-            .handler_file
-            .canonicalize()
-            .map_err(|error| DbError::Config(format!("resolve process handler: {error}")))?;
+        let mut guards = FileGuards::default();
+        let (manifest, handler_file) =
+            if config.runtime_root.is_some() {
+                (
+                    guards.canonical_file(&config.manifest)?,
+                    guards.canonical_file(&config.handler_file)?,
+                )
+            } else {
+                let manifest = config.manifest.canonicalize().map_err(|error| {
+                    DbError::Config(format!("resolve process manifest: {error}"))
+                })?;
+                let handler_file = config.handler_file.canonicalize().map_err(|error| {
+                    DbError::Config(format!("resolve process handler: {error}"))
+                })?;
+                (manifest, handler_file)
+            };
         let module = handler_file
             .file_stem()
             .and_then(|name| name.to_str())
@@ -124,10 +133,6 @@ impl VerifiedBinding {
             return Err(DbError::Unsupported(
                 "local Python worker requires a Python process descriptor".into(),
             ));
-        }
-        let mut guards = FileGuards::default();
-        if descriptor.python_environment.is_some() {
-            guards.retain(manifest_file);
         }
         if python_environment::file_sha256(&handler_file)? != descriptor.implementation_digest {
             return Err(DbError::InvalidOperation(

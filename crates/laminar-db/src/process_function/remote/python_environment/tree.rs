@@ -31,16 +31,14 @@ struct Entry {
     bytes: u64,
 }
 
-pub(super) fn canonical_directory(path: &Path) -> Result<PathBuf, DbError> {
-    let metadata = regular_metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(DbError::Config(format!(
-            "Python tree root is not a directory: {}",
-            path.display()
-        )));
-    }
+pub(super) fn canonical_directory(
+    path: &Path,
+    guards: &mut FileGuards,
+) -> Result<PathBuf, DbError> {
+    let path = guards.retain_ancestors(path)?;
+    guards.retain_directory(&path)?;
     path.canonicalize()
-        .map_err(|error| inventory_error(path, &error))
+        .map_err(|error| inventory_error(&path, &error))
 }
 
 pub(super) fn regular_metadata(path: &Path) -> Result<Metadata, DbError> {
@@ -276,12 +274,52 @@ mod tests {
     fn inventory_rejects_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("imports")).unwrap();
+        std::fs::write(outside.path().join("imports/module.py"), b"original").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("escape")).unwrap();
         assert!(fingerprint(root.path(), &mut InventoryBudget::default())
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
-        assert!(canonical_directory(&root.path().join("escape")).is_err());
+        assert!(
+            canonical_directory(&root.path().join("escape"), &mut FileGuards::default()).is_err()
+        );
+        assert!(canonical_directory(
+            &root.path().join("escape/imports"),
+            &mut FileGuards::default()
+        )
+        .is_err());
+        assert!(FileGuards::default()
+            .canonical_file(&root.path().join("escape/imports/module.py"))
+            .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inventory_rejects_junction_ancestors() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("imports")).unwrap();
+        std::fs::write(outside.path().join("imports/module.py"), b"original").unwrap();
+        let link = root.path().join("escape");
+        let result = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(
+            canonical_directory(&link.join("imports"), &mut FileGuards::default())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported")
+        );
+        assert!(FileGuards::default()
+            .canonical_file(&link.join("imports/module.py"))
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[cfg(windows)]
@@ -305,6 +343,6 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported"));
-        assert!(canonical_directory(&link).is_err());
+        assert!(canonical_directory(&link, &mut FileGuards::default()).is_err());
     }
 }

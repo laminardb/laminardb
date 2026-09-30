@@ -1,10 +1,10 @@
 use std::fs::{File, Metadata, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::DbError;
 
-/// On Windows, retains read-share handles to existing entries. This does not prevent
-/// directory additions, protect external dependencies, or survive termination of the host.
+/// On Windows, retains read-share handles to existing entries and configured path ancestors.
+/// This does not prevent directory additions or survive termination of the host.
 #[derive(Default)]
 pub(in crate::process_function::remote) struct FileGuards {
     #[cfg(windows)]
@@ -12,6 +12,39 @@ pub(in crate::process_function::remote) struct FileGuards {
 }
 
 impl FileGuards {
+    pub(in crate::process_function::remote) fn canonical_file(
+        &mut self,
+        path: &Path,
+    ) -> Result<PathBuf, DbError> {
+        let path = self.retain_ancestors(path)?;
+        self.retain(Self::open_file(&path)?);
+        path.canonicalize().map_err(|error| {
+            DbError::Config(format!(
+                "resolve Python inventory '{}': {error}",
+                path.display()
+            ))
+        })
+    }
+
+    pub(super) fn retain_ancestors(&mut self, path: &Path) -> Result<PathBuf, DbError> {
+        let path = std::path::absolute(path).map_err(|error| {
+            DbError::Config(format!(
+                "resolve Python inventory '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let ancestors: Vec<_> = path.ancestors().skip(1).take(129).collect();
+        if ancestors.len() > 128 {
+            return Err(DbError::Config("Python path exceeds 128 ancestors".into()));
+        }
+        // Validate before canonicalization erases links. On Windows, acquire from the root
+        // downward to exclude parent rename/deletion while opening its children.
+        for ancestor in ancestors.into_iter().rev() {
+            self.retain_directory(ancestor)?;
+        }
+        Ok(path)
+    }
+
     pub(in crate::process_function::remote) fn open_file(path: &Path) -> Result<File, DbError> {
         let file = open(path)?;
         if !regular_metadata(path, file.metadata())?.is_file() {
@@ -43,7 +76,12 @@ impl FileGuards {
             self.retain(file);
         }
         #[cfg(not(windows))]
-        super::tree::canonical_directory(path)?;
+        if !regular_metadata(path, std::fs::symlink_metadata(path))?.is_dir() {
+            return Err(DbError::Config(format!(
+                "Python inventory entry is not a directory: {}",
+                path.display()
+            )));
+        }
         Ok(())
     }
 }
@@ -103,6 +141,39 @@ pub(super) fn regular_metadata(
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_file_retains_ancestors_through_release() {
+        let root = tempfile::tempdir().unwrap();
+        let deployment = root.path().join("deployment");
+        let imports = deployment.join("imports");
+        std::fs::create_dir_all(&imports).unwrap();
+        let file = imports.join("module.py");
+        std::fs::write(&file, b"original").unwrap();
+        let mut guards = FileGuards::default();
+        assert_eq!(
+            guards.canonical_file(&file).unwrap(),
+            file.canonicalize().unwrap()
+        );
+        let moved = root.path().join("moved");
+        assert!(std::fs::rename(&deployment, &moved).is_err());
+        drop(guards);
+        std::fs::rename(&deployment, &moved).unwrap();
+    }
+
+    #[test]
+    fn path_depth_is_bounded_before_filesystem_access() {
+        let root = tempfile::tempdir().unwrap();
+        let mut path = root.path().to_path_buf();
+        for _ in 0..129 {
+            path.push("directory");
+        }
+        assert!(FileGuards::default()
+            .canonical_file(&path.join("module.py"))
+            .unwrap_err()
+            .to_string()
+            .contains("128 ancestors"));
+    }
 
     #[test]
     fn read_sharing_blocks_existing_and_future_writers() {

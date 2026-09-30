@@ -10,7 +10,7 @@ mod tree;
 
 pub(super) use file_guards::FileGuards;
 pub(super) use tree::file_sha256;
-use tree::{canonical_directory, fingerprint_guarded, regular_metadata, InventoryBudget};
+use tree::{canonical_directory, fingerprint_guarded, InventoryBudget};
 
 pub(super) struct VerifiedEnvironment {
     pub(super) python: PathBuf,
@@ -28,8 +28,9 @@ impl PythonEnvironmentBinding {
     /// still require a quiescent deployment, and capture does not retain lifetime protection.
     ///
     /// # Errors
-    /// Rejects an interpreter outside the runtime tree, links/reparse points, non-UTF-8 paths,
-    /// more than 16 import roots, 32,768 total entries, 4 GiB total bytes or a 512 MiB file.
+    /// Rejects an interpreter outside the runtime tree, links/reparse points (including path
+    /// ancestors), more than 128 ancestors per configured path, non-UTF-8 paths, more than
+    /// 16 import roots, 32,768 total entries, 4 GiB total bytes or a 512 MiB file.
     /// Windows also rejects files with an existing incompatible write/delete handle.
     pub fn capture(
         runtime_root: &Path,
@@ -62,15 +63,8 @@ fn capture(
     if !valid_python_handler(handler) {
         return Err(DbError::Config("invalid Python environment handler".into()));
     }
-    let runtime_root = canonical_directory(runtime_root)?;
-    if !regular_metadata(python)?.is_file() {
-        return Err(DbError::Config(
-            "Python executable must be a regular file".into(),
-        ));
-    }
-    let python = python
-        .canonicalize()
-        .map_err(|error| DbError::Config(format!("resolve bound Python executable: {error}")))?;
+    let runtime_root = canonical_directory(runtime_root, guards)?;
+    let python = guards.canonical_file(python)?;
     let relative = python
         .strip_prefix(&runtime_root)
         .map_err(|_| DbError::Config("Python executable is outside the runtime root".into()))?;
@@ -83,7 +77,7 @@ fn capture(
     let mut import_roots_sha256 = Vec::with_capacity(import_roots.len());
     for root in import_roots {
         import_roots_sha256.push(fingerprint_guarded(
-            &canonical_directory(root)?,
+            &canonical_directory(root, guards)?,
             &mut budget,
             guards,
         )?);
@@ -115,7 +109,7 @@ pub(super) fn verify(
     let mut import_roots = vec![handler_directory.to_path_buf()];
     for root in &config.python_paths {
         let root = if descriptor.python_environment.is_some() {
-            canonical_directory(root)?
+            canonical_directory(root, &mut guards)?
         } else {
             root.canonicalize()
                 .map_err(|error| DbError::Config(format!("resolve Python import root: {error}")))?
@@ -130,7 +124,7 @@ pub(super) fn verify(
             guards,
         }),
         (Some(expected), Some(root)) => {
-            let runtime_root = canonical_directory(root)?;
+            let runtime_root = canonical_directory(root, &mut guards)?;
             if manifest.starts_with(&runtime_root)
                 || import_roots.iter().any(|root| manifest.starts_with(root))
             {
