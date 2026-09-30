@@ -54,7 +54,7 @@ checkpoint-aws = ["aws"]
 checkpoint-gcs = ["gcs"]
 checkpoint-azure = ["azure"]
 remote = ["dep:reqwest", "dep:governor"]
-process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost"]
+process-remote = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:windows-sys"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
@@ -146,6 +146,7 @@ rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
+windows-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

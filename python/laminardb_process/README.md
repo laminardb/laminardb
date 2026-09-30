@@ -215,12 +215,28 @@ Windows reparse points and special files are rejected. All files, data and empty
 directories are included. Hashing runs on a blocking startup task, with no new
 per-record work. Identical trees may move while retaining their identity.
 
-This is a deployment drift check for quiescent, trusted files. It neither resolves
-the dependency closure nor prevents writes between verification and import or
-while the worker runs. Handler-created import paths, external data and libraries
-loaded from outside the declared trees are not protected. Python therefore
-remains `BestEffort` in embedded and single-node modes; `AtLeastOnce`,
-`ExactlyOnce` and both cluster forms remain rejected.
+On Windows, bound supervision opens inventoried files with read sharing only,
+hashes those handles, and retains them during startup and execution. It also
+retains the manifest and inventoried directory handles. Existing writers reject
+startup; later edits, deletion and replacement of held entries fail with a
+sharing violation. Read access remains available for imports and native loaders.
+Normal shutdown, failed readiness and cancelled startup reap the child before
+releasing the handles. Packaging releases its temporary handles when capture
+returns. See [Windows file sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+
+The tree limits bound this retention to 32,786 handles, including 17 roots and
+the manifest; process, socket and unrelated engine handles are additional.
+Other operating systems retain startup drift checking without enforced sharing.
+
+The deployment must still be quiescent and trusted. Directory additions,
+ancestor paths and metadata are not sealed. Timestamps can affect selection of
+[existing Python bytecode](https://docs.python.org/3.13/reference/import.html#cached-bytecode-invalidation).
+Abrupt host termination releases the guards.
+Handler-created import paths, external data and libraries loaded
+from outside the declared trees are not protected. This does not establish the
+complete immutable dependency closure. Python remains `BestEffort` in embedded
+and single-node modes; `AtLeastOnce`, `ExactlyOnce` and both cluster forms remain
+rejected.
 
 To run the environment-bound Rust regressions, set `LAMINAR_PROCESS_PYTHON` to
 an explicit interpreter file and `LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT` to its
@@ -229,6 +245,9 @@ directory when packages are not installed in the SDK import root. Bound workers
 do not use global site packages. The database test verifies matching-package
 recovery, rejection of dependency drift, and checkpoint rejection after a
 dependency rebuild; the configured server test exercises SQL input and recovery.
+Windows regressions also verify denied edits, successful lazy imports, and child
+cleanup with guard release after shutdown, startup cancellation, readiness
+timeout and handler initialization failure.
 
 ## Container image
 

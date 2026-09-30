@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use crate::error::DbError;
 use crate::process_function::descriptor::valid_relative_python_path;
 
+use super::file_guards::FileGuards;
+
 // Packaging and launch share a total budget across all declared trees, including overlap.
 pub(super) struct InventoryBudget {
     entries_left: usize,
@@ -42,27 +44,15 @@ pub(super) fn canonical_directory(path: &Path) -> Result<PathBuf, DbError> {
 }
 
 pub(super) fn regular_metadata(path: &Path) -> Result<Metadata, DbError> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|error| inventory_error(path, &error))?;
-    #[cfg(windows)]
-    let linked = {
-        use std::os::windows::fs::MetadataExt;
-        // Windows junctions and other reparse points must not escape the declared tree.
-        metadata.file_attributes() & 0x400 != 0
-    };
-    #[cfg(not(windows))]
-    let linked = metadata.file_type().is_symlink();
-    if linked || (!metadata.is_file() && !metadata.is_dir()) {
-        return Err(DbError::Config(format!(
-            "unsupported Python tree entry: {}",
-            path.display()
-        )));
-    }
-    Ok(metadata)
+    super::file_guards::regular_metadata(path, std::fs::symlink_metadata(path))
 }
 
-pub(super) fn fingerprint(root: &Path, budget: &mut InventoryBudget) -> Result<String, DbError> {
-    let entries = inventory(root, budget)?;
+pub(super) fn fingerprint_guarded(
+    root: &Path,
+    budget: &mut InventoryBudget,
+    guards: &mut FileGuards,
+) -> Result<String, DbError> {
+    let entries = inventory(root, budget, guards)?;
     let mut digest = Sha256::new();
     digest.update(b"laminardb-python-tree-v1\0");
     for entry in entries {
@@ -75,16 +65,23 @@ pub(super) fn fingerprint(root: &Path, budget: &mut InventoryBudget) -> Result<S
             continue;
         }
         digest.update(entry.bytes.to_be_bytes());
-        digest.update(file_digest(&entry.path, entry.bytes)?);
+        let mut file = FileGuards::open_file(&entry.path)?;
+        digest.update(file_digest(&entry.path, &mut file, entry.bytes)?);
+        guards.retain(file);
     }
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn inventory(root: &Path, budget: &mut InventoryBudget) -> Result<Vec<Entry>, DbError> {
+fn inventory(
+    root: &Path,
+    budget: &mut InventoryBudget,
+    guards: &mut FileGuards,
+) -> Result<Vec<Entry>, DbError> {
     let mut directories = vec![(root.to_path_buf(), String::new())];
     let mut entries = Vec::new();
     // Every discovered entry consumes the shared budget before another directory is queued.
     while let Some((directory, prefix)) = directories.pop() {
+        guards.retain_directory(&directory)?;
         let children =
             std::fs::read_dir(&directory).map_err(|error| inventory_error(&directory, &error))?;
         for child in children {
@@ -140,11 +137,18 @@ pub(crate) fn file_sha256(path: &Path) -> Result<String, DbError> {
             "Python handler must be a regular file of at most 512 MiB".into(),
         ));
     }
-    Ok(format!("{:x}", file_digest(path, metadata.len())?))
+    let mut file = FileGuards::open_file(path)?;
+    Ok(format!(
+        "{:x}",
+        file_digest(path, &mut file, metadata.len())?
+    ))
 }
 
-fn file_digest(path: &Path, expected_bytes: u64) -> Result<sha2::digest::Output<Sha256>, DbError> {
-    let file = File::open(path).map_err(|error| inventory_error(path, &error))?;
+fn file_digest(
+    path: &Path,
+    file: &mut File,
+    expected_bytes: u64,
+) -> Result<sha2::digest::Output<Sha256>, DbError> {
     let mut file = file.take(expected_bytes + 1);
     let mut digest = Sha256::new();
     // The length captured by inventory bounds this read even if another process grows the file.
@@ -169,6 +173,10 @@ fn inventory_error(path: &Path, error: &std::io::Error) -> DbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fingerprint(root: &Path, budget: &mut InventoryBudget) -> Result<String, DbError> {
+        fingerprint_guarded(root, budget, &mut FileGuards::default())
+    }
 
     #[test]
     fn tree_digest_binds_names_contents_bytecode_and_empty_directories() {
@@ -233,14 +241,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("4 GiB"));
-        assert!(file_digest(&root.path().join("file"), 2)
-            .unwrap_err()
-            .to_string()
-            .contains("changed"));
-        assert!(file_digest(&root.path().join("file"), 4)
-            .unwrap_err()
-            .to_string()
-            .contains("changed"));
+        assert!(file_digest(
+            &root.path().join("file"),
+            &mut File::open(root.path().join("file")).unwrap(),
+            2
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed"));
+        assert!(file_digest(
+            &root.path().join("file"),
+            &mut File::open(root.path().join("file")).unwrap(),
+            4
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("changed"));
         File::create(root.path().join("oversized"))
             .unwrap()
             .set_len(512 * 1024 * 1024 + 1)

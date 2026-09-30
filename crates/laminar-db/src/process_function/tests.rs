@@ -2438,6 +2438,10 @@ def handle(activations):
             &std::fs::read(&config.manifest).unwrap(),
         )
         .unwrap();
+        descriptor.implementation_digest = format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(&config.handler_file).unwrap())
+        );
         let mut roots = vec![config.handler_file.parent().unwrap().to_path_buf()];
         roots.extend(config.python_paths.iter().cloned());
         descriptor.python_environment = Some(
@@ -2454,6 +2458,164 @@ def handle(activations):
             .unwrap(),
         );
         std::fs::write(&config.manifest, descriptor.to_manifest_json().unwrap()).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn environment_bound_python_blocks_file_edits_through_shutdown() {
+        let (Ok(python), Some(runtime)) = (
+            std::env::var("LAMINAR_PROCESS_PYTHON"),
+            std::env::var_os("LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT"),
+        ) else {
+            return;
+        };
+        let package = tempfile::tempdir().unwrap();
+        let config = environment_bound_python_config(&python, Path::new(&runtime), package.path());
+        let lazy_module = config.handler_file.parent().unwrap().join("lazy_module.py");
+        std::fs::write(&lazy_module, b"VALUE = 1\n").unwrap();
+        let mut source = std::fs::read_to_string(&config.handler_file).unwrap();
+        source.push_str("\nbase_handle = handle\ndef handle(activations):\n    import lazy_module\n    assert lazy_module.VALUE == 1\n    return base_handle(activations)\n");
+        std::fs::write(&config.handler_file, &source).unwrap();
+        repackage_python_environment(&config);
+
+        let worker = LocalPythonWorker::start(config.clone()).await.unwrap();
+        for file in [&config.handler_file, &config.manifest, &lazy_module] {
+            assert_eq!(
+                std::fs::write(file, b"changed").unwrap_err().raw_os_error(),
+                Some(32)
+            );
+            assert!(std::fs::remove_file(file).is_err());
+        }
+        assert!(std::fs::rename(
+            config.handler_file.parent().unwrap(),
+            package.path().join("moved_handlers")
+        )
+        .is_err());
+        let storage = tempfile::tempdir().unwrap();
+        let db = checkpointed_python_database(storage.path(), &worker).await;
+        let mut portal = db
+            .open_subscription("activity", None, SubscribeStart::Tail)
+            .await
+            .unwrap();
+        db.source_untyped("events")
+            .unwrap()
+            .push_arrow(python_input("a", 60, 100_000))
+            .unwrap();
+        assert_eq!(next_process_total(&mut portal).await, 60);
+        db.shutdown().await.unwrap();
+        drop(portal);
+        drop(db);
+        worker.shutdown().await.unwrap();
+        std::fs::write(&lazy_module, b"VALUE = 2\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&config.manifest)
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum PythonStartupFailure {
+        Cancelled,
+        ReadinessTimeout,
+        HandlerError,
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn environment_bound_python_reaps_failed_startup_before_releasing_guards() {
+        let (Ok(python), Some(runtime)) = (
+            std::env::var("LAMINAR_PROCESS_PYTHON"),
+            std::env::var_os("LAMINAR_PROCESS_PYTHON_RUNTIME_ROOT"),
+        ) else {
+            return;
+        };
+        for failure in [
+            PythonStartupFailure::Cancelled,
+            PythonStartupFailure::ReadinessTimeout,
+            PythonStartupFailure::HandlerError,
+        ] {
+            let package = tempfile::tempdir().unwrap();
+            let mut config =
+                environment_bound_python_config(&python, Path::new(&runtime), package.path());
+            let (timeout, action, expected) = match failure {
+                PythonStartupFailure::ReadinessTimeout => (
+                    Duration::from_secs(5),
+                    "time.sleep(25)",
+                    "readiness timed out",
+                ),
+                PythonStartupFailure::Cancelled => {
+                    (Duration::from_secs(30), "time.sleep(25)", "cancelled")
+                }
+                PythonStartupFailure::HandlerError => (
+                    Duration::from_secs(30),
+                    "raise RuntimeError('startup fixture failed')",
+                    "closed before readiness",
+                ),
+            };
+            config.timeout = timeout;
+            let marker = package.path().join("startup_pid");
+            let marker_literal = serde_json::to_string(&marker.to_string_lossy()).unwrap();
+            std::fs::write(&config.handler_file, format!(
+                "import os, time\nfrom pathlib import Path\nPath({marker_literal}).write_text(str(os.getpid()))\n{action}\ndef handle(_activations):\n    return ()\n"
+            )).unwrap();
+            repackage_python_environment(&config);
+            let startup = tokio::spawn(LocalPythonWorker::start(config.clone()));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            match failure {
+                PythonStartupFailure::Cancelled => {
+                    assert_eq!(
+                        std::fs::write(&config.handler_file, b"changed")
+                            .unwrap_err()
+                            .raw_os_error(),
+                        Some(32)
+                    );
+                    startup.abort();
+                    assert!(startup.await.err().unwrap().is_cancelled());
+                }
+                PythonStartupFailure::ReadinessTimeout | PythonStartupFailure::HandlerError => {
+                    let error = startup.await.unwrap().err().unwrap();
+                    assert!(error.to_string().contains(expected), "{error}");
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&config.handler_file)
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let process_id: u32 = std::fs::read_to_string(&marker).unwrap().parse().unwrap();
+            let status = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command"])
+                .arg(format!(
+                    "if (Get-Process -Id {process_id} -ErrorAction SilentlyContinue) {{ exit 1 }}"
+                ))
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "startup worker {process_id} was not reaped"
+            );
+            std::fs::write(&config.handler_file, b"released").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&config.manifest)
+                .unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

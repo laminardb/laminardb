@@ -5,15 +5,18 @@ use crate::error::DbError;
 use crate::process_function::descriptor::{valid_python_handler, MAX_PYTHON_IMPORT_ROOTS};
 use crate::process_function::{ProcessFunctionDescriptor, PythonEnvironmentBinding};
 
+mod file_guards;
 mod tree;
 
+pub(super) use file_guards::FileGuards;
 pub(super) use tree::file_sha256;
-use tree::{canonical_directory, fingerprint, regular_metadata, InventoryBudget};
+use tree::{canonical_directory, fingerprint_guarded, regular_metadata, InventoryBudget};
 
 pub(super) struct VerifiedEnvironment {
     pub(super) python: PathBuf,
     pub(super) runtime_root: Option<PathBuf>,
     pub(super) import_roots: Vec<PathBuf>,
+    pub(super) guards: FileGuards,
 }
 
 impl PythonEnvironmentBinding {
@@ -21,56 +24,79 @@ impl PythonEnvironmentBinding {
     /// source, bytecode, native libraries and data. The first import root is the handler directory.
     /// `handler` selects the exact `module:function` entry point in that directory.
     /// This performs blocking filesystem work; call it during packaging or on a blocking task.
+    /// On Windows, read-share handles exclude writers until capture returns. Directory additions
+    /// still require a quiescent deployment, and capture does not retain lifetime protection.
     ///
     /// # Errors
     /// Rejects an interpreter outside the runtime tree, links/reparse points, non-UTF-8 paths,
     /// more than 16 import roots, 32,768 total entries, 4 GiB total bytes or a 512 MiB file.
+    /// Windows also rejects files with an existing incompatible write/delete handle.
     pub fn capture(
         runtime_root: &Path,
         python: &Path,
         handler: &str,
         import_roots: &[PathBuf],
     ) -> Result<Self, DbError> {
-        if import_roots.is_empty() || import_roots.len() > MAX_PYTHON_IMPORT_ROOTS {
-            return Err(DbError::Config(
-                "Python binding requires 1..=16 import roots".into(),
-            ));
-        }
-        if !valid_python_handler(handler) {
-            return Err(DbError::Config("invalid Python environment handler".into()));
-        }
-        let runtime_root = canonical_directory(runtime_root)?;
-        if !regular_metadata(python)?.is_file() {
-            return Err(DbError::Config(
-                "Python executable must be a regular file".into(),
-            ));
-        }
-        let python = python.canonicalize().map_err(|error| {
-            DbError::Config(format!("resolve bound Python executable: {error}"))
-        })?;
-        let relative = python
-            .strip_prefix(&runtime_root)
-            .map_err(|_| DbError::Config("Python executable is outside the runtime root".into()))?;
-        let executable = relative
-            .to_str()
-            .ok_or_else(|| DbError::Config("Python executable path must be UTF-8".into()))?
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        let mut budget = InventoryBudget::default();
-        let runtime_sha256 = fingerprint(&runtime_root, &mut budget)?;
-        let mut import_roots_sha256 = Vec::with_capacity(import_roots.len());
-        for root in import_roots {
-            import_roots_sha256.push(fingerprint(&canonical_directory(root)?, &mut budget)?);
-        }
-        let binding = Self {
-            version: 1,
-            executable,
-            handler: handler.to_owned(),
-            runtime_sha256,
-            import_roots_sha256,
-        };
-        binding.validate()?;
-        Ok(binding)
+        capture(
+            runtime_root,
+            python,
+            handler,
+            import_roots,
+            &mut FileGuards::default(),
+        )
     }
+}
+
+fn capture(
+    runtime_root: &Path,
+    python: &Path,
+    handler: &str,
+    import_roots: &[PathBuf],
+    guards: &mut FileGuards,
+) -> Result<PythonEnvironmentBinding, DbError> {
+    if import_roots.is_empty() || import_roots.len() > MAX_PYTHON_IMPORT_ROOTS {
+        return Err(DbError::Config(
+            "Python binding requires 1..=16 import roots".into(),
+        ));
+    }
+    if !valid_python_handler(handler) {
+        return Err(DbError::Config("invalid Python environment handler".into()));
+    }
+    let runtime_root = canonical_directory(runtime_root)?;
+    if !regular_metadata(python)?.is_file() {
+        return Err(DbError::Config(
+            "Python executable must be a regular file".into(),
+        ));
+    }
+    let python = python
+        .canonicalize()
+        .map_err(|error| DbError::Config(format!("resolve bound Python executable: {error}")))?;
+    let relative = python
+        .strip_prefix(&runtime_root)
+        .map_err(|_| DbError::Config("Python executable is outside the runtime root".into()))?;
+    let executable = relative
+        .to_str()
+        .ok_or_else(|| DbError::Config("Python executable path must be UTF-8".into()))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let mut budget = InventoryBudget::default();
+    let runtime_sha256 = fingerprint_guarded(&runtime_root, &mut budget, guards)?;
+    let mut import_roots_sha256 = Vec::with_capacity(import_roots.len());
+    for root in import_roots {
+        import_roots_sha256.push(fingerprint_guarded(
+            &canonical_directory(root)?,
+            &mut budget,
+            guards,
+        )?);
+    }
+    let binding = PythonEnvironmentBinding {
+        version: 1,
+        executable,
+        handler: handler.to_owned(),
+        runtime_sha256,
+        import_roots_sha256,
+    };
+    binding.validate()?;
+    Ok(binding)
 }
 
 pub(super) fn verify(
@@ -79,6 +105,7 @@ pub(super) fn verify(
     handler_directory: &Path,
     manifest: &Path,
     module: &str,
+    mut guards: FileGuards,
 ) -> Result<VerifiedEnvironment, DbError> {
     if config.python_paths.len() >= MAX_PYTHON_IMPORT_ROOTS {
         return Err(DbError::Config(
@@ -100,6 +127,7 @@ pub(super) fn verify(
             python: config.python.clone(),
             runtime_root: None,
             import_roots,
+            guards,
         }),
         (Some(expected), Some(root)) => {
             let runtime_root = canonical_directory(root)?;
@@ -110,11 +138,12 @@ pub(super) fn verify(
                     "bound process manifest must be outside the hashed trees".into(),
                 ));
             }
-            let actual = PythonEnvironmentBinding::capture(
+            let actual = capture(
                 &runtime_root,
                 &config.python,
                 &format!("{module}:{}", config.function),
                 &import_roots,
+                &mut guards,
             )?;
             if &actual != expected {
                 return Err(DbError::Config(
@@ -126,6 +155,7 @@ pub(super) fn verify(
                 python,
                 runtime_root: Some(runtime_root),
                 import_roots,
+                guards,
             })
         }
         _ => Err(DbError::Config(
@@ -197,6 +227,7 @@ mod tests {
             config.handler_file.parent().unwrap(),
             &config.manifest,
             "handler",
+            FileGuards::default(),
         )
     }
 
@@ -273,5 +304,31 @@ mod tests {
             &vec![config.python_paths[0].clone(); 17]
         )
         .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_environment_retains_file_guards_and_failed_checks_release_them() {
+        let root = tempfile::tempdir().unwrap();
+        let (config, descriptor) = deployment(root.path());
+        let files = [
+            config.python.clone(),
+            config.runtime_root.as_ref().unwrap().join("stdlib.py"),
+            config.handler_file.clone(),
+            config.python_paths[0].join("worker.py"),
+        ];
+        let environment = check(&config, &descriptor).unwrap();
+        for file in &files {
+            assert_eq!(
+                std::fs::write(file, b"changed").unwrap_err().raw_os_error(),
+                Some(32)
+            );
+        }
+        drop(environment);
+        std::fs::write(&files[3], b"changed").unwrap();
+        assert!(check(&config, &descriptor).is_err());
+        for file in &files {
+            std::fs::OpenOptions::new().write(true).open(file).unwrap();
+        }
     }
 }

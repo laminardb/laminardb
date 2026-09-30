@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use super::python_environment::{self, VerifiedEnvironment};
+use super::python_environment::{self, FileGuards, VerifiedEnvironment};
 use super::{RemoteProcessClient, MAX_IN_FLIGHT};
 use crate::error::DbError;
 use crate::process_function::descriptor::{valid_python_identifier, MAX_MANIFEST_BYTES};
@@ -17,6 +18,7 @@ use crate::process_function::{ProcessFunctionDescriptor, ProcessRuntime};
 
 /// Explicit local Python worker launch. The handler file is the direct digest-bound artifact;
 /// an optional environment binding checks deployment drift without certifying replay equivalence.
+/// On Windows, bound launches also retain read-share handles to inventoried files.
 #[derive(Clone)]
 pub struct LocalPythonWorkerConfig {
     /// Python executable or a trusted executable name resolved by the host environment.
@@ -24,6 +26,7 @@ pub struct LocalPythonWorkerConfig {
     pub python: PathBuf,
     /// Complete interpreter installation to check against the descriptor's environment binding.
     /// Supply this together with `python_environment`; exclude the function manifest from it.
+    /// On Windows, existing files remain guarded while the supervisor owns the child.
     pub runtime_root: Option<PathBuf>,
     /// Canonical descriptor manifest consumed by the worker.
     pub manifest: PathBuf,
@@ -44,6 +47,7 @@ pub struct LocalPythonWorkerConfig {
 
 /// One child process with an explicit shutdown owner. Unexpected exit is observed by the
 /// supervisor and outstanding calls fail through the connected transport.
+/// Cancelling startup signals the same supervisor to stop and reap the child.
 pub struct LocalPythonWorker {
     client: Arc<RemoteProcessClient>,
     cancel: CancellationToken,
@@ -63,6 +67,8 @@ struct VerifiedBinding {
     descriptor: ProcessFunctionDescriptor,
     environment: VerifiedEnvironment,
 }
+
+type StartupResult = Result<(Arc<RemoteProcessClient>, u16), DbError>;
 
 impl VerifiedBinding {
     fn verify(config: &LocalPythonWorkerConfig) -> Result<Self, DbError> {
@@ -97,11 +103,10 @@ impl VerifiedBinding {
         let mut manifest_bytes = Vec::new();
         let manifest_limit = u64::try_from(MAX_MANIFEST_BYTES)
             .map_err(|error| DbError::Config(format!("process manifest size limit: {error}")))?;
-        std::fs::File::open(&manifest)
-            .and_then(|file| {
-                file.take(manifest_limit + 3)
-                    .read_to_end(&mut manifest_bytes)
-            })
+        let mut manifest_file = FileGuards::open_file(&manifest)?;
+        (&mut manifest_file)
+            .take(manifest_limit + 3)
+            .read_to_end(&mut manifest_bytes)
             .map_err(|error| DbError::Config(format!("read process manifest: {error}")))?;
         let canonical = manifest_bytes
             .strip_suffix(b"\r\n")
@@ -118,6 +123,10 @@ impl VerifiedBinding {
                 "local Python worker requires a Python process descriptor".into(),
             ));
         }
+        let mut guards = FileGuards::default();
+        if descriptor.python_environment.is_some() {
+            guards.retain(manifest_file);
+        }
         if python_environment::file_sha256(&handler_file)? != descriptor.implementation_digest {
             return Err(DbError::InvalidOperation(
                 "Python handler file digest differs from its manifest".into(),
@@ -127,8 +136,14 @@ impl VerifiedBinding {
         let handler_directory = handler_file
             .parent()
             .ok_or_else(|| DbError::InvalidOperation("Python handler has no parent".into()))?;
-        let environment =
-            python_environment::verify(config, &descriptor, handler_directory, &manifest, &module)?;
+        let environment = python_environment::verify(
+            config,
+            &descriptor,
+            handler_directory,
+            &manifest,
+            &module,
+            guards,
+        )?;
         Ok(Self {
             manifest,
             handler_file,
@@ -192,49 +207,47 @@ impl LocalPythonWorker {
         })
         .await
         .map_err(|error| DbError::Pipeline(format!("verify Python process binding: {error}")))??;
-        let mut child = binding
+        let child = binding
             .command(&config)?
             .spawn()
             .map_err(|error| DbError::Pipeline(format!("start Python process worker: {error}")))?;
-        let ready = tokio::time::timeout(config.timeout, read_ready(&mut child)).await;
-        let port = match ready {
-            Ok(Ok(port)) => port,
-            Ok(Err(error)) => {
-                return Err(stop_after_start_error(&mut child, error).await);
-            }
-            Err(_) => {
-                return Err(stop_after_start_error(
-                    &mut child,
-                    DbError::Pipeline("Python process worker readiness timed out".into()),
-                )
-                .await);
-            }
-        };
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let client = match RemoteProcessClient::connect_loopback(
-            &endpoint,
-            binding.descriptor,
-            config.max_in_flight,
-            config.timeout,
-        )
-        .await
-        {
-            Ok(client) => Arc::new(client),
-            Err(error) => {
-                return Err(stop_after_start_error(&mut child, error).await);
-            }
-        };
         let cancel = CancellationToken::new();
+        let startup_cancel = cancel.clone().drop_guard();
         let exited = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         #[cfg(test)]
         let process_id = child.id().unwrap_or(0);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        // Transfer the child and file handles before the first await after spawn. Cancelling
+        // startup signals this same cleanup owner, which retains handles while reaping.
         let supervisor = tokio::spawn(supervise(
             child,
+            binding,
+            config,
+            ready_tx,
             cancel.clone(),
             exited.clone(),
             Arc::clone(&alive),
         ));
+        let (client, _port) = match ready_rx
+            .await
+            .map_err(|error| DbError::Pipeline(format!("Python worker startup channel: {error}")))
+            .and_then(|result| result)
+        {
+            Ok(ready) => ready,
+            Err(primary) => {
+                return match supervisor.await {
+                    Ok(Ok(())) => Err(primary),
+                    Ok(Err(cleanup)) => Err(DbError::Pipeline(format!(
+                        "{primary}; worker cleanup: {cleanup}"
+                    ))),
+                    Err(error) => Err(DbError::Pipeline(format!(
+                        "{primary}; worker supervisor: {error}"
+                    ))),
+                };
+            }
+        };
+        startup_cancel.disarm();
         Ok(Self {
             client,
             cancel,
@@ -244,7 +257,7 @@ impl LocalPythonWorker {
             #[cfg(test)]
             process_id,
             #[cfg(test)]
-            endpoint,
+            endpoint: format!("http://127.0.0.1:{_port}"),
         })
     }
 
@@ -344,13 +357,59 @@ async fn stop_after_start_error(child: &mut Child, primary: DbError) -> DbError 
     }
 }
 
+async fn connect_child(
+    child: &mut Child,
+    descriptor: ProcessFunctionDescriptor,
+    config: &LocalPythonWorkerConfig,
+) -> StartupResult {
+    let port = tokio::time::timeout(config.timeout, read_ready(child))
+        .await
+        .map_err(|_| DbError::Pipeline("Python process worker readiness timed out".into()))??;
+    let client = RemoteProcessClient::connect_loopback(
+        &format!("http://127.0.0.1:{port}"),
+        descriptor,
+        config.max_in_flight,
+        config.timeout,
+    )
+    .await?;
+    Ok((Arc::new(client), port))
+}
+
 async fn supervise(
     mut child: Child,
+    binding: VerifiedBinding,
+    config: LocalPythonWorkerConfig,
+    ready: oneshot::Sender<StartupResult>,
     cancel: CancellationToken,
     exited: CancellationToken,
     alive: Arc<AtomicBool>,
 ) -> Result<(), DbError> {
-    let outcome = tokio::select! {
+    let startup = tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(DbError::Pipeline("Python worker startup cancelled".into())),
+        result = connect_child(&mut child, binding.descriptor, &config) => result,
+    };
+    let outcome = match startup {
+        Ok(client) => {
+            if ready.send(Ok(client)).is_err() {
+                cancel.cancel();
+            }
+            observe_child(&mut child, &cancel).await
+        }
+        Err(primary) => {
+            let error = stop_after_start_error(&mut child, primary).await;
+            let _ = ready.send(Err(error));
+            Ok(())
+        }
+    };
+    drop(binding.environment.guards);
+    alive.store(false, Ordering::Release);
+    exited.cancel();
+    outcome
+}
+
+async fn observe_child(child: &mut Child, cancel: &CancellationToken) -> Result<(), DbError> {
+    tokio::select! {
         biased;
         status = child.wait() => {
             match status {
@@ -363,10 +422,7 @@ async fn supervise(
             }
         }
         () = cancel.cancelled() => {
-            stop_child(&mut child).await
+            stop_child(child).await
         }
-    };
-    alive.store(false, Ordering::Release);
-    exited.cancel();
-    outcome
+    }
 }
