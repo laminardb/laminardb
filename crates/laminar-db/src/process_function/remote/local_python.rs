@@ -29,6 +29,7 @@ pub struct LocalPythonWorkerConfig {
     /// the host's `PYTHONPATH` or Python user site.
     pub python_paths: Vec<PathBuf>,
     /// Maximum simultaneous worker calls. The process and client use the same limit.
+    /// The launcher sets `OMP_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` before imports.
     pub max_in_flight: usize,
     /// Startup and per-call deadline, between 1 millisecond and 30 seconds.
     pub timeout: Duration,
@@ -154,6 +155,8 @@ impl LocalPythonWorker {
             .arg(config.max_in_flight.to_string())
             .env("PYTHONPATH", python_path)
             .env_remove("PYTHONHOME")
+            .env("OMP_NUM_THREADS", "1")
+            .env("OPENBLAS_NUM_THREADS", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);

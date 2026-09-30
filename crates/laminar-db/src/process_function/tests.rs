@@ -2921,6 +2921,65 @@ def handle(activations):
     }
 
     #[tokio::test]
+    async fn local_python_worker_caps_inherited_compute_threads() {
+        const CHILD_ROOT: &str = "LAMINAR_PROCESS_COMPUTE_THREADS_CHILD";
+        let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {
+            return;
+        };
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = Path::new(&root);
+            let bootstrap =
+                serde_json::to_string(&root.join("bootstrap.json").to_string_lossy()).unwrap();
+            let config = python_test_handler_config(
+                &python,
+                root,
+                &format!(
+                    "import json\nfrom pathlib import Path\n\
+                     observed = json.loads(Path({bootstrap}).read_text())\n\
+                     assert observed == ['1', '1', False], observed\n\
+                     def handle(_activations):\n    return ()\n"
+                ),
+            );
+            // sitecustomize runs before the SDK imports NumPy through PyArrow.
+            std::fs::write(
+                root.join("sitecustomize.py"),
+                format!(
+                    "import json, os, sys\nfrom pathlib import Path\n\
+                     Path({bootstrap}).write_text(json.dumps([\
+                     os.environ.get('OMP_NUM_THREADS'), \
+                     os.environ.get('OPENBLAS_NUM_THREADS'), 'numpy' in sys.modules]))\n"
+                ),
+            )
+            .unwrap();
+            LocalPythonWorker::start(config)
+                .await
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "process_function::tests::remote_pipeline::local_python_worker_caps_inherited_compute_threads",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, directory.path())
+            .env("OMP_NUM_THREADS", "24")
+            .env("OPENBLAS_NUM_THREADS", "24")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
     async fn local_python_worker_ignores_ambient_pythonpath() {
         const CHILD_ROOT: &str = "LAMINAR_PROCESS_AMBIENT_PATH_CHILD";
         let Ok(python) = std::env::var("LAMINAR_PROCESS_PYTHON") else {

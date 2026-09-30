@@ -33,6 +33,8 @@ fn write_handler(root: &Path, repository: &Path) -> Result<(PathBuf, PathBuf)> {
     let release = quoted(&path_string(&root.join("release-second")));
     let pid = quoted(&path_string(&root.join("worker-pid")));
     let delay = quoted(&path_string(&root.join("invocation-delay")));
+    let memory = quoted(&path_string(&root.join("worker-arrow-samples.csv")));
+    let probe = quoted(&path_string(&root.join("sample-worker-memory")));
     let handler = format!(
         r#"{base}
 import os as _os
@@ -50,8 +52,22 @@ def _exit_now():
     _ack.write_text(str(_os.getpid()))
     _os._exit(47)
 def _watch_exit():
+    samples = None
+    if _Path({probe}).exists():
+        samples = _Path({memory}).open('w')
+        samples.write('elapsed_seconds,backend,allocated_bytes,peak_allocated_bytes\n')
+    started = _time.monotonic()
+    next_sample = started
     while not _exit.exists():
+        now = _time.monotonic()
+        if samples is not None and now >= next_sample:
+            pool = pa.default_memory_pool()
+            samples.write(f"{{now - started:.3f}},{{pool.backend_name}},{{pool.bytes_allocated()}},{{pool.max_memory()}}\n")
+            samples.flush()
+            next_sample = now + 1
         _time.sleep(0.01)
+    if samples is not None:
+        samples.close()
     _exit_now()
 _threading.Thread(target=_watch_exit, daemon=True).start()
 _original_handle = handle
@@ -182,7 +198,9 @@ fn wait_until(
 }
 
 fn http_request(port: u16, method: &str, path: &str) -> Result<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))?;
+    let mut stream =
+        TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(3))
+            .with_context(|| format!("connect HTTP {method} {path} on port {port}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     let request = format!(
@@ -437,6 +455,7 @@ fn sample_saturation(host: &mut Child, root: &Path, port: u16, records: usize) -
     wait_until(host, "buffer metric publication", || {
         Ok(maximum_metric(&http_request(port, "GET", "/metrics")?, "input_buf_bytes").is_ok())
     })?;
+    std::fs::write(root.join("phase"), "load")?;
     let mut samples = std::fs::File::create(root.join("queue-samples.csv"))?;
     writeln!(
         samples,
@@ -494,7 +513,57 @@ fn sample_saturation(host: &mut Child, root: &Path, port: u16, records: usize) -
     Ok(())
 }
 
-fn run_saturation(records: usize) -> Result<()> {
+fn sample_drained_server(
+    host: &mut Child,
+    root: &Path,
+    port: u16,
+    records: usize,
+    idle_for: Duration,
+) -> Result<()> {
+    // Capture the completed-file inventory once, then measure without new files or checkpoints.
+    std::fs::write(root.join("phase"), "checkpoint")?;
+    checkpoint(port)?;
+    let published = sink_totals(&root.join("output"))?;
+    anyhow::ensure!(published.len() == records);
+    let mut samples = std::fs::File::create(root.join("idle-queue-samples.csv"))?;
+    writeln!(
+        samples,
+        "elapsed_seconds,source_reserved_bytes,max_graph_input_bytes,emitted_rows"
+    )?;
+    std::fs::write(root.join("phase"), "idle")?;
+    let started = Instant::now();
+    let deadline = started + idle_for;
+    loop {
+        if let Some(status) = host.try_wait()? {
+            anyhow::bail!("server exited after drain: {status}");
+        }
+        let metrics = http_request(port, "GET", "/metrics")?;
+        let reserved = maximum_metric(&metrics, "source_queue_reserved_bytes")?;
+        let graph = maximum_metric(&metrics, "input_buf_bytes")?;
+        let emitted = maximum_metric(&metrics, "events_emitted_total")?;
+        anyhow::ensure!(reserved == 0, "FIFO was not empty after drain: {reserved}");
+        anyhow::ensure!(graph == 0, "graph was not empty after drain: {graph}");
+        anyhow::ensure!(emitted == records, "output changed after drain: {emitted}");
+        writeln!(
+            samples,
+            "{:.3},{reserved},{graph},{emitted}",
+            started.elapsed().as_secs_f64()
+        )?;
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::ensure!(sink_totals(&root.join("output"))? == published);
+    std::fs::write(root.join("phase"), "finished")?;
+    println!(
+        "post-drain idle: {} seconds",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn run_saturation(records: usize, idle_for: Duration) -> Result<()> {
     let Some(python) = std::env::var_os("LAMINAR_PROCESS_PYTHON") else {
         return Ok(());
     };
@@ -506,8 +575,10 @@ fn run_saturation(records: usize) -> Result<()> {
     let port = listener.local_addr()?.port();
     drop(listener);
     let config = prepare_saturation(root, port, &python.to_string_lossy(), records)?;
+    std::fs::write(root.join("sample-worker-memory"), [])?;
     let mut host = spawn_server(&config)?;
-    let result = sample_saturation(&mut host, root, port, records);
+    let result = sample_saturation(&mut host, root, port, records)
+        .and_then(|()| sample_drained_server(&mut host, root, port, records, idle_for));
     let stopped = stop_host_and_worker(&mut host, root);
     match (result, stopped) {
         (Err(primary), Err(cleanup)) => {
@@ -520,15 +591,15 @@ fn run_saturation(records: usize) -> Result<()> {
 
 #[test]
 fn standalone_server_samples_bounded_python_saturation() -> Result<()> {
-    run_saturation(128)
+    run_saturation(128, Duration::from_secs(1))
 }
 
 #[test]
-#[ignore = "manual server and Python worker RSS sampling"]
+#[ignore = "manual server and Python worker load/idle memory sampling"]
 fn standalone_server_python_saturation_resource_stress() -> Result<()> {
     anyhow::ensure!(
         std::env::var_os("LAMINAR_PROCESS_PYTHON").is_some(),
         "Python interpreter is required for resource sampling"
     );
-    run_saturation(4096)
+    run_saturation(4096, Duration::from_secs(120))
 }

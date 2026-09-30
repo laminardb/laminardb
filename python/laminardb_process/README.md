@@ -38,6 +38,10 @@ loopback IP because plaintext nonlocal transport is not admitted. Each client
 RPC must carry a deadline of at most
 30 seconds so an incomplete request cannot occupy a worker slot indefinitely.
 Local worker concurrency is capped at 32 calls per process.
+The supervised local launcher and container set `OMP_NUM_THREADS=1` and
+`OPENBLAS_NUM_THREADS=1` before Python imports native libraries. Arrow's CPU and
+I/O pools use the configured call limit. These settings limit nested native
+parallelism; they do not impose an OS CPU quota or control handler-created threads.
 
 To see state survive a database and Python worker restart, use a new checkpoint
 directory and run these as two separate commands from the repository root:
