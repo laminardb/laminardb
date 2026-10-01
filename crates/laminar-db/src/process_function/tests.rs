@@ -784,6 +784,95 @@ async fn keyed_state_and_timer_survive_graph_checkpoint_restore() {
 }
 
 #[tokio::test]
+async fn vnode_restore_rejects_missing_descriptor_metadata() {
+    let mut binding = descriptor();
+    binding.timer_names.clear();
+    let mut original = build_graph(binding.clone(), Arc::new(StateEcho))
+        .initialize_managed_state()
+        .await
+        .unwrap();
+    original
+        .execute_cycle(&source(&[("a", 3, 100_000)]), 100, None)
+        .await
+        .unwrap();
+    let (whole, vnodes) = materialize(original.capture_state(u64::MAX).unwrap());
+    let restored = build_graph(binding.clone(), Arc::new(StateEcho))
+        .initialize_managed_state()
+        .await
+        .unwrap()
+        .restore_state_frames(&[], &vnodes, 256);
+    let error = restored.err().unwrap();
+    assert!(error.to_string().contains("validated metadata"), "{error}");
+
+    // State-only frames must not bypass an immutable implementation binding either.
+    binding.implementation_digest = "f".repeat(64);
+    let restored = build_graph(binding, Arc::new(StateEcho))
+        .initialize_managed_state()
+        .await
+        .unwrap()
+        .restore_state_frames(&whole, &vnodes, 256);
+    let error = restored.err().unwrap();
+    assert!(error.to_string().contains("binding"), "{error}");
+}
+
+#[tokio::test]
+async fn metadata_restore_is_single_use_and_rejects_live_state() {
+    let mut original =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    let whole = original.checkpoint().unwrap().unwrap().data;
+    let mut restored =
+        ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 4).unwrap();
+    let mut invalid: serde_json::Value = serde_json::from_slice(&whole).unwrap();
+    invalid["descriptor_sha256"] = serde_json::Value::String("f".repeat(64));
+    assert!(restored
+        .restore(crate::operator_graph::OperatorCheckpoint {
+            data: serde_json::to_vec(&invalid).unwrap(),
+        })
+        .is_err());
+    restored
+        .restore(crate::operator_graph::OperatorCheckpoint {
+            data: whole.clone(),
+        })
+        .unwrap();
+    let error = restored
+        .restore(crate::operator_graph::OperatorCheckpoint {
+            data: whole.clone(),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("fresh operator"), "{error}");
+
+    original
+        .process_with_frontiers(
+            &[vec![input_batch(&[("a", 7, 100_000)])]],
+            &[InputFrontier {
+                watermark: Some(100),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let before = original.checkpoint().unwrap().unwrap().data;
+    let accounting = original.managed_state_accounting();
+    let error = original
+        .restore(crate::operator_graph::OperatorCheckpoint { data: whole })
+        .unwrap_err();
+    assert!(error.to_string().contains("fresh operator"), "{error}");
+    assert_eq!(original.checkpoint().unwrap().unwrap().data, before);
+    assert_eq!(original.managed_state_accounting(), accounting);
+    let output = original
+        .process_with_frontiers(
+            &[vec![input_batch(&[("a", 5, 101_000)])]],
+            &[InputFrontier {
+                watermark: Some(101),
+                idle: false,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(totals(&output), vec![12]);
+}
+
+#[tokio::test]
 async fn due_timers_remain_scheduled_after_callback_limit() {
     let mut binding = descriptor();
     binding.limits.max_timer_callbacks_per_step = 1;
@@ -1050,6 +1139,8 @@ fn vnode_restore_rejects_oversized_frame_before_decoding() {
     let mut binding = descriptor();
     binding.limits.max_state_bytes = 1;
     let mut operator = ProcessFunctionOperator::new(binding, Arc::new(AccountActivity), 4).unwrap();
+    let whole = operator.checkpoint().unwrap().unwrap();
+    operator.restore(whole).unwrap();
     let error = operator.restore_vnode(0, 4, &[b' '; 135]).unwrap_err();
     assert!(error.to_string().contains("frame exceeds state budget"));
     assert_eq!(operator.managed_state_accounting().unwrap().live, 0);
@@ -1283,6 +1374,311 @@ async fn native_function_restores_from_database_checkpoint() {
     });
     assert_eq!(totals(&[timer]), vec![110]);
     restored.shutdown().await.unwrap();
+}
+
+mod shared_checkpoint {
+    use std::collections::{BTreeMap, HashMap};
+
+    use bytes::Bytes;
+    use laminar_core::checkpoint::{
+        checkpoint_manifest_bytes, checkpoint_sha256, ByteRange, ChannelProgress,
+        CheckpointAssignmentFence, CheckpointManifest, CheckpointParticipant, CheckpointScope,
+        CheckpointStore, CommittedCheckpointIndex, CommittedParticipantRef, ConnectorCheckpoint,
+        LeaderProof, LeaderProofOwner, ObjectStoreCheckpointStore, StateFrame, StateFrameKey,
+        COMMITTED_CHECKPOINT_INDEX_VERSION,
+    };
+    use laminar_core::checkpoint_decision::{CheckpointOutcome, CheckpointVerdict};
+    use laminar_core::state::KeyGroupCount;
+    use object_store::local::LocalFileSystem;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::recovery_manager::{ClusterRecoveryTarget, RecoveredState, RecoveryManager};
+
+    const DEPLOYMENT: &str = "00000000-0000-0000-0000-000000000001";
+    const OWNER: u64 = 7;
+
+    pub(super) struct Fixture {
+        directory: tempfile::TempDir,
+        committed: CommittedCheckpointIndex,
+        outcome: CheckpointOutcome,
+    }
+
+    impl Fixture {
+        fn store(&self) -> ObjectStoreCheckpointStore {
+            ObjectStoreCheckpointStore::new(
+                Arc::new(LocalFileSystem::new_with_prefix(self.directory.path()).unwrap()),
+                "process-recovery",
+            )
+            .with_key_group_count(KeyGroupCount::try_from(256_u16).unwrap())
+            .with_participant_id(OWNER)
+        }
+
+        fn target(&self) -> ClusterRecoveryTarget {
+            ClusterRecoveryTarget {
+                assignment: self.committed.assignment_fence.clone().unwrap(),
+                owned_vnodes: (0..256).collect(),
+                max_graph_payload_bytes: 1024 * 1024,
+            }
+        }
+
+        async fn recover(&self, target: ClusterRecoveryTarget) -> Result<RecoveredState, DbError> {
+            let store = self.store();
+            RecoveryManager::new(
+                &store,
+                &self.committed.pipeline_identity,
+                DEPLOYMENT,
+                CheckpointScope::Cluster,
+            )
+            .recover_committed_for_target(&self.outcome, &self.committed, Some(target))
+            .await
+        }
+
+        pub(super) async fn restore_graph(
+            &self,
+            graph: OperatorGraph,
+        ) -> Result<OperatorGraph, DbError> {
+            let recovered = self.recover(self.target()).await?;
+            let mut whole = Vec::new();
+            let mut vnodes = Vec::new();
+            for frame in recovered.state_frames {
+                assert_eq!(frame.participant_id, OWNER);
+                match frame.key {
+                    StateFrameKey::OperatorWhole { operator_id } => whole.push((
+                        operator_id.strip_prefix("graph:").unwrap().to_owned(),
+                        frame.payload,
+                    )),
+                    StateFrameKey::Vnode { operator_id, vnode } => vnodes.push((
+                        operator_id.strip_prefix("graph:").unwrap().to_owned(),
+                        u32::from(vnode),
+                        frame.payload,
+                    )),
+                }
+            }
+            graph
+                .restore_state_frames(&whole, &vnodes, 256)
+                .map(|(graph, _)| graph)
+        }
+    }
+
+    pub(super) async fn persist(graph: &mut OperatorGraph) -> Fixture {
+        let key_groups = KeyGroupCount::try_from(256_u16).unwrap();
+        let boot = Uuid::from_u128(7);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[OWNER; 256],
+            vec![CheckpointParticipant {
+                node_id: OWNER,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        let mut manifest = CheckpointManifest::new_with_key_group_count(1, 1, key_groups);
+        manifest.bind_participant(OWNER);
+        manifest.deployment_id = DEPLOYMENT.into();
+        manifest.assignment_fence = Some(fence.clone());
+        manifest.reassignment_portable = true;
+        manifest.owned_vnodes = (0..256).collect();
+        manifest.source_names = vec!["events".into()];
+        manifest.source_offsets.insert(
+            "events".into(),
+            ConnectorCheckpoint::with_offsets(HashMap::from([("partition-0".into(), "3".into())])),
+        );
+        manifest.channel_progress.push(ChannelProgress {
+            participant_id: OWNER,
+            source_name: "events".into(),
+            input_channel: b"partition-0".to_vec(),
+            watermark: Some(105),
+            idle: false,
+        });
+        manifest.checkpoint_watermark = Some(105);
+        let (whole, vnodes) = materialize(graph.capture_state(1024 * 1024).unwrap());
+        let frames = whole
+            .into_iter()
+            .map(|(name, payload)| {
+                (
+                    StateFrameKey::OperatorWhole {
+                        operator_id: format!("graph:{name}"),
+                    },
+                    payload,
+                )
+            })
+            .chain(vnodes.into_iter().map(|(name, vnode, payload)| {
+                (
+                    StateFrameKey::Vnode {
+                        operator_id: format!("graph:{name}"),
+                        vnode: u16::try_from(vnode).unwrap(),
+                    },
+                    payload,
+                )
+            }));
+        let mut data = Vec::new();
+        for (key, payload) in frames {
+            manifest.state_frames.push(StateFrame {
+                key,
+                chunk: manifest.node_data.chunk,
+                range: ByteRange {
+                    offset: data.len() as u64,
+                    length: payload.len() as u64,
+                },
+                sha256: checkpoint_sha256(&payload),
+            });
+            data.extend_from_slice(&payload);
+        }
+        manifest.node_data.object_length = data.len() as u64;
+        manifest.node_data.sha256 = checkpoint_sha256(&data);
+        let participant = CommittedParticipantRef::from_manifest(
+            &manifest,
+            &checkpoint_manifest_bytes(&manifest).unwrap(),
+        )
+        .unwrap();
+        let committed = CommittedCheckpointIndex {
+            version: COMMITTED_CHECKPOINT_INDEX_VERSION,
+            deployment_id: DEPLOYMENT.into(),
+            pipeline_identity: manifest.pipeline_identity.clone(),
+            epoch: 1,
+            checkpoint_id: 1,
+            predecessor: None,
+            scope: CheckpointScope::Cluster,
+            vnode_count: 256,
+            assignment_fence: Some(fence.clone()),
+            reassignment_portable: true,
+            participants: vec![participant],
+            source_names: manifest.source_names.clone(),
+            source_offsets: BTreeMap::from([(
+                "events".into(),
+                manifest.source_offsets["events"].clone(),
+            )]),
+            channel_progress: manifest.channel_progress.clone(),
+            source_watermarks: BTreeMap::from([("events".into(), 105)]),
+            checkpoint_watermark: Some(105),
+        };
+        let (_, reference) = committed.encode_and_reference().unwrap();
+        let fixture = Fixture {
+            directory: tempfile::tempdir().unwrap(),
+            committed,
+            outcome: CheckpointOutcome {
+                version: 3,
+                scope: CheckpointScope::Cluster,
+                epoch: 1,
+                checkpoint_id: 1,
+                deployment_id: DEPLOYMENT.into(),
+                assignment_fence: Some(fence),
+                leader_proof: Some(LeaderProof {
+                    owner: LeaderProofOwner {
+                        node_id: OWNER,
+                        boot_id: boot,
+                        process_term: 1,
+                    },
+                    fencing_token: 1,
+                }),
+                committed_checkpoint: Some(reference),
+                verdict: CheckpointVerdict::Commit,
+            },
+        };
+        fixture
+            .store()
+            .save_checkpoint(&manifest, &[Bytes::from(data)])
+            .await
+            .unwrap();
+        fixture
+    }
+
+    #[tokio::test]
+    async fn one_owner_checkpoint_restores_process_state_timers_and_source_cut() {
+        let mut original = build_graph(descriptor(), Arc::new(AccountActivity))
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        original
+            .execute_cycle(
+                &source(&[("a", 60, 100_000), ("b", 5, 101_000), ("a", 50, 102_000)]),
+                105,
+                None,
+            )
+            .await
+            .unwrap();
+        let fixture = persist(&mut original).await;
+        drop(original);
+        let recovered = fixture.recover(fixture.target()).await.unwrap();
+        assert_eq!(
+            recovered.source_offsets()["events"].offsets["partition-0"],
+            "3"
+        );
+        assert_eq!(recovered.checkpoint_watermark(), Some(105));
+        assert_eq!(recovered.state_frames.len(), 257);
+        assert!(!recovered.reassigned);
+        let fresh = build_graph(descriptor(), Arc::new(AccountActivity))
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        let mut restored = fixture.restore_graph(fresh).await.unwrap();
+        let output = restored
+            .execute_cycle(&FxHashMap::default(), 112, None)
+            .await
+            .unwrap();
+        let mut rows = activity_rows(&output["activity"]);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".into(), "inactive".into(), 110, false, 112_000),
+                ("b".into(), "inactive".into(), 5, false, 111_000),
+            ]
+        );
+        let output = restored
+            .execute_cycle(&source(&[("a", 1, 120_000)]), 120, None)
+            .await
+            .unwrap();
+        assert_eq!(totals(&output["activity"]), vec![111]);
+    }
+
+    #[tokio::test]
+    async fn one_owner_checkpoint_rejects_changed_authority_roster_and_binding() {
+        let mut original = build_graph(descriptor(), Arc::new(AccountActivity))
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        original
+            .execute_cycle(
+                &source(&[("a", 60, 100_000), ("b", 5, 101_000), ("a", 50, 102_000)]),
+                105,
+                None,
+            )
+            .await
+            .unwrap();
+        let fixture = persist(&mut original).await;
+        for (version, boot) in [(6, 7), (7, 8)] {
+            let mut target = fixture.target();
+            target.assignment = CheckpointAssignmentFence::from_owner_map(
+                version,
+                &[OWNER; 256],
+                vec![CheckpointParticipant {
+                    node_id: OWNER,
+                    boot_incarnation: Uuid::from_u128(boot),
+                }],
+            )
+            .unwrap();
+            assert!(fixture.recover(target).await.is_err());
+        }
+        let mut target = fixture.target();
+        target.owned_vnodes.pop();
+        assert!(fixture.recover(target).await.is_err());
+        let mut target = fixture.target();
+        target.max_graph_payload_bytes = 1;
+        let error = fixture.recover(target).await.unwrap_err();
+        assert!(matches!(error, DbError::ManagedStateBudgetExceeded { .. }));
+
+        let mut changed = descriptor();
+        changed.implementation_digest = "f".repeat(64);
+        let fresh = build_graph(changed, Arc::new(AccountActivity))
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        let error = fixture.restore_graph(fresh).await.err().unwrap();
+        assert!(error.to_string().contains("binding"), "{error}");
+        assert!(fixture.recover(fixture.target()).await.is_ok());
+    }
 }
 
 #[cfg(feature = "process-remote")]
@@ -2065,6 +2461,202 @@ def handle(activations):
             .await
             .unwrap();
         assert_eq!(totals(&drain(&mut restored, 120).await), vec![110]);
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    struct DelayedActivity {
+        entered: tokio::sync::Notify,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl NativeProcessFunction for DelayedActivity {
+        fn invoke(
+            &self,
+            activations: &[ProcessActivation],
+        ) -> Result<Vec<ProcessActivationResult>, DbError> {
+            let delayed = activations.iter().any(|activation| {
+                let ProcessCallback::Input(batch) = &activation.callback else {
+                    return false;
+                };
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+                    == 999
+            });
+            if delayed {
+                self.entered.notify_one();
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            AccountActivity.invoke(activations)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_restore_rejects_pending_work_without_discarding_its_result() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (release, receiver) = std::sync::mpsc::channel();
+        let handler = Arc::new(DelayedActivity {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(receiver),
+        });
+        let (client, shutdown, worker) =
+            worker_client(binding.clone(), handler.clone(), Duration::from_secs(5)).await;
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut operator = ProcessFunctionOperator::new_remote(
+            binding,
+            &client,
+            tokio::runtime::Handle::current(),
+            Arc::clone(&wake),
+            "activity".into(),
+            4,
+        )
+        .unwrap();
+        let metadata = operator.checkpoint().unwrap().unwrap().data;
+        let frame = operator
+            .checkpoint_vnodes(&[0], 4, 1024)
+            .unwrap()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .state
+            .unwrap()
+            .materialize(&mut 0, 1024)
+            .unwrap();
+        operator
+            .restore(crate::operator_graph::OperatorCheckpoint {
+                data: metadata.clone(),
+            })
+            .unwrap();
+        let frontier = InputFrontier {
+            watermark: Some(95),
+            idle: false,
+        };
+        operator
+            .process_with_frontiers(&[vec![input_batch(&[("a", 999, 100_000)])]], &[frontier])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), handler.entered.notified())
+            .await
+            .unwrap();
+        assert!(operator.checkpoint_drain_pending());
+        let error = operator
+            .restore(crate::operator_graph::OperatorCheckpoint { data: metadata })
+            .unwrap_err();
+        assert!(error.to_string().contains("fresh operator"), "{error}");
+        let error = operator.restore_vnode(0, 4, &frame).unwrap_err();
+        assert!(
+            error.to_string().contains("no pending invocation"),
+            "{error}"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), wake.notified())
+            .await
+            .unwrap();
+        let output = operator
+            .process_with_frontiers(&[Vec::new()], &[frontier])
+            .await
+            .unwrap();
+        assert_eq!(totals(&output), vec![999]);
+        assert!(!operator.checkpoint_drain_pending());
+        assert!(operator.checkpoint().is_ok());
+        drop(operator);
+        shutdown.cancel();
+        worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delayed_old_graph_reply_cannot_mutate_shared_checkpoint_recovery() {
+        let mut binding = descriptor();
+        binding.runtime = ProcessRuntime::RemoteRust;
+        let (release, receiver) = std::sync::mpsc::channel();
+        let handler = Arc::new(DelayedActivity {
+            entered: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(receiver),
+        });
+        let (client, shutdown, worker) =
+            worker_client(binding.clone(), handler.clone(), Duration::from_secs(5)).await;
+        let mut original = remote_graph(
+            binding.clone(),
+            Arc::clone(&client),
+            tokio::runtime::Handle::current(),
+        )
+        .initialize_managed_state()
+        .await
+        .unwrap();
+        original
+            .execute_cycle(
+                &source(&[("a", 60, 100_000), ("b", 5, 101_000), ("a", 50, 102_000)]),
+                105,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut values = totals(&drain(&mut original, 105).await);
+        values.sort_unstable();
+        assert_eq!(values, vec![5, 60, 110]);
+        let fixture = shared_checkpoint::persist(&mut original).await;
+        original
+            .execute_cycle(&source(&[("a", 999, 106_000)]), 105, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), handler.entered.notified())
+            .await
+            .unwrap();
+        assert!(!original.checkpoint_is_quiescent());
+        let old_wake = original.process_work_wake().unwrap();
+
+        let fresh = remote_graph(binding, client, tokio::runtime::Handle::current())
+            .initialize_managed_state()
+            .await
+            .unwrap();
+        let mut restored = fixture.restore_graph(fresh).await.unwrap();
+        restored
+            .execute_cycle(&source(&[("a", 1, 106_000)]), 105, None)
+            .await
+            .unwrap();
+        assert_eq!(totals(&drain(&mut restored, 105).await), vec![111]);
+        release.send(()).unwrap();
+        // Keep the old graph idle until its real RPC reply reaches its completion channel.
+        // Dropping it then discards that proposal while the restored graph keeps its own state.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !original.has_runnable_deferred_work() {
+                old_wake.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(original);
+        restored
+            .execute_cycle(&FxHashMap::default(), 113, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&drain(&mut restored, 113).await),
+            vec![("b".into(), "inactive".into(), 5, false, 111_000),]
+        );
+        restored
+            .execute_cycle(&FxHashMap::default(), 117, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&drain(&mut restored, 117).await),
+            vec![("a".into(), "inactive".into(), 111, false, 116_000),]
+        );
+        restored
+            .execute_cycle(&source(&[("a", 1, 120_000)]), 120, None)
+            .await
+            .unwrap();
+        assert_eq!(totals(&drain(&mut restored, 120).await), vec![112]);
+        drop(restored);
         shutdown.cancel();
         worker.await.unwrap().unwrap();
     }

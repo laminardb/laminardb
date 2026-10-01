@@ -107,6 +107,7 @@ pub(crate) struct ProcessFunctionOperator {
     key_count: usize,
     timer_count: usize,
     graph_budget: usize,
+    metadata_restored: bool,
 }
 
 impl ProcessFunctionOperator {
@@ -184,6 +185,7 @@ impl ProcessFunctionOperator {
             key_count: 0,
             timer_count: 0,
             graph_budget: usize::MAX,
+            metadata_restored: false,
         })
     }
 

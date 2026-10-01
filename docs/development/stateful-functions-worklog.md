@@ -437,6 +437,79 @@ This completes the scoped account demonstration. It qualifies embedded completed
 Single-node admission is unchanged. Python stronger delivery and both cluster
 forms remain closed pending their existing qualification gates.
 
+### Continuation: bound process restoration and shared-cut regressions (2026-10-01)
+
+Starting from `32bace2f67a2093446468408538409dcbc690f95`, this increment begins
+original Phase E with the existing process checkpoint participant. A vnode frame
+contains keyed values and timers, but its descriptor/partition binding lives in
+the whole-operator frame. Restoration now requires that metadata to have passed
+validation first. Metadata may be installed once into a fresh operator; it cannot
+reset a live operator or pending remote work. Vnode restoration also rejects
+pending worker proposals. Failed validation leaves the operator unchanged and a
+fresh operator may retry valid metadata. Existing valid checkpoint bytes and the
+codec are unchanged. The production change adds one local restoration flag and
+checks only constructor/restore paths; no record dispatch, coordinator cycle,
+core operator, dependency, protocol or registration admission changed.
+
+The new regression fixture captures real process graph frames, writes them with
+`ObjectStoreCheckpointStore` onto a temporary local object store, reopens the
+store, and reads the exact ranges through `RecoveryManager`. Its seeded
+one-participant cluster-format cut binds owner 7, assignment 7, all 256 vnodes,
+source position 3 and watermark 105. It constructs the index and Commit outcome
+in the test, including the format's required portability flag; it does not run
+CAS publication, acquire a process lease or certify portable distributed state.
+Tests verify restored totals, timer replacement/consumption, source-cut metadata,
+changed implementation binding, stale assignment, changed boot identity, wrong
+vnode inventory and the graph-payload limit. Missing metadata is tested with a
+state-only image so timer validation cannot mask a binding bypass.
+
+The real loopback Rust-worker regression delays an uncheckpointed same-key
+activation, restores the cut into a separate graph using the same worker/client,
+and updates the restored total. It then receives the old graph's actual RPC
+proposal into that graph's completion channel before discarding it. The recovered
+graph keeps total 111, the untouched second key's timer and its own replacement
+timer; subsequent input produces 112. This verifies separation of graph
+generations sharing a transport, including reused numeric activation IDs. It
+does not fence an old graph against a live cluster assignment. Another real RPC
+test rejects restoration during pending work and verifies that the rejected
+restore does not discard that invocation's valid result.
+
+Validation: with `RUST_MIN_STACK=8388608` and no real-Python environment selected,
+`cargo test -p laminar-db --lib --no-default-features --features
+cluster,process-remote,files process_function::tests:: -- --test-threads=1 --quiet`
+passed 51 tests (one resource stress test ignored) in 71.71 seconds. The whole
+command took 1,205.94 seconds including compilation and build-lock waiting. It
+includes all six new regressions and the existing native/Rust file-source
+host-loss cases. Python-dependent tests that return without the environment
+remain unqualified by this run; the SDK, server CLI and container examples were
+not changed or rerun in this increment.
+
+`cargo test --workspace --lib -- --test-threads=1 --quiet`, with the same documented
+Windows stack setting, passed 1,977 connector, 973 core, 2,051 database (two
+ignored), and 870 SQL tests: 5,871 passed in total. The whole command took
+1,306.80 seconds. Both required workspace Clippy gates passed with `-D warnings`
+(483.02 seconds all features/targets, 712.42 seconds without defaults, including
+build-lock waiting). Nightly formatting, readability (unchanged 19 module/193
+function exceptions), and diff checks passed. No coordinator/core record path
+changed, so its Criterion/IPC gate was not triggered; no latency claim is made.
+The Windows default-stack, OpenSSL debug-symbol and proc-macro compatibility
+caveats remain.
+
+Preliminary runs exposed an invalid test-handler command and the cluster index's
+mandatory portability flag; the fixtures were corrected. Two existing host-loss
+tests timed out in the broad default-connector run, then passed unchanged in the
+feature-specific run above and the workspace gate. Both preliminary logs are
+retained with final qualification artifacts under ignored
+`target/process-cluster-recovery-20261001/`. An independent topology-validation
+build ran in the same checkout; its compiler processes were left running. Only
+the four files belonging to this restoration increment are included in its commit.
+
+Both cluster forms remain rejected. This is recovery preparation for embedded
+and single-node process operators, with cluster-format fixtures. Real one-owner
+cluster lease loss/restart, fenced publication, and distributed transfer remain
+unqualified. There is no new scheduler, state backend or speculative transfer
+framework. Python's supported delivery profile remains `BestEffort`.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -450,13 +523,16 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Continue original Phase E with one-owner cluster process-state recovery and
-assignment fencing before distributed handoff. Inspect and reuse the shared
-checkpoint, vnode capture/restore and process-lease lifecycle; qualify ownership
-loss/restart and stale attempts before widening admission. Keep both cluster
-forms closed until their actual ownership/loss/stale-response tests pass. Do not
-introduce a second scheduler or state backend. Coordinator/core changes require
-the repository's before/after Criterion and IPC gates.
+Continue original Phase E with process-lease and assignment fencing through the
+existing graph lifecycle. The shared-cut fixture above verifies same-owner frame
+restoration and isolated graph generations; it is not an admission certificate.
+Next integrate process state/timers with the existing managed vnode
+prepare/publish/abort lifecycle and bind remote attempts to the authoritative
+assignment/recovery generation. Qualify actual one-owner lease loss/restart and
+stale results before distributed acquisition/revocation. Keep both cluster forms
+closed until their actual ownership/loss/stale-response tests pass. Do not add a
+second scheduler or state backend. Coordinator/core changes require the
+repository's before/after Criterion and IPC gates.
 
 Complete Python dependency/effect binding, host-loss and cleanup-failure
 qualification before stronger Python delivery. Longer resource qualification

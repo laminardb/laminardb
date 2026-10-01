@@ -183,6 +183,17 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        if self.metadata_restored
+            || self.next_activation_id != 0
+            || self.next_timer_generation != 0
+            || self.live_bytes != 0
+            || self.watermark_us != i64::MIN
+            || self.checkpoint_drain_pending()
+        {
+            return Err(DbError::Checkpoint(
+                "process metadata restore requires a fresh operator before input admission".into(),
+            ));
+        }
         if checkpoint.data.len() > MAX_OPERATOR_FRAME_BYTES {
             return Err(DbError::Checkpoint(
                 "process metadata frame exceeds its size bound".into(),
@@ -202,6 +213,7 @@ impl GraphOperator for ProcessFunctionOperator {
         self.next_activation_id = frame.next_activation_id;
         self.next_timer_generation = frame.next_timer_generation;
         self.watermark_us = frame.watermark_us;
+        self.metadata_restored = true;
         Ok(())
     }
 
@@ -255,6 +267,14 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, bytes: &[u8]) -> Result<(), DbError> {
+        // RECOVERY: vnode bytes do not repeat the descriptor binding. Validate it in the whole
+        // frame before installing keyed data, and keep worker proposals outside this restore cut.
+        if !self.metadata_restored || self.checkpoint_drain_pending() {
+            return Err(DbError::Checkpoint(
+                "process vnode restore requires validated metadata and no pending invocation"
+                    .into(),
+            ));
+        }
         if vnode_count != self.vnode_count.get() || vnode >= vnode_count {
             return Err(DbError::Checkpoint(
                 "process restore vnode domain mismatch".into(),
