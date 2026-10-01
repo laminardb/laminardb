@@ -6,6 +6,7 @@ use super::{
     AuthorityCreateOutcome, CheckpointDecisionStore, LeaderAuthorityRecord, LeaderLeaseStore,
     LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
     TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
+    TOPOLOGY_PREPARATION_RECORD_VERSION,
 };
 use crate::cluster::control::topology::{
     LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
@@ -27,7 +28,8 @@ impl LeaderAuthorityRecord {
             (
                 TOPOLOGY_AUTHORITY_RECORD_VERSION
                 | TOPOLOGY_ADMISSION_RECORD_VERSION
-                | TOPOLOGY_CUT_RECORD_VERSION,
+                | TOPOLOGY_CUT_RECORD_VERSION
+                | TOPOLOGY_PREPARATION_RECORD_VERSION,
                 Some(baseline),
             ) => {
                 baseline
@@ -63,6 +65,7 @@ impl LeaderAuthorityRecord {
                 TOPOLOGY_AUTHORITY_RECORD_VERSION
                     | TOPOLOGY_ADMISSION_RECORD_VERSION
                     | TOPOLOGY_CUT_RECORD_VERSION
+                    | TOPOLOGY_PREPARATION_RECORD_VERSION
             ) || baseline.authority_sequence != next.lease.seq
                 || self.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
             {
@@ -134,6 +137,7 @@ impl LeaderLeaseStore {
             TOPOLOGY_AUTHORITY_RECORD_VERSION
                 | TOPOLOGY_ADMISSION_RECORD_VERSION
                 | TOPOLOGY_CUT_RECORD_VERSION
+                | TOPOLOGY_PREPARATION_RECORD_VERSION
         ) || record.topology_baseline.as_ref() != Some(baseline)
         {
             return Err(LeaseError::Invalid(

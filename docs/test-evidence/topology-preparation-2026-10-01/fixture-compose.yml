@@ -1,0 +1,5 @@
+services:
+  minio:
+    container_name: laminardb-topology-9929-minio
+  redpanda:
+    container_name: laminardb-topology-9929-redpanda

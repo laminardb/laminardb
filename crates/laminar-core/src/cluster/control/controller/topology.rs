@@ -1,4 +1,4 @@
-//! Old-topology checkpoint control with the controller's configured namespace and process gates.
+//! Participant preparation and old-topology cuts through configured authority and process gates.
 
 use super::{ClusterController, LeaderProof};
 use crate::checkpoint::CheckpointAttempt;
@@ -8,6 +8,67 @@ use crate::cluster::control::topology::{
 };
 
 impl ClusterController {
+    /// Publish this process's independently compiled descriptor under its configured namespace.
+    /// The identity must have been sampled before compilation. This grants no actor readiness.
+    ///
+    /// # Errors
+    /// Rejects process/assignment changes, recovery, divergence or bounded authority contention.
+    pub async fn certify_topology_candidate(
+        &self,
+        operation_id: TopologyOperationId,
+        expected_plan: &TopologyPlanRef,
+        before: super::LocalProcessAuthorityIdentity,
+        compiled: &crate::cluster::control::topology::ClusterTopologyValidation,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        if self.is_recovering()
+            || self.is_draining()
+            || self.try_live_local_process_authority_identity().ok() != Some(before)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?;
+        let assignments = self.snapshot.as_ref().ok_or_else(|| {
+            TopologyError::Protocol("preparation has no configured assignment authority".into())
+        })?;
+        let (_, plan, _, _) = authority.topology_preparation_input(operation_id).await?;
+        let evidence = self
+            .read_local_process_authority_evidence()
+            .await
+            .map_err(|error| TopologyError::Conflict(error.to_string()))?;
+        if evidence.participant != before.participant
+            || evidence.process_term != before.process_term
+            || !evidence.adopted_assignment.matches_fence(&plan.assignment)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let status = authority
+            .certify_topology_participant(
+                assignments,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("process lease authority is not installed".into())
+                })?,
+                operation_id,
+                expected_plan,
+                before,
+                crate::cluster::control::topology::TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+                compiled,
+            )
+            .await?;
+        if self.is_recovering()
+            || self.is_draining()
+            || self.try_live_local_process_authority_identity().ok() != Some(before)
+            || self
+                .checkpoint_assignment_fence(plan.assignment.assignment_version)
+                .as_ref()
+                != Some(&plan.assignment)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(status)
+    }
+
     /// Bind an old-topology cut using this controller's assignment store and exact live leader.
     /// No candidate runtime is authorized.
     ///
@@ -33,6 +94,9 @@ impl ClusterController {
             .begin_topology_checkpoint_cut(
                 proof,
                 assignments,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("process lease authority is not installed".into())
+                })?,
                 operation_id,
                 expected_plan,
                 inventory,

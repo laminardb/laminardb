@@ -7760,3 +7760,6 @@ async fn cluster_artifact_cleanup_is_preserved_and_fenced_across_takeover() {
         .unwrap();
     assert_eq!(metadata.phase, ClusterArtifactCleanupPhase::DeleteMetadata);
 }
+
+#[path = "topology_preparation_tests.rs"]
+mod topology_preparation;

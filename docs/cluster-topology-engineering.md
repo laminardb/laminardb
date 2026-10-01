@@ -9,13 +9,13 @@ Uninitialized --existing cold catalog seal--> LegacySealed
 LegacySealed --fenced identical-inventory adoption--> Versioned(topology 1)
 ```
 
-Old-topology preparation implements `Planned -> Quiescing -> CutPrepared`, with
+Old-topology preparation implements `Planned -> Preparing -> Quiescing -> CutPrepared`, with
 pre-target-commit abort on a leader term change, definitive checkpoint Abort or
 durable recovery fault. A prepared cut includes the exact committed checkpoint
 and every frozen process's application receipt; intake and successor sink epochs
 remain held. It reserves an exact candidate without authorizing candidate actors.
 No record can commit topology 2. Local additive candidate compilation and definition
-compatibility descriptors are implemented. Durable participant certificates, target
+compatibility descriptors and durable participant certificates are implemented. Target
 restore, retirement, Committed/Activating/Active and release remain unfinished.
 Runtime DDL stays fenced.
 
@@ -45,7 +45,9 @@ Encoding 13 requires a valid baseline. Encoding 14 adds assignment reservations
 and the pre-cut request journal. It may precede baseline adoption; missing baseline
 metadata still means an unversioned legacy catalog. Encoding 15 binds the exact
 old-topology checkpoint inventory, Commit and frozen application roster and
-requires an adopted baseline. Every later lease, checkpoint,
+requires an adopted baseline. Encoding 16 binds the canonical candidate descriptor
+and exact-process preparation certificates; new cuts require preparation protocol 2.
+Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
 reject unsupported encodings/admission fields; an old writer paused after reading encoding 12
@@ -81,8 +83,8 @@ inventory, assignment map and boot roster, unresolved authority and prior consum
 assignments. It stages the target and canonical request, then appends one payload-bound
 reservation. Assignment reservations, recovery decisions and checkpoint artifact
 admission contend on that same sequence. There is no check-then-publish gap between
-an admitted drain intent and topology admission. This does not yet certify participant
-capabilities, operator compatibility or new-source activation positions.
+an admitted drain intent and topology admission. Preparation protocol 2 additionally binds the canonical local candidate report.
+Admission alone does not certify participant agreement or resolve new-source positions.
 
 Only one request can be preparing. Identical retries return the original durable
 status, including a prior abort and retry by a replacement leader process; a
@@ -150,15 +152,75 @@ Local descriptor format 1 is scoped explicitly to `LocalCandidatePlan`. It
 classifies additions as future-only, leaves concrete source positions unresolved,
 and identifies the six activation requirements still missing. It is not a
 participant receipt, state-restore mapping, source ownership token or target
-commit certificate. The core pre-cut plan currently does not bind this descriptor.
-Future participant certification must persist agreement over the same exact
-candidate and frozen process roster before target preparation can advance.
+commit certificate. The protocol-2 core plan binds the exact canonical report by
+SHA-256 and length. Each required participant independently recompiles it before
+persisting its agreement; a matching read-only response alone remains insufficient.
 
 Input is bounded to 64 individual CREATEs/256 KiB SQL, 256 total objects and a
 1 MiB encoded descriptor, with a 30 second end-to-end asynchronous deadline.
 The console-authenticated HTTP route adds a 512 KiB JSON-body limit and returns
 local scope, parent conflicts, unsupported operations, busy and deadline results.
 No new dependency, scheduler or per-record work is added.
+
+## Durable participant preparation
+
+The same typed format-1 report is used by dry-run and durable preparation. Its
+public JSON and digest encoding are unchanged; managed-codec names are now owned
+strings so durable decode cannot rely on static lifetimes. `stage_topology_compatibility`
+writes a content-addressed immutable report with bounded read-back. Admission binds
+its reference in the immutable protocol-2 plan and upgrades shared authority to 16.
+It audits exact deployment, parent/target catalogs, incarnations/classifications,
+full pipeline identities and descriptor digest. It does not trust a report as
+proof that any required participant has compiled it.
+
+`LaminarDB::prepare_cluster_topology_operation` reads the authoritative target,
+derives its additive CREATEs and invokes the existing isolated compiler. The caller
+supplies only an operation UUID. The entire locally compiled report must equal the
+admitted report. The configured controller checks live boot/term around compilation,
+its exact durable local assignment adoption, current frozen assignment and process
+lease authority before publishing a certificate. Process leases can use a separate
+namespace from checkpoint/catalog storage; the controller supplies the configured
+`ProcessLeaseAuthority` rather than deriving one from a checkpoint-store handle.
+
+The shared append records one sorted participant/boot/process-term/protocol receipt
+and its immutable authority sequence. The first receipt advances `Planned` to
+`Preparing`; only the complete frozen owner/evidence roster sets `complete_sequence`.
+Identical retries return existing evidence. Missing capability, divergent reports,
+unknown/stale boots or terms, changed assignments, leader changes and recovery
+abort/fence preparation. A completed append survives cancellation or a lost response
+and remains queryable through operation status. Term-change/pre-commit abort retains
+certificates and any successful parent checkpoint. Status/pruning audit and retain
+each certificate append as well as the descriptor and admission binding.
+
+New cut binding requires every frozen process certificate, current exact durable
+process terms and the descriptor's full parent pipeline identity. Historical protocol-1
+reservations remain readable/abortable but cannot begin a new cut. Existing historical
+cut receipts remain readable and recoverable. Authority format rejection and create-only
+successors fence older writers; a coordinated binary upgrade remains necessary to
+retire older actors. Certificates prove compilation agreement, never actor retirement,
+source positions, state restoration, target readiness or output authorization.
+
+Preparation uses the existing single compiler and 30 second compile limit inside a
+45 second total request deadline. Certificate publication uses 16 CAS attempts within
+15 seconds. Reports are limited to 1 MiB, plans to 32 KiB, rosters to the existing 129
+participants, journals to 64 requests and authority records to the existing 256 KiB
+encoding limit. Large retained rosters can hit that record limit before 64 requests.
+No detached migration worker or new task is created. Periodic checkpoint admission
+defers incomplete preparation and held cuts without allocating a cut or faulting the
+pipeline. Prepare-time races still retire reserved attempts with their original proof.
+
+The DB clones its controller handle under a short synchronous lock and drops that
+guard before reading or compiling. Compilation finishes before certificate publication;
+no live catalog or assignment lock spans those awaits. The existing compiler permit
+bounds local work, and the fenced authority CAS serializes receipts with other transitions.
+
+| Preparation boundary | Durable/recovery behavior |
+| --- | --- |
+| Divergent report or missing protocol | Reject without appending a certificate; the frozen request remains unresolved |
+| Only part of the frozen roster agrees | Retain receipts in Preparing; defer ordinary checkpoints and reject a new cut |
+| Boot, process term or assignment changes | Reject stale evidence; current recovery/leader authority aborts the uncommitted candidate |
+| Certificate append succeeds but response/caller disappears | Status audits the exact retained append; an identical live-process retry returns the original certificate |
+| Old certificate anchor or descriptor is damaged | Fail closed in status, cut admission and authority pruning |
 
 ## Old-topology checkpoint cut
 
@@ -291,8 +353,8 @@ remains absent.
 1. Integrate candidate planning with a DB-owned migration worker and its existing
    manual checkpoint owner. The old-cut binding, capture and hold are implemented;
    detached submission/target-stage ownership remain unfinished.
-2. Certify the frozen owner-complete/evidence process rosters, candidate identity,
-   compatibility mapping and protocol on all required participants.
+2. Drive the implemented exact-process certification path from detached submission;
+   explicit local preparation is available, but automatic collection remains unfinished.
 3. Observe superseded actor retirement after the reconciled old checkpoint cut.
 4. Atomically bind target catalog, exact cut, state mappings, concrete source start
    positions, progress/frontiers and durable migration roots in shared authority.
@@ -310,7 +372,8 @@ remains absent.
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)
 includes the real cut/abort/restart oracle, gate hold observations, failure logs
-and existing queue comparison. The latest [local candidate validation evidence](test-evidence/topology-planning-2026-10-01/README.md)
-records matching reports on all three running stateful processes and the subsequent
-cut/abort/restart oracle. These results do not certify target migration or
+and existing queue comparison. The [local candidate validation evidence](test-evidence/topology-planning-2026-10-01/README.md)
+records matching dry-run reports. The latest [participant certification evidence](test-evidence/topology-preparation-2026-10-01/README.md)
+records independently compiled durable receipts on all three running stateful
+processes and the subsequent cut/abort/restart oracle. These results do not certify target migration or
 production latency.

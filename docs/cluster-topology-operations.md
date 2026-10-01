@@ -1,7 +1,8 @@
 # Cluster topology status and upgrade checkpoint
 
 This checkpoint implements explicit legacy catalog adoption, core admission,
-an old-topology checkpoint cut, topology/operation status and local candidate validation.
+an old-topology checkpoint cut, topology/operation status, local candidate validation
+and durable preparation of already admitted candidates.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -13,7 +14,8 @@ and durable replay. There is no supported migration submission or activation rou
 | Read an admitted pre-cut request's durable status | Implemented, console authorization |
 | Dry-run an additive candidate against an adopted parent | Local compile and compatibility descriptor; no durable admission |
 | Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
-| Prepare and hold an exact old-topology cut | Existing manual checkpoint path for an internal core reservation; no target activation |
+| Certify an already admitted candidate on this process | Local preparation API; complete frozen roster required before a new cut |
+| Prepare and hold an exact old-topology cut | Existing manual checkpoint path after participant-complete internal admission/preparation; no target activation |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -163,7 +165,7 @@ sequences and `state`. Malformed/nil UUIDs return 400; an unknown migration requ
 returns 404 with `Cache-Control: no-store`. Baseline adoption is reported by the
 catalog-status endpoint, not this migration-request journal.
 
-The implemented `state.phase` values are `planned`, `quiescing`, `cut_prepared`
+The implemented `state.phase` values are `planned`, `preparing`, `quiescing`, `cut_prepared`
 and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
 `checkpoint_aborted` or `recovery`. A reservation never implies that the
 candidate catalog is committed or locally active. The committed catalog remains
@@ -182,8 +184,9 @@ contains the inventory, binding sequence, definitive checkpoint Commit reference
 and completed process roster. `quiescing` remains visible after Commit while
 application receipts are missing. The leader's receipt follows aggregated external
 sink settlement; every frozen process must also finish its local cut. `cut_prepared`
-means intake and successor sink output remain held. It does not mean that the
-candidate is compatible, installed, retired or active. Committed catalog version
+means intake and successor sink output remain held. Protocol-2 cuts also require
+complete durable compilation agreement. It does not mean that the candidate is
+installed, old actors retired or the target active. Committed catalog version
 remains 1 and locally active version is null while intake is held.
 
 There is no target worker in this checkpoint. If testing the internal cut path,
@@ -199,6 +202,36 @@ Assignment refresh cannot release a held cut. The current certificate remains
 available to its checkpoint tails, while intake and successor sink admission stay
 closed. An authorized coordinated recovery release clears the local hold after
 the existing retirement and readiness checks; a rejected release keeps it closed.
+
+## Certify an admitted candidate locally
+
+`POST /api/v1/cluster/topology/operations/{operation_id}/prepare` uses console
+authorization and startup/serving gates. It is intentionally local: call every
+required exact process rather than forwarding all requests to the leader. The
+request has no planning payload; the server independently compiles the immutable
+candidate already bound by core admission. This endpoint does not submit a new
+migration. There is still no supported public admission/activation command.
+
+Successful status includes `preparation.compatibility`, sorted `certificates`
+(participant node/boot, process term, exact protocol and authority sequence) and
+`complete_sequence`. A missing complete sequence means participants are still
+required. Intake remains open while they prepare; ordinary checkpoints defer.
+Only the complete frozen roster permits the old-topology cut. Certificates are
+retained after abort and restart for audit; they do not grant a restarted boot
+permission to reuse an old process's certificate.
+
+Preparation has a 45 second end-to-end deadline and uses the same single local
+compiler/30 second compilation bounds as dry-run. Responses are uncached. Busy
+compilation returns 429; divergence/non-running parent returns 409; unsupported
+protocol returns 422; fencing/unavailable authority returns 503; deadline or an
+uncertain append returns 504. On cancellation or uncertainty, read operation status
+and retry the same identity. A successful certificate append may outlive the request.
+
+Preparation protocol 2 upgrades authority to encoding 16. Upgrade all required
+binaries together before internally admitting such a request. Old protocol-1
+requests remain readable/abortable but cannot start new uncertified cuts. Descriptor
+agreement does not resolve source positions, restore target state, retire actors,
+commit topology 2 or authorize target output. Normal SQL remains guarded by LDB-6043.
 
 ## Errors and recovery
 

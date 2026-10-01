@@ -7,6 +7,7 @@ mod subscription_replay;
 mod topology;
 mod topology_admission;
 mod topology_cut;
+mod topology_preparation;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
@@ -61,6 +62,7 @@ const AUTHORITY_RECORD_VERSION: u32 = 12;
 const TOPOLOGY_AUTHORITY_RECORD_VERSION: u32 = 13;
 const TOPOLOGY_ADMISSION_RECORD_VERSION: u32 = 14;
 const TOPOLOGY_CUT_RECORD_VERSION: u32 = 15;
+const TOPOLOGY_PREPARATION_RECORD_VERSION: u32 = 16;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1329,6 +1331,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
             && self.version != TOPOLOGY_ADMISSION_RECORD_VERSION
             && self.version != TOPOLOGY_CUT_RECORD_VERSION
+            && self.version != TOPOLOGY_PREPARATION_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2671,6 +2674,14 @@ impl LeaderLeaseStore {
             authority.audit_topology_operation(operation).await?;
             retained.insert(operation.admitted_sequence);
             retained.insert(operation.status_sequence);
+            if let Some(preparation) = &operation.preparation {
+                retained.extend(
+                    preparation
+                        .certificates
+                        .iter()
+                        .map(|certificate| certificate.authority_sequence),
+                );
+            }
             if let Some(cut) = &operation.cut {
                 retained.insert(cut.bound_sequence);
                 if let Some(commit) = &cut.committed {

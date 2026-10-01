@@ -226,6 +226,38 @@ async fn topology_validation_http_is_local_bounded_authenticated_and_does_not_ad
         assert_eq!(response.status(), expected);
         assert_eq!(response.headers()["cache-control"], "no-store");
     }
+    for (identity, bearer, expected) in [
+        (
+            "00000000-0000-0000-0000-000000000058",
+            "wrong-token",
+            StatusCode::UNAUTHORIZED,
+        ),
+        ("not-a-uuid", token.as_str(), StatusCode::BAD_REQUEST),
+        (
+            "00000000-0000-0000-0000-000000000058",
+            token.as_str(),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/cluster/topology/operations/{identity}/prepare"
+                    ))
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        if expected != StatusCode::UNAUTHORIZED {
+            assert_eq!(response.headers()["cache-control"], "no-store");
+        }
+    }
     assert_eq!(authority.load().await.unwrap(), before_authority);
     assert_eq!(
         objects.list(None).try_collect::<Vec<_>>().await.unwrap(),

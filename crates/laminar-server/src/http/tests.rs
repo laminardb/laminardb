@@ -3748,6 +3748,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
         parent_manifest: reference.clone(),
         target_manifest: target.reference().unwrap(),
         assignment: seed.assignment_fence().unwrap(),
+        compatibility: None,
     };
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &snapshot_store, &plan, &target)

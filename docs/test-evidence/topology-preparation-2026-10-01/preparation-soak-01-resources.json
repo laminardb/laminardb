@@ -1,0 +1,53 @@
+{
+  "started_utc": "2026-10-01T20:22:06.1725792Z",
+  "ended_utc": "2026-10-01T20:27:01.0675133Z",
+  "executable_sha256": "62fdc6b6c5cfab392456940c2df90bfd0e0caccae9717a8698398c144fd8ae36",
+  "test_exit_code": 0,
+  "sample_interval_ms": 1000,
+  "samples": 254,
+  "max_sampled_combined_working_set_bytes": 727097344,
+  "processes": [
+    {
+      "pid": 664300,
+      "samples": 44,
+      "observed_peak_working_set_bytes": 178905088,
+      "max_sampled_private_bytes": 133464064
+    },
+    {
+      "pid": 687436,
+      "samples": 116,
+      "observed_peak_working_set_bytes": 225050624,
+      "max_sampled_private_bytes": 183439360
+    },
+    {
+      "pid": 702904,
+      "samples": 116,
+      "observed_peak_working_set_bytes": 296849408,
+      "max_sampled_private_bytes": 253153280
+    },
+    {
+      "pid": 703032,
+      "samples": 128,
+      "observed_peak_working_set_bytes": 181870592,
+      "max_sampled_private_bytes": 127528960
+    },
+    {
+      "pid": 706264,
+      "samples": 54,
+      "observed_peak_working_set_bytes": 200421376,
+      "max_sampled_private_bytes": 153944064
+    },
+    {
+      "pid": 711656,
+      "samples": 127,
+      "observed_peak_working_set_bytes": 220114944,
+      "max_sampled_private_bytes": 153739264
+    },
+    {
+      "pid": 715492,
+      "samples": 117,
+      "observed_peak_working_set_bytes": 208588800,
+      "max_sampled_private_bytes": 166502400
+    }
+  ]
+}

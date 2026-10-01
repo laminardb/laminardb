@@ -32,13 +32,31 @@ pub struct TopologyAdmissionPlan {
     pub target_manifest: CatalogManifestRef,
     /// Owner-complete map and process roster; never a reachable-node majority.
     pub assignment: CheckpointAssignmentFence,
+    /// Exact canonical DB candidate report, required by preparation protocol two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<super::TopologyCompatibilityRef>,
 }
 
 impl TopologyAdmissionPlan {
     pub(crate) fn validate(&self) -> Result<(), TopologyError> {
-        if self.protocol_version != TOPOLOGY_PROTOCOL_VERSION {
+        if !matches!(
+            self.protocol_version,
+            TOPOLOGY_PROTOCOL_VERSION | super::TOPOLOGY_PREPARATION_PROTOCOL_VERSION
+        ) {
             return Err(TopologyError::Protocol(
                 "unsupported admission protocol".into(),
+            ));
+        }
+        if self.protocol_version == super::TOPOLOGY_PREPARATION_PROTOCOL_VERSION {
+            self.compatibility
+                .as_ref()
+                .ok_or_else(|| {
+                    TopologyError::Protocol("preparation requires a candidate descriptor".into())
+                })?
+                .validate()?;
+        } else if self.compatibility.is_some() {
+            return Err(TopologyError::Protocol(
+                "legacy admission cannot carry preparation evidence".into(),
             ));
         }
         self.expected_parent.successor()?;
@@ -73,6 +91,8 @@ pub enum TopologyAbortReason {
 pub enum TopologyAdmissionPhase {
     /// Durable reservation; active graph and catalog still belong to the parent.
     Planned,
+    /// Participants are durably certifying the exact candidate; intake remains open.
+    Preparing,
     /// One exact old-topology attempt is admitted; its barrier and sink settlement are pending.
     Quiescing,
     /// Every frozen process has applied the exact Commit and held intake and sink succession.
@@ -161,6 +181,9 @@ pub struct TopologyAdmissionStatus {
     /// Exact old-topology cut, absent until barrier preparation is authorized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cut: Option<TopologyCheckpointCut>,
+    /// Immutable descriptor and monotonic exact-process compatibility certificates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<super::TopologyPreparation>,
 }
 
 impl TopologyAdmissionStatus {
@@ -172,6 +195,7 @@ impl TopologyAdmissionStatus {
         matches!(
             self.phase,
             TopologyAdmissionPhase::Planned
+                | TopologyAdmissionPhase::Preparing
                 | TopologyAdmissionPhase::Quiescing
                 | TopologyAdmissionPhase::CutPrepared
         )
@@ -190,8 +214,14 @@ impl TopologyAdmissionStatus {
                 "invalid topology admission status".into(),
             ));
         }
+        self.validate_preparation(head)?;
         match (&self.cut, self.phase) {
-            (None, TopologyAdmissionPhase::Planned | TopologyAdmissionPhase::Aborted { .. }) => {}
+            (
+                None,
+                TopologyAdmissionPhase::Planned
+                | TopologyAdmissionPhase::Preparing
+                | TopologyAdmissionPhase::Aborted { .. },
+            ) => {}
             (
                 Some(cut),
                 TopologyAdmissionPhase::Quiescing
@@ -278,6 +308,7 @@ impl TopologyAdmissionStatus {
                 "authority cannot rewrite a topology request or its terminal result".into(),
             ));
         }
+        self.validate_preparation_successor(after, sequence)?;
         if let Some(prior_cut) = &self.cut {
             let next_cut = after.cut.as_ref().ok_or_else(|| {
                 TopologyError::Invalid("authority cannot forget a topology cut".into())
@@ -301,8 +332,10 @@ impl TopologyAdmissionStatus {
                 ));
             }
         } else if let Some(cut) = &after.cut {
-            if !self.is_planned()
-                || after.phase != TopologyAdmissionPhase::Quiescing
+            if !matches!(
+                self.phase,
+                TopologyAdmissionPhase::Planned | TopologyAdmissionPhase::Preparing
+            ) || after.phase != TopologyAdmissionPhase::Quiescing
                 || cut.bound_sequence != sequence
                 || cut.committed.is_some()
                 || !cut.completed_participants.is_empty()

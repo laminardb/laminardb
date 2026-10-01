@@ -128,6 +128,7 @@ impl LeaderLeaseStore {
         &self,
         proof: &LeaderProof,
         assignments: &AssignmentSnapshotStore,
+        processes: &crate::cluster::control::ProcessLeaseAuthority,
         operation_id: TopologyOperationId,
         expected_plan: &TopologyPlanRef,
         inventory: CheckpointArtifactInventory,
@@ -154,10 +155,14 @@ impl LeaderLeaseStore {
                     }
                     return Ok(operation.clone());
                 }
-                if !operation.is_planned() || operation.admitted_by != *proof {
+                if !matches!(operation.phase, TopologyAdmissionPhase::Planned | TopologyAdmissionPhase::Preparing) || operation.admitted_by != *proof {
                     return Err(TopologyError::Conflict("topology operation cannot start a cut in its current disposition".into()));
                 }
                 let plan = self.load_topology_plan(&operation.plan).await?;
+                let descriptor = self.require_topology_prepared(operation, &plan, processes).await?;
+                if inventory.pipeline_identity != descriptor.parent_pipeline {
+                    return Err(TopologyError::Conflict("cut pipeline differs from the certified parent".into()));
+                }
                 let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no adopted parent".into()))?;
                 if inventory.deployment_id != baseline.deployment_id || inventory.assignment_fence.as_ref() != Some(&plan.assignment)
                     || baseline.manifest != plan.parent_manifest || baseline.topology_version != plan.expected_parent
@@ -183,7 +188,7 @@ impl LeaderLeaseStore {
                 lease.seq = lease.seq.checked_add(1).ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
                 let sequence = lease.seq;
                 let mut next = current.preserve_with_lease(lease);
-                next.version = TOPOLOGY_CUT_RECORD_VERSION;
+                next.version = next.version.max(TOPOLOGY_CUT_RECORD_VERSION);
                 next.active_checkpoint_artifacts = Some(inventory.clone());
                 next.active_checkpoint_artifact_leader_proof = Some(proof.clone());
                 let operation = &mut next.topology_operations[index];

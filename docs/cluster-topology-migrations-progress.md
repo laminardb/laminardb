@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, the old-topology checkpoint cut and local additive candidate validation implemented; runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut and local additive candidate validation implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -335,13 +335,69 @@ workflow framework, dependency, runtime actor or per-record work.
   All test server processes exited and only the isolated Compose fixtures were
   removed, preserving volumes and artifacts.
 
+## Completed increment (2026-10-01, participant certification)
+
+Started clean at `aa6336a5e1bd18d9adc604f1069accca92d87515`. This connects
+the isolated candidate compiler to the existing exact-process, assignment and
+shared authority contracts. It adds no migration worker, generic framework,
+dependency or per-record work.
+
+- The existing format-1 report and digest now have one shared typed definition
+  for local planning and durable decoding. Canonical bounded descriptor blobs are
+  content addressed and immutably bound to protocol-2 admission. Authority format
+  16 preserves baseline 1 and older request/cut history; it never downgrades.
+- `LaminarDB::prepare_cluster_topology_operation` and console-authenticated local
+  `POST /api/v1/cluster/topology/operations/{operation_id}/prepare` load the exact
+  admitted target and independently compile it. The whole report must match.
+  Caller-supplied compatibility reports cannot bypass compilation. Source/sink
+  lifecycle effects, actor installation and intake closure remain absent.
+- The configured controller uses its actual process authority, including when its
+  storage differs from checkpoint/catalog storage. Exact local assignment adoption,
+  boot/term and leader authority fence publication. Each shared append records one
+  immutable certificate; `Preparing` completes only for the frozen owner/evidence
+  roster. New cuts require every certificate's current term and the exact parent
+  pipeline identity. Legacy reservations remain readable but cannot start new cuts.
+- Identical retries, lost responses and cancellation resolve to the retained
+  append. Abort/restart retains certificates and the successful parent cut. Status
+  and pruning audit/pin all certificate anchors. Ordinary checkpoint admission
+  defers incomplete preparation and held cuts before reserving an attempt; existing
+  manual cut ownership and Prepare-time race cleanup remain in force.
+- Bounds remain one compiler, 30 seconds compilation, 45 seconds end to end,
+  15 seconds/16 CAS attempts for publication, 1 MiB descriptors, 129 participants,
+  64 retained requests and the existing 256 KiB authority record limit. A large
+  roster can reach the record limit before the request count. There is no public
+  submission or automatic certificate collection yet.
+- Added exact-roster/idempotency, mixed protocol, divergence, stale term,
+  cancellation, lost-response, paused-time timeout, leader-race, pruning and
+  damaged evidence tests. DB tests use distinct configured process storage and
+  connector lifecycle spies; router tests cover auth and typed invalid/nonrunning
+  responses. A golden test decodes the previous checked-in report and preserves
+  its descriptor digest. The full cluster suite passes 1,020 core, 1,986 DB and
+  356 server tests (one existing DB test ignored). All-target Clippy, non-cluster
+  server and cluster FFI builds, 414 non-cluster core tests, fmt and diff checks
+  pass. Exact commands and output are in the
+  [preparation evidence](test-evidence/topology-preparation-2026-10-01/README.md).
+- The optimized three-process scenario passes in 294.19 s. All three processes
+  independently compile and durably certify the identical 48-object candidate
+  in 1.657 s, with per-node request times 626.095 / 482.627 / 486.585 ms and
+  intake active. The exact roster completes at authority 539. Cut 81 reaches
+  CutPrepared in 10.123 s; full restart activates unchanged topology 1 in 38.469 s
+  and retains all certificates, the candidate abort and successful parent cut.
+  Independent oracles observe every expected stateful output across 101,989
+  logical input IDs, with the frozen prefix durable through checkpoint 119.
+  Logged gate hold through deliberate restart/recovery is 48.695..48.735 s;
+  sampled combined working set peaks at 727,097,344 bytes. These are old-graph
+  functional observations, without a matched baseline or consumer-visible
+  migration latency measurement. All test servers exit; only isolated fixture
+  containers/network are removed, preserving volumes and evidence.
+
 ## Remaining work
 
-1. Durable participant capability/compatibility certificates and binding of the
-   implemented local candidate descriptor to core admission.
-   Core pre-cut admission, payload-bound status and serialization with the production
-   assignment writer are implemented. The manual checkpoint path establishes the
-   old cut; no worker certifies compatibility, stages or commits a target.
+1. Integrate the implemented participant certification path with detached submission
+   and automatic collection. Core protocol-2 admission binds the candidate report;
+   each local preparation API independently compiles and durably certifies it.
+   The manual checkpoint path requires the full frozen roster before a new cut;
+   no worker stages or commits a target.
 2. Authorized state/ABI mappings, concrete new-source positions and durable target
    migration roots. Old checkpoint binding, quiescence and live root pinning exist.
 3. Observed actor retirement, install/release and post-commit recovery.
@@ -361,8 +417,9 @@ Criterion output are under ignored `target/topology-evidence` and
 `target/topology-baseline`; checked-in queue sample evidence is under
 `docs/test-evidence/topology-adoption-2026-09-30` and
 `docs/test-evidence/topology-admission-2026-10-01`. Cut results are in
-`docs/test-evidence/topology-cut-2026-10-01`; the latest local candidate validation
-and stateful restart results are in
-`docs/test-evidence/topology-planning-2026-10-01`. This is a resumable checkpoint
+`docs/test-evidence/topology-cut-2026-10-01`; local candidate validation results
+are in `docs/test-evidence/topology-planning-2026-10-01`. The latest exact-process
+certification and stateful restart results are in
+`docs/test-evidence/topology-preparation-2026-10-01`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

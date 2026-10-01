@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use super::{DbError, DbState, LaminarDB};
 
 mod planning;
+mod preparation;
 pub use planning::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,

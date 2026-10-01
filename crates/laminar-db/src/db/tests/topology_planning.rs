@@ -123,6 +123,10 @@ impl Fixture {
 
     async fn with_objects(objects: Arc<dyn ObjectStore>) -> Self {
         let authority = test_catalog_authority_with_ttl(objects, 60_000).await;
+        Self::with_authority(authority).await
+    }
+
+    async fn with_authority(authority: TestCatalogAuthority) -> Self {
         let effects = Arc::new(AtomicUsize::new(0));
         let factory_effects = Arc::clone(&effects);
         let process = authority.controller.recovery_incarnation();
@@ -240,6 +244,246 @@ impl Fixture {
     }
 }
 
+async fn preparation_fixture() -> (
+    Fixture,
+    laminar_core::cluster::control::AssignmentSnapshotStore,
+) {
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv,
+        LeaseDeadline, ProcessLeaseAuthority, ProcessLeaseOutcome,
+    };
+    use laminar_core::cluster::discovery::NodeId as ClusterNodeId;
+    let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let mut authority = test_catalog_authority_with_ttl(Arc::clone(&objects), 60_000).await;
+    let owner = authority.lease.owner.clone();
+    let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&objects)));
+    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(owner.node));
+    let (_, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        owner.node,
+        Arc::clone(&control),
+        control,
+        Some(Arc::clone(&assignments)),
+        members_rx,
+        owner.boot,
+    ));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    // Deliberately separate process storage: the controller must supply this configured authority.
+    let processes = Arc::new(
+        ProcessLeaseAuthority::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+    );
+    let ProcessLeaseOutcome::Acquired(process) = processes
+        .store_for(owner.node)
+        .try_acquire(owner.boot, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("fixture process must acquire its term");
+    };
+    controller.set_process_lease_authority(processes).unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process)
+        .await
+        .unwrap();
+    let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(authority.lease.clone()));
+    controller
+        .set_leader_lease_watch(
+            lease_rx,
+            owner.clone(),
+            Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
+        )
+        .unwrap();
+    controller.set_leader_lease_store(Arc::clone(&authority.lease_store));
+    controller.install_local_leader_proof_provider();
+    controller.set_active(true);
+    let snapshot = AssignmentSnapshot::empty()
+        .next_for_participants(
+            AssignmentSnapshot::vnodes_from_vec(&[ClusterNodeId(1); 8]),
+            vec![laminar_core::checkpoint::CheckpointParticipant {
+                node_id: owner.node.0,
+                boot_incarnation: owner.boot,
+            }],
+        )
+        .unwrap();
+    assignments.save_if_absent(&snapshot).await.unwrap();
+    let fence = snapshot.assignment_fence().unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    controller
+        .announce_adopted_assignment(&laminar_core::checkpoint::CheckpointAssignmentAdoption {
+            participant: fence.participants[0],
+            assignment_version: fence.assignment_version,
+            partitioning_abi_version: fence.partitioning_abi_version,
+            vnode_count: fence.vnode_count,
+            assignment_digest: fence.assignment_digest,
+            vnode_state_ready: true,
+        })
+        .await
+        .unwrap();
+    authority.controller = controller;
+    authority.lease_tx = lease_tx;
+    let fixture = Fixture::with_authority(authority).await;
+    fixture.adopt().await;
+    (fixture, AssignmentSnapshotStore::new(objects))
+}
+
+async fn admit_preparation_candidate(
+    fixture: &Fixture,
+    assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
+) -> laminar_core::cluster::control::TopologyAdmissionStatus {
+    use laminar_core::cluster::control::{
+        CatalogManifestEntry, CatalogObjectKind, TopologyAdmissionPlan,
+        TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    };
+    let statements = vec!["CREATE STREAM future AS SELECT * FROM totals".into()];
+    let descriptor = fixture.validate(&statements).await.unwrap();
+    let mut target = fixture
+        .authority
+        .manifest_store
+        .load()
+        .await
+        .unwrap()
+        .unwrap();
+    target.entries.push(CatalogManifestEntry {
+        canonical_name: "future".into(),
+        kind: CatalogObjectKind::Stream,
+        catalog_generation: 1,
+        ddl: statements[0].clone(),
+    });
+    let compatibility = fixture
+        .authority
+        .lease_store
+        .stage_topology_compatibility(&descriptor)
+        .await
+        .unwrap();
+    let plan = TopologyAdmissionPlan {
+        protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+        operation_id: uuid::Uuid::from_u128(88).try_into().unwrap(),
+        expected_parent: descriptor.parent_version,
+        parent_manifest: descriptor.parent_manifest.clone(),
+        target_manifest: descriptor.target_manifest.clone(),
+        assignment: assignments
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .assignment_fence()
+            .unwrap(),
+        compatibility: Some(compatibility),
+    };
+    let admitted = fixture
+        .authority
+        .lease_store
+        .admit_topology_plan(
+            &fixture.authority.lease.proof(),
+            assignments,
+            &plan,
+            &target,
+        )
+        .await
+        .unwrap();
+    let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+        crate::checkpoint_coordinator::CheckpointConfig::default(),
+        test_checkpoint_store(),
+    )
+    .unwrap();
+    coordinator
+        .bind_pipeline_identity(descriptor.parent_pipeline)
+        .unwrap();
+    *fixture.db.coordinator.lock().await = Some(coordinator);
+    DbState::Running.store(&fixture.db.state);
+    admitted
+}
+
+#[tokio::test]
+async fn topology_preparation_recompiles_durable_candidate_without_connector_effects() {
+    let (fixture, assignments) = preparation_fixture().await;
+    let admitted = admit_preparation_candidate(&fixture, &assignments).await;
+    let inventory = fixture.db.catalog_manifest_inventory().unwrap();
+    let prepared = fixture
+        .db
+        .prepare_cluster_topology_operation(admitted.operation_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.phase,
+        laminar_core::cluster::control::TopologyAdmissionPhase::Preparing
+    );
+    let preparation = prepared.preparation.as_ref().unwrap();
+    assert_eq!(preparation.certificates.len(), 1);
+    assert_eq!(
+        preparation.complete_sequence,
+        Some(prepared.status_sequence)
+    );
+    assert!(prepared.cut.is_none());
+    assert_eq!(
+        fixture
+            .db
+            .prepare_cluster_topology_operation(admitted.operation_id)
+            .await
+            .unwrap(),
+        prepared
+    );
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    assert!(fixture.db.owned_source_tasks.lock().is_empty());
+    assert!(fixture.db.owned_sink_handles.lock().is_empty());
+    assert!(!fixture.db.topology_cut_hold.load(Ordering::Acquire));
+    assert!(fixture.db.source_gate.load(Ordering::Acquire));
+    let guard = fixture.db.topology_validation_lock.lock().await;
+    assert!(matches!(
+        fixture
+            .db
+            .prepare_cluster_topology_operation(admitted.operation_id)
+            .await,
+        Err(DbError::Topology(TopologyError::PlanningBusy))
+    ));
+    drop(guard);
+    fixture.db.shutdown.store(true, Ordering::Release);
+    assert!(matches!(
+        fixture
+            .db
+            .prepare_cluster_topology_operation(admitted.operation_id)
+            .await,
+        Err(DbError::Shutdown)
+    ));
+}
+
+#[tokio::test]
+async fn topology_preparation_rejects_changed_local_config_and_nonrunning_parent() {
+    let (fixture, assignments) = preparation_fixture().await;
+    let admitted = admit_preparation_candidate(&fixture, &assignments).await;
+    DbState::Created.store(&fixture.db.state);
+    assert!(matches!(
+        fixture
+            .db
+            .prepare_cluster_topology_operation(admitted.operation_id)
+            .await,
+        Err(DbError::Topology(TopologyError::Conflict(_)))
+    ));
+    DbState::Running.store(&fixture.db.state);
+    let before = fixture.authority.lease_store.load().await.unwrap();
+    let mut changed = fixture.db.connector_manager.lock().sources()["trades"].clone();
+    changed
+        .connector_options
+        .insert("topic".into(), "divergent".into());
+    fixture.db.connector_manager.lock().register_source(changed);
+    assert!(matches!(
+        fixture
+            .db
+            .prepare_cluster_topology_operation(admitted.operation_id)
+            .await,
+        Err(DbError::Topology(TopologyError::Conflict(_)))
+    ));
+    assert_eq!(fixture.authority.lease_store.load().await.unwrap(), before);
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+}
+
 fn source_ddl(name: &str, options: &str) -> String {
     format!("CREATE SOURCE {name} (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"planning-source\" ({options})")
 }
@@ -292,7 +536,10 @@ async fn topology_validation_additive_plan_is_deterministic_preserves_state_and_
         preserved.transition,
         ClusterTopologyObjectTransition::Preserve
     );
-    assert_eq!(preserved.managed_state_contract, Some("sql_aggregate_v1"));
+    assert_eq!(
+        preserved.managed_state_contract.as_deref(),
+        Some("sql_aggregate_v1")
+    );
     assert_eq!(
         preserved.initialization,
         TopologyInitialization::PreserveExactCut

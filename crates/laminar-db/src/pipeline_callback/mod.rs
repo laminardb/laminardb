@@ -4254,14 +4254,15 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    // None defers incomplete participant preparation or an already held cut without a fault.
     async fn checkpoint_flags_for_assignment(
         controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
         deadline: tokio::time::Instant,
-    ) -> Result<u64, String> {
+    ) -> Result<Option<u64>, String> {
         let Some(controller) = controller else {
             return if assignment_fence.is_none() {
-                Ok(laminar_core::checkpoint::flags::NONE)
+                Ok(Some(laminar_core::checkpoint::flags::NONE))
             } else {
                 Err("local checkpoint received a cluster assignment fence".into())
             };
@@ -4286,12 +4287,16 @@ impl ConnectorPipelineCallback {
                 .map_err(|error| error.to_string())?
                 {
                     if operation.phase == laminar_core::cluster::control::topology::TopologyAdmissionPhase::CutPrepared {
-                        return Err("topology cut is already prepared; intake must remain held".into());
+                        return Ok(None);
                     }
-                    return Ok(laminar_core::checkpoint::flags::TOPOLOGY_CUT);
+                    if matches!(operation.phase, laminar_core::cluster::control::topology::TopologyAdmissionPhase::Planned | laminar_core::cluster::control::topology::TopologyAdmissionPhase::Preparing)
+                        && operation.preparation.as_ref().is_none_or(|preparation| preparation.complete_sequence.is_none()) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(laminar_core::checkpoint::flags::TOPOLOGY_CUT));
                 }
             }
-            return Ok(laminar_core::checkpoint::flags::NONE);
+            return Ok(Some(laminar_core::checkpoint::flags::NONE));
         };
         let fence = assignment_fence.as_ref().ok_or_else(|| {
             "active assignment drain has no admitted predecessor fence".to_string()
@@ -4319,7 +4324,7 @@ impl ConnectorPipelineCallback {
         {
             return Err("assignment drain authority changed during HANDOFF readiness audit".into());
         }
-        Ok(laminar_core::checkpoint::flags::HANDOFF)
+        Ok(Some(laminar_core::checkpoint::flags::HANDOFF))
     }
 
     /// Acquire the existing graph/assignment read fence only for shuffle alignment and mutable
@@ -6329,7 +6334,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 assignment_fence.clone(),
                 deadline,
             )
-            .await?;
+            .await?.ok_or_else(|| "checkpoint flags no longer match admission while participant preparation is pending or cut is held".to_string())?;
             if flags != expected_flags {
                 return Err(format!(
                     "checkpoint flags {flags:#x} no longer match admission {expected_flags:#x}"
@@ -6400,7 +6405,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 Some(assignment_fence.clone()),
                 deadline,
             )
-            .await?;
+            .await?.ok_or_else(|| "checkpoint flags no longer match admission while participant preparation is pending or cut is held".to_string())?;
             if flags != publish_flags {
                 return Err(format!(
                     "checkpoint flags {flags:#x} changed before Prepare publication to {publish_flags:#x}"
@@ -6518,7 +6523,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         )
         .await
         {
-            Ok(flags) => flags,
+            Ok(Some(flags)) => flags,
+            Ok(None) => {
+                return CheckpointAssignmentAdmission::Deferred(
+                    "topology participants are preparing or the cut remains held".into(),
+                )
+            }
             Err(error)
                 if drain_was_active || controller.checkpoint_drain_transition().is_some() =>
             {

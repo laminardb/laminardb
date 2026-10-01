@@ -70,6 +70,12 @@ impl LeaderAuthorityRecord {
                     "checkpoint-bound topology requires authority format 15".into(),
                 ));
             }
+            if operation.preparation.is_some() && self.version < TOPOLOGY_PREPARATION_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "participant preparation requires authority format 16".into(),
+                ));
+            }
             if operation.is_preparing() {
                 planned += 1;
                 if !self.lease.matches_proof(&operation.admitted_by) {
@@ -394,6 +400,14 @@ impl LeaderLeaseStore {
                     && anchored.admitted_sequence == sequence
                     && anchored.plan == operation.plan
                     && anchored.admitted_by == operation.admitted_by
+                    && anchored
+                        .preparation
+                        .as_ref()
+                        .map(|preparation| &preparation.compatibility)
+                        == operation
+                            .preparation
+                            .as_ref()
+                            .map(|preparation| &preparation.compatibility)
                     && record.topology_baseline.as_ref().is_some_and(|baseline| {
                         baseline.manifest == plan.parent_manifest
                             && baseline.topology_version == plan.expected_parent
@@ -410,6 +424,9 @@ impl LeaderLeaseStore {
                 ));
             }
         }
+        self.audit_topology_preparation(operation, &plan)
+            .await
+            .map_err(topology_lease_error)?;
         self.audit_topology_cut(operation).await
     }
 
@@ -571,11 +588,22 @@ impl LeaderLeaseStore {
                 .map_err(topology_checkpoint_error)?;
             let parent = self.load_catalog_manifest(&plan.parent_manifest).await?;
             // Only additive inventory reservation is implemented. DB semantic compatibility
-            // certification and a cut are still required before any future commit transition.
+            // certificates and a cut are required before any future target commit transition.
             if target.entries.len() <= parent.entries.len()
                 || !target.entries.starts_with(&parent.entries)
             {
                 return Err(TopologyError::Invalid("admission currently requires exact preservation of the ordered parent inventory".into()));
+            }
+            if let Some(reference) = &plan.compatibility {
+                let descriptor = self.load_topology_compatibility(reference).await?;
+                descriptor.validate_catalogs(&parent, target)?;
+                if descriptor.parent_version != plan.expected_parent
+                    || descriptor.deployment_id != baseline.deployment_id
+                {
+                    return Err(TopologyError::Conflict(
+                        "descriptor parent/deployment differs from admission authority".into(),
+                    ));
+                }
             }
             self.ensure_catalog_manifest_blob(&target_bytes, &target_ref)
                 .await?;
@@ -588,7 +616,11 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
             let sequence = lease.seq;
             let mut next = current.preserve_with_lease(lease);
-            next.version = next.version.max(TOPOLOGY_ADMISSION_RECORD_VERSION);
+            next.version = next.version.max(if plan.compatibility.is_some() {
+                TOPOLOGY_PREPARATION_RECORD_VERSION
+            } else {
+                TOPOLOGY_ADMISSION_RECORD_VERSION
+            });
             let operation = TopologyAdmissionStatus {
                 operation_id: plan.operation_id,
                 plan: reference.clone(),
@@ -597,6 +629,13 @@ impl LeaderLeaseStore {
                 status_sequence: sequence,
                 phase: TopologyAdmissionPhase::Planned,
                 cut: None,
+                preparation: plan.compatibility.clone().map(|compatibility| {
+                    crate::cluster::control::topology::TopologyPreparation {
+                        compatibility,
+                        certificates: Vec::new(),
+                        complete_sequence: None,
+                    }
+                }),
             };
             next.topology_operations.push(operation.clone());
             match self

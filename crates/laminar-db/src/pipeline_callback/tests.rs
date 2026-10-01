@@ -901,11 +901,7 @@ async fn authoritative_local_leader(
         .unwrap();
 
     let process_authority = Arc::new(
-        ProcessLeaseAuthority::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            Duration::from_secs(30),
-        )
-        .unwrap(),
+        ProcessLeaseAuthority::new(Arc::clone(&objects), Duration::from_secs(30)).unwrap(),
     );
     let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
         .store_for(node)
@@ -974,7 +970,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     use laminar_core::cluster::control::{
         CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind, ClusterKv,
         InMemoryKv, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyVersion,
-        ANNOUNCEMENT_KEY, TOPOLOGY_PROTOCOL_VERSION,
+        ANNOUNCEMENT_KEY, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
     };
     use laminar_core::cluster::discovery::NodeId;
     use laminar_core::state::{KeyGroupCount, VnodeRegistry};
@@ -1011,13 +1007,76 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         catalog_generation: 1,
         ddl: "CREATE SOURCE candidate (id BIGINT)".into(),
     });
+    use laminar_core::cluster::control::topology::{
+        ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+        TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+    };
+    let mut objects = target
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| ClusterTopologyObjectPlan {
+            name: entry.canonical_name.clone(),
+            kind: entry.kind,
+            catalog_generation: entry.catalog_generation,
+            transition: if index == 0 {
+                ClusterTopologyObjectTransition::Preserve
+            } else {
+                ClusterTopologyObjectTransition::AddFutureOnly
+            },
+            initialization: if index == 0 {
+                TopologyInitialization::PreserveExactCut
+            } else {
+                TopologyInitialization::ResolveSourcePositionsOnce
+            },
+            definition_sha256: "1".repeat(64),
+            compatibility_sha256: "1".repeat(64),
+            dependencies: Vec::new(),
+            schema_sha256: None,
+            managed_state_contract: None,
+        })
+        .collect::<Vec<_>>();
+    objects.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut descriptor = ClusterTopologyValidation {
+        validation_format_version: 1,
+        scope: TopologyValidationScope::LocalCandidatePlan,
+        deployment_id: deployment.clone(),
+        parent_version: TopologyVersion::LEGACY_BASELINE,
+        target_version: TopologyVersion::new(2).unwrap(),
+        parent_manifest: parent.reference().unwrap(),
+        target_manifest: target.reference().unwrap(),
+        parent_pipeline: PipelineIdentity::empty(),
+        target_pipeline: PipelineIdentity {
+            canonical_version: 7,
+            sha256: "2".repeat(64),
+        },
+        environment_sha256: "3".repeat(64),
+        compatibility_sha256: String::new(),
+        objects,
+        requires_processing_pause: true,
+        required_before_activation: vec![
+            TopologyActivationRequirement::ParticipantPlanAgreement,
+            TopologyActivationRequirement::ReconciledCheckpointCut,
+            TopologyActivationRequirement::DurableInitializationAndProgress,
+            TopologyActivationRequirement::ObservedActorRetirement,
+            TopologyActivationRequirement::AtomicTargetCommit,
+            TopologyActivationRequirement::InstalledTargetRelease,
+        ],
+    };
+    descriptor.compatibility_sha256 = descriptor.descriptor_digest().unwrap();
+    let compatibility = leader
+        .authority
+        .stage_topology_compatibility(&descriptor)
+        .await
+        .unwrap();
     let plan = TopologyAdmissionPlan {
-        protocol_version: TOPOLOGY_PROTOCOL_VERSION,
+        protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::from_u128(41).try_into().unwrap(),
         expected_parent: TopologyVersion::LEGACY_BASELINE,
         parent_manifest: parent.reference().unwrap(),
         target_manifest: target.reference().unwrap(),
         assignment: leader.fence.clone(),
+        compatibility: Some(compatibility),
     };
     let store = ObjectStoreCheckpointStore::new(Arc::clone(&leader.objects), "topology-cut")
         .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
@@ -1054,6 +1113,7 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
     )
     .await
     .unwrap();
+    let ordinary_flags = ordinary_flags.unwrap();
     assert_eq!(ordinary_flags, flags::NONE);
     let rejected = callback.reserve_attempt(deadline).await.unwrap();
     assert_eq!(
@@ -1188,11 +1248,48 @@ async fn topology_cut_prepare_binds_real_artifact_admission_before_source_captur
         ConnectorPipelineCallback::checkpoint_flags_for_assignment(
             Some(Arc::clone(&leader.controller)),
             Some(leader.fence.clone()),
+            deadline
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let processes = laminar_core::cluster::control::ProcessLeaseAuthority::new(
+        Arc::clone(&leader.objects),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let _prepared = leader
+        .authority
+        .certify_topology_participant(
+            &leader.assignment_store,
+            &processes,
+            plan.operation_id,
+            &leader
+                .authority
+                .topology_operation_status(plan.operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .plan,
+            leader
+                .controller
+                .try_live_local_process_authority_identity()
+                .unwrap(),
+            TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+            &descriptor,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ConnectorPipelineCallback::checkpoint_flags_for_assignment(
+            Some(Arc::clone(&leader.controller)),
+            Some(leader.fence.clone()),
             deadline,
         )
         .await
         .unwrap(),
-        flags::TOPOLOGY_CUT
+        Some(flags::TOPOLOGY_CUT)
     );
     crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
         &mut callback,

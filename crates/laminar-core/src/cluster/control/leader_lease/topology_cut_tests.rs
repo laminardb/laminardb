@@ -15,7 +15,7 @@ async fn bound_fixture(
     TopologyAdmissionStatus,
     CheckpointArtifactInventory,
 ) {
-    let (lease, assignments, mut plan, target) = topology_admission::fixture(authority).await;
+    let (lease, assignments, mut plan, target) = topology_preparation::fixture(authority).await;
     if two_processes {
         let prior = assignments.load().await.unwrap().unwrap();
         let mut participants = prior.participants.clone();
@@ -39,11 +39,13 @@ async fn bound_fixture(
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
         .unwrap();
+    topology_preparation::prepare_all(authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(authority, &plan.assignment, 1).await;
     let bound = authority
         .begin_topology_checkpoint_cut(
             &lease.proof(),
             &assignments,
+            &topology_preparation::processes(authority),
             plan.operation_id,
             &admitted.plan,
             inventory.clone(),
@@ -105,13 +107,14 @@ async fn exact_cut_binding_precedes_barriers_and_is_payload_bound() {
         )
         .await
         .is_err());
-    assert_eq!(head.version, TOPOLOGY_CUT_RECORD_VERSION);
+    assert_eq!(head.version, TOPOLOGY_PREPARATION_RECORD_VERSION);
     assert_eq!(head.active_checkpoint_artifacts, Some(inventory.clone()));
     assert_eq!(
         authority
             .begin_topology_checkpoint_cut(
                 &lease.proof(),
                 &assignments,
+                &topology_preparation::processes(&authority),
                 bound.operation_id,
                 &bound.plan,
                 inventory.clone()
@@ -161,6 +164,7 @@ async fn exact_cut_binding_precedes_barriers_and_is_payload_bound() {
         .begin_topology_checkpoint_cut(
             &lease.proof(),
             &assignments,
+            &topology_preparation::processes(&authority),
             bound.operation_id,
             &bound.plan,
             changed.clone()
@@ -279,12 +283,13 @@ async fn commit_requires_every_exact_process_completion_before_cut_prepared() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn lost_binding_response_and_client_cancellation_leave_the_exact_admission() {
-    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(5));
-    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(6));
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
         .unwrap();
+    topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
     let task_authority = authority.clone();
     let task_assignments = AssignmentSnapshotStore::new(authority.store.clone());
@@ -297,6 +302,7 @@ async fn lost_binding_response_and_client_cancellation_leave_the_exact_admission
             .begin_topology_checkpoint_cut(
                 &proof,
                 &task_assignments,
+                &topology_preparation::processes(&task_authority),
                 operation_id,
                 &task_plan,
                 task_inventory,
@@ -313,12 +319,13 @@ async fn lost_binding_response_and_client_cancellation_leave_the_exact_admission
         .unwrap()
         .unwrap();
     assert_eq!(recovered.phase, TopologyAdmissionPhase::Quiescing);
-    assert_eq!(recovered.cut.as_ref().unwrap().bound_sequence, 5);
+    assert_eq!(recovered.cut.as_ref().unwrap().bound_sequence, 6);
     assert_eq!(
         reopened
             .begin_topology_checkpoint_cut(
                 &lease.proof(),
                 &assignments,
+                &topology_preparation::processes(&authority),
                 operation_id,
                 &admitted.plan,
                 inventory.clone()
@@ -341,7 +348,7 @@ async fn lost_binding_response_and_client_cancellation_leave_the_exact_admission
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn lost_commit_response_keeps_the_cut_quiescing_until_sink_completion() {
-    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(6));
+    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(7));
     let (lease, _, bound, inventory) = bound_fixture(&authority, false).await;
     let checkpoint = committed_checkpoint(
         &authority,
@@ -411,7 +418,7 @@ async fn lost_commit_response_keeps_the_cut_quiescing_until_sink_completion() {
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn cancelled_final_receipt_is_resolved_by_status_and_exact_retry() {
-    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(7));
+    let (raw, authority) = delayed_ambiguous_response_once_at(30_000, lease_path(8));
     let (lease, _, bound, inventory) = bound_fixture(&authority, false).await;
     commit_cut(&authority, &lease.proof(), &inventory).await;
     let participant = inventory.assignment_fence.as_ref().unwrap().participants[0];
@@ -433,7 +440,7 @@ async fn cancelled_final_receipt_is_resolved_by_status_and_exact_retry() {
         .unwrap()
         .unwrap();
     assert_eq!(prepared.phase, TopologyAdmissionPhase::CutPrepared);
-    assert_eq!(prepared.status_sequence, 7);
+    assert_eq!(prepared.status_sequence, 8);
     assert_eq!(
         reopened
             .complete_topology_checkpoint_cut(&lease.proof(), attempt, participant)
@@ -575,7 +582,7 @@ async fn term_change_after_commit_aborts_only_the_candidate_and_preserves_the_pa
         .unwrap();
     assert_eq!(
         authority.load_record().await.unwrap().unwrap().version,
-        TOPOLOGY_CUT_RECORD_VERSION
+        TOPOLOGY_PREPARATION_RECORD_VERSION
     );
 }
 
@@ -746,12 +753,13 @@ async fn malformed_or_rewound_cut_evidence_is_rejected_without_an_append() {
 
 #[tokio::test]
 async fn cut_binding_is_fenced_when_a_new_term_wins_before_its_append() {
-    let (raw, authority) = blocking_once_at(30_000, lease_path(5));
-    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let (raw, authority) = blocking_once_at(30_000, lease_path(6));
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
         .unwrap();
+    topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
     let task_authority = Arc::clone(&authority);
     let task_proof = lease.proof();
@@ -760,6 +768,7 @@ async fn cut_binding_is_fenced_when_a_new_term_wins_before_its_append() {
             .begin_topology_checkpoint_cut(
                 &task_proof,
                 &assignments,
+                &topology_preparation::processes(&task_authority),
                 plan.operation_id,
                 &admitted.plan,
                 inventory,
@@ -793,12 +802,14 @@ async fn cut_binding_is_fenced_when_a_new_term_wins_before_its_append() {
 
 #[tokio::test(start_paused = true)]
 async fn cut_binding_deadline_before_append_retains_only_the_original_plan() {
-    let (raw, authority) = blocking_once_at(30_000, lease_path(5));
-    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let (raw, authority) = blocking_once_at(30_000, lease_path(6));
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
         .unwrap();
+    let prepared =
+        topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
     let task_authority = Arc::clone(&authority);
     let task_proof = lease.proof();
@@ -808,6 +819,7 @@ async fn cut_binding_deadline_before_append_retains_only_the_original_plan() {
             .begin_topology_checkpoint_cut(
                 &task_proof,
                 &assignments,
+                &topology_preparation::processes(&task_authority),
                 plan.operation_id,
                 &task_plan,
                 inventory,
@@ -822,7 +834,7 @@ async fn cut_binding_deadline_before_append_retains_only_the_original_plan() {
             .topology_operation_status(plan.operation_id)
             .await
             .unwrap(),
-        Some(admitted)
+        Some(prepared)
     );
     assert!(authority
         .load_record()
@@ -836,7 +848,7 @@ async fn cut_binding_deadline_before_append_retains_only_the_original_plan() {
 #[tokio::test]
 async fn unused_reservation_abort_retries_exactly_and_cannot_reclassify_admitted_abort() {
     let authority = store(30_000);
-    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
@@ -863,11 +875,13 @@ async fn unused_reservation_abort_retries_exactly_and_cannot_reclassify_admitted
             .unwrap(),
         Some(admitted.clone())
     );
+    topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 2).await;
     authority
         .begin_topology_checkpoint_cut(
             &lease.proof(),
             &assignments,
+            &topology_preparation::processes(&authority),
             plan.operation_id,
             &admitted.plan,
             inventory.clone(),
@@ -913,12 +927,13 @@ async fn unused_reservation_abort_retries_exactly_and_cannot_reclassify_admitted
 
 #[tokio::test]
 async fn cut_admission_winning_unused_abort_append_requires_normal_recovery() {
-    let (raw, authority) = blocking_once_at(30_000, lease_path(5));
-    let (lease, assignments, plan, target) = topology_admission::fixture(&authority).await;
+    let (raw, authority) = blocking_once_at(30_000, lease_path(6));
+    let (lease, assignments, plan, target) = topology_preparation::fixture(&authority).await;
     let admitted = authority
         .admit_topology_plan(&lease.proof(), &assignments, &plan, &target)
         .await
         .unwrap();
+    topology_preparation::prepare_all(&authority, &assignments, &plan, &admitted).await;
     let inventory = checkpoint_artifact_inventory(&authority, &plan.assignment, 1).await;
     let task_authority = Arc::clone(&authority);
     let proof = lease.proof();
@@ -934,6 +949,7 @@ async fn cut_admission_winning_unused_abort_append_requires_normal_recovery() {
         .begin_topology_checkpoint_cut(
             &lease.proof(),
             &assignments,
+            &topology_preparation::processes(&authority),
             plan.operation_id,
             &admitted.plan,
             inventory,

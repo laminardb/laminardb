@@ -40,6 +40,7 @@ pub(super) async fn fixture(
         parent_manifest,
         target_manifest,
         assignment: fence,
+        compatibility: None,
     };
     (lease, assignments, plan, target)
 }

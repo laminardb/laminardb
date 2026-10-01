@@ -6,11 +6,10 @@ use std::sync::Arc;
 
 use laminar_core::checkpoint::PipelineIdentity;
 use laminar_core::cluster::control::{
-    CatalogManifest, CatalogManifestEntry, CatalogManifestRef, CatalogObjectKind,
-    TopologyCatalogState, TopologyError, TopologyVersion,
+    CatalogManifest, CatalogManifestEntry, CatalogObjectKind, TopologyCatalogState, TopologyError,
+    TopologyVersion,
 };
 use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
-use serde::Serialize;
 
 use crate::db::{DbState, LaminarDB, RuntimeMode};
 use crate::error::DbError;
@@ -25,113 +24,11 @@ const VALIDATION_FORMAT_VERSION: u16 = 1;
 const MAX_VALIDATION_OBJECTS: usize = 256;
 const MAX_VALIDATION_STATEMENTS: usize = 64;
 const MAX_VALIDATION_SQL_BYTES: usize = 256 * 1024;
-const MAX_VALIDATION_DESCRIPTOR_BYTES: usize = 1024 * 1024;
 
-/// What a successful validation proves. Participant agreement and runtime authorization follow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TopologyValidationScope {
-    /// This binary compiled a compatible candidate without changing the active catalog or actors.
-    LocalCandidatePlan,
-}
-
-/// Conservative operation classification for the initial additive planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClusterTopologyObjectTransition {
-    /// Same incarnation, definition, dependency closure, schema and managed-state contract.
-    Preserve,
-    /// New object, activated at an explicitly persisted future-only boundary.
-    AddFutureOnly,
-}
-
-/// Required initialization semantics. These are requirements, never concrete cut positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TopologyInitialization {
-    /// Retain the exact reconciled cut's state, timers, watermarks and source/output progress.
-    PreserveExactCut,
-    /// Process only target-generation input after the cut, without historical replay or backfill.
-    FutureOnlyAtCut,
-    /// Resolve concrete latest source/partition positions once at the cut and persist before commit.
-    ResolveSourcePositionsOnce,
-}
-
-/// Authorization still needed before this local plan can activate a target graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TopologyActivationRequirement {
-    /// Every required exact owner/evidence process must validate the same plan and protocol.
-    ParticipantPlanAgreement,
-    /// Establish and reconcile one exact old-topology checkpoint cut.
-    ReconciledCheckpointCut,
-    /// Persist source/channel positions, state mapping and output/replay frontiers.
-    DurableInitializationAndProgress,
-    /// Observe superseded actors' terminal completion and fence staged target output.
-    ObservedActorRetirement,
-    /// Commit the target manifest, cut and mapping atomically in shared authority.
-    AtomicTargetCommit,
-    /// Install the committed graph and consume an owner-complete coordinated Release.
-    InstalledTargetRelease,
-}
-
-/// One catalog-bound entry of the local compatibility descriptor, sorted by canonical name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ClusterTopologyObjectPlan {
-    /// Stable catalog name, never an optimizer node index.
-    pub name: String,
-    /// Typed catalog namespace owner.
-    pub kind: CatalogObjectKind,
-    /// Incarnation retained from the parent, or one for a never-before-created additive name.
-    pub catalog_generation: u64,
-    /// Supported local classification.
-    pub transition: ClusterTopologyObjectTransition,
-    /// Required activation semantics; no scalar offset is invented during validation.
-    pub initialization: TopologyInitialization,
-    /// Hash of the same resolved definition used by strict pipeline identity.
-    pub definition_sha256: String,
-    /// Hash binding identity, schema, ABI, capability, connector contract and dependency closure.
-    pub compatibility_sha256: String,
-    /// Sorted direct catalog dependencies, with their identities transitively bound by the hash.
-    pub dependencies: Vec<String>,
-    /// Resolved Arrow schema hash, absent for sinks.
-    pub schema_sha256: Option<String>,
-    /// Versioned codec name of a managed operator, absent for stateless/source/sink objects.
-    pub managed_state_contract: Option<&'static str>,
-}
-
-/// Effect-free candidate validation. This is neither a durable admission nor an activation receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ClusterTopologyValidation {
-    /// Deterministic local descriptor format, independent of catalog and topology versions.
-    pub validation_format_version: u16,
-    /// Exact scope of the returned evidence.
-    pub scope: TopologyValidationScope,
-    /// Existing control/checkpoint deployment identity.
-    pub deployment_id: String,
-    /// Expected authoritative parent.
-    pub parent_version: TopologyVersion,
-    /// Proposed exact successor; not a committed version.
-    pub target_version: TopologyVersion,
-    /// Exact durable parent bytes and inventory.
-    pub parent_manifest: CatalogManifestRef,
-    /// Candidate inventory reference, computed without writing the blob or a catalog head.
-    pub target_manifest: CatalogManifestRef,
-    /// Unmodified strict recovery identity for the parent graph.
-    pub parent_pipeline: PipelineIdentity,
-    /// Full strict identity for the changed graph; ordinary parent checkpoints will not match it.
-    pub target_pipeline: PipelineIdentity,
-    /// Global state/routing/delivery ABI and config shared by every object descriptor.
-    pub environment_sha256: String,
-    /// Deterministic descriptor digest. Participants must agree on this before admission advances.
-    pub compatibility_sha256: String,
-    /// Preserved and additive objects with explicit state and initialization requirements.
-    pub objects: Vec<ClusterTopologyObjectPlan>,
-    /// A processing pause is required for the implemented old-topology cut contract.
-    pub requires_processing_pause: bool,
-    /// Evidence this validation does not supply; the public mutation path remains guarded.
-    pub required_before_activation: Vec<TopologyActivationRequirement>,
-}
+pub use laminar_core::cluster::control::topology::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
 
 impl LaminarDB {
     /// Compile an additive topology candidate separately from the active graph.
@@ -289,29 +186,7 @@ impl LaminarDB {
         let target_version = expected_parent.successor()?;
         let target_manifest = target.reference().map_err(TopologyError::from)?;
         let objects: Vec<_> = objects.into_values().collect();
-        let descriptor = (
-            "laminardb-topology-compatibility-v1",
-            VALIDATION_FORMAT_VERSION,
-            &baseline.deployment_id,
-            expected_parent,
-            target_version,
-            &baseline.manifest,
-            &target_manifest,
-            &parent_identities.pipeline,
-            &target_identities.pipeline,
-            &parent_identities.environment_sha256,
-            &objects,
-        );
-        let encoded = serde_json::to_vec(&descriptor)
-            .map_err(|error| TopologyError::Invalid(error.to_string()))?;
-        if encoded.len() > MAX_VALIDATION_DESCRIPTOR_BYTES {
-            return Err(TopologyError::Unsupported(
-                "candidate compatibility descriptor exceeds 1 MiB".into(),
-            )
-            .into());
-        }
-        let compatibility_sha256 = compatibility_digest(&descriptor)?;
-        Ok(ClusterTopologyValidation {
+        let mut report = ClusterTopologyValidation {
             validation_format_version: VALIDATION_FORMAT_VERSION,
             scope: TopologyValidationScope::LocalCandidatePlan,
             deployment_id: baseline.deployment_id.clone(),
@@ -322,7 +197,7 @@ impl LaminarDB {
             parent_pipeline: parent_identities.pipeline,
             target_pipeline: target_identities.pipeline,
             environment_sha256: parent_identities.environment_sha256,
-            compatibility_sha256,
+            compatibility_sha256: String::new(),
             objects,
             requires_processing_pause: true,
             required_before_activation: vec![
@@ -333,7 +208,10 @@ impl LaminarDB {
                 TopologyActivationRequirement::AtomicTargetCommit,
                 TopologyActivationRequirement::InstalledTargetRelease,
             ],
-        })
+        };
+        report.compatibility_sha256 = report.descriptor_digest()?;
+        report.validate_catalogs(&parent, &target)?;
+        Ok(report)
     }
 
     fn ensure_validation_catalog_available(&self) -> Result<(), DbError> {
@@ -620,7 +498,7 @@ fn describe_catalog(
                 compatibility_sha256: identity,
                 dependencies,
                 schema_sha256,
-                managed_state_contract: state_contract,
+                managed_state_contract: state_contract.map(str::to_owned),
             },
         );
     }

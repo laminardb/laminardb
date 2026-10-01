@@ -12,10 +12,20 @@ use super::{CatalogManifestError, CatalogManifestRef, LeaseError};
 use crate::error_codes;
 
 mod admission;
+mod compatibility;
+mod preparation;
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
     TopologyCheckpointCut, TopologyCutCommit, TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
+};
+pub use compatibility::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyCompatibilityRef, TopologyInitialization,
+    TopologyValidationScope,
+};
+pub use preparation::{
+    TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
 
 /// Version of the topology adoption protocol understood by this binary.

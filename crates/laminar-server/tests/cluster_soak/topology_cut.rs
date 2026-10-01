@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
     AssignmentSnapshotStore, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
-    CheckpointAssignmentFence, LeaderLeaseStore, LegacyTopologyBaseline, TopologyAbortReason,
-    TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyError,
-    TOPOLOGY_PROTOCOL_VERSION,
+    CheckpointAssignmentFence, ClusterTopologyValidation, LeaderLeaseStore, LegacyTopologyBaseline,
+    TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
+    TopologyError, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
 
 pub(super) fn prepare_old_cut(
@@ -37,7 +37,7 @@ pub(super) fn prepare_old_cut(
         .unwrap();
     let mut candidate = parent.clone();
     // Validate through the public, authenticated read-only API on every running process. The
-    // core admission below still does not bind participant certificates or authorize this target.
+    // admission below binds this descriptor; every process independently recompiles to certify it.
     candidate.entries.push(CatalogManifestEntry {
         canonical_name: "topology_cut_probe".into(),
         kind: CatalogObjectKind::Stream,
@@ -108,13 +108,19 @@ pub(super) fn prepare_old_cut(
     )
     .unwrap();
     eprintln!("soak: all {} running processes validated the same candidate and preserved managed state contracts; target remains uncommitted", nodes.len());
+    let descriptor: ClusterTopologyValidation =
+        serde_json::from_value(expected_validation.unwrap()).unwrap();
+    let compatibility = runtime
+        .block_on(authority.stage_topology_compatibility(&descriptor))
+        .unwrap();
     let plan = TopologyAdmissionPlan {
-        protocol_version: TOPOLOGY_PROTOCOL_VERSION,
+        protocol_version: TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::new_v4().try_into().unwrap(),
         expected_parent: baseline.topology_version,
         parent_manifest: baseline.manifest.clone(),
         target_manifest: candidate.reference().unwrap(),
         assignment: assignment.clone(),
+        compatibility: Some(compatibility),
     };
     let mut admitted = None;
     wait_for(
@@ -144,6 +150,61 @@ pub(super) fn prepare_old_cut(
         },
     );
     assert_eq!(admitted.unwrap().phase, TopologyAdmissionPhase::Planned);
+    let preparation_started = Instant::now();
+    let mut certified = None;
+    let mut preparation_observations = Vec::new();
+    for (index, node) in nodes.iter_mut().enumerate() {
+        let started = Instant::now();
+        let body = node.http_request("POST", &format!("/api/v1/cluster/topology/operations/{}/prepare", plan.operation_id.get()), None, ceiling)
+            .expect("every frozen running process must independently compile and durably certify the admitted candidate");
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let status: TopologyAdmissionStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(status.phase, TopologyAdmissionPhase::Preparing);
+        let preparation = status.preparation.as_ref().unwrap();
+        assert_eq!(
+            preparation.compatibility,
+            plan.compatibility.clone().unwrap()
+        );
+        assert_eq!(preparation.certificates.len(), index + 1);
+        assert_eq!(
+            preparation.complete_sequence.is_some(),
+            index + 1 == plan.assignment.participants.len()
+        );
+        assert!(preparation.certificates.iter().all(|certificate| plan
+            .assignment
+            .participant_incarnation(certificate.participant.node_id)
+            == Some(certificate.participant.boot_incarnation)));
+        let active: serde_json::Value =
+            serde_json::from_str(&node.http_get("/api/v1/cluster/topology").unwrap()).unwrap();
+        assert_eq!(active["committed_version"].as_u64(), Some(1));
+        assert_eq!(active["locally_active_version"].as_u64(), Some(1));
+        preparation_observations.push(serde_json::json!({"node": node.id, "preparation_elapsed_ms": elapsed_ms, "status": status}));
+        certified = Some(status);
+    }
+    let certified = certified.unwrap();
+    assert_eq!(
+        certified
+            .preparation
+            .as_ref()
+            .unwrap()
+            .certificates
+            .iter()
+            .map(|certificate| certificate.participant)
+            .collect::<Vec<_>>(),
+        plan.assignment.participants
+    );
+    assert_eq!(
+        runtime
+            .block_on(authority.topology_operation_status(plan.operation_id))
+            .unwrap(),
+        Some(certified.clone())
+    );
+    std::fs::write(
+        evidence_dir.join("topology-participant-preparations.json"),
+        serde_json::to_vec_pretty(&preparation_observations).unwrap(),
+    )
+    .unwrap();
+    eprintln!("soak: all {} frozen exact processes durably certified descriptor {} in {:?}; target remains uncommitted", plan.assignment.participants.len(), descriptor.compatibility_sha256, preparation_started.elapsed());
     let started = Instant::now();
     // This is the real authenticated management checkpoint path, including leader routing.
     let response = nodes[0]
@@ -243,6 +304,7 @@ pub(super) fn assert_aborted_after_restart(
             reason: TopologyAbortReason::LeaderChanged | TopologyAbortReason::Recovery
         }
     ));
+    assert_eq!(aborted.preparation, prepared.preparation);
     assert_eq!(
         aborted.cut, prepared.cut,
         "pre-commit abort rewound the irreversible parent cut"
