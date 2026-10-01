@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status increment implemented; runtime topology migration
+Status: legacy adoption/status and core pre-cut admission implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -84,7 +84,7 @@ a target checkpoint or an explicitly authorized migration root.
 | Key/schema/window/aggregate/source/sink changes | Transformation required or unsupported | Remain rejected until separately certified |
 | Materialized views, uncertified connectors, arbitrary local SQL | Unsupported in cluster | Existing cluster admission applies |
 
-## Validation log
+## Legacy increment validation (2026-09-30)
 
 - Baseline `cargo test -p laminar-core --features cluster --lib catalog_manifest
   --no-default-features`: 9 passed.
@@ -139,7 +139,7 @@ change alone makes the currently missing migration tests runnable. Migration
 pause, consumer latency, RSS, allocations and artifact-growth comparisons were
 not measured.
 
-## Completed increment
+## Completed increment (2026-09-30)
 
 - Distinct checked logical-version/request IDs and explicit Uninitialized,
   LegacySealed and Versioned(topology 1) observations.
@@ -161,12 +161,53 @@ not measured.
   independent output oracles. It is an upgrade compatibility scenario; it does
   not submit an additive graph migration.
 
+## Completed increment (2026-10-01)
+
+Continuation started clean at `d5867bf03e34207f7a97ac3800d4fb1eac17ad76`.
+The implementation extends existing authority/checkpoint/assignment contracts;
+it adds no parallel scheduler, consensus service or general workflow framework.
+
+- Authority format 14 preserves baseline and a bounded immutable request journal.
+  Core candidate admission freezes the exact parent, candidate, owner map and boot
+  roster. One shared append serializes it with checkpoint and assignment admission.
+  It only implements `Planned -> Aborted`, leaving the active graph and catalog
+  unchanged. Semantic compatibility and the cutover worker remain unfinished.
+- Production graceful assignment publication reserves its exact immutable proposal
+  before raw snapshot publication. The existing watcher/driver materializes an
+  interrupted intent. Exact drain/recovery settlement releases the reservation;
+  drain settlement materializes it before release. Settled proposal cleanup follows
+  the admitted floor in bounded batches.
+- Payload-bound retries return the original result, including from a replacement
+  leader process. Stale proofs and changed payloads fail. Renewal preserves a
+  reservation; term change or a durable recovery fault atomically aborts pre-cut
+  preparation. Committed-phase behavior is not represented by this abort helper.
+- Console-authenticated `GET /api/v1/cluster/topology/operations/{operation_id}`
+  reports the typed durable state and retained evidence. Unknown identities return
+  an uncached 404, malformed UUIDs 400, and damaged evidence fails closed.
+- Plan/journal/retry/read bounds and retained authority anchors are implemented.
+  Journal eviction and orphan topology-artifact cleanup remain missing; the fixed
+  64-request limit rejects further admission. No public submission uses this partial
+  contract. A coordinated binary upgrade is required before normal format-14 drains.
+- All 17 new deterministic admission/drain fault tests and final all-target Clippy
+  pass. The final full suite passes 995 core, 1,967 DB and 354 server tests
+  (one existing DB test ignored). Non-cluster server and cluster FFI builds, fmt
+  and diff checks also pass. The current
+  [validation evidence](test-evidence/topology-admission-2026-10-01/README.md)
+  records commands, build identity and the scope of each result.
+- Rebuilt three-process stateful Kafka/S3 adoption/restart soak passes in 879.42 s:
+  326,129 logical input IDs, all expected bounded/temporal/matrix/window outputs,
+  allowed ALO duplicates, leader failure/rejoin and all-node restart. The frozen
+  input prefix reaches checkpoint 46. S3 readback confirms format 14, baseline 1
+  and no pending drain. This is unchanged-graph evidence, not runtime migration.
+  Debug SLOs are observational and miss the stall budget. Only task fixtures were
+  removed after the run. Queue comparison is 6.1545 us original versus 6.1181 us
+  modified per 32-batch burst; Criterion reports no significant change (p=0.07).
+
 ## Remaining work
 
-1. Durable migration operation evidence/journal, expected-parent and payload-bound
-   idempotency, participant capability gates, and admission serialized with actual
-   checkpoint/recovery/assignment transitions. Baseline adoption is implemented;
-   a target topology and migration state machine are not.
+1. DB-owned candidate planning and participant capability/compatibility certificates.
+   Core pre-cut admission, payload-bound status and serialization with the production
+   assignment writer are implemented. No worker establishes a cut or commits a target.
 2. Exact checkpoint-bound quiescence, root pinning and authorized state restore.
 3. Observed actor retirement, install/release and post-commit recovery.
 4. Public SQL/atomic API, detached ownership, dry run and leader routing. The
@@ -183,6 +224,7 @@ Use [operator guidance](cluster-topology-operations.md) and the
 [engineering checkpoint](cluster-topology-engineering.md). Raw local logs and
 Criterion output are under ignored `target/topology-evidence` and
 `target/topology-baseline`; checked-in queue sample evidence is under
-`docs/test-evidence/topology-adoption-2026-09-30`. This is a resumable checkpoint
+`docs/test-evidence/topology-adoption-2026-09-30` and
+`docs/test-evidence/topology-admission-2026-10-01`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

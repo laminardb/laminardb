@@ -1,6 +1,7 @@
 # Cluster topology status and upgrade checkpoint
 
-This increment implements explicit legacy catalog adoption and topology status.
+This checkpoint implements explicit legacy catalog adoption, core pre-cut admission
+and topology/operation status.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or dry-run route.
@@ -9,6 +10,8 @@ and durable replay. There is no supported migration submission or dry-run route.
 | --- | --- |
 | Initial cold bootstrap and exact sealed-catalog replay | Existing behavior |
 | Read durable topology and local activation status | Implemented |
+| Read an admitted pre-cut request's durable status | Implemented, console authorization |
+| Reserve/abort a candidate | Core library primitives; no public submit route or cutover worker |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Rejected; checkpoint cutover and graph installation unfinished |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -51,17 +54,24 @@ topology operation or allocate a checkpoint/deployment identity.
 
 ## Legacy upgrade and restart
 
-Existing authority format 12 remains readable and writable until explicit
-adoption. Upgrading binaries alone does not adopt the inventory. Normal startup
+Authority formats 12 and 13 remain readable. A coordinated binary upgrade is
+required for this build: the first serialized assignment drain writes format 14,
+even before logical catalog adoption. Stop and observe termination of the old
+server processes, then start every required participant with the new binary and
+the same configuration and durable namespaces. Mixed-binary operation is
+unsupported. Format rejection does not retire cached actors or replace process
+and sink fencing.
+
+Upgrading binaries alone does not adopt the inventory. Normal startup
 continues to replay the same sealed catalog with its existing generations and
 checkpoint identities.
 
 The core `CatalogManifestStore::adopt_legacy_topology` API requires the current
 leader proof, the exact sealed manifest reference, the existing deployment UUID,
 and a nonzero operation UUID reused on retries. Its caller must first complete a
-coordinated binary upgrade of every required participant. Format 13 makes old
-authority readers fail closed; it does not stop already-running old actors or
-replace process/sink fencing. Mixed-version adoption is unsupported.
+coordinated binary upgrade of every required participant. Adoption writes format
+13 or preserves format 14 when assignment admission already upgraded it. Older
+authority readers fail closed; mixed-version adoption is unsupported.
 
 There is no operator-facing adoption CLI or write endpoint in this increment.
 The API is a foundation for the migration coordinator. Do not manually edit
@@ -76,15 +86,36 @@ status and retry the same operation and evidence under the current leader proof.
 Concurrent compatible adoption calls converge on the original winner, whose
 operation UUID is returned. Changed manifest/deployment evidence is rejected.
 
+## Pre-cut request status
+
+`GET /api/v1/cluster/topology/operations/{operation_id}` uses the same console
+authorization and 15 second deadline. It returns the original operation UUID,
+canonical plan reference, admitting leader proof, admission/disposition authority
+sequences and `state`. Malformed/nil UUIDs return 400; an unknown migration request
+returns 404 with `Cache-Control: no-store`. Baseline adoption is reported by the
+catalog-status endpoint, not this migration-request journal.
+
+The implemented `state.phase` values are `planned` and `aborted`. Aborted includes
+`state.reason`:
+`requested`, `leader_changed` or `recovery`. A reservation never implies that the
+candidate catalog is committed or locally active. The committed catalog remains
+topology 1. Identical retries resolve to the original status, including an abort;
+reusing an identity with a different payload fails. The core journal retains at
+most 64 identities and rejects further admission until journal retention exists.
+
+This route is exercised against admitted/aborted requests by the existing HTTP
+router fixture. There is still no supported HTTP/SQL submission, dry-run or manual
+admission command. Do not create a reservation by editing authority files.
+
 ## Errors and recovery
 
 | Code | Meaning and response |
 | --- | --- |
 | `LDB-6043` | Runtime topology migration is unavailable; use the existing inventory |
 | `LDB-6060` | Invalid/missing catalog or topology evidence; repair the underlying artifact, without resetting identity |
-| `LDB-6061` | Expected manifest/deployment conflict; reread authority and resolve the mismatch |
+| `LDB-6061` | Parent/payload conflict, unresolved admission, full journal or unknown operation; reread authority and resolve the stated condition |
 | `LDB-6062` | Leader proof fenced; acquire current authority before retrying |
-| `LDB-6063` | Unsupported adoption protocol; complete the coordinated binary upgrade |
+| `LDB-6063` | Unsupported topology protocol; complete the coordinated binary upgrade |
 | `LDB-6064` | Bounded operation contention/uncertain outcome, or status-read timeout; the message distinguishes these cases |
 | `LDB-6065` | Shared authority I/O/validation failed; restore access or exact persisted evidence |
 

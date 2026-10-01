@@ -2510,6 +2510,10 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/cluster/leader"),
         ("GET", "/api/v1/cluster/checkpoints"),
         ("GET", "/api/v1/cluster/topology"),
+        (
+            "GET",
+            "/api/v1/cluster/topology/operations/00000000-0000-0000-0000-00000000002b",
+        ),
         ("GET", "/api/v1/pipeline/status"),
         ("GET", "/ws/events"),
         ("POST", "/api/v1/checkpoint"),
@@ -3538,26 +3542,21 @@ async fn test_cluster_leader_404_when_not_cluster() {
 
 #[tokio::test]
 async fn topology_status_404_when_not_cluster_and_requires_console_authorization() {
-    let response = build_router(test_state())
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/cluster/topology")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    let response = build_router(test_state_with_token("topology-console"))
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/cluster/topology")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    for uri in [
+        "/api/v1/cluster/topology",
+        "/api/v1/cluster/topology/operations/00000000-0000-0000-0000-00000000002b",
+    ] {
+        let response = build_router(test_state())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = build_router(test_state_with_token("topology-console"))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -3573,10 +3572,14 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     use object_store::{ObjectStore, ObjectStoreExt};
 
     async fn read_status(app: Router, token: &str) -> serde_json::Value {
+        read_status_at(app, token, "/api/v1/cluster/topology").await
+    }
+
+    async fn read_status_at(app: Router, token: &str, uri: &str) -> serde_json::Value {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/v1/cluster/topology")
+                    .uri(uri)
                     .header("authorization", format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
@@ -3603,7 +3606,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
         panic!("empty namespace must admit the test leader");
     };
-    let catalog = Arc::new(CatalogManifestStore::new(authority));
+    let catalog = Arc::new(CatalogManifestStore::new(Arc::clone(&authority)));
     let snapshot_store = Arc::new(
         laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&objects)),
     );
@@ -3648,7 +3651,7 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
     mutable_state.db = db;
     mutable_state.cluster = Some(ClusterComponents {
         controller,
-        snapshot_store,
+        snapshot_store: Arc::clone(&snapshot_store),
         membership_rx: members_rx,
     });
     let app = build_router(Arc::clone(&state));
@@ -3703,6 +3706,100 @@ async fn topology_status_reads_explicit_legacy_and_adopted_authority_without_act
         legacy["catalog"]["manifest"]
     );
     assert_eq!(adopted["catalog"]["baseline"]["deployment_id"], deployment);
+
+    let seed = laminar_core::cluster::control::AssignmentSnapshot::empty()
+        .next_for_participants(
+            laminar_core::cluster::control::AssignmentSnapshot::vnodes_from_vec(&[node]),
+            vec![participant],
+        )
+        .unwrap();
+    snapshot_store.save_if_absent(&seed).await.unwrap();
+    let mut target = manifest.clone();
+    target.entries.push(CatalogManifestEntry {
+        canonical_name: "candidate".into(),
+        kind: CatalogObjectKind::Source,
+        catalog_generation: 1,
+        ddl: "CREATE SOURCE candidate (id BIGINT)".into(),
+    });
+    let plan = laminar_core::cluster::control::TopologyAdmissionPlan {
+        protocol_version: laminar_core::cluster::control::TOPOLOGY_PROTOCOL_VERSION,
+        operation_id: uuid::Uuid::from_u128(43).try_into().unwrap(),
+        expected_parent: laminar_core::cluster::control::TopologyVersion::LEGACY_BASELINE,
+        parent_manifest: reference.clone(),
+        target_manifest: target.reference().unwrap(),
+        assignment: seed.assignment_fence().unwrap(),
+    };
+    let admitted = authority
+        .admit_topology_plan(&lease.proof(), &snapshot_store, &plan, &target)
+        .await
+        .unwrap();
+    let operation_uri = format!(
+        "/api/v1/cluster/topology/operations/{}",
+        plan.operation_id.get()
+    );
+    let status = read_status_at(app.clone(), &token, &operation_uri).await;
+    assert_eq!(status, serde_json::to_value(&admitted).unwrap());
+    assert_eq!(status["state"]["phase"], "planned");
+    let aborted = authority
+        .abort_topology_plan(&lease.proof(), plan.operation_id, &admitted.plan)
+        .await
+        .unwrap();
+    let status = read_status_at(app.clone(), &token, &operation_uri).await;
+    assert_eq!(status, serde_json::to_value(&aborted).unwrap());
+    assert_eq!(
+        status["operation_id"],
+        admitted.operation_id.get().to_string()
+    );
+    assert_eq!(status["admitted_sequence"], admitted.admitted_sequence);
+    assert_eq!(status["state"]["phase"], "aborted");
+    assert_eq!(status["state"]["reason"], "requested");
+    for (identity, expected) in [
+        ("bad-id", StatusCode::BAD_REQUEST),
+        (
+            "00000000-0000-0000-0000-000000000000",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "00000000-0000-0000-0000-00000000002c",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/cluster/topology/operations/{identity}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(
+        read_status(app.clone(), &token).await["committed_version"],
+        1
+    );
+    objects
+        .delete(&object_store::path::Path::from(format!(
+            "control/topology-plans/v1/{}.json",
+            admitted.plan.sha256
+        )))
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&operation_uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     objects
         .delete(&object_store::path::Path::from(format!(

@@ -811,7 +811,15 @@ impl SnapshotWatcher {
             let audit = tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => return,
-                result = tokio::time::timeout_at(head_deadline, self.store.load()) => result,
+                result = tokio::time::timeout_at(head_deadline, async {
+                    if let Some(controller) = self.controller.as_deref() {
+                        let authority = controller.checkpoint_authority()
+                            .map_err(|e| SnapshotError::Invalid(e.to_string()))?;
+                        authority.materialize_reserved_assignment_drain(&self.store).await
+                            .map_err(assignment_publication_error)?;
+                    }
+                    self.store.load().await
+                }) => result,
             };
             let mut audited_target = None;
             let mut audited_terminal = None;
@@ -3299,6 +3307,21 @@ enum DrainPublicationReconciliation {
     },
 }
 
+fn assignment_publication_error(
+    error: laminar_core::cluster::control::ClusterCheckpointAuthorityError,
+) -> SnapshotError {
+    use laminar_core::cluster::control::{ClusterCheckpointAuthorityError, LeaseError};
+    match error {
+        ClusterCheckpointAuthorityError::Authority(LeaseError::Io(reason)) => {
+            SnapshotError::Io(reason)
+        }
+        ClusterCheckpointAuthorityError::Decision(
+            laminar_core::checkpoint_decision::DecisionError::Io(reason),
+        ) => SnapshotError::Io(reason),
+        error => SnapshotError::Invalid(error.to_string()),
+    }
+}
+
 async fn reconcile_drain_publication(
     store: &AssignmentSnapshotStore,
     controller: &ClusterController,
@@ -3319,7 +3342,24 @@ async fn reconcile_drain_publication(
             return Ok(DrainPublicationReconciliation::Deferred);
         }
 
-        match store.save_if_version(drain, prior_version).await {
+        if transition.predecessor.assignment_version != prior_version {
+            return Err(SnapshotError::Invalid(
+                "drain predecessor differs from publication version".into(),
+            ));
+        }
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(assignment_publication_error)?;
+        let published = authority
+            .publish_assignment_drain(&transition.leader, store, drain)
+            .await;
+        if matches!(
+            &published,
+            Err(laminar_core::cluster::control::ClusterCheckpointAuthorityError::Fenced)
+        ) {
+            return Ok(DrainPublicationReconciliation::Deferred);
+        }
+        match published.map_err(assignment_publication_error) {
             Ok(outcome) => {
                 authority_changed |=
                     controller.is_recovering() || !controller.proof_is_live(&transition.leader);
@@ -3662,6 +3702,16 @@ fn try_rebalance_owned(
 ) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
     Box::pin(async move {
         let head_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
+        let authority = controller
+            .checkpoint_authority()
+            .map_err(|error| error.to_string())?;
+        tokio::time::timeout_at(
+            head_deadline,
+            authority.materialize_reserved_assignment_drain(&store),
+        )
+        .await
+        .map_err(|_| "reserved assignment drain materialization timed out".to_string())?
+        .map_err(|error| error.to_string())?;
         let current = tokio::time::timeout_at(head_deadline, store.load())
             .await
             .map_err(|_| "durable assignment head audit timed out".to_string())?
@@ -4441,7 +4491,7 @@ async fn finalize_drain_snapshot(
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
     let decision = match authority
-        .record_assignment_drain_decision(&deciding_proof, requested)
+        .record_assignment_drain_decision_with_assignments(&deciding_proof, requested, store)
         .await
         .map_err(|error| error.to_string())?
     {

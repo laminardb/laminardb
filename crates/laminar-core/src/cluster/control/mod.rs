@@ -62,8 +62,10 @@ pub use snapshot::{
     SnapshotError,
 };
 pub use topology::{
-    LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
-    TopologyOperationId, TopologyVersion, TOPOLOGY_PROTOCOL_VERSION,
+    LegacyTopologyBaseline, TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan,
+    TopologyAdmissionStatus, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
+    TopologyOperationId, TopologyPlanRef, TopologyVersion, MAX_TOPOLOGY_OPERATIONS,
+    TOPOLOGY_PROTOCOL_VERSION,
 };
 
 #[cfg(feature = "cluster")]

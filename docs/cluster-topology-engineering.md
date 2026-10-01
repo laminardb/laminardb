@@ -9,11 +9,11 @@ Uninitialized --existing cold catalog seal--> LegacySealed
 LegacySealed --fenced identical-inventory adoption--> Versioned(topology 1)
 ```
 
-No record in this increment can authorize topology 2. The full migration states
-Planned -> Preparing -> Quiescing -> CutPrepared -> Committed -> Activating ->
-Active, and pre-commit Aborted, remain unimplemented. Runtime DDL admission stays
-fenced until those transitions have working cut, restore, retirement and release
-contracts.
+Core pre-cut admission now implements `Planned -> Aborted`, including abort on a
+leader term change or durable recovery fault. It reserves an exact candidate and
+assignment without authorizing candidate actors. No record can commit topology 2.
+Preparing, Quiescing, CutPrepared, Committed, Activating and Active still need the
+working cut, restore, retirement and release contracts. Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
 authority append uses a create-only sequence object and the store's conditional
@@ -36,11 +36,13 @@ the inventory, generations or state ABI. The adoption API reads and validates
 the original blob and existing deployment identity before appending; it never
 initializes a missing identity or rewrites historical checkpoints.
 
-Encoding 12 omits the new optional field, preserving its canonical serialization.
-Encoding 13 requires a valid baseline. Every later lease, checkpoint, assignment,
-retention, fault and release append preserves both the encoding and baseline.
+Encoding 12 omits the new optional fields, preserving its canonical serialization.
+Encoding 13 requires a valid baseline. Encoding 14 adds assignment reservations
+and the pre-cut request journal. It may precede baseline adoption; missing baseline
+metadata still means an unversioned legacy catalog. Every later lease, checkpoint,
+assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
-reject encoding 13/unknown fields; an old writer paused after reading encoding 12
+reject unsupported encodings/admission fields; an old writer paused after reading encoding 12
 cannot overwrite the upgrade's create-only successor. Coordinated binary upgrade
 is still a caller precondition because format rejection cannot retire old actors.
 
@@ -50,6 +52,50 @@ LegacySealed, never an inferred current version. Cleanup retains the adoption
 append permanently as one extra authority root. A prune snapshot taken before
 adoption cannot delete a later sequence. Future migration roots and replay pins
 still need integration with checkpoint/artifact retention floors.
+
+## Pre-cut admission and assignment serialization
+
+`publish_assignment_drain` stages the exact canonical snapshot under a content
+address, then reserves it through the existing shared authority append before
+writing the assignment snapshot. The reservation survives caller cancellation and
+lease changes. Snapshot watchers and the rebalance driver materialize the original
+intent after interruption. Materialization does not transfer vnode ownership or
+open intake. An exact drain/recovery decision must settle the reservation; drain
+settlement materializes its intent before clearing it. Recovery's existing separate
+materialization winner continues to fence delayed old raw snapshot writes.
+
+The production graceful-drain writer uses this path. The low-level snapshot CAS is
+storage materialization, not cluster admission. Core callers supply the actual
+namespace-verified assignment store owned by the controller; HTTP callers cannot
+choose a store. Seed assignment creation still precedes migration admission.
+
+`admit_topology_plan` checks an explicitly adopted parent, exact ordered predecessor
+inventory, assignment map and boot roster, unresolved authority and prior consumed
+assignments. It stages the target and canonical request, then appends one payload-bound
+reservation. Assignment reservations, recovery decisions and checkpoint artifact
+admission contend on that same sequence. There is no check-then-publish gap between
+an admitted drain intent and topology admission. This does not yet certify participant
+capabilities, operator compatibility, source positions or a checkpoint cut.
+
+Only one request can be Planned. Identical retries return the original durable
+status, including a prior abort and retry by a replacement leader process; a
+different payload with the same identity fails. Current leader authority is still
+required. Frozen participant membership is checked for fresh admission, not for
+returning an existing request's result.
+Legacy adoption identities cannot be reused for migration requests. New ordinary
+checkpoint/assignment admission is rejected during Planned. Renewal preserves it;
+a new leader term or recovery fault atomically aborts it and retains recovery
+evidence. This policy applies only to the implemented pre-cut phase. Future committed
+phases must recover the target instead of using this abort helper.
+
+Plan payloads are capped at 32 KiB and the retained request journal at 64 identities.
+Both admission and explicit abort allow 16 CAS attempts within 15 seconds. Reads
+audit canonical plan/catalog blobs and the retained admission/disposition appends.
+Pruning retains those appends and any pending drain admission. Settled drain proposal
+cleanup follows the admitted assignment-decision floor in bounded batches. Request
+journal eviction and orphan candidate/plan cleanup are not implemented; a full
+journal rejects further admission. No public submit endpoint or cutover worker is
+enabled, so this bound is not advertised as a complete migration retention policy.
 
 ## Bounds, ownership and locks
 
@@ -91,10 +137,10 @@ migration, participant-complete activation or exactly-once external effects.
 
 ## Required next integration
 
-1. Reserve migration admission atomically with checkpoint/recovery authority and
-   actual assignment transitions. Assignment snapshots have a separate store;
-   checking a leader record followed by installing a barrier leaves a race.
-2. Freeze owner-complete/evidence process rosters and certify candidate identity,
+1. Integrate the implemented admission reservation with a DB-owned cutover worker.
+   Bind its checkpoint attempt before permitting cut barrier/artifact admission;
+   ordinary checkpoints remain blocked while the pre-cut reservation is Planned.
+2. Certify the frozen owner-complete/evidence process rosters, candidate identity,
    compatibility mapping and protocol on all required participants.
 3. Establish the old graph's committed checkpoint cut without blocking source
    barrier arrival. Reconcile old prepared sink outcomes and observe retirement.

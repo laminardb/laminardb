@@ -91,6 +91,14 @@ pub struct CatalogManifest {
 }
 
 impl CatalogManifest {
+    /// Compute the canonical content reference without publishing or changing authority.
+    ///
+    /// # Errors
+    /// Rejects a malformed or oversized inventory.
+    pub fn reference(&self) -> Result<CatalogManifestRef, CatalogManifestError> {
+        self.encode_and_reference().map(|(_, reference)| reference)
+    }
+
     /// Construct and validate a complete inventory.
     ///
     /// # Errors
@@ -242,6 +250,18 @@ pub enum CatalogManifestError {
 }
 
 impl CatalogManifestStore {
+    /// Read the definitive payload-bound status of a reserved topology request.
+    ///
+    /// # Errors
+    /// Fails on unavailable/corrupt evidence or the bounded read deadline.
+    pub async fn operation_status(
+        &self,
+        operation_id: super::topology::TopologyOperationId,
+    ) -> Result<Option<super::topology::TopologyAdmissionStatus>, super::topology::TopologyError>
+    {
+        self.authority.topology_operation_status(operation_id).await
+    }
+
     /// Share the exact append-only authority used by the leader lease manager.
     #[must_use]
     pub fn new(authority: Arc<LeaderLeaseStore>) -> Self {

@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use super::{
     AuthorityCreateOutcome, CheckpointDecisionStore, LeaderAuthorityRecord, LeaderLeaseStore,
-    LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_AUTHORITY_RECORD_VERSION,
+    LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
+    TOPOLOGY_AUTHORITY_RECORD_VERSION,
 };
 use crate::cluster::control::topology::{
     LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
@@ -20,7 +21,13 @@ impl LeaderAuthorityRecord {
     pub(super) fn validate_topology_baseline(&self) -> Result<(), LeaseError> {
         match (self.version, self.topology_baseline.as_ref()) {
             (AUTHORITY_RECORD_VERSION, None) => Ok(()),
-            (TOPOLOGY_AUTHORITY_RECORD_VERSION, Some(baseline)) => {
+            (TOPOLOGY_ADMISSION_RECORD_VERSION, None) if self.topology_operations.is_empty() => {
+                Ok(())
+            }
+            (
+                TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION,
+                Some(baseline),
+            ) => {
                 baseline
                     .validate()
                     .map_err(|error| LeaseError::Invalid(error.to_string()))?;
@@ -42,15 +49,17 @@ impl LeaderAuthorityRecord {
 
     pub(super) fn validate_topology_successor(&self, next: &Self) -> Result<(), LeaseError> {
         if let Some(baseline) = self.topology_baseline.as_ref() {
-            if next.version != self.version || next.topology_baseline.as_ref() != Some(baseline) {
+            if next.version < self.version || next.topology_baseline.as_ref() != Some(baseline) {
                 return Err(LeaseError::Invalid(
                     "authority append cannot downgrade or replace an adopted topology baseline"
                         .into(),
                 ));
             }
         } else if let Some(baseline) = next.topology_baseline.as_ref() {
-            if next.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
-                || baseline.authority_sequence != next.lease.seq
+            if !matches!(
+                next.version,
+                TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION
+            ) || baseline.authority_sequence != next.lease.seq
                 || self.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
             {
                 return Err(LeaseError::Invalid(
@@ -116,8 +125,10 @@ impl LeaderLeaseStore {
         let record = super::read_authority_record(self.store.as_ref(), baseline.authority_sequence)
             .await?
             .ok_or_else(|| LeaseError::Invalid("topology adoption authority is missing".into()))?;
-        if record.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
-            || record.topology_baseline.as_ref() != Some(baseline)
+        if !matches!(
+            record.version,
+            TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION
+        ) || record.topology_baseline.as_ref() != Some(baseline)
         {
             return Err(LeaseError::Invalid(
                 "topology baseline disagrees with its retained adoption authority".into(),
@@ -126,7 +137,10 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
-    async fn require_topology_deployment(&self, expected: &str) -> Result<(), TopologyError> {
+    pub(super) async fn require_topology_deployment(
+        &self,
+        expected: &str,
+    ) -> Result<(), TopologyError> {
         let actual = CheckpointDecisionStore::new(self.store.clone())
             .load_deployment_id()
             .await
@@ -242,7 +256,7 @@ impl LeaderLeaseStore {
             let mut lease = current.lease.clone();
             lease.seq = sequence;
             let mut candidate = current.preserve_with_lease(lease);
-            candidate.version = TOPOLOGY_AUTHORITY_RECORD_VERSION;
+            candidate.version = candidate.version.max(TOPOLOGY_AUTHORITY_RECORD_VERSION);
             candidate.topology_baseline = Some(baseline.clone());
             match self
                 .create_authority_record(Some(&published), &candidate)

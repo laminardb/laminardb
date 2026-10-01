@@ -1,6 +1,8 @@
 //! Read-only durable topology status. Runtime DDL remains guarded until cutover is implemented.
 
-use laminar_core::cluster::control::{TopologyCatalogState, TopologyVersion};
+use laminar_core::cluster::control::{
+    TopologyAdmissionStatus, TopologyCatalogState, TopologyOperationId, TopologyVersion,
+};
 use std::sync::atomic::Ordering;
 
 use super::{DbError, DbState, LaminarDB};
@@ -18,6 +20,25 @@ pub struct ClusterTopologyStatus {
 }
 
 impl LaminarDB {
+    /// Read an admitted request's definitive status; no request ownership depends on this call.
+    ///
+    /// # Errors
+    /// Fails outside cluster mode or for unavailable/corrupt durable evidence.
+    pub async fn cluster_topology_operation_status(
+        &self,
+        operation_id: TopologyOperationId,
+    ) -> Result<Option<TopologyAdmissionStatus>, DbError> {
+        if !self.is_cluster_runtime() {
+            return Err(DbError::InvalidOperation(
+                "cluster topology status requires cluster mode".into(),
+            ));
+        }
+        let store = self.catalog_manifest_store.lock().clone().ok_or_else(|| {
+            DbError::InvalidOperation("cluster topology status requires a catalog authority".into())
+        })?;
+        Ok(store.operation_status(operation_id).await?)
+    }
+
     /// Read the cluster's durable topology and this process's local activation evidence.
     ///
     /// This is a control-path read, with no catalog mutation, checkpoint allocation or source

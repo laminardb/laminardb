@@ -11,6 +11,13 @@ use uuid::Uuid;
 use super::{CatalogManifestError, CatalogManifestRef, LeaseError};
 use crate::error_codes;
 
+mod admission;
+pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
+pub use admission::{
+    TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
+    TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
+};
+
 /// Version of the topology adoption protocol understood by this binary.
 pub const TOPOLOGY_PROTOCOL_VERSION: u16 = 1;
 

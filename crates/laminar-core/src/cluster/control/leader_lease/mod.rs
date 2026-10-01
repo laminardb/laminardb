@@ -1,9 +1,11 @@
 //! Durable, append-only leader fencing.
 
 mod artifact_admission;
+mod assignment_drain;
 mod attempt_status;
 mod subscription_replay;
 mod topology;
+mod topology_admission;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
@@ -56,6 +58,7 @@ const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
 const AUTHORITY_RECORD_VERSION: u32 = 12;
 const TOPOLOGY_AUTHORITY_RECORD_VERSION: u32 = 13;
+const TOPOLOGY_ADMISSION_RECORD_VERSION: u32 = 14;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1059,6 +1062,20 @@ struct LeaderAuthorityRecord {
     /// Explicit baseline, present only after the coordinated authority-format upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topology_baseline: Option<super::topology::LegacyTopologyBaseline>,
+    /// Frozen drain intent, admitted before any assignment snapshot publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignment_drain_reservation: Option<AssignmentDrainReservation>,
+    /// Bounded payload-bound pre-cut request journal, preserved by every authority append.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    topology_operations: Vec<super::topology::TopologyAdmissionStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignmentDrainReservation {
+    proposal: AssignmentSnapshotRef,
+    transition: AssignmentDrainTransition,
+    authority_sequence: u64,
 }
 
 impl LeaderLease {
@@ -1263,11 +1280,14 @@ impl LeaderAuthorityRecord {
             recovery_release_commit: None,
             recovery_release_head: None,
             topology_baseline: None,
+            assignment_drain_reservation: None,
+            topology_operations: Vec::new(),
         }
     }
 
     fn preserve_with_lease(&self, lease: LeaderLease) -> Self {
-        Self {
+        let leader_changed = self.lease.owner != lease.owner || self.lease.token != lease.token;
+        let mut preserved = Self {
             version: self.version,
             lease,
             checkpoint_outcome: None,
@@ -1292,12 +1312,20 @@ impl LeaderAuthorityRecord {
             recovery_release_commit: None,
             recovery_release_head: self.recovery_release_head.clone(),
             topology_baseline: self.topology_baseline.clone(),
+            assignment_drain_reservation: self.assignment_drain_reservation.clone(),
+            topology_operations: self.topology_operations.clone(),
+        };
+        if leader_changed {
+            preserved
+                .abort_topology_preparation(super::topology::TopologyAbortReason::LeaderChanged);
         }
+        preserved
     }
 
     fn validate(&self) -> Result<(), LeaseError> {
         if self.version != AUTHORITY_RECORD_VERSION
             && self.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
+            && self.version != TOPOLOGY_ADMISSION_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -1306,6 +1334,7 @@ impl LeaderAuthorityRecord {
         }
         self.lease.validate()?;
         self.validate_topology_baseline()?;
+        self.validate_topology_admission()?;
         for link in [
             self.previous_outcome,
             self.outcome_head,
@@ -2150,6 +2179,7 @@ impl LeaderLeaseStore {
                 candidate.recovery_fault_slots.insert(insert_at, slot);
             }
             candidate.recovery_fault_revision = sequence;
+            candidate.abort_topology_preparation(super::topology::TopologyAbortReason::Recovery);
             candidate.validate()?;
 
             match self
@@ -2634,6 +2664,14 @@ impl LeaderLeaseStore {
             authority.audit_topology_adoption(baseline).await?;
             retained.insert(baseline.authority_sequence);
         }
+        for operation in &head.topology_operations {
+            authority.audit_topology_operation(operation).await?;
+            retained.insert(operation.admitted_sequence);
+            retained.insert(operation.status_sequence);
+        }
+        if let Some(reservation) = &head.assignment_drain_reservation {
+            retained.insert(reservation.authority_sequence);
+        }
         if let Some(previous) = head_sequence
             .checked_sub(1)
             .filter(|sequence| *sequence != 0)
@@ -2914,7 +2952,19 @@ impl LeaderLeaseStore {
                 "leader lease history still exceeds the bounded prune budget".into(),
             ));
         }
-        Self::prune_recovery_release_terminals(store, retained_release.as_ref(), grace_ms).await
+        Self::prune_recovery_release_terminals(store, retained_release.as_ref(), grace_ms).await?;
+        if let Some(floor) = head.assignment_decision_floor.as_ref() {
+            let before = head.assignment_drain_reservation.as_ref().map_or(
+                floor.before_target_version,
+                |reservation| {
+                    floor
+                        .before_target_version
+                        .min(reservation.proposal.version)
+                },
+            );
+            authority.prune_drain_proposals(before).await?;
+        }
+        Ok(())
     }
 
     async fn prune_recovery_release_terminals(
@@ -3421,6 +3471,8 @@ impl LeaderLeaseStore {
             }
             Some(head) if head.record.lease.seq.checked_add(1) == Some(candidate.lease.seq) => {
                 head.record.validate_topology_successor(candidate)?;
+                head.record
+                    .validate_topology_admission_successor(candidate)?;
                 Some(&head.pointer)
             }
             Some(head) => {
@@ -4432,6 +4484,7 @@ impl LeaderLeaseStore {
             }
             self.reject_consumed_checkpoint_assignment(current, assignment_fence)
                 .await?;
+            current.reject_topology_preparation()?;
             if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
                 if active == &inventory
                     && current.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
@@ -5086,6 +5139,7 @@ impl LeaderLeaseStore {
         &self,
         proof: &LeaderProof,
         decision: AuthorityAssignmentDecision,
+        assignments: Option<&AssignmentSnapshotStore>,
     ) -> Result<RecordAuthorityAssignmentDecisionResult, ClusterCheckpointAuthorityError> {
         decision.validate()?;
         if decision.leader_proof() != proof || !proof.is_canonical() {
@@ -5125,6 +5179,19 @@ impl LeaderLeaseStore {
                         winner: winner.clone(),
                     })
                 };
+            }
+            current.reject_topology_preparation()?;
+            current.validate_reserved_assignment_decision(&decision)?;
+            if let (Some(reservation), AuthorityAssignmentDecision::Drain(_)) =
+                (&current.assignment_drain_reservation, &decision)
+            {
+                let assignments = assignments.ok_or_else(|| {
+                    LeaseError::Invalid(
+                        "reserved drain settlement requires its configured assignment store".into(),
+                    )
+                })?;
+                self.materialize_drain_reservation(reservation, assignments)
+                    .await?;
             }
             if matches!(&decision, AuthorityAssignmentDecision::Drain(_)) {
                 let predecessor = decision.predecessor();
@@ -5184,6 +5251,7 @@ impl LeaderLeaseStore {
                 target_version: decision.target_version(),
             });
             candidate.assignment_handoff_pin = assignment_handoff_pin;
+            candidate.assignment_drain_reservation = None;
             candidate.validate()?;
 
             match self
@@ -5240,9 +5308,27 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         decision: AssignmentDrainDecision,
     ) -> Result<RecordAssignmentDrainDecisionResult, ClusterCheckpointAuthorityError> {
-        match Box::pin(
-            self.record_assignment_decision(proof, AuthorityAssignmentDecision::Drain(decision)),
-        )
+        let assignments = AssignmentSnapshotStore::new(Arc::clone(&self.store));
+        self.record_assignment_drain_decision_with_assignments(proof, decision, &assignments)
+            .await
+    }
+
+    /// Settle a drain using the cluster's configured, namespace-verified assignment store.
+    /// An admitted intent is materialized before its reservation can be cleared.
+    ///
+    /// # Errors
+    /// Rejects stale authority, conflicting evidence, or failed materialization/decision I/O.
+    pub async fn record_assignment_drain_decision_with_assignments(
+        &self,
+        proof: &LeaderProof,
+        decision: AssignmentDrainDecision,
+        assignments: &AssignmentSnapshotStore,
+    ) -> Result<RecordAssignmentDrainDecisionResult, ClusterCheckpointAuthorityError> {
+        match Box::pin(self.record_assignment_decision(
+            proof,
+            AuthorityAssignmentDecision::Drain(decision),
+            Some(assignments),
+        ))
         .await?
         {
             RecordAuthorityAssignmentDecisionResult::Created(
@@ -5278,9 +5364,11 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         decision: AssignmentRecoveryDecision,
     ) -> Result<RecordAssignmentRecoveryDecisionResult, ClusterCheckpointAuthorityError> {
-        match Box::pin(
-            self.record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision)),
-        )
+        match Box::pin(self.record_assignment_decision(
+            proof,
+            AuthorityAssignmentDecision::Recovery(decision),
+            None,
+        ))
         .await?
         {
             RecordAuthorityAssignmentDecisionResult::Created(

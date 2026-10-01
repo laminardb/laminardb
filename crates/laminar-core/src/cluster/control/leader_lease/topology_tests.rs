@@ -4,7 +4,7 @@ fn topology_operation() -> crate::cluster::control::TopologyOperationId {
     Uuid::from_u128(42).try_into().unwrap()
 }
 
-async fn topology_adoption_fixture(
+pub(super) async fn topology_adoption_fixture(
     store: &LeaderLeaseStore,
 ) -> (LeaderLease, CatalogManifestRef, String) {
     let incumbent = owner(1, 1, 1);

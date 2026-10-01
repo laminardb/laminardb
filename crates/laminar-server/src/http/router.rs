@@ -34,7 +34,7 @@ use super::cluster_evidence::{cluster_local_checkpoint_barrier_timings, cluster_
 use super::error_response;
 use super::ops::{handle_reload, health_check, prometheus_metrics, readiness_check};
 use super::state::AppState;
-use super::topology::cluster_topology;
+use super::topology::{cluster_topology, cluster_topology_operation};
 use super::ws::ws_upgrade;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -67,6 +67,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/cluster/topology", get(cluster_topology))
+        .route(
+            "/api/v1/cluster/topology/operations/{operation_id}",
+            get(cluster_topology_operation),
+        )
         .route("/api/v1/pipeline/stop", post(stop_pipeline))
         .route("/api/v1/pipeline/start", post(start_pipeline))
         .route("/api/v1/pipeline/status", get(pipeline_status))
