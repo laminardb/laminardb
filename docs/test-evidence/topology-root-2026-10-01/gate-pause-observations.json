@@ -1,0 +1,26 @@
+[
+  {
+    "node": 0,
+    "closed_utc": "2026-10-01T22:43:44.740648+00:00",
+    "release_observed_utc": "2026-10-01T22:44:49.427580+00:00",
+    "elapsed_ms": 64686.932,
+    "close_line": "2026-10-01T22:43:44.740648Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "release_line": "2026-10-01T22:44:49.427580Z  WARN laminar_db::coordinated_recovery: recovery Release consumed; source gate opened target_epoch=60 gen=4"
+  },
+  {
+    "node": 1,
+    "closed_utc": "2026-10-01T22:43:44.740646+00:00",
+    "release_observed_utc": "2026-10-01T22:44:49.329924+00:00",
+    "elapsed_ms": 64589.27799999999,
+    "close_line": "2026-10-01T22:43:44.740646Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "release_line": "2026-10-01T22:44:49.329924Z  WARN laminar_db::coordinated_recovery: recovery Release consumed; source gate opened target_epoch=60 gen=4"
+  },
+  {
+    "node": 2,
+    "closed_utc": "2026-10-01T22:43:44.740931+00:00",
+    "release_observed_utc": "2026-10-01T22:44:49.253003+00:00",
+    "elapsed_ms": 64512.072,
+    "close_line": "2026-10-01T22:43:44.740931Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "release_line": "2026-10-01T22:44:49.253003Z  WARN laminar_db::coordinated_recovery: coordinated recovery complete; Release retained gen=4 participants=3"
+  }
+]

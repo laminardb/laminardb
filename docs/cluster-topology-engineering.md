@@ -15,7 +15,8 @@ durable recovery fault. A prepared cut includes the exact committed checkpoint
 and every frozen process's application receipt; intake and successor sink epochs
 remain held. It reserves an exact candidate without authorizing candidate actors.
 No record can commit topology 2. Local additive candidate compilation and definition
-compatibility descriptors and durable participant certificates are implemented. Target
+compatibility descriptors and durable participant certificates are implemented.
+Exact-cut state/progress root staging is implemented for stateless downstream additions. Target
 restore, retirement, Committed/Activating/Active and release remain unfinished.
 Runtime DDL stays fenced.
 
@@ -47,6 +48,8 @@ metadata still means an unversioned legacy catalog. Encoding 15 binds the exact
 old-topology checkpoint inventory, Commit and frozen application roster and
 requires an adopted baseline. Encoding 16 binds the canonical candidate descriptor
 and exact-process preparation certificates; new cuts require preparation protocol 2.
+Encoding 17 pins immutable migration-root requirements after CutPrepared. It preserves
+the same protocol-2 plan, old catalog and checkpoint allocator; it grants no target authority.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -59,8 +62,9 @@ from one immutable authority snapshot. Absence of metadata explicitly means
 LegacySealed, never an inferred current version. Cleanup retains the adoption
 append permanently as one extra authority root. A prune snapshot taken before
 adoption cannot delete a later sequence. Live old-cut roots are now protected from
-checkpoint artifact-floor advancement; target migration roots and replay mappings
-still need integration.
+checkpoint artifact-floor advancement. A staged migration root retains that live cut
+pin and its own immutable authority anchor. Post-target-commit retention and replay
+consumption of these mappings still need integration.
 
 ## Pre-cut admission and assignment serialization
 
@@ -271,6 +275,58 @@ after retirement, restore/readiness and exact authority checks. A rejected relea
 preserves it. A fresh process starts with intake fenced by the existing startup
 recovery protocol.
 
+## Exact-cut migration root staging
+
+`LaminarDB::stage_cluster_topology_migration_root` uses the existing controller,
+configured process/assignment authorities and checkpoint store. The DB must be
+Running with the old cut held, intake closed and recovery/shutdown fences clear.
+The authority requires the admitting leader, unchanged assignment, complete
+current process certificates and `CutPrepared`. New-source additions are rejected
+until concrete connector positions can be resolved once and durably bound.
+
+The root reads only the exact committed index and its checksummed participant
+manifest metadata. It never reads or rewrites node state or Arrow output segments.
+The shared checkpoint validator verifies exact source/snapshot/channel progress,
+exclusive full vnode ownership and subscription publication metadata. Recovery
+uses the same progress check. State ranges, timers, watermarks, output segments,
+source positions and sink decisions remain referenced through the old cut.
+
+Every preserved catalog object has its exact kind, incarnation and certified
+compatibility digest. Stream state uses the existing `graph:<canonical name>`
+identity; unrecognized frames and managed streams without preserved vnode state
+are rejected. New stateless streams/sinks are explicitly future-only. No existing
+managed stream can silently receive empty state.
+
+Preserved subscriptions retain their stream generation, schema, final operator,
+distribution, query/changelog/retention contracts and complete partition sequence
+vector. Their required target certificate changes only the pipeline identity.
+Target installation must consume this explicit mapping instead of recomputing a
+stream generation from the new whole-graph hash. These certificates are staged
+requirements; they do not authorize target replay or output.
+
+The canonical root is create-only and content-addressed. One format-17 authority
+append pins its reference and first sequence while leaving `CutPrepared` and
+catalog T unchanged. Retries return that immutable binding. Status and pruning
+audit its canonical body, exact certified plan/cut and first append. A live root
+retains the existing cut artifact-floor pin. Abort retains its metadata and
+authority evidence; ordinary checkpoint/replay retention then owns old artifacts.
+Target-commit retention remains unfinished.
+
+The DB call has a 30 second total deadline; the authority allows 16 CAS attempts
+within 15 seconds. Root bodies are bounded at 1 MiB and participant metadata at
+16 MiB in aggregate before reads. Sequential metadata reads bound preparation
+memory independently of state/output payload size. There is no new task owner,
+scheduler, generic workflow, dependency or per-record work.
+
+| Failure | Result |
+| --- | --- |
+| Missing/changed manifest, divergent progress or state identity | Reject without a root authority append |
+| Unresolved new source or incompatible subscription | Reject with an explicit initialization/compatibility reason |
+| Deadline/cancellation before append | Preserve CutPrepared; an unreferenced content blob grants no authority |
+| Append succeeds but response/caller is lost | Exact status/retry resolves the original root binding |
+| Leader/process/assignment changes | Fence staging; coordinated recovery retains the old cut |
+| Root or first authority anchor is damaged | Status and pruning fail closed |
+
 ## Bounds, ownership and locks
 
 Adoption allows at most 16 CAS attempts within a 15 second deadline. Status/catalog
@@ -356,16 +412,15 @@ remains absent.
 2. Drive the implemented exact-process certification path from detached submission;
    explicit local preparation is available, but automatic collection remains unfinished.
 3. Observe superseded actor retirement after the reconciled old checkpoint cut.
-4. Atomically bind target catalog, exact cut, state mappings, concrete source start
-   positions, progress/frontiers and durable migration roots in shared authority.
+4. Extend staged exact-cut roots with concrete new-source positions, then atomically
+   bind target catalog and root at the logical topology-change Commit.
 5. Restore/install the target before participant-complete release, with stale
    graph/shuffle/sink completion fences and target-only post-commit recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.
-7. Preserve unchanged subscription object/sequence identity through the explicit
-   pipeline-identity mapping. Whole-graph hashes currently differ on additions;
-   skipping their check is unsafe.
+7. Consume staged subscription identity/frontier mappings during target install
+   and replay. Whole-graph hashes differ on additions; skipping their check is unsafe.
 8. Change restart configuration assertions only after target precedence is durable,
    and run the stateful multi-process migration/restart oracle and fault matrix.
 
@@ -375,5 +430,8 @@ includes the real cut/abort/restart oracle, gate hold observations, failure logs
 and existing queue comparison. The [local candidate validation evidence](test-evidence/topology-planning-2026-10-01/README.md)
 records matching dry-run reports. The latest [participant certification evidence](test-evidence/topology-preparation-2026-10-01/README.md)
 records independently compiled durable receipts on all three running stateful
-processes and the subsequent cut/abort/restart oracle. These results do not certify target migration or
-production latency.
+processes and the subsequent cut/abort/restart oracle. The
+[root staging evidence](test-evidence/topology-root-2026-10-01/README.md) records
+immutable state/progress requirements from those real checkpoint manifests and
+their retained binding after restart. These results do not certify target migration
+or production latency.

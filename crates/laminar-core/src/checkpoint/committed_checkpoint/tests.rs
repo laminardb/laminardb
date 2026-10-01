@@ -75,6 +75,9 @@ fn cluster_cut() -> (CommittedCheckpointIndex, Vec<CheckpointManifest>) {
             manifest.reassignment_portable = true;
             manifest.owned_vnodes = vec![u16::try_from(vnode).unwrap()];
             manifest.source_names = vec!["source".into()];
+            manifest
+                .source_offsets
+                .insert("source".into(), ConnectorCheckpoint::default());
             manifest.sink_names = vec!["sink".into()];
             manifest.node_data.sha256 = checkpoint_sha256(b"");
             manifest
@@ -463,6 +466,7 @@ fn every_cluster_manifest_must_bind_the_portability_proof() {
 fn participant_source_and_sink_inventories_must_match() {
     let (mut index, mut manifests) = cluster_cut();
     manifests[1].source_names = vec!["other-source".into()];
+    manifests[1].source_offsets.clear();
     let encoded = bind_manifests(&mut index, &manifests);
     let error = validate_manifests(&index, &manifests, &encoded).unwrap_err();
     assert!(error.contains("source topology"));

@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut and local additive candidate validation implemented; runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation and exact-cut root staging implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -391,6 +391,61 @@ dependency or per-record work.
   migration latency measurement. All test servers exit; only isolated fixture
   containers/network are removed, preserving volumes and evidence.
 
+## Completed increment (2026-10-01, exact-cut root staging)
+
+This continuation starts clean at `9db1b6862309ebc27917c7bc01da86fb88dbd4ef`,
+after participant certification. The original baseline and dependency/feature
+selection remain unchanged.
+
+- The DB/core API stages immutable migration-root requirements for certified
+  stateless downstream additions at a held `CutPrepared` checkpoint. It uses the
+  configured checkpoint reader and actual process/assignment authorities, including
+  separately stored process leases. No candidate actor, restore, topology Commit
+  or Release is authorized; catalog T and its allocator remain unchanged.
+- Root encoding 1 preserves exact catalog incarnations and certified compatibility
+  digests, maps the existing `graph:<canonical name>` state slots, rejects unknown
+  frames/missing managed state, and lists future-only additions. Source/snapshot/
+  channel progress, state ranges, timers, watermarks, sink decisions and output
+  segments remain referenced through the exact old cut. Unresolved new-source
+  positions are explicitly rejected.
+- Preserved subscriptions retain their stream generation, schema, distribution,
+  query/changelog/retention contracts and full partition sequence vector. Required
+  target certificates change only the strict pipeline identity; target installation
+  must explicitly consume these mappings. No historical manifest is rewritten and
+  ordinary strict restore identity checks remain enabled.
+- One format-17 shared authority append pins the canonical root and its first
+  sequence. Exact retries resolve to the same binding, including after cancellation
+  or a lost response. Status and pruning audit/pin its canonical body and first
+  append. A live prepared root retains the existing cut artifact-floor pin. After
+  Abort, ordinary checkpoint/replay retention owns old artifacts; historical root
+  audit still works after those artifacts retire.
+- Metadata reads are sequential, capped at 16 MiB in aggregate before reads. Root
+  bodies are capped at 1 MiB. The DB has a 30 second deadline and authority staging
+  retains the existing 15 second/16 CAS budget. The existing source/channel progress
+  validator moves into the shared checkpoint validator for both recovery and staging.
+  No new scheduler, task owner, general workflow, dependency or per-record work is
+  introduced.
+- Ten core failure/retry/retention tests and a DB test with lifecycle spies and
+  separately configured process storage pass. The full cluster suite passes
+  1,030 core, 1,987 DB and 356 server tests, with one existing DB test ignored.
+  Current build and real-process results are recorded in the
+  [root staging evidence](test-evidence/topology-root-2026-10-01/README.md).
+- All-target Clippy, non-cluster server and cluster FFI checks, all 414 non-cluster
+  core tests, formatting and diff checks pass. The optimized three-process scenario
+  passes in 345.46 s. Core staging takes 508.011 ms, inspecting 606,855 bytes of
+  participant metadata and pinning a 50,338-byte root at authority 437. It retains
+  47 object mappings and nine exact subscription sequence vectors; identical retry
+  and all-node status agree. Full restart activates unchanged topology 1 in
+  59.970 s and retains the root, certificates, successful cut 60 and candidate abort.
+  Every expected bounded/temporal output is observed across 122,826 logical input
+  IDs, durable through checkpoint 89, with allowed ALO duplicates. Logged gate hold
+  through deliberate restart/recovery is 64.512..64.687 s. Sampled combined server
+  working set peaks at 826,122,240 bytes. These are old-graph functional/control-path
+  observations, without a matched baseline, staging allocation measurement or
+  consumer-visible migration latency distribution. Source, server and harness
+  hashes are verified before/after the run. All test servers exit; only isolated
+  fixtures are removed, preserving volumes/evidence.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -398,8 +453,9 @@ dependency or per-record work.
    each local preparation API independently compiles and durably certifies it.
    The manual checkpoint path requires the full frozen roster before a new cut;
    no worker stages or commits a target.
-2. Authorized state/ABI mappings, concrete new-source positions and durable target
-   migration roots. Old checkpoint binding, quiescence and live root pinning exist.
+2. Extend staged exact-cut state/subscription requirements with concrete new-source
+   positions, then authorize their consumption at target restore and topology Commit.
+   Old checkpoint binding, quiescence and live root pinning exist.
 3. Observed actor retirement, install/release and post-commit recovery.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
@@ -420,6 +476,7 @@ Criterion output are under ignored `target/topology-evidence` and
 `docs/test-evidence/topology-cut-2026-10-01`; local candidate validation results
 are in `docs/test-evidence/topology-planning-2026-10-01`. The latest exact-process
 certification and stateful restart results are in
-`docs/test-evidence/topology-preparation-2026-10-01`. This is a resumable checkpoint
+`docs/test-evidence/topology-preparation-2026-10-01`; exact-cut root staging results
+are in `docs/test-evidence/topology-root-2026-10-01`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

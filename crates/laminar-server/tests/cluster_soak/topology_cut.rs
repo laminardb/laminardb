@@ -6,11 +6,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use laminar_core::checkpoint::ObjectStoreCheckpointStore;
+use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::cluster::control::{
     AssignmentSnapshotStore, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
     CheckpointAssignmentFence, ClusterTopologyValidation, LeaderLeaseStore, LegacyTopologyBaseline,
-    TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
-    TopologyError, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    ProcessLeaseAuthority, TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan,
+    TopologyAdmissionStatus, TopologyError, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
 
 pub(super) fn prepare_old_cut(
@@ -23,6 +25,14 @@ pub(super) fn prepare_old_cut(
 ) -> TopologyAdmissionStatus {
     let objects = topology_adoption::objects_for_namespace(checkpoint_url);
     let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
+    // This harness configures one shared namespace for process, checkpoint and catalog storage.
+    let processes =
+        ProcessLeaseAuthority::new(Arc::clone(&objects), Duration::from_secs(30)).unwrap();
+    let checkpoint_store = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "")
+        .with_key_group_count(
+            laminar_core::state::KeyGroupCount::try_from(assignment.vnode_count).unwrap(),
+        );
+    let decisions = CheckpointDecisionStore::new(Arc::clone(&objects));
     let assignments = AssignmentSnapshotStore::new(objects);
     let catalog = CatalogManifestStore::new(Arc::clone(&authority));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -240,6 +250,72 @@ pub(super) fn prepare_old_cut(
         },
     );
     let prepared = prepared.unwrap();
+    let cut_prepared_elapsed = started.elapsed();
+    let root_started = Instant::now();
+    let prepared = runtime
+        .block_on(async {
+            let proof = authority.load().await.unwrap().unwrap().proof();
+            authority
+                .stage_topology_migration_root(
+                    &proof,
+                    &assignments,
+                    &processes,
+                    &checkpoint_store,
+                    prepared.operation_id,
+                    &prepared.plan,
+                )
+                .await
+        })
+        .expect("exact stateful cut metadata must stage preserved mappings before target commit");
+    let root_elapsed_ms = root_started.elapsed().as_secs_f64() * 1000.0;
+    let root = runtime
+        .block_on(authority.topology_migration_root(prepared.operation_id))
+        .unwrap()
+        .unwrap();
+    let index = runtime
+        .block_on(decisions.load_committed_checkpoint(&root.cut.checkpoint))
+        .unwrap();
+    let manifest_metadata_bytes = index
+        .participants
+        .iter()
+        .map(|p| p.manifest_len)
+        .sum::<u64>();
+    assert_eq!(root.preserved_objects.len(), descriptor.objects.iter().filter(|o| o.transition == laminar_core::cluster::control::topology::ClusterTopologyObjectTransition::Preserve).count());
+    assert_eq!(root.future_only_objects, ["topology_cut_probe"]);
+    assert!(root
+        .subscriptions
+        .iter()
+        .all(
+            |s| s.parent_certificate.stream_generation == s.target_certificate.stream_generation
+                && s.parent_certificate.pipeline_identity == descriptor.parent_pipeline
+                && s.target_certificate.pipeline_identity == descriptor.target_pipeline
+        ));
+    let retried = runtime.block_on(async {
+        let proof = authority.load().await.unwrap().unwrap().proof();
+        authority
+            .stage_topology_migration_root(
+                &proof,
+                &assignments,
+                &processes,
+                &checkpoint_store,
+                prepared.operation_id,
+                &prepared.plan,
+            )
+            .await
+            .unwrap()
+    });
+    assert_eq!(retried, prepared);
+    std::fs::write(
+        evidence_dir.join("topology-migration-root.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "cut_prepared_elapsed_ms": cut_prepared_elapsed.as_secs_f64() * 1000.0,
+            "participant_manifest_metadata_bytes": manifest_metadata_bytes,
+            "root_staging_elapsed_ms": root_elapsed_ms, "root": root, "status": prepared,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    eprintln!("soak: immutable migration root staged in {root_elapsed_ms:.3} ms; preserved {} object mappings and {} subscription sequence vectors; target remains uncommitted", root.preserved_objects.len(), root.subscriptions.len());
     let cut = prepared.cut.as_ref().unwrap();
     assert_eq!(cut.inventory.assignment_fence.as_ref(), Some(assignment));
     assert_eq!(cut.completed_participants, assignment.participants);
@@ -275,7 +351,7 @@ pub(super) fn prepare_old_cut(
     )
     .unwrap();
     eprintln!("soak: old-topology cut {} prepared in {:?}, bound at authority {}, committed at {}, all {} exact processes held; candidate remains uncommitted",
-        checkpoint_id, started.elapsed(), cut.bound_sequence, cut.committed.as_ref().unwrap().authority_sequence, cut.completed_participants.len());
+        checkpoint_id, cut_prepared_elapsed, cut.bound_sequence, cut.committed.as_ref().unwrap().authority_sequence, cut.completed_participants.len());
     prepared
 }
 
@@ -305,6 +381,7 @@ pub(super) fn assert_aborted_after_restart(
         }
     ));
     assert_eq!(aborted.preparation, prepared.preparation);
+    assert_eq!(aborted.migration_root, prepared.migration_root);
     assert_eq!(
         aborted.cut, prepared.cut,
         "pre-commit abort rewound the irreversible parent cut"

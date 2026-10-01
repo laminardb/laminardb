@@ -65,8 +65,10 @@ pub use topology::{
     ClusterTopologyValidation, LegacyTopologyBaseline, TopologyAbortReason, TopologyAdmissionPhase,
     TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyAdoptionOutcome, TopologyCatalogState,
     TopologyCheckpointCut, TopologyCompatibilityRef, TopologyCutCommit, TopologyError,
+    TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
     TopologyOperationId, TopologyParticipantCertificate, TopologyPlanRef, TopologyPreparation,
-    TopologyVersion, MAX_TOPOLOGY_OPERATIONS, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    TopologyPreservedObject, TopologySubscriptionRoot, TopologyVersion, MAX_TOPOLOGY_OPERATIONS,
+    MAX_TOPOLOGY_ROOT_MANIFEST_BYTES, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
     TOPOLOGY_PROTOCOL_VERSION,
 };
 

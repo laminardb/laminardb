@@ -7763,3 +7763,6 @@ async fn cluster_artifact_cleanup_is_preserved_and_fenced_across_takeover() {
 
 #[path = "topology_preparation_tests.rs"]
 mod topology_preparation;
+
+#[path = "topology_migration_root_tests.rs"]
+mod topology_migration_root;

@@ -65,6 +65,13 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
+            if operation.migration_root.is_some()
+                && self.version < TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "migration roots require authority format 17".into(),
+                ));
+            }
             if operation.cut.is_some() && self.version < TOPOLOGY_CUT_RECORD_VERSION {
                 return Err(LeaseError::Invalid(
                     "checkpoint-bound topology requires authority format 15".into(),
@@ -424,10 +431,14 @@ impl LeaderLeaseStore {
                 ));
             }
         }
-        self.audit_topology_preparation(operation, &plan)
+        let descriptor = self
+            .audit_topology_preparation(operation, &plan)
             .await
             .map_err(topology_lease_error)?;
-        self.audit_topology_cut(operation).await
+        self.audit_topology_cut(operation).await?;
+        self.audit_topology_migration_root(operation, &plan, descriptor.as_ref())
+            .await
+            .map_err(topology_lease_error)
     }
 
     /// Read the definitive, payload-bound pre-cut request status without allocating identities.
@@ -629,6 +640,7 @@ impl LeaderLeaseStore {
                 status_sequence: sequence,
                 phase: TopologyAdmissionPhase::Planned,
                 cut: None,
+                migration_root: None,
                 preparation: plan.compatibility.clone().map(|compatibility| {
                     crate::cluster::control::topology::TopologyPreparation {
                         compatibility,

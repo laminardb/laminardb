@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use super::{DbError, DbState, LaminarDB};
 
+mod migration_root;
 mod planning;
 mod preparation;
 pub use planning::{

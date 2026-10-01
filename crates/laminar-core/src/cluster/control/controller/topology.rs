@@ -8,6 +8,66 @@ use crate::cluster::control::topology::{
 };
 
 impl ClusterController {
+    /// Pin restore requirements with this controller's actual assignment/process authority.
+    /// This leaves the old cut held and grants no target execution or output authority.
+    ///
+    /// # Errors
+    /// Rejects recovery, process/leader/assignment changes or invalid exact-cut metadata.
+    pub async fn stage_topology_migration_root(
+        &self,
+        checkpoint_store: &dyn crate::checkpoint::CheckpointStore,
+        operation_id: TopologyOperationId,
+        expected_plan: &TopologyPlanRef,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let before = self
+            .try_live_local_process_authority_identity()
+            .map_err(|_| TopologyError::Fenced)?;
+        let proof = self.capture_leader_proof().ok_or(TopologyError::Fenced)?;
+        if self.is_recovering() || self.is_draining() || !self.proof_is_live(&proof) {
+            return Err(TopologyError::Fenced);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|e| TopologyError::Protocol(e.to_string()))?;
+        let (_, plan, _, _) = authority.topology_preparation_input(operation_id).await?;
+        let evidence = self
+            .read_local_process_authority_evidence()
+            .await
+            .map_err(|e| TopologyError::Conflict(e.to_string()))?;
+        if evidence.participant != before.participant
+            || evidence.process_term != before.process_term
+            || !evidence.adopted_assignment.matches_fence(&plan.assignment)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let status = authority
+            .stage_topology_migration_root(
+                &proof,
+                self.snapshot.as_ref().ok_or_else(|| {
+                    TopologyError::Protocol("root has no assignment authority".into())
+                })?,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("root has no process authority".into())
+                })?,
+                checkpoint_store,
+                operation_id,
+                expected_plan,
+            )
+            .await?;
+        if self.is_recovering()
+            || self.is_draining()
+            || !self.proof_is_live(&proof)
+            || self.try_live_local_process_authority_identity().ok() != Some(before)
+            || self
+                .checkpoint_assignment_fence(plan.assignment.assignment_version)
+                .as_ref()
+                != Some(&plan.assignment)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(status)
+    }
+
     /// Publish this process's independently compiled descriptor under its configured namespace.
     /// The identity must have been sampled before compilation. This grants no actor readiness.
     ///

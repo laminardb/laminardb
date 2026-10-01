@@ -1,0 +1,155 @@
+[
+  {
+    "node": 0,
+    "preparation_elapsed_ms": 696.3912,
+    "status": {
+      "admitted_by": {
+        "fencing_token": 4,
+        "owner": {
+          "boot_id": "18db0832-dea5-41fc-872a-a98f5ee5d749",
+          "node_id": 12632117528189947522,
+          "process_term": 3
+        }
+      },
+      "admitted_sequence": 416,
+      "operation_id": "d3379e14-ff38-483c-ac2d-43920d2a953a",
+      "plan": {
+        "encoded_len": 1010,
+        "sha256": "e191fb01417856025beab0d7b255c9c163b673e864a4055a9f4b93cba0b5eff8"
+      },
+      "preparation": {
+        "certificates": [
+          {
+            "authority_sequence": 422,
+            "participant": {
+              "boot_incarnation": "d79a06bc-6485-4760-9724-f700c2fa5b14",
+              "node_id": 16059159448129433833
+            },
+            "process_term": 1,
+            "protocol_version": 2
+          }
+        ],
+        "compatibility": {
+          "encoded_len": 22717,
+          "sha256": "09187dc1f6c3df3cd24f004427dc2cc59be4252bd803b28df37be706a33b13a5"
+        },
+        "complete_sequence": null
+      },
+      "state": {
+        "phase": "preparing"
+      },
+      "status_sequence": 422
+    }
+  },
+  {
+    "node": 1,
+    "preparation_elapsed_ms": 487.8333,
+    "status": {
+      "admitted_by": {
+        "fencing_token": 4,
+        "owner": {
+          "boot_id": "18db0832-dea5-41fc-872a-a98f5ee5d749",
+          "node_id": 12632117528189947522,
+          "process_term": 3
+        }
+      },
+      "admitted_sequence": 416,
+      "operation_id": "d3379e14-ff38-483c-ac2d-43920d2a953a",
+      "plan": {
+        "encoded_len": 1010,
+        "sha256": "e191fb01417856025beab0d7b255c9c163b673e864a4055a9f4b93cba0b5eff8"
+      },
+      "preparation": {
+        "certificates": [
+          {
+            "authority_sequence": 423,
+            "participant": {
+              "boot_incarnation": "5a631014-a85f-4d55-98d5-a228b709e89b",
+              "node_id": 15506916534570490772
+            },
+            "process_term": 1,
+            "protocol_version": 2
+          },
+          {
+            "authority_sequence": 422,
+            "participant": {
+              "boot_incarnation": "d79a06bc-6485-4760-9724-f700c2fa5b14",
+              "node_id": 16059159448129433833
+            },
+            "process_term": 1,
+            "protocol_version": 2
+          }
+        ],
+        "compatibility": {
+          "encoded_len": 22717,
+          "sha256": "09187dc1f6c3df3cd24f004427dc2cc59be4252bd803b28df37be706a33b13a5"
+        },
+        "complete_sequence": null
+      },
+      "state": {
+        "phase": "preparing"
+      },
+      "status_sequence": 423
+    }
+  },
+  {
+    "node": 2,
+    "preparation_elapsed_ms": 476.852,
+    "status": {
+      "admitted_by": {
+        "fencing_token": 4,
+        "owner": {
+          "boot_id": "18db0832-dea5-41fc-872a-a98f5ee5d749",
+          "node_id": 12632117528189947522,
+          "process_term": 3
+        }
+      },
+      "admitted_sequence": 416,
+      "operation_id": "d3379e14-ff38-483c-ac2d-43920d2a953a",
+      "plan": {
+        "encoded_len": 1010,
+        "sha256": "e191fb01417856025beab0d7b255c9c163b673e864a4055a9f4b93cba0b5eff8"
+      },
+      "preparation": {
+        "certificates": [
+          {
+            "authority_sequence": 424,
+            "participant": {
+              "boot_incarnation": "18db0832-dea5-41fc-872a-a98f5ee5d749",
+              "node_id": 12632117528189947522
+            },
+            "process_term": 3,
+            "protocol_version": 2
+          },
+          {
+            "authority_sequence": 423,
+            "participant": {
+              "boot_incarnation": "5a631014-a85f-4d55-98d5-a228b709e89b",
+              "node_id": 15506916534570490772
+            },
+            "process_term": 1,
+            "protocol_version": 2
+          },
+          {
+            "authority_sequence": 422,
+            "participant": {
+              "boot_incarnation": "d79a06bc-6485-4760-9724-f700c2fa5b14",
+              "node_id": 16059159448129433833
+            },
+            "process_term": 1,
+            "protocol_version": 2
+          }
+        ],
+        "compatibility": {
+          "encoded_len": 22717,
+          "sha256": "09187dc1f6c3df3cd24f004427dc2cc59be4252bd803b28df37be706a33b13a5"
+        },
+        "complete_sequence": 424
+      },
+      "state": {
+        "phase": "preparing"
+      },
+      "status_sequence": 424
+    }
+  }
+]

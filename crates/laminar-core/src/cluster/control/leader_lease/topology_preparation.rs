@@ -345,9 +345,9 @@ impl LeaderLeaseStore {
         &self,
         operation: &TopologyAdmissionStatus,
         plan: &TopologyAdmissionPlan,
-    ) -> Result<(), TopologyError> {
+    ) -> Result<Option<ClusterTopologyValidation>, TopologyError> {
         match (&plan.compatibility, &operation.preparation) {
-            (None, None) => return Ok(()),
+            (None, None) => return Ok(None),
             (Some(reference), Some(preparation)) if reference == &preparation.compatibility => {}
             _ => {
                 return Err(TopologyError::Invalid(
@@ -405,6 +405,6 @@ impl LeaderLeaseStore {
                 ));
             }
         }
-        Ok(())
+        Ok(Some(descriptor))
     }
 }

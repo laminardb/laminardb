@@ -422,22 +422,6 @@ impl<'a> RecoveryManager<'a> {
                 checkpoint_error(format!("committed checkpoint manifests: {error}"))
             })?;
 
-        let mut source_offsets = BTreeMap::<String, ConnectorCheckpoint>::new();
-        let mut channel_progress = BTreeMap::<(u64, String, Vec<u8>), ChannelProgress>::new();
-        for manifest in manifests {
-            merge_manifest_progress(manifest, &mut source_offsets, &mut channel_progress)?;
-        }
-        if source_offsets != committed.source_offsets {
-            return Err(checkpoint_error(
-                "participant source offsets do not exactly reconstruct the committed source cut",
-            ));
-        }
-        let merged_channels = channel_progress.into_values().collect::<Vec<_>>();
-        if merged_channels != committed.channel_progress {
-            return Err(checkpoint_error(
-                "participant channel progress does not exactly reconstruct the committed time cut",
-            ));
-        }
         Ok(())
     }
 }
@@ -649,114 +633,6 @@ pub(crate) async fn load_verified_state_frames(
         ));
     }
     Ok(recovered)
-}
-
-fn merge_manifest_progress(
-    manifest: &CheckpointManifest,
-    source_offsets: &mut BTreeMap<String, ConnectorCheckpoint>,
-    channel_progress: &mut BTreeMap<(u64, String, Vec<u8>), ChannelProgress>,
-) -> Result<(), DbError> {
-    for (source, local) in &manifest.source_offsets {
-        let (merged, first_participant) = match source_offsets.entry(source.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => (
-                entry.insert(ConnectorCheckpoint {
-                    offsets: std::collections::HashMap::new(),
-                    metadata: std::collections::HashMap::new(),
-                    input_channels: local.input_channels.clone(),
-                    source_assignment_version: local.source_assignment_version,
-                }),
-                true,
-            ),
-            std::collections::btree_map::Entry::Occupied(entry) => {
-                if entry.get().source_assignment_version != local.source_assignment_version {
-                    return Err(checkpoint_error(format!(
-                        "participant {} source '{source}' has a conflicting assignment version",
-                        manifest.participant_id
-                    )));
-                }
-                (entry.into_mut(), false)
-            }
-        };
-        merge_connector_map(
-            manifest.participant_id,
-            source,
-            "offset",
-            &mut merged.offsets,
-            &local.offsets,
-        )?;
-        merge_connector_map(
-            manifest.participant_id,
-            source,
-            "metadata",
-            &mut merged.metadata,
-            &local.metadata,
-        )?;
-        if !first_participant {
-            match (&mut merged.input_channels, &local.input_channels) {
-                (None, None) => {}
-                (Some(merged), Some(local)) => {
-                    if local
-                        .iter()
-                        .any(|channel| merged.binary_search(channel).is_ok())
-                    {
-                        return Err(checkpoint_error(format!(
-                            "source '{source}' input channel is owned by multiple participants"
-                        )));
-                    }
-                    merged.extend(local.iter().cloned());
-                    merged.sort_unstable();
-                }
-                _ => {
-                    return Err(checkpoint_error(format!(
-                        "source '{source}' participant checkpoints disagree on whether input channels are declared"
-                    )));
-                }
-            }
-        }
-    }
-
-    for channel in &manifest.channel_progress {
-        if channel.participant_id != manifest.participant_id {
-            return Err(checkpoint_error(format!(
-                "participant {} manifest contains source '{}' progress owned by participant {}",
-                manifest.participant_id, channel.source_name, channel.participant_id
-            )));
-        }
-        let key = (
-            channel.participant_id,
-            channel.source_name.clone(),
-            channel.input_channel.clone(),
-        );
-        if let Some(existing) = channel_progress.insert(key, channel.clone()) {
-            if existing == *channel {
-                continue;
-            }
-            return Err(checkpoint_error(format!(
-                "participant {} source '{}' input channel has conflicting progress",
-                manifest.participant_id, channel.source_name
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn merge_connector_map(
-    participant_id: u64,
-    source: &str,
-    field: &str,
-    merged: &mut std::collections::HashMap<String, String>,
-    local: &std::collections::HashMap<String, String>,
-) -> Result<(), DbError> {
-    for (key, value) in local {
-        if let Some(existing) = merged.insert(key.clone(), value.clone()) {
-            if existing != *value {
-                return Err(checkpoint_error(format!(
-                    "participant {participant_id} source '{source}' has conflicting {field} '{key}'"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn insert_chunk(

@@ -1,0 +1,2138 @@
+[
+  {
+    "node": 0,
+    "validation": {
+      "compatibility_sha256": "44a62daa239423137f4de3e2d56670d4d897296ee96181f7ce1263ba74e6403d",
+      "deployment_id": "01a0f9a0-e174-7537-b6f7-23e89784eded",
+      "environment_sha256": "a725867e145723dda29d51300692487bcf44b1232a30cbcdd357edefad0781eb",
+      "objects": [
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2567841f32436acde888d7a6873ccda13e1eb7ad9e605e66ae21bc1f1d3f55a4",
+          "definition_sha256": "4fbc11e725e19dedf3e3e5701f78b4073aab79c3be34e07d4e4fd64d044f8e6f",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_left",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "43fe25dcada7bc9f754b13b70a5ca42cb4a1bdaca7859e557674a054ac92c71b",
+          "definition_sha256": "ca09391fdb027c7bc1f6fa24ac9e85a9183f6d71cf9b0fa5d10c910bfe4442c8",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_right",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9461f7738a196e2402cc780e3865d43d28a3f9bb9ba28030d049fbedbc9c4f7b",
+          "definition_sha256": "1caa5f6aecdab8f0e614b6a771840bba52dae596d4fae56e8468a13d92284c48",
+          "dependencies": [
+            "join_left",
+            "join_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_join",
+          "schema_sha256": "1c445ddb69c77683d1b02870122c75010044e3f8c953e6ef0908ffe56f8f732d",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b3e21a6c6be00acb156ff27b1c5165643556b5d07f7f512ef7c7e16395c436b6",
+          "definition_sha256": "d24cd99ef8314f0ee73fbb3bdd64ee64f2abecf7015ce654ef64bae896fe98a3",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_join_aggregate",
+          "schema_sha256": "68bef23dedf666e2950c81be723853e154257746d0871e7fd4e5cf9a0bd4622f",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c6c136ce9f7467f6fdd0622782fee7268abfa16e26c1875554ba34bd4c9e2469",
+          "definition_sha256": "291493ee8c381c43e7e42a68e806e2f7bac60dd5d3e789053bf8afa658a5fac7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_full",
+          "schema_sha256": "48bf869cd5279f2ad8f895b18ef296911fc768c342cca825be7f1bc12b9c0132",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "96f819205abfc9eb3d26aa85b949404aa625a1e39b38572efb22d2acfb6bf4d6",
+          "definition_sha256": "a3970cfd31e2ff8e57bee368cd696f226e98e2892dddb3408fcf78a85be6551c",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_full_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9a832822ee8ff2a3877a3bb95860d400f883ebf264bab4bf0817f8c774876f08",
+          "definition_sha256": "6baf81c90366e40306832311f59f0732634d2afd3e5b4f7789fddfb8ab640a8a",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_full_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "138473a8d2d46f0823006b2a4c301d616e3bc4aee48e510ca1ac6dfd9136022e",
+          "definition_sha256": "ebaa9a9738ef825c5db7af81d259b35d988cc3198afdde64ba87f4c237865c82",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_inner",
+          "schema_sha256": "a3f73ecb728111e53e9403cd558b92ece31104bb8c6eda175eee4f8a69998146",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "60a91fd7b01bae3b762051265a86bb71584824e557f8a3fcd1d45b84aadcf025",
+          "definition_sha256": "739352f61d31c7ee837aa64e6353cb9c8b98f8c03a49fe0f1c3edf212d52b813",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_inner_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e0da68d127e8e928b57d334e94546664121696035dfb68aa6e97891ad54facda",
+          "definition_sha256": "04536f7897513377323006b9bc5c781cdfbf210164685e0d3b78d8856ddf7d9f",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_inner_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "d71d75e86ce391a056ae23c401ed3078a193394c14f5de234b25b3c3507f1021",
+          "definition_sha256": "d783c48d41b77b575fb040e3ba71c133e9de2aef95b184927ad9419bb9148808",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "4545b0f537bc9d16d2fbfe7600d7c35270c020e731be597f112cf374fc642bdb",
+          "definition_sha256": "c48688e36cab948e2bd65f531b381072bfae6b5430bdcfcdf4b9a7486654950e",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b88873943f07158cde6dbae22d260507e37e5b30ac215105c0e915bdcdbf94b0",
+          "definition_sha256": "4b9fbf02fb2ec2b0c0c10169d7298e3c51a0ba8d9b5fa69579c3efb4382fe938",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_anti",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9f29e5719f6b34a0dd62e7ee5921ac082ac79f40871fe2a4302d7d32e109ddbf",
+          "definition_sha256": "cacdb6a05e489bf00475f02760f1fa1094a0799e49fbbbba79f71b1af7cfc6b2",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5e47cc5dca8e32c07323744fdc57e5709d4f339b68c6178c25ced2a1c6eff623",
+          "definition_sha256": "ce0beea09c22db1ef372d7f9d9323bc52895e21fe19e25de3c728b2c42200154",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "06c456544a0952490168629e6fa8d62f8a68cfc9fbcedb5ae01fbecc1467e1a1",
+          "definition_sha256": "0cb01ce5faac79de3c2791cf13c7f887f26476e752547471904b8d0b6dfbe23d",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bf39124473ed0adf28a64184859418da654360fbcbe615e98182eb0739abbc28",
+          "definition_sha256": "07e73349b467b959a765db48ddefa62cff8f424b38813980756c968bd54115cd",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_semi",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "52a70c5e0815a567ce12580aab6723787aa931b594b73696d51dedc8e3d0e236",
+          "definition_sha256": "0c34ba539f8efae8d5298f14b64ba80124c1b4dc002dac496361cbf911af91cb",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "850970fdc0b595ebb206490187e918f830e11f2c449d15d065b7bba851298047",
+          "definition_sha256": "16932f359a2d719aa866788a28212c4c3c3522bb6693ea50bb65ca4b5e729639",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "715e249f2f5d346fd873b433b1e7f7af8b1248f1f64bdc31c9a110c84b6970ef",
+          "definition_sha256": "dd478431dba4fe1a85b0ccc6d464d77b0f1eb7dc659c9ddfc41ad20b55774585",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_lhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "55935a7f6e017fabe077bd30a8f131b6022c40848e50cba480148525ce9f7abe",
+          "definition_sha256": "369f99d2e0b922495b8b2a2450381622bcedc1744df21393e188e48971e1b638",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_rhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c573a9058022c96e9f898ed5bb6e71af373fdf331bdfeb3d6c15684a35b27834",
+          "definition_sha256": "861680c5c47abc94fc19494b782c0e44f9f4de2363aee498c8d6d274314df443",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "100764b79570c6a5cf7f21dd35d1f784d8cc1218f3571e45ae375902f8e27b99",
+          "definition_sha256": "bc4bfc469d0e7b7c7e44f798f6aa5f13e404f769cfa71bbe55274935bdfb94f2",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "886650d5cd06b97534b6e6214db189e2d12b731cf72006c4a9d3dbb06e560b7c",
+          "definition_sha256": "39ee55e268f8b74c095f7d180519d7899d5b670ede55f4b419ebdbed9d37e338",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_anti",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c839ec732d3e3bba23fcae1d0859153726bb260a6d1d131f2f1af7b75e5c178b",
+          "definition_sha256": "74282f7da5890f068c330c21c9205ac11075fe9dbe8bfa05013a2e420f119e5b",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "453090403ab4d8a8b441a281a3da8d86e4f3647d462fcfb512a43a1b49c821a9",
+          "definition_sha256": "bff9b115a2271d6f2820264399f16267d004eeb226cf5d1bd212dc9fe3caa155",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2d084bc4c28671bd4dd2b65d68a4fb460be5949b53228c7e452f2f987aa378db",
+          "definition_sha256": "84b26c1637e7cf8d6af10ba61af965834610e598d9f119252296bfaa99c1abe5",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e4f0296732e7ea6c638f51c27818521ba9baa826ccf9780c099d7e7786578556",
+          "definition_sha256": "f0a61f46db2e8dbc3a6384d7d4c907bdaea4a6c11fe7ab42a0dc071d2d59fbf7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_semi",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b322c37ade803ace534e5194b3c1903f550efcc5c6f722a6fa509627bf9a6887",
+          "definition_sha256": "869c91f9ac680567866bb4ba9656fb26e536c8e2e7ac80077b30724172b95c08",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "079f5af1d4c6d79cbd238d38a6df42162bcc1ba12330a3e3c1a8adf52c37f2f5",
+          "definition_sha256": "606e142af0bd88e4a84847c8060dfabc9595147cb0fa63a92ff10e102b38ee5f",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "f8aec777730b4044d321b398310e0d62ff290cc62787fc5d17893858aed649d0",
+          "definition_sha256": "027aae51c9ae3059c44af32a56ebfbf579dd6175fb101dcd3701da3bbe1bb712",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7cd43412f86301814c8d495c09002b024020c016d5dd2ef7b7df92a927369992",
+          "definition_sha256": "c06de6be7baae4d35f1b1fbd5d9cbe6068415c55a1b1b64db84286252ba7f707",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "828073b81c885604968152e3561342394d690c8b347fbf148537cc7d4ed1877a",
+          "definition_sha256": "541086096b250af10d9a8e1beef6a7377bed11e453b41b212c1e0fa08f8dbe83",
+          "dependencies": [
+            "temporal_load_left",
+            "temporal_load_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_load",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9277bf7d2cbffb91e4265b1e8100ed4e192be1e6fa0d097724633823decfc200",
+          "definition_sha256": "b3c6c007102b85b3bba6f1f9973cb4be14593cee409aee519471cebcb44b818b",
+          "dependencies": [
+            "soak_temporal_load"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_load_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "a3fa1bf0783533306e3c2bfd9fd09af3f879eef95b55b0bba898197ef28e9f12",
+          "definition_sha256": "137f554790d69c2ccef80c35ea6529d4139175177d9a982cda20b7eba3c404ae",
+          "dependencies": [
+            "soak_temporal"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "49f68df23e3ba3ba35c4ce4412bed162ee5ba0d2b7ca61a95a9e9c0106a47371",
+          "definition_sha256": "8db51674c813e1dcc6447729a4a1ade158bfbd8e0bd753cddcdea6602c445698",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_probe",
+          "schema_sha256": "99ba2c3383103af5f02d6a9022efdbeb54190125edcf497ab7deeef5dc93e9ac",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "789df12708e63f03909c4d86873fde2681b2afc42bd3e5d1500a326969513e8b",
+          "definition_sha256": "b255455c710394e70e7a8e21abe9f2c3c08090231958de8d845c4a8df1257a63",
+          "dependencies": [
+            "soak_temporal_probe"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_probe_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "1ff2f9d1ccf70d8ec4f1205452b9b83b5b7d1358c43018c5c0ac66884d94e230",
+          "definition_sha256": "47fd9a4eeea4bfd78df2228d5d494edca0fbb566cd098b461b4aadcd77322b03",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_hop",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7b549bb35de9238dcdb4e439558846ebb2e4013abfafeeb128f397f82e1db333",
+          "definition_sha256": "3c3ada86c536f658df13c764b0b3411cb91041bbdd35fddfc4892c2340e6d10e",
+          "dependencies": [
+            "soak_window_hop"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_hop_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "554e0acd36cac8fd67c22918b657e41e3151f478b44b281a089da50c7236e763",
+          "definition_sha256": "7dc41eeb3454ce5671e8c5ee228423b0e7a8c85be3b22ae2d402c875040b5727",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_session",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "3a7004dc472eff22380121cbb1065131774f31a0fdd549d74499990e96c11c89",
+          "definition_sha256": "fbe16ad1cacafdad7dba0c9327215d51817a79da8bccb54c68869b4194daf400",
+          "dependencies": [
+            "soak_window_session"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_session_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5bad47350b720229f25eba2ce08c53bba4e8f6af8030d395b5834fbeee9086f0",
+          "definition_sha256": "95cdf501e3a8a8351967b1d06d00f60b1c651c76db551338eca19e1094eacd25",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_tumble",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "8e6b1667d04dbc72e7453572ad2c90aad1ffd33862c78d1843ea6117c24272bc",
+          "definition_sha256": "fd7a59f9da02ac782acfd8eb2979c448780db84b5598d71505ddb7a699185ea2",
+          "dependencies": [
+            "soak_window_tumble"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_tumble_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "fe7085323e30526c15f68ba3fd74e8a6cfbe252781b542c902e12b038aeea69d",
+          "definition_sha256": "36b1d346ea5655d756b11b67fc839bc0393333cfee7ce74f3ac2568e78c875bc",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_left",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b5931546424153dcf484070bc9f8da4d5be9058c5b72de1abcb9127fdb074c16",
+          "definition_sha256": "9b30530a7e2bf9eb21541d72ae57bf018aadf0f2812733c472e53363ae1b7b5e",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_left",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "ec63eff2d07d274ceead3f58cc2beff7731b08a7b6861b583495e05b47c04dbd",
+          "definition_sha256": "cd47ab72265a2e8bd2e8ff86a21c8d48209583741b14032094faa28f22ff3ac7",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_right",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bcdc0adf8c1d794db5d8a42346a234cf5fa9266af1978fbba141f89bb44ffb45",
+          "definition_sha256": "a2672b7716176f60ef41c3c8a96a71baa9d52db58dcf32353e628098103383f0",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_right",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "25ea6502d38de9149f77fd24205ecb562b0bc1314e224ae5c5b2bdab20ec91e9",
+          "definition_sha256": "ed00e591a3e489ae81ce59e5476e6dae8ca9d8b88f140961a2fe5f04c67ebeff",
+          "dependencies": [
+            "join_left"
+          ],
+          "initialization": "future_only_at_cut",
+          "kind": "stream",
+          "managed_state_contract": null,
+          "name": "topology_cut_probe",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "add_future_only"
+        }
+      ],
+      "parent_manifest": {
+        "encoded_len": 18088,
+        "entry_count": 47,
+        "sha256": "9de55139e83510bcfce2d8a87fbc3034fc084b5cfd7e7390e4c8276610a08907",
+        "version": 1
+      },
+      "parent_pipeline": {
+        "canonical_version": 7,
+        "sha256": "caafc75a88dadb4f099748c25ec25e29d6b0355f2441d7cb0f9745bcc0796a19"
+      },
+      "parent_version": 1,
+      "required_before_activation": [
+        "participant_plan_agreement",
+        "reconciled_checkpoint_cut",
+        "durable_initialization_and_progress",
+        "observed_actor_retirement",
+        "atomic_target_commit",
+        "installed_target_release"
+      ],
+      "requires_processing_pause": true,
+      "scope": "local_candidate_plan",
+      "target_manifest": {
+        "encoded_len": 18216,
+        "entry_count": 48,
+        "sha256": "4ae15b65d7a65dc4904cd63609f1b55bf33fa79f260a7c4e64493319ba3d9967",
+        "version": 1
+      },
+      "target_pipeline": {
+        "canonical_version": 7,
+        "sha256": "17c01e36806c1dcfecf38d834d33bf44bb35d2c7071063b9abaf77cc7b94273a"
+      },
+      "target_version": 2,
+      "validation_format_version": 1
+    },
+    "validation_elapsed_ms": 999.696
+  },
+  {
+    "node": 1,
+    "validation": {
+      "compatibility_sha256": "44a62daa239423137f4de3e2d56670d4d897296ee96181f7ce1263ba74e6403d",
+      "deployment_id": "01a0f9a0-e174-7537-b6f7-23e89784eded",
+      "environment_sha256": "a725867e145723dda29d51300692487bcf44b1232a30cbcdd357edefad0781eb",
+      "objects": [
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2567841f32436acde888d7a6873ccda13e1eb7ad9e605e66ae21bc1f1d3f55a4",
+          "definition_sha256": "4fbc11e725e19dedf3e3e5701f78b4073aab79c3be34e07d4e4fd64d044f8e6f",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_left",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "43fe25dcada7bc9f754b13b70a5ca42cb4a1bdaca7859e557674a054ac92c71b",
+          "definition_sha256": "ca09391fdb027c7bc1f6fa24ac9e85a9183f6d71cf9b0fa5d10c910bfe4442c8",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_right",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9461f7738a196e2402cc780e3865d43d28a3f9bb9ba28030d049fbedbc9c4f7b",
+          "definition_sha256": "1caa5f6aecdab8f0e614b6a771840bba52dae596d4fae56e8468a13d92284c48",
+          "dependencies": [
+            "join_left",
+            "join_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_join",
+          "schema_sha256": "1c445ddb69c77683d1b02870122c75010044e3f8c953e6ef0908ffe56f8f732d",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b3e21a6c6be00acb156ff27b1c5165643556b5d07f7f512ef7c7e16395c436b6",
+          "definition_sha256": "d24cd99ef8314f0ee73fbb3bdd64ee64f2abecf7015ce654ef64bae896fe98a3",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_join_aggregate",
+          "schema_sha256": "68bef23dedf666e2950c81be723853e154257746d0871e7fd4e5cf9a0bd4622f",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c6c136ce9f7467f6fdd0622782fee7268abfa16e26c1875554ba34bd4c9e2469",
+          "definition_sha256": "291493ee8c381c43e7e42a68e806e2f7bac60dd5d3e789053bf8afa658a5fac7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_full",
+          "schema_sha256": "48bf869cd5279f2ad8f895b18ef296911fc768c342cca825be7f1bc12b9c0132",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "96f819205abfc9eb3d26aa85b949404aa625a1e39b38572efb22d2acfb6bf4d6",
+          "definition_sha256": "a3970cfd31e2ff8e57bee368cd696f226e98e2892dddb3408fcf78a85be6551c",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_full_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9a832822ee8ff2a3877a3bb95860d400f883ebf264bab4bf0817f8c774876f08",
+          "definition_sha256": "6baf81c90366e40306832311f59f0732634d2afd3e5b4f7789fddfb8ab640a8a",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_full_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "138473a8d2d46f0823006b2a4c301d616e3bc4aee48e510ca1ac6dfd9136022e",
+          "definition_sha256": "ebaa9a9738ef825c5db7af81d259b35d988cc3198afdde64ba87f4c237865c82",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_inner",
+          "schema_sha256": "a3f73ecb728111e53e9403cd558b92ece31104bb8c6eda175eee4f8a69998146",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "60a91fd7b01bae3b762051265a86bb71584824e557f8a3fcd1d45b84aadcf025",
+          "definition_sha256": "739352f61d31c7ee837aa64e6353cb9c8b98f8c03a49fe0f1c3edf212d52b813",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_inner_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e0da68d127e8e928b57d334e94546664121696035dfb68aa6e97891ad54facda",
+          "definition_sha256": "04536f7897513377323006b9bc5c781cdfbf210164685e0d3b78d8856ddf7d9f",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_inner_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "d71d75e86ce391a056ae23c401ed3078a193394c14f5de234b25b3c3507f1021",
+          "definition_sha256": "d783c48d41b77b575fb040e3ba71c133e9de2aef95b184927ad9419bb9148808",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "4545b0f537bc9d16d2fbfe7600d7c35270c020e731be597f112cf374fc642bdb",
+          "definition_sha256": "c48688e36cab948e2bd65f531b381072bfae6b5430bdcfcdf4b9a7486654950e",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b88873943f07158cde6dbae22d260507e37e5b30ac215105c0e915bdcdbf94b0",
+          "definition_sha256": "4b9fbf02fb2ec2b0c0c10169d7298e3c51a0ba8d9b5fa69579c3efb4382fe938",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_anti",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9f29e5719f6b34a0dd62e7ee5921ac082ac79f40871fe2a4302d7d32e109ddbf",
+          "definition_sha256": "cacdb6a05e489bf00475f02760f1fa1094a0799e49fbbbba79f71b1af7cfc6b2",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5e47cc5dca8e32c07323744fdc57e5709d4f339b68c6178c25ced2a1c6eff623",
+          "definition_sha256": "ce0beea09c22db1ef372d7f9d9323bc52895e21fe19e25de3c728b2c42200154",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "06c456544a0952490168629e6fa8d62f8a68cfc9fbcedb5ae01fbecc1467e1a1",
+          "definition_sha256": "0cb01ce5faac79de3c2791cf13c7f887f26476e752547471904b8d0b6dfbe23d",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bf39124473ed0adf28a64184859418da654360fbcbe615e98182eb0739abbc28",
+          "definition_sha256": "07e73349b467b959a765db48ddefa62cff8f424b38813980756c968bd54115cd",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_semi",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "52a70c5e0815a567ce12580aab6723787aa931b594b73696d51dedc8e3d0e236",
+          "definition_sha256": "0c34ba539f8efae8d5298f14b64ba80124c1b4dc002dac496361cbf911af91cb",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "850970fdc0b595ebb206490187e918f830e11f2c449d15d065b7bba851298047",
+          "definition_sha256": "16932f359a2d719aa866788a28212c4c3c3522bb6693ea50bb65ca4b5e729639",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "715e249f2f5d346fd873b433b1e7f7af8b1248f1f64bdc31c9a110c84b6970ef",
+          "definition_sha256": "dd478431dba4fe1a85b0ccc6d464d77b0f1eb7dc659c9ddfc41ad20b55774585",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_lhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "55935a7f6e017fabe077bd30a8f131b6022c40848e50cba480148525ce9f7abe",
+          "definition_sha256": "369f99d2e0b922495b8b2a2450381622bcedc1744df21393e188e48971e1b638",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_rhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c573a9058022c96e9f898ed5bb6e71af373fdf331bdfeb3d6c15684a35b27834",
+          "definition_sha256": "861680c5c47abc94fc19494b782c0e44f9f4de2363aee498c8d6d274314df443",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "100764b79570c6a5cf7f21dd35d1f784d8cc1218f3571e45ae375902f8e27b99",
+          "definition_sha256": "bc4bfc469d0e7b7c7e44f798f6aa5f13e404f769cfa71bbe55274935bdfb94f2",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "886650d5cd06b97534b6e6214db189e2d12b731cf72006c4a9d3dbb06e560b7c",
+          "definition_sha256": "39ee55e268f8b74c095f7d180519d7899d5b670ede55f4b419ebdbed9d37e338",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_anti",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c839ec732d3e3bba23fcae1d0859153726bb260a6d1d131f2f1af7b75e5c178b",
+          "definition_sha256": "74282f7da5890f068c330c21c9205ac11075fe9dbe8bfa05013a2e420f119e5b",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "453090403ab4d8a8b441a281a3da8d86e4f3647d462fcfb512a43a1b49c821a9",
+          "definition_sha256": "bff9b115a2271d6f2820264399f16267d004eeb226cf5d1bd212dc9fe3caa155",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2d084bc4c28671bd4dd2b65d68a4fb460be5949b53228c7e452f2f987aa378db",
+          "definition_sha256": "84b26c1637e7cf8d6af10ba61af965834610e598d9f119252296bfaa99c1abe5",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e4f0296732e7ea6c638f51c27818521ba9baa826ccf9780c099d7e7786578556",
+          "definition_sha256": "f0a61f46db2e8dbc3a6384d7d4c907bdaea4a6c11fe7ab42a0dc071d2d59fbf7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_semi",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b322c37ade803ace534e5194b3c1903f550efcc5c6f722a6fa509627bf9a6887",
+          "definition_sha256": "869c91f9ac680567866bb4ba9656fb26e536c8e2e7ac80077b30724172b95c08",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "079f5af1d4c6d79cbd238d38a6df42162bcc1ba12330a3e3c1a8adf52c37f2f5",
+          "definition_sha256": "606e142af0bd88e4a84847c8060dfabc9595147cb0fa63a92ff10e102b38ee5f",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "f8aec777730b4044d321b398310e0d62ff290cc62787fc5d17893858aed649d0",
+          "definition_sha256": "027aae51c9ae3059c44af32a56ebfbf579dd6175fb101dcd3701da3bbe1bb712",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7cd43412f86301814c8d495c09002b024020c016d5dd2ef7b7df92a927369992",
+          "definition_sha256": "c06de6be7baae4d35f1b1fbd5d9cbe6068415c55a1b1b64db84286252ba7f707",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "828073b81c885604968152e3561342394d690c8b347fbf148537cc7d4ed1877a",
+          "definition_sha256": "541086096b250af10d9a8e1beef6a7377bed11e453b41b212c1e0fa08f8dbe83",
+          "dependencies": [
+            "temporal_load_left",
+            "temporal_load_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_load",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9277bf7d2cbffb91e4265b1e8100ed4e192be1e6fa0d097724633823decfc200",
+          "definition_sha256": "b3c6c007102b85b3bba6f1f9973cb4be14593cee409aee519471cebcb44b818b",
+          "dependencies": [
+            "soak_temporal_load"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_load_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "a3fa1bf0783533306e3c2bfd9fd09af3f879eef95b55b0bba898197ef28e9f12",
+          "definition_sha256": "137f554790d69c2ccef80c35ea6529d4139175177d9a982cda20b7eba3c404ae",
+          "dependencies": [
+            "soak_temporal"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "49f68df23e3ba3ba35c4ce4412bed162ee5ba0d2b7ca61a95a9e9c0106a47371",
+          "definition_sha256": "8db51674c813e1dcc6447729a4a1ade158bfbd8e0bd753cddcdea6602c445698",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_probe",
+          "schema_sha256": "99ba2c3383103af5f02d6a9022efdbeb54190125edcf497ab7deeef5dc93e9ac",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "789df12708e63f03909c4d86873fde2681b2afc42bd3e5d1500a326969513e8b",
+          "definition_sha256": "b255455c710394e70e7a8e21abe9f2c3c08090231958de8d845c4a8df1257a63",
+          "dependencies": [
+            "soak_temporal_probe"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_probe_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "1ff2f9d1ccf70d8ec4f1205452b9b83b5b7d1358c43018c5c0ac66884d94e230",
+          "definition_sha256": "47fd9a4eeea4bfd78df2228d5d494edca0fbb566cd098b461b4aadcd77322b03",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_hop",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7b549bb35de9238dcdb4e439558846ebb2e4013abfafeeb128f397f82e1db333",
+          "definition_sha256": "3c3ada86c536f658df13c764b0b3411cb91041bbdd35fddfc4892c2340e6d10e",
+          "dependencies": [
+            "soak_window_hop"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_hop_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "554e0acd36cac8fd67c22918b657e41e3151f478b44b281a089da50c7236e763",
+          "definition_sha256": "7dc41eeb3454ce5671e8c5ee228423b0e7a8c85be3b22ae2d402c875040b5727",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_session",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "3a7004dc472eff22380121cbb1065131774f31a0fdd549d74499990e96c11c89",
+          "definition_sha256": "fbe16ad1cacafdad7dba0c9327215d51817a79da8bccb54c68869b4194daf400",
+          "dependencies": [
+            "soak_window_session"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_session_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5bad47350b720229f25eba2ce08c53bba4e8f6af8030d395b5834fbeee9086f0",
+          "definition_sha256": "95cdf501e3a8a8351967b1d06d00f60b1c651c76db551338eca19e1094eacd25",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_tumble",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "8e6b1667d04dbc72e7453572ad2c90aad1ffd33862c78d1843ea6117c24272bc",
+          "definition_sha256": "fd7a59f9da02ac782acfd8eb2979c448780db84b5598d71505ddb7a699185ea2",
+          "dependencies": [
+            "soak_window_tumble"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_tumble_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "fe7085323e30526c15f68ba3fd74e8a6cfbe252781b542c902e12b038aeea69d",
+          "definition_sha256": "36b1d346ea5655d756b11b67fc839bc0393333cfee7ce74f3ac2568e78c875bc",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_left",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b5931546424153dcf484070bc9f8da4d5be9058c5b72de1abcb9127fdb074c16",
+          "definition_sha256": "9b30530a7e2bf9eb21541d72ae57bf018aadf0f2812733c472e53363ae1b7b5e",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_left",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "ec63eff2d07d274ceead3f58cc2beff7731b08a7b6861b583495e05b47c04dbd",
+          "definition_sha256": "cd47ab72265a2e8bd2e8ff86a21c8d48209583741b14032094faa28f22ff3ac7",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_right",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bcdc0adf8c1d794db5d8a42346a234cf5fa9266af1978fbba141f89bb44ffb45",
+          "definition_sha256": "a2672b7716176f60ef41c3c8a96a71baa9d52db58dcf32353e628098103383f0",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_right",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "25ea6502d38de9149f77fd24205ecb562b0bc1314e224ae5c5b2bdab20ec91e9",
+          "definition_sha256": "ed00e591a3e489ae81ce59e5476e6dae8ca9d8b88f140961a2fe5f04c67ebeff",
+          "dependencies": [
+            "join_left"
+          ],
+          "initialization": "future_only_at_cut",
+          "kind": "stream",
+          "managed_state_contract": null,
+          "name": "topology_cut_probe",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "add_future_only"
+        }
+      ],
+      "parent_manifest": {
+        "encoded_len": 18088,
+        "entry_count": 47,
+        "sha256": "9de55139e83510bcfce2d8a87fbc3034fc084b5cfd7e7390e4c8276610a08907",
+        "version": 1
+      },
+      "parent_pipeline": {
+        "canonical_version": 7,
+        "sha256": "caafc75a88dadb4f099748c25ec25e29d6b0355f2441d7cb0f9745bcc0796a19"
+      },
+      "parent_version": 1,
+      "required_before_activation": [
+        "participant_plan_agreement",
+        "reconciled_checkpoint_cut",
+        "durable_initialization_and_progress",
+        "observed_actor_retirement",
+        "atomic_target_commit",
+        "installed_target_release"
+      ],
+      "requires_processing_pause": true,
+      "scope": "local_candidate_plan",
+      "target_manifest": {
+        "encoded_len": 18216,
+        "entry_count": 48,
+        "sha256": "4ae15b65d7a65dc4904cd63609f1b55bf33fa79f260a7c4e64493319ba3d9967",
+        "version": 1
+      },
+      "target_pipeline": {
+        "canonical_version": 7,
+        "sha256": "17c01e36806c1dcfecf38d834d33bf44bb35d2c7071063b9abaf77cc7b94273a"
+      },
+      "target_version": 2,
+      "validation_format_version": 1
+    },
+    "validation_elapsed_ms": 610.4322
+  },
+  {
+    "node": 2,
+    "validation": {
+      "compatibility_sha256": "44a62daa239423137f4de3e2d56670d4d897296ee96181f7ce1263ba74e6403d",
+      "deployment_id": "01a0f9a0-e174-7537-b6f7-23e89784eded",
+      "environment_sha256": "a725867e145723dda29d51300692487bcf44b1232a30cbcdd357edefad0781eb",
+      "objects": [
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2567841f32436acde888d7a6873ccda13e1eb7ad9e605e66ae21bc1f1d3f55a4",
+          "definition_sha256": "4fbc11e725e19dedf3e3e5701f78b4073aab79c3be34e07d4e4fd64d044f8e6f",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_left",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "43fe25dcada7bc9f754b13b70a5ca42cb4a1bdaca7859e557674a054ac92c71b",
+          "definition_sha256": "ca09391fdb027c7bc1f6fa24ac9e85a9183f6d71cf9b0fa5d10c910bfe4442c8",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "join_right",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9461f7738a196e2402cc780e3865d43d28a3f9bb9ba28030d049fbedbc9c4f7b",
+          "definition_sha256": "1caa5f6aecdab8f0e614b6a771840bba52dae596d4fae56e8468a13d92284c48",
+          "dependencies": [
+            "join_left",
+            "join_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_join",
+          "schema_sha256": "1c445ddb69c77683d1b02870122c75010044e3f8c953e6ef0908ffe56f8f732d",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b3e21a6c6be00acb156ff27b1c5165643556b5d07f7f512ef7c7e16395c436b6",
+          "definition_sha256": "d24cd99ef8314f0ee73fbb3bdd64ee64f2abecf7015ce654ef64bae896fe98a3",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_join_aggregate",
+          "schema_sha256": "68bef23dedf666e2950c81be723853e154257746d0871e7fd4e5cf9a0bd4622f",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c6c136ce9f7467f6fdd0622782fee7268abfa16e26c1875554ba34bd4c9e2469",
+          "definition_sha256": "291493ee8c381c43e7e42a68e806e2f7bac60dd5d3e789053bf8afa658a5fac7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_full",
+          "schema_sha256": "48bf869cd5279f2ad8f895b18ef296911fc768c342cca825be7f1bc12b9c0132",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "96f819205abfc9eb3d26aa85b949404aa625a1e39b38572efb22d2acfb6bf4d6",
+          "definition_sha256": "a3970cfd31e2ff8e57bee368cd696f226e98e2892dddb3408fcf78a85be6551c",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_full_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9a832822ee8ff2a3877a3bb95860d400f883ebf264bab4bf0817f8c774876f08",
+          "definition_sha256": "6baf81c90366e40306832311f59f0732634d2afd3e5b4f7789fddfb8ab640a8a",
+          "dependencies": [
+            "soak_matrix_full"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_full_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "138473a8d2d46f0823006b2a4c301d616e3bc4aee48e510ca1ac6dfd9136022e",
+          "definition_sha256": "ebaa9a9738ef825c5db7af81d259b35d988cc3198afdde64ba87f4c237865c82",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_inner",
+          "schema_sha256": "a3f73ecb728111e53e9403cd558b92ece31104bb8c6eda175eee4f8a69998146",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "60a91fd7b01bae3b762051265a86bb71584824e557f8a3fcd1d45b84aadcf025",
+          "definition_sha256": "739352f61d31c7ee837aa64e6353cb9c8b98f8c03a49fe0f1c3edf212d52b813",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_inner_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e0da68d127e8e928b57d334e94546664121696035dfb68aa6e97891ad54facda",
+          "definition_sha256": "04536f7897513377323006b9bc5c781cdfbf210164685e0d3b78d8856ddf7d9f",
+          "dependencies": [
+            "soak_matrix_inner"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_inner_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "d71d75e86ce391a056ae23c401ed3078a193394c14f5de234b25b3c3507f1021",
+          "definition_sha256": "d783c48d41b77b575fb040e3ba71c133e9de2aef95b184927ad9419bb9148808",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "4545b0f537bc9d16d2fbfe7600d7c35270c020e731be597f112cf374fc642bdb",
+          "definition_sha256": "c48688e36cab948e2bd65f531b381072bfae6b5430bdcfcdf4b9a7486654950e",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b88873943f07158cde6dbae22d260507e37e5b30ac215105c0e915bdcdbf94b0",
+          "definition_sha256": "4b9fbf02fb2ec2b0c0c10169d7298e3c51a0ba8d9b5fa69579c3efb4382fe938",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_anti",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9f29e5719f6b34a0dd62e7ee5921ac082ac79f40871fe2a4302d7d32e109ddbf",
+          "definition_sha256": "cacdb6a05e489bf00475f02760f1fa1094a0799e49fbbbba79f71b1af7cfc6b2",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5e47cc5dca8e32c07323744fdc57e5709d4f339b68c6178c25ced2a1c6eff623",
+          "definition_sha256": "ce0beea09c22db1ef372d7f9d9323bc52895e21fe19e25de3c728b2c42200154",
+          "dependencies": [
+            "soak_matrix_left_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "06c456544a0952490168629e6fa8d62f8a68cfc9fbcedb5ae01fbecc1467e1a1",
+          "definition_sha256": "0cb01ce5faac79de3c2791cf13c7f887f26476e752547471904b8d0b6dfbe23d",
+          "dependencies": [
+            "soak_matrix_left"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bf39124473ed0adf28a64184859418da654360fbcbe615e98182eb0739abbc28",
+          "definition_sha256": "07e73349b467b959a765db48ddefa62cff8f424b38813980756c968bd54115cd",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_left_semi",
+          "schema_sha256": "56719e14904beb55b821c33854056b923b3a861a10669243535b9d27fea14d03",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "52a70c5e0815a567ce12580aab6723787aa931b594b73696d51dedc8e3d0e236",
+          "definition_sha256": "0c34ba539f8efae8d5298f14b64ba80124c1b4dc002dac496361cbf911af91cb",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_left_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "850970fdc0b595ebb206490187e918f830e11f2c449d15d065b7bba851298047",
+          "definition_sha256": "16932f359a2d719aa866788a28212c4c3c3522bb6693ea50bb65ca4b5e729639",
+          "dependencies": [
+            "soak_matrix_left_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_left_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "715e249f2f5d346fd873b433b1e7f7af8b1248f1f64bdc31c9a110c84b6970ef",
+          "definition_sha256": "dd478431dba4fe1a85b0ccc6d464d77b0f1eb7dc659c9ddfc41ad20b55774585",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_lhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "55935a7f6e017fabe077bd30a8f131b6022c40848e50cba480148525ce9f7abe",
+          "definition_sha256": "369f99d2e0b922495b8b2a2450381622bcedc1744df21393e188e48971e1b638",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "soak_matrix_rhs",
+          "schema_sha256": "8370991ec46e3a55d2532e27549bdfde39e1d38f49a272ca3f12a674ce16f6a8",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c573a9058022c96e9f898ed5bb6e71af373fdf331bdfeb3d6c15684a35b27834",
+          "definition_sha256": "861680c5c47abc94fc19494b782c0e44f9f4de2363aee498c8d6d274314df443",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "100764b79570c6a5cf7f21dd35d1f784d8cc1218f3571e45ae375902f8e27b99",
+          "definition_sha256": "bc4bfc469d0e7b7c7e44f798f6aa5f13e404f769cfa71bbe55274935bdfb94f2",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "886650d5cd06b97534b6e6214db189e2d12b731cf72006c4a9d3dbb06e560b7c",
+          "definition_sha256": "39ee55e268f8b74c095f7d180519d7899d5b670ede55f4b419ebdbed9d37e338",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_anti",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "c839ec732d3e3bba23fcae1d0859153726bb260a6d1d131f2f1af7b75e5c178b",
+          "definition_sha256": "74282f7da5890f068c330c21c9205ac11075fe9dbe8bfa05013a2e420f119e5b",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_anti_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "453090403ab4d8a8b441a281a3da8d86e4f3647d462fcfb512a43a1b49c821a9",
+          "definition_sha256": "bff9b115a2271d6f2820264399f16267d004eeb226cf5d1bd212dc9fe3caa155",
+          "dependencies": [
+            "soak_matrix_right_anti"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_anti_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "2d084bc4c28671bd4dd2b65d68a4fb460be5949b53228c7e452f2f987aa378db",
+          "definition_sha256": "84b26c1637e7cf8d6af10ba61af965834610e598d9f119252296bfaa99c1abe5",
+          "dependencies": [
+            "soak_matrix_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "e4f0296732e7ea6c638f51c27818521ba9baa826ccf9780c099d7e7786578556",
+          "definition_sha256": "f0a61f46db2e8dbc3a6384d7d4c907bdaea4a6c11fe7ab42a0dc071d2d59fbf7",
+          "dependencies": [
+            "soak_matrix_lhs",
+            "soak_matrix_rhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "bounded_interval_join_v3",
+          "name": "soak_matrix_right_semi",
+          "schema_sha256": "9327ce4746121e4e617426d02d0c661afb4b1f76192e9e91e8cf119a6715fd39",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b322c37ade803ace534e5194b3c1903f550efcc5c6f722a6fa509627bf9a6887",
+          "definition_sha256": "869c91f9ac680567866bb4ba9656fb26e536c8e2e7ac80077b30724172b95c08",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "sql_aggregate_v1",
+          "name": "soak_matrix_right_semi_aggregate",
+          "schema_sha256": "bcc0d5d8b8ebb1032de48a15f053b7eced848adef779a2b7d2d5e4de145d8a91",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "079f5af1d4c6d79cbd238d38a6df42162bcc1ba12330a3e3c1a8adf52c37f2f5",
+          "definition_sha256": "606e142af0bd88e4a84847c8060dfabc9595147cb0fa63a92ff10e102b38ee5f",
+          "dependencies": [
+            "soak_matrix_right_semi"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_matrix_right_semi_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "f8aec777730b4044d321b398310e0d62ff290cc62787fc5d17893858aed649d0",
+          "definition_sha256": "027aae51c9ae3059c44af32a56ebfbf579dd6175fb101dcd3701da3bbe1bb712",
+          "dependencies": [
+            "soak_join"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7cd43412f86301814c8d495c09002b024020c016d5dd2ef7b7df92a927369992",
+          "definition_sha256": "c06de6be7baae4d35f1b1fbd5d9cbe6068415c55a1b1b64db84286252ba7f707",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "828073b81c885604968152e3561342394d690c8b347fbf148537cc7d4ed1877a",
+          "definition_sha256": "541086096b250af10d9a8e1beef6a7377bed11e453b41b212c1e0fa08f8dbe83",
+          "dependencies": [
+            "temporal_load_left",
+            "temporal_load_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_load",
+          "schema_sha256": "a2c7e7c6e0d7e349478ab0112a25e6f80ea84f97dc04e83b6805341c10a2e1b5",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "9277bf7d2cbffb91e4265b1e8100ed4e192be1e6fa0d097724633823decfc200",
+          "definition_sha256": "b3c6c007102b85b3bba6f1f9973cb4be14593cee409aee519471cebcb44b818b",
+          "dependencies": [
+            "soak_temporal_load"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_load_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "a3fa1bf0783533306e3c2bfd9fd09af3f879eef95b55b0bba898197ef28e9f12",
+          "definition_sha256": "137f554790d69c2ccef80c35ea6529d4139175177d9a982cda20b7eba3c404ae",
+          "dependencies": [
+            "soak_temporal"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "49f68df23e3ba3ba35c4ce4412bed162ee5ba0d2b7ca61a95a9e9c0106a47371",
+          "definition_sha256": "8db51674c813e1dcc6447729a4a1ade158bfbd8e0bd753cddcdea6602c445698",
+          "dependencies": [
+            "temporal_left",
+            "temporal_right"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "temporal_join_v1",
+          "name": "soak_temporal_probe",
+          "schema_sha256": "99ba2c3383103af5f02d6a9022efdbeb54190125edcf497ab7deeef5dc93e9ac",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "789df12708e63f03909c4d86873fde2681b2afc42bd3e5d1500a326969513e8b",
+          "definition_sha256": "b255455c710394e70e7a8e21abe9f2c3c08090231958de8d845c4a8df1257a63",
+          "dependencies": [
+            "soak_temporal_probe"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_temporal_probe_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "1ff2f9d1ccf70d8ec4f1205452b9b83b5b7d1358c43018c5c0ac66884d94e230",
+          "definition_sha256": "47fd9a4eeea4bfd78df2228d5d494edca0fbb566cd098b461b4aadcd77322b03",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_hop",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "7b549bb35de9238dcdb4e439558846ebb2e4013abfafeeb128f397f82e1db333",
+          "definition_sha256": "3c3ada86c536f658df13c764b0b3411cb91041bbdd35fddfc4892c2340e6d10e",
+          "dependencies": [
+            "soak_window_hop"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_hop_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "554e0acd36cac8fd67c22918b657e41e3151f478b44b281a089da50c7236e763",
+          "definition_sha256": "7dc41eeb3454ce5671e8c5ee228423b0e7a8c85be3b22ae2d402c875040b5727",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_session",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "3a7004dc472eff22380121cbb1065131774f31a0fdd549d74499990e96c11c89",
+          "definition_sha256": "fbe16ad1cacafdad7dba0c9327215d51817a79da8bccb54c68869b4194daf400",
+          "dependencies": [
+            "soak_window_session"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_session_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "5bad47350b720229f25eba2ce08c53bba4e8f6af8030d395b5834fbeee9086f0",
+          "definition_sha256": "95cdf501e3a8a8351967b1d06d00f60b1c651c76db551338eca19e1094eacd25",
+          "dependencies": [
+            "soak_matrix_lhs"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "stream",
+          "managed_state_contract": "core_window_v1",
+          "name": "soak_window_tumble",
+          "schema_sha256": "40d52901dff59560096ca686fa73a70823484d33aac7c582b30bf2dbb018de76",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "8e6b1667d04dbc72e7453572ad2c90aad1ffd33862c78d1843ea6117c24272bc",
+          "definition_sha256": "fd7a59f9da02ac782acfd8eb2979c448780db84b5598d71505ddb7a699185ea2",
+          "dependencies": [
+            "soak_window_tumble"
+          ],
+          "initialization": "preserve_exact_cut",
+          "kind": "sink",
+          "managed_state_contract": null,
+          "name": "soak_window_tumble_output",
+          "schema_sha256": null,
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "fe7085323e30526c15f68ba3fd74e8a6cfbe252781b542c902e12b038aeea69d",
+          "definition_sha256": "36b1d346ea5655d756b11b67fc839bc0393333cfee7ce74f3ac2568e78c875bc",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_left",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "b5931546424153dcf484070bc9f8da4d5be9058c5b72de1abcb9127fdb074c16",
+          "definition_sha256": "9b30530a7e2bf9eb21541d72ae57bf018aadf0f2812733c472e53363ae1b7b5e",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_left",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "ec63eff2d07d274ceead3f58cc2beff7731b08a7b6861b583495e05b47c04dbd",
+          "definition_sha256": "cd47ab72265a2e8bd2e8ff86a21c8d48209583741b14032094faa28f22ff3ac7",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_load_right",
+          "schema_sha256": "87d52dc2c0c3ac84652603d0969772dbeafc36b8343c7348b24fc9efccf8d02c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "bcdc0adf8c1d794db5d8a42346a234cf5fa9266af1978fbba141f89bb44ffb45",
+          "definition_sha256": "a2672b7716176f60ef41c3c8a96a71baa9d52db58dcf32353e628098103383f0",
+          "dependencies": [],
+          "initialization": "preserve_exact_cut",
+          "kind": "source",
+          "managed_state_contract": null,
+          "name": "temporal_right",
+          "schema_sha256": "8b8a9e92ea79f0813b6470a33f1db8969526ffa50a9c1f1c0659aa5567bd763c",
+          "transition": "preserve"
+        },
+        {
+          "catalog_generation": 1,
+          "compatibility_sha256": "25ea6502d38de9149f77fd24205ecb562b0bc1314e224ae5c5b2bdab20ec91e9",
+          "definition_sha256": "ed00e591a3e489ae81ce59e5476e6dae8ca9d8b88f140961a2fe5f04c67ebeff",
+          "dependencies": [
+            "join_left"
+          ],
+          "initialization": "future_only_at_cut",
+          "kind": "stream",
+          "managed_state_contract": null,
+          "name": "topology_cut_probe",
+          "schema_sha256": "bb07f59cad0b6b8cb76c3a99cfc7b05310c188b1ee5cc358659aca64a3733943",
+          "transition": "add_future_only"
+        }
+      ],
+      "parent_manifest": {
+        "encoded_len": 18088,
+        "entry_count": 47,
+        "sha256": "9de55139e83510bcfce2d8a87fbc3034fc084b5cfd7e7390e4c8276610a08907",
+        "version": 1
+      },
+      "parent_pipeline": {
+        "canonical_version": 7,
+        "sha256": "caafc75a88dadb4f099748c25ec25e29d6b0355f2441d7cb0f9745bcc0796a19"
+      },
+      "parent_version": 1,
+      "required_before_activation": [
+        "participant_plan_agreement",
+        "reconciled_checkpoint_cut",
+        "durable_initialization_and_progress",
+        "observed_actor_retirement",
+        "atomic_target_commit",
+        "installed_target_release"
+      ],
+      "requires_processing_pause": true,
+      "scope": "local_candidate_plan",
+      "target_manifest": {
+        "encoded_len": 18216,
+        "entry_count": 48,
+        "sha256": "4ae15b65d7a65dc4904cd63609f1b55bf33fa79f260a7c4e64493319ba3d9967",
+        "version": 1
+      },
+      "target_pipeline": {
+        "canonical_version": 7,
+        "sha256": "17c01e36806c1dcfecf38d834d33bf44bb35d2c7071063b9abaf77cc7b94273a"
+      },
+      "target_version": 2,
+      "validation_format_version": 1
+    },
+    "validation_elapsed_ms": 503.2488000000001
+  }
+]

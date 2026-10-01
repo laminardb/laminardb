@@ -484,6 +484,165 @@ async fn topology_preparation_rejects_changed_local_config_and_nonrunning_parent
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn topology_root_staging_uses_configured_metadata_and_process_authority_without_actor_effects(
+) {
+    use laminar_core::checkpoint::{
+        ByteRange, CheckpointAttempt, CheckpointManifest, CheckpointStore,
+        CommittedCheckpointIndex, CommittedParticipantRef, ConnectorCheckpoint,
+        ObjectStoreCheckpointStore, StateFrame, StateFrameKey,
+    };
+    use laminar_core::checkpoint_decision::{CheckpointArtifactInventory, CheckpointVerdict};
+    use std::collections::BTreeMap;
+    let (fixture, assignments) = preparation_fixture().await;
+    let admitted = admit_preparation_candidate(&fixture, &assignments).await;
+    fixture
+        .db
+        .prepare_cluster_topology_operation(admitted.operation_id)
+        .await
+        .unwrap();
+    let (_, plan, _, descriptor) = fixture
+        .authority
+        .lease_store
+        .topology_preparation_input(admitted.operation_id)
+        .await
+        .unwrap();
+    assert!(fixture
+        .db
+        .stage_cluster_topology_migration_root(admitted.operation_id)
+        .await
+        .is_err());
+    let inventory = CheckpointArtifactInventory {
+        deployment_id: descriptor.deployment_id.clone(),
+        pipeline_identity: descriptor.parent_pipeline.clone(),
+        attempt: CheckpointAttempt::canonical(1),
+        assignment_fence: Some(plan.assignment.clone()),
+        sink_artifact_intent_protocol: true,
+    };
+    fixture
+        .authority
+        .controller
+        .begin_topology_checkpoint_cut(
+            &fixture.authority.lease.proof(),
+            admitted.operation_id,
+            &admitted.plan,
+            inventory,
+        )
+        .await
+        .unwrap();
+    // These are checksummed cut metadata fixtures. Staging must inspect their slots/references
+    // without decoding, duplicating or restoring the placeholder state payload.
+    let store = ObjectStoreCheckpointStore::new(fixture.authority.checkpoint_store.clone(), "")
+        .with_key_group_count(fixture.db.checkpoint_key_groups());
+    let mut manifest = CheckpointManifest::new_with_key_group_count(1, 1, store.key_group_count());
+    manifest.bind_participant(plan.assignment.participants[0].node_id);
+    manifest.assignment_fence = Some(plan.assignment.clone());
+    manifest.deployment_id.clone_from(&descriptor.deployment_id);
+    manifest
+        .pipeline_identity
+        .clone_from(&descriptor.parent_pipeline);
+    manifest.reassignment_portable = true;
+    manifest.source_names = vec!["trades".into()];
+    manifest
+        .source_offsets
+        .insert("trades".into(), ConnectorCheckpoint::new());
+    manifest.sink_names = vec!["existing_sink".into()];
+    let data = bytes::Bytes::from_static(b"12345678");
+    manifest.node_data.object_length = 8;
+    manifest.node_data.sha256 = laminar_core::checkpoint::checkpoint_sha256(&data);
+    manifest.state_frames = (0..8)
+        .map(|vnode| StateFrame {
+            key: StateFrameKey::Vnode {
+                operator_id: "graph:totals".into(),
+                vnode,
+            },
+            chunk: manifest.node_data.chunk,
+            range: ByteRange {
+                offset: u64::from(vnode),
+                length: 1,
+            },
+            sha256: laminar_core::checkpoint::checkpoint_sha256(
+                &data[usize::from(vnode)..=usize::from(vnode)],
+            ),
+        })
+        .collect();
+    let bytes = store.save_checkpoint(&manifest, &[data]).await.unwrap();
+    let index = CommittedCheckpointIndex {
+        version: laminar_core::checkpoint::COMMITTED_CHECKPOINT_INDEX_VERSION,
+        deployment_id: descriptor.deployment_id,
+        pipeline_identity: descriptor.parent_pipeline,
+        epoch: 1,
+        checkpoint_id: 1,
+        scope: laminar_core::checkpoint::CheckpointScope::Cluster,
+        vnode_count: 8,
+        assignment_fence: Some(plan.assignment.clone()),
+        reassignment_portable: true,
+        predecessor: None,
+        participants: vec![CommittedParticipantRef::from_manifest(&manifest, &bytes).unwrap()],
+        source_names: manifest.source_names.clone(),
+        source_offsets: BTreeMap::from([("trades".into(), ConnectorCheckpoint::new())]),
+        channel_progress: Vec::new(),
+        source_watermarks: BTreeMap::new(),
+        checkpoint_watermark: None,
+    };
+    let reference = CheckpointDecisionStore::new(fixture.authority.checkpoint_store.clone())
+        .create_committed_checkpoint(&index)
+        .await
+        .unwrap();
+    fixture
+        .authority
+        .lease_store
+        .record_cluster_outcome(
+            &fixture.authority.lease.proof(),
+            1,
+            1,
+            plan.assignment.clone(),
+            CheckpointVerdict::Commit,
+            Some(reference),
+        )
+        .await
+        .unwrap();
+    fixture
+        .authority
+        .controller
+        .complete_topology_checkpoint_cut(
+            &fixture.authority.lease.proof(),
+            CheckpointAttempt::canonical(1),
+        )
+        .await
+        .unwrap();
+    fixture.db.topology_cut_hold.store(true, Ordering::Release);
+    let inventory = fixture.db.catalog_manifest_inventory().unwrap();
+    let staged = fixture
+        .db
+        .stage_cluster_topology_migration_root(admitted.operation_id)
+        .await
+        .unwrap();
+    assert!(staged.migration_root.is_some());
+    assert_eq!(
+        fixture
+            .db
+            .stage_cluster_topology_migration_root(admitted.operation_id)
+            .await
+            .unwrap(),
+        staged
+    );
+    assert!(fixture.db.topology_cut_hold.load(Ordering::Acquire));
+    assert!(fixture.db.source_gate.load(Ordering::Acquire));
+    assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
+    assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    assert!(fixture.db.owned_source_tasks.lock().is_empty());
+    assert!(fixture.db.owned_sink_handles.lock().is_empty());
+    fixture.db.shutdown.store(true, Ordering::Release);
+    assert!(matches!(
+        fixture
+            .db
+            .stage_cluster_topology_migration_root(admitted.operation_id)
+            .await,
+        Err(DbError::Shutdown)
+    ));
+}
+
 fn source_ddl(name: &str, options: &str) -> String {
     format!("CREATE SOURCE {name} (id BIGINT NOT NULL, ts TIMESTAMP NOT NULL, value BIGINT NOT NULL, WATERMARK FOR ts AS ts - INTERVAL '1' SECOND) FROM \"planning-source\" ({options})")
 }

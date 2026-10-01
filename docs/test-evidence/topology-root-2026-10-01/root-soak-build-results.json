@@ -1,0 +1,15 @@
+{
+  "server": {
+    "command": "cargo rustc --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb -- -C link-arg=/STACK:16777216",
+    "started_utc": "2026-10-01T21:46:03.0842274Z",
+    "ended_utc": "2026-10-01T22:12:02.7220201Z",
+    "exit_code": 0
+  },
+  "harness": {
+    "command": "cargo rustc --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka --test cluster_soak",
+    "started_utc": "2026-10-01T22:13:47.9702047Z",
+    "ended_utc": "2026-10-01T22:39:09.6400763Z",
+    "exit_code": 0
+  },
+  "harness_sha256": "259f26c2e678be0b784946152d06164ee23eeb05033c566dc621c6fc5089440f"
+}

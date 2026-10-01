@@ -13,6 +13,7 @@ use crate::error_codes;
 
 mod admission;
 mod compatibility;
+mod migration_root;
 mod preparation;
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
@@ -23,6 +24,10 @@ pub use compatibility::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyCompatibilityRef, TopologyInitialization,
     TopologyValidationScope,
+};
+pub use migration_root::{
+    TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
+    TopologyPreservedObject, TopologySubscriptionRoot, MAX_TOPOLOGY_ROOT_MANIFEST_BYTES,
 };
 pub use preparation::{
     TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,

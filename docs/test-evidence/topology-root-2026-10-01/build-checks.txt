@@ -1,0 +1,45 @@
+Command: cargo clippy -p laminar-core -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings
+Result: exit 0
+Checking laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 11s
+
+Command: cargo check -p laminar-server --no-default-features
+Result: exit 0
+Compiling laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.00s
+
+Command: cargo check -p laminar-db --no-default-features --features cluster,ffi
+Result: exit 0
+Checking laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 52.69s
+
+Command: cargo test -p laminar-core --no-default-features --lib -- --quiet
+Result: exit 0
+   Compiling laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.61s
+     Running unittests src\lib.rs (target\debug\deps\laminar_core-2e3e3054cd866e9f.exe)
+
+running 414 tests
+....................................................................................... 87/414
+....................................................................................... 174/414
+....................................................................................... 261/414
+....................................................................................... 348/414
+..................................................................
+test result: ok. 414 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.09s
+
+Command: cargo fmt --all -- --check
+Result: exit 0
+
+Command: git diff --check
+Result: exit 0

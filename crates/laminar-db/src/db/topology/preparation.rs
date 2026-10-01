@@ -44,7 +44,7 @@ impl LaminarDB {
         }).await.map_err(|_| TopologyError::Contended)?
     }
 
-    fn ensure_topology_preparation_available(&self) -> Result<(), DbError> {
+    pub(super) fn ensure_topology_preparation_available(&self) -> Result<(), DbError> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(DbError::Shutdown);
         }

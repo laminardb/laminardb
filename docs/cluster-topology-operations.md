@@ -2,7 +2,8 @@
 
 This checkpoint implements explicit legacy catalog adoption, core admission,
 an old-topology checkpoint cut, topology/operation status, local candidate validation
-and durable preparation of already admitted candidates.
+and durable preparation of already admitted candidates. Exact-cut root staging
+is available through the DB/core library for stateless downstream additions.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -16,6 +17,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
 | Certify an already admitted candidate on this process | Local preparation API; complete frozen roster required before a new cut |
 | Prepare and hold an exact old-topology cut | Existing manual checkpoint path after participant-complete internal admission/preparation; no target activation |
+| Stage exact-cut state/progress/subscription requirements | DB/core library, held cut and complete current roster; no target restore/output authority |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -124,7 +126,7 @@ router's status codes.
 
 ## Legacy upgrade and restart
 
-Authority formats 12 through 15 remain readable. A coordinated binary upgrade is
+Authority formats 12 through 17 remain readable. A coordinated binary upgrade is
 required for this build: the first serialized assignment drain writes format 14,
 even before logical catalog adoption. Stop and observe termination of the old
 server processes, then start every required participant with the new binary and
@@ -140,7 +142,7 @@ The core `CatalogManifestStore::adopt_legacy_topology` API requires the current
 leader proof, the exact sealed manifest reference, the existing deployment UUID,
 and a nonzero operation UUID reused on retries. Its caller must first complete a
 coordinated binary upgrade of every required participant. Adoption writes format
-13 or preserves format 14/15 when earlier authority admission already upgraded it. Older
+13 or preserves a later format when earlier authority admission already upgraded it. Older
 authority readers fail closed; mixed-version adoption is unsupported.
 
 There is no operator-facing adoption CLI or write endpoint in this increment.
@@ -232,6 +234,29 @@ binaries together before internally admitting such a request. Old protocol-1
 requests remain readable/abortable but cannot start new uncertified cuts. Descriptor
 agreement does not resolve source positions, restore target state, retire actors,
 commit topology 2 or authorize target output. Normal SQL remains guarded by LDB-6043.
+
+## Stage an exact-cut root internally
+
+The DB/core library can stage immutable state/progress/subscription requirements
+for a certified stateless downstream addition after every participant applies the
+old cut. The DB call requires Running state, the held cut and closed intake, and
+uses the controller's configured process/assignment authorities. There is no HTTP
+root-staging or migration submission route in this increment.
+
+Operation status then includes `migration_root.root` (SHA-256 and exact byte
+length) and its first `authority_sequence`. Authority format 17 pins this evidence.
+The phase remains `cut_prepared`, and the committed catalog remains topology 1.
+The root preserves the exact old checkpoint, object incarnations, state mappings
+and subscription sequence vectors. It does not restore a target graph, permit
+target output or release intake. New sources are rejected until their concrete
+starting positions can be persisted once.
+
+The DB call has a 30 second deadline, including an authority staging budget of
+15 seconds/16 append attempts. Participant manifest metadata is capped at 16 MiB
+in aggregate and the root body at 1 MiB. Retrying the same prepared operation
+returns its original binding; a lost response or cancellation can leave a successful
+append. Query status to resolve uncertainty. Abort preserves the root metadata
+and old checkpoint decision; normal coordinated recovery resumes topology 1.
 
 ## Errors and recovery
 

@@ -184,6 +184,9 @@ pub struct TopologyAdmissionStatus {
     /// Immutable descriptor and monotonic exact-process compatibility certificates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation: Option<super::TopologyPreparation>,
+    /// Exact-cut restore/initialization requirements. This is never a target Commit or Release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_root: Option<super::TopologyMigrationRootBinding>,
 }
 
 impl TopologyAdmissionStatus {
@@ -215,6 +218,32 @@ impl TopologyAdmissionStatus {
             ));
         }
         self.validate_preparation(head)?;
+        if let Some(binding) = &self.migration_root {
+            binding.root.validate()?;
+            if !matches!(
+                self.phase,
+                TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Aborted { .. }
+            ) || self
+                .preparation
+                .as_ref()
+                .is_none_or(|p| p.complete_sequence.is_none())
+                || self.cut.as_ref().is_none_or(|cut| {
+                    cut.committed.as_ref().is_none_or(|commit| {
+                        binding.authority_sequence <= commit.authority_sequence
+                    }) || cut
+                        .inventory
+                        .assignment_fence
+                        .as_ref()
+                        .is_none_or(|fence| cut.completed_participants != fence.participants)
+                })
+                || binding.authority_sequence > self.status_sequence
+                || binding.authority_sequence > head
+            {
+                return Err(TopologyError::Invalid(
+                    "migration root requires the complete certified prepared cut".into(),
+                ));
+            }
+        }
         match (&self.cut, self.phase) {
             (
                 None,
@@ -309,6 +338,22 @@ impl TopologyAdmissionStatus {
             ));
         }
         self.validate_preparation_successor(after, sequence)?;
+        match (&self.migration_root, &after.migration_root) {
+            (None, None) => {}
+            (Some(prior), Some(next)) if prior == next => {}
+            (None, Some(binding))
+                if self.phase == TopologyAdmissionPhase::CutPrepared
+                    && after.phase == TopologyAdmissionPhase::CutPrepared
+                    && binding.authority_sequence == sequence
+                    && self.cut == after.cut
+                    && self.preparation == after.preparation => {}
+            _ => {
+                return Err(TopologyError::Invalid(
+                    "authority cannot replace a migration root or stage it outside a prepared cut"
+                        .into(),
+                ))
+            }
+        }
         if let Some(prior_cut) = &self.cut {
             let next_cut = after.cut.as_ref().ok_or_else(|| {
                 TopologyError::Invalid("authority cannot forget a topology cut".into())
@@ -325,7 +370,12 @@ impl TopologyAdmissionStatus {
                     .any(|participant| !next_cut.completed_participants.contains(participant))
                 || (self.phase == TopologyAdmissionPhase::CutPrepared
                     && self != after
-                    && !matches!(after.phase, TopologyAdmissionPhase::Aborted { .. }))
+                    && !matches!(after.phase, TopologyAdmissionPhase::Aborted { .. })
+                    && !(after.phase == TopologyAdmissionPhase::CutPrepared
+                        && self.migration_root.is_none()
+                        && after.migration_root.is_some()
+                        && prior_cut == next_cut
+                        && self.preparation == after.preparation))
             {
                 return Err(TopologyError::Invalid(
                     "authority cannot replace a cut or rewind its evidence".into(),
