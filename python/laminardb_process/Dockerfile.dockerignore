@@ -15,3 +15,6 @@
 !examples/process_python/
 !examples/process_python/handler.py
 !examples/process_python/manifest.json
+!examples/process_account/
+!examples/process_account/handler.py
+!examples/process_account/manifest.json

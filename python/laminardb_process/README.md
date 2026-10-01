@@ -6,6 +6,12 @@ function transport. A handler accepts immutable `Activation` values and returns
 state, timers, checkpoints, and output publication. Handler-local mutable data is
 not managed state.
 
+The [account activity example](../../examples/process_account/README.md) runs the
+same monitor in native Rust and vectorized Python. It checks running totals,
+threshold crossings, named inactivity timers and completed-checkpoint recovery
+against a fixed independent reference. Its container targets reuse the Compose
+controls below. The smaller running-total quickstart remains available here.
+
 ## Local worker quickstart
 
 Use Python 3.13 in a virtual environment. From the repository root on Bash:

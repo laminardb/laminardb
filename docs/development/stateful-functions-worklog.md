@@ -361,6 +361,82 @@ Final gates: `RUST_MIN_STACK=8388608 cargo test --workspace --lib -- --test-thre
 
 This completes the scoped container quickstart increment, not all of Phase D. Python remains embedded/single-node `BestEffort`; the new container demonstration uses embedded registration. Complete dependency/effect binding, real immutable-profile host loss and cleanup-failure qualification remain open before stronger Python delivery. Both cluster forms stay rejected.
 
+### Continuation: Account activity example (2026-10-01)
+
+Starting from `78f564a8`, original brief section 19 now has a public account
+monitor in `process_account`: matching native Rust and vectorized Python,
+engine-owned Int64 totals, upward threshold crossings at 100, and named
+`inactive` event-time output without clearing totals. Python uses PyArrow 20
+checked addition, comparisons and selection over the bounded input batch, then
+returns one-row slices. Both handlers reject null state, total overflow and timer
+overflow. No engine, coordinator, state codec, scheduling or transport code changed.
+The original running-total fixture and its recovery/host-loss tests remain intact.
+The new handler's SHA-256 is
+`3966a08b7536a91dca874ab2860de4ba9159f1bd12ae4c4f351b0e411ffac682`;
+local Git attributes preserve LF bytes for its bound source and manifest.
+
+The driver checks all four output columns against hand-calculated expectations:
+19 rows across four accounts, out-of-order timestamps across accounts, repeated
+keys, a distinct duplicate Bob event that counts twice, repeated threshold
+crossings, timer replacement, retained totals after inactivity, and controlled
+110/111/123/130 ms frontiers. Checkpoint mode accepts the first five rows; resume
+accepts the remaining fourteen in a fresh engine and Python worker. Bob's saved
+timer remains untouched by continuation and fires at 110040 µs. Alice's replaced
+timer fires once at 111000 µs. A separate handler test repeats the same logical
+activation with its original state snapshot and checks purity across worker reuse.
+The example defines inactivity relative to the most recently accepted input;
+per-account fixture timestamps do not regress. No sorting or business deduplication
+is claimed.
+
+Initial driver attempts exposed the existing source progress boundary: publishing
+an atomic watermark does not by itself wake and execute an idle graph. An empty
+batch faults timestamp extraction, and a checkpoint wake alone does not advance
+a quiescent process operator's timer frontier. Those attempts failed the reference
+and were removed. The final fixture uses ordinary Dana transactions to drive
+input cycles after each explicit watermark; their outputs are included in the
+independent reference. No fabricated timer input or alternate scheduler was added.
+
+The SDK Dockerfile now supplies `account-worker` and `account-example` targets,
+sharing its existing runtime layers and Compose controls. The original `worker`
+remains the default target. Native client images contain only their selected
+example binary. Copied commands resolve image IDs and save configuration before
+activation. The qualified account worker is
+`sha256:b713672da5ed724574b5793bb6a344766dbbcf65523d52fa407d718725e758ff`;
+the client is
+`sha256:043430a99d85111894f3b9e5b95643489fde4f65ef355c954e153ae10edf2ef7`.
+The Linux/amd64 client build took 312.41 seconds (Rust compilation 4m13s).
+Compose checkpoint passed in 12.79 seconds including deployment/readiness; worker
+restart followed by fresh-engine resume passed in 6.37 seconds. Init PIDs changed
+37491 to 38465. The existing in-container probe verified UID/GID 10001, one CPU,
+256 MiB with zero swap, 64 PIDs, zero effective capabilities, no-new-privileges,
+read-only root, 16 MiB nonexecutable temporary storage and loopback-only networking.
+Python/dependency versions match the previous qualified profile. Final stop exited
+zero without OOM. The Compose containers were removed; the images, resolved
+configuration, evidence and `laminar-account-20261001_checkpoints` volume remain.
+
+Validation: the native reference/restart tests passed two tests without default
+features; the real Python-enabled example target passed all three tests in 3.40
+seconds after a 239.61-second build/run command. That Python test starts and
+explicitly stops three real workers. The rebuilt native CLI separately passed
+full, checkpoint and resume commands. Four Python handler tests passed in 0.825
+seconds. The required workspace library gate, with the existing
+`RUST_MIN_STACK=8388608` Windows setting and serial execution, passed 1,977 connector,
+973 core, 2,045 database (two ignored), and 870 SQL tests in 288.10 seconds including
+26.41 seconds compilation. Both required workspace Clippy gates with `-D warnings`
+passed (15.33 seconds all features/targets; 15.63 seconds without defaults).
+Nightly formatting, readability (19 module/193 function exceptions) and diff
+checks passed. Logs, expected failed driver attempts, native checkpoints, image
+metadata, controls and container recovery evidence are retained in ignored
+`target/process-account-20261001/`. Existing Windows default-stack, OpenSSL linker
+debug-symbol and proc-macro future-compatibility caveats remain. This example adds
+no coordinator/core change and makes no latency or throughput claim; their
+Criterion/IPC gate was not triggered.
+
+This completes the scoped account demonstration. It qualifies embedded completed-cut
+`BestEffort` recovery; no crash replay is promised for its direct in-memory source.
+Single-node admission is unchanged. Python stronger delivery and both cluster
+forms remain closed pending their existing qualification gates.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -374,6 +450,18 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 
 ## Next executable task
 
-Complete the original brief's account activity demonstration (section 19) using the existing registration, timer and checkpoint APIs: matching native Rust and Python running totals, threshold-crossing output, named inactivity-timer output, multiple accounts, fixed event-time/watermark progression and an independent expected result. Reuse the qualified container/checkpoint commands for the Python path. The current public example is a running-total fixture, so do not claim that the complete account-monitor demonstration is finished. Keep this scoped to the original example requirement.
+Continue original Phase E with one-owner cluster process-state recovery and
+assignment fencing before distributed handoff. Inspect and reuse the shared
+checkpoint, vnode capture/restore and process-lease lifecycle; qualify ownership
+loss/restart and stale attempts before widening admission. Keep both cluster
+forms closed until their actual ownership/loss/stale-response tests pass. Do not
+introduce a second scheduler or state backend. Coordinator/core changes require
+the repository's before/after Criterion and IPC gates.
 
-Then continue Phase E with one-owner cluster recovery and assignment fencing before distributed handoff. Keep both cluster forms closed until their actual ownership/loss/stale-response tests pass. Complete Python dependency/effect binding, host-loss and cleanup-failure qualification before stronger Python delivery. Longer resource qualification must account for retained FILES history and the remaining small idle memory increments; target-hardware CPU/IPC and representative tail latency remain required before product latency claims.
+Complete Python dependency/effect binding, host-loss and cleanup-failure
+qualification before stronger Python delivery. Longer resource qualification
+must account for retained FILES history and the remaining small idle memory
+increments; target-hardware CPU/IPC and representative tail latency remain
+required before product latency claims. The atomic-only idle watermark boundary
+observed by this example is documented above; it has not been changed or qualified
+as autonomous idle timer progress.
