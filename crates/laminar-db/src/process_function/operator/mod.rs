@@ -108,6 +108,10 @@ pub(crate) struct ProcessFunctionOperator {
     timer_count: usize,
     graph_budget: usize,
     metadata_restored: bool,
+    #[cfg(feature = "cluster")]
+    assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+    #[cfg(feature = "cluster")]
+    vnode_transition: transition::ProcessVnodeTransition,
 }
 
 impl ProcessFunctionOperator {
@@ -186,6 +190,10 @@ impl ProcessFunctionOperator {
             timer_count: 0,
             graph_budget: usize::MAX,
             metadata_restored: false,
+            #[cfg(feature = "cluster")]
+            assignment_fence: None,
+            #[cfg(feature = "cluster")]
+            vnode_transition: transition::ProcessVnodeTransition::Idle,
         })
     }
 
@@ -727,3 +735,6 @@ fn validate_time_column(schema: &arrow_schema::Schema, name: &str) -> Result<usi
 mod graph;
 #[cfg(feature = "process-remote")]
 mod remote;
+mod restoration;
+#[cfg(feature = "cluster")]
+mod transition;

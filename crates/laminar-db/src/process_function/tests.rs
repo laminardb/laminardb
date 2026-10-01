@@ -1376,6 +1376,568 @@ async fn native_function_restores_from_database_checkpoint() {
     restored.shutdown().await.unwrap();
 }
 
+#[cfg(feature = "cluster")]
+mod vnode_transition {
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
+
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::state::{NodeId, PartitionKeyCodecV1};
+    use rustc_hash::FxHashSet;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::operator_graph::{
+        ManagedVnodeRestore, ManagedVnodeTransition, ManagedVnodeTransitionMode,
+        ManagedWholeRestore, OperatorCheckpoint,
+    };
+
+    fn vnode(key: &str) -> u32 {
+        let codec = PartitionKeyCodecV1::try_new([DataType::Utf8]).unwrap();
+        let encoded = codec
+            .encode_columns(&[Arc::new(StringArray::from(vec![key]))])
+            .unwrap();
+        PartitionKeyCodecV1::vnode_for_encoded(encoded.row(0).data(), NonZeroU32::new(256).unwrap())
+    }
+
+    fn fence(version: u64, owners: &[NodeId]) -> CheckpointAssignmentFence {
+        let participants = owners
+            .iter()
+            .map(|owner| owner.0)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|node_id| CheckpointParticipant {
+                node_id,
+                boot_incarnation: Uuid::from_u128(u128::from(node_id)),
+            })
+            .collect();
+        CheckpointAssignmentFence::from_owner_map(
+            version,
+            &owners.iter().map(|owner| owner.0).collect::<Vec<_>>(),
+            participants,
+        )
+        .unwrap()
+    }
+
+    fn image(operator: &mut ProcessFunctionOperator) -> (Vec<u8>, Vec<(u32, Vec<u8>)>) {
+        let mut required = vec![vnode("a"), vnode("b"), vnode("c")];
+        required.sort_unstable();
+        let frames = operator
+            .checkpoint_vnodes(&required, 256, u64::MAX)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|frame| {
+                (
+                    frame.vnode,
+                    frame
+                        .state
+                        .unwrap()
+                        .materialize(&mut 0, u64::MAX)
+                        .unwrap()
+                        .to_vec(),
+                )
+            })
+            .collect();
+        (operator.checkpoint().unwrap().unwrap().data, frames)
+    }
+
+    #[derive(Clone)]
+    struct Fixture {
+        owners: Vec<NodeId>,
+        predecessor: CheckpointAssignmentFence,
+        installed: CheckpointAssignmentFence,
+        target: CheckpointAssignmentFence,
+        donor_metadata: Vec<u8>,
+        acquired_metadata: Vec<u8>,
+        original: Vec<(u32, Vec<u8>)>,
+        acquired: Vec<u8>,
+    }
+
+    impl Fixture {
+        async fn new(binding: ProcessFunctionDescriptor) -> Self {
+            assert_ne!(vnode("a"), vnode("b"));
+            assert_ne!(vnode("a"), vnode("c"));
+            assert_ne!(vnode("b"), vnode("c"));
+            let mut donor =
+                ProcessFunctionOperator::new(binding.clone(), Arc::new(AccountActivity), 256)
+                    .unwrap();
+            let mut acquired =
+                ProcessFunctionOperator::new(binding, Arc::new(AccountActivity), 256).unwrap();
+            let frontier = [InputFrontier {
+                watermark: Some(105),
+                idle: false,
+            }];
+            donor
+                .process_with_frontiers(
+                    &[vec![input_batch(&[
+                        ("a", 60, 100_000),
+                        ("b", 5, 101_000),
+                        ("a", 50, 102_000),
+                    ])]],
+                    &frontier,
+                )
+                .await
+                .unwrap();
+            acquired
+                .process_with_frontiers(&[vec![input_batch(&[("c", 9, 102_000)])]], &frontier)
+                .await
+                .unwrap();
+            let (donor_metadata, mut original) = image(&mut donor);
+            original.retain(|(slot, _)| *slot != vnode("c"));
+            let (acquired_metadata, acquired) = image(&mut acquired);
+            let acquired = acquired
+                .into_iter()
+                .find(|(slot, _)| *slot == vnode("c"))
+                .unwrap()
+                .1;
+            let mut owners = vec![NodeId(7); 256];
+            owners[vnode("c") as usize] = NodeId(8);
+            let predecessor = fence(6, &owners);
+            let installed = fence(7, &owners);
+            let mut target_owners = owners.clone();
+            target_owners[vnode("b") as usize] = NodeId(8);
+            target_owners[vnode("c") as usize] = NodeId(7);
+            let target = fence(8, &target_owners);
+            Self {
+                owners,
+                predecessor,
+                installed,
+                target,
+                donor_metadata,
+                acquired_metadata,
+                original,
+                acquired,
+            }
+        }
+
+        fn bootstrap(&self, operator: &mut ProcessFunctionOperator) -> Result<(), DbError> {
+            let restores = self
+                .original
+                .iter()
+                .map(|(vnode, state)| ManagedVnodeRestore {
+                    participant_id: 7,
+                    vnode: *vnode,
+                    state,
+                })
+                .collect::<Vec<_>>();
+            let whole = [ManagedWholeRestore {
+                participant_id: 7,
+                state: &self.donor_metadata,
+            }];
+            operator.prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &self.predecessor,
+                target: &self.installed,
+                revoked: &FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &self.owners,
+                },
+            })
+        }
+
+        fn transfer(&self, operator: &mut ProcessFunctionOperator) -> Result<(), DbError> {
+            operator.prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &self.installed,
+                target: &self.target,
+                revoked: &FxHashSet::from_iter([vnode("b")]),
+                restores: &[ManagedVnodeRestore {
+                    participant_id: 8,
+                    vnode: vnode("c"),
+                    state: &self.acquired,
+                }],
+                whole_restores: &[ManagedWholeRestore {
+                    participant_id: 8,
+                    state: &self.acquired_metadata,
+                }],
+                mode: ManagedVnodeTransitionMode::Live,
+            })
+        }
+
+        fn installed_operator(
+            &self,
+            binding: ProcessFunctionDescriptor,
+        ) -> ProcessFunctionOperator {
+            let mut operator =
+                ProcessFunctionOperator::new(binding, Arc::new(AccountActivity), 256).unwrap();
+            self.bootstrap(&mut operator).unwrap();
+            operator.publish_vnode_transition();
+            operator.finish_vnode_transition();
+            operator
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_abort_retry_and_publish_preserve_state_and_timers() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        let before = image(&mut operator);
+        fixture.bootstrap(&mut operator).unwrap();
+        let staged = operator.managed_state_accounting().unwrap();
+        assert_eq!(staged.live, 0);
+        assert!(staged.prepared > 0);
+        assert_eq!(staged.retired, 0);
+        assert_eq!(image(&mut operator), before);
+        assert!(fixture.bootstrap(&mut operator).is_err());
+        assert!(operator
+            .restore(OperatorCheckpoint {
+                data: before.0.clone()
+            })
+            .is_err());
+        assert!(operator
+            .restore_vnode(before.1[0].0, 256, &before.1[0].1)
+            .is_err());
+        operator.abort_vnode_transition();
+        assert_eq!(operator.managed_state_accounting().unwrap(), staged);
+        assert_eq!(image(&mut operator), before);
+        assert!(fixture.bootstrap(&mut operator).is_err());
+        operator.finish_vnode_transition();
+        assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        fixture.bootstrap(&mut operator).unwrap();
+        operator.publish_vnode_transition();
+        let published = operator.managed_state_accounting().unwrap();
+        assert!(published.live > 0);
+        assert_eq!(published.prepared, 0);
+        assert!(published.retired > 0);
+        operator.finish_vnode_transition();
+        assert_eq!(operator.managed_state_accounting().unwrap().retired, 0);
+        let output = operator
+            .process_with_frontiers(
+                &[],
+                &[InputFrontier {
+                    watermark: Some(112),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&output),
+            vec![
+                ("b".into(), "inactive".into(), 5, false, 111_000),
+                ("a".into(), "inactive".into(), 110, false, 112_000),
+            ]
+        );
+        let output = operator
+            .process_with_frontiers(
+                &[vec![input_batch(&[("a", 1, 120_000)])]],
+                &[InputFrontier {
+                    watermark: Some(120),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(totals(&output), vec![111]);
+    }
+
+    #[tokio::test]
+    async fn live_transfer_preserves_retained_key_and_retires_revoked_timer() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator = fixture.installed_operator(descriptor());
+        let before = image(&mut operator);
+        fixture.transfer(&mut operator).unwrap();
+        assert_eq!(image(&mut operator), before);
+        operator.abort_vnode_transition();
+        operator.finish_vnode_transition();
+        assert_eq!(image(&mut operator), before);
+        fixture.transfer(&mut operator).unwrap();
+        operator.publish_vnode_transition();
+        assert!(operator.managed_state_accounting().unwrap().retired > 0);
+        assert!(fixture.transfer(&mut operator).is_err());
+        operator.finish_vnode_transition();
+        let after = image(&mut operator);
+        assert_eq!(before.0, after.0);
+        assert_ne!(before.1, after.1);
+        let output = operator
+            .process_with_frontiers(
+                &[],
+                &[InputFrontier {
+                    watermark: Some(112),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            activity_rows(&output),
+            vec![
+                ("a".into(), "inactive".into(), 110, false, 112_000),
+                ("c".into(), "inactive".into(), 9, false, 112_000),
+            ]
+        );
+        let output = operator
+            .process_with_frontiers(
+                &[vec![input_batch(&[("a", 1, 120_000), ("c", 1, 120_000)])]],
+                &[InputFrontier {
+                    watermark: Some(120),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(totals(&output), vec![111, 10]);
+    }
+
+    #[tokio::test]
+    async fn transition_rejects_stale_fence_and_unbound_live_operator() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut unbound =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        assert!(fixture
+            .transfer(&mut unbound)
+            .unwrap_err()
+            .to_string()
+            .contains("installed assignment"));
+        let mut operator = fixture.installed_operator(descriptor());
+        let before = image(&mut operator);
+        for change in 0..3 {
+            let mut invalid = fixture.clone();
+            match change {
+                0 => invalid.installed.assignment_version -= 1,
+                1 => invalid.installed.participants[0].boot_incarnation = Uuid::from_u128(100),
+                2 => invalid.target.assignment_version += 1,
+                _ => unreachable!(),
+            }
+            assert!(invalid.transfer(&mut operator).is_err());
+            assert_eq!(image(&mut operator), before);
+            assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        }
+        fixture.transfer(&mut operator).unwrap();
+        operator.abort_vnode_transition();
+        operator.finish_vnode_transition();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_invalid_donor_binding_and_vnode_frames_atomically() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        let before = image(&mut operator);
+        for change in 0..7 {
+            let mut invalid = fixture.clone();
+            match change {
+                0 => {
+                    let mut metadata: serde_json::Value =
+                        serde_json::from_slice(&invalid.donor_metadata).unwrap();
+                    metadata["descriptor_sha256"] = serde_json::json!("f".repeat(64));
+                    invalid.donor_metadata = serde_json::to_vec(&metadata).unwrap();
+                }
+                1 => invalid.original.last_mut().unwrap().1 = b"{".to_vec(),
+                2 => invalid.original.push(invalid.original[0].clone()),
+                3 => invalid.original[0].0 = 256,
+                4 => invalid.owners[vnode("a") as usize] = NodeId(8),
+                5 => invalid.donor_metadata.clear(),
+                6 => {
+                    let mut metadata: serde_json::Value =
+                        serde_json::from_slice(&invalid.donor_metadata).unwrap();
+                    metadata["next_timer_generation"] = serde_json::json!(0);
+                    invalid.donor_metadata = serde_json::to_vec(&metadata).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(invalid.bootstrap(&mut operator).is_err(), "case {change}");
+            assert_eq!(image(&mut operator), before, "case {change}");
+            assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        }
+        fixture.bootstrap(&mut operator).unwrap();
+        operator.abort_vnode_transition();
+        operator.finish_vnode_transition();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_merges_donor_counters_and_validates_each_donors_timer_generation() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator =
+            ProcessFunctionOperator::new(descriptor(), Arc::new(AccountActivity), 256).unwrap();
+        let before = image(&mut operator);
+        let target = fence(7, &vec![NodeId(7); 256]);
+        for change in 0..5 {
+            let mut frames = fixture.original.clone();
+            frames.push((vnode("c"), fixture.acquired.clone()));
+            frames.sort_unstable_by_key(|(vnode, _)| *vnode);
+            let mut whole = vec![
+                (7, fixture.donor_metadata.clone()),
+                (8, fixture.acquired_metadata.clone()),
+            ];
+            match change {
+                0 => {
+                    whole.pop();
+                }
+                1 => whole.push(whole[0].clone()),
+                2 => whole[1].0 = 9,
+                3 => {
+                    let mut metadata: serde_json::Value =
+                        serde_json::from_slice(&whole[1].1).unwrap();
+                    metadata["watermark_us"] = serde_json::json!(104_000);
+                    whole[1].1 = serde_json::to_vec(&metadata).unwrap();
+                }
+                4 => {
+                    let frame = frames
+                        .iter_mut()
+                        .find(|(slot, _)| *slot == vnode("c"))
+                        .unwrap();
+                    let mut state: serde_json::Value = serde_json::from_slice(&frame.1).unwrap();
+                    state["entries"][0][1]["timers"]["inactive"]["generation"] =
+                        serde_json::json!(2);
+                    frame.1 = serde_json::to_vec(&state).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let restores = frames
+                .iter()
+                .map(|(slot, state)| ManagedVnodeRestore {
+                    participant_id: if *slot == vnode("c") { 8 } else { 7 },
+                    vnode: *slot,
+                    state,
+                })
+                .collect::<Vec<_>>();
+            let whole_restores = whole
+                .iter()
+                .map(|(participant_id, state)| ManagedWholeRestore {
+                    participant_id: *participant_id,
+                    state,
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                operator
+                    .prepare_vnode_transition(ManagedVnodeTransition {
+                        predecessor: &fixture.predecessor,
+                        target: &target,
+                        revoked: &FxHashSet::default(),
+                        restores: &restores,
+                        whole_restores: &whole_restores,
+                        mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                            predecessor_owners: &fixture.owners
+                        },
+                    })
+                    .is_err(),
+                "case {change}"
+            );
+            assert_eq!(image(&mut operator), before);
+            assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        }
+        let mut frames = fixture.original.clone();
+        frames.push((vnode("c"), fixture.acquired.clone()));
+        frames.sort_unstable_by_key(|(slot, _)| *slot);
+        let restores = frames
+            .iter()
+            .map(|(slot, state)| ManagedVnodeRestore {
+                participant_id: if *slot == vnode("c") { 8 } else { 7 },
+                vnode: *slot,
+                state,
+            })
+            .collect::<Vec<_>>();
+        let whole_restores = [
+            ManagedWholeRestore {
+                participant_id: 7,
+                state: &fixture.donor_metadata,
+            },
+            ManagedWholeRestore {
+                participant_id: 8,
+                state: &fixture.acquired_metadata,
+            },
+        ];
+        operator
+            .prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &fixture.predecessor,
+                target: &target,
+                revoked: &FxHashSet::default(),
+                restores: &restores,
+                whole_restores: &whole_restores,
+                mode: ManagedVnodeTransitionMode::CheckpointBootstrap {
+                    predecessor_owners: &fixture.owners,
+                },
+            })
+            .unwrap();
+        operator.publish_vnode_transition();
+        operator.finish_vnode_transition();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&operator.checkpoint().unwrap().unwrap().data).unwrap();
+        assert_eq!(metadata["next_activation_id"], 3);
+        assert_eq!(metadata["next_timer_generation"], 3);
+        let output = operator
+            .process_with_frontiers(
+                &[],
+                &[InputFrontier {
+                    watermark: Some(112),
+                    idle: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(totals(&output), vec![5, 110, 9]);
+    }
+
+    #[tokio::test]
+    async fn transfer_rejects_donor_cut_mismatch_without_revoking_live_state() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator = fixture.installed_operator(descriptor());
+        let before = image(&mut operator);
+        let mut invalid = fixture.clone();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&invalid.acquired_metadata).unwrap();
+        metadata["watermark_us"] = serde_json::json!(104_000);
+        invalid.acquired_metadata = serde_json::to_vec(&metadata).unwrap();
+        assert!(invalid
+            .transfer(&mut operator)
+            .unwrap_err()
+            .to_string()
+            .contains("watermarks"));
+        assert_eq!(image(&mut operator), before);
+        assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+    }
+
+    #[tokio::test]
+    async fn transition_reserves_temporary_state_and_checks_final_key_timer_limits() {
+        let fixture = Fixture::new(descriptor()).await;
+        let mut operator = fixture.installed_operator(descriptor());
+        let before = image(&mut operator);
+        operator.set_managed_state_budget(operator.managed_state_accounting().unwrap().live);
+        assert!(matches!(
+            fixture.transfer(&mut operator),
+            Err(DbError::ManagedStateBudgetExceeded { .. })
+        ));
+        assert_eq!(image(&mut operator), before);
+        assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        for change in 0..3 {
+            let mut binding = descriptor();
+            match change {
+                0 => binding.limits.max_keys = 2,
+                1 => binding.limits.max_timers = 2,
+                2 => binding.limits.max_state_bytes = 512,
+                _ => unreachable!(),
+            }
+            let fixture = Fixture::new(binding.clone()).await;
+            let mut operator = fixture.installed_operator(binding);
+            let before = image(&mut operator);
+            let mut target_owners = fixture.owners.clone();
+            target_owners[vnode("c") as usize] = NodeId(7);
+            let target = fence(8, &target_owners);
+            let result = operator.prepare_vnode_transition(ManagedVnodeTransition {
+                predecessor: &fixture.installed,
+                target: &target,
+                revoked: &FxHashSet::default(),
+                restores: &[ManagedVnodeRestore {
+                    participant_id: 8,
+                    vnode: vnode("c"),
+                    state: &fixture.acquired,
+                }],
+                whole_restores: &[ManagedWholeRestore {
+                    participant_id: 8,
+                    state: &fixture.acquired_metadata,
+                }],
+                mode: ManagedVnodeTransitionMode::Live,
+            });
+            assert!(result.is_err(), "case {change}");
+            assert_eq!(image(&mut operator), before);
+            assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        }
+    }
+}
+
 mod shared_checkpoint {
     use std::collections::{BTreeMap, HashMap};
 
@@ -2557,6 +3119,31 @@ def handle(activations):
             error.to_string().contains("no pending invocation"),
             "{error}"
         );
+        #[cfg(feature = "cluster")]
+        {
+            use crate::operator_graph::{ManagedVnodeTransition, ManagedVnodeTransitionMode};
+            use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+            let participant = CheckpointParticipant {
+                node_id: 7,
+                boot_incarnation: uuid::Uuid::from_u128(7),
+            };
+            let predecessor =
+                CheckpointAssignmentFence::from_owner_map(1, &[7; 4], vec![participant]).unwrap();
+            let target =
+                CheckpointAssignmentFence::from_owner_map(2, &[7; 4], vec![participant]).unwrap();
+            let error = operator
+                .prepare_vnode_transition(ManagedVnodeTransition {
+                    predecessor: &predecessor,
+                    target: &target,
+                    revoked: &rustc_hash::FxHashSet::default(),
+                    restores: &[],
+                    whole_restores: &[],
+                    mode: ManagedVnodeTransitionMode::Live,
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("drained invocations"), "{error}");
+            assert_eq!(operator.managed_state_accounting().unwrap().prepared, 0);
+        }
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), wake.notified())
             .await

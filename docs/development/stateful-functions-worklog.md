@@ -510,6 +510,87 @@ cluster lease loss/restart, fenced publication, and distributed transfer remain
 unqualified. There is no new scheduler, state backend or speculative transfer
 framework. Python's supported delivery profile remains `BestEffort`.
 
+### Continuation: process vnode preparation and publication (2026-10-01)
+
+Starting from `fc7363ebc3a514aaa37f09aa8ad80b35df83a3b8` on
+`codex/stateful-process-functions`, this Phase E increment implements the process
+operator's existing `GraphOperator` prepare/abort/publish/finish hooks. It does not
+enable cluster registration or remove the graph's transfer-admission rejection.
+The toolchain remains Rust 1.98.0 and Cargo 1.98.0; no dependency, protocol,
+checkpoint codec or public API changes are needed.
+
+Preparation binds to canonical predecessor/target fences, requires a fresh graph
+for older-cut bootstrap or the exact installed predecessor for an adjacent live
+transition, and rejects pending worker calls. Every acquired vnode needs its
+donor's validated descriptor metadata. Donor counters merge by maximum, but each
+timer is validated against its own donor's generation. Donor watermarks must
+describe the same cut; a live transfer cannot lower the installed watermark.
+The graph remains responsible for exact live owner rosters and verified donor
+provenance. Bootstrap additionally checks the supplied predecessor owner map.
+
+Only changed vnode maps are staged. A replacement due-timer index is reserved
+before publication; unchanged keyed maps remain resident. Accounting includes
+prepared and retired state, map capacities, timer-index copies, slot/assignment
+metadata, borrowed payloads and decode headroom. Key, timer and state limits apply to the
+resulting live state as well. Publication swaps prepared allocations and retains
+displaced state for explicit cleanup outside graph authority locks. Abort keeps
+live state untouched and retains its allocations until the same cleanup hook.
+An enum owns the preparation/cleanup lifecycle and blocks reuse before cleanup.
+Startup and transfer restoration share the existing metadata and vnode decoding
+rules; direct startup restoration rejects overlapping transition state.
+
+Tests use captured native process frames and canonical assignment fixtures to
+exercise bootstrap, abort/retry, live acquire/revoke, retained-key continuity,
+revoked timers, multiple donors, counter merging, malformed/duplicate/missing
+donor state, stale assignment/boot identity, and temporary/final state budgets.
+The existing actual-RPC pending-restore regression also attempts a transition and
+verifies rejection leaves the delayed invocation's valid result intact. These
+are participant-hook tests, not actual process-lease, shuffle, CAS-publication or
+cluster-admission qualification.
+
+Baseline: the unchanged feature-specific process suite passed 51 tests (one
+resource stress test ignored) in 27.45 seconds, 30.99 seconds including Cargo.
+The unchanged recovery-manager tests passed four tests in 0.22 seconds using the
+same baseline binary. The feature-specific command
+`cargo test -p laminar-db --lib --no-default-features --features
+cluster,process-remote,files process_function::tests:: -- --test-threads=1 --quiet`
+then passed 58 tests (one resource stress test ignored) in 43.26 seconds, 744.45
+seconds including compilation. The rebuilt binary's four recovery-manager tests
+also passed in 0.01 seconds. No real-Python environment was selected; its tests
+that return without the environment do not add Python qualification here.
+
+After the two lint fixes below, final `cargo test --workspace --lib --
+--test-threads=1 --quiet` passed 5,878 tests: connectors 1,977 in 155.60 seconds,
+core 973 in 15.39 seconds, db 2,058 in 92.74 seconds (two ignored), derive zero,
+and SQL 870 in 2.18 seconds. This run includes all seven new tests and the
+modified real-RPC pending-work regression on final Rust source. The whole command
+took 1,303.96 seconds, including 17m13s compilation. Both test runs used the
+existing Windows `RUST_MIN_STACK=8388608` setting; the unadjusted stack boundary
+has not been fixed. Cargo build concurrency was limited to two jobs.
+
+Required `cargo clippy --workspace --all-features --all-targets -- -D warnings`
+and `cargo clippy --workspace --no-default-features -- -D warnings` passed in
+53.10 and 13.49 seconds. Nightly formatting, `git diff --check` and readability
+passed; the checker retains 19 module and 193 function exceptions without growth.
+Existing OpenSSL debug-symbol and proc-macro future-compatibility warnings remain.
+No coordinator/core operator or record dispatch changed; the mandatory
+Criterion/IPC gate for those paths was not triggered and no performance claim is
+added. SDK, CLI and container code are unchanged and were not separately rerun.
+
+Preliminary attempts are retained: one fixture needed a `Bytes`-to-`Vec` conversion;
+one sandboxed compile ended with exit code -1 before testing; a duplicated test
+definition was removed; and Clippy requested a borrowed internal transition view
+and a checked-width vnode result. The latter uses the existing codec's `u32`
+return directly. An independent Cargo job was left running throughout. Evidence
+is retained under `target/process-vnode-transition-20261001/`.
+
+Embedded and single-node server admission are unchanged. Both cluster forms and
+stronger Python delivery remain rejected. The new assignment fence is installed
+by participant bootstrap publication only; initial and same-assignment cluster
+startup still need authoritative graph/control binding before intake. Actual
+lease loss, old-owner responses, shuffle ordering and distributed publication
+remain unqualified; these operator-hook tests do not open cluster admission.
+
 ## Deployment scope and qualification gates
 
 | Mode | Current admission | Required before enabling |
@@ -526,10 +607,15 @@ One-node cluster execution uses the cluster lifecycle and cannot be treated as a
 Continue original Phase E with process-lease and assignment fencing through the
 existing graph lifecycle. The shared-cut fixture above verifies same-owner frame
 restoration and isolated graph generations; it is not an admission certificate.
-Next integrate process state/timers with the existing managed vnode
-prepare/publish/abort lifecycle and bind remote attempts to the authoritative
-assignment/recovery generation. Qualify actual one-owner lease loss/restart and
-stale results before distributed acquisition/revocation. Keep both cluster forms
+The process participant now implements staged state/timer replacement through
+the existing prepare/publish/abort/finish hooks. Next bind it to the existing
+cluster graph/control authority at initial and same-assignment startup, route
+canonical keyed input through the existing shuffle, and bind remote attempts to
+authoritative assignment/recovery generations. The current hook fixtures do not
+acquire leases or validate record intake against ownership; remote invocation
+scope generations remain local zero values. Qualify actual one-owner lease
+loss/restart and stale results before admitting distributed acquisition/revocation.
+Keep both cluster forms
 closed until their actual ownership/loss/stale-response tests pass. Do not add a
 second scheduler or state backend. Coordinator/core changes require the
 repository's before/after Criterion and IPC gates.

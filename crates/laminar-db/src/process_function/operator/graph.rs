@@ -1,12 +1,5 @@
-use std::sync::Arc;
-
-use arrow::array::{RecordBatch, StringArray};
-use async_trait::async_trait;
-use laminar_core::serialization::BoundedBytesWriter;
-use laminar_core::state::PARTITIONING_ABI_VERSION;
-use rustc_hash::FxHashMap;
-
-use super::{charged_key, OperatorFrame, ProcessFunctionOperator, VnodeCapture, VnodeFrame};
+use super::restoration::MAX_OPERATOR_FRAME_BYTES;
+use super::{ProcessFunctionOperator, VnodeCapture};
 use crate::error::DbError;
 use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 use crate::operator_graph::{
@@ -16,9 +9,9 @@ use crate::operator_graph::{
 #[cfg(feature = "process-remote")]
 use crate::process_function::ProcessHandler;
 use crate::process_function::STATE_CODEC_VERSION;
-
-// V1 metadata has fixed fields, a 64-byte SHA-256 digest, and bounded integer widths.
-const MAX_OPERATOR_FRAME_BYTES: usize = 512;
+use arrow::array::RecordBatch;
+use async_trait::async_trait;
+use laminar_core::serialization::BoundedBytesWriter;
 
 #[async_trait]
 impl GraphOperator for ProcessFunctionOperator {
@@ -27,10 +20,14 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn managed_state_accounting(&self) -> Option<ManagedStateAccountingSnapshot> {
+        #[cfg(feature = "cluster")]
+        let (prepared, retired) = self.vnode_transition.accounting();
+        #[cfg(not(feature = "cluster"))]
+        let (prepared, retired) = (0, 0);
         Some(ManagedStateAccountingSnapshot {
             live: self.live_bytes,
-            prepared: 0,
-            retired: 0,
+            prepared,
+            retired,
         })
     }
 
@@ -163,15 +160,7 @@ impl GraphOperator for ProcessFunctionOperator {
                 "process worker invocation must drain before checkpoint capture".into(),
             ));
         }
-        let frame = OperatorFrame {
-            codec: STATE_CODEC_VERSION,
-            descriptor_sha256: self.descriptor_sha256.clone(),
-            partitioning_abi: PARTITIONING_ABI_VERSION,
-            vnode_count: self.vnode_count.get(),
-            next_activation_id: self.next_activation_id,
-            next_timer_generation: self.next_timer_generation,
-            watermark_us: self.watermark_us,
-        };
+        let frame = self.checkpoint_frame();
         let data = serde_json::to_vec(&frame)
             .map_err(|error| DbError::Checkpoint(format!("encode process checkpoint: {error}")))?;
         if data.len() > MAX_OPERATOR_FRAME_BYTES {
@@ -183,6 +172,12 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if !self.vnode_transition.is_idle() {
+            return Err(DbError::Checkpoint(
+                "process metadata restore overlaps a vnode transition".into(),
+            ));
+        }
         if self.metadata_restored
             || self.next_activation_id != 0
             || self.next_timer_generation != 0
@@ -194,22 +189,7 @@ impl GraphOperator for ProcessFunctionOperator {
                 "process metadata restore requires a fresh operator before input admission".into(),
             ));
         }
-        if checkpoint.data.len() > MAX_OPERATOR_FRAME_BYTES {
-            return Err(DbError::Checkpoint(
-                "process metadata frame exceeds its size bound".into(),
-            ));
-        }
-        let frame: OperatorFrame = serde_json::from_slice(&checkpoint.data)
-            .map_err(|error| DbError::Checkpoint(format!("decode process checkpoint: {error}")))?;
-        if frame.codec != STATE_CODEC_VERSION
-            || frame.descriptor_sha256 != self.descriptor_sha256
-            || frame.partitioning_abi != PARTITIONING_ABI_VERSION
-            || frame.vnode_count != self.vnode_count.get()
-        {
-            return Err(DbError::Checkpoint(
-                "process function checkpoint binding or state codec mismatch".into(),
-            ));
-        }
+        let frame = self.decode_metadata(&checkpoint.data)?;
         self.next_activation_id = frame.next_activation_id;
         self.next_timer_generation = frame.next_timer_generation;
         self.watermark_us = frame.watermark_us;
@@ -267,6 +247,12 @@ impl GraphOperator for ProcessFunctionOperator {
     }
 
     fn restore_vnode(&mut self, vnode: u32, vnode_count: u32, bytes: &[u8]) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if !self.vnode_transition.is_idle() {
+            return Err(DbError::Checkpoint(
+                "process vnode restore overlaps a vnode transition".into(),
+            ));
+        }
         // RECOVERY: vnode bytes do not repeat the descriptor binding. Validate it in the whole
         // frame before installing keyed data, and keep worker proposals outside this restore cut.
         if !self.metadata_restored || self.checkpoint_drain_pending() {
@@ -280,8 +266,6 @@ impl GraphOperator for ProcessFunctionOperator {
                 "process restore vnode domain mismatch".into(),
             ));
         }
-        // A JSON string byte can expand to six escaped bytes. The fixed per-key and per-timer
-        // charges cover framing, so a valid image cannot exceed this bound.
         let state_limit = self
             .descriptor
             .limits
@@ -290,97 +274,72 @@ impl GraphOperator for ProcessFunctionOperator {
         let remaining_state_bytes = state_limit.checked_sub(self.live_bytes).ok_or_else(|| {
             DbError::Checkpoint("process restored state exceeds its budget".into())
         })?;
-        let frame_limit = remaining_state_bytes.saturating_mul(6).saturating_add(128);
-        if bytes.len() > frame_limit {
-            return Err(DbError::Checkpoint(
-                "process vnode frame exceeds state budget".into(),
-            ));
-        }
-        let frame: VnodeFrame = serde_json::from_slice(bytes)
-            .map_err(|error| DbError::Checkpoint(format!("decode process vnode: {error}")))?;
-        if frame.codec != STATE_CODEC_VERSION || frame.vnode != vnode {
-            return Err(DbError::Checkpoint(
-                "process vnode codec or identity mismatch".into(),
-            ));
-        }
         if !self.state[vnode as usize].is_empty() {
             return Err(DbError::Checkpoint("process vnode restored twice".into()));
         }
-        let mut previous: Option<Vec<u8>> = None;
-        let mut restored = FxHashMap::default();
-        let mut staged_due = std::collections::BTreeSet::new();
-        let mut live_bytes = self.live_bytes;
-        let mut key_count = self.key_count;
-        let mut timer_count = self.timer_count;
-        for (key, state) in frame.entries {
-            let encoded_key = self
-                .key_codec
-                .encode_columns(&[Arc::new(StringArray::from(vec![state.key_text.as_str()]))])
-                .map_err(|error| {
-                    DbError::Checkpoint(format!("encode restored process key: {error}"))
-                })?;
-            if previous
-                .as_deref()
-                .is_some_and(|before| before >= key.as_slice())
-                || self.vnode_for(&key) != vnode as usize
-                || state.is_empty()
-                || encoded_key.row(0).data() != key.as_slice()
-            {
-                return Err(DbError::Checkpoint(
-                    "invalid process vnode key roster".into(),
-                ));
-            }
-            previous = Some(key.clone());
-            for (name, timer) in &state.timers {
-                if !self
-                    .descriptor
-                    .timer_names
-                    .iter()
-                    .any(|declared| declared == name)
-                    || timer.generation > self.next_timer_generation
-                {
-                    return Err(DbError::Checkpoint(
-                        "invalid process timer in checkpoint".into(),
-                    ));
-                }
-            }
-            live_bytes = live_bytes
-                .checked_add(charged_key(&key, &state)?)
-                .ok_or_else(|| {
-                    DbError::Checkpoint("process restored state byte accounting overflow".into())
-                })?;
-            key_count = key_count.checked_add(1).ok_or_else(|| {
+        let mut restored = self.decode_vnode(
+            vnode,
+            bytes,
+            self.next_timer_generation,
+            remaining_state_bytes,
+        )?;
+        let key_count = self
+            .key_count
+            .checked_add(restored.state.len())
+            .ok_or_else(|| {
                 DbError::Checkpoint("process restored key accounting overflow".into())
             })?;
-            timer_count = timer_count.checked_add(state.timers.len()).ok_or_else(|| {
+        let timer_count = self
+            .timer_count
+            .checked_add(restored.due.len())
+            .ok_or_else(|| {
                 DbError::Checkpoint("process restored timer accounting overflow".into())
             })?;
-            if live_bytes > state_limit
-                || key_count > self.descriptor.limits.max_keys
-                || timer_count > self.descriptor.limits.max_timers
-            {
-                return Err(DbError::Checkpoint(
-                    "process restored state or timer budget exceeded".into(),
-                ));
-            }
-            for (name, timer) in &state.timers {
-                staged_due.insert((timer.at_us, key.clone(), name.clone(), timer.generation));
-            }
-            restored.insert(key, state);
+        if key_count > self.descriptor.limits.max_keys
+            || timer_count > self.descriptor.limits.max_timers
+        {
+            return Err(DbError::Checkpoint(
+                "process restored state or timer budget exceeded".into(),
+            ));
         }
-        self.due.append(&mut staged_due);
-        self.state[vnode as usize] = restored;
-        self.live_bytes = live_bytes;
+        self.due.append(&mut restored.due);
+        self.state[vnode as usize] = restored.state;
+        self.live_bytes += restored.live_bytes;
         self.key_count = key_count;
         self.timer_count = timer_count;
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepare_vnode_transition(
+        &mut self,
+        transition: crate::operator_graph::ManagedVnodeTransition<'_>,
+    ) -> Result<(), DbError> {
+        let prepared = self.prepare_transition(&transition)?;
+        self.vnode_transition = super::transition::ProcessVnodeTransition::Prepared(prepared);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_vnode_transition(&mut self) {
+        self.vnode_transition.abort();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn publish_vnode_transition(&mut self) {
+        self.publish_transition();
+    }
+
+    #[cfg(feature = "cluster")]
+    fn finish_vnode_transition(&mut self) {
+        self.vnode_transition.finish();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{VnodeCapture, VnodeFrame, MAX_OPERATOR_FRAME_BYTES};
-    use crate::process_function::operator::{KeyState, OperatorFrame};
+    use super::{VnodeCapture, MAX_OPERATOR_FRAME_BYTES};
+    use crate::process_function::operator::{KeyState, OperatorFrame, VnodeFrame};
     use crate::process_function::{ValueState, STATE_CODEC_VERSION};
 
     #[test]
