@@ -10914,6 +10914,33 @@ async fn topology_status_distinguishes_adoption_replay_and_runtime_release() {
             .locally_active_version,
         Some(TopologyVersion::LEGACY_BASELINE)
     );
+    // The real capture helper and assignment/source release share the existing authority lock.
+    // A still-current assignment must not reopen a held topology cut or report it active.
+    assert!(
+        crate::pipeline_callback::fence_intake_after_terminal_cut_capture(
+            &db.source_gate,
+            &db.topology_cut_hold,
+            &db.cluster_authority_transition,
+            laminar_core::checkpoint::flags::TOPOLOGY_CUT,
+            false,
+        )
+    );
+    db.set_source_gate(false);
+    assert!(db.source_gate.load(std::sync::atomic::Ordering::Acquire));
+    assert!(db
+        .topology_cut_hold
+        .load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        db.cluster_topology_status()
+            .await
+            .unwrap()
+            .locally_active_version,
+        None
+    );
+    // Reset the control-state fixture; production clears this only at authorized recovery Release.
+    db.topology_cut_hold
+        .store(false, std::sync::atomic::Ordering::Release);
+    db.set_source_gate(false);
     authority.controller.set_recovering(true);
     assert_eq!(
         db.cluster_topology_status()

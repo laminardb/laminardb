@@ -208,7 +208,7 @@ impl CheckpointCoordinator {
                 .await?;
         let handoff_replay_pending = request.handoff_replay_pending;
         let terminal_handoff =
-            sink_epoch_admission::is_terminal_handoff(request.flags, handoff_replay_pending);
+            sink_epoch_admission::is_terminal_cut(request.flags, handoff_replay_pending);
         let prepare_outcome = self
             .follower_prepare_acked_until(
                 request,

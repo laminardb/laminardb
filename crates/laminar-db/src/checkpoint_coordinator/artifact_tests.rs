@@ -31,6 +31,36 @@ use object_store::memory::InMemory;
 #[cfg(feature = "cluster")]
 use object_store::ObjectStoreExt;
 
+#[tokio::test]
+async fn terminal_cut_capture_rejects_unconfigured_mixed_and_replay_cuts() {
+    use laminar_core::checkpoint::flags;
+    let store = ObjectStoreCheckpointStore::new(Arc::new(InMemory::new()), "invalid-topology-cut");
+    let coordinator =
+        CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store)).unwrap();
+    let mut request = CheckpointRequest {
+        flags: flags::TOPOLOGY_CUT,
+        ..Default::default()
+    };
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("requires"));
+    request.flags |= flags::HANDOFF;
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("exclusive"));
+    request.flags = flags::TOPOLOGY_CUT;
+    request.handoff_replay_pending = true;
+    assert!(coordinator
+        .validate_request(&request)
+        .unwrap_err()
+        .to_string()
+        .contains("replay-free"));
+}
+
 #[cfg(feature = "cluster")]
 pub(super) struct CommitThenIoStore {
     pub(super) inner: Arc<dyn object_store::ObjectStore>,

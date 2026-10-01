@@ -9,11 +9,14 @@ Uninitialized --existing cold catalog seal--> LegacySealed
 LegacySealed --fenced identical-inventory adoption--> Versioned(topology 1)
 ```
 
-Core pre-cut admission now implements `Planned -> Aborted`, including abort on a
-leader term change or durable recovery fault. It reserves an exact candidate and
-assignment without authorizing candidate actors. No record can commit topology 2.
-Preparing, Quiescing, CutPrepared, Committed, Activating and Active still need the
-working cut, restore, retirement and release contracts. Runtime DDL stays fenced.
+Old-topology preparation implements `Planned -> Quiescing -> CutPrepared`, with
+pre-target-commit abort on a leader term change, definitive checkpoint Abort or
+durable recovery fault. A prepared cut includes the exact committed checkpoint
+and every frozen process's application receipt; intake and successor sink epochs
+remain held. It reserves an exact candidate without authorizing candidate actors.
+No record can commit topology 2. Candidate compatibility, target restore,
+retirement, Committed/Activating/Active and release remain unfinished. Runtime DDL
+stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
 authority append uses a create-only sequence object and the store's conditional
@@ -39,7 +42,9 @@ initializes a missing identity or rewrites historical checkpoints.
 Encoding 12 omits the new optional fields, preserving its canonical serialization.
 Encoding 13 requires a valid baseline. Encoding 14 adds assignment reservations
 and the pre-cut request journal. It may precede baseline adoption; missing baseline
-metadata still means an unversioned legacy catalog. Every later lease, checkpoint,
+metadata still means an unversioned legacy catalog. Encoding 15 binds the exact
+old-topology checkpoint inventory, Commit and frozen application roster and
+requires an adopted baseline. Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
 reject unsupported encodings/admission fields; an old writer paused after reading encoding 12
@@ -50,8 +55,9 @@ Reads validate the catalog blob, retained adoption append and deployment identit
 from one immutable authority snapshot. Absence of metadata explicitly means
 LegacySealed, never an inferred current version. Cleanup retains the adoption
 append permanently as one extra authority root. A prune snapshot taken before
-adoption cannot delete a later sequence. Future migration roots and replay pins
-still need integration with checkpoint/artifact retention floors.
+adoption cannot delete a later sequence. Live old-cut roots are now protected from
+checkpoint artifact-floor advancement; target migration roots and replay mappings
+still need integration.
 
 ## Pre-cut admission and assignment serialization
 
@@ -75,17 +81,18 @@ assignments. It stages the target and canonical request, then appends one payloa
 reservation. Assignment reservations, recovery decisions and checkpoint artifact
 admission contend on that same sequence. There is no check-then-publish gap between
 an admitted drain intent and topology admission. This does not yet certify participant
-capabilities, operator compatibility, source positions or a checkpoint cut.
+capabilities, operator compatibility or new-source activation positions.
 
-Only one request can be Planned. Identical retries return the original durable
+Only one request can be preparing. Identical retries return the original durable
 status, including a prior abort and retry by a replacement leader process; a
 different payload with the same identity fails. Current leader authority is still
 required. Frozen participant membership is checked for fresh admission, not for
 returning an existing request's result.
 Legacy adoption identities cannot be reused for migration requests. New ordinary
-checkpoint/assignment admission is rejected during Planned. Renewal preserves it;
+checkpoint/assignment admission is rejected throughout preparation except for the
+exact atomically bound old cut. Renewal preserves it;
 a new leader term or recovery fault atomically aborts it and retains recovery
-evidence. This policy applies only to the implemented pre-cut phase. Future committed
+evidence. This policy applies only before target commit. Future committed
 phases must recover the target instead of using this abort helper.
 
 Plan payloads are capped at 32 KiB and the retained request journal at 64 identities.
@@ -96,6 +103,55 @@ cleanup follows the admitted assignment-decision floor in bounded batches. Reque
 journal eviction and orphan candidate/plan cleanup are not implemented; a full
 journal rejects further admission. No public submit endpoint or cutover worker is
 enabled, so this bound is not advertised as a complete migration retention policy.
+
+## Old-topology checkpoint cut
+
+The existing manual checkpoint owner drives a reserved cut. Periodic admission
+defers before reserving an attempt. The controller uses its configured assignment
+store and live leader/process gates; one shared append installs `Quiescing`, the
+exact artifact inventory and its leader proof before Prepare or source barrier
+publication. A retry can only reuse that same attempt, deployment, pipeline ABI
+and complete owner/boot roster. An ordinary, unbound or mixed-flag barrier cannot
+cross the reservation.
+
+`TOPOLOGY_CUT` uses the existing source barrier, shuffle alignment, asynchronous
+operator drain, sink fence and checkpoint capture contracts. Source intake closes
+after its barriers arrive, before mutable state capture. A topology cut rejects
+retained intermediate shuffle replay instead of treating it as a final cut. The
+existing full pipeline fingerprint and state checks remain mandatory.
+
+The normal old-topology terminal Commit and the operation's exact checkpoint
+reference are persisted in the same authority append. This is a checkpoint Commit
+under T, not a topology-change Commit. It leaves `Quiescing` visible. The leader
+then finishes the existing globally aggregated external sink settlement; its
+receipt follows that settlement. Followers report local checkpoint application.
+Only the complete frozen roster, including the original leader, yields
+`CutPrepared`. Each runtime-owned tail keeps successor sink publication sealed.
+Missing receipts or uncertain sink responses never imply sink failure or permit
+target execution. Completion publication failure reports a continuation error
+while preserving a successful old checkpoint; recovery must reconcile it.
+
+Cancellation or a lost write response is resolved by the exact operation and
+attempt. Authority pruning pins admission, disposition, cut-binding and old
+Commit appends. While preparation is live, status audits the canonical committed
+index and cleanup cannot advance its artifact floor beyond the cut. After abort,
+ordinary checkpoint/replay retention owns that index; historical operation status
+still audits its retained authority anchors and does not require artifacts already
+retired by normal retention.
+
+Requested abort is allowed before binding or after all application receipts.
+An unresolved `Quiescing` cut requires coordinated recovery rather than assuming
+its sink outcome. An abort never reopens local intake by itself. Recovery/restart
+must resume T from its reconciled committed progress; a committed old cut is not
+rewound. This increment has no target worker or direct local resume shortcut.
+
+The cut sets a dedicated local hold under the existing authority-transition lock.
+Assignment refresh may retain its current certificate for checkpoint tails, but
+cannot reopen intake or admit a successor sink epoch while that hold is set.
+Only consumption of an authorized coordinated recovery Release clears the hold,
+after retirement, restore/readiness and exact authority checks. A rejected release
+preserves it. A fresh process starts with intake fenced by the existing startup
+recovery protocol.
 
 ## Bounds, ownership and locks
 
@@ -111,9 +167,23 @@ after the complete ordered inventory matches. Source intake release, Running
 state and live process/recovery authority are separately required for local
 activation. No synchronous lock spans an await in the new code.
 
-All additions run on control/API/startup paths. The record/batch push, operator
-execution, Arrow ownership, shuffle envelope and sink publication paths are
-unchanged. There are no new per-row checks, serialization, locks or allocations.
+All additions run on control/API/startup paths. Checkpoint admission now reads
+shared topology authority; cut completion adds bounded control appends. These
+reads can affect checkpoint control latency and require separate measurement.
+The callback retains the current exact leader proof when checkpoint reservation
+returns an ID, before deadline, process and Prepare-time rechecks. If topology
+admission wins after ordinary flag selection, that attempt reaches a definitive
+Abort before any source barrier or intake hold. Its original proof owns cleanup;
+a replacement proof cannot be substituted. The unchanged Planned request can
+then bind a later cut using the same operation identity.
+Reservation-only Abort requires an idle coordinator, no prepared local state,
+sink intents or transactional sinks, and no admitted checkpoint artifacts. The
+authority append enforces artifact absence atomically with admission. Exact retry
+audits the original Abort append, so a settled admitted Abort cannot be relabeled
+as unused. Once admission or capture has begun, normal cluster Abort continues
+to require coordinated recovery.
+The record/batch push, operator execution, Arrow ownership and shuffle envelope
+paths are unchanged. There are no new per-row checks, serialization, locks or allocations.
 There is not yet a topology generation check at transport/install boundaries;
 that missing protection is a reason live migration remains disabled.
 
@@ -135,15 +205,39 @@ that missing protection is a reason live migration remains disabled.
 These are authority/adoption tests. They do not prove state-preserving graph
 migration, participant-complete activation or exactly-once external effects.
 
+## Old-cut failure matrix
+
+| Boundary/failure | Result under current authority |
+| --- | --- |
+| Ordinary flag audit precedes topology admission, Prepare follows it | Retire the reserved attempt with its original proof; leave the same request Planned and intake open |
+| Deadline/process check fails after exact reservation | Cleanup retains the reservation's proof even when Prepare has not run; changed authority fences it |
+| Artifact admission wins a reservation-only Abort append | Reject the shortcut; preserve admitted ownership and require normal recovery |
+| Cut append stalls before create | Deadline leaves the original Planned request and no artifact admission |
+| New term wins the cut-binding sequence | Candidate aborts; delayed old binding is fenced before Prepare |
+| Binding or Commit succeeds but response/caller is lost | Read the exact operation/attempt; preserve the binding and definitive old checkpoint |
+| Old checkpoint Abort | Candidate is Aborted; admitted artifacts remain owned until exact cleanup |
+| Commit exists but sink settlement or receipts are missing | Keep Quiescing and intake/sink succession held; reconcile through normal recovery |
+| Final process receipt succeeds but response is lost | Status/exact retry resolves the original CutPrepared append |
+| Assignment watcher refreshes its certificate during a held cut | Retain the certificate for checkpoint tails; preserve intake hold and exclude successor sink admission |
+| Recovery release loses its authority or a replacement fault wins | Keep the hold and intake closed; only an authorized retry can clear it |
+| Process, leader or recovery fence changes after old Commit | Abort the candidate, preserve T's irreversible checkpoint and resume through coordinated recovery |
+| Live cut index or authority anchor is damaged | Fail closed, including status and authority pruning; do not infer completion |
+| Newer artifact floor races with a live prepared cut | Refuse floor advancement beyond the cut; retain its canonical index |
+
+Deterministic tests use the existing object-store fault injection and exact
+semaphores at append boundaries. The three-process scenario covers a real manual
+cut and restart after CutPrepared; it does not cover target installation or
+post-target-commit failure. Required transactional sink migration certification
+remains absent.
+
 ## Required next integration
 
-1. Integrate the implemented admission reservation with a DB-owned cutover worker.
-   Bind its checkpoint attempt before permitting cut barrier/artifact admission;
-   ordinary checkpoints remain blocked while the pre-cut reservation is Planned.
+1. Integrate candidate planning with a DB-owned migration worker and its existing
+   manual checkpoint owner. The old-cut binding, capture and hold are implemented;
+   detached submission/target-stage ownership remain unfinished.
 2. Certify the frozen owner-complete/evidence process rosters, candidate identity,
    compatibility mapping and protocol on all required participants.
-3. Establish the old graph's committed checkpoint cut without blocking source
-   barrier arrival. Reconcile old prepared sink outcomes and observe retirement.
+3. Observe superseded actor retirement after the reconciled old checkpoint cut.
 4. Atomically bind target catalog, exact cut, state mappings, concrete source start
    positions, progress/frontiers and durable migration roots in shared authority.
 5. Restore/install the target before participant-complete release, with stale
@@ -157,5 +251,7 @@ migration, participant-complete activation or exactly-once external effects.
    and run the stateful multi-process migration/restart oracle and fault matrix.
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
-results and unfinished certification. The [queue benchmark evidence](test-evidence/topology-adoption-2026-09-30/README.md)
-measures existing steady queue behavior only.
+results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)
+includes the real cut/abort/restart oracle, gate hold observations, failure logs
+and existing queue comparison. It does not certify target migration or production
+latency.

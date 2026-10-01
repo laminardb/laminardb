@@ -8,7 +8,7 @@ fn operation(value: u128) -> TopologyOperationId {
     Uuid::from_u128(value).try_into().unwrap()
 }
 
-async fn fixture(
+pub(super) async fn fixture(
     authority: &LeaderLeaseStore,
 ) -> (
     LeaderLease,

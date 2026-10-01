@@ -93,6 +93,9 @@ use std::time::{Duration, Instant};
 #[path = "cluster_soak/topology.rs"]
 mod topology_adoption;
 #[cfg(feature = "kafka")]
+#[path = "cluster_soak/topology_cut.rs"]
+mod topology_cut;
+#[cfg(feature = "kafka")]
 mod workload_qualification;
 
 #[cfg(all(feature = "kafka", feature = "delta-lake-s3"))]
@@ -13741,7 +13744,26 @@ fn three_node_alo_join_kill9_soak() {
 #[ignore = "spawns 3 real processes with Kafka/S3, adopts legacy authority, and restarts all nodes"]
 #[cfg(all(feature = "kafka", feature = "aws"))]
 fn three_node_alo_legacy_topology_adoption_restart_soak() {
-    run_three_node_join_kill9_soak_with_adoption(JoinDelivery::AtLeastOnce, false, None, true);
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        false,
+    );
+}
+
+#[test]
+#[ignore = "spawns 3 real Kafka/S3 processes, prepares an old-graph cut, aborts by restart, and checks stateful output oracles"]
+#[cfg(all(feature = "kafka", feature = "aws"))]
+fn three_node_alo_topology_cut_abort_restart_soak() {
+    run_three_node_join_kill9_soak_with_adoption(
+        JoinDelivery::AtLeastOnce,
+        false,
+        None,
+        true,
+        true,
+    );
 }
 
 #[test]
@@ -13776,6 +13798,7 @@ fn run_three_node_join_kill9_soak(
         subscription_soak,
         forced_fault_role,
         false,
+        false,
     );
 }
 
@@ -13785,6 +13808,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
     subscription_soak: bool,
     forced_fault_role: Option<&str>,
     adopt_legacy: bool,
+    prepare_topology_cut: bool,
 ) {
     let delivery_label = delivery.label();
     let executable = Arc::new(
@@ -14608,6 +14632,16 @@ fn run_three_node_join_kill9_soak_with_adoption(
             .snapshot
             .assignment_fence()
             .expect("pre-restart converged assignment is canonical");
+        let old_cut = prepare_topology_cut.then(|| {
+            topology_cut::prepare_old_cut(
+                &checkpoint_url,
+                &mut nodes,
+                baseline,
+                &restart_fence,
+                recovery_ceiling,
+                &log_dir,
+            )
+        });
         for node in &nodes {
             let evidence = local_convergence
                 .evidence_by_node
@@ -14632,6 +14666,15 @@ fn run_three_node_join_kill9_soak_with_adoption(
                 });
         }
         topology_adoption::restart_all(&mut nodes, baseline, recovery_ceiling);
+        if let Some(cut) = old_cut.as_ref() {
+            topology_cut::assert_aborted_after_restart(
+                &checkpoint_url,
+                &mut nodes,
+                cut,
+                recovery_ceiling,
+                &log_dir,
+            );
+        }
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),

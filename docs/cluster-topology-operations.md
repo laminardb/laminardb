@@ -1,7 +1,7 @@
 # Cluster topology status and upgrade checkpoint
 
-This checkpoint implements explicit legacy catalog adoption, core pre-cut admission
-and topology/operation status.
+This checkpoint implements explicit legacy catalog adoption, core admission,
+an old-topology checkpoint cut and topology/operation status.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or dry-run route.
@@ -11,9 +11,10 @@ and durable replay. There is no supported migration submission or dry-run route.
 | Initial cold bootstrap and exact sealed-catalog replay | Existing behavior |
 | Read durable topology and local activation status | Implemented |
 | Read an admitted pre-cut request's durable status | Implemented, console authorization |
-| Reserve/abort a candidate | Core library primitives; no public submit route or cutover worker |
+| Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
+| Prepare and hold an exact old-topology cut | Existing manual checkpoint path for an internal core reservation; no target activation |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
-| Add an independent pipeline or downstream stream/sink | Rejected; checkpoint cutover and graph installation unfinished |
+| Add an independent pipeline or downstream stream/sink | Rejected; candidate compatibility and target installation unfinished |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
 | Change keys, windows, state schema, source identity or sink semantics | Rejected; requires certified transformation/replay contracts |
 
@@ -54,7 +55,7 @@ topology operation or allocate a checkpoint/deployment identity.
 
 ## Legacy upgrade and restart
 
-Authority formats 12 and 13 remain readable. A coordinated binary upgrade is
+Authority formats 12 through 15 remain readable. A coordinated binary upgrade is
 required for this build: the first serialized assignment drain writes format 14,
 even before logical catalog adoption. Stop and observe termination of the old
 server processes, then start every required participant with the new binary and
@@ -70,7 +71,7 @@ The core `CatalogManifestStore::adopt_legacy_topology` API requires the current
 leader proof, the exact sealed manifest reference, the existing deployment UUID,
 and a nonzero operation UUID reused on retries. Its caller must first complete a
 coordinated binary upgrade of every required participant. Adoption writes format
-13 or preserves format 14 when assignment admission already upgraded it. Older
+13 or preserves format 14/15 when earlier authority admission already upgraded it. Older
 authority readers fail closed; mixed-version adoption is unsupported.
 
 There is no operator-facing adoption CLI or write endpoint in this increment.
@@ -95,9 +96,9 @@ sequences and `state`. Malformed/nil UUIDs return 400; an unknown migration requ
 returns 404 with `Cache-Control: no-store`. Baseline adoption is reported by the
 catalog-status endpoint, not this migration-request journal.
 
-The implemented `state.phase` values are `planned` and `aborted`. Aborted includes
-`state.reason`:
-`requested`, `leader_changed` or `recovery`. A reservation never implies that the
+The implemented `state.phase` values are `planned`, `quiescing`, `cut_prepared`
+and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
+`checkpoint_aborted` or `recovery`. A reservation never implies that the
 candidate catalog is committed or locally active. The committed catalog remains
 topology 1. Identical retries resolve to the original status, including an abort;
 reusing an identity with a different payload fails. The core journal retains at
@@ -106,6 +107,30 @@ most 64 identities and rejects further admission until journal retention exists.
 This route is exercised against admitted/aborted requests by the existing HTTP
 router fixture. There is still no supported HTTP/SQL submission, dry-run or manual
 admission command. Do not create a reservation by editing authority files.
+
+An internally admitted cut is bound to its exact old deployment, pipeline ABI,
+assignment/boot roster and checkpoint attempt before Prepare. Its optional `cut`
+contains the inventory, binding sequence, definitive checkpoint Commit reference
+and completed process roster. `quiescing` remains visible after Commit while
+application receipts are missing. The leader's receipt follows aggregated external
+sink settlement; every frozen process must also finish its local cut. `cut_prepared`
+means intake and successor sink output remain held. It does not mean that the
+candidate is compatible, installed, retired or active. Committed catalog version
+remains 1 and locally active version is null while intake is held.
+
+There is no target worker in this checkpoint. If testing the internal cut path,
+use coordinated recovery or restart on the same namespace to resume the original
+topology. A new leader/recovery fault aborts the uncommitted candidate and retains
+the old checkpoint Commit. Recovery must reconcile prepared sink outcomes before
+release; it cannot rewind a committed checkpoint or treat a timeout as an Abort.
+Explicit abort alone does not reopen intake. The real-process cut/abort test uses
+the existing authenticated manual checkpoint route and all-process restart; it
+does not submit a supported topology migration.
+
+Assignment refresh cannot release a held cut. The current certificate remains
+available to its checkpoint tails, while intake and successor sink admission stay
+closed. An authorized coordinated recovery release clears the local hold after
+the existing retirement and readiness checks; a rejected release keeps it closed.
 
 ## Errors and recovery
 
@@ -125,6 +150,6 @@ legacy fallback for a damaged adopted deployment. Missing deployment identity
 or missing adoption anchor also blocks catalog startup replay. Keep gates closed
 and recover the original artifacts from the deployment's storage procedures.
 
-No cutover-pause duration or migration recovery procedure can be certified in
+No target cutover-pause duration or migration activation can be certified in
 this increment. See the [engineering checkpoint](cluster-topology-engineering.md)
 and [remaining work](cluster-topology-migrations-progress.md).

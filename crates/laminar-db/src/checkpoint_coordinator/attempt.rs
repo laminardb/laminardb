@@ -184,10 +184,8 @@ impl CheckpointCoordinator {
         require_canonical_attempt(attempt, "checkpoint admission")?;
         let flags = request.flags;
         let failure_fence = request.assignment_fence.clone();
-        let terminal_handoff = sink_epoch_admission::is_terminal_handoff(
-            request.flags,
-            request.handoff_replay_pending,
-        );
+        let terminal_handoff =
+            sink_epoch_admission::is_terminal_cut(request.flags, request.handoff_replay_pending);
         #[cfg(feature = "cluster")]
         let validation_proof = match &quorum {
             QuorumStage::Captured { leader_proof, .. } => Some(leader_proof.clone()),
@@ -695,6 +693,19 @@ impl CheckpointCoordinator {
             CheckpointAttempt::new(epoch, checkpoint_id),
             "checkpoint abandonment",
         )?;
+        #[cfg(feature = "cluster")]
+        if let Some(result) = self
+            .abort_unadmitted_cluster_reservation_until(
+                attempt,
+                &error,
+                assignment_fence.clone(),
+                leader_proof.clone(),
+                deadline,
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         let started = Instant::now();
         Ok(self
             .fail_before_commit(

@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status and core pre-cut admission implemented; runtime topology migration
+Status: legacy adoption/status, core admission and the old-topology checkpoint cut implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -203,12 +203,87 @@ it adds no parallel scheduler, consensus service or general workflow framework.
   removed after the run. Queue comparison is 6.1545 us original versus 6.1181 us
   modified per 32-batch burst; Criterion reports no significant change (p=0.07).
 
+## Completed increment (2026-10-01, checkpoint cut)
+
+Started clean at `ab18ca39b4ce07d6f00ad2d63e513a6ead54473f`. This continues
+increment C through the old-graph checkpoint cut. It reuses the manual checkpoint
+owner, capture, durable tails and coordinated recovery. There is no general
+workflow framework, new dependency or per-record work.
+
+- Format 15 atomically binds `Quiescing` and exact checkpoint artifact admission
+  before Prepare/source barrier publication. Ordinary checkpoints and assignment
+  transitions remain excluded. The configured controller supplies namespace and
+  process/leader fences; retries cannot replace the attempt or frozen roster.
+- Source barriers arrive before intake closes. Existing shuffle/operator/sink
+  drains and full pipeline/state identity checks still apply. Retained intermediate
+  shuffle replay is explicitly rejected for topology cuts.
+- The old-topology Commit and its exact cut reference share one authority append.
+  Commit alone remains `Quiescing`. The leader reports after globally aggregated
+  external sink settlement; followers finish local checkpoint application. Every
+  frozen exact process must report before `CutPrepared`. Intake and successor sink
+  epochs stay held. These receipts do not authorize target installation or prove
+  observed actor retirement.
+- A term change or recovery fault aborts the uncommitted candidate, retaining any
+  successful parent checkpoint and receipts. Explicit abort of an unresolved cut
+  is rejected; even a prepared-cut abort requires coordinated recovery/restart to
+  reopen intake. An application/publication error preserves the durable checkpoint
+  and reports a continuation error instead of treating it as a failed sink Commit.
+- Pruning pins request, binding and Commit authority anchors. Live preparation
+  pins the old checkpoint index against newer artifact-floor cleanup. Aborted
+  status retains authority evidence while normal checkpoint/replay retention can
+  eventually retire old artifacts.
+- Added deterministic cut identity, complete roster, stale boot, cancellation,
+  ambiguous successful response, leader-race, deadline, recovery and damaged-root
+  coverage, plus runtime Prepare/gate/sink/manual-owner boundary tests.
+- The first real-process attempt found an ordinary checkpoint/topology admission
+  race before Prepare. The reserved checkpoint had no retained leader proof, so
+  abandonment could not persist Abort and faulted the pipeline. Proof ownership
+  now begins at exact reservation, including deadline/process failure before
+  Prepare. Deterministic coverage forces the flags race, verifies the exact Abort,
+  no intake hold/Prepare, unchanged Planned status and same-operation retry.
+  An unused reservation with no prepared state or transactional sinks can abort
+  without recovery only when the same authority append proves artifact admission
+  is absent. A semaphore test lets cut admission win that append and rejects the
+  shortcut. Admitted Abort retains normal recovery/artifact ownership.
+- The second real-process attempt reached the exact old checkpoint and all process
+  receipts, then found that assignment refresh reopened intake. Capture now sets
+  a specific cut hold under the existing authority-transition lock. Assignment
+  refresh retains its certificate but cannot open intake or a successor sink epoch.
+  The existing authorized recovery Release owns hold removal. Deterministic tests
+  verify assignment reopening is refused, rejected release preserves the hold,
+  and an authorized retry clears it. No new data-path lock or check was added.
+- The new real-process `three_node_alo_topology_cut_abort_restart_soak` stages a
+  candidate through the core API, drives the existing authenticated manual checkpoint
+  route, verifies all processes held at the exact cut, and restarts the unchanged
+  topology on the same namespace. It reuses the existing independent Kafka stateful
+  oracles. Candidate planning/SQL migration submission are deliberately unfinished.
+- Final validation passes 1,009 core, 1,970 DB and 354 server cluster tests (one
+  existing DB test ignored), 414 non-cluster core tests, all-target Clippy with
+  `cluster,aws,kafka`, non-cluster server and `cluster,ffi` builds, fmt and diff
+  checks. Exact commands and raw results are in the
+  [cut evidence](test-evidence/topology-cut-2026-10-01/README.md).
+- The final optimized three-process cut/abort/restart soak passes in 313.58 s.
+  Checkpoint 47 reaches CutPrepared with all exact receipts in 2.145 s; full restart
+  activates the unchanged topology in 45.102 s and retains the candidate abort and
+  old cut. All expected stateful output is observed across 109,733 logical input
+  IDs; ALO replay duplicates remain allowed. The frozen prefix reaches checkpoint
+  82. Gate closure through deliberate restart/recovery is 46.7..46.9 s; this is
+  not target activation or consumer-visible latency. Sampled combined working set
+  peaks at 729,796,608 bytes, without a matched baseline or allocation measurement.
+  Earlier runs exposed the two fixed races; a later unoptimized run reached
+  CutPrepared but missed the unchanged 90 s restart budget. The final run uses
+  the repository's `soak` profile and keeps that budget. Queue time is 6.0732 us
+  versus the original 6.1545 us; Criterion reports change within noise threshold
+  (p=0.01), not a certified throughput improvement. SLO modes remain observational.
+
 ## Remaining work
 
 1. DB-owned candidate planning and participant capability/compatibility certificates.
    Core pre-cut admission, payload-bound status and serialization with the production
-   assignment writer are implemented. No worker establishes a cut or commits a target.
-2. Exact checkpoint-bound quiescence, root pinning and authorized state restore.
+   assignment writer are implemented. The manual checkpoint path establishes the
+   old cut; no worker certifies compatibility, stages or commits a target.
+2. Authorized state/ABI mappings, concrete new-source positions and durable target
+   migration roots. Old checkpoint binding, quiescence and live root pinning exist.
 3. Observed actor retirement, install/release and post-commit recovery.
 4. Public SQL/atomic API, detached ownership, dry run and leader routing. The
    read-only topology status contract is implemented; write routes are not.
@@ -225,6 +300,7 @@ Use [operator guidance](cluster-topology-operations.md) and the
 Criterion output are under ignored `target/topology-evidence` and
 `target/topology-baseline`; checked-in queue sample evidence is under
 `docs/test-evidence/topology-adoption-2026-09-30` and
-`docs/test-evidence/topology-admission-2026-10-01`. This is a resumable checkpoint
+`docs/test-evidence/topology-admission-2026-10-01`, with the latest cut results in
+`docs/test-evidence/topology-cut-2026-10-01`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

@@ -3158,6 +3158,9 @@ mod topology;
 #[path = "topology_admission_tests.rs"]
 mod topology_admission;
 
+#[path = "topology_cut_tests.rs"]
+mod topology_cut;
+
 #[tokio::test]
 async fn committed_recovery_release_survives_renewal_and_takeover() {
     let store = Arc::new(store(1));

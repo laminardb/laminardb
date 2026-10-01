@@ -7,7 +7,7 @@ use crate::cluster::control::topology::{
     MAX_TOPOLOGY_PLAN_BYTES,
 };
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const MAX_ADMISSION_ATTEMPTS: usize = 16;
 const PLAN_PREFIX: &str = "control/topology-plans/v1/";
 
@@ -65,12 +65,26 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
-            if operation.is_planned() {
+            if operation.cut.is_some() && self.version < TOPOLOGY_CUT_RECORD_VERSION {
+                return Err(LeaseError::Invalid(
+                    "checkpoint-bound topology requires authority format 15".into(),
+                ));
+            }
+            if operation.is_preparing() {
                 planned += 1;
                 if !self.lease.matches_proof(&operation.admitted_by) {
                     return Err(LeaseError::Invalid(
                         "planned topology belongs to an obsolete term".into(),
                     ));
+                }
+                if let Some(cut) = &operation.cut {
+                    if cut.committed.is_none()
+                        && self.active_checkpoint_artifacts.as_ref() != Some(&cut.inventory)
+                    {
+                        return Err(LeaseError::Invalid(
+                            "unsettled topology cut lost its admitted artifacts".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -92,7 +106,20 @@ impl LeaderAuthorityRecord {
         if planned > 1
             || (planned != 0
                 && (self.assignment_drain_reservation.is_some()
-                    || self.active_checkpoint_artifacts.is_some()
+                    || self
+                        .active_checkpoint_artifacts
+                        .as_ref()
+                        .is_some_and(|active| {
+                            self.topology_operations
+                                .iter()
+                                .filter(|entry| entry.is_preparing())
+                                .all(|entry| {
+                                    entry
+                                        .cut
+                                        .as_ref()
+                                        .is_none_or(|cut| cut.inventory != *active)
+                                })
+                        })
                     || self.assignment_handoff_pin.is_some()
                     || self.recovery_fault_slots.iter().any(|slot| slot.active)))
         {
@@ -105,7 +132,7 @@ impl LeaderAuthorityRecord {
 
     pub(super) fn abort_topology_preparation(&mut self, reason: TopologyAbortReason) {
         for operation in &mut self.topology_operations {
-            if operation.is_planned() {
+            if operation.is_preparing() {
                 operation.phase = TopologyAdmissionPhase::Aborted { reason };
                 operation.status_sequence = self.lease.seq;
             }
@@ -118,7 +145,7 @@ impl LeaderAuthorityRecord {
         if let Some(operation) = self
             .topology_operations
             .iter()
-            .find(|operation| operation.is_planned())
+            .find(|operation| operation.is_preparing())
         {
             return Err(DecisionError::Conflict(format!(
                 "topology operation {} reserves checkpoint and assignment admission",
@@ -164,17 +191,30 @@ impl LeaderAuthorityRecord {
             .iter()
             .zip(&next.topology_operations)
         {
-            if prior.operation_id != after.operation_id
-                || prior.plan != after.plan
-                || prior.admitted_sequence != after.admitted_sequence
-                || prior.admitted_by != after.admitted_by
-                || (!prior.is_planned() && prior != after)
-                || (prior != after
-                    && (after.is_planned() || after.status_sequence != next.lease.seq))
-            {
-                return Err(LeaseError::Invalid(
-                    "authority cannot rewrite a topology request or its terminal result".into(),
-                ));
+            prior
+                .validate_successor(after, next.lease.seq)
+                .map_err(|error| LeaseError::Invalid(error.to_string()))?;
+            if let Some(cut) = &after.cut {
+                let prior_commit = prior.cut.as_ref().and_then(|cut| cut.committed.as_ref());
+                if prior_commit.is_none() {
+                    if let Some(commit) = &cut.committed {
+                        if commit.authority_sequence != next.lease.seq
+                            || next.checkpoint_outcome.as_ref().is_none_or(|outcome| {
+                                !outcome.is_commit()
+                                    || outcome.committed_checkpoint.as_ref()
+                                        != Some(&commit.checkpoint)
+                                    || outcome.assignment_fence != cut.inventory.assignment_fence
+                                    || outcome.deployment_id != cut.inventory.deployment_id
+                                    || outcome.leader_proof.as_ref() != Some(&after.admitted_by)
+                            })
+                        {
+                            return Err(LeaseError::Invalid(
+                                "new topology cut Commit must bind its terminal authority append"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
             }
         }
         for added in next
@@ -282,7 +322,7 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
-    async fn load_topology_plan(
+    pub(super) async fn load_topology_plan(
         &self,
         reference: &TopologyPlanRef,
     ) -> Result<TopologyAdmissionPlan, TopologyError> {
@@ -325,6 +365,15 @@ impl LeaderLeaseStore {
                 .map_err(TopologyError::from)
                 .map_err(topology_lease_error)?;
         }
+        if operation
+            .cut
+            .as_ref()
+            .is_some_and(|cut| cut.inventory.assignment_fence.as_ref() != Some(&plan.assignment))
+        {
+            return Err(LeaseError::Invalid(
+                "topology cut changed its frozen assignment".into(),
+            ));
+        }
         for sequence in [operation.admitted_sequence, operation.status_sequence] {
             let record = read_authority_record(self.store.as_ref(), sequence)
                 .await?
@@ -348,6 +397,9 @@ impl LeaderLeaseStore {
                     && record.topology_baseline.as_ref().is_some_and(|baseline| {
                         baseline.manifest == plan.parent_manifest
                             && baseline.topology_version == plan.expected_parent
+                            && operation.cut.as_ref().is_none_or(|cut| {
+                                cut.inventory.deployment_id == baseline.deployment_id
+                            })
                     })
             } else {
                 anchored == operation
@@ -358,7 +410,7 @@ impl LeaderLeaseStore {
                 ));
             }
         }
-        Ok(())
+        self.audit_topology_cut(operation).await
     }
 
     /// Read the definitive, payload-bound pre-cut request status without allocating identities.
@@ -483,7 +535,7 @@ impl LeaderLeaseStore {
             if current
                 .topology_operations
                 .iter()
-                .any(TopologyAdmissionStatus::is_planned)
+                .any(TopologyAdmissionStatus::is_preparing)
                 || current.assignment_drain_reservation.is_some()
                 || current.active_checkpoint_artifacts.is_some()
                 || current.assignment_handoff_pin.is_some()
@@ -536,7 +588,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
             let sequence = lease.seq;
             let mut next = current.preserve_with_lease(lease);
-            next.version = TOPOLOGY_ADMISSION_RECORD_VERSION;
+            next.version = next.version.max(TOPOLOGY_ADMISSION_RECORD_VERSION);
             let operation = TopologyAdmissionStatus {
                 operation_id: plan.operation_id,
                 plan: reference.clone(),
@@ -544,6 +596,7 @@ impl LeaderLeaseStore {
                 admitted_sequence: sequence,
                 status_sequence: sequence,
                 phase: TopologyAdmissionPhase::Planned,
+                cut: None,
             };
             next.topology_operations.push(operation.clone());
             match self
@@ -590,8 +643,11 @@ impl LeaderLeaseStore {
                     return Err(TopologyError::Conflict("operation payload differs".into()));
                 }
                 self.audit_topology_operation(operation).await?;
-                if !operation.is_planned() {
+                if !operation.is_preparing() {
                     return Ok(operation.clone());
+                }
+                if operation.phase == TopologyAdmissionPhase::Quiescing {
+                    return Err(TopologyError::Conflict("cut sink settlement is unresolved; coordinated recovery must reconcile it before resuming the parent".into()));
                 }
                 let mut lease = current.lease.clone();
                 lease.seq = lease
@@ -618,7 +674,7 @@ impl LeaderLeaseStore {
     }
 }
 
-fn topology_checkpoint_error(error: ClusterCheckpointAuthorityError) -> TopologyError {
+pub(super) fn topology_checkpoint_error(error: ClusterCheckpointAuthorityError) -> TopologyError {
     match error {
         ClusterCheckpointAuthorityError::Authority(error) => TopologyError::Authority(error),
         ClusterCheckpointAuthorityError::Decision(DecisionError::Io(reason)) => {
@@ -629,7 +685,7 @@ fn topology_checkpoint_error(error: ClusterCheckpointAuthorityError) -> Topology
     }
 }
 
-fn topology_assignment_error(error: SnapshotError) -> TopologyError {
+pub(super) fn topology_assignment_error(error: SnapshotError) -> TopologyError {
     match error {
         SnapshotError::Io(reason) => TopologyError::Authority(LeaseError::Io(reason)),
         error => TopologyError::Invalid(error.to_string()),

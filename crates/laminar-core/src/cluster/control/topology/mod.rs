@@ -15,7 +15,7 @@ mod admission;
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
-    TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
+    TopologyCheckpointCut, TopologyCutCommit, TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
 };
 
 /// Version of the topology adoption protocol understood by this binary.

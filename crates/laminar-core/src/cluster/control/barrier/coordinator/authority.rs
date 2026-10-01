@@ -145,7 +145,8 @@ impl BarrierCoordinator {
         // An assignment certificate is the barrier layer's cluster-runtime marker. Embedded and
         // single-node coordinators can be built with the cluster feature enabled, but do not have
         // a remote leader lease and must retain their local KV path.
-        if ann.assignment_fence.is_none() {
+        if ann.assignment_fence.is_none() && ann.flags & crate::checkpoint::flags::TOPOLOGY_CUT == 0
+        {
             return Ok(());
         }
         let proof = ann.leader_proof.as_ref().ok_or_else(|| {
@@ -190,7 +191,9 @@ impl BarrierCoordinator {
             .lock()
             .clone()
             .and_then(|provider| provider());
-        if local_proof.as_ref() == Some(proof) {
+        if local_proof.as_ref() == Some(proof)
+            && ann.flags & crate::checkpoint::flags::TOPOLOGY_CUT == 0
+        {
             return Ok(());
         }
         let store = self
@@ -198,18 +201,17 @@ impl BarrierCoordinator {
             .lock()
             .clone()
             .ok_or_else(|| "durable leader lease store is not installed".to_string())?;
-        let lease = store
-            .load()
+        store
+            .validate_topology_checkpoint_barrier(
+                proof,
+                crate::checkpoint::CheckpointAttempt::new(ann.epoch, ann.checkpoint_id),
+                ann.assignment_fence.as_ref(),
+                ann.flags,
+            )
             .await
-            .map_err(|error| format!("leader lease read failed: {error}"))?
-            .ok_or_else(|| "no durable leader lease exists".to_string())?;
-        if !lease.matches_proof(proof) {
-            return Err(format!(
-                "clustered {:?} for checkpoint {}/{} does not match the latest durable leader lease",
-                ann.phase, ann.epoch, ann.checkpoint_id
-            ));
-        }
-        Ok(())
+            .map_err(|error| {
+                format!("leader lease read or checkpoint binding validation failed: {error}")
+            })
     }
 
     #[cfg(feature = "cluster")]

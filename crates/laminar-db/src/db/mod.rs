@@ -400,6 +400,10 @@ pub struct LaminarDB {
     /// peer whose receiver isn't up yet and the fire-and-forget frames are lost.
     #[cfg(feature = "cluster")]
     pub(crate) source_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// A terminal topology cut is held independently of assignment readiness. Only an
+    /// authorized coordinated recovery release may clear it after the old runtime retires.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_cut_hold: Arc<std::sync::atomic::AtomicBool>,
     /// One-way local data-plane fence after stable process-lease loss.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_authority_revoked: std::sync::atomic::AtomicBool,
@@ -1837,6 +1841,8 @@ impl LaminarDB {
             source_gate: Arc::new(std::sync::atomic::AtomicBool::new(
                 runtime_mode.is_cluster(),
             )),
+            #[cfg(feature = "cluster")]
+            topology_cut_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
             cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "cluster")]

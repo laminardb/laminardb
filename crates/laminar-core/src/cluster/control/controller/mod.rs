@@ -880,6 +880,8 @@ mod membership;
 mod recovery_faults;
 mod recovery_identity;
 mod recovery_protocol;
+#[cfg(feature = "cluster")]
+mod topology;
 mod wire;
 
 use wire::{

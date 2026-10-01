@@ -125,7 +125,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("authority sequence exhausted".into()))?;
             let sequence = lease.seq;
             let mut next = current.preserve_with_lease(lease);
-            next.version = TOPOLOGY_ADMISSION_RECORD_VERSION;
+            next.version = next.version.max(TOPOLOGY_ADMISSION_RECORD_VERSION);
             next.assignment_drain_reservation = Some(AssignmentDrainReservation {
                 proposal: reference.clone(),
                 transition: transition.clone(),

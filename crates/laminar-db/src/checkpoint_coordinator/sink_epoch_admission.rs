@@ -10,8 +10,11 @@ const CLUSTER_SINK_EPOCH_POLL_INITIAL: Duration = Duration::from_millis(10);
 #[cfg(feature = "cluster")]
 const CLUSTER_SINK_EPOCH_POLL_MAX: Duration = Duration::from_millis(250);
 
-pub(crate) const fn is_terminal_handoff(flags: u64, handoff_replay_pending: bool) -> bool {
-    flags & laminar_core::checkpoint::flags::HANDOFF != 0 && !handoff_replay_pending
+pub(crate) const fn is_terminal_cut(flags: u64, handoff_replay_pending: bool) -> bool {
+    flags
+        & (laminar_core::checkpoint::flags::HANDOFF | laminar_core::checkpoint::flags::TOPOLOGY_CUT)
+        != 0
+        && !handoff_replay_pending
 }
 
 #[cfg(feature = "cluster")]

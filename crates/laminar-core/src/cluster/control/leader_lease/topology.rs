@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::{
     AuthorityCreateOutcome, CheckpointDecisionStore, LeaderAuthorityRecord, LeaderLeaseStore,
     LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
-    TOPOLOGY_AUTHORITY_RECORD_VERSION,
+    TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
 };
 use crate::cluster::control::topology::{
     LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
@@ -25,7 +25,9 @@ impl LeaderAuthorityRecord {
                 Ok(())
             }
             (
-                TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION,
+                TOPOLOGY_AUTHORITY_RECORD_VERSION
+                | TOPOLOGY_ADMISSION_RECORD_VERSION
+                | TOPOLOGY_CUT_RECORD_VERSION,
                 Some(baseline),
             ) => {
                 baseline
@@ -58,7 +60,9 @@ impl LeaderAuthorityRecord {
         } else if let Some(baseline) = next.topology_baseline.as_ref() {
             if !matches!(
                 next.version,
-                TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION
+                TOPOLOGY_AUTHORITY_RECORD_VERSION
+                    | TOPOLOGY_ADMISSION_RECORD_VERSION
+                    | TOPOLOGY_CUT_RECORD_VERSION
             ) || baseline.authority_sequence != next.lease.seq
                 || self.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
             {
@@ -127,7 +131,9 @@ impl LeaderLeaseStore {
             .ok_or_else(|| LeaseError::Invalid("topology adoption authority is missing".into()))?;
         if !matches!(
             record.version,
-            TOPOLOGY_AUTHORITY_RECORD_VERSION | TOPOLOGY_ADMISSION_RECORD_VERSION
+            TOPOLOGY_AUTHORITY_RECORD_VERSION
+                | TOPOLOGY_ADMISSION_RECORD_VERSION
+                | TOPOLOGY_CUT_RECORD_VERSION
         ) || record.topology_baseline.as_ref() != Some(baseline)
         {
             return Err(LeaseError::Invalid(

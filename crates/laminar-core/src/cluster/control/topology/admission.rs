@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 use super::{TopologyError, TopologyOperationId, TopologyVersion, TOPOLOGY_PROTOCOL_VERSION};
-use crate::checkpoint::{CheckpointAssignmentFence, LeaderProof};
+use crate::checkpoint::{
+    CheckpointAssignmentFence, CheckpointParticipant, CommittedCheckpointRef, LeaderProof,
+};
+use crate::checkpoint_decision::CheckpointArtifactInventory;
 use crate::cluster::control::CatalogManifestRef;
 
 /// Maximum retained request identities until topology journal retention is implemented.
@@ -60,19 +63,54 @@ pub enum TopologyAbortReason {
     LeaderChanged,
     /// Recovery was durably requested before cutover.
     Recovery,
+    /// The bound old-topology checkpoint received a definitive Abort.
+    CheckpointAborted,
 }
 
-/// Implemented pre-cut states. There is deliberately no commit/activation variant yet.
+/// Old-topology preparation states. No state here authorizes the candidate graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TopologyAdmissionPhase {
     /// Durable reservation; active graph and catalog still belong to the parent.
     Planned,
-    /// Definitive pre-cut abort; no candidate actors were authorized.
+    /// One exact old-topology attempt is admitted; its barrier and sink settlement are pending.
+    Quiescing,
+    /// Every frozen process has applied the exact Commit and held intake and sink succession.
+    /// The leader's receipt also certifies globally aggregated external sink settlement.
+    CutPrepared,
+    /// Definitive pre-target-commit abort; no candidate actors were authorized.
     Aborted {
         /// Durable reason.
         reason: TopologyAbortReason,
     },
+}
+
+/// Exact old-topology Commit retained while a cut is prepared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologyCutCommit {
+    /// Complete source/channel/state/output cut; never a scalar source offset.
+    pub checkpoint: CommittedCheckpointRef,
+    /// Immutable shared authority append of the definitive Commit.
+    pub authority_sequence: u64,
+}
+
+/// Binding installed atomically with artifact admission, before any source barrier is injected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TopologyCheckpointCut {
+    /// Exact deployment, old pipeline ABI, attempt and owner-complete process roster.
+    pub inventory: CheckpointArtifactInventory,
+    /// Shared append that bound this attempt and admitted its artifacts.
+    pub bound_sequence: u64,
+    /// A Commit alone does not prove that the leader finished external sink settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<TopologyCutCommit>,
+    /// Sorted processes whose runtime-owned tails finished applying the cut.
+    /// The leader reports after external sink settlement; followers finish their local checkpoint.
+    /// Their intake remains held; these receipts do not prove actor retirement or target readiness.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completed_participants: Vec<CheckpointParticipant>,
 }
 
 /// Small immutable plan reference carried by authority renewals.
@@ -120,11 +158,23 @@ pub struct TopologyAdmissionStatus {
     /// Definitive pre-cut phase.
     #[serde(rename = "state")]
     pub phase: TopologyAdmissionPhase,
+    /// Exact old-topology cut, absent until barrier preparation is authorized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut: Option<TopologyCheckpointCut>,
 }
 
 impl TopologyAdmissionStatus {
     pub(crate) fn is_planned(&self) -> bool {
         self.phase == TopologyAdmissionPhase::Planned
+    }
+
+    pub(crate) fn is_preparing(&self) -> bool {
+        matches!(
+            self.phase,
+            TopologyAdmissionPhase::Planned
+                | TopologyAdmissionPhase::Quiescing
+                | TopologyAdmissionPhase::CutPrepared
+        )
     }
 
     pub(crate) fn validate(&self, head: u64) -> Result<(), TopologyError> {
@@ -139,6 +189,128 @@ impl TopologyAdmissionStatus {
             return Err(TopologyError::Invalid(
                 "invalid topology admission status".into(),
             ));
+        }
+        match (&self.cut, self.phase) {
+            (None, TopologyAdmissionPhase::Planned | TopologyAdmissionPhase::Aborted { .. }) => {}
+            (
+                Some(cut),
+                TopologyAdmissionPhase::Quiescing
+                | TopologyAdmissionPhase::CutPrepared
+                | TopologyAdmissionPhase::Aborted { .. },
+            ) => {
+                cut.inventory.validate().map_err(TopologyError::Invalid)?;
+                let fence = cut.inventory.assignment_fence.as_ref().ok_or_else(|| {
+                    TopologyError::Invalid("topology cut requires an assignment fence".into())
+                })?;
+                if cut.bound_sequence <= self.admitted_sequence
+                    || cut.bound_sequence > self.status_sequence
+                    || fence.participant_incarnation(self.admitted_by.owner.node_id)
+                        != Some(self.admitted_by.owner.boot_id)
+                    || !cut
+                        .completed_participants
+                        .windows(2)
+                        .all(|pair| pair[0].node_id < pair[1].node_id)
+                    || cut.completed_participants.iter().any(|participant| {
+                        fence.participant_incarnation(participant.node_id)
+                            != Some(participant.boot_incarnation)
+                    })
+                {
+                    return Err(TopologyError::Invalid(
+                        "invalid topology checkpoint binding or completion roster".into(),
+                    ));
+                }
+                if let Some(commit) = &cut.committed {
+                    commit
+                        .checkpoint
+                        .validate()
+                        .map_err(TopologyError::Invalid)?;
+                    if commit.checkpoint.epoch != cut.inventory.attempt.epoch
+                        || commit.checkpoint.checkpoint_id != cut.inventory.attempt.checkpoint_id
+                        || commit.authority_sequence <= cut.bound_sequence
+                        || commit.authority_sequence > self.status_sequence
+                    {
+                        return Err(TopologyError::Invalid(
+                            "topology cut Commit differs from its bound attempt".into(),
+                        ));
+                    }
+                } else if !cut.completed_participants.is_empty() {
+                    return Err(TopologyError::Invalid(
+                        "uncommitted cut cannot have completion receipts".into(),
+                    ));
+                }
+                if self.phase == TopologyAdmissionPhase::CutPrepared
+                    && (cut.committed.is_none() || cut.completed_participants != fence.participants)
+                {
+                    return Err(TopologyError::Invalid(
+                        "prepared cut requires every exact process completion".into(),
+                    ));
+                }
+                if self.phase == TopologyAdmissionPhase::Quiescing
+                    && cut.completed_participants == fence.participants
+                {
+                    return Err(TopologyError::Invalid(
+                        "every process completion must advance the cut to prepared".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(TopologyError::Invalid(
+                    "topology phase and checkpoint binding disagree".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_successor(
+        &self,
+        after: &Self,
+        sequence: u64,
+    ) -> Result<(), TopologyError> {
+        if self.operation_id != after.operation_id
+            || self.plan != after.plan
+            || self.admitted_sequence != after.admitted_sequence
+            || self.admitted_by != after.admitted_by
+            || (!self.is_preparing() && self != after)
+            || (self != after && (after.is_planned() || after.status_sequence != sequence))
+        {
+            return Err(TopologyError::Invalid(
+                "authority cannot rewrite a topology request or its terminal result".into(),
+            ));
+        }
+        if let Some(prior_cut) = &self.cut {
+            let next_cut = after.cut.as_ref().ok_or_else(|| {
+                TopologyError::Invalid("authority cannot forget a topology cut".into())
+            })?;
+            if prior_cut.inventory != next_cut.inventory
+                || prior_cut.bound_sequence != next_cut.bound_sequence
+                || prior_cut
+                    .committed
+                    .as_ref()
+                    .is_some_and(|commit| next_cut.committed.as_ref() != Some(commit))
+                || prior_cut
+                    .completed_participants
+                    .iter()
+                    .any(|participant| !next_cut.completed_participants.contains(participant))
+                || (self.phase == TopologyAdmissionPhase::CutPrepared
+                    && self != after
+                    && !matches!(after.phase, TopologyAdmissionPhase::Aborted { .. }))
+            {
+                return Err(TopologyError::Invalid(
+                    "authority cannot replace a cut or rewind its evidence".into(),
+                ));
+            }
+        } else if let Some(cut) = &after.cut {
+            if !self.is_planned()
+                || after.phase != TopologyAdmissionPhase::Quiescing
+                || cut.bound_sequence != sequence
+                || cut.committed.is_some()
+                || !cut.completed_participants.is_empty()
+            {
+                return Err(TopologyError::Invalid(
+                    "new cut must bind its exact artifact admission append".into(),
+                ));
+            }
         }
         Ok(())
     }

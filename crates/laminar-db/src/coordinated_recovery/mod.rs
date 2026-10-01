@@ -2493,6 +2493,13 @@ impl RecoveryMonitor {
             return false;
         }
         controller.set_recovering(false);
+        // This Release certifies retirement, restore/readiness and the exact current authority.
+        // Assignment refresh alone cannot clear a held topology cut. Reuse the source-release
+        // transition lock so checkpoint capture cannot race a gate reopen.
+        let topology_cut_was_held = {
+            let _transition = db.cluster_authority_transition.lock();
+            db.topology_cut_hold.swap(false, Ordering::AcqRel)
+        };
         db.set_source_gate(false);
         if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
             || db.terminal_pipeline_halt.load(Ordering::Acquire)
@@ -2508,6 +2515,10 @@ impl RecoveryMonitor {
         {
             controller.set_recovering(true);
             db.set_source_gate(true);
+            if topology_cut_was_held {
+                let _transition = db.cluster_authority_transition.lock();
+                db.topology_cut_hold.store(true, Ordering::Release);
+            }
             drop(release_guard);
             self.defer_release_retry(db, controller, release.round.id.generation, false);
             return false;

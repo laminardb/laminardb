@@ -6,6 +6,7 @@ mod attempt_status;
 mod subscription_replay;
 mod topology;
 mod topology_admission;
+mod topology_cut;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
@@ -59,6 +60,7 @@ const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-termina
 const AUTHORITY_RECORD_VERSION: u32 = 12;
 const TOPOLOGY_AUTHORITY_RECORD_VERSION: u32 = 13;
 const TOPOLOGY_ADMISSION_RECORD_VERSION: u32 = 14;
+const TOPOLOGY_CUT_RECORD_VERSION: u32 = 15;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1326,6 +1328,7 @@ impl LeaderAuthorityRecord {
         if self.version != AUTHORITY_RECORD_VERSION
             && self.version != TOPOLOGY_AUTHORITY_RECORD_VERSION
             && self.version != TOPOLOGY_ADMISSION_RECORD_VERSION
+            && self.version != TOPOLOGY_CUT_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2668,6 +2671,12 @@ impl LeaderLeaseStore {
             authority.audit_topology_operation(operation).await?;
             retained.insert(operation.admitted_sequence);
             retained.insert(operation.status_sequence);
+            if let Some(cut) = &operation.cut {
+                retained.insert(cut.bound_sequence);
+                if let Some(commit) = &cut.committed {
+                    retained.insert(commit.authority_sequence);
+                }
+            }
         }
         if let Some(reservation) = &head.assignment_drain_reservation {
             retained.insert(reservation.authority_sequence);
@@ -4484,7 +4493,7 @@ impl LeaderLeaseStore {
             }
             self.reject_consumed_checkpoint_assignment(current, assignment_fence)
                 .await?;
-            current.reject_topology_preparation()?;
+            current.validate_topology_checkpoint_inventory(&inventory)?;
             if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
                 if active == &inventory
                     && current.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)
@@ -4650,6 +4659,52 @@ impl LeaderLeaseStore {
         verdict: CheckpointVerdict,
         committed_checkpoint: Option<CommittedCheckpointRef>,
     ) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
+        self.record_cluster_outcome_inner(
+            proof,
+            epoch,
+            checkpoint_id,
+            assignment_fence,
+            verdict,
+            committed_checkpoint,
+            false,
+        )
+        .await
+    }
+
+    /// Retire an unused checkpoint reservation only while artifact admission is absent.
+    /// The same authority append serializes this condition with checkpoint/cut admission.
+    /// An existing Abort is reusable only if its original append had no admitted artifacts.
+    ///
+    /// # Errors
+    /// Rejects changed leader proof, admitted artifacts, incompatible terminal outcomes or I/O.
+    pub async fn abort_unadmitted_cluster_checkpoint(
+        &self,
+        proof: &LeaderProof,
+        attempt: crate::checkpoint::CheckpointAttempt,
+        assignment_fence: CheckpointAssignmentFence,
+    ) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
+        self.record_cluster_outcome_inner(
+            proof,
+            attempt.epoch,
+            attempt.checkpoint_id,
+            assignment_fence,
+            CheckpointVerdict::Abort,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn record_cluster_outcome_inner(
+        &self,
+        proof: &LeaderProof,
+        epoch: u64,
+        checkpoint_id: u64,
+        assignment_fence: CheckpointAssignmentFence,
+        verdict: CheckpointVerdict,
+        committed_checkpoint: Option<CommittedCheckpointRef>,
+        require_unadmitted: bool,
+    ) -> Result<RecordOutcomeResult, ClusterCheckpointAuthorityError> {
         if !proof.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
@@ -4691,10 +4746,28 @@ impl LeaderLeaseStore {
             }
             let snapshot = self.cached_audited_cluster_outcomes_from(current).await?;
             let outcomes = &snapshot.outcomes;
-            if let Some(winner) = outcomes
+            if let Some((index, winner)) = outcomes
                 .iter()
-                .find(|outcome| outcome.epoch == candidate.epoch)
+                .enumerate()
+                .find(|(_, outcome)| outcome.epoch == candidate.epoch)
             {
+                if require_unadmitted && winner == &candidate {
+                    let link = snapshot.terminal_links.get(index).ok_or_else(|| {
+                        LeaseError::Invalid("reserved Abort has no authority link".into())
+                    })?;
+                    let anchor = read_authority_record(self.store.as_ref(), link.sequence)
+                        .await?
+                        .ok_or_else(|| {
+                            LeaseError::Invalid("reserved Abort anchor is missing".into())
+                        })?;
+                    if anchor.active_checkpoint_artifacts.is_some() {
+                        return Err(DecisionError::Conflict(
+                            "admitted checkpoint Abort cannot become reservation-only cleanup"
+                                .into(),
+                        )
+                        .into());
+                    }
+                }
                 return if winner == &candidate {
                     Ok(RecordOutcomeResult::Unchanged(winner.clone()))
                 } else {
@@ -4702,6 +4775,12 @@ impl LeaderLeaseStore {
                         winner: winner.clone(),
                     })
                 };
+            }
+            if require_unadmitted && current.active_checkpoint_artifacts.is_some() {
+                return Err(DecisionError::Conflict(
+                    "checkpoint reservation already has admitted artifacts".into(),
+                )
+                .into());
             }
             let active = match current.active_checkpoint_artifacts.as_ref() {
                 Some(active)
@@ -4841,6 +4920,7 @@ impl LeaderLeaseStore {
                 checkpoint_id: candidate.checkpoint_id,
             };
             next.outcome_head = Some(new_link);
+            next.record_topology_cut_outcome(&candidate)?;
             if candidate.is_commit() {
                 next.previous_commit = current.commit_head;
                 next.commit_head = Some(new_link);
@@ -6075,6 +6155,9 @@ impl LeaderLeaseStore {
                 protected.epoch > pin.checkpoint.epoch
                     && protected.checkpoint_id > pin.checkpoint.checkpoint_id
             }) {
+                return Ok(None);
+            }
+            if current.topology_cut_blocks_cleanup(&protected) {
                 return Ok(None);
             }
             if current

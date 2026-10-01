@@ -198,8 +198,11 @@ impl LaminarDB {
         }
         let _transition = self.cluster_authority_transition.lock();
         if self
-            .terminal_pipeline_halt
+            .topology_cut_hold
             .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .terminal_pipeline_halt
+                .load(std::sync::atomic::Ordering::Acquire)
             || self
                 .durable_terminal_recovery_fence
                 .load(std::sync::atomic::Ordering::Acquire)

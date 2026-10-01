@@ -19,25 +19,7 @@ pub(super) fn adopt_inventory(
     nodes: &mut [Node],
     recovery_ceiling: Duration,
 ) -> LegacyTopologyBaseline {
-    let mut storage = std::collections::HashMap::new();
-    for (environment, key) in [
-        ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
-        ("LAMINAR_SOAK_S3_ACCESS_KEY", "aws_access_key_id"),
-        ("LAMINAR_SOAK_S3_SECRET_KEY", "aws_secret_access_key"),
-        ("LAMINAR_SOAK_S3_REGION", "region"),
-    ] {
-        if let Ok(value) = std::env::var(environment) {
-            storage.insert(key.to_owned(), value);
-        }
-    }
-    if storage.contains_key("endpoint") {
-        storage.insert("allow_http".to_owned(), "true".to_owned());
-    }
-    let objects = laminar_core::checkpoint::object_store_builder::build_object_store(
-        checkpoint_url,
-        &storage,
-    )
-    .expect("build exact shared soak authority namespace");
+    let objects = objects_for_namespace(checkpoint_url);
     let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&objects), 30_000));
     let catalog = CatalogManifestStore::new(Arc::clone(&authority));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -114,6 +96,25 @@ pub(super) fn adopt_inventory(
         baseline.operation_id.get()
     );
     baseline
+}
+
+pub(super) fn objects_for_namespace(checkpoint_url: &str) -> Arc<dyn object_store::ObjectStore> {
+    let mut storage = std::collections::HashMap::new();
+    for (environment, key) in [
+        ("LAMINAR_SOAK_S3_ENDPOINT", "endpoint"),
+        ("LAMINAR_SOAK_S3_ACCESS_KEY", "aws_access_key_id"),
+        ("LAMINAR_SOAK_S3_SECRET_KEY", "aws_secret_access_key"),
+        ("LAMINAR_SOAK_S3_REGION", "region"),
+    ] {
+        if let Ok(value) = std::env::var(environment) {
+            storage.insert(key.to_owned(), value);
+        }
+    }
+    if storage.contains_key("endpoint") {
+        storage.insert("allow_http".to_owned(), "true".to_owned());
+    }
+    laminar_core::checkpoint::object_store_builder::build_object_store(checkpoint_url, &storage)
+        .expect("build exact shared soak authority namespace")
 }
 
 fn wait_for_status(

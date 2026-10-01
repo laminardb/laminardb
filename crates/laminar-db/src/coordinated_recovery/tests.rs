@@ -3870,6 +3870,7 @@ async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
     db.set_shuffle_recovery_gen(7);
     controller.set_recovering(true);
     let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
+    db.topology_cut_hold.store(true, Ordering::Release);
     let releasing = {
         let db = Arc::clone(&db);
         let controller = Arc::clone(&controller);
@@ -3905,6 +3906,7 @@ async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
     assert!(!opened);
     assert!(restored_for.is_some());
     assert!(db.cluster_intake_fenced());
+    assert!(db.topology_cut_hold.load(Ordering::Acquire));
     assert!(controller.is_recovering());
     assert_eq!(controller.checkpoint_assignment_fence(1), None);
 
@@ -3921,6 +3923,7 @@ async fn assignment_closure_wins_while_recovery_release_waits_to_open_intake() {
     assert!(retry.restored_for.is_none());
     assert!(!retry.fault_fenced);
     assert!(!db.cluster_intake_fenced());
+    assert!(!db.topology_cut_hold.load(Ordering::Acquire));
     assert!(!controller.is_recovering());
     assert_eq!(
         controller

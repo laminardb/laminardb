@@ -44,11 +44,21 @@ impl CheckpointCoordinator {
     }
 
     fn validate_request_flags(&self, request: &CheckpointRequest) -> Result<(), DbError> {
-        let unsupported_flags = request.flags & !laminar_core::checkpoint::flags::HANDOFF;
+        let supported_flags = laminar_core::checkpoint::flags::HANDOFF
+            | laminar_core::checkpoint::flags::TOPOLOGY_CUT;
+        let unsupported_flags = request.flags & !supported_flags;
         if unsupported_flags != 0 {
             return Err(DbError::Checkpoint(format!(
                 "checkpoint request carries unsupported flags {unsupported_flags:#x}"
             )));
+        }
+        if request.flags & laminar_core::checkpoint::flags::TOPOLOGY_CUT != 0
+            && (request.flags != laminar_core::checkpoint::flags::TOPOLOGY_CUT
+                || request.handoff_replay_pending)
+        {
+            return Err(DbError::Checkpoint(
+                "topology cut requires an exclusive, replay-free barrier".into(),
+            ));
         }
         if request.handoff_replay_pending
             && request.flags & laminar_core::checkpoint::flags::HANDOFF == 0
@@ -64,17 +74,15 @@ impl CheckpointCoordinator {
             ));
         }
         #[cfg(feature = "cluster")]
-        if request.flags & laminar_core::checkpoint::flags::HANDOFF != 0
-            && self.cluster_controller.is_none()
-        {
+        if request.flags & supported_flags != 0 && self.cluster_controller.is_none() {
             return Err(DbError::Checkpoint(
-                "assignment handoff checkpoint requires a cluster runtime".into(),
+                "terminal checkpoint cut requires a cluster runtime".into(),
             ));
         }
         #[cfg(not(feature = "cluster"))]
         if request.flags != 0 {
             return Err(DbError::Checkpoint(
-                "assignment handoff checkpoint requires cluster support".into(),
+                "terminal checkpoint cut requires cluster support".into(),
             ));
         }
         Ok(())

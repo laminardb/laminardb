@@ -33,6 +33,69 @@ async fn terminal_checkpoint_hint_cannot_outlive_its_cleanup_deadline() {
 }
 
 impl CheckpointCoordinator {
+    /// Retire a reservation that cannot have published Prepare or captured participant state.
+    /// Artifact admission precedes both boundaries in the clustered originator protocol. Once
+    /// artifacts exist, or a transactional sink epoch is open, normal Abort/recovery still owns
+    /// settlement. The outcome append rechecks the exact leader and active inventory atomically.
+    #[cfg(feature = "cluster")]
+    pub(super) async fn abort_unadmitted_cluster_reservation_until(
+        &mut self,
+        attempt: CheckpointAttempt,
+        reason: &str,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        leader_proof: Option<LeaderProof>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<CheckpointResult>, DbError> {
+        let Some(controller) = self.cluster_controller.as_ref() else {
+            return Ok(None);
+        };
+        if self.failure_requires_recovery
+            || self.phase != CheckpointPhase::Idle
+            || self.has_checkpoint_committable_sinks()
+            || self.active_sink_witness.is_some()
+            || self.active_sink_artifact_intents.is_some()
+            || self.prepared.contains_key(&attempt)
+        {
+            return Ok(None);
+        }
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!("reserved checkpoint authority: {error}"))
+        })?;
+        let artifacts = tokio::time::timeout_at(deadline, authority.cluster_checkpoint_artifacts())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint("reserved checkpoint inventory audit timed out".into())
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!("reserved checkpoint inventory audit: {error}"))
+            })?;
+        if artifacts.is_some() {
+            return Ok(None);
+        }
+        let started = Instant::now();
+        self.record_outcome_until_inner(
+            attempt,
+            laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+            None,
+            assignment_fence,
+            leader_proof,
+            deadline,
+            true,
+        )
+        .await?;
+        self.allocator.advance_epoch_to(checked_successor_epoch(
+            attempt.epoch,
+            "retiring an unadmitted checkpoint reservation",
+        )?);
+        // No participant has received Prepare: no terminal transport hint or rollback is needed.
+        Ok(Some(self.failed_result(
+            attempt,
+            started,
+            reason.to_owned(),
+            CheckpointFailureDisposition::Retryable,
+        )))
+    }
+
     pub(super) async fn record_outcome_until(
         &self,
         attempt: CheckpointAttempt,
@@ -42,7 +105,31 @@ impl CheckpointCoordinator {
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
     ) -> Result<laminar_core::checkpoint_decision::CheckpointOutcome, DbError> {
+        self.record_outcome_until_inner(
+            attempt,
+            verdict,
+            committed_checkpoint,
+            assignment_fence,
+            leader_proof,
+            deadline,
+            false,
+        )
+        .await
+    }
+
+    async fn record_outcome_until_inner(
+        &self,
+        attempt: CheckpointAttempt,
+        verdict: laminar_core::checkpoint_decision::CheckpointVerdict,
+        committed_checkpoint: Option<super::CommittedCheckpointRef>,
+        assignment_fence: Option<laminar_core::checkpoint::CheckpointAssignmentFence>,
+        leader_proof: Option<LeaderProof>,
+        deadline: tokio::time::Instant,
+        require_unadmitted: bool,
+    ) -> Result<laminar_core::checkpoint_decision::CheckpointOutcome, DbError> {
         use laminar_core::checkpoint_decision::RecordOutcomeResult;
+        #[cfg(not(feature = "cluster"))]
+        let _ = require_unadmitted;
 
         #[cfg(feature = "cluster")]
         let result = if let Some(controller) = self.cluster_controller.as_ref() {
@@ -55,17 +142,24 @@ impl CheckpointCoordinator {
             let authority = controller.checkpoint_authority().map_err(|error| {
                 DbError::Checkpoint(format!("cluster checkpoint authority: {error}"))
             })?;
-            tokio::time::timeout_at(
-                deadline,
-                authority.record_cluster_outcome(
-                    proof,
-                    attempt.epoch,
-                    attempt.checkpoint_id,
-                    fence,
-                    verdict.clone(),
-                    committed_checkpoint.clone(),
-                ),
-            )
+            tokio::time::timeout_at(deadline, async {
+                if require_unadmitted {
+                    authority
+                        .abort_unadmitted_cluster_checkpoint(proof, attempt, fence)
+                        .await
+                } else {
+                    authority
+                        .record_cluster_outcome(
+                            proof,
+                            attempt.epoch,
+                            attempt.checkpoint_id,
+                            fence,
+                            verdict.clone(),
+                            committed_checkpoint.clone(),
+                        )
+                        .await
+                }
+            })
             .await
             .map_err(|_| DbError::Checkpoint("cluster outcome create timed out".into()))?
             .map_err(|error| DbError::Checkpoint(format!("cluster outcome create: {error}")))?

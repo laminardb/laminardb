@@ -1,0 +1,29 @@
+[
+  {
+    "node": 0,
+    "held_at_utc": "2026-10-01T14:14:11.0731690+00:00",
+    "released_at_utc": "2026-10-01T14:14:57.9799640+00:00",
+    "observed_gate_hold_seconds": 46.906795,
+    "checkpoint_id": 47,
+    "start_log_line": "2026-10-01T14:14:11.073169Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "end_log_line": "2026-10-01T14:14:57.979964Z  INFO laminar_db::coordinated_recovery: coordinated recovery: releasing source gate gen=3 target=47 owned_vnodes=21 assignment_version=4"
+  },
+  {
+    "node": 1,
+    "held_at_utc": "2026-10-01T14:14:11.0732340+00:00",
+    "released_at_utc": "2026-10-01T14:14:57.7713260+00:00",
+    "observed_gate_hold_seconds": 46.698092,
+    "checkpoint_id": 47,
+    "start_log_line": "2026-10-01T14:14:11.073234Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "end_log_line": "2026-10-01T14:14:57.771326Z  INFO laminar_db::coordinated_recovery: coordinated recovery: releasing source gate gen=3 target=47 owned_vnodes=22 assignment_version=4"
+  },
+  {
+    "node": 2,
+    "held_at_utc": "2026-10-01T14:14:11.0734370+00:00",
+    "released_at_utc": "2026-10-01T14:14:57.8113160+00:00",
+    "observed_gate_hold_seconds": 46.737879,
+    "checkpoint_id": 47,
+    "start_log_line": "2026-10-01T14:14:11.073437Z  INFO laminar_db::pipeline_callback: terminal checkpoint cut fenced graph intake until coordinated transition flags=16",
+    "end_log_line": "2026-10-01T14:14:57.811316Z  INFO laminar_db::coordinated_recovery: coordinated recovery: releasing source gate gen=3 target=47 owned_vnodes=21 assignment_version=4"
+  }
+]

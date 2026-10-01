@@ -64,6 +64,7 @@ impl LaminarDB {
         let controller = self.cluster_controller.lock().clone();
         let locally_active_version = if DbState::load(&self.state) == DbState::Running
             && !self.source_gate.load(Ordering::Acquire)
+            && !self.topology_cut_hold.load(Ordering::Acquire)
             && !self.cluster_authority_revoked.load(Ordering::Acquire)
             && !self.durable_terminal_recovery_fence.load(Ordering::Acquire)
             && !self.terminal_pipeline_halt.load(Ordering::Acquire)

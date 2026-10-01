@@ -1,0 +1,3 @@
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 20.06s
