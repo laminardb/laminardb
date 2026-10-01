@@ -195,6 +195,11 @@ pub use db::ClusterTopologyStatus;
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
+#[cfg(feature = "cluster")]
+pub use db::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

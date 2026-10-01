@@ -7,6 +7,12 @@ use std::sync::atomic::Ordering;
 
 use super::{DbError, DbState, LaminarDB};
 
+mod planning;
+pub use planning::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
+
 /// Durable catalog version and this process's independently observed runtime activation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClusterTopologyStatus {

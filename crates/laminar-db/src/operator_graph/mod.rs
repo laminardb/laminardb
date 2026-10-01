@@ -1211,6 +1211,48 @@ impl OperatorGraph {
         }
     }
 
+    /// Inspect an isolated, initialized candidate on the control path. Every retained-state
+    /// operator must bind a declared catalog output, so synthetic traversal indices can never
+    /// become a migration mapping. This inventory supplements existing DDL/codec checks.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn topology_operator_contracts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, OperatorCapability>, DbError> {
+        use laminar_core::cluster::control::TopologyError;
+
+        let mut contracts = std::collections::BTreeMap::new();
+        for node in self.nodes.iter().filter(|node| !node.removed) {
+            if node.capability.cluster_status != ClusterExecutionStatus::DdlGuarded {
+                return Err(TopologyError::Unsupported(format!(
+                    "operator '{}' has no admitted cluster execution contract: {:?}",
+                    node.name, node.capability.cluster_status
+                ))
+                .into());
+            }
+            if node.capability.state_class != OperatorStateClass::Stateless
+                && (node.capability.managed_state.is_none()
+                    || !self.output_map.contains_key(node.name.as_ref()))
+            {
+                return Err(TopologyError::Unsupported(format!(
+                    "retained-state operator '{}' lacks a catalog-bound managed state mapping",
+                    node.name
+                ))
+                .into());
+            }
+        }
+        for (name, node_id) in &self.output_map {
+            let node = self
+                .nodes
+                .get(*node_id)
+                .filter(|node| !node.removed)
+                .ok_or_else(|| {
+                    TopologyError::Invalid(format!("output '{name}' has no live planned operator"))
+                })?;
+            contracts.insert(name.to_string(), node.capability);
+        }
+        Ok(contracts)
+    }
+
     pub fn set_shared_source_isolation(&mut self, on: bool, max_replay_buffer_bytes: usize) {
         self.shared_source_isolation = on;
         self.max_replay_buffer_bytes = max_replay_buffer_bytes;

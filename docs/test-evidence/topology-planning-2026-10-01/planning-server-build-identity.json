@@ -1,0 +1,11 @@
+{
+  "path": "C:\\Users\\sujit\\.codex\\worktrees\\9929\\laminardb\\target\\topology-evidence\\laminardb-planning-test-stack.exe",
+  "sha256": "b38e28d20e5a768548d1f9ba21e838f6f75d68874051be86c469ffac1bcee4cc",
+  "bytes": 169346048,
+  "profile": "soak",
+  "features": "cluster,aws,kafka",
+  "windows_main_stack_bytes": 16777216,
+  "built_from_commit": "d58d797514f1126926c69127010e1a634d65de30",
+  "worktree_modified": true,
+  "built_utc": "2026-10-01T16:49:13.2922102Z"
+}

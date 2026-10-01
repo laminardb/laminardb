@@ -6441,6 +6441,9 @@ struct TestCatalogAuthority {
 }
 
 #[cfg(feature = "cluster")]
+mod topology_planning;
+
+#[cfg(feature = "cluster")]
 async fn test_catalog_authority(
     object_store: Arc<dyn object_store::ObjectStore>,
 ) -> TestCatalogAuthority {

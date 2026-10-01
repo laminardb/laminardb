@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission and the old-topology checkpoint cut implemented; runtime topology migration
+Status: legacy adoption/status, core admission, the old-topology checkpoint cut and local additive candidate validation implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -276,17 +276,77 @@ workflow framework, new dependency or per-record work.
   versus the original 6.1545 us; Criterion reports change within noise threshold
   (p=0.01), not a certified throughput improvement. SLO modes remain observational.
 
+## Completed increment (2026-10-01, local candidate planning)
+
+Started clean at `d58d797514f1126926c69127010e1a634d65de30`. This implements
+DB-owned local candidate compilation and a public dry-run route, reusing the
+existing catalog, physical planner, graph and connector checks. It adds no general
+workflow framework, dependency, runtime actor or per-record work.
+
+- `LaminarDB::validate_cluster_topology_change` and console-authenticated
+  `POST /api/v1/cluster/topology/validate` audit the exact adopted parent and
+  compile parent/target catalogs privately. They support local validation of
+  independent replayable-source/stateless-stream/durable-sink additions and
+  stateless downstream streams/sinks while checking preserved managed definitions.
+- Descriptor format 1 binds stable catalog names/incarnations, canonical definitions,
+  global ABI/config, schemas, physical/state-codec contracts, connector implementation
+  versions/cancellation contracts and transitive dependencies. Full pipeline
+  identity encoding 7 and authority format 15 are unchanged. Ordinary recovery
+  remains strict; no state is restored across different fingerprints.
+- The private Created database shares frozen factories and a snapshot of live
+  routing resource availability. It has no authority, transport or runtime. Small
+  schema-only source queues reject intake without spawning their normal drain
+  tasks. Empty managed graphs use the configured state budget and are dropped
+  sequentially; no historical Arrow/state data is copied.
+- New objects are explicitly future-only. Source positions remain unresolved and
+  must be concretely resolved once at the cut and persisted before target commit.
+  The response lists missing participant agreement, cut, durable mapping/progress,
+  observed retirement, atomic target commit and installed-target Release.
+  Matching local reports do not constitute durable participant certificates.
+- One local compiler, 64 statements/256 KiB SQL, 256 total objects, 1 MiB
+  descriptor, 512 KiB HTTP body and a 30 second deadline bound validation.
+  Cancelled/busy/timed-out validation admits no durable operation. Unsupported
+  replacements, removals, new state, MV/reference tables, custom implementations
+  and uncertified connector/execution contracts fail closed.
+- New deterministic tests cover exact preserved incarnation/dependency binding,
+  independent/downstream additions, zero connector lifecycle effects and durable
+  writes, missing artifacts, conflicting/changed parents, unsafe changes,
+  source/sink/changelog/filter admission, missing live routing scope, bounded
+  queues without background tasks, cancellation, concurrency and deadlines.
+  Router coverage exercises authentication, local scope, request limits and
+  typed conflicts/unsupported operations using actual Kafka factories.
+- The real three-process cut/abort/restart harness now dry-runs the same candidate
+  on every running stateful node, compares complete descriptors, verifies intake
+  remains active, and records request latency. It still does not install the target.
+- Final validation passes 1,011 core, 1,984 DB and 356 server tests with
+  `cluster,aws,kafka` (one existing DB test ignored), 414 non-cluster core tests,
+  all-target Clippy, non-cluster server and `cluster,ffi` builds, fmt and diff
+  checks. Exact commands and output are in the
+  [planning evidence](test-evidence/topology-planning-2026-10-01/README.md).
+- The optimized three-process scenario passes in 321.13 s. All nodes return the
+  same 48-object plan, preserving 47 objects including 24 managed-state contracts;
+  request times are 1,367.189 / 470.731 / 2,322.800 ms with intake active. Cut 71
+  reaches CutPrepared in 2.731 s; full restart activates unchanged topology 1 in
+  37.104 s and retains the candidate abort and successful parent cut. Independent
+  stateful oracles observe every expected output across 111,741 logical input IDs,
+  with the frozen prefix durable through checkpoint 113. Sampled combined working
+  set peaks at 709,943,296 bytes. SLO modes remain observational; no matched
+  resource/throughput baseline or consumer-visible migration latency is measured.
+  All test server processes exited and only the isolated Compose fixtures were
+  removed, preserving volumes and artifacts.
+
 ## Remaining work
 
-1. DB-owned candidate planning and participant capability/compatibility certificates.
+1. Durable participant capability/compatibility certificates and binding of the
+   implemented local candidate descriptor to core admission.
    Core pre-cut admission, payload-bound status and serialization with the production
    assignment writer are implemented. The manual checkpoint path establishes the
    old cut; no worker certifies compatibility, stages or commits a target.
 2. Authorized state/ABI mappings, concrete new-source positions and durable target
    migration roots. Old checkpoint binding, quiescence and live root pinning exist.
 3. Observed actor retirement, install/release and post-commit recovery.
-4. Public SQL/atomic API, detached ownership, dry run and leader routing. The
-   read-only topology status contract is implemented; write routes are not.
+4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
+   status and local dry-run validation are implemented; activation/write routes are not.
 5. Removal/replacement contracts, fault matrix and existing soak extensions.
 6. Real multi-process stateful migration/restart oracle and comparative resource,
    steady-state and pause-inclusive performance measurements.
@@ -300,7 +360,9 @@ Use [operator guidance](cluster-topology-operations.md) and the
 Criterion output are under ignored `target/topology-evidence` and
 `target/topology-baseline`; checked-in queue sample evidence is under
 `docs/test-evidence/topology-adoption-2026-09-30` and
-`docs/test-evidence/topology-admission-2026-10-01`, with the latest cut results in
-`docs/test-evidence/topology-cut-2026-10-01`. This is a resumable checkpoint
+`docs/test-evidence/topology-admission-2026-10-01`. Cut results are in
+`docs/test-evidence/topology-cut-2026-10-01`; the latest local candidate validation
+and stateful restart results are in
+`docs/test-evidence/topology-planning-2026-10-01`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

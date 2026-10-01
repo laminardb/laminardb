@@ -5,7 +5,8 @@
 //! state contract is complete.
 
 /// How retained operator data is owned conceptually.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum OperatorStateClass {
     /// No retained data influences a later input batch.
     Stateless,
@@ -25,7 +26,8 @@ pub(crate) enum OperatorStateClass {
 /// implementation and codec; cluster execution additionally projects this contract onto vnode
 /// ownership and rebalance. A state class without a managed contract remains descriptive only and
 /// must not participate in the managed lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ManagedStateContract {
     /// The existing incremental SQL aggregate checkpoint codec.
     SqlAggregateV1,
@@ -40,7 +42,8 @@ pub(crate) enum ManagedStateContract {
 }
 
 /// Current relationship between this inventory entry and cluster DDL admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ClusterExecutionStatus {
     /// Existing DDL validation independently guards this shape.
     ///
@@ -59,7 +62,8 @@ pub(crate) enum ClusterExecutionStatus {
 ///
 /// This is only the physical shape. Durable stream, schema, query, and pipeline bindings are added
 /// by `subscription::distribution` before it becomes an `OutputDistributionCertificate`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum SubscriptionOutputDistribution {
     /// Final grouping keys map through the stable vnode partition ABI.
     VnodePartitioned,
@@ -71,7 +75,8 @@ pub(crate) enum SubscriptionOutputDistribution {
 ///
 /// Keep one variant per concrete implementation. The exhaustive match in
 /// [`OperatorCapability::fixed`] makes additions a compile-time review point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum OperatorImplementation {
     SourcePassthrough,
     Tombstoned,
@@ -91,7 +96,7 @@ pub(crate) enum OperatorImplementation {
 }
 
 /// Mandatory, admission-neutral description returned by every graph operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct OperatorCapability {
     pub(crate) implementation: OperatorImplementation,
     pub(crate) state_class: OperatorStateClass,

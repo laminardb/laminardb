@@ -14,9 +14,10 @@ pre-target-commit abort on a leader term change, definitive checkpoint Abort or
 durable recovery fault. A prepared cut includes the exact committed checkpoint
 and every frozen process's application receipt; intake and successor sink epochs
 remain held. It reserves an exact candidate without authorizing candidate actors.
-No record can commit topology 2. Candidate compatibility, target restore,
-retirement, Committed/Activating/Active and release remain unfinished. Runtime DDL
-stays fenced.
+No record can commit topology 2. Local additive candidate compilation and definition
+compatibility descriptors are implemented. Durable participant certificates, target
+restore, retirement, Committed/Activating/Active and release remain unfinished.
+Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
 authority append uses a create-only sequence object and the store's conditional
@@ -103,6 +104,61 @@ cleanup follows the admitted assignment-decision floor in bounded batches. Reque
 journal eviction and orphan candidate/plan cleanup are not implemented; a full
 journal rejects further admission. No public submit endpoint or cutover worker is
 enabled, so this bound is not advertised as a complete migration retention policy.
+
+## Local candidate planning
+
+`LaminarDB::validate_cluster_topology_change` audits the adopted parent through
+the existing catalog authority. Under the existing asynchronous catalog read
+lock, it captures live canonical definitions and, for a Running database, checks
+the coordinator's exact bound pipeline identity. It replays that inventory into
+a private Created database, reconciles only private catalog generations, compiles
+the parent, appends supported CREATEs privately and compiles the complete target.
+Before returning it rechecks the live definitions, authority and lifecycle.
+
+The private database shares only frozen connector factories. It has no controller,
+catalog authority, transport, runtime, source/sink actors or retained history.
+DDL's resource-presence checks consume a snapshot of the live process's shuffle
+and vnode availability; normal DBs still check actual handles. That private
+snapshot carries no execution, assignment, restore or publication authority.
+Source queues use the existing minimum 1,024 channel slots and a one-entry empty
+snapshot ring regardless of production buffer settings. Their consumer is dropped
+immediately, so input is rejected and no queue drain task is spawned. At most one candidate
+compiler runs locally. Parent and target managed graphs are dropped sequentially;
+empty managed-state initialization still uses the configured state budget.
+
+Planning reuses typed DDL, physical query-shape certification, schema resolution,
+source/role and sink delivery admission, sink predicate compilation, graph
+construction and managed-state initialization. Connector constructors/contract
+methods supply metadata; no lifecycle method or latest-position query runs.
+Replay-immutable changelog filters and reserved engine-column restrictions match
+the existing sink path. Unmapped internal managed operators fail closed instead
+of being assigned an optimizer index as a durable identity.
+
+Definition hashes come from the same canonical payload as strict
+`PipelineIdentity` encoding 7. Its serialization and ordinary recovery checks are
+unchanged. Each compatibility hash separately binds the catalog name/kind and
+generation, global ABI/config hash, canonical definition, resolved Arrow schema,
+physical capability/managed-state contract, connector implementation name/version,
+connector/cancellation contract and
+sorted dependency identities. Dependency hashes bind the transitive closure.
+Preserved descriptors must match exactly after the additive compilation. Target
+manifest references are computed but never written. Custom UDF/UDAF and optimizer
+rule implementations are rejected because their implementation identity is not
+certified by this descriptor.
+
+Local descriptor format 1 is scoped explicitly to `LocalCandidatePlan`. It
+classifies additions as future-only, leaves concrete source positions unresolved,
+and identifies the six activation requirements still missing. It is not a
+participant receipt, state-restore mapping, source ownership token or target
+commit certificate. The core pre-cut plan currently does not bind this descriptor.
+Future participant certification must persist agreement over the same exact
+candidate and frozen process roster before target preparation can advance.
+
+Input is bounded to 64 individual CREATEs/256 KiB SQL, 256 total objects and a
+1 MiB encoded descriptor, with a 30 second end-to-end asynchronous deadline.
+The console-authenticated HTTP route adds a 512 KiB JSON-body limit and returns
+local scope, parent conflicts, unsupported operations, busy and deadline results.
+No new dependency, scheduler or per-record work is added.
 
 ## Old-topology checkpoint cut
 
@@ -242,8 +298,9 @@ remains absent.
    positions, progress/frontiers and durable migration roots in shared authority.
 5. Restore/install the target before participant-complete release, with stale
    graph/shuffle/sink completion fences and target-only post-commit recovery.
-6. Wire public SQL and atomic multi-object submission, dry run, expected parent,
-   payload-bound idempotency and detached durable ownership. Do not reuse bootstrap.
+6. Wire public SQL and atomic multi-object submission, expected parent,
+   payload-bound idempotency and detached durable ownership. Local dry run exists;
+   it does not advance admission. Do not reuse bootstrap.
 7. Preserve unchanged subscription object/sequence identity through the explicit
    pipeline-identity mapping. Whole-graph hashes currently differ on additions;
    skipping their check is unsafe.
@@ -253,5 +310,7 @@ remains absent.
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)
 includes the real cut/abort/restart oracle, gate hold observations, failure logs
-and existing queue comparison. It does not certify target migration or production
-latency.
+and existing queue comparison. The latest [local candidate validation evidence](test-evidence/topology-planning-2026-10-01/README.md)
+records matching reports on all three running stateful processes and the subsequent
+cut/abort/restart oracle. These results do not certify target migration or
+production latency.

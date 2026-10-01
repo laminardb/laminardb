@@ -325,6 +325,10 @@ mod sink_preparation;
 mod source_contracts;
 mod startup;
 mod startup_preparation;
+#[cfg(feature = "cluster")]
+mod topology_planning;
+#[cfg(feature = "cluster")]
+pub(crate) use topology_planning::PlannedTopologyGraph;
 mod state_recovery;
 
 #[cfg(all(test, feature = "cluster"))]

@@ -36,8 +36,8 @@ pub(super) fn prepare_old_cut(
         .find(|entry| entry.kind == CatalogObjectKind::Source)
         .unwrap();
     let mut candidate = parent.clone();
-    // This staged definition only gives the request a changed payload. It is never compiled,
-    // installed or submitted as a supported SQL migration in this control-path scenario.
+    // Validate through the public, authenticated read-only API on every running process. The
+    // core admission below still does not bind participant certificates or authorize this target.
     candidate.entries.push(CatalogManifestEntry {
         canonical_name: "topology_cut_probe".into(),
         kind: CatalogObjectKind::Stream,
@@ -47,6 +47,67 @@ pub(super) fn prepare_old_cut(
             source.canonical_name.replace('"', "\"\"")
         ),
     });
+    let request = serde_json::json!({
+        "expected_parent_version": baseline.topology_version.get(),
+        "statements": [candidate.entries.last().unwrap().ddl],
+    });
+    let mut validations = Vec::new();
+    let mut expected_validation = None;
+    for node in nodes.iter_mut() {
+        let validated_at = Instant::now();
+        let body = node
+            .http_request(
+                "POST",
+                "/api/v1/cluster/topology/validate",
+                Some(&request.to_string()),
+                ceiling,
+            )
+            .expect("running stateful catalog must accept effect-free additive validation");
+        let validation_elapsed_ms = validated_at.elapsed().as_secs_f64() * 1000.0;
+        let validation: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(validation["scope"], "local_candidate_plan");
+        assert_eq!(validation["parent_version"].as_u64(), Some(1));
+        assert_eq!(validation["target_version"].as_u64(), Some(2));
+        assert_eq!(
+            validation["parent_manifest"],
+            serde_json::to_value(&baseline.manifest).unwrap()
+        );
+        assert_eq!(
+            validation["target_manifest"],
+            serde_json::to_value(candidate.reference().unwrap()).unwrap()
+        );
+        assert_ne!(validation["parent_pipeline"], validation["target_pipeline"]);
+        let mapped_state = validation["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|object| {
+                object["transition"] == "preserve" && object["managed_state_contract"].is_string()
+            })
+            .count();
+        assert!(
+            mapped_state >= 4,
+            "stateful oracle graph lost its compatibility mappings: {validation}"
+        );
+        if let Some(expected) = &expected_validation {
+            assert_eq!(&validation, expected);
+        } else {
+            expected_validation = Some(validation.clone());
+        }
+        let active: serde_json::Value =
+            serde_json::from_str(&node.http_get("/api/v1/cluster/topology").unwrap()).unwrap();
+        assert_eq!(active["committed_version"].as_u64(), Some(1));
+        assert_eq!(active["locally_active_version"].as_u64(), Some(1));
+        eprintln!("soak: node{} local topology validation completed in {validation_elapsed_ms:.3} ms with intake active", node.id);
+        validations.push(serde_json::json!({"node": node.id, "validation_elapsed_ms": validation_elapsed_ms, "validation": validation}));
+    }
+    assert_eq!(runtime.block_on(catalog.load()).unwrap().unwrap(), parent);
+    std::fs::write(
+        evidence_dir.join("topology-local-validations.json"),
+        serde_json::to_vec_pretty(&validations).unwrap(),
+    )
+    .unwrap();
+    eprintln!("soak: all {} running processes validated the same candidate and preserved managed state contracts; target remains uncommitted", nodes.len());
     let plan = TopologyAdmissionPlan {
         protocol_version: TOPOLOGY_PROTOCOL_VERSION,
         operation_id: uuid::Uuid::new_v4().try_into().unwrap(),

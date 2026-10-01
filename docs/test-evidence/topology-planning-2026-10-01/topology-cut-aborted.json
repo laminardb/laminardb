@@ -1,0 +1,111 @@
+{
+  "operation_id": "4254c305-2e12-401d-a4cf-1ded43228a3b",
+  "plan": {
+    "sha256": "b3d5f6c4fa80900c8dbc1c379e9108a1b15c0ee5ce43bd2115996f792e1de4bf",
+    "encoded_len": 896
+  },
+  "admitted_by": {
+    "owner": {
+      "node_id": 12632117528189947522,
+      "boot_id": "f1b4bbbc-6a51-40cc-bfa0-24fd36d929a7",
+      "process_term": 3
+    },
+    "fencing_token": 3
+  },
+  "admitted_sequence": 486,
+  "status_sequence": 502,
+  "state": {
+    "phase": "aborted",
+    "reason": "leader_changed"
+  },
+  "cut": {
+    "inventory": {
+      "deployment_id": "01a0f867-f8fa-7399-beaf-8aac7375ca3c",
+      "pipeline_identity": {
+        "canonical_version": 7,
+        "sha256": "04a7fcb3cd7884d5ed85b5de659fd11efcfeb266582c92f5058c590f66929443"
+      },
+      "attempt": {
+        "epoch": 71,
+        "checkpoint_id": 71
+      },
+      "assignment_fence": {
+        "assignment_version": 3,
+        "partitioning_abi_version": 2,
+        "vnode_count": 64,
+        "assignment_digest": [
+          4,
+          129,
+          37,
+          184,
+          28,
+          193,
+          137,
+          119,
+          42,
+          153,
+          19,
+          91,
+          95,
+          41,
+          14,
+          107,
+          74,
+          116,
+          175,
+          189,
+          101,
+          148,
+          200,
+          56,
+          194,
+          6,
+          158,
+          183,
+          203,
+          130,
+          105,
+          203
+        ],
+        "participants": [
+          {
+            "node_id": 12632117528189947522,
+            "boot_incarnation": "f1b4bbbc-6a51-40cc-bfa0-24fd36d929a7"
+          },
+          {
+            "node_id": 15506916534570490772,
+            "boot_incarnation": "f6f8b7fc-d60b-4efe-8825-ce98fe029a7d"
+          },
+          {
+            "node_id": 16059159448129433833,
+            "boot_incarnation": "a3bf7e28-b70f-45bc-9019-339394fb0641"
+          }
+        ]
+      }
+    },
+    "bound_sequence": 488,
+    "committed": {
+      "checkpoint": {
+        "epoch": 71,
+        "checkpoint_id": 71,
+        "sha256": "a80227a6af402e7c8d3505982a0ae3fc5c73e6869e2d6d60b5ddc3f2d9358a9f",
+        "len": 58875
+      },
+      "authority_sequence": 494
+    },
+    "completed_participants": [
+      {
+        "node_id": 12632117528189947522,
+        "boot_incarnation": "f1b4bbbc-6a51-40cc-bfa0-24fd36d929a7"
+      },
+      {
+        "node_id": 15506916534570490772,
+        "boot_incarnation": "f6f8b7fc-d60b-4efe-8825-ce98fe029a7d"
+      },
+      {
+        "node_id": 16059159448129433833,
+        "boot_incarnation": "a3bf7e28-b70f-45bc-9019-339394fb0641"
+      }
+    ]
+  }
+}

@@ -205,6 +205,8 @@ pub const TOPOLOGY_PROTOCOL_UNSUPPORTED: &str = "LDB-6063";
 pub const TOPOLOGY_AUTHORITY_CONTENDED: &str = "LDB-6064";
 /// Shared topology authority could not be read or persisted.
 pub const TOPOLOGY_AUTHORITY_FAILED: &str = "LDB-6065";
+/// Candidate topology needs an unimplemented state, initialization or connector contract.
+pub const TOPOLOGY_CHANGE_UNSUPPORTED: &str = "LDB-6066";
 
 // ── DataFusion / Arrow Interop (LDB-7xxx) ──
 

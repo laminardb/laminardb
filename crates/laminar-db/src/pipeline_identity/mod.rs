@@ -25,6 +25,13 @@ use laminar_core::checkpoint::checkpoint_manifest::{PipelineIdentity, PIPELINE_I
 const STATE_ABI_VERSION: u32 = crate::operator_graph::STATE_FRAME_ABI_VERSION;
 const STATE_LAYOUT: &str = "vnode";
 
+#[cfg(feature = "cluster")]
+mod compatibility;
+#[cfg(feature = "cluster")]
+pub(crate) use compatibility::digest as compatibility_digest;
+#[cfg(feature = "cluster")]
+pub(crate) use compatibility::{compatibility_identities, PipelineCompatibilityIdentities};
+
 #[derive(Serialize)]
 struct CanonicalPipeline {
     canonical_version: u16,
@@ -165,7 +172,11 @@ impl<'a> PipelineIdentityContext<'a> {
 
 /// Compute the exact checkpoint recovery identity.
 pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineIdentity, DbError> {
-    let payload = CanonicalPipeline {
+    identity_for_payload(&canonical_pipeline(context)?)
+}
+
+fn canonical_pipeline(context: &PipelineIdentityContext<'_>) -> Result<CanonicalPipeline, DbError> {
+    Ok(CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
         partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
@@ -188,7 +199,10 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
         streams: canonical_streams(context.config, &context.registrations)?,
         tables: canonical_tables(context.catalog, &context.registrations)?,
         sinks: canonical_sinks(context.config, &context.registrations)?,
-    };
+    })
+}
+
+fn identity_for_payload(payload: &CanonicalPipeline) -> Result<PipelineIdentity, DbError> {
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| DbError::Checkpoint(format!("pipeline identity encode: {error}")))?;
     let digest = Sha256::digest(encoded);

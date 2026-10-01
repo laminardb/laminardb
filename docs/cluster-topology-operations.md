@@ -1,20 +1,21 @@
 # Cluster topology status and upgrade checkpoint
 
 This checkpoint implements explicit legacy catalog adoption, core admission,
-an old-topology checkpoint cut and topology/operation status.
+an old-topology checkpoint cut, topology/operation status and local candidate validation.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
-and durable replay. There is no supported migration submission or dry-run route.
+and durable replay. There is no supported migration submission or activation route.
 
 | Operation | Current support |
 | --- | --- |
 | Initial cold bootstrap and exact sealed-catalog replay | Existing behavior |
 | Read durable topology and local activation status | Implemented |
 | Read an admitted pre-cut request's durable status | Implemented, console authorization |
+| Dry-run an additive candidate against an adopted parent | Local compile and compatibility descriptor; no durable admission |
 | Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
 | Prepare and hold an exact old-topology cut | Existing manual checkpoint path for an internal core reservation; no target activation |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
-| Add an independent pipeline or downstream stream/sink | Rejected; candidate compatibility and target installation unfinished |
+| Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
 | Change keys, windows, state schema, source identity or sink semantics | Rejected; requires certified transformation/replay contracts |
 
@@ -52,6 +53,72 @@ Status is an observation, not an ownership grant. It may change immediately
 after a response. Existing authority reads can reconcile publication of a
 previously created authority record; the status request does not admit a new
 topology operation or allocate a checkpoint/deployment identity.
+
+## Validate an additive candidate
+
+`POST /api/v1/cluster/topology/validate` uses console authorization and the existing
+serving gates. It runs locally on the addressed process; it does not forward to
+the leader. The catalog must already have an explicitly adopted version, and
+the process must have replayed that exact parent. Created and Running databases
+can validate; startup, recovery and shutdown reject validation.
+
+```http
+POST /api/v1/cluster/topology/validate HTTP/1.1
+Host: 127.0.0.1:8080
+Authorization: Bearer <configured-console-token>
+Content-Type: application/json
+
+{
+  "expected_parent_version": 1,
+  "statements": [
+    "CREATE STREAM new_projection AS SELECT id, value FROM existing_source WHERE value > 0"
+  ]
+}
+```
+
+Each array entry must be one additive `CREATE SOURCE`, `CREATE STREAM` or
+`CREATE SINK`. Sources require explicit columns and replayable, cluster-supported
+connectors; sinks require supported durable connectors and compatible input
+semantics. New streams must be stateless. Unchanged managed aggregates, supported
+windows and joins are mapped by their exact definitions, incarnation, schema,
+state codec and dependency closure. Object names alone are insufficient.
+Reference tables, materialized views, replacement, removal, new stateful streams,
+catalog-only ingress/output and custom function/optimizer implementations are
+unsupported. The existing DDL, physical planner and connector admission checks
+still reject unsupported query shapes, placement, filters and delivery contracts.
+
+A successful response has `scope = "local_candidate_plan"`, exact parent/target
+manifest references, both strict pipeline identities, a deterministic
+`compatibility_sha256`, and sorted `objects`. Each object is classified as
+`preserve` or `add_future_only`, with an explicit initialization requirement.
+Preserved objects require the reconciled cut's state and progress. New streams
+and sinks require future-only cut boundaries. New sources require concrete latest
+source/partition positions resolved once and persisted before target commit.
+This endpoint does not discover positions or imply historical replay/backfill.
+
+Validation constructs a private catalog and empty managed graph, with small empty
+source queues. It reads the adopted parent and rechecks its authority, without
+writing a target manifest, admitting a request, allocating a checkpoint, copying
+retained history, opening/polling sources, opening/publishing sinks or closing live
+intake. The strict recovery fingerprint remains mandatory; the changed target
+identity cannot restore an ordinary parent checkpoint through this API.
+
+`required_before_activation` lists the missing authorization: complete participant
+plan agreement, reconciled old cut, durable initialization/progress mappings,
+observed actor retirement, atomic target commit and installed-target Release.
+Even identical successful results from every node are observations, not durable
+participant certificates or authorization to submit/activate the target. Normal
+SQL still returns LDB-6043 after successful validation.
+
+Bounds are one compiler per process, 1..64 statements, 256 KiB of SQL, 256 total
+catalog objects, a 1 MiB compatibility descriptor and a 30 second deadline.
+HTTP JSON bodies are capped at 512 KiB. Responses are uncached. Parent conflicts
+return 409; malformed/bounded SQL requests return 400; unsupported semantic
+operations return 422; a busy compiler returns 429 with `Retry-After: 1`;
+deadline expiry returns 504; unavailable authority or serving fences return 503.
+Cancellation releases private planning ownership without a durable operation to
+resume. Authentication, media-type and JSON-shape failures use the existing
+router's status codes.
 
 ## Legacy upgrade and restart
 
@@ -105,8 +172,9 @@ reusing an identity with a different payload fails. The core journal retains at
 most 64 identities and rejects further admission until journal retention exists.
 
 This route is exercised against admitted/aborted requests by the existing HTTP
-router fixture. There is still no supported HTTP/SQL submission, dry-run or manual
-admission command. Do not create a reservation by editing authority files.
+router fixture. Local dry-run validation is available separately; there is still
+no supported HTTP/SQL submission or manual admission command. Do not create a
+reservation by editing authority files.
 
 An internally admitted cut is bound to its exact old deployment, pipeline ABI,
 assignment/boot roster and checkpoint attempt before Prepare. Its optional `cut`
@@ -143,6 +211,7 @@ the existing retirement and readiness checks; a rejected release keeps it closed
 | `LDB-6063` | Unsupported topology protocol; complete the coordinated binary upgrade |
 | `LDB-6064` | Bounded operation contention/uncertain outcome, or status-read timeout; the message distinguishes these cases |
 | `LDB-6065` | Shared authority I/O/validation failed; restore access or exact persisted evidence |
+| `LDB-6066` | Candidate operation or compatibility contract is unsupported; use the reported supported subset |
 
 The status endpoint returns 503 for unavailable/corrupt authority or serving
 fences, and 504 for a read deadline. It must not return a successful empty or

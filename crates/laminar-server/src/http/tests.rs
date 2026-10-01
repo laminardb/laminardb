@@ -38,6 +38,9 @@ use tower::ServiceExt;
 #[cfg(feature = "cluster")]
 use tracing::instrument::WithSubscriber as _;
 
+#[cfg(all(feature = "cluster", feature = "kafka"))]
+mod topology_planning;
+
 #[cfg(feature = "cluster")]
 #[derive(Clone, Default)]
 struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
@@ -2510,6 +2513,7 @@ async fn diagnostic_bearer_is_rejected_before_every_console_handler() {
         ("GET", "/api/v1/cluster/leader"),
         ("GET", "/api/v1/cluster/checkpoints"),
         ("GET", "/api/v1/cluster/topology"),
+        ("POST", "/api/v1/cluster/topology/validate"),
         (
             "GET",
             "/api/v1/cluster/topology/operations/00000000-0000-0000-0000-00000000002b",
@@ -3542,17 +3546,33 @@ async fn test_cluster_leader_404_when_not_cluster() {
 
 #[tokio::test]
 async fn topology_status_404_when_not_cluster_and_requires_console_authorization() {
-    for uri in [
-        "/api/v1/cluster/topology",
-        "/api/v1/cluster/topology/operations/00000000-0000-0000-0000-00000000002b",
+    for (method, uri) in [
+        ("GET", "/api/v1/cluster/topology"),
+        (
+            "GET",
+            "/api/v1/cluster/topology/operations/00000000-0000-0000-0000-00000000002b",
+        ),
+        ("POST", "/api/v1/cluster/topology/validate"),
     ] {
         let response = build_router(test_state())
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let response = build_router(test_state_with_token("topology-console"))
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);

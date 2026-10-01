@@ -53,7 +53,8 @@ impl FromStr for DeliveryGuarantee {
 /// This is deliberately a small, ordered set of operational contracts rather
 /// than a collection of independent capability flags. A source must advertise
 /// the strongest contract its implementation can actually uphold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceConsistency {
     /// Events cannot be reconstructed after the runtime has accepted them.
     #[default]
@@ -80,7 +81,8 @@ impl SourceConsistency {
 }
 
 /// How a source may be placed across runtime nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceTopology {
     /// Exactly one runtime instance owns the source.
     #[default]
@@ -92,7 +94,8 @@ pub enum SourceTopology {
 }
 
 /// Update model emitted by a configured source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceInputMode {
     /// Every row is an insertion.
     #[default]
@@ -104,7 +107,8 @@ pub enum SourceInputMode {
 }
 
 /// Whether a source emits an ordered deterministic position for every decoded row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SourceRowPositionCapability {
     /// The source does not provide row positions.
     #[default]
@@ -117,7 +121,7 @@ pub enum SourceRowPositionCapability {
 }
 
 /// Complete source admission contract for a concrete connector configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 pub struct SourceContract {
     /// Recovery and external-progress semantics.
     pub consistency: SourceConsistency,
@@ -186,7 +190,8 @@ impl SourceContract {
 ///
 /// This describes externally observable behaviour, not an implementation
 /// detail such as whether the client library buffers or retries writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SinkConsistency {
     /// An accepted write can be lost when the connector or peer fails.
     #[default]
@@ -201,7 +206,8 @@ pub enum SinkConsistency {
 }
 
 /// How a sink may be placed across runtime nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SinkTopology {
     /// Only one fenced runtime writer may target the configured destination.
     #[default]
@@ -213,7 +219,8 @@ pub enum SinkTopology {
 }
 
 /// The strongest input update model a configured sink understands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SinkInputMode {
     /// Inserts only; retractions or deletes would be lost.
     #[default]
@@ -235,7 +242,7 @@ impl SinkInputMode {
 }
 
 /// Complete sink admission contract for a concrete connector configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
 pub struct SinkContract {
     /// Durability and checkpoint-commit semantics.
     pub consistency: SinkConsistency,

@@ -185,6 +185,15 @@ pub enum TopologyError {
     /// A status read exceeded its control-path deadline.
     #[error("[{code}] topology status read exceeded its 15 second deadline; retry this read", code = error_codes::TOPOLOGY_AUTHORITY_CONTENDED)]
     ReadTimedOut,
+    /// A candidate requires an unsupported semantic transformation or execution contract.
+    #[error("[{code}] unsupported topology change: {0}", code = error_codes::TOPOLOGY_CHANGE_UNSUPPORTED)]
+    Unsupported(String),
+    /// Another bounded local candidate compilation owns this process's planning slot.
+    #[error("[{code}] topology validation is busy on this process; retry validation", code = error_codes::TOPOLOGY_AUTHORITY_CONTENDED)]
+    PlanningBusy,
+    /// Local validation exceeded its bounded control-path budget without admitting an operation.
+    #[error("[{code}] topology validation exceeded its 30 second deadline; no operation was admitted", code = error_codes::TOPOLOGY_AUTHORITY_CONTENDED)]
+    PlanningTimedOut,
 }
 
 impl From<CatalogManifestError> for TopologyError {
@@ -206,7 +215,10 @@ impl TopologyError {
             Self::Conflict(_) => error_codes::TOPOLOGY_PARENT_CONFLICT,
             Self::Fenced => error_codes::TOPOLOGY_FENCED,
             Self::Protocol(_) => error_codes::TOPOLOGY_PROTOCOL_UNSUPPORTED,
-            Self::Contended | Self::ReadTimedOut => error_codes::TOPOLOGY_AUTHORITY_CONTENDED,
+            Self::Unsupported(_) => error_codes::TOPOLOGY_CHANGE_UNSUPPORTED,
+            Self::Contended | Self::ReadTimedOut | Self::PlanningBusy | Self::PlanningTimedOut => {
+                error_codes::TOPOLOGY_AUTHORITY_CONTENDED
+            }
         }
     }
 }

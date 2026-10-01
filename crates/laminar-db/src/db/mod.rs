@@ -16,6 +16,11 @@ pub(crate) use assignment_authority::{
 };
 #[cfg(feature = "cluster")]
 pub use topology::ClusterTopologyStatus;
+#[cfg(feature = "cluster")]
+pub use topology::{
+    ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
+    TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -291,6 +296,13 @@ pub struct LaminarDB {
     /// Serializes topology DDL through manifest persistence; catalog reads take a shared guard so
     /// they cannot observe a tentative create that may still roll back.
     pub(crate) topology_ddl_lock: tokio::sync::RwLock<()>,
+    /// One effect-free candidate compiler at a time; rejected callers do not queue more graphs.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_validation_lock: tokio::sync::Mutex<()>,
+    // Only a private, unstarted topology catalog carries a resource-availability snapshot.
+    // Normal databases check their actual transport and ownership handles during DDL admission.
+    #[cfg(feature = "cluster")]
+    pub(crate) topology_planning_ownership_scope: Option<bool>,
     /// Typed ownership for every user-visible catalog identifier.
     pub(crate) catalog_namespace: parking_lot::Mutex<HashMap<String, CatalogObjectKind>>,
     #[cfg(test)]
@@ -1787,6 +1799,10 @@ impl LaminarDB {
             control_runtime: DbControlRuntime::new(),
             startup_attempt: parking_lot::Mutex::new(None),
             topology_ddl_lock: tokio::sync::RwLock::new(()),
+            #[cfg(feature = "cluster")]
+            topology_validation_lock: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "cluster")]
+            topology_planning_ownership_scope: None,
             catalog_namespace: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(test)]
             topology_planning_gate: parking_lot::Mutex::new(None),

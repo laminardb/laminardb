@@ -1,15 +1,105 @@
-//! Bounded, authenticated read-only durable topology status.
+//! Bounded, authenticated topology status and effect-free candidate validation.
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-#[cfg(feature = "cluster")]
 use axum::Json;
 
 use super::cluster_admin::CLUSTER_DISABLED_MSG;
 use super::{error_response, AppState};
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+pub(super) struct TopologyValidationRequest {
+    expected_parent_version: u64,
+    statements: Vec<String>,
+}
+
+/// This local validation route follows the same console authorization/startup gates as status.
+/// No leader forwarding is needed: the result explicitly certifies this process's local plan only.
+pub(super) async fn validate_cluster_topology(
+    State(state): State<Arc<AppState>>,
+    request: Result<Json<TopologyValidationRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    #[cfg(not(feature = "cluster"))]
+    let response = {
+        let _ = (state, request);
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    };
+    #[cfg(feature = "cluster")]
+    let response = {
+        use laminar_core::cluster::control::{TopologyError, TopologyVersion};
+
+        let validation = async {
+            if state.cluster.is_none() {
+                return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+            }
+            let request = match request {
+                Ok(Json(request)) => request,
+                Err(error) => {
+                    return error_response(error.status(), error.body_text()).into_response()
+                }
+            };
+            let expected_parent = match TopologyVersion::new(request.expected_parent_version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return error_response(StatusCode::BAD_REQUEST, error.to_string())
+                        .into_response()
+                }
+            };
+            let result = state
+                .db
+                .validate_cluster_topology_change(expected_parent, &request.statements)
+                .await;
+            if let Some(reason) = state.serving_rejection() {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+            }
+            match result {
+                Ok(validation) => Json(validation).into_response(),
+                Err(error) => {
+                    let status = match &error {
+                        laminar_db::DbError::Topology(TopologyError::Conflict(_)) => {
+                            StatusCode::CONFLICT
+                        }
+                        laminar_db::DbError::Topology(TopologyError::Invalid(_))
+                        | laminar_db::DbError::SqlParse(_)
+                        | laminar_db::DbError::Sql(_) => StatusCode::BAD_REQUEST,
+                        laminar_db::DbError::Topology(
+                            TopologyError::Unsupported(_) | TopologyError::Protocol(_),
+                        ) => StatusCode::UNPROCESSABLE_ENTITY,
+                        laminar_db::DbError::Topology(TopologyError::PlanningBusy) => {
+                            StatusCode::TOO_MANY_REQUESTS
+                        }
+                        laminar_db::DbError::Topology(
+                            TopologyError::PlanningTimedOut | TopologyError::ReadTimedOut,
+                        ) => StatusCode::GATEWAY_TIMEOUT,
+                        laminar_db::DbError::Topology(_) | laminar_db::DbError::Shutdown => {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                        _ => StatusCode::UNPROCESSABLE_ENTITY,
+                    };
+                    error_response(status, error.to_string()).into_response()
+                }
+            }
+        };
+        validation.await
+    };
+    let mut response = response;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    response
+}
 
 pub(super) async fn cluster_topology(State(state): State<Arc<AppState>>) -> Response {
     #[cfg(not(feature = "cluster"))]
