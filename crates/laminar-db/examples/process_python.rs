@@ -1,9 +1,13 @@
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use laminar_db::process_function::remote::{LocalPythonWorker, LocalPythonWorkerConfig};
+use laminar_db::process_function::remote::{
+    LocalPythonWorker, LocalPythonWorkerConfig, RemoteProcessClient,
+};
+use laminar_db::process_function::ProcessFunctionDescriptor;
 use laminar_db::subscription::{PortalFrame, SubscribeStart};
 use laminar_db::LaminarDB;
 
@@ -30,6 +34,22 @@ fn demo_mode() -> Result<DemoMode, Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mode = demo_mode()?;
+    if let Some(endpoint) = std::env::var_os("LAMINAR_PROCESS_ENDPOINT") {
+        let endpoint = endpoint.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker endpoint must be UTF-8",
+            )
+        })?;
+        let descriptor = ProcessFunctionDescriptor::from_manifest_json(include_bytes!(
+            "../../../examples/process_python/manifest.json"
+        ))?;
+        let client = Arc::new(
+            RemoteProcessClient::connect_loopback(endpoint, descriptor, 2, Duration::from_secs(5))
+                .await?,
+        );
+        return run_database(&client, &mode).await;
+    }
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let example = root.join("examples/process_python");
     let python = std::env::var_os("LAMINAR_PROCESS_PYTHON")
@@ -45,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         timeout: Duration::from_secs(5),
     })
     .await?;
-    let outcome = run_database(&worker, &mode).await;
+    let outcome = run_database(&worker.client(), &mode).await;
     let cleanup = worker.shutdown().await;
     match (outcome, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -57,7 +77,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn run_database(worker: &LocalPythonWorker, mode: &DemoMode) -> Result<(), Box<dyn Error>> {
+async fn run_database(
+    client: &Arc<RemoteProcessClient>,
+    mode: &DemoMode,
+) -> Result<(), Box<dyn Error>> {
     let db = match mode {
         DemoMode::InMemory => LaminarDB::open()?,
         DemoMode::Checkpoint(path) | DemoMode::Resume(path) => {
@@ -68,7 +91,7 @@ async fn run_database(worker: &LocalPythonWorker, mode: &DemoMode) -> Result<(),
                 .await?
         }
     };
-    let outcome = run_pipeline(&db, worker, mode).await;
+    let outcome = run_pipeline(&db, client, mode).await;
     let cleanup = db.shutdown().await;
     match (outcome, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -81,8 +104,8 @@ async fn run_database(worker: &LocalPythonWorker, mode: &DemoMode) -> Result<(),
 }
 
 async fn run_pipeline(
-    db: &std::sync::Arc<LaminarDB>,
-    worker: &LocalPythonWorker,
+    db: &Arc<LaminarDB>,
+    client: &Arc<RemoteProcessClient>,
     mode: &DemoMode,
 ) -> Result<(), Box<dyn Error>> {
     db.execute(
@@ -93,8 +116,8 @@ async fn run_pipeline(
     db.register_remote_process_function(
         "activity",
         "events",
-        worker.client().descriptor().clone(),
-        worker.client(),
+        client.descriptor().clone(),
+        Arc::clone(client),
     )
     .await?;
     db.start().await?;
@@ -107,7 +130,7 @@ async fn run_pipeline(
         DemoMode::Resume(_) => (&[(50, 100_050)], &[110]),
     };
     let batch = RecordBatch::try_new(
-        worker.client().descriptor().input_schema.clone(),
+        client.descriptor().input_schema.clone(),
         vec![
             std::sync::Arc::new(StringArray::from(vec!["a"; rows.len()])),
             std::sync::Arc::new(Int64Array::from(

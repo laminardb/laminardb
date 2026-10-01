@@ -9,6 +9,7 @@ import importlib.util
 from hashlib import sha256
 import ipaddress
 from pathlib import Path
+import signal
 import sys
 import threading
 import time
@@ -301,8 +302,17 @@ def serve(manifest: Manifest, handler: Handler, bind: str, max_in_flight: int = 
         if bound_port == 0:
             raise OSError("failed to bind process worker listener")
         server.start()
-        print(f"READY {bound_port}", flush=True)
-        server.wait_for_termination()
+        previous_sigterm = None
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm = signal.signal(signal.SIGTERM, lambda _signal, _frame: server.stop(5))
+        try:
+            print(f"READY {bound_port}", flush=True)
+            server.wait_for_termination()
+        finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
+            if not server.stop(0).wait(timeout=5):
+                raise TimeoutError("process worker failed to stop")
 
 
 def _load_bound_module(module_name: str, handler_file: Path, digest: bytes) -> ModuleType:

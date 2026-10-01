@@ -1,0 +1,44 @@
+services:
+  worker:
+    image: ${LAMINAR_PROCESS_WORKER_IMAGE:?resolve the worker image before running}
+    pull_policy: never
+    init: true
+    network_mode: none
+    read_only: true
+    cpus: 1
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+
+  example:
+    image: ${LAMINAR_PROCESS_EXAMPLE_IMAGE:?resolve the example image before running}
+    pull_policy: never
+    init: true
+    network_mode: service:worker
+    depends_on:
+      worker:
+        condition: service_healthy
+    read_only: true
+    cpus: 1
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    volumes:
+      - checkpoints:/var/lib/laminardb-process
+
+volumes:
+  checkpoints:

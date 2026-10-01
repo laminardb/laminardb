@@ -262,16 +262,93 @@ timeout and handler initialization failure. A configured path beneath a junction
 ancestor is rejected, and deployment-directory renaming remains blocked through
 worker execution and succeeds after cleanup.
 
-## Container image
+## Container checkpoint quickstart
 
-From the repository root, build the same pinned package and example:
+Use Docker with Linux containers and the Compose plugin. From the repository
+root, build the pinned worker and the Rust engine example:
 
-```bash
-docker build -f python/laminardb_process/Dockerfile -t laminardb-process-local .
+```sh
+docker build --target worker -f python/laminardb_process/Dockerfile -t laminardb-process-local .
+docker build --target example -f python/laminardb_process/Dockerfile -t laminardb-process-example .
 ```
 
-The image starts the loopback example worker. A client must share its network
-namespace; exposing the plaintext worker on a nonlocal interface is unsupported.
+The default Dockerfile target is the worker. The `example` target builds the same
+Rust example with the workspace MSRV and locked dependencies, without debug
+symbols. It is a development build, not a performance reference.
+
+Resolve the tags to local content-addressed image IDs before activation. On Bash:
+
+```bash
+export LAMINAR_PROCESS_WORKER_IMAGE="$(docker image inspect --format '{{.Id}}' laminardb-process-local)"
+export LAMINAR_PROCESS_EXAMPLE_IMAGE="$(docker image inspect --format '{{.Id}}' laminardb-process-example)"
+mkdir -p target/process-container
+```
+
+On PowerShell:
+
+```powershell
+$env:LAMINAR_PROCESS_WORKER_IMAGE = docker image inspect --format '{{.Id}}' laminardb-process-local
+$env:LAMINAR_PROCESS_EXAMPLE_IMAGE = docker image inspect --format '{{.Id}}' laminardb-process-example
+New-Item -ItemType Directory -Path target/process-container -Force | Out-Null
+```
+
+The following commands work in either shell. Use a fresh Compose project name
+for the first checkpoint; reusing an existing checkpoint causes the example's
+expected-total check to fail.
+
+```sh
+docker compose -p laminar-process-quickstart -f examples/process_python/compose.yaml config --output target/process-container/compose.resolved.yaml
+docker compose -f target/process-container/compose.resolved.yaml run --rm example checkpoint /var/lib/laminardb-process/checkpoints
+docker compose -f target/process-container/compose.resolved.yaml restart worker
+docker compose -f target/process-container/compose.resolved.yaml run --rm example resume /var/lib/laminardb-process/checkpoints
+docker compose -f target/process-container/compose.resolved.yaml down
+```
+
+The saved configuration retains the selected image IDs, so subsequent commands
+do not resolve the build tags again. Keep it and the named checkpoint volume
+for recovery. Local image IDs are specific to the Docker daemon. For registry
+distribution, operators should use a resolved `repository@sha256:...` reference
+and retain that image; the engine does not pull images or access a Docker socket.
+
+The first engine container prints `key=a total=60` and commits a checkpoint.
+After the worker restart, a new engine container restores state and prints
+`key=a total=110`. `down` removes the containers and retains the checkpoint
+volume. This demonstrates embedded `BestEffort` recovery from a completed cut;
+the direct source does not replay uncommitted input. The descriptor binds the
+handler and protocol; the saved deployment configuration pins the complete
+images. This does not certify Python replay equivalence or enable cluster mode.
+
+The worker verifies `handler.py` before loading it. Both images run as UID/GID
+10001. The [Compose configuration](../../examples/process_python/compose.yaml)
+sets each container to one CPU, 256 MiB memory without swap, 64 tasks, a read-only
+root filesystem, and a 16 MiB temporary filesystem with execution disabled.
+It drops Linux capabilities and forbids privilege escalation. The engine writes
+only to its checkpoint volume. That volume uses ordinary Docker storage and has
+no quota; provision its capacity separately for longer runs.
+See the [Compose service options](https://docs.docker.com/reference/compose-file/services/)
+for these deployment controls.
+
+The worker's network namespace has only loopback, and the engine shares it.
+The example publishes no ports and has no external egress. Exposing the
+plaintext worker on a nonlocal interface remains unsupported. The gRPC readiness
+check runs after package loading, and Compose waits for it before launching the
+engine. The fixed image probe targets port 50051; override the healthcheck if
+you change the worker's bind port. Worker logs rotate at 1 MiB with two files.
+
+SIGTERM stops new calls and gives active calls five seconds to complete before
+gRPC cancellation. Compose allows ten seconds before forcibly stopping the
+container. A blocked handler cannot be interrupted safely inside Python; the
+container deadline is the final bound. Stop intake and checkpoint/drain the
+engine before stopping a worker in a running deployment. The example commands
+finish the engine process before each worker restart.
+The drain uses [gRPC's graceful stop](https://grpc.github.io/grpc/python/grpc.html#grpc.Server.stop).
+
+To use an independently deployed worker with the local Rust example, set
+`LAMINAR_PROCESS_ENDPOINT=http://127.0.0.1:50051`. It connects through the existing
+bounded client and uses the example's compiled descriptor. The caller owns the
+worker lifecycle, and must run in the same network namespace with the matching
+example package. Without this variable, the local Python quickstart starts its
+own supervised worker.
 
 The checked-in Protobuf messages are generated from
 `crates/laminar-db/proto/process_worker.proto` with `grpcio-tools==1.84.0`:

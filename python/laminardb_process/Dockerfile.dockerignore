@@ -1,4 +1,10 @@
 **
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!vendor/
+!vendor/**
 !python/
 !python/laminardb_process/
 !python/laminardb_process/requirements.lock

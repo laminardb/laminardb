@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 import os
 import py_compile
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -16,6 +19,7 @@ import grpc
 import pyarrow as pa
 
 from laminardb_process import Manifest
+from laminardb_process import process_worker_pb2 as wire
 from laminardb_process.worker import ProtocolError, _decode_batch, _encode_batch, _load_bound_module, serve
 
 
@@ -51,6 +55,77 @@ def manifest_bytes() -> bytes:
 
 
 class WorkerBoundaryTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "requires POSIX SIGTERM")
+    def test_sigterm_drains_an_active_call_and_rejects_new_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, ThreadPoolExecutor(max_workers=1) as reader:
+            handler = Path(directory) / "handler.py"
+            handler.write_text(
+                "import sys\nfrom laminardb_process import ActivationResult\n"
+                "def handle(activations):\n"
+                "    print('ENTERED', flush=True)\n"
+                "    if sys.stdin.buffer.read(1) != b'x':\n"
+                "        raise RuntimeError('missing release')\n"
+                "    return tuple(ActivationResult(a.id) for a in activations)\n",
+                encoding="utf-8",
+            )
+            data = json.loads(manifest_bytes())
+            data["implementation_digest"] = sha256(handler.read_bytes()).hexdigest()
+            manifest_file = Path(directory) / "manifest.json"
+            manifest_file.write_text(json.dumps(data), encoding="utf-8")
+            manifest = Manifest.from_bytes(manifest_file.read_bytes())
+            process = subprocess.Popen(
+                [sys.executable, "-m", "laminardb_process.worker", "--manifest", str(manifest_file),
+                 "--handler", "handler:handle", "--handler-file", str(handler), "--max-in-flight", "1"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+            )
+            try:
+                ready = reader.submit(process.stdout.readline).result(timeout=5)
+                self.assertTrue(ready.startswith(b"READY "), ready)
+                with grpc.insecure_channel(f"127.0.0.1:{int(ready.split()[1])}") as channel:
+                    grpc.channel_ready_future(channel).result(timeout=5)
+                    exchange = channel.stream_stream(
+                        "/laminar.process.v1.ProcessWorker/Exchange",
+                        request_serializer=wire.HostFrame.SerializeToString,
+                        response_deserializer=wire.WorkerFrame.FromString,
+                    )
+                    frames = [
+                        wire.HostFrame(open=wire.Open(
+                            protocol_version=1, descriptor_sha256=manifest.digest, operator_id="test",
+                            vnode_count=1, batch_id=b"a" * 16, attempt_id=b"b" * 16,
+                            deadline_unix_ms=time.time_ns() // 1_000_000 + 10_000,
+                        )),
+                        wire.HostFrame(activation=wire.Activation(
+                            id=1, canonical_key=b"key", key_text="key", event_time_us=1,
+                            timer_name="flush", absent=True,
+                        )),
+                        wire.HostFrame(end=wire.End(count=1)),
+                    ]
+                    call = exchange(iter(frames), timeout=10)
+                    self.assertEqual(reader.submit(process.stdout.readline).result(timeout=5), b"ENTERED\n")
+                    process.send_signal(signal.SIGTERM)
+                    for _ in range(20):
+                        try:
+                            list(exchange(iter(frames), timeout=0.1))
+                            self.fail("worker admitted a call while draining")
+                        except grpc.RpcError as error:
+                            if error.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.CANCELLED):
+                                break
+                            self.assertEqual(error.code(), grpc.StatusCode.RESOURCE_EXHAUSTED)
+                        time.sleep(0.05)
+                    else:
+                        self.fail("worker did not stop admission")
+                    process.stdin.write(b"x")
+                    response = list(call)
+                    self.assertEqual([frame.WhichOneof("kind") for frame in response], ["ack", "result", "complete"])
+                    self.assertEqual(response[-1].complete.result_count, 1)
+                self.assertEqual(process.wait(timeout=5), 0)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                process.stdin.close()
+                process.stdout.close()
+
     def test_worker_rejects_handler_from_another_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = Path(directory) / "manifest.json"
