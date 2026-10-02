@@ -2792,12 +2792,7 @@ impl LaminarDB {
             )));
         }
         replay_guard.sealed();
-        *self.replayed_topology_version.lock() = match topology {
-            laminar_core::cluster::control::TopologyCatalogState::Versioned { baseline } => {
-                Some(baseline.topology_version)
-            }
-            _ => None,
-        };
+        *self.replayed_topology_version.lock() = topology.committed_version();
         Ok(Some(manifest))
     }
 
@@ -4763,6 +4758,27 @@ impl LaminarDB {
         }
 
         if let Some(manifest) = self.restore_catalog_from_manifest().await? {
+            let configured_catalog_store = self.catalog_manifest_store.lock().clone();
+            let configured_legacy_baseline = if let Some(store) = configured_catalog_store {
+                if let laminar_core::cluster::control::TopologyCatalogState::Versioned {
+                    baseline,
+                    committed: Some(commit),
+                } = store.topology_state().await?
+                {
+                    // Additive Commit audit certifies that the original inventory remains this
+                    // exact ordered prefix. Only the full current inventory or the full original
+                    // bootstrap is accepted; an arbitrary subset is never a startup assertion.
+                    commit.manifest
+                        == manifest
+                            .reference()
+                            .map_err(laminar_core::cluster::control::TopologyError::from)?
+                        && parsed.len() == baseline.manifest.entry_count as usize
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             let configured_matches = parsed.iter().zip(&manifest.entries).all(
                 |((ddl, _, canonical_name, kind), entry)| {
                     ddl == &entry.ddl
@@ -4770,9 +4786,11 @@ impl LaminarDB {
                         && kind == &entry.kind
                 },
             );
-            if parsed.len() != manifest.entries.len() || !configured_matches {
+            if (parsed.len() != manifest.entries.len() && !configured_legacy_baseline)
+                || !configured_matches
+            {
                 return Err(DbError::Pipeline(format!(
-                    "configured cluster catalog must exactly match the complete ordered sealed inventory (configured entries: {}, sealed entries: {})",
+                    "configured cluster catalog must exactly match the complete ordered sealed inventory or its original adopted bootstrap (configured entries: {}, sealed entries: {})",
                     parsed.len(),
                     manifest.entries.len()
                 )));

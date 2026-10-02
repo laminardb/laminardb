@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::{
     AuthorityCreateOutcome, CheckpointDecisionStore, LeaderAuthorityRecord, LeaderLeaseStore,
     LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
-    TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
+    TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_COMMIT_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
     TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION, TOPOLOGY_PREPARATION_RECORD_VERSION,
     TOPOLOGY_SOURCE_ROOT_RECORD_VERSION, TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
 };
@@ -33,20 +33,20 @@ impl LeaderAuthorityRecord {
                 | TOPOLOGY_PREPARATION_RECORD_VERSION
                 | TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
                 | TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
-                | TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
+                | TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
+                | TOPOLOGY_COMMIT_RECORD_VERSION,
                 Some(baseline),
             ) => {
                 baseline
                     .validate()
                     .map_err(|error| LeaseError::Invalid(error.to_string()))?;
-                if baseline.authority_sequence > self.lease.seq
-                    || self.lease.catalog_manifest.as_ref() != Some(&baseline.manifest)
-                {
+                if baseline.authority_sequence > self.lease.seq {
                     return Err(LeaseError::Invalid(
                         "topology baseline does not bind the sealed catalog and authority sequence"
                             .into(),
                     ));
                 }
+                self.validate_committed_topology_chain(baseline)?;
                 Ok(())
             }
             _ => Err(LeaseError::Invalid(
@@ -79,6 +79,7 @@ impl LeaderAuthorityRecord {
                 ));
             }
         }
+        self.validate_committed_topology_successor(next)?;
         Ok(())
     }
 }
@@ -113,17 +114,28 @@ impl LeaderLeaseStore {
         let Some(head) = self.load_record().await? else {
             return Ok(None);
         };
-        let Some(manifest) = head.lease.catalog_manifest else {
+        let Some(manifest) = head.lease.catalog_manifest.as_ref() else {
             return Ok(None);
         };
-        let inventory = self.load_catalog_manifest(&manifest).await?;
-        let state = match head.topology_baseline {
-            None => TopologyCatalogState::LegacySealed { manifest },
+        let inventory = self.load_catalog_manifest(manifest).await?;
+        let state = match head.topology_baseline.as_ref() {
+            None => TopologyCatalogState::LegacySealed {
+                manifest: manifest.clone(),
+            },
             Some(baseline) => {
-                self.audit_topology_adoption(&baseline).await?;
+                self.audit_topology_adoption(baseline).await?;
                 self.require_topology_deployment(&baseline.deployment_id)
                     .await?;
-                TopologyCatalogState::Versioned { baseline }
+                let committed = if let Some(operation) = head.committed_topology_operation() {
+                    self.audit_topology_operation(operation).await?;
+                    operation.commit.clone()
+                } else {
+                    None
+                };
+                TopologyCatalogState::Versioned {
+                    baseline: baseline.clone(),
+                    committed,
+                }
             }
         };
         Ok(Some((inventory, state)))

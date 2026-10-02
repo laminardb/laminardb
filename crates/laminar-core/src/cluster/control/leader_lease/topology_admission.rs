@@ -65,6 +65,17 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
+            if (operation.commit.is_some()
+                || operation.target_preparations.iter().any(|receipt| {
+                    receipt.protocol_version
+                        == super::super::topology::TOPOLOGY_COMMIT_PROTOCOL_VERSION
+                }))
+                && self.version < TOPOLOGY_COMMIT_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "topology Commit capability requires authority format 20".into(),
+                ));
+            }
             if !operation.target_preparations.is_empty()
                 && self.version < TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
             {
@@ -90,9 +101,9 @@ impl LeaderAuthorityRecord {
                     "participant preparation requires authority format 16".into(),
                 ));
             }
-            if operation.is_preparing() {
+            if operation.blocks_admission() {
                 planned += 1;
-                if !self.lease.matches_proof(&operation.admitted_by) {
+                if operation.is_preparing() && !self.lease.matches_proof(&operation.admitted_by) {
                     return Err(LeaseError::Invalid(
                         "planned topology belongs to an obsolete term".into(),
                     ));
@@ -141,7 +152,11 @@ impl LeaderAuthorityRecord {
                                 })
                         })
                     || self.assignment_handoff_pin.is_some()
-                    || self.recovery_fault_slots.iter().any(|slot| slot.active)))
+                    || (self
+                        .topology_operations
+                        .iter()
+                        .any(TopologyAdmissionStatus::is_preparing)
+                        && self.recovery_fault_slots.iter().any(|slot| slot.active))))
         {
             return Err(LeaseError::Invalid(
                 "topology preparation overlaps incompatible authority".into(),
@@ -165,7 +180,7 @@ impl LeaderAuthorityRecord {
         if let Some(operation) = self
             .topology_operations
             .iter()
-            .find(|operation| operation.is_preparing())
+            .find(|operation| operation.blocks_admission())
         {
             return Err(DecisionError::Conflict(format!(
                 "topology operation {} reserves checkpoint and assignment admission",
@@ -423,8 +438,8 @@ impl LeaderLeaseStore {
                             .as_ref()
                             .map(|preparation| &preparation.compatibility)
                     && record.topology_baseline.as_ref().is_some_and(|baseline| {
-                        baseline.manifest == plan.parent_manifest
-                            && baseline.topology_version == plan.expected_parent
+                        record.committed_topology_identity()
+                            == Some((plan.expected_parent, &plan.parent_manifest))
                             && operation.cut.as_ref().is_none_or(|cut| {
                                 cut.inventory.deployment_id == baseline.deployment_id
                             })
@@ -446,7 +461,8 @@ impl LeaderLeaseStore {
         self.audit_topology_migration_root(operation, &plan, descriptor.as_ref())
             .await
             .map_err(topology_lease_error)?;
-        self.audit_topology_target_preparations(operation).await
+        self.audit_topology_target_preparations(operation).await?;
+        self.audit_topology_commit(operation, &plan).await
     }
 
     /// Read the definitive, payload-bound pre-cut request status without allocating identities.
@@ -555,8 +571,8 @@ impl LeaderLeaseStore {
                     "operation identity was already used for legacy adoption".into(),
                 ));
             }
-            if baseline.topology_version != plan.expected_parent
-                || baseline.manifest != plan.parent_manifest
+            if current.committed_topology_identity()
+                != Some((plan.expected_parent, &plan.parent_manifest))
             {
                 return Err(TopologyError::Conflict(
                     "expected topology parent does not match committed authority".into(),
@@ -571,7 +587,7 @@ impl LeaderLeaseStore {
             if current
                 .topology_operations
                 .iter()
-                .any(TopologyAdmissionStatus::is_preparing)
+                .any(TopologyAdmissionStatus::blocks_admission)
                 || current.assignment_drain_reservation.is_some()
                 || current.active_checkpoint_artifacts.is_some()
                 || current.assignment_handoff_pin.is_some()
@@ -650,6 +666,7 @@ impl LeaderLeaseStore {
                 cut: None,
                 migration_root: None,
                 target_preparations: Vec::new(),
+                commit: None,
                 preparation: plan.compatibility.clone().map(|compatibility| {
                     crate::cluster::control::topology::TopologyPreparation {
                         compatibility,
@@ -703,6 +720,9 @@ impl LeaderLeaseStore {
                     return Err(TopologyError::Conflict("operation payload differs".into()));
                 }
                 self.audit_topology_operation(operation).await?;
+                if operation.has_target_commit() {
+                    return Err(TopologyError::Conflict("committed topology requires target recovery and cannot abort".into()));
+                }
                 if !operation.is_preparing() {
                     return Ok(operation.clone());
                 }

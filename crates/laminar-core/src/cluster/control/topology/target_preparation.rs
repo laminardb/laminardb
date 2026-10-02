@@ -31,7 +31,11 @@ impl TopologyAdmissionStatus {
     #[must_use]
     pub fn target_preparation_complete(&self) -> bool {
         self.phase == TopologyAdmissionPhase::CutPrepared
-            && self.migration_root.is_some()
+            && self.target_preparation_roster_complete()
+    }
+
+    pub(crate) fn target_preparation_roster_complete(&self) -> bool {
+        self.migration_root.is_some()
             && self.cut.as_ref().is_some_and(|cut| {
                 cut.inventory
                     .assignment_fence
@@ -50,23 +54,30 @@ impl TopologyAdmissionStatus {
     // Only receipt/status progress can change while an image is retained. Every field defining
     // its restore authority remains exact. Destructuring forces future fields to be considered.
     pub(crate) fn same_restore_binding(&self, other: &Self) -> bool {
+        self.phase == other.phase
+            && self.commit == other.commit
+            && self.same_migration_binding(other)
+    }
+
+    // A Commit preserves these historical requirements while changing phase/catalog authority.
+    pub(crate) fn same_migration_binding(&self, other: &Self) -> bool {
         let Self {
             operation_id,
             plan,
             admitted_by,
             admitted_sequence,
             status_sequence: _,
-            phase,
+            phase: _,
             cut,
             preparation,
             migration_root,
             target_preparations: _,
+            commit: _,
         } = self;
         *operation_id == other.operation_id
             && *plan == other.plan
             && *admitted_by == other.admitted_by
             && *admitted_sequence == other.admitted_sequence
-            && *phase == other.phase
             && *cut == other.cut
             && *preparation == other.preparation
             && *migration_root == other.migration_root
@@ -84,15 +95,20 @@ impl TopologyAdmissionStatus {
         })?;
         if !matches!(
             self.phase,
-            TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Aborted { .. }
+            TopologyAdmissionPhase::CutPrepared
+                | TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Aborted { .. }
         ) || self.target_preparations.len() > MAX_CHECKPOINT_PARTICIPANTS
             || !self
                 .target_preparations
                 .windows(2)
                 .all(|pair| pair[0].participant.node_id < pair[1].participant.node_id)
             || self.target_preparations.iter().any(|receipt| {
-                receipt.protocol_version != TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION
-                    || receipt.authority_sequence <= root.authority_sequence
+                !matches!(
+                    receipt.protocol_version,
+                    TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION
+                        | super::TOPOLOGY_COMMIT_PROTOCOL_VERSION
+                ) || receipt.authority_sequence <= root.authority_sequence
                     || receipt.authority_sequence > self.status_sequence
                     || receipt.authority_sequence > head
                     || !preparation.certificates.iter().any(|certificate| {

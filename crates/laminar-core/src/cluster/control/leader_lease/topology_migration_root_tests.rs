@@ -17,6 +17,9 @@ use crate::cluster::control::CatalogObjectKind;
 use crate::state::KeyGroupCount;
 use std::collections::{BTreeMap, HashMap};
 
+#[path = "topology_commit_tests.rs"]
+mod topology_commit;
+
 struct Fixture {
     lease: LeaderLease,
     assignments: AssignmentSnapshotStore,

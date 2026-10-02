@@ -84,16 +84,20 @@ impl LaminarDB {
         let (parent, state) = store.load_with_topology().await?.ok_or_else(|| {
             TopologyError::Conflict("no sealed parent catalog; initialize and explicitly adopt the legacy baseline first".into())
         })?;
-        let TopologyCatalogState::Versioned { baseline } = &state else {
+        let TopologyCatalogState::Versioned {
+            baseline,
+            committed,
+        } = &state
+        else {
             return Err(TopologyError::Protocol(
                 "legacy catalog must be explicitly adopted before topology validation".into(),
             )
             .into());
         };
-        if baseline.topology_version != expected_parent {
+        if state.committed_version() != Some(expected_parent) {
             return Err(TopologyError::Conflict(format!(
                 "expected parent {expected_parent:?}, authority has {:?}",
-                baseline.topology_version
+                state.committed_version()
             ))
             .into());
         }
@@ -192,7 +196,10 @@ impl LaminarDB {
             deployment_id: baseline.deployment_id.clone(),
             parent_version: expected_parent,
             target_version,
-            parent_manifest: baseline.manifest.clone(),
+            parent_manifest: committed.as_ref().map_or_else(
+                || baseline.manifest.clone(),
+                |commit| commit.manifest.clone(),
+            ),
             target_manifest,
             parent_pipeline: parent_identities.pipeline,
             target_pipeline: target_identities.pipeline,

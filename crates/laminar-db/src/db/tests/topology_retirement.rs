@@ -7,6 +7,9 @@ use tokio::sync::Notify;
 #[path = "topology_target_preparation.rs"]
 mod target_preparation;
 
+#[path = "topology_commit.rs"]
+mod topology_commit;
+
 fn namespace_lock(db: &LaminarDB) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let owner = file.reopen().unwrap();

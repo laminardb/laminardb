@@ -1,4 +1,4 @@
-//! Evidence for a reserved, pre-cut topology operation. No transition here commits a graph.
+//! Immutable request, held parent cut and irreversible target catalog decision.
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,9 @@ pub enum TopologyAdmissionPhase {
     /// Every frozen process has applied the exact Commit and held intake and sink succession.
     /// The leader's receipt also certifies globally aggregated external sink settlement.
     CutPrepared,
+    /// Catalog and exact migration root are committed. Target installation/Release remain pending.
+    /// Leader changes and recovery faults must preserve this decision; it cannot abort.
+    Committed,
     /// Definitive pre-target-commit abort; no candidate actors were authorized.
     Aborted {
         /// Durable reason.
@@ -161,7 +164,7 @@ impl TopologyPlanRef {
     }
 }
 
-/// Durable status of one payload-bound request. A reserved target is never a committed catalog.
+/// Durable status of one payload-bound request, including its optional target catalog decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TopologyAdmissionStatus {
@@ -175,7 +178,7 @@ pub struct TopologyAdmissionStatus {
     pub admitted_sequence: u64,
     /// Exact append of the current disposition.
     pub status_sequence: u64,
-    /// Definitive pre-cut phase.
+    /// Definitive migration phase; Commit does not authorize target activation.
     #[serde(rename = "state")]
     pub phase: TopologyAdmissionPhase,
     /// Exact old-topology cut, absent until barrier preparation is authorized.
@@ -191,6 +194,9 @@ pub struct TopologyAdmissionStatus {
     /// These receipts do not authorize installation, output or intake release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_preparations: Vec<super::TopologyTargetPreparationReceipt>,
+    /// Irreversible target catalog decision; absent throughout preparation and pre-commit abort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<super::TopologyCommit>,
 }
 
 impl TopologyAdmissionStatus {
@@ -223,11 +229,14 @@ impl TopologyAdmissionStatus {
         }
         self.validate_preparation(head)?;
         self.validate_target_preparations(head)?;
+        self.validate_commit(head)?;
         if let Some(binding) = &self.migration_root {
             binding.root.validate()?;
             if !matches!(
                 self.phase,
-                TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Aborted { .. }
+                TopologyAdmissionPhase::CutPrepared
+                    | TopologyAdmissionPhase::Committed
+                    | TopologyAdmissionPhase::Aborted { .. }
             ) || self
                 .preparation
                 .as_ref()
@@ -260,6 +269,7 @@ impl TopologyAdmissionStatus {
                 Some(cut),
                 TopologyAdmissionPhase::Quiescing
                 | TopologyAdmissionPhase::CutPrepared
+                | TopologyAdmissionPhase::Committed
                 | TopologyAdmissionPhase::Aborted { .. },
             ) => {
                 cut.inventory.validate().map_err(TopologyError::Invalid)?;
@@ -302,8 +312,11 @@ impl TopologyAdmissionStatus {
                         "uncommitted cut cannot have completion receipts".into(),
                     ));
                 }
-                if self.phase == TopologyAdmissionPhase::CutPrepared
-                    && (cut.committed.is_none() || cut.completed_participants != fence.participants)
+                if matches!(
+                    self.phase,
+                    TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Committed
+                ) && (cut.committed.is_none()
+                    || cut.completed_participants != fence.participants)
                 {
                     return Err(TopologyError::Invalid(
                         "prepared cut requires every exact process completion".into(),
@@ -344,6 +357,7 @@ impl TopologyAdmissionStatus {
         }
         self.validate_preparation_successor(after, sequence)?;
         self.validate_target_preparation_successor(after, sequence)?;
+        self.validate_commit_successor(after, sequence)?;
         match (&self.migration_root, &after.migration_root) {
             (None, None) => {}
             (Some(prior), Some(next)) if prior == next => {}
@@ -383,7 +397,12 @@ impl TopologyAdmissionStatus {
                         && prior_cut == next_cut
                         && self.preparation == after.preparation)
                     && !(self.same_restore_binding(after)
-                        && after.target_preparations.len() == self.target_preparations.len() + 1))
+                        && after.target_preparations.len() == self.target_preparations.len() + 1)
+                    && !(after.phase == TopologyAdmissionPhase::Committed
+                        && prior_cut == next_cut
+                        && self.preparation == after.preparation
+                        && self.migration_root == after.migration_root
+                        && self.target_preparations == after.target_preparations))
             {
                 return Err(TopologyError::Invalid(
                     "authority cannot replace a cut or rewind its evidence".into(),

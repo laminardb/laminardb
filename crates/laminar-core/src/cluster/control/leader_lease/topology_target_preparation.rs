@@ -3,11 +3,11 @@
 use super::topology_admission::{CONTROL_TIMEOUT, MAX_ADMISSION_ATTEMPTS};
 use super::{
     read_authority_record, AssignmentSnapshotStore, AuthorityCreateOutcome, LeaderLeaseStore,
-    LeaseError, TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
+    LeaseError, TOPOLOGY_COMMIT_RECORD_VERSION, TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION,
 };
 use crate::cluster::control::{
     ProcessLeaseAuthority, TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyError,
-    TopologyRestoreInput, TopologyTargetPreparationReceipt,
+    TopologyRestoreInput, TopologyTargetPreparationReceipt, TOPOLOGY_COMMIT_PROTOCOL_VERSION,
     TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
 };
 
@@ -28,7 +28,10 @@ impl LeaderLeaseStore {
         input: &TopologyRestoreInput,
         protocol_version: u16,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
-        if protocol_version != TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION {
+        if !matches!(
+            protocol_version,
+            TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION | TOPOLOGY_COMMIT_PROTOCOL_VERSION
+        ) {
             return Err(TopologyError::Protocol(
                 "participant lacks target preparation protocol three".into(),
             ));
@@ -89,7 +92,13 @@ impl LeaderLeaseStore {
                     .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
                 let sequence = lease.seq;
                 let mut next = current.preserve_with_lease(lease);
-                next.version = next.version.max(TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION);
+                next.version =
+                    next.version
+                        .max(if protocol_version == TOPOLOGY_COMMIT_PROTOCOL_VERSION {
+                            TOPOLOGY_COMMIT_RECORD_VERSION
+                        } else {
+                            TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
+                        });
                 let operation = &mut next.topology_operations[index];
                 operation.status_sequence = sequence;
                 operation
@@ -141,6 +150,8 @@ impl LeaderLeaseStore {
                     LeaseError::Invalid("target preparation authority anchor is missing".into())
                 })?;
             if record.version < TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
+                || (receipt.protocol_version == TOPOLOGY_COMMIT_PROTOCOL_VERSION
+                    && record.version < TOPOLOGY_COMMIT_RECORD_VERSION)
                 || record
                     .topology_operations
                     .iter()

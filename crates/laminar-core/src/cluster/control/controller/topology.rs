@@ -37,7 +37,7 @@ impl ClusterController {
                     TopologyError::Protocol("target preparation has no process authority".into())
                 })?,
                 input,
-                crate::cluster::control::TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
+                crate::cluster::control::TOPOLOGY_COMMIT_PROTOCOL_VERSION,
             )
             .await?;
         let after = self
@@ -63,47 +63,124 @@ impl ClusterController {
         &self,
         operation_id: TopologyOperationId,
     ) -> Result<crate::cluster::control::TopologyRestoreInput, TopologyError> {
+        self.read_topology_restore_input(operation_id, false).await
+    }
+
+    /// Read explicit committed-root reconstruction authority for the exact locally adopted process.
+    /// Recovery may replace boots with the same vnode owners. No actors or Release are authorized.
+    ///
+    /// # Errors
+    /// Rejects obsolete/uncommitted targets, changed current process/assignment or damaged evidence.
+    pub async fn committed_topology_restore_input(
+        &self,
+        operation_id: TopologyOperationId,
+    ) -> Result<crate::cluster::control::TopologyRestoreInput, TopologyError> {
+        self.read_topology_restore_input(operation_id, true).await
+    }
+
+    async fn read_topology_restore_input(
+        &self,
+        operation_id: TopologyOperationId,
+        committed: bool,
+    ) -> Result<crate::cluster::control::TopologyRestoreInput, TopologyError> {
         let before = self
             .try_live_local_process_authority_identity()
             .map_err(|_| TopologyError::Fenced)?;
-        if self.is_recovering() || self.is_draining() {
+        if (!committed && self.is_recovering()) || self.is_draining() {
             return Err(TopologyError::Fenced);
         }
         let authority = self
             .checkpoint_authority()
             .map_err(|e| TopologyError::Protocol(e.to_string()))?;
-        let input = authority
-            .topology_restore_input(
-                self.snapshot.as_ref().ok_or_else(|| {
-                    TopologyError::Protocol("restore has no assignment authority".into())
-                })?,
-                self.process_lease_authority.get().ok_or_else(|| {
-                    TopologyError::Protocol("restore has no process authority".into())
-                })?,
-                operation_id,
-                before,
-            )
-            .await?;
+        let assignments = self
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| TopologyError::Protocol("restore has no assignment authority".into()))?;
+        let processes = self
+            .process_lease_authority
+            .get()
+            .ok_or_else(|| TopologyError::Protocol("restore has no process authority".into()))?;
+        let input = if committed {
+            authority
+                .committed_topology_restore_input(assignments, processes, operation_id, before)
+                .await?
+        } else {
+            authority
+                .topology_restore_input(assignments, processes, operation_id, before)
+                .await?
+        };
         let evidence = self
             .read_local_process_authority_evidence()
             .await
             .map_err(|e| TopologyError::Conflict(e.to_string()))?;
-        if self.is_recovering()
+        if (!committed && self.is_recovering())
             || self.is_draining()
             || self.try_live_local_process_authority_identity().ok() != Some(before)
             || evidence.participant != before.participant
             || evidence.process_term != before.process_term
             || !evidence
                 .adopted_assignment
-                .matches_fence(&input.plan().assignment)
+                .matches_fence(input.assignment())
             || self
-                .checkpoint_assignment_fence(input.plan().assignment.assignment_version)
+                .checkpoint_assignment_fence(input.assignment().assignment_version)
                 .as_ref()
-                != Some(&input.plan().assignment)
+                != Some(input.assignment())
         {
             return Err(TopologyError::Fenced);
         }
         Ok(input)
+    }
+
+    /// Commit the exact privately restored target after runtime-owned parent retirement.
+    /// This publishes the catalog/root decision only; installation and Release stay fenced.
+    ///
+    /// # Errors
+    /// Rejects stale local adoption/leader, incomplete protocol-four roster or conflicting authority.
+    /// An uncertain result must be resolved from this operation's durable status.
+    pub async fn commit_topology_target(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let proof = self.capture_leader_proof().ok_or(TopologyError::Fenced)?;
+        if self.is_recovering()
+            || self.is_draining()
+            || !self.proof_is_live(&proof)
+            || self.try_live_local_process_authority_identity().ok() != Some(input.process())
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let evidence = self
+            .read_local_process_authority_evidence()
+            .await
+            .map_err(|_| TopologyError::Fenced)?;
+        if evidence.participant != input.process().participant
+            || evidence.process_term != input.process().process_term
+            || !evidence
+                .adopted_assignment
+                .matches_fence(input.assignment())
+        {
+            return Err(TopologyError::Fenced);
+        }
+        let status = self
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?
+            .commit_topology_target(
+                &proof,
+                self.snapshot.as_ref().ok_or_else(|| {
+                    TopologyError::Protocol("Commit has no assignment authority".into())
+                })?,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("Commit has no process authority".into())
+                })?,
+                input,
+            )
+            .await?;
+        if !self.proof_is_live(&proof)
+            || self.try_live_local_process_authority_identity().ok() != Some(input.process())
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(status)
     }
 
     /// Pin restore requirements with this controller's actual assignment/process authority.

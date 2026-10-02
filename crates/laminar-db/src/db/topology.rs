@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use super::{DbError, DbState, LaminarDB};
 
+mod commit;
 mod migration_root;
 mod planning;
 mod preparation;
@@ -68,13 +69,17 @@ impl LaminarDB {
             DbError::InvalidOperation("cluster topology status requires a catalog authority".into())
         })?;
         let catalog = store.topology_state().await?;
-        let committed_version = match &catalog {
-            TopologyCatalogState::Versioned { baseline } => Some(baseline.topology_version),
-            TopologyCatalogState::Uninitialized | TopologyCatalogState::LegacySealed { .. } => None,
-        };
+        let committed_version = catalog.committed_version();
         let replayed_version = *self.replayed_topology_version.lock();
         let controller = self.cluster_controller.lock().clone();
         let locally_active_version = if DbState::load(&self.state) == DbState::Running
+            && !matches!(
+                &catalog,
+                TopologyCatalogState::Versioned {
+                    committed: Some(_),
+                    ..
+                }
+            )
             && !self.source_gate.load(Ordering::Acquire)
             && !self.topology_cut_hold.load(Ordering::Acquire)
             && !self.cluster_authority_revoked.load(Ordering::Acquire)

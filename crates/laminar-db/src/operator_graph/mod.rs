@@ -5428,7 +5428,7 @@ impl OperatorGraph {
             || self.cluster_shuffle.as_ref().is_none_or(|scope| {
                 scope.self_id.0 != input.process().participant.node_id
                     || scope.registry.versioned_snapshot().version()
-                        != input.plan().assignment.assignment_version
+                        != input.assignment().assignment_version
             })
         {
             return Err(DbError::Checkpoint(

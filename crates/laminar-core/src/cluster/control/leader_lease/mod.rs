@@ -6,6 +6,8 @@ mod attempt_status;
 mod subscription_replay;
 mod topology;
 mod topology_admission;
+mod topology_commit;
+mod topology_committed_restore;
 mod topology_cut;
 mod topology_migration_root;
 mod topology_preparation;
@@ -69,6 +71,7 @@ const TOPOLOGY_PREPARATION_RECORD_VERSION: u32 = 16;
 const TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION: u32 = 17;
 const TOPOLOGY_SOURCE_ROOT_RECORD_VERSION: u32 = 18;
 const TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION: u32 = 19;
+const TOPOLOGY_COMMIT_RECORD_VERSION: u32 = 20;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -398,7 +401,7 @@ pub struct LeaderLease {
     pub owner: LeaderLeaseOwner,
     /// Owner-written wall-clock expiry for diagnostics only.
     pub expires_at_ms: i64,
-    /// Immutable catalog content reference, once sealed for this control namespace.
+    /// Immutable catalog content reference, advanced only by an atomic topology Commit after seal.
     pub catalog_manifest: Option<CatalogManifestRef>,
 }
 
@@ -1341,6 +1344,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
             && self.version != TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
             && self.version != TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
+            && self.version != TOPOLOGY_COMMIT_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2222,6 +2226,7 @@ impl LeaderLeaseStore {
             .load_record()
             .await?
             .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        current.reject_pending_topology_commit()?;
         let Some(release_head) = current.recovery_release_head.as_ref() else {
             return Ok(false);
         };
@@ -2370,6 +2375,7 @@ impl LeaderLeaseStore {
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
             let current = &published.record;
+            current.reject_pending_topology_commit()?;
             if let Some(winner) = current.recovery_release_head.as_ref() {
                 if winner.terminal == reference
                     || winner.terminal.generation() >= reference.generation()
@@ -2521,6 +2527,7 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            head.reject_pending_topology_commit()?;
             let Some(link) = head.recovery_release_head.clone() else {
                 return Ok(RecoveryAdmissionSnapshot {
                     committed_release: None,
@@ -2534,6 +2541,7 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            rechecked.reject_pending_topology_commit()?;
             if rechecked.lease.seq >= head.lease.seq
                 && rechecked.recovery_release_head == head.recovery_release_head
                 && rechecked.recovery_fault_revision == head.recovery_fault_revision
@@ -2564,7 +2572,11 @@ impl LeaderLeaseStore {
             .await?
             .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
         let inventory = Self::recovery_fault_inventory_from(&current);
-        Ok(current.lease.matches_proof(leader_proof)
+        Ok(!current
+            .topology_operations
+            .iter()
+            .any(super::topology::TopologyAdmissionStatus::has_target_commit)
+            && current.lease.matches_proof(leader_proof)
             && current.lease.seq >= snapshot.authority_sequence
             && current.recovery_release_head == snapshot.release_head
             && inventory == snapshot.fault_inventory
@@ -2689,6 +2701,9 @@ impl LeaderLeaseStore {
                     .iter()
                     .map(|receipt| receipt.authority_sequence),
             );
+            if let Some(commit) = &operation.commit {
+                retained.insert(commit.authority_sequence);
+            }
             if let Some(root) = &operation.migration_root {
                 retained.insert(root.authority_sequence);
             }

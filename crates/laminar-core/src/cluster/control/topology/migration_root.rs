@@ -195,12 +195,14 @@ impl TopologyMigrationRoot {
             .ok_or_else(|| {
                 TopologyError::Conflict("root staging requires a definitive old cut".into())
             })?;
-        if operation.phase != TopologyAdmissionPhase::CutPrepared
-            || index
-                .encode_and_reference()
-                .map_err(TopologyError::Invalid)?
-                .1
-                != cut.checkpoint
+        if !matches!(
+            operation.phase,
+            TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Committed
+        ) || index
+            .encode_and_reference()
+            .map_err(TopologyError::Invalid)?
+            .1
+            != cut.checkpoint
             || index.pipeline_identity != descriptor.parent_pipeline
             || index.deployment_id != descriptor.deployment_id
         {

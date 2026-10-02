@@ -4,7 +4,7 @@ use super::{
     ClusterTopologyValidation, TopologyAdmissionPlan, TopologyAdmissionStatus,
     TopologyMigrationRoot,
 };
-use crate::checkpoint::CommittedCheckpointIndex;
+use crate::checkpoint::{CheckpointAssignmentFence, CommittedCheckpointIndex, LeaderProof};
 use crate::checkpoint_decision::CheckpointOutcome;
 use crate::cluster::control::{CatalogManifest, LocalProcessAuthorityIdentity};
 
@@ -23,6 +23,9 @@ pub struct TopologyRestoreInput {
     pub(crate) checkpoint: CommittedCheckpointIndex,
     pub(crate) owned_vnodes: Vec<u32>,
     pub(crate) process: LocalProcessAuthorityIdentity,
+    pub(crate) restore_assignment: CheckpointAssignmentFence,
+    pub(crate) restore_processes: Vec<LocalProcessAuthorityIdentity>,
+    pub(crate) committed_leader: Option<LeaderProof>,
 }
 
 impl TopologyRestoreInput {
@@ -40,8 +43,44 @@ impl TopologyRestoreInput {
             && self.checkpoint == other.checkpoint
             && self.owned_vnodes == other.owned_vnodes
             && self.process == other.process
+            && self.restore_assignment == other.restore_assignment
+            && self.restore_processes == other.restore_processes
+            && self.committed_leader == other.committed_leader
     }
-    /// Exact still-prepared operation, including its root authority anchor.
+
+    /// Whether a fresh committed authorization retains the prepared image's exact historical
+    /// requirements and local process. This compares images only, never grants output or Release.
+    #[must_use]
+    pub fn is_committed_successor_of(&self, prepared: &Self) -> bool {
+        self.operation.has_target_commit()
+            && self.committed_leader.is_some()
+            && prepared.operation.phase == super::TopologyAdmissionPhase::CutPrepared
+            && prepared.operation.commit.is_none()
+            && self.operation.same_migration_binding(&prepared.operation)
+            && self.plan == prepared.plan
+            && self.target == prepared.target
+            && self.descriptor == prepared.descriptor
+            && self.root == prepared.root
+            && self.outcome == prepared.outcome
+            && self.checkpoint == prepared.checkpoint
+            && self.owned_vnodes == prepared.owned_vnodes
+            && self.process == prepared.process
+            && self.restore_assignment == prepared.restore_assignment
+    }
+
+    /// Exact current assignment authorizing this private reconstruction. Historical state and
+    /// source attempts retain `plan().assignment`; recovery may replace boots with the same owners.
+    #[must_use]
+    pub const fn assignment(&self) -> &CheckpointAssignmentFence {
+        &self.restore_assignment
+    }
+
+    /// Whether this is explicit committed-root reconstruction, still without installation/Release.
+    #[must_use]
+    pub const fn is_committed(&self) -> bool {
+        self.committed_leader.is_some()
+    }
+    /// Exact prepared or committed operation, including its root authority anchor.
     #[must_use]
     pub const fn operation(&self) -> &TopologyAdmissionStatus {
         &self.operation
@@ -51,7 +90,7 @@ impl TopologyRestoreInput {
     pub const fn plan(&self) -> &TopologyAdmissionPlan {
         &self.plan
     }
-    /// Complete candidate inventory; it is not the committed catalog.
+    /// Complete sealed target inventory, committed only when this authorization records Commit.
     #[must_use]
     pub const fn target(&self) -> &CatalogManifest {
         &self.target

@@ -3,7 +3,7 @@
 use super::*;
 use crate::cluster::control::{TopologyRestoreInput, TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION};
 
-async fn input(
+pub(super) async fn input(
     authority: &LeaderLeaseStore,
     fixture: &Fixture,
     participant: usize,
@@ -90,7 +90,7 @@ async fn topology_target_preparation_requires_every_frozen_process_and_preserves
     );
     assert_eq!(reopened.load().await.unwrap().unwrap().seq, head.lease.seq);
     assert!(matches!(reopened.topology_catalog_state().await.unwrap(),
-        crate::cluster::control::TopologyCatalogState::Versioned { baseline }
+        crate::cluster::control::TopologyCatalogState::Versioned { baseline, committed: None }
             if baseline.topology_version == TopologyVersion::LEGACY_BASELINE));
     assert_eq!(
         input(&reopened, &fixture, 0).await.checkpoint(),
@@ -135,7 +135,7 @@ async fn topology_target_preparation_rejects_divergent_inputs_and_old_protocol_w
     fixture.stage(&authority).await.unwrap();
     let original = input(&authority, &fixture, 0).await;
     let before = authority.load_record().await.unwrap();
-    for protocol in [0, 1, 2, 4] {
+    for protocol in [0, 1, 2, 5] {
         assert!(matches!(
             authority
                 .certify_topology_target_preparation(

@@ -2,11 +2,12 @@
 
 ## Implemented transition
 
-The current state transition is only:
+The catalog transitions are:
 
 ```text
 Uninitialized --existing cold catalog seal--> LegacySealed
 LegacySealed --fenced identical-inventory adoption--> Versioned(topology 1)
+Versioned(T) --atomic target catalog/root Commit--> Versioned(T+1, installation pending)
 ```
 
 Old-topology preparation implements `Planned -> Preparing -> Quiescing -> CutPrepared`, with
@@ -14,15 +15,16 @@ pre-target-commit abort on a leader term change, definitive checkpoint Abort or
 durable recovery fault. A prepared cut includes the exact committed checkpoint
 and every frozen process's application receipt; intake and successor sink epochs
 remain held. It reserves an exact candidate without authorizing candidate actors.
-No record can commit topology 2. Local additive candidate compilation and definition
+The internal DB/core path can commit topology 2 with its exact recoverable root.
+Local additive candidate compilation and definition
 compatibility descriptors and durable participant certificates are implemented.
 Exact-cut state/progress root staging includes stateless downstream additions and sealed
 new-source initialization requirements. Private target restore preparation is
 implemented. Exact-root parent retirement now observes existing actor/connector
 owners while retaining the runtime and namespace fences. Exact-process target
 preparation receipts now record those observations in the same authority log.
-Topology Commit,
-install/activation and release remain unfinished.
+Explicit private reconstruction after Commit is implemented, including before the
+first target checkpoint. Installation/activation and Release remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -41,8 +43,9 @@ catalog-object generation. `CatalogManifestRef.version` remains encoding 1.
 
 `LegacyTopologyBaseline` contains protocol 1, topology 1, the original catalog
 reference, existing canonical deployment UUID, operation UUID and exact authority
-sequence. Validation binds it to the lease's sealed inventory. It cannot change
-the inventory, generations or state ABI. The adoption API reads and validates
+sequence. Validation retains it as the first committed inventory. Later decisions
+form a checked version/manifest chain ending at the lease's catalog reference.
+Adoption cannot change the inventory, generations or state ABI. The adoption API reads and validates
 the original blob and existing deployment identity before appending; it never
 initializes a missing identity or rewrites historical checkpoints.
 
@@ -62,6 +65,11 @@ the same prepared cut. Each reporting process must implement target preparation
 protocol 3; the admitted candidate plan remains protocol 2. Earlier encodings omit
 the empty receipt vector and retain their original bytes. Older writers fail closed
 on encoding 19; this storage gate does not by itself retire cached actors.
+Encoding 20 admits protocol-4 target preparation evidence and irreversible target
+Commit. Protocol-3 receipts remain readable but cannot authorize Commit or be
+rewritten as protocol 4; abort and admit a new operation after coordinated upgrade.
+The protocol-2 plan and root encodings remain unchanged. Earlier statuses omit
+the absent Commit field. All participants must certify protocol 4 before Commit.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -75,8 +83,10 @@ LegacySealed, never an inferred current version. Cleanup retains the adoption
 append permanently as one extra authority root. A prune snapshot taken before
 adoption cannot delete a later sequence. Live old-cut roots are now protected from
 checkpoint artifact-floor advancement. A staged migration root retains that live cut
-pin and its own immutable authority anchor. Post-target-commit retention and replay
-consumption of these mappings still need integration.
+pin and its own immutable authority anchor. A pending committed target retains
+every preparation/Commit/root/old-cut authority anchor and the old checkpoint
+artifact pin. Consumption after target installation/checkpoints and reference-aware
+retention cleanup still need integration.
 
 ## Pre-cut admission and assignment serialization
 
@@ -102,7 +112,8 @@ admission contend on that same sequence. There is no check-then-publish gap betw
 an admitted drain intent and topology admission. Preparation protocol 2 additionally binds the canonical local candidate report.
 Admission alone does not certify participant agreement or resolve new-source positions.
 
-Only one request can be preparing. Identical retries return the original durable
+Only one request can be preparing or awaiting committed target installation.
+Identical retries return the original durable
 status, including a prior abort and retry by a replacement leader process; a
 different payload with the same identity fails. Current leader authority is still
 required. Frozen participant membership is checked for fresh admission, not for
@@ -111,8 +122,8 @@ Legacy adoption identities cannot be reused for migration requests. New ordinary
 checkpoint/assignment admission is rejected throughout preparation except for the
 exact atomically bound old cut. Renewal preserves it;
 a new leader term or recovery fault atomically aborts it and retains recovery
-evidence. This policy applies only before target commit. Future committed
-phases must recover the target instead of using this abort helper.
+evidence. This policy applies only before target Commit. A committed operation
+remains Committed under leader replacement or a recovery fault and rejects abort.
 
 Plan payloads are capped at 32 KiB and the retained request journal at 64 identities.
 Both admission and explicit abort allow 16 CAS attempts within 15 seconds. Reads
@@ -323,7 +334,7 @@ catalog T unchanged. Retries return that immutable binding. Status and pruning
 audit its canonical body, exact certified plan/cut and first append. A live root
 retains the existing cut artifact-floor pin. Abort retains its metadata and
 authority evidence; ordinary checkpoint/replay retention then owns old artifacts.
-Target-commit retention remains unfinished.
+Pending target Commit retains this pin. Post-activation root retirement remains unfinished.
 
 New-source positions use the existing `ConnectorCheckpoint` encoding, including
 Kafka's numeric next-to-read baselines for empty/never-read partitions. They have
@@ -467,7 +478,7 @@ cut and restart after CutPrepared; it does not cover target installation or
 post-target-commit failure. Required transactional sink migration certification
 remains absent.
 
-## Required next integration
+## Private target restore and retirement
 
 Private restore preparation now connects the staged root to the existing strict
 recovery loader and operator codecs. `TopologyRestoreInput` is opaque and comes
@@ -530,7 +541,7 @@ claims, waits for issued checkpoint decisions, reconciles the sink-open witness 
 observes all connector termination. A sink close result alone never grants success.
 Only after those checks and a fresh complete root authorization is the image's
 local retirement observation set. The target remains inactive and still owns the
-compiler permit. A future Commit/installer must revalidate this potentially stale
+compiler permit. Commit and the future installer must revalidate this potentially stale
 observation; old shuffle transport remains process-owned and needs generation fencing.
 
 | Parent retirement failure | Result |
@@ -554,7 +565,8 @@ before control-store I/O; public lifecycle/mutation fences keep the held boundar
 No synchronous guard crosses an await.
 
 One sorted receipt binds the exact candidate-certificate participant/boot/term,
-target preparation protocol 3 and the first immutable append. The enclosing
+target preparation protocol and the first immutable append. New DB observations
+use protocol 4; historical protocol-3 observations remain readable. The enclosing
 operation fixes the plan, descriptor, assignment, root and old checkpoint. Each
 append adds exactly one participant after root publication. Full preparation
 requires all frozen owner/evidence processes. Authority reads audit every receipt
@@ -579,10 +591,67 @@ PipelineIdentity and historical checkpoint bytes are unchanged.
 | Receipt anchor missing, corrupt or rewritten | Fail closed; do not manufacture a receipt from transport/local state |
 
 These are historical restore/retirement observations, not installed receiver/sink
-readiness or proof of image residency. A future Commit must revalidate current
-authority and all exact processes and have a usable post-Commit root recovery path.
+readiness or proof of image residency. Commit revalidates current authority and
+all exact processes and provides explicit post-Commit root reconstruction.
 Target generation fencing, installation and participant-complete Release remain
-required before output. No target Commit is exposed by this increment.
+required before output. No public SQL/HTTP submission or target output is enabled.
+
+## Atomic target Commit and private reconstruction
+
+`LaminarDB::commit_cluster_topology_target(&mut image)` re-observes the held parent
+through the existing lifecycle, records this process's protocol-4 preparation and
+commits through its configured leader controller. Every exact frozen process must
+have protocol-4 evidence and current original process/assignment authority. The
+current catalog, latest parent checkpoint Commit, root, compiled descriptor and
+retained image must agree. The DB revalidates sealed source positions using read-only
+metadata before the decision, without resolving `latest` again. Unresolved checkpoint,
+cleanup, assignment or recovery authority rejects Commit. Sixteen CAS attempts
+share a 15-second authority budget;
+the DB's total retirement/write/recheck budget is 45 seconds.
+
+One create-only authority append sets both `lease.catalog_manifest` and the
+operation's immutable `commit`, advancing the logical version once. The existing
+bounded journal supplies the current committed decision; no second head, scheduler,
+registry or per-record work is introduced. The original baseline, object
+incarnations, checkpoint allocator and terminal outcome links remain unchanged.
+Success reports Committed with no locally active version. Ordinary checkpoint,
+assignment and topology admission remain held. Existing parent recovery Release
+and ordinary startup reject this pending target. Cached parent recovery-admission
+snapshots also become invalid; a prior Release cannot authorize parent intake.
+
+`recover_committed_cluster_topology(operation_id)` reconstructs a private image
+from the current Commit and its exact root. It works on a Created DB or a still-held
+retired parent after losing its image. The controller audits the current leader,
+every current process term, exact local durable adoption and current assignment
+before and after reads. Restarted boots may use a newer assignment version with
+the same vnode owner digest, domain, ABI and complete stable participant roster;
+rescaling and changed ownership remain rejected. Historical source attempts,
+manifest bytes, checksums and parent PipelineIdentity remain exact. The ordinary
+target fingerprint path still rejects the parent checkpoint. No target checkpoint
+or historical acknowledgement is fabricated. New-source cursors are validated,
+never resolved again. The compiler slot, state/payload budgets and 45-second
+restore deadline are reused.
+
+The committed inventory takes precedence during replay. Cold bootstrap accepts
+either the complete current inventory or the exact complete adopted bootstrap,
+whose preserved ordered prefix is certified by the additive Commit audit. Arbitrary
+subsets and changed definitions reject. No startup configuration can revert the
+committed catalog. Runtime installation/generation fencing and participant-complete
+Release must be implemented before ordinary startup or output can be enabled.
+
+| Boundary/failure | Result |
+| --- | --- |
+| Missing protocol-4 process, stale image or original process/assignment | Reject before Commit; preserve held parent/root |
+| Leader replacement wins the Commit slot | Pre-Commit abort under replacement authority; retain the old checkpoint |
+| Commit create succeeds but response/caller is lost | Read the same operation; target stays committed; retry or reconstruct its exact root |
+| Leader change or recovery fault after Commit | Preserve target decision; reject abort and parent Release |
+| Private reconstruction cancelled, timed out or corrupt | Drop partial image/permit; retain Commit, root and runtime hold; retry reconstruction |
+| Commit/root/adoption authority anchor missing or malformed | Fail closed on status/catalog authorization; never assume the parent is current |
+
+These tests certify authority/private reconstruction only. Public submission,
+actor installation, Release and full multi-process target recovery remain unfinished.
+
+## Required next integration
 
 1. Integrate candidate planning with a DB-owned migration worker and its existing
    manual checkpoint owner. The old-cut binding, capture and hold are implemented;
@@ -592,8 +661,8 @@ required before output. No target Commit is exposed by this increment.
 3. Drive private restore, observed retirement and the implemented durable target
    preparation receipts from owned migration work. At Commit, revalidate the full
    exact process/assignment roster; receipts alone cannot grant target output.
-4. Drive the implemented private restore preparation from owned migration work,
-   then atomically bind target catalog and root at the logical topology-change Commit.
+4. Drive the implemented atomic target Commit and private post-Commit root
+   reconstruction from owned migration work; both remain internal library paths.
 5. Restore/install the target before participant-complete release, with stale
    graph/shuffle/sink completion fences and target-only post-commit recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
@@ -601,8 +670,9 @@ required before output. No target Commit is exposed by this increment.
    it does not advance admission. Do not reuse bootstrap.
 7. Consume staged subscription identity/frontier mappings during target install
    and replay. Whole-graph hashes differ on additions; skipping their check is unsafe.
-8. Change restart configuration assertions only after target precedence is durable,
-   and run the stateful multi-process migration/restart oracle and fault matrix.
+8. Wire reconstruction into automatic target runtime recovery and run the stateful
+   multi-process migration/restart oracle and fault matrix. Durable target catalog
+   precedence and exact original-bootstrap assertions are implemented.
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)
@@ -625,5 +695,8 @@ records task/connector terminal observation and retained lifecycle/namespace fen
 The [target preparation evidence](test-evidence/topology-target-preparation-2026-10-02/README.md)
 records durable exact-process observations, concurrent/lost/cancelled appends and
 retained receipt anchors.
+The [Commit and reconstruction evidence](test-evidence/topology-commit-2026-10-02/README.md)
+records the atomic catalog/root decision, retained Commit across failures and
+strict private reconstruction before a target checkpoint.
 These results do not certify target migration
 or production latency.

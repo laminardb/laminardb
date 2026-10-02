@@ -83,7 +83,10 @@ async fn topology_adoption_racing_renewal_preserves_winner_and_retries_exact_ope
     );
     assert_eq!(
         authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned { baseline }
+        TopologyCatalogState::Versioned {
+            baseline,
+            committed: None
+        }
     );
 }
 
@@ -145,7 +148,10 @@ async fn topology_adoption_resolves_lost_record_and_head_responses() {
             .load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(
             authority.topology_catalog_state().await.unwrap(),
-            TopologyCatalogState::Versioned { baseline }
+            TopologyCatalogState::Versioned {
+                baseline,
+                committed: None
+            }
         );
         assert_eq!(authority.load().await.unwrap().unwrap().seq, 3);
         assert_eq!(raw.put_count(&lease_path(3), "create"), 1);
@@ -180,8 +186,10 @@ async fn topology_adoption_cancelled_after_durable_create_is_recoverable() {
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     let restarted = LeaderLeaseStore::new(raw.clone(), 30_000);
-    let TopologyCatalogState::Versioned { baseline } =
-        restarted.topology_catalog_state().await.unwrap()
+    let TopologyCatalogState::Versioned {
+        baseline,
+        committed: None,
+    } = restarted.topology_catalog_state().await.unwrap()
     else {
         panic!("durable append must be recovered independently of the cancelled request");
     };
@@ -277,7 +285,10 @@ async fn topology_adoption_preserves_unresolved_checkpoint_and_commit_chain() {
     );
     assert_eq!(
         authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned { baseline }
+        TopologyCatalogState::Versioned {
+            baseline,
+            committed: None
+        }
     );
 }
 
@@ -349,6 +360,9 @@ async fn topology_adoption_record_is_retained_and_format_cannot_downgrade() {
     );
     assert_eq!(
         authority.topology_catalog_state().await.unwrap(),
-        TopologyCatalogState::Versioned { baseline }
+        TopologyCatalogState::Versioned {
+            baseline,
+            committed: None
+        }
     );
 }

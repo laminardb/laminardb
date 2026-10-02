@@ -185,7 +185,10 @@ async fn concurrent_adoptions_and_identical_retry_return_original_winner() {
             .count(),
         1
     );
-    let TopologyCatalogState::Versioned { baseline } = f.catalog.topology_state().await.unwrap()
+    let TopologyCatalogState::Versioned {
+        baseline,
+        committed: None,
+    } = f.catalog.topology_state().await.unwrap()
     else {
         panic!("adoption must be visible");
     };
@@ -255,7 +258,10 @@ async fn adoption_survives_renewal_and_fresh_store_reconstruction() {
     let restarted = CatalogManifestStore::new(Arc::new(LeaderLeaseStore::new(f.backing, 30_000)));
     assert_eq!(
         restarted.topology_state().await.unwrap(),
-        TopologyCatalogState::Versioned { baseline }
+        TopologyCatalogState::Versioned {
+            baseline,
+            committed: None
+        }
     );
     assert_eq!(
         restarted.load().await.unwrap().unwrap().entries[0].canonical_name,

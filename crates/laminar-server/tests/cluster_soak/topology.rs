@@ -140,7 +140,8 @@ fn wait_for_status(
                 assert_eq!(
                     catalog,
                     TopologyCatalogState::Versioned {
-                        baseline: baseline.clone()
+                        baseline: baseline.clone(),
+                        committed: None
                     },
                     "node{} observed a different adopted inventory or operation",
                     node.id

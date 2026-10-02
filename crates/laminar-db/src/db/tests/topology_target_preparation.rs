@@ -30,7 +30,7 @@ async fn topology_target_preparation_certifies_a_retained_image_without_committi
         prepared.phase,
         laminar_core::cluster::control::TopologyAdmissionPhase::CutPrepared
     );
-    assert_eq!(prepared.target_preparations[0].protocol_version, 3);
+    assert_eq!(prepared.target_preparations[0].protocol_version, 4);
     assert_eq!(
         prepared.target_preparations[0].participant,
         fixture

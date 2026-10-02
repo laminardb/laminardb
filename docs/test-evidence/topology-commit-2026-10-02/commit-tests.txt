@@ -1,0 +1,56 @@
+CARGO_BUILD_JOBS=1
+RUST_MIN_STACK=4194304
+cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_commit -- --nocapture
+exit_code: 0
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.66s
+     Running unittests src\lib.rs (target\debug\deps\laminar_connectors-d995ef82c5c9bcd6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 915 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_core-9b1613879a5ff62e.exe)
+
+running 13 tests
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_malformed_decisions_catalog_rewrites_and_rollback_fail_closed ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_deadline_before_create_keeps_prepared_parent_authority ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_cancelled_successful_write_reconstructs_without_target_checkpoint ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_recovery_fault_preserves_target_and_rejects_parent_release ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_lost_response_resolves_original_catalog_decision ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_leader_change_wins_before_create_and_aborts_only_precommit ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_leader_change_after_decision_preserves_target_and_rejects_abort ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_pruning_retains_decision_and_corrupt_anchor_fails_catalog_reads ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_atomically_publishes_target_and_exact_recoverable_root ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_concurrent_identical_writers_publish_once ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_rejects_changed_image_and_assignment_without_append ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_requires_every_protocol_four_owner_and_evidence_process ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::topology_commit::topology_commit_reconstruction_uses_current_boots_but_retains_historical_ownership ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 1054 filtered out; finished in 30.16s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_db-37560d7655ba525f.exe)
+
+running 8 tests
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_rejects_uncommitted_recovery_foreign_image_and_local_fault ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_resolves_successful_decision_before_image_authority_handoff ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_reconstruction_deadline_keeps_commit_and_releases_partial_image ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_revalidates_sealed_cursors_within_total_budget_before_decision ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_preserves_state_and_reconstructs_after_image_loss ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_cancelled_reconstruction_retains_target_root_hold_and_compiler_owner ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_created_replay_accepts_original_bootstrap_and_gates_ordinary_start ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_commit_db_missing_or_corrupt_parent_payload_keeps_commit_visible_and_identity_strict ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2011 filtered out; finished in 0.41s
+
+     Running unittests src\bin\hash_test.rs (target\debug\deps\hash_test-d740050894734938.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\laminardb-572646521bf03734.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 356 filtered out; finished in 0.00s

@@ -12,6 +12,7 @@ use super::{CatalogManifestError, CatalogManifestRef, LeaseError};
 use crate::error_codes;
 
 mod admission;
+mod commit;
 mod compatibility;
 mod migration_root;
 mod preparation;
@@ -23,6 +24,7 @@ pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
     TopologyCheckpointCut, TopologyCutCommit, TopologyPlanRef, MAX_TOPOLOGY_OPERATIONS,
 };
+pub use commit::{TopologyCommit, TOPOLOGY_COMMIT_PROTOCOL_VERSION};
 pub use compatibility::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyCompatibilityRef, TopologyInitialization,
@@ -110,8 +112,8 @@ impl TopologyOperationId {
 
 /// Immutable identity of the existing inventory at the authority format upgrade.
 ///
-/// This record deliberately cannot represent topology two: no target may become authoritative
-/// before the checkpoint-bound migration protocol is installed.
+/// This record always represents the original topology one. Later Commit decisions carry the
+/// current catalog separately, retaining this exact adoption and all historical identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LegacyTopologyBaseline {
@@ -170,7 +172,28 @@ pub enum TopologyCatalogState {
     Versioned {
         /// Durable baseline identity.
         baseline: LegacyTopologyBaseline,
+        /// Latest irreversible catalog decision, absent while topology one remains committed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        committed: Option<TopologyCommit>,
     },
+}
+
+impl TopologyCatalogState {
+    /// Current committed logical version; local installation and Release are separate evidence.
+    #[must_use]
+    pub fn committed_version(&self) -> Option<TopologyVersion> {
+        match self {
+            Self::Versioned {
+                baseline,
+                committed,
+            } => Some(
+                committed
+                    .as_ref()
+                    .map_or(baseline.topology_version, |commit| commit.topology_version),
+            ),
+            Self::Uninitialized | Self::LegacySealed { .. } => None,
+        }
+    }
 }
 
 /// Result of one explicit format upgrade, including the original winner on an identical retry.

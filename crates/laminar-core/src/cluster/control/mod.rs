@@ -64,14 +64,14 @@ pub use snapshot::{
 pub use topology::{
     ClusterTopologyValidation, LegacyTopologyBaseline, TopologyAbortReason, TopologyAdmissionPhase,
     TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyAdoptionOutcome, TopologyCatalogState,
-    TopologyCheckpointCut, TopologyCompatibilityRef, TopologyCutCommit, TopologyError,
-    TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
+    TopologyCheckpointCut, TopologyCommit, TopologyCompatibilityRef, TopologyCutCommit,
+    TopologyError, TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
     TopologyOperationId, TopologyParticipantCertificate, TopologyPlanRef, TopologyPreparation,
     TopologyPreservedObject, TopologyRestoreInput, TopologySourceInitialization,
     TopologySubscriptionRoot, TopologyTargetPreparationReceipt, TopologyVersion,
     MAX_TOPOLOGY_OPERATIONS, MAX_TOPOLOGY_ROOT_MANIFEST_BYTES, MAX_TOPOLOGY_SOURCE_CHANNELS,
-    TOPOLOGY_PREPARATION_PROTOCOL_VERSION, TOPOLOGY_PROTOCOL_VERSION,
-    TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
+    TOPOLOGY_COMMIT_PROTOCOL_VERSION, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    TOPOLOGY_PROTOCOL_VERSION, TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
 };
 
 #[cfg(feature = "cluster")]

@@ -1,6 +1,7 @@
 //! Private target images reuse the isolated compiler and exact-cut recovery loader.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use laminar_core::checkpoint::{
@@ -68,6 +69,12 @@ impl std::fmt::Debug for PreparedTopologyRestore {
 }
 
 impl PreparedTopologyRestore {
+    /// Whether this image was authorized from an irreversible target Commit. It remains private;
+    /// receivers, state installation, sinks and participant-complete Release are still required.
+    #[must_use]
+    pub const fn is_committed(&self) -> bool {
+        self.input.is_committed()
+    }
     /// Whether this image's parent actors were observed terminal after exact authority checks.
     /// This is a local observation, not a durable readiness receipt or target output permit.
     /// A future installer must revalidate current authority and the retired runtime boundary.
@@ -83,7 +90,7 @@ impl PreparedTopologyRestore {
         )
     }
 
-    /// Candidate version, still uncommitted and inactive.
+    /// Target version of this private image; Commit does not activate it.
     #[must_use]
     pub fn target_version(&self) -> TopologyVersion {
         self.input.descriptor().target_version
@@ -134,7 +141,32 @@ impl LaminarDB {
         &self,
         operation_id: TopologyOperationId,
     ) -> Result<PreparedTopologyRestore, DbError> {
-        self.ensure_topology_root_available()?;
+        self.prepare_topology_restore_image(operation_id, false)
+            .await
+    }
+
+    /// Reconstruct the current committed target from its exact migration root before its first
+    /// checkpoint. Reuses the same strict historical-parent loader and actual target codecs.
+    /// A Created DB or still-held retired parent can reconstruct; the private image never starts
+    /// actors, changes the local catalog/coordinator, acknowledges input or opens intake.
+    ///
+    /// # Errors
+    /// Rejects uncommitted/obsolete targets, live or faulted local actors, changed owner maps,
+    /// stale current process/adoption, missing/corrupt artifacts or the existing 45 second budget.
+    pub async fn recover_committed_cluster_topology(
+        &self,
+        operation_id: TopologyOperationId,
+    ) -> Result<PreparedTopologyRestore, DbError> {
+        self.prepare_topology_restore_image(operation_id, true)
+            .await
+    }
+
+    async fn prepare_topology_restore_image(
+        &self,
+        operation_id: TopologyOperationId,
+        committed: bool,
+    ) -> Result<PreparedTopologyRestore, DbError> {
+        self.ensure_topology_restore_available(committed)?;
         let compiler = Arc::clone(&self.topology_validation_lock)
             .try_lock_owned()
             .map_err(|_| TopologyError::PlanningBusy)?;
@@ -144,19 +176,31 @@ impl LaminarDB {
                 let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
                     TopologyError::Protocol("restore requires the configured controller".into())
                 })?;
-                let input = controller.topology_restore_input(operation_id).await?;
-                self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline)
-                    .await?;
+                let input = if committed {
+                    let input = controller.committed_topology_restore_input(operation_id).await?;
+                    if super::DbState::load(&self.state) == super::DbState::ShuttingDown {
+                        self.stop_pipeline_for_topology_retirement().await?;
+                    }
+                    input
+                } else {
+                    controller.topology_restore_input(operation_id).await?
+                };
+                if !committed {
+                    self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
+                }
                 let parent_count = input.plan().parent_manifest.entry_count as usize;
                 let parent_entries = input.target().entries.get(..parent_count).ok_or_else(|| {
                     TopologyError::Invalid("restore target is shorter than its parent".into())
                 })?;
-                if self.catalog_manifest_inventory()? != parent_entries {
+                let local = self.catalog_manifest_inventory()?;
+                let catalog_matches = local == parent_entries
+                    || (committed && (local.is_empty() || local == input.target().entries));
+                if !catalog_matches {
                     return Err(TopologyError::Conflict(
                         "restore requires the exact live parent inventory".into(),
                     ).into());
                 }
-                if self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
+                if !committed && self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
                     return Err(TopologyError::Conflict(
                         "live parent differs from the certified restore parent".into(),
                     ).into());
@@ -187,8 +231,8 @@ impl LaminarDB {
                 };
                 let assignment = scope.registry.versioned_snapshot();
                 let owner_ids = assignment.owners().iter().map(|owner| owner.0).collect::<Vec<_>>();
-                if assignment.version() != input.plan().assignment.assignment_version
-                    || !input.plan().assignment.matches_owner_map(&owner_ids)
+                if assignment.version() != input.assignment().assignment_version
+                    || !input.assignment().matches_owner_map(&owner_ids)
                 {
                     return Err(TopologyError::Fenced.into());
                 }
@@ -224,13 +268,21 @@ impl LaminarDB {
                 // Release verified encoded buffers immediately after decoding, before broker I/O.
                 recovered.state_frames.clear();
                 let sources = prepare_source_positions(&candidate, &input).await?;
-                if !controller.topology_restore_input(operation_id).await?.same_restore_requirements(&input) {
+                let after = if committed {
+                    controller.committed_topology_restore_input(operation_id).await?
+                } else {
+                    controller.topology_restore_input(operation_id).await?
+                };
+                if !after.same_restore_requirements(&input) {
                     return Err(TopologyError::Fenced.into());
                 }
-                self.ensure_topology_root_available()?;
-                self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
-                if self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
-                    return Err(TopologyError::Fenced.into());
+                self.ensure_topology_restore_available(committed)?;
+                if self.catalog_manifest_inventory()? != local { return Err(TopologyError::Fenced.into()); }
+                if !committed {
+                    self.validate_bound_parent_pipeline(&input.descriptor().parent_pipeline).await?;
+                    if self.topology_definition_identities()?.pipeline != input.descriptor().parent_pipeline {
+                        return Err(TopologyError::Fenced.into());
+                    }
                 }
                 Ok::<_, DbError>((candidate, graph, input, recovered, sources, restored_frames))
             })
@@ -247,9 +299,38 @@ impl LaminarDB {
             compiler,
         })
     }
+
+    pub(super) fn ensure_topology_restore_available(&self, committed: bool) -> Result<(), DbError> {
+        if !committed {
+            return self.ensure_topology_root_available();
+        }
+        if self.is_closed() {
+            return Err(DbError::Shutdown);
+        }
+        let state = super::DbState::load(&self.state);
+        if !self.is_cluster_runtime()
+            || !matches!(
+                state,
+                super::DbState::Created | super::DbState::ShuttingDown
+            )
+            || (state == super::DbState::ShuttingDown
+                && (!self.topology_cut_hold.load(Ordering::Acquire)
+                    || !self.source_gate.load(Ordering::Acquire)
+                    || !self.runtime_shutdown.read().is_cancelled()))
+            || self.cluster_authority_revoked.load(Ordering::Acquire)
+            || self.durable_terminal_recovery_fence.load(Ordering::Acquire)
+            || self.terminal_pipeline_halt.load(Ordering::Acquire)
+            || self.coordinated_recovery_in_progress()
+            || self.pending_recovery_fault.load(Ordering::Acquire) != 0
+            || self.last_fault.lock().is_some()
+        {
+            return Err(TopologyError::Conflict("committed reconstruction requires a Created DB or its still-held retired parent without local faults".into()).into());
+        }
+        self.ensure_catalog_cleanup_unfenced("committed topology reconstruction")
+    }
 }
 
-async fn prepare_source_positions(
+pub(super) async fn prepare_source_positions(
     candidate: &LaminarDB,
     input: &TopologyRestoreInput,
 ) -> Result<BTreeMap<String, PreparedTopologySourcePosition>, DbError> {

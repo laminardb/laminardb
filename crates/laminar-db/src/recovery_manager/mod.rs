@@ -200,8 +200,9 @@ impl VerifiedStateFramePlan {
 impl<'a> RecoveryManager<'a> {
     /// Load a currently authorized migration cut using the strict parent identity and local roster.
     /// All historical manifests/segments retain their original identity. The rebuilt root must
-    /// equal the sealed requirements before any state payload is read. This is private target
-    /// preparation, never ordinary target recovery or source/output authorization.
+    /// equal the sealed requirements before any state payload is read. This supports private
+    /// target preparation and reconstruction after Commit. Ordinary recovery retains its strict
+    /// pipeline identity checks; this method grants no source/output authorization.
     ///
     /// # Errors
     /// Rejects a reader bound to another participant, pipeline, deployment or scope, divergent

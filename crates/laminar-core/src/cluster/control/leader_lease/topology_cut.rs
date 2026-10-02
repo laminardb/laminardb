@@ -18,7 +18,7 @@ impl LeaderAuthorityRecord {
         let Some(operation) = self
             .topology_operations
             .iter()
-            .find(|entry| entry.is_preparing())
+            .find(|entry| entry.blocks_admission())
         else {
             return Ok(());
         };
@@ -75,7 +75,7 @@ impl LeaderAuthorityRecord {
     pub(super) fn topology_cut_blocks_cleanup(&self, protected: &CommittedCheckpointRef) -> bool {
         self.topology_operations
             .iter()
-            .filter(|operation| operation.is_preparing())
+            .filter(|operation| operation.blocks_admission())
             .filter_map(|operation| operation.cut.as_ref()?.committed.as_ref())
             .any(|commit| protected.epoch > commit.checkpoint.epoch)
     }
@@ -165,7 +165,7 @@ impl LeaderLeaseStore {
                 }
                 let baseline = current.topology_baseline.as_ref().ok_or_else(|| TopologyError::Invalid("cut has no adopted parent".into()))?;
                 if inventory.deployment_id != baseline.deployment_id || inventory.assignment_fence.as_ref() != Some(&plan.assignment)
-                    || baseline.manifest != plan.parent_manifest || baseline.topology_version != plan.expected_parent
+                    || current.committed_topology_identity() != Some((plan.expected_parent, &plan.parent_manifest))
                 {
                     return Err(TopologyError::Conflict("cut inventory does not bind the admitted parent and assignment".into()));
                 }
@@ -226,7 +226,7 @@ impl LeaderLeaseStore {
         let operation = current
             .topology_operations
             .iter()
-            .find(|entry| entry.is_preparing());
+            .find(|entry| entry.blocks_admission());
         if flags & crate::checkpoint::flags::TOPOLOGY_CUT == 0 {
             return if operation.is_none() {
                 Ok(())
@@ -431,7 +431,7 @@ impl LeaderLeaseStore {
                     "topology cut does not bind its exact definitive Commit".into(),
                 ));
             }
-            if operation.is_preparing() {
+            if operation.blocks_admission() {
                 let index = CheckpointDecisionStore::new(self.store.clone())
                     .load_committed_checkpoint(&commit.checkpoint)
                     .await

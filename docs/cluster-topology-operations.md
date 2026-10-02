@@ -6,7 +6,8 @@ and durable preparation of already admitted candidates. Exact-cut root staging
 is available through the DB/core library for stateless downstream additions and
 new sources with a supported sealed initialization contract. Private target
 restore preparation and observed parent retirement are available through the DB
-library after root publication.
+library after root publication. The internal DB/core path now supports irreversible
+target Commit and private reconstruction from its exact root before a target checkpoint.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -15,7 +16,7 @@ and durable replay. There is no supported migration submission or activation rou
 | --- | --- |
 | Initial cold bootstrap and exact sealed-catalog replay | Existing behavior |
 | Read durable topology and local activation status | Implemented |
-| Read an admitted pre-cut request's durable status | Implemented, console authorization |
+| Read an admitted migration request's durable status | Implemented, console authorization |
 | Dry-run an additive candidate against an adopted parent | Local compile and compatibility descriptor; no durable admission |
 | Reserve/abort a candidate | Core library primitives; no public submit route or target worker |
 | Certify an already admitted candidate on this process | Local preparation API; complete frozen roster required before a new cut |
@@ -25,6 +26,8 @@ and durable replay. There is no supported migration submission or activation rou
 | Prepare a private restored target image | DB library; verified parent state and sealed cursors; no target install/Commit/Release |
 | Observe retirement of a prepared image's parent actors | DB library; exact current root authority and terminal task proofs; namespace and cut stay held |
 | Record every participant's target preparation | DB library; durable exact-root restore/retirement observations; target remains uncommitted and inactive |
+| Commit the exact restored target | DB library; complete protocol-4 frozen roster; atomic catalog/root decision; installation and Release remain pending |
+| Reconstruct the committed target before its first checkpoint | DB library; explicit root, strict parent manifest/state checks and current process/adoption; private image only |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -54,7 +57,9 @@ The request and these states are exercised by the server router test
   no admitted logical version. Both version fields are null.
 - `catalog.state = "versioned"`: the baseline includes its exact manifest,
   deployment UUID, successful operation UUID and adoption authority sequence.
-  `committed_version` is 1.
+  `committed_version` is 1 until an internal target Commit. After Commit,
+  `catalog.committed` carries the irreversible decision and `committed_version`
+  advances while `locally_active_version` stays null until installation/Release.
 - `locally_active_version` is populated only after exact replay on this process,
   Running state, intake release, a live process lease, and clear recovery and
   terminal fences. It never certifies activation of other participants. It may
@@ -133,7 +138,7 @@ router's status codes.
 
 ## Legacy upgrade and restart
 
-Authority formats 12 through 19 remain readable. A coordinated binary upgrade is
+Authority formats 12 through 20 remain readable. A coordinated binary upgrade is
 required for this build: the first serialized assignment drain writes format 14,
 even before logical catalog adoption. Stop and observe termination of the old
 server processes, then start every required participant with the new binary and
@@ -155,9 +160,11 @@ authority readers fail closed; mixed-version adoption is unsupported.
 There is no operator-facing adoption CLI or write endpoint in this increment.
 The API is a foundation for the migration coordinator. Do not manually edit
 authority JSON to adopt a deployment. Do not delete the catalog, checkpoint
-directory or control namespace. Exact inventory replay remains mandatory;
-post-migration bootstrap-configuration precedence is still unfinished because
-no target topology can be committed yet.
+directory or control namespace. Exact committed inventory replay remains mandatory.
+After an internal additive Commit, cold replay accepts the complete current inventory
+or the exact complete original adopted bootstrap. It reconstructs the committed
+target in both cases. Arbitrary subsets and changed definitions reject. Ordinary
+start remains fenced while target installation/Release are unfinished.
 
 Adoption appends metadata without rewriting catalog or checkpoint bytes. A lost
 response/cancelled call may already have admitted the baseline. Read authoritative
@@ -165,7 +172,7 @@ status and retry the same operation and evidence under the current leader proof.
 Concurrent compatible adoption calls converge on the original winner, whose
 operation UUID is returned. Changed manifest/deployment evidence is rejected.
 
-## Pre-cut request status
+## Migration request status
 
 `GET /api/v1/cluster/topology/operations/{operation_id}` uses the same console
 authorization and 15 second deadline. It returns the original operation UUID,
@@ -174,11 +181,13 @@ sequences and `state`. Malformed/nil UUIDs return 400; an unknown migration requ
 returns 404 with `Cache-Control: no-store`. Baseline adoption is reported by the
 catalog-status endpoint, not this migration-request journal.
 
-The implemented `state.phase` values are `planned`, `preparing`, `quiescing`, `cut_prepared`
-and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
+The implemented `state.phase` values are `planned`, `preparing`, `quiescing`, `cut_prepared`,
+`committed` and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
 `checkpoint_aborted` or `recovery`. A reservation never implies that the
 candidate catalog is committed or locally active. The committed catalog remains
-topology 1. Identical retries resolve to the original status, including an abort;
+at its parent version until the atomic target Commit. Committed status includes the
+exact `commit` binding and still grants no local activation. Identical retries
+resolve to the original status, including an abort;
 reusing an identity with a different payload fails. The core journal retains at
 most 64 identities and rejects further admission until journal retention exists.
 
@@ -190,7 +199,7 @@ reservation by editing authority files.
 An internally admitted cut is bound to its exact old deployment, pipeline ABI,
 assignment/boot roster and checkpoint attempt before Prepare. Its optional `cut`
 contains the inventory, binding sequence, definitive checkpoint Commit reference
-and completed process roster. `quiescing` remains visible after Commit while
+and completed process roster. `quiescing` remains visible after checkpoint Commit while
 application receipts are missing. The leader's receipt follows aggregated external
 sink settlement; every frozen process must also finish its local cut. `cut_prepared`
 means intake and successor sink output remain held. Protocol-2 cuts also require
@@ -360,9 +369,12 @@ flag. The total cooperative budget is 45 seconds, including the authority append
 the core append allows 16 CAS attempts within 15 seconds. There is no HTTP route
 or automatic worker for this call.
 
-The first receipt writes authority format 19 and requires target preparation
-protocol 3. The candidate plan and original certificates remain protocol 2. Mixed
-binaries are unsupported; complete the coordinated upgrade before using this API.
+Historical protocol-3 receipts use authority format 19. This build's DB receipt
+API certifies protocol 4 and writes format 20, supporting target Commit and explicit
+root reconstruction; the immutable candidate plan remains protocol 2. Every frozen
+participant must certify protocol 4 before Commit. A retained protocol-3 receipt
+cannot be changed in place; abort before Commit and admit a new internal operation
+after coordinated binary upgrade. Mixed binaries remain unsupported.
 The operation stays `cut_prepared`. Its status now includes sorted
 `target_preparations`, each with its original immutable authority sequence.
 `target_preparation_complete()` requires the whole frozen owner/evidence roster,
@@ -380,9 +392,47 @@ without deleting its receipt or reopening intake. A receipt does not prove that
 state is still resident, a cursor remains available, or target receivers/sinks
 are installed. The current APIs require the retained image for retry; if it is
 lost before Commit, abort and recover the parent through coordinated recovery.
-Commit must check current authority and every required process;
+Commit checks current authority and every required process;
 installation must obtain a valid target image, revalidate sealed cursors and wait
-for participant-complete Release. These paths remain unfinished. LDB-6043 remains.
+for participant-complete Release. Installation/Release remain unfinished. LDB-6043 remains.
+
+## Commit and reconstruct internally
+
+`LaminarDB::commit_cluster_topology_target(&mut image)` re-observes parent retirement
+and revalidates sealed source positions before publishing the exact target
+inventory/root through the configured leader. Every
+frozen owner/evidence process must have current protocol-4 preparation. Success
+reports `state.phase = "committed"` and a `commit` binding; the private target
+stays unstarted and locally inactive. The retained parent remains ShuttingDown
+with its intake/cut hold and namespace lock. There is no public Commit route.
+
+Commit is irreversible. A leader replacement or recovery fault preserves it.
+Explicit abort and parent recovery Release reject after Commit; cached parent
+recovery-admission snapshots also become invalid. On a lost response
+or cancelled call, query the same operation identity; retrying the same retained
+image resolves its original decision. Do not create another operation or revert
+the catalog to its parent. The total cooperative DB deadline is 45 seconds;
+authority writes permit 16 CAS attempts within 15 seconds.
+
+If a committed image is lost, `recover_committed_cluster_topology(operation_id)`
+reconstructs it privately on a Created DB or the still-held retired parent. It
+audits the current leader, all exact process terms, local durable adoption and
+assignment around restore. New boots may reconstruct with a newer assignment
+version only when the complete stable roster, vnode owners/domain and partitioning
+ABI remain identical. Rescaling or changed owners reject. The recovery path keeps
+historical parent identities/checksums, unchanged source attempts and subscription
+incarnations/exclusive sequence frontiers. New cursors retain their first sealed
+numeric position; `latest` is never resolved again. No target checkpoint or input
+acknowledgement is invented.
+
+Reconstruction shares the existing compiler slot, state/payload budgets and
+45-second request deadline. Cancellation/deadline drops the partial image and
+retains the decision/hold. Missing or corrupt state remains a committed recovery
+failure. Repair the referenced artifact and retry reconstruction; never
+cold-start preserved state. Ordinary startup cannot load the parent checkpoint
+under the target identity and rejects until target installation/Release is wired.
+This internal checkpoint does not provide an operationally complete migration,
+public submission, activated target or automatic full-cluster recovery.
 
 ## Errors and recovery
 
@@ -405,4 +455,6 @@ and recover the original artifacts from the deployment's storage procedures.
 
 No target cutover-pause duration or migration activation can be certified in
 this increment. See the [engineering checkpoint](cluster-topology-engineering.md)
-and [remaining work](cluster-topology-migrations-progress.md).
+and [remaining work](cluster-topology-migrations-progress.md). The
+[Commit evidence](test-evidence/topology-commit-2026-10-02/README.md) records the
+tested internal authority/private reconstruction scope and its limits.

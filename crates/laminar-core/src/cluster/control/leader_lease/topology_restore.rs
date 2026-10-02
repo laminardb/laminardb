@@ -124,6 +124,9 @@ impl LeaderLeaseStore {
                 .collect();
             Ok(TopologyRestoreInput {
                 operation: operation.clone(),
+                restore_assignment: plan.assignment.clone(),
+                restore_processes: Vec::new(),
+                committed_leader: None,
                 plan,
                 target,
                 descriptor,

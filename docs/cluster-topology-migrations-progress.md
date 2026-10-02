@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging and sealed new-source initialization implemented; runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization, private restore/retirement and atomic target Commit with private post-Commit reconstruction implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -632,6 +632,61 @@ selection remain unchanged.
   new internal DB method. Real target migration and performance certification
   remain unfinished.
 
+## Atomic target Commit and private reconstruction, 2026-10-02
+
+- Continuation starts clean at `ca2674957e162bf508f6347529e70eea1a4b006b`.
+  The existing shared authority now atomically binds the committed target catalog
+  and exact operation/root/cut/descriptor/participant evidence. No second head,
+  scheduler, registry, framework, dependency or per-record work is added.
+- Authority format 20 and protocol-4 preparation require every frozen exact
+  owner/evidence process to support Commit and explicit root reconstruction. The
+  immutable plan remains protocol 2; root encodings remain 1/2. Historical protocol-3
+  receipts stay readable but cannot be rewritten/upgraded in place or authorize Commit.
+  Commit revalidates the whole current original process/assignment roster, retained
+  image, parent catalog and latest settled cut. All existing bounds/fault fences apply.
+- One irreversible append advances the committed logical version and preserves
+  the original baseline, manifest bytes/object incarnations, old checkpoint/outcome
+  links and allocator. Leader replacement and recovery faults preserve Committed;
+  explicit abort rejects. Ordinary checkpoint/assignment/topology admission and
+  parent recovery Release remain held, including cached recovery-admission snapshots.
+- The retained image's DB can Commit and reconstruct after image loss. A separate
+  Created DB can replay the committed catalog and privately restore before its first
+  checkpoint. Strict parent PipelineIdentity/manifests/checksums and actual operator
+  codecs remain mandatory; no target checkpoint, cold-started preserved state or
+  historical acknowledgement is invented. Current boot/term and durable local
+  adoption are audited around restore. New boots may use a newer assignment only
+  with identical vnode owners/domain/ABI and the complete stable participant roster;
+  changed ownership/rescaling rejects. New-source positions are validated, not resolved again.
+- The DB keeps the 45-second total cooperative budgets and existing compiler slot,
+  payload/state limits and retirement task ownership. The parent stays ShuttingDown
+  with cut/intake/namespace held; target images remain Created/unstarted. Cancellation
+  or damaged artifacts retain Commit and drop partial images. Durable operation
+  status resolves ambiguous writes; committed recovery never rolls back the catalog.
+- Cold replay accepts the exact full current inventory or the exact full adopted
+  original bootstrap and reconstructs the target in both cases. Arbitrary subsets
+  or changed definitions reject. Committed and locally active versions remain
+  separate. Ordinary startup rejects pending Commit until target installation/Release
+  are implemented. This is internal Commit/private recovery, not activated runtime
+  migration or automatic full-cluster target restart. LDB-6043 remains.
+
+- Validation is recorded in the
+  [Commit evidence](test-evidence/topology-commit-2026-10-02/README.md). The final
+  focused command passes all 21 cases (13 core and eight DB). The final selected
+  four-package suite passes 4,355 tests: 1,067 core, 914 connectors, 2,018 DB and
+  356 server, with the same two existing ignored tests. All-target Clippy with
+  warnings denied, non-default server, cluster/FFI, formatting and diff checks pass.
+  All 33 changed Rust source hashes and Cargo.lock remain unchanged through final
+  validation and staging. Existing bootstrap rejection and corrupt-catalog recovery
+  diagnostics remain compatible.
+- Core tests use the exact-root two-process authority fixture and a real full
+  monotonic peer process takeover. DB tests use actual aggregate codecs, preserved
+  subscriptions/cursors, a controlled watcher and OS namespace locking. A separate
+  Created DB restores the committed inventory with the same configured control
+  process; this does not certify a full target runtime restart. No broker or
+  optimized multi-process scenario is rerun because the existing harness does not
+  drive these internal methods. Activated migration and performance certification
+  remain unfinished.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -643,8 +698,9 @@ selection remain unchanged.
    target preparation receipts from owned migration work, and collect the full roster.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
-3. Atomically bind target catalog and migration root at topology Commit; implement
-   target installation, generation fencing, Release and post-commit recovery.
+3. Drive implemented atomic Commit/private reconstruction from owned migration work;
+   implement target installation, generation fencing, participant-complete Release
+   and automatic post-Commit runtime recovery. Ordinary startup stays fenced meanwhile.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
 5. Removal/replacement contracts, fault matrix and existing soak extensions.
@@ -673,6 +729,8 @@ and its checks are recorded in
 are recorded in `docs/test-evidence/topology-retirement-2026-10-02`.
 Durable target preparation observations and their checks are recorded in
 `docs/test-evidence/topology-target-preparation-2026-10-02`.
+Atomic Commit/private reconstruction checks are recorded in
+`docs/test-evidence/topology-commit-2026-10-02`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.
