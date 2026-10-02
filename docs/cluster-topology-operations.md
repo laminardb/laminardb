@@ -24,6 +24,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Seal new-source initial positions | Same internal staging call; explicit Kafka topics with earliest/latest |
 | Prepare a private restored target image | DB library; verified parent state and sealed cursors; no target install/Commit/Release |
 | Observe retirement of a prepared image's parent actors | DB library; exact current root authority and terminal task proofs; namespace and cut stay held |
+| Record every participant's target preparation | DB library; durable exact-root restore/retirement observations; target remains uncommitted and inactive |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -132,7 +133,7 @@ router's status codes.
 
 ## Legacy upgrade and restart
 
-Authority formats 12 through 18 remain readable. A coordinated binary upgrade is
+Authority formats 12 through 19 remain readable. A coordinated binary upgrade is
 required for this build: the first serialized assignment drain writes format 14,
 even before logical catalog adoption. Stop and observe termination of the old
 server processes, then start every required participant with the new binary and
@@ -348,6 +349,40 @@ must revalidate the observation, current authority and transport generation befo
 Commit/install/Release. Process-lifetime shuffle handles remain in place; target
 generation fencing and installation are unfinished. This step alone does not
 activate a migration or certify transactional sink migration behavior.
+
+## Record target preparation internally
+
+`LaminarDB::certify_cluster_topology_target_preparation(&mut image)` accepts the
+opaque image prepared by that DB. It reuses observed parent retirement, including
+on retry, and publishes one exact participant/boot/process-term receipt through
+the configured controller. The caller cannot supply its own receipt or termination
+flag. The total cooperative budget is 45 seconds, including the authority append;
+the core append allows 16 CAS attempts within 15 seconds. There is no HTTP route
+or automatic worker for this call.
+
+The first receipt writes authority format 19 and requires target preparation
+protocol 3. The candidate plan and original certificates remain protocol 2. Mixed
+binaries are unsupported; complete the coordinated upgrade before using this API.
+The operation stays `cut_prepared`. Its status now includes sorted
+`target_preparations`, each with its original immutable authority sequence.
+`target_preparation_complete()` requires the whole frozen owner/evidence roster,
+including exact boot incarnations. It never reports Commit or activation.
+
+An uncertain or cancelled write may already have persisted its receipt. Read
+operation status and retry the same image; an identical receipt consumes no new
+append. Missing/corrupt anchors reject status and preparation. Leader change or
+recovery before Commit aborts the operation while retaining its cut, root and
+historical receipts. A cancelled waiter before retirement leaves unresolved tasks
+in the existing DB owners and writes no receipt.
+
+Receipts are historical observations. Dropping an image frees its private state
+without deleting its receipt or reopening intake. A receipt does not prove that
+state is still resident, a cursor remains available, or target receivers/sinks
+are installed. The current APIs require the retained image for retry; if it is
+lost before Commit, abort and recover the parent through coordinated recovery.
+Commit must check current authority and every required process;
+installation must obtain a valid target image, revalidate sealed cursors and wait
+for participant-complete Release. These paths remain unfinished. LDB-6043 remains.
 
 ## Errors and recovery
 

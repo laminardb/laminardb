@@ -8,6 +8,52 @@ use crate::cluster::control::topology::{
 };
 
 impl ClusterController {
+    /// Record this process's exact-root private restore and observed parent retirement.
+    /// The caller must observe termination through runtime-owned actor/connector handles.
+    /// A receipt records historical preparation, never installation or output authorization.
+    ///
+    /// # Errors
+    /// Rejects changed restore requirements, local process/adoption, recovery or draining.
+    /// On an uncertain/cancelled append, read status and retry the same retained image/input.
+    pub async fn certify_topology_target_preparation(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let before = self
+            .topology_restore_input(input.operation().operation_id)
+            .await?;
+        if !before.same_restore_requirements(input) {
+            return Err(TopologyError::Fenced);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|e| TopologyError::Protocol(e.to_string()))?;
+        let status = authority
+            .certify_topology_target_preparation(
+                self.snapshot.as_ref().ok_or_else(|| {
+                    TopologyError::Protocol("target preparation has no assignment authority".into())
+                })?,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("target preparation has no process authority".into())
+                })?,
+                input,
+                crate::cluster::control::TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
+            )
+            .await?;
+        let after = self
+            .topology_restore_input(input.operation().operation_id)
+            .await?;
+        if !after.same_restore_requirements(input)
+            || status
+                .target_preparations
+                .iter()
+                .any(|receipt| !after.operation().target_preparations.contains(receipt))
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(after.operation().clone())
+    }
+
     /// Read current private restore input using this controller's exact local process adoption.
     /// This does not install a graph or authorize source/output work.
     ///

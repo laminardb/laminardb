@@ -1,0 +1,26 @@
+target-preparation-clippy-final.txt
+    Checking laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.19s
+Exit code: 0
+
+target-preparation-server-no-default.txt
+   Compiling laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.48s
+Exit code: 0
+
+target-preparation-db-cluster-ffi.txt
+    Checking laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 48.38s
+Exit code: 0
+
+cargo fmt --all -- --check: exit 0
+git -c core.excludesFile= diff --check: exit 0
+git -c core.excludesFile= diff --cached --check: exit 0

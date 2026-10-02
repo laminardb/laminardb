@@ -95,8 +95,8 @@ impl LeaderLeaseStore {
             }
             validate_manifest_budget(&checkpoint)?;
             let target = self.load_catalog_manifest(&plan.target_manifest).await?;
-            // Renewals can append while this read runs; any operation/leader/assignment change
-            // invalidates preparation. No mutable head or restore receipt is written here.
+            // Renewals and target preparation receipts can advance while this read runs.
+            // Restore requirements, leader and assignment must stay exact. This writes no receipt.
             self.require_topology_prepared(operation, &plan, processes)
                 .await?;
             let after = self.load_record().await?.ok_or(TopologyError::Fenced)?;
@@ -105,7 +105,7 @@ impl LeaderLeaseStore {
                     .topology_operations
                     .iter()
                     .find(|entry| entry.operation_id == operation_id)
-                    != Some(operation)
+                    .is_none_or(|entry| !operation.same_restore_binding(entry))
                 || assignments
                     .load()
                     .await

@@ -4,6 +4,9 @@ use super::*;
 use laminar_connectors::connector::ConnectorTaskOwner;
 use tokio::sync::Notify;
 
+#[path = "topology_target_preparation.rs"]
+mod target_preparation;
+
 fn namespace_lock(db: &LaminarDB) -> tempfile::NamedTempFile {
     let file = tempfile::NamedTempFile::new().unwrap();
     let owner = file.reopen().unwrap();

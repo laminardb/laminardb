@@ -26,6 +26,21 @@ pub struct TopologyRestoreInput {
 }
 
 impl TopologyRestoreInput {
+    /// Compare all restore requirements, allowing only monotonic receipt/status progress.
+    /// Both inputs must come from current controller authorization; this comparison never
+    /// replaces a fresh read or the authority's receipt, leader, process and assignment audits.
+    #[must_use]
+    pub fn same_restore_requirements(&self, other: &Self) -> bool {
+        self.operation.same_restore_binding(&other.operation)
+            && self.plan == other.plan
+            && self.target == other.target
+            && self.descriptor == other.descriptor
+            && self.root == other.root
+            && self.outcome == other.outcome
+            && self.checkpoint == other.checkpoint
+            && self.owned_vnodes == other.owned_vnodes
+            && self.process == other.process
+    }
     /// Exact still-prepared operation, including its root authority anchor.
     #[must_use]
     pub const fn operation(&self) -> &TopologyAdmissionStatus {

@@ -10,6 +10,7 @@ mod topology_cut;
 mod topology_migration_root;
 mod topology_preparation;
 mod topology_restore;
+mod topology_target_preparation;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{
@@ -67,6 +68,7 @@ const TOPOLOGY_CUT_RECORD_VERSION: u32 = 15;
 const TOPOLOGY_PREPARATION_RECORD_VERSION: u32 = 16;
 const TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION: u32 = 17;
 const TOPOLOGY_SOURCE_ROOT_RECORD_VERSION: u32 = 18;
+const TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION: u32 = 19;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1338,6 +1340,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_PREPARATION_RECORD_VERSION
             && self.version != TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
             && self.version != TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
+            && self.version != TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2680,6 +2683,12 @@ impl LeaderLeaseStore {
             authority.audit_topology_operation(operation).await?;
             retained.insert(operation.admitted_sequence);
             retained.insert(operation.status_sequence);
+            retained.extend(
+                operation
+                    .target_preparations
+                    .iter()
+                    .map(|receipt| receipt.authority_sequence),
+            );
             if let Some(root) = &operation.migration_root {
                 retained.insert(root.authority_sequence);
             }

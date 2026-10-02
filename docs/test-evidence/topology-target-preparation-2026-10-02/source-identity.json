@@ -1,0 +1,116 @@
+{
+  "starting_commit": "7a9496889a68841d8fce6a79bd41cf2506273dfc",
+  "original_baseline": "5d81ba9b18d80343373ecfaec4793df8c5caccf1",
+  "branch": "feature/cluster-topology-migrations",
+  "starting_working_tree_clean": true,
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "cargo": "cargo 1.98.0 (797e8a9bc 2026-08-05)",
+  "packages": [
+    "laminar-core",
+    "laminar-connectors",
+    "laminar-db",
+    "laminar-server"
+  ],
+  "features": [
+    "cluster",
+    "aws",
+    "kafka"
+  ],
+  "source_hashes": [
+    {
+      "path": "crates/laminar-core/src/cluster/control/controller/topology.rs",
+      "sha256": "68261ccc5ed3d233836fca2479d544f332d8d94857227b186eb9b0609223533c"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/mod.rs",
+      "sha256": "ccb99aebd547fa129467edc725fbb3b98fefa040fec0b9108905294068fc1d33"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_admission.rs",
+      "sha256": "42407dd716318d0ed2b99e7db328f3d2a00588dca4ed4c1a44795ea7e91bbe5d"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_migration_root_tests.rs",
+      "sha256": "4c3bf1d1efdc3de6e0e29b4668a64189f9e27bfe78016fc8ca10f72a325d435f"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_restore.rs",
+      "sha256": "6ddd82ab68cb4e0376623dc1332302557e157995c2c69034ae03d6d7a9b85a0a"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_target_preparation_tests.rs",
+      "sha256": "5b7a4a402383d7dfaa861a1011ea266c56ce146470c9f1a123d0079ba1eeadf4"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology_target_preparation.rs",
+      "sha256": "86c95a7616335eae47affdbc4f853210c14124f771de798f26d055ccaa5906c1"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/leader_lease/topology.rs",
+      "sha256": "e3f7211bf93be1b13da2e7178dbcb582332dc4a214243ae325bd74a4f3368bac"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/mod.rs",
+      "sha256": "aac3943923c675343845b1825e7a7db8a46cc8c23d668239b11c51a2054f8270"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/admission.rs",
+      "sha256": "6c1ac5a150e19923ef4fdc79c75c29cc55b764f28299bde9699669d1d7325ef4"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/mod.rs",
+      "sha256": "1ecc7092eadbc42bcbe93978cc4f49508df6114f780c5ca13d73c15e72eaefe2"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/restore.rs",
+      "sha256": "e7d34ebd3da4f2c11c0308e8bfc776b3410a595fcd5c7f38050dca4a4e8a52d9"
+    },
+    {
+      "path": "crates/laminar-core/src/cluster/control/topology/target_preparation.rs",
+      "sha256": "e802a540556e0f60559dce966e036c6f0508dcca93ea48b8b0be1416f6d5356a"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_retirement.rs",
+      "sha256": "ed56002367b77a71e1c1e9bfb819a4c93dab18df9e8a510ae6e19cacc3a58215"
+    },
+    {
+      "path": "crates/laminar-db/src/db/tests/topology_target_preparation.rs",
+      "sha256": "06142b075da286f6f4ada80c17287cbb9f7541c95b6cc0600258b4aceb7ec0b0"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology.rs",
+      "sha256": "b98e0f8ddddb48bee2882ccffef88dc8b3abfe84d1e97788a463396b319ecde6"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/restore.rs",
+      "sha256": "4cf629f658bc87127d36dc8a9f6af9a06e6286acb5f2a79ff24ad333870118a7"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/retirement.rs",
+      "sha256": "c2d37804c143cd3573cc113684cf89039db305b22c601481f90f66ae2a98a383"
+    },
+    {
+      "path": "crates/laminar-db/src/db/topology/target_preparation.rs",
+      "sha256": "77d34d2fec021587db70d7a17f1b8ba80cd4ca80b0db7a85494db7402abbfc6a"
+    }
+  ],
+  "cargo_lock_sha256": "86bb2c49746f448cff945252de91f8c597a72137ce6055024b035e9f93cad68f",
+  "source_hashes_verified_after_final_checks": true,
+  "results": {
+    "focused_core_passed": 10,
+    "focused_db_passed": 5,
+    "full_core_passed": 1054,
+    "full_connectors_passed": 914,
+    "full_db_passed": 2010,
+    "full_server_passed": 356,
+    "full_passed": 4334,
+    "full_ignored": 2,
+    "clippy_all_targets_exit": 0,
+    "server_no_default_exit": 0,
+    "db_cluster_ffi_exit": 0,
+    "fmt_exit": 0,
+    "working_diff_check_exit": 0,
+    "staged_diff_check_exit": 0
+  },
+  "source_hashes_verified_after_staging": true
+}

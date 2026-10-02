@@ -187,6 +187,10 @@ pub struct TopologyAdmissionStatus {
     /// Exact-cut restore/initialization requirements. This is never a target Commit or Release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration_root: Option<super::TopologyMigrationRootBinding>,
+    /// Historical exact-process target restore and parent retirement observations.
+    /// These receipts do not authorize installation, output or intake release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_preparations: Vec<super::TopologyTargetPreparationReceipt>,
 }
 
 impl TopologyAdmissionStatus {
@@ -218,6 +222,7 @@ impl TopologyAdmissionStatus {
             ));
         }
         self.validate_preparation(head)?;
+        self.validate_target_preparations(head)?;
         if let Some(binding) = &self.migration_root {
             binding.root.validate()?;
             if !matches!(
@@ -338,6 +343,7 @@ impl TopologyAdmissionStatus {
             ));
         }
         self.validate_preparation_successor(after, sequence)?;
+        self.validate_target_preparation_successor(after, sequence)?;
         match (&self.migration_root, &after.migration_root) {
             (None, None) => {}
             (Some(prior), Some(next)) if prior == next => {}
@@ -375,7 +381,9 @@ impl TopologyAdmissionStatus {
                         && self.migration_root.is_none()
                         && after.migration_root.is_some()
                         && prior_cut == next_cut
-                        && self.preparation == after.preparation))
+                        && self.preparation == after.preparation)
+                    && !(self.same_restore_binding(after)
+                        && after.target_preparations.len() == self.target_preparations.len() + 1))
             {
                 return Err(TopologyError::Invalid(
                     "authority cannot replace a cut or rewind its evidence".into(),

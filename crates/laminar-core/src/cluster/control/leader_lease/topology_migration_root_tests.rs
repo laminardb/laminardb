@@ -387,6 +387,8 @@ async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -
 mod restore;
 #[path = "topology_source_root_tests.rs"]
 mod source_initialization;
+#[path = "topology_target_preparation_tests.rs"]
+mod target_preparation;
 
 fn checkpoint_store(authority: &LeaderLeaseStore, vnode_count: u32) -> ObjectStoreCheckpointStore {
     ObjectStoreCheckpointStore::new(authority.store.clone(), "")

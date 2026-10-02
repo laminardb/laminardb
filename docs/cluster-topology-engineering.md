@@ -19,7 +19,9 @@ compatibility descriptors and durable participant certificates are implemented.
 Exact-cut state/progress root staging includes stateless downstream additions and sealed
 new-source initialization requirements. Private target restore preparation is
 implemented. Exact-root parent retirement now observes existing actor/connector
-owners while retaining the runtime and namespace fences. Topology Commit,
+owners while retaining the runtime and namespace fences. Exact-process target
+preparation receipts now record those observations in the same authority log.
+Topology Commit,
 install/activation and release remain unfinished.
 Runtime DDL stays fenced.
 
@@ -55,6 +57,11 @@ Encoding 17 pins immutable migration-root requirements after CutPrepared. It pre
 the same protocol-2 plan, old catalog and checkpoint allocator; it grants no target authority.
 Encoding 18 requires support for source-initialization roots. Root encoding 2 carries
 the new global source cursors; encoding-1 bodies retain their exact canonical bytes.
+Encoding 19 records historical target restore/parent retirement observations under
+the same prepared cut. Each reporting process must implement target preparation
+protocol 3; the admitted candidate plan remains protocol 2. Earlier encodings omit
+the empty receipt vector and retain their original bytes. Older writers fail closed
+on encoding 19; this storage gate does not by itself retire cached actors.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -536,13 +543,55 @@ observation; old shuffle transport remains process-owned and needs generation fe
 | Image is dropped after retirement | Free private target state and compiler slot; retain the runtime/cut/namespace fences |
 | Pre-commit abort followed by coordinated recovery | Existing recovery stop can take over the retired parent; resume T from its reconciled cut |
 
+`certify_cluster_topology_target_preparation` connects a retained image and the
+same observed lifecycle to a durable historical receipt. It always rechecks
+retirement, then the controller checks local process/adoption around the authority
+append. The DB accepts no caller-supplied root, process identity or terminal flag.
+The existing compiler permit stays with the image. The 45-second total cooperative
+budget covers cleanup, publication and final checks; no new detached worker or
+task registry is introduced. Retirement releases its asynchronous lifecycle locks
+before control-store I/O; public lifecycle/mutation fences keep the held boundary.
+No synchronous guard crosses an await.
+
+One sorted receipt binds the exact candidate-certificate participant/boot/term,
+target preparation protocol 3 and the first immutable append. The enclosing
+operation fixes the plan, descriptor, assignment, root and old checkpoint. Each
+append adds exactly one participant after root publication. Full preparation
+requires all frozen owner/evidence processes. Authority reads audit every receipt
+against its original append; pruning retains every anchor, including after abort.
+Existing 129-participant and 256 KiB authority bounds remain enforced.
+
+Receipt/status progress may advance while another image is being restored or held.
+`same_restore_requirements` compares every immutable input field, including phase,
+leader, process term, assignment, cut, root, checkpoint, target and descriptor.
+It permits only the separately validated receipt/status progress. Ordinary
+PipelineIdentity and historical checkpoint bytes are unchanged.
+
+| Target preparation failure | Result |
+| --- | --- |
+| Only part of the frozen roster reports | Retain partial observations in CutPrepared; no target authorization |
+| Another participant appends concurrently | Existing authority CAS retries without changing either restore binding |
+| Create succeeds but reply is lost or waiter cancels | Authoritative status/read reconciliation finds the same append; identical retry appends nothing |
+| Deadline before create | Retain the old cut/root and unresolved runtime owners; no receipt |
+| Leader replacement wins the pending create | Reject the stale writer and durably abort preparation under the new term |
+| Exact retry after process/assignment/recovery changes | Reject even if its historical receipt already exists |
+| Image is dropped after receipt | Retain historical proof and the cut/namespace hold; installation must obtain and revalidate a target image |
+| Receipt anchor missing, corrupt or rewritten | Fail closed; do not manufacture a receipt from transport/local state |
+
+These are historical restore/retirement observations, not installed receiver/sink
+readiness or proof of image residency. A future Commit must revalidate current
+authority and all exact processes and have a usable post-Commit root recovery path.
+Target generation fencing, installation and participant-complete Release remain
+required before output. No target Commit is exposed by this increment.
+
 1. Integrate candidate planning with a DB-owned migration worker and its existing
    manual checkpoint owner. The old-cut binding, capture and hold are implemented;
    detached submission/target-stage ownership remain unfinished.
 2. Drive the implemented exact-process certification path from detached submission;
    explicit local preparation is available, but automatic collection remains unfinished.
-3. Drive the implemented observed parent retirement from owned migration work
-   and bind participant-complete target readiness at the commit boundary.
+3. Drive private restore, observed retirement and the implemented durable target
+   preparation receipts from owned migration work. At Commit, revalidate the full
+   exact process/assignment roster; receipts alone cannot grant target output.
 4. Drive the implemented private restore preparation from owned migration work,
    then atomically bind target catalog and root at the logical topology-change Commit.
 5. Restore/install the target before participant-complete release, with stale
@@ -573,5 +622,8 @@ records exact root authorization, operator decoding, cursor availability and
 bounded-image ownership/cancellation checks.
 The [parent retirement evidence](test-evidence/topology-retirement-2026-10-02/README.md)
 records task/connector terminal observation and retained lifecycle/namespace fences.
+The [target preparation evidence](test-evidence/topology-target-preparation-2026-10-02/README.md)
+records durable exact-process observations, concurrent/lost/cancelled appends and
+retained receipt anchors.
 These results do not certify target migration
 or production latency.

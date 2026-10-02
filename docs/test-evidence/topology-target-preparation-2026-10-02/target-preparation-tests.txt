@@ -1,0 +1,45 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.22s
+     Running unittests src\lib.rs (target\debug\deps\laminar_connectors-d995ef82c5c9bcd6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 915 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_core-9b1613879a5ff62e.exe)
+
+running 10 tests
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_deadline_before_append_retains_the_unreleased_root ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_malformed_receipts_and_rewrites_fail_closed ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_leader_change_wins_the_blocked_append ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_lost_response_reconciles_one_original_append ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_cancelled_successful_write_survives_reopen ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_abort_retains_receipts_and_pruning_pins_every_anchor ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_concurrent_receipts_append_once_per_process ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_requires_every_frozen_process_and_preserves_the_cut ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_rejects_divergent_inputs_and_old_protocol_without_append ... ok
+test cluster::control::leader_lease::tests::topology_migration_root::target_preparation::topology_target_preparation_rechecks_all_processes_and_current_assignment_on_retry ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1044 filtered out; finished in 30.14s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_db-37560d7655ba525f.exe)
+
+running 5 tests
+test db::tests::topology_planning::restore::retirement::target_preparation::topology_target_preparation_process_loss_during_retirement_writes_no_receipt ... ok
+test db::tests::topology_planning::restore::retirement::target_preparation::topology_target_preparation_total_deadline_preserves_runtime_and_namespace_ownership ... ok
+test db::tests::topology_planning::restore::retirement::target_preparation::topology_target_preparation_cancellation_before_retirement_writes_no_receipt_and_can_retry ... ok
+test db::tests::topology_planning::restore::retirement::target_preparation::topology_target_preparation_certifies_a_retained_image_without_committing_or_releasing ... ok
+test db::tests::topology_planning::restore::retirement::target_preparation::topology_target_preparation_foreign_image_and_local_fault_cannot_publish ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2006 filtered out; finished in 0.31s
+
+     Running unittests src\bin\hash_test.rs (target\debug\deps\hash_test-d740050894734938.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\laminardb-572646521bf03734.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 356 filtered out; finished in 0.00s

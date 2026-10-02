@@ -597,6 +597,41 @@ selection remain unchanged.
   three-process scenario is rerun: those existing scenarios do not yet drive this
   internal retirement API. Target migration/performance certification remains unfinished.
 
+## Durable target preparation observations, 2026-10-02
+
+- Continuation starts clean at `7a9496889a68841d8fce6a79bd41cf2506273dfc`.
+  The retained private image can drive observed retirement and publish an exact
+  participant/boot/process-term preparation receipt through its configured
+  controller and the existing fenced authority append. The DB accepts no caller
+  termination flag, process identity, root or receipt. No new worker, registry,
+  scheduler, dependency or per-record work is added.
+- The first receipt writes authority format 19 and requires target preparation
+  protocol 3. The immutable candidate plan remains protocol 2. Every frozen
+  owner/evidence process is required, and each receipt is audited against its
+  original retained append. Identical retries append nothing; concurrent reporters,
+  leader replacement and lost responses use the existing conditional-write contract.
+- The operation stays CutPrepared with its original plan/root/cut and committed
+  topology 1. Another participant's receipt may advance status while all immutable
+  restore requirements stay exact. Old encodings omit empty receipts. Counts remain
+  bounded at 129 processes and authority bodies at 256 KiB.
+- A receipt is a historical restore/retirement observation, not image residency,
+  installed receiver/sink readiness or an output permit. Image drop retains the
+  cut/namespace hold and historical proof. Commit must revalidate every current
+  process/assignment and provide usable target recovery before its first checkpoint.
+  Atomic Commit, target generation fencing, install/Release, detached work and public
+  SQL submission remain unfinished. LDB-6043 remains; the runtime migration
+  definition of done is unmet.
+- Commands, validation results and fixture limits are recorded in the
+  [target preparation evidence](test-evidence/topology-target-preparation-2026-10-02/README.md).
+  All 15 focused tests and the full 4,334-test selected-feature suite pass:
+  1,054 core, 914 connectors, 2,010 DB and 356 server. All-target Clippy with
+  warnings denied, non-default server and cluster/FFI checks, formatting and
+  working/staged diff checks pass. All 19 changed Rust source hashes and Cargo.lock
+  remain unchanged through final verification and staging. No broker or optimized
+  multi-process scenario is rerun; their existing harness does not yet drive this
+  new internal DB method. Real target migration and performance certification
+  remain unfinished.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -604,8 +639,8 @@ selection remain unchanged.
    each local preparation API independently compiles and durably certifies it.
    The manual checkpoint path requires the full frozen roster before a new cut;
    no worker stages or commits a target.
-2. Drive the implemented private restore and observed parent retirement from owned
-   migration work, with participant-complete target readiness/retirement receipts.
+2. Drive the implemented private restore, observed parent retirement and durable
+   target preparation receipts from owned migration work, and collect the full roster.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
 3. Atomically bind target catalog and migration root at topology Commit; implement
@@ -636,6 +671,8 @@ and the latest stateful restart run are in
 and its checks are recorded in
 `docs/test-evidence/topology-restore-2026-10-02`. Parent retirement and its checks
 are recorded in `docs/test-evidence/topology-retirement-2026-10-02`.
+Durable target preparation observations and their checks are recorded in
+`docs/test-evidence/topology-target-preparation-2026-10-02`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

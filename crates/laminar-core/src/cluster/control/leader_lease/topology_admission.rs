@@ -65,6 +65,13 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
+            if !operation.target_preparations.is_empty()
+                && self.version < TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "target preparation observations require authority format 19".into(),
+                ));
+            }
             if operation.migration_root.is_some()
                 && self.version < TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
             {
@@ -438,7 +445,8 @@ impl LeaderLeaseStore {
         self.audit_topology_cut(operation).await?;
         self.audit_topology_migration_root(operation, &plan, descriptor.as_ref())
             .await
-            .map_err(topology_lease_error)
+            .map_err(topology_lease_error)?;
+        self.audit_topology_target_preparations(operation).await
     }
 
     /// Read the definitive, payload-bound pre-cut request status without allocating identities.
@@ -641,6 +649,7 @@ impl LeaderLeaseStore {
                 phase: TopologyAdmissionPhase::Planned,
                 cut: None,
                 migration_root: None,
+                target_preparations: Vec::new(),
                 preparation: plan.compatibility.clone().map(|compatibility| {
                     crate::cluster::control::topology::TopologyPreparation {
                         compatibility,

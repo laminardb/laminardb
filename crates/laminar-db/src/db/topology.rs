@@ -12,6 +12,7 @@ mod planning;
 mod preparation;
 mod restore;
 mod retirement;
+mod target_preparation;
 pub use planning::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,

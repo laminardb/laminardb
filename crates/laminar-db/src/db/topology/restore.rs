@@ -224,7 +224,7 @@ impl LaminarDB {
                 // Release verified encoded buffers immediately after decoding, before broker I/O.
                 recovered.state_frames.clear();
                 let sources = prepare_source_positions(&candidate, &input).await?;
-                if controller.topology_restore_input(operation_id).await? != input {
+                if !controller.topology_restore_input(operation_id).await?.same_restore_requirements(&input) {
                     return Err(TopologyError::Fenced.into());
                 }
                 self.ensure_topology_root_available()?;

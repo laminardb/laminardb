@@ -55,7 +55,7 @@ impl LaminarDB {
         .map_err(|_| TopologyError::Contended)?
     }
 
-    async fn validate_topology_retirement_input(
+    pub(super) async fn validate_topology_retirement_input(
         &self,
         input: &TopologyRestoreInput,
     ) -> Result<(), DbError> {
@@ -63,10 +63,10 @@ impl LaminarDB {
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             TopologyError::Protocol("retirement requires the configured controller".into())
         })?;
-        if controller
+        if !controller
             .topology_restore_input(input.operation().operation_id)
             .await?
-            != *input
+            .same_restore_requirements(input)
         {
             return Err(TopologyError::Fenced.into());
         }

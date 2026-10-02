@@ -17,6 +17,7 @@ mod migration_root;
 mod preparation;
 mod restore;
 mod source_initialization;
+mod target_preparation;
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,
@@ -37,6 +38,9 @@ pub use preparation::{
 };
 pub use restore::TopologyRestoreInput;
 pub use source_initialization::{TopologySourceInitialization, MAX_TOPOLOGY_SOURCE_CHANNELS};
+pub use target_preparation::{
+    TopologyTargetPreparationReceipt, TOPOLOGY_TARGET_PREPARATION_PROTOCOL_VERSION,
+};
 
 /// Version of the topology adoption protocol understood by this binary.
 pub const TOPOLOGY_PROTOCOL_VERSION: u16 = 1;
