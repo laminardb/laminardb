@@ -5,7 +5,8 @@ an old-topology checkpoint cut, topology/operation status, local candidate valid
 and durable preparation of already admitted candidates. Exact-cut root staging
 is available through the DB/core library for stateless downstream additions and
 new sources with a supported sealed initialization contract. Private target
-restore preparation is available through the DB library after root publication.
+restore preparation and observed parent retirement are available through the DB
+library after root publication.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -22,6 +23,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Stage exact-cut state/progress/subscription requirements | DB/core library, held cut and complete current roster; no target restore/output authority |
 | Seal new-source initial positions | Same internal staging call; explicit Kafka topics with earliest/latest |
 | Prepare a private restored target image | DB library; verified parent state and sealed cursors; no target install/Commit/Release |
+| Observe retirement of a prepared image's parent actors | DB library; exact current root authority and terminal task proofs; namespace and cut stay held |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -312,8 +314,40 @@ read buffers coexist transiently; these limits are not a total-process RSS cap.
 
 Success writes no authority receipt, changes no committed catalog/coordinator,
 starts no source/sink actor and permits no target output. A retained image can
-become stale. Observed old-actor retirement, atomic topology Commit, installation
-and participant-complete Release remain required. LDB-6043 stays in place.
+become stale. Parent retirement is a separate internal step. Atomic topology Commit,
+installation and participant-complete Release remain required. LDB-6043 stays in place.
+
+## Retire the held parent internally
+
+`LaminarDB::retire_cluster_topology_parent(&mut image)` accepts only an image
+prepared by that same database. There is no HTTP retirement route or automatic
+migration worker. The call checks the exact root, old checkpoint, admitting leader,
+complete current preparation roster, process and assignment before stopping the
+parent and after observing its termination.
+
+The existing lifecycle owns compute, source and sink tasks and their connector
+children throughout cleanup. Joining compute, signalling cancellation or receiving
+a sink close result alone is insufficient. Retirement also settles checkpoint
+decision work and the sink-open witness and waits for every retained source/sink
+actor and connector child to be terminal. The 45-second total budget includes
+authority reads and cleanup. A deadline or cancelled waiter retains unresolved
+handles and the namespace lock; retry with the same image while authority remains
+current. A runtime fault requires coordinated recovery.
+
+Successful retirement leaves the runtime in `ShuttingDown`, with intake closed,
+the old cut held, the checkpoint namespace still owned and the parent catalog and
+coordinator identity unchanged. The private target remains unstarted. Public
+start/stop cannot release this boundary, and dropping the image does not reopen
+intake. Terminal shutdown and authorized coordinated recovery retain their existing
+cleanup paths; after a pre-commit abort, recovery resumes the unchanged topology
+from its reconciled checkpoint. Do not reset the namespace or checkpoints.
+
+`image.parent_retirement_observed()` records a local observation. It appends no
+durable readiness receipt and grants no target output permission. The installer
+must revalidate the observation, current authority and transport generation before
+Commit/install/Release. Process-lifetime shuffle handles remain in place; target
+generation fencing and installation are unfinished. This step alone does not
+activate a migration or certify transactional sink migration behavior.
 
 ## Errors and recovery
 

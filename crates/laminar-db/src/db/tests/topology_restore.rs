@@ -10,6 +10,9 @@ use laminar_core::checkpoint::{
 use laminar_core::checkpoint_decision::{CheckpointArtifactInventory, CheckpointVerdict};
 use std::collections::BTreeMap;
 
+#[path = "topology_retirement.rs"]
+mod retirement;
+
 async fn restorable_fixture() -> (
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,

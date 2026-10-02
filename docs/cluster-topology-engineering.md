@@ -18,8 +18,9 @@ No record can commit topology 2. Local additive candidate compilation and defini
 compatibility descriptors and durable participant certificates are implemented.
 Exact-cut state/progress root staging includes stateless downstream additions and sealed
 new-source initialization requirements. Private target restore preparation is
-implemented. Actor retirement, topology Commit, install/activation and release
-remain unfinished.
+implemented. Exact-root parent retirement now observes existing actor/connector
+owners while retaining the runtime and namespace fences. Topology Commit,
+install/activation and release remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -505,12 +506,43 @@ require measurement; no performance certification follows from those limits.
 | Recovery or authority changes after decoding | Reject the late image; no target receipt or activation |
 | Caller retains a successful image | Keep the compiler busy; future install must revalidate its authority |
 
+The private image can now drive `retire_cluster_topology_parent`. Its compiler
+guard identifies the originating DB without a second identity registry. Current
+root authority and the exact live parent are checked before retirement and after
+terminal observation. The existing stop path has one explicit topology-retirement
+authority: it retains `ShuttingDown`, the cut hold and the checkpoint namespace,
+rather than publishing `Created` or enabling a public restart. No authority format,
+phase, receipt, scheduler, dependency or per-record check changes.
+
+Retirement uses the existing lock order: startup ownership/state claim, topology
+write ownership, lifecycle mutex, watcher mutex, then the graph-rotation write
+fence. Synchronous guards do not cross awaits. The watcher stays in its DB mutex
+while joined; sources, sinks and connector children stay in their stable registries
+across cancellation. The existing stop code observes compute exit, retires vnode
+claims, waits for issued checkpoint decisions, reconciles the sink-open witness and
+observes all connector termination. A sink close result alone never grants success.
+Only after those checks and a fresh complete root authorization is the image's
+local retirement observation set. The target remains inactive and still owns the
+compiler permit. A future Commit/installer must revalidate this potentially stale
+observation; old shuffle transport remains process-owned and needs generation fencing.
+
+| Parent retirement failure | Result |
+| --- | --- |
+| Foreign image, lost intake hold or stale authority before stop | Reject without cancelling the parent runtime |
+| Compute, source/sink actor or connector child remains live | Deadline/cancellation retains the runtime boundary, namespace and unresolved owners |
+| Watcher panic or runtime/recovery fault | No retirement observation; recovery or terminal shutdown must take over |
+| Leader/process/assignment/recovery changes during stop | Keep the parent stopped and intake held; no readiness receipt or target authorization |
+| Retry with the same current image | Resume existing cleanup and revalidate the same root; no new catalog/root write |
+| Image is dropped after retirement | Free private target state and compiler slot; retain the runtime/cut/namespace fences |
+| Pre-commit abort followed by coordinated recovery | Existing recovery stop can take over the retired parent; resume T from its reconciled cut |
+
 1. Integrate candidate planning with a DB-owned migration worker and its existing
    manual checkpoint owner. The old-cut binding, capture and hold are implemented;
    detached submission/target-stage ownership remain unfinished.
 2. Drive the implemented exact-process certification path from detached submission;
    explicit local preparation is available, but automatic collection remains unfinished.
-3. Observe superseded actor retirement after the reconciled old checkpoint cut.
+3. Drive the implemented observed parent retirement from owned migration work
+   and bind participant-complete target readiness at the commit boundary.
 4. Drive the implemented private restore preparation from owned migration work,
    then atomically bind target catalog and root at the logical topology-change Commit.
 5. Restore/install the target before participant-complete release, with stale
@@ -539,5 +571,7 @@ legacy root bytes and the subsequent three-process cut/abort/full-restart oracle
 The [private restore evidence](test-evidence/topology-restore-2026-10-02/README.md)
 records exact root authorization, operator decoding, cursor availability and
 bounded-image ownership/cancellation checks.
+The [parent retirement evidence](test-evidence/topology-retirement-2026-10-02/README.md)
+records task/connector terminal observation and retained lifecycle/namespace fences.
 These results do not certify target migration
 or production latency.

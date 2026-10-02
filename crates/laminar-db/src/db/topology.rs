@@ -11,6 +11,7 @@ mod migration_root;
 mod planning;
 mod preparation;
 mod restore;
+mod retirement;
 pub use planning::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,

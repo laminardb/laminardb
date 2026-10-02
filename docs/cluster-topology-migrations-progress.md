@@ -562,6 +562,41 @@ selection remain unchanged.
   only isolated fixtures are removed. Exact commands and limits are in the
   [private restore evidence](test-evidence/topology-restore-2026-10-02/README.md).
 
+## Observed parent retirement, 2026-10-02
+
+- Continuation starts clean at `1430fe8cd251c2fcc227c1be303020eb99c15523`.
+  A prepared exact-root target can now retire its originating DB's held parent.
+  The existing compiler guard identifies that DB; no identity registry, workflow
+  framework, authority format, phase, receipt, scheduler or dependency is added.
+- Complete current root/old-cut/leader/process/assignment authorization and exact
+  local parent definitions are checked before signalling stop and after observing
+  terminal cleanup. The same production lifecycle joins compute, retires vnode
+  claims, settles decision/sink-open work and observes source/sink actors and all
+  tracked connector children. Cancellation and close requests alone do not count
+  as terminal proof. Watcher failures remain visible and cannot certify an image.
+- The total deadline is 45 seconds. Unresolved handles stay in their existing DB
+  owners across deadline/cancellation. Retry can continue cleanup using the same
+  current image. Retirement retains ShuttingDown, the intake/cut hold, checkpoint
+  namespace and historical parent catalog/coordinator identity. The private target
+  remains unstarted; dropping it frees the compiler but never reopens intake.
+- Public start/stop cannot release a held cut. Terminal shutdown and authorized
+  coordinated recovery retain their cleanup paths; recovery can take over after
+  pre-commit abort. The image's retirement flag is a local observation, not a durable
+  readiness receipt or output permit, and must be revalidated at the future commit
+  and installation boundary. Process-owned shuffle generation fencing, atomic
+  topology Commit, install/Release, detached ownership and public submission remain
+  unfinished. LDB-6043 remains; the runtime migration definition of done is unmet.
+- Validation results and commands are recorded in the
+  [parent retirement evidence](test-evidence/topology-retirement-2026-10-02/README.md).
+  All ten focused tests and the full 4,319-test suite pass: 1,044 core, 914 connector,
+  2,005 DB and 356 server. All-target Clippy with warnings denied, non-default server
+  and cluster/FFI checks, formatting and working/staged diff checks pass. Final source
+  hashes remain unchanged through validation. The production terminal wrappers,
+  process-fenced sink actor, connector child trackers and OS namespace lock are
+  exercised with a controlled watcher in the DB fixture. No broker or optimized
+  three-process scenario is rerun: those existing scenarios do not yet drive this
+  internal retirement API. Target migration/performance certification remains unfinished.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -569,11 +604,12 @@ selection remain unchanged.
    each local preparation API independently compiles and durably certifies it.
    The manual checkpoint path requires the full frozen roster before a new cut;
    no worker stages or commits a target.
-2. Drive the implemented private target restore preparation from owned migration
-   work, then atomically bind target catalog and migration root at topology Commit.
+2. Drive the implemented private restore and observed parent retirement from owned
+   migration work, with participant-complete target readiness/retirement receipts.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
-3. Observed actor retirement, install/release and post-commit recovery.
+3. Atomically bind target catalog and migration root at topology Commit; implement
+   target installation, generation fencing, Release and post-commit recovery.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
 5. Removal/replacement contracts, fault matrix and existing soak extensions.
@@ -598,6 +634,8 @@ are in `docs/test-evidence/topology-root-2026-10-01`; sealed source initializati
 and the latest stateful restart run are in
 `docs/test-evidence/topology-sources-2026-10-02`. Private target restore preparation
 and its checks are recorded in
-`docs/test-evidence/topology-restore-2026-10-02`. This is a resumable checkpoint
+`docs/test-evidence/topology-restore-2026-10-02`. Parent retirement and its checks
+are recorded in `docs/test-evidence/topology-retirement-2026-10-02`.
+This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

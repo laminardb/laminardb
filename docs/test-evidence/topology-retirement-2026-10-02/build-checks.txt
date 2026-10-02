@@ -1,0 +1,20 @@
+Command: cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings
+Exit: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 44.42s
+
+Command: cargo check --locked -p laminar-server --no-default-features
+Exit: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.40s
+
+Command: cargo check --locked -p laminar-db --no-default-features --features cluster,ffi
+Exit: 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.76s
+
+Command: cargo fmt --all -- --check
+Exit: 0
+
+Command: git -c core.excludesFile= diff --check
+Exit: 0
+
+Command: git -c core.excludesFile= diff --cached --check
+Exit: 0

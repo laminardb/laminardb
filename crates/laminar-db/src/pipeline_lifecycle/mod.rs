@@ -91,6 +91,8 @@ enum PipelineLifecycleAuthority {
     Public,
     #[cfg(feature = "cluster")]
     CoordinatedRecovery,
+    #[cfg(feature = "cluster")]
+    TopologyRetirement,
 }
 
 #[derive(Clone, Copy)]

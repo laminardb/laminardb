@@ -1,0 +1,44 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.47s
+     Running unittests src\lib.rs (target\debug\deps\laminar_connectors-d995ef82c5c9bcd6.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 915 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_core-9b1613879a5ff62e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1044 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_db-37560d7655ba525f.exe)
+
+running 10 tests
+test db::tests::topology_planning::restore::retirement::topology_retirement_local_recovery_and_fault_fences_cannot_be_overridden ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_rejects_stale_authority_before_stop ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_rejects_foreign_image_and_lost_local_hold_before_stop ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_process_lease_loss_during_cleanup_cannot_certify_the_image ... ok
+
+thread 'db::tests::topology_planning::restore::retirement::topology_retirement_runtime_panic_is_sticky_and_never_certifies_an_image' (215140) panicked at crates\laminar-db\src\db\tests\topology_retirement.rs:447:35:
+injected watcher failure
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test db::tests::topology_planning::restore::retirement::topology_retirement_runtime_panic_is_sticky_and_never_certifies_an_image ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_observes_compute_source_sink_and_connector_children ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_rechecks_authority_after_observing_the_old_runtime ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_cancellation_retains_runtime_owner_and_supports_retry ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_deadline_keeps_unobserved_work_fenced ... ok
+test db::tests::topology_planning::restore::retirement::topology_retirement_preserves_cut_catalog_namespace_and_unstarted_target ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1996 filtered out; finished in 0.26s
+
+     Running unittests src\bin\hash_test.rs (target\debug\deps\hash_test-d740050894734938.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\laminardb-572646521bf03734.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 356 filtered out; finished in 0.00s

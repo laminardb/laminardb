@@ -286,14 +286,25 @@ impl LaminarDB {
         authority: PipelineLifecycleAuthority,
         operation: &str,
     ) -> Result<(), DbError> {
-        if self
-            .coordinated_recovery_fenced
-            .load(std::sync::atomic::Ordering::Acquire)
-            && authority == PipelineLifecycleAuthority::Public
-        {
+        if authority != PipelineLifecycleAuthority::CoordinatedRecovery {
+            self.ensure_coordinated_recovery_mutation_unfenced(operation)?;
+        }
+        let topology_held = self
+            .topology_cut_hold
+            .load(std::sync::atomic::Ordering::Acquire);
+        if topology_held && authority == PipelineLifecycleAuthority::Public {
             return Err(DbError::InvalidOperation(format!(
-                "pipeline {operation} is fenced by coordinated recovery"
+                "pipeline {operation} is fenced by the held topology cut; use coordinated recovery to resume an aborted operation"
             )));
+        }
+        if authority == PipelineLifecycleAuthority::TopologyRetirement
+            && (!self.is_cluster_runtime()
+                || !topology_held
+                || !self.source_gate.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(DbError::InvalidOperation(
+                "topology retirement requires the held old-topology intake boundary".into(),
+            ));
         }
         Ok(())
     }
@@ -336,7 +347,15 @@ impl LaminarDB {
         &self,
         operation: &str,
     ) -> Result<(), DbError> {
-        self.ensure_pipeline_lifecycle_authorized(PipelineLifecycleAuthority::Public, operation)
+        if self
+            .coordinated_recovery_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "pipeline {operation} is fenced by coordinated recovery"
+            )));
+        }
+        Ok(())
     }
 
     /// Permanently withdraw this process's clustered data-plane authority after lease loss.

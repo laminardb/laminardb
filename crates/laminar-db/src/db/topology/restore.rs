@@ -39,12 +39,13 @@ pub enum PreparedTopologySourcePosition {
 pub struct PreparedTopologyRestore {
     pub(crate) candidate: LaminarDB,
     pub(crate) graph: crate::operator_graph::OperatorGraph,
-    input: TopologyRestoreInput,
+    pub(super) input: TopologyRestoreInput,
     recovered: crate::recovery_manager::RecoveredState,
     sources: BTreeMap<String, PreparedTopologySourcePosition>,
     restored_frames: usize,
+    pub(super) parent_retirement_observed: bool,
     // Declared last: the private graph/catalog are dropped before another compiler can run.
-    _compiler: tokio::sync::OwnedMutexGuard<()>,
+    compiler: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl std::fmt::Debug for PreparedTopologyRestore {
@@ -53,6 +54,10 @@ impl std::fmt::Debug for PreparedTopologyRestore {
             .field("operation", &self.input.operation().operation_id)
             .field("target_version", &self.target_version())
             .field("restored_frames", &self.restored_frames)
+            .field(
+                "parent_retirement_observed",
+                &self.parent_retirement_observed,
+            )
             .field("managed_state_bytes", &self.managed_state_bytes())
             .field(
                 "private_catalog_state",
@@ -63,6 +68,21 @@ impl std::fmt::Debug for PreparedTopologyRestore {
 }
 
 impl PreparedTopologyRestore {
+    /// Whether this image's parent actors were observed terminal after exact authority checks.
+    /// This is a local observation, not a durable readiness receipt or target output permit.
+    /// A future installer must revalidate current authority and the retired runtime boundary.
+    #[must_use]
+    pub const fn parent_retirement_observed(&self) -> bool {
+        self.parent_retirement_observed
+    }
+
+    pub(super) fn belongs_to(&self, db: &LaminarDB) -> bool {
+        Arc::ptr_eq(
+            tokio::sync::OwnedMutexGuard::mutex(&self.compiler),
+            &db.topology_validation_lock,
+        )
+    }
+
     /// Candidate version, still uncommitted and inactive.
     #[must_use]
     pub fn target_version(&self) -> TopologyVersion {
@@ -223,7 +243,8 @@ impl LaminarDB {
             recovered,
             sources,
             restored_frames,
-            _compiler: compiler,
+            parent_retirement_observed: false,
+            compiler,
         })
     }
 }

@@ -238,6 +238,14 @@ impl LaminarDB {
             .await
     }
 
+    /// Reuse terminal observation without releasing the namespace or publishing Created.
+    /// Only the exact-root preparation path calls this after authority validation.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn stop_pipeline_for_topology_retirement(&self) -> Result<(), DbError> {
+        self.stop_pipeline_with_lifecycle_authority(PipelineLifecycleAuthority::TopologyRetirement)
+            .await
+    }
+
     pub(super) async fn stop_pipeline_with_lifecycle_authority(
         &self,
         authority: PipelineLifecycleAuthority,
@@ -248,6 +256,8 @@ impl LaminarDB {
             PipelineLifecycleAuthority::CoordinatedRecovery => {
                 self.coordinated_recovery_stop_timeout()
             }
+            #[cfg(feature = "cluster")]
+            PipelineLifecycleAuthority::TopologyRetirement => std::time::Duration::from_secs(45),
         };
         let deadline = checked_pipeline_deadline(stop_timeout, "pipeline stop")?;
         let first_stop = loop {
@@ -262,6 +272,12 @@ impl LaminarDB {
                 } else {
                     match DbState::load(&self.state) {
                         DbState::Created | DbState::Stopped => {
+                            #[cfg(feature = "cluster")]
+                            if authority == PipelineLifecycleAuthority::TopologyRetirement {
+                                return Err(DbError::InvalidOperation(
+                                    "topology retirement lost the held parent runtime".into(),
+                                ));
+                            }
                             drop(owned);
                             return Ok(());
                         }
@@ -340,6 +356,14 @@ impl LaminarDB {
                 }
                 Ok(Err(e)) => {
                     runtime_handle.take();
+                    #[cfg(feature = "cluster")]
+                    if authority == PipelineLifecycleAuthority::TopologyRetirement {
+                        let reason = format!(
+                            "parent runtime watcher failed during topology retirement: {e}"
+                        );
+                        self.last_fault.lock().get_or_insert_with(|| reason.clone());
+                        return Err(DbError::Pipeline(reason));
+                    }
                     tracing::warn!(error = %e, "Pipeline task panicked during stop");
                 }
                 Err(_) => {
@@ -390,6 +414,13 @@ impl LaminarDB {
         self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
+        #[cfg(feature = "cluster")]
+        if authority == PipelineLifecycleAuthority::TopologyRetirement {
+            // Keep T's identity, exact cut, namespace and ShuttingDown fence until a future
+            // authorized target install or coordinated recovery takes ownership. Cancellation
+            // at any earlier await leaves all unresolved handles in their existing DB registries.
+            return Ok(());
+        }
         *self.checkpoint_namespace_lock.lock() = None;
         if self.is_closed() {
             // A concurrent shutdown owns the terminal transition. Leaving ShuttingDown in place
