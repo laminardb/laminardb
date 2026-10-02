@@ -430,10 +430,11 @@ authority append enforces artifact absence atomically with admission. Exact retr
 audits the original Abort append, so a settled admitted Abort cannot be relabeled
 as unused. Once admission or capture has begun, normal cluster Abort continues
 to require coordinated recovery.
-The record/batch push, operator execution, Arrow ownership and shuffle envelope
-paths are unchanged. There are no new per-row checks, serialization, locks or allocations.
-There is not yet a topology generation check at transport/install boundaries;
-that missing protection is a reason live migration remains disabled.
+Record push and Arrow batch ownership remain unchanged. Logical topology checks now
+run at graph/ownership/batch boundaries and the existing stream handshake; see the
+transport preparation checkpoint below. There are no new per-row checks,
+serialization, locks or allocations. Target actors and participant-complete Release
+remain required before live migration can be enabled.
 
 ## Adoption failure matrix
 
@@ -636,8 +637,9 @@ The committed inventory takes precedence during replay. Cold bootstrap accepts
 either the complete current inventory or the exact complete adopted bootstrap,
 whose preserved ordered prefix is certified by the additive Commit audit. Arbitrary
 subsets and changed definitions reject. No startup configuration can revert the
-committed catalog. Runtime installation/generation fencing and participant-complete
-Release must be implemented before ordinary startup or output can be enabled.
+committed catalog. Transport generation fencing is implemented below. Runtime
+installation and participant-complete Release must be implemented before ordinary
+startup or output can be enabled.
 
 | Boundary/failure | Result |
 | --- | --- |
@@ -651,6 +653,58 @@ Release must be implemented before ordinary startup or output can be enabled.
 These tests certify authority/private reconstruction only. Public submission,
 actor installation, Release and full multi-process target recovery remain unfinished.
 
+## Committed transport preparation, 2026-10-02
+
+`prepare_cluster_topology_transport(&mut image)` binds the retained private graph
+and both directions of the process-owned shuffle fabric to the exact committed
+logical version and catalog SHA-256. It accepts no caller-supplied Commit, authority
+or retirement flag. It reobserves parent actor termination, validates sealed cursors
+without resolving them again, holds the existing assignment-adoption and execution
+rotation locks, and audits the current complete process/assignment/adoption roster
+around publication. Its total cooperative budget is 45 seconds. Created recovery
+requires no runtime/connector owners; the retired parent retains its namespace.
+
+`ShuffleTopologyFence` is a small Copy identity, separate from assignment versions,
+recovery generations and serialization protocols. The existing assignment locks
+publish both endpoint bindings; the existing delivery mutex serializes the loss
+audit, pending admissions and sequence reset. Installation cancels old scope tokens,
+connections, blocked sends and handshake tokens. Old queued/staged data, frontiers
+and barriers are filtered before loss accounting. Unrepaired loss, expired process
+leases and inactive or mismatched assignments reject before either endpoint changes.
+Assignment changes and recovery retain the topology conflict floor; identical target
+retries preserve sequence continuity. No loss is forgiven by topology publication.
+
+Handshake request/response and leading Hello carry the exact version/digest pair.
+Zero version plus empty digest explicitly denotes the legacy fabric. Partial,
+malformed, divergent and legacy identities reject on a migrated fabric. The client
+checks the echoed pair, so a legacy binary that ignores new fields cannot open a
+migrated stream. Data/frontier/barrier payloads and Arrow schemas are unchanged.
+No catalog lookup, hash, serialization, new lock or allocation runs per row. Managed
+operators and the graph use cheap version atomics at existing batch/ownership
+boundaries; actual stream admission compares the full immutable digest. Retained
+asynchronous send plans capture the graph's fixed binding and cannot borrow the new
+identity from mutable process endpoints. Private binding updates operator transport
+configuration without reattaching operators or changing decoded state.
+
+This internal method performs no authority append, actor startup, local catalog or
+checkpoint-coordinator replacement, input acknowledgement or output release. The
+image remains private; intake/cut stay held and the operation remains Committed.
+Cancellation after local publication retains the target fence and hold; retry the
+same image or reconstruct from the immutable root. Reconstruction accepts only the
+authorized parent/target fabric (or empty Created fabric), never a divergent digest.
+The low-level endpoint method is trusted control-path infrastructure and supplies
+no readiness or Release permit. Protocol-4 preparation proves Commit support, not
+participant-complete installation capability; future Release must certify that
+capability and actual target state/receivers/sinks on every required current process.
+
+Real loopback gRPC tests cover stale traffic, sequence continuity, blocked sends,
+pending admissions and loss preservation. DB tests use the actual aggregate codecs,
+strict parent root, sealed source cursors, controlled watcher and OS namespace lock.
+Their direct private codec execution is not a target runtime/output test. The
+[transport evidence](test-evidence/topology-transport-2026-10-02/README.md) records
+validation and limits. Automatic recovery, actors, Release and the real multi-process
+migration/restart/performance oracle remain unfinished; LDB-6043 remains.
+
 ## Required next integration
 
 1. Integrate candidate planning with a DB-owned migration worker and its existing
@@ -663,8 +717,10 @@ actor installation, Release and full multi-process target recovery remain unfini
    exact process/assignment roster; receipts alone cannot grant target output.
 4. Drive the implemented atomic target Commit and private post-Commit root
    reconstruction from owned migration work; both remain internal library paths.
-5. Restore/install the target before participant-complete release, with stale
-   graph/shuffle/sink completion fences and target-only post-commit recovery.
+5. Drive the implemented exact-Commit transport preparation and install the runtime
+   catalog/coordinator, source and sink actors before participant-complete Release.
+   Certify current installation capabilities/readiness and fence stale sink completions;
+   graph/shuffle generation fences exist. Wire target-only post-Commit runtime recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.
@@ -698,5 +754,7 @@ retained receipt anchors.
 The [Commit and reconstruction evidence](test-evidence/topology-commit-2026-10-02/README.md)
 records the atomic catalog/root decision, retained Commit across failures and
 strict private reconstruction before a target checkpoint.
+The [transport preparation evidence](test-evidence/topology-transport-2026-10-02/README.md)
+records real gRPC generation changes and held exact-Commit DB preparation.
 These results do not certify target migration
 or production latency.

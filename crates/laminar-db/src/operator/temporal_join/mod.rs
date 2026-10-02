@@ -1098,6 +1098,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let sender_digest = config.sender.active_assignment_digest();
         let receiver_digest = config.receiver.active_assignment_digest();
@@ -4187,12 +4188,14 @@ impl ManagedTemporalJoinOperator {
             .outbound
             .take()
             .expect("idle temporal send plan must retain its outbound cut");
+        let topology = config.topology;
         let sender = Arc::clone(&config.sender);
         let wake = config.receiver.work_ready_notify();
         let context = format!("temporal join [{}] shuffle", self.name);
         pending.send = Some(tokio::spawn(async move {
             let result = crate::operator::send_shuffle_plan_retaining(
                 &sender,
+                topology,
                 assignment_version,
                 outbound,
                 &context,
@@ -4724,6 +4727,7 @@ impl ManagedTemporalJoinOperator {
                 self.name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
         let target_contains_self = assignment.owners().contains(&config.self_id);
@@ -5251,6 +5255,13 @@ impl ManagedTemporalJoinOperator {
 
 #[async_trait]
 impl GraphOperator for ManagedTemporalJoinOperator {
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(scope) = &mut self.cluster_shuffle {
+            scope.topology = Some(topology);
+        }
+    }
+
     fn cluster_capability(&self) -> OperatorCapability {
         OperatorCapability::managed_temporal_join()
     }

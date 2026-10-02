@@ -687,6 +687,53 @@ selection remain unchanged.
   drive these internal methods. Activated migration and performance certification
   remain unfinished.
 
+## Committed transport generation fencing, 2026-10-02
+
+- Continuation starts clean at `646fab31e19db2d24c5d3bfbcefa0175d7992e72`.
+  The next installation prerequisite now binds the process-owned shuffle endpoints
+  and private graph to the exact committed logical topology/catalog digest. It
+  extends existing assignment publication, scope cancellation, delivery tracking
+  and graph execution boundaries. No framework, scheduler, dependency, authority
+  format or preparation/root protocol change is introduced.
+- The existing delivery lock serializes pending admissions/loss reporting with
+  the topology audit/reset. Old connections, handshake tokens and blocked sends
+  cancel; old queued/staged data/frontiers/barriers drop before loss accounting.
+  Genuine unrepaired loss blocks installation without forgiveness. Conflicting
+  digests, downgrades, inactive/mismatched assignments and expired processes reject.
+  Assignment/recovery preserve the topology floor. Identical target retries retain
+  delivery sequence continuity and do not reset the domain.
+- Hello and the request/response handshake carry the exact version/digest pair.
+  Zero plus empty denotes legacy fabric, never inferred topology 1. Migrated
+  peers reject legacy, divergent and malformed identities; client echo checks
+  reject old binaries ignoring the fields. Data/control payloads and Arrow schemas
+  remain unchanged. Fixed graph bindings and retained async send plans reject
+  predecessor work at batch/ownership boundaries without per-row costs.
+- `prepare_cluster_topology_transport(&mut image)` reobserves actual actor retirement
+  and fresh complete Commit/process/assignment/adoption authorization, validates
+  sealed cursor availability, and holds existing assignment/execution ownership.
+  The total cooperative budget is 45 seconds. Created recovery requires empty
+  runtime/connector ownership. Cancellation after local publication retains the
+  target fence and hold; exact retry or root reconstruction resumes preparation.
+- Success leaves the operation Committed, private target unstarted, parent
+  ShuttingDown, catalog/coordinator unchanged and intake/cut/namespace held. No
+  acknowledgement, actor readiness or Release permit is produced. Protocol-4
+  preparation does not certify current target installation capability/readiness;
+  future participant-complete Release must obtain both. Runtime installation,
+  automatic target recovery and public migration remain unfinished. LDB-6043 remains.
+- Validation is recorded in the
+  [transport evidence](test-evidence/topology-transport-2026-10-02/README.md).
+  All 18 focused tests pass (11 core, seven DB). The selected-feature suite passes
+  4,373 tests: 1,078 core, 914 connectors, 2,025 DB and 356 server, with the same two
+  existing ignored tests. All-target Clippy with warnings denied, non-default server,
+  cluster/FFI, formatting and diff checks pass. All 30 changed Rust/protobuf source
+  hashes and Cargo.lock remain unchanged through final verification and staging.
+  Real loopback gRPC tests exercise topology changes under
+  unchanged process/assignment/recovery identities. DB tests use actual aggregate
+  codecs, sealed cursors, controlled watcher ownership and OS namespace locking.
+  Their private codec execution and Created reconstruction do not certify target
+  actors, output or multi-process target restart. No broker or optimized migration
+  performance scenario is rerun; the existing harness does not drive this internal method.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -699,8 +746,10 @@ selection remain unchanged.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
 3. Drive implemented atomic Commit/private reconstruction from owned migration work;
-   implement target installation, generation fencing, participant-complete Release
-   and automatic post-Commit runtime recovery. Ordinary startup stays fenced meanwhile.
+   drive exact-Commit transport preparation, install the runtime catalog/coordinator
+   and source/sink actors, fence stale sink completions, and certify current capabilities
+   and actual readiness for participant-complete Release. Graph/shuffle generation
+   fencing exists. Wire automatic post-Commit runtime recovery; ordinary startup stays held.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
 5. Removal/replacement contracts, fault matrix and existing soak extensions.
@@ -731,6 +780,8 @@ Durable target preparation observations and their checks are recorded in
 `docs/test-evidence/topology-target-preparation-2026-10-02`.
 Atomic Commit/private reconstruction checks are recorded in
 `docs/test-evidence/topology-commit-2026-10-02`.
+Committed transport preparation checks are recorded in
+`docs/test-evidence/topology-transport-2026-10-02`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

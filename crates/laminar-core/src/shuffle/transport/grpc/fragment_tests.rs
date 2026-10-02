@@ -22,6 +22,7 @@ fn received_envelope_retains_admission_through_consumer_fold() {
             stream_id: Uuid::from_u128(3),
             assignment_version: 4,
             assignment_certificate_digest: [4; 32],
+            topology: None,
             recovery_gen: 5,
         },
         assignment_digest: None,
@@ -60,6 +61,7 @@ fn batch_admission_releases_after_last_retaining_consumer() {
         receiver_incarnation: Uuid::from_u128(2),
         stream_id: Uuid::from_u128(3),
         assignment_version: 4,
+        topology: None,
         recovery_gen: 5,
         checkpoint_sequence: 0,
     };

@@ -168,6 +168,7 @@ async fn cluster_scope(owners: [u64; 8]) -> ClusterShuffleConfig {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id: NodeId(1),
     }
 }

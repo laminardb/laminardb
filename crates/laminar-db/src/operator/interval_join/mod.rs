@@ -1250,6 +1250,7 @@ impl IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let sender_digest = config.sender.active_assignment_digest();
         let receiver_digest = config.receiver.active_assignment_digest();
@@ -2717,6 +2718,7 @@ impl IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let requested_owner_bytes = assignment
             .owners()
@@ -4079,6 +4081,7 @@ impl IntervalJoinOperator {
             .outbound
             .take()
             .expect("idle interval send plan must retain its outbound cut");
+        let topology = config.topology;
         let sender = Arc::clone(&config.sender);
         let wake = config.receiver.work_ready_notify();
         let context = format!("interval join [{}] shuffle", self.projection.op_name);
@@ -4087,6 +4090,7 @@ impl IntervalJoinOperator {
         pending.send = Some(tokio::spawn(async move {
             let outcome = crate::operator::send_shuffle_plan_retaining(
                 &sender,
+                topology,
                 assignment_version,
                 outbound,
                 &context,
@@ -4491,6 +4495,13 @@ impl IntervalJoinOperator {
 
 #[async_trait]
 impl GraphOperator for IntervalJoinOperator {
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(scope) = &mut self.cluster_shuffle {
+            scope.topology = Some(topology);
+        }
+    }
+
     fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
         crate::operator::capability::OperatorCapability::bounded_interval_join()
     }
@@ -5462,6 +5473,7 @@ impl GraphOperator for IntervalJoinOperator {
                 self.projection.op_name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let allocation = |bytes: usize| {
             bytes

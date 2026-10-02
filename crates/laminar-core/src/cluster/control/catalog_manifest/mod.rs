@@ -163,7 +163,7 @@ pub struct CatalogManifestRef {
 }
 
 impl CatalogManifestRef {
-    pub(super) fn validate(&self) -> Result<(), CatalogManifestError> {
+    pub(crate) fn validate(&self) -> Result<(), CatalogManifestError> {
         if self.version != CATALOG_MANIFEST_FORMAT_VERSION {
             return Err(CatalogManifestError::Invalid(format!(
                 "unsupported catalog manifest version {}",

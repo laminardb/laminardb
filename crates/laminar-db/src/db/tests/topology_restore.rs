@@ -102,6 +102,7 @@ async fn restorable_fixture() -> (
                 registry,
                 sender,
                 receiver,
+                topology: None,
                 self_id: NodeId(1),
             },
         )

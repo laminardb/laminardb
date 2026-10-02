@@ -466,6 +466,11 @@ pub(crate) trait GraphOperator: Send {
         false
     }
 
+    /// Bind a privately restored operator's future transport to the exact target generation.
+    /// The graph invokes this only before execution, without rebuilding or changing saved state.
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, _topology: laminar_core::shuffle::ShuffleTopologyFence) {}
+
     /// Retain a peer-shipped shuffle batch as channel state outside the normal `process` path so
     /// the barrier-aligned row and its pending downstream emission enter the snapshot together.
     #[cfg(feature = "cluster")]
@@ -1075,6 +1080,10 @@ pub(crate) struct OperatorGraph {
     build_errors: Vec<DbError>,
     // Whole-graph restore is a one-shot startup transition and closes before the first cycle.
     whole_restore_open: bool,
+    // Decoding closes restore, but the private topology image may still bind its transport until
+    // an execution attempt is armed. Sticky even when the attempt later fails or is cancelled.
+    #[cfg(feature = "cluster")]
+    execution_started: bool,
     // Sticky for this in-memory graph generation. A dropped/panicking execution attempt may have
     // advanced operator state while losing graph-local inputs/results; only fresh restore is safe.
     execution_poisoned: Arc<AtomicBool>,
@@ -1175,6 +1184,8 @@ impl OperatorGraph {
             reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
             whole_restore_open: true,
+            #[cfg(feature = "cluster")]
+            execution_started: false,
             execution_poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1482,6 +1493,28 @@ impl OperatorGraph {
         &self,
     ) -> Option<&crate::operator::sql_query::ClusterShuffleConfig> {
         self.cluster_shuffle.as_ref()
+    }
+
+    /// Control-path handoff of a private image's transport binding; never a runtime/output permit.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn bind_cluster_topology_fence(
+        &mut self,
+        topology: laminar_core::shuffle::ShuffleTopologyFence,
+    ) -> Result<(), DbError> {
+        if self.whole_restore_open || self.execution_started || self.has_pending_vnode_transition()
+        {
+            return Err(DbError::Checkpoint(
+                "topology binding requires an unexecuted private restore image".into(),
+            ));
+        }
+        let scope = self.cluster_shuffle.as_mut().ok_or_else(|| {
+            DbError::Checkpoint("topology binding requires a cluster graph".into())
+        })?;
+        scope.topology = Some(topology);
+        for node in &mut self.nodes {
+            node.operator.bind_cluster_topology(topology);
+        }
+        Ok(())
     }
 
     /// Install node-local source progress for managed ordered peer-frontier channels.
@@ -3225,9 +3258,13 @@ impl OperatorGraph {
             )
         })?;
         let _rotation_guard = Arc::clone(rotation_fence).read_owned().await;
+        if let Some(scope) = &self.cluster_shuffle {
+            scope.ensure_topology_current()?;
+        }
 
         // Waiting for assignment publication has not touched operator state. Cancellation after
         // this point is indeterminate for the same reason as a normal graph cycle.
+        self.execution_started = true;
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         self.whole_restore_open = false;
         self.last_execution_assignment_version = None;
@@ -3314,8 +3351,16 @@ impl OperatorGraph {
             None => None,
         };
 
+        #[cfg(feature = "cluster")]
+        if let Some(scope) = &self.cluster_shuffle {
+            scope.ensure_topology_current()?;
+        }
         // Waiting for the cluster rotation fence has not admitted input or touched operator state.
         // Arm only after it is held so cancellation while ownership is rotating is not poisoned.
+        #[cfg(feature = "cluster")]
+        {
+            self.execution_started = true;
+        }
         let mut attempt = GraphExecutionAttemptGuard::new(self);
         let result = self
             .execute_cycle_attempt(source_batches, current_watermark, source_frontiers, mode)
@@ -3810,6 +3855,7 @@ impl OperatorGraph {
             ));
         }
         let current_assignment = cfg.registry.assignment_version();
+        cfg.ensure_topology_current()?;
         let current_recovery = cfg.receiver.recovery_gen();
         if received.peer() == cfg.self_id.0
             || received.stream_id().is_nil()
@@ -3819,6 +3865,7 @@ impl OperatorGraph {
             || received.assignment_version() != cfg.receiver.assignment_version()
             || received.recovery_gen() != current_recovery
             || received.recovery_gen() != cfg.sender.recovery_gen()
+            || received.topology_fence() != cfg.topology
         {
             return Err(DbError::Checkpoint(format!(
                 "shuffle frontier from peer {} is outside current assignment {current_assignment} recovery {current_recovery}",
@@ -4060,6 +4107,7 @@ impl OperatorGraph {
         recovery_gen: u64,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<(), DbError> {
+        cfg.ensure_topology_current()?;
         if !assignment_fence.is_canonical() || !assignment_fence.contains(cfg.self_id.0) {
             return Err(DbError::Pipeline(
                 "shuffle alignment has a non-canonical or incomplete assignment certificate".into(),
@@ -4823,6 +4871,7 @@ impl OperatorGraph {
         let mut staged_graph_state = false;
         let mut irreversible_dequeue = false;
         let alignment = tokio::time::timeout_at(deadline, async {
+            cfg.ensure_topology_current()?;
             if cfg.receiver.assignment_version() == 0 || cfg.sender.assignment_version() == 0 {
                 return Ok(ShuffleFlushWaveOutcome {
                     outcome: ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging,
@@ -4865,7 +4914,7 @@ impl OperatorGraph {
             };
             let fan_out = cfg
                 .sender
-                .fan_out_barrier(&peers, barrier, assignment_fence);
+                .fan_out_barrier_for_topology(&peers, barrier, assignment_fence, cfg.topology);
             tokio::pin!(fan_out);
             let (fan_out_complete, queued_work_pending) = match Self::gate_shuffle_barrier_fan_out(
                 &cfg,

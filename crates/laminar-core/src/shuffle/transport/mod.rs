@@ -5,6 +5,7 @@
 //! the HTTP/2 stream.
 
 use super::message::ShuffleMessage;
+use super::ShuffleTopologyFence;
 #[cfg(feature = "cluster")]
 use crate::checkpoint::CheckpointAttempt;
 
@@ -390,6 +391,7 @@ pub struct ReceivedBatch {
     stream_id: uuid::Uuid,
     assignment_version: u64,
     recovery_gen: u64,
+    topology: Option<ShuffleTopologyFence>,
     checkpoint_sequence: u64,
 }
 
@@ -462,6 +464,12 @@ impl ReceivedBatch {
         self.recovery_gen
     }
 
+    /// Exact logical topology bound by the handshake; absent only on the legacy fabric.
+    #[must_use]
+    pub const fn topology_fence(&self) -> Option<ShuffleTopologyFence> {
+        self.topology
+    }
+
     /// Zero-based logical-frame sequence for this data batch.
     #[must_use]
     pub const fn checkpoint_sequence(&self) -> u64 {
@@ -487,6 +495,7 @@ impl std::fmt::Debug for ReceivedBatch {
             .field("stream_id", &self.stream_id)
             .field("assignment_version", &self.assignment_version)
             .field("recovery_gen", &self.recovery_gen)
+            .field("topology", &self.topology)
             .field("checkpoint_sequence", &self.checkpoint_sequence)
             .field("admitted", &self.reservation.is_some())
             .finish()
@@ -506,6 +515,7 @@ pub struct ReceivedShuffle {
     assignment_version: u64,
     assignment_digest: Option<[u8; 32]>,
     recovery_gen: u64,
+    topology: Option<ShuffleTopologyFence>,
     checkpoint_sequence: u64,
 }
 
@@ -558,6 +568,12 @@ impl ReceivedShuffle {
         self.recovery_gen
     }
 
+    /// Exact logical topology bound by the handshake; absent only on the legacy fabric.
+    #[must_use]
+    pub const fn topology_fence(&self) -> Option<ShuffleTopologyFence> {
+        self.topology
+    }
+
     /// Data and frontiers carry their logical-frame sequence. A barrier carries the exclusive
     /// high-water sequence it closes.
     #[must_use]
@@ -580,6 +596,7 @@ impl std::fmt::Debug for ReceivedShuffle {
             .field("stream_id", &self.stream_id)
             .field("assignment_version", &self.assignment_version)
             .field("recovery_gen", &self.recovery_gen)
+            .field("topology", &self.topology)
             .field("checkpoint_sequence", &self.checkpoint_sequence)
             .field("admitted", &self.reservation.is_some())
             .finish_non_exhaustive()
@@ -639,6 +656,7 @@ fn take_frontier_prefix(
             && batch.stream_id == frontier.stream_id
             && batch.assignment_version == frontier.assignment_version
             && batch.recovery_gen == frontier.recovery_gen
+            && batch.topology == frontier.topology
             && batch.checkpoint_sequence < frontier.checkpoint_sequence
     });
     if !remaining.is_empty() {
@@ -659,12 +677,14 @@ struct InboundReservation;
 
 #[cfg(feature = "cluster")]
 mod grpc {
+    mod topology;
     use std::collections::hash_map::Entry;
     use std::collections::VecDeque;
     use std::io;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, OnceLock};
+    use topology::parse_topology_fence;
 
     use arrow_array::RecordBatch;
     use bytes::Bytes;
@@ -690,8 +710,8 @@ mod grpc {
         is_scope_cancelled, may_have_admitted_shuffle_frame, scope_cancelled_io,
         take_frontier_prefix, validate_checkpoint_barrier, validate_frontier, CheckpointAttempt,
         Holdover, InboundReservation, ReceivedBatch, ReceivedFrontierCut, ReceivedShuffle,
-        ShuffleMessage, ShufflePeerId, MAX_STAGE_NAME_BYTES, NONCANONICAL_BARRIER, SCOPE_CANCELLED,
-        SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
+        ShuffleMessage, ShufflePeerId, ShuffleTopologyFence, MAX_STAGE_NAME_BYTES,
+        NONCANONICAL_BARRIER, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -1063,6 +1083,7 @@ mod grpc {
                 assignment_version: self.fence.assignment_version,
                 assignment_digest: self.assignment_digest,
                 recovery_gen: self.fence.recovery_gen,
+                topology: self.fence.topology,
                 checkpoint_sequence: self.checkpoint_sequence,
             }
         }
@@ -1475,6 +1496,7 @@ mod grpc {
         assignment_version: u64,
         assignment_certificate_digest: [u8; 32],
         recovery_gen: u64,
+        topology: Option<ShuffleTopologyFence>,
     }
 
     /// Locally admitted assignment authority. The digest binds both the ordered owner map and
@@ -1482,6 +1504,7 @@ mod grpc {
     #[derive(Debug)]
     struct InstalledAssignment {
         fence: CheckpointAssignmentFence,
+        topology: Option<ShuffleTopologyFence>,
         digest: [u8; 32],
         owners: Arc<[ShufflePeerId]>,
     }
@@ -1499,6 +1522,7 @@ mod grpc {
                 && self.assignment.fence.assignment_version == fence.assignment_version
                 && self.assignment.digest == fence.assignment_certificate_digest
                 && self.recovery_gen == fence.recovery_gen
+                && self.assignment.topology == fence.topology
         }
     }
 
@@ -1521,6 +1545,7 @@ mod grpc {
             }
             Ok(Arc::new(Self {
                 digest: fence.digest(),
+                topology: None,
                 fence: fence.clone(),
                 owners: Arc::from(owners),
             }))
@@ -1533,6 +1558,7 @@ mod grpc {
         fn matches_stream_sender(&self, fence: &StreamFence) -> bool {
             self.fence.assignment_version == fence.assignment_version
                 && self.digest == fence.assignment_certificate_digest
+                && self.topology == fence.topology
                 && self.certifies(fence.sender_node_id, fence.sender_incarnation)
         }
 
@@ -1873,6 +1899,10 @@ mod grpc {
             assignment_version: fence.assignment_version,
             recovery_gen: fence.recovery_gen,
             assignment_certificate_digest: fence.assignment_certificate_digest.to_vec(),
+            topology_version: fence.topology.map_or(0, ShuffleTopologyFence::version),
+            topology_manifest_sha256: fence
+                .topology
+                .map_or_else(Vec::new, |t| t.manifest_sha256().to_vec()),
         }
     }
 
@@ -1893,6 +1923,10 @@ mod grpc {
                 "assignment certificate digest",
             )?,
             recovery_gen: hello.recovery_gen,
+            topology: parse_topology_fence(
+                hello.topology_version,
+                &hello.topology_manifest_sha256,
+            )?,
         })
     }
 
@@ -2044,6 +2078,7 @@ mod grpc {
         assignment_certificate_digest: [u8; 32],
         expected_receiver_incarnation: Uuid,
         recovery_gen: u64,
+        topology: Option<ShuffleTopologyFence>,
         current_assignment: Arc<AtomicU64>,
         current_recovery_gen: Arc<AtomicU64>,
         scope_cancel: CancellationToken,
@@ -2069,6 +2104,7 @@ mod grpc {
         assignment_suspended: AtomicBool,
         /// Stamped onto every outbound data message; bumped by a coordinated rewind.
         recovery_gen: Arc<AtomicU64>,
+        topology_version: Arc<AtomicU64>,
         /// Ordered data/frontier frames enqueued per peer. Lives here, not on `PeerConn`, so it
         /// survives a reconnect that discards a queue and leaves a detectable gap.
         seqs: Mutex<FxHashMap<ShufflePeerId, u64>>,
@@ -2112,6 +2148,7 @@ mod grpc {
                 process_lease: Arc::new(ProcessLeaseGate::default()),
                 assignment_suspended: AtomicBool::new(false),
                 recovery_gen: Arc::new(AtomicU64::new(0)),
+                topology_version: Arc::new(AtomicU64::new(0)),
                 seqs: Mutex::new(FxHashMap::default()),
                 checkpointed_control_node_budget: Arc::new(Semaphore::new(
                     CHECKPOINTED_CONTROL_NODE_BUDGET_BYTES,
@@ -2223,7 +2260,7 @@ mod grpc {
             fence: &CheckpointAssignmentFence,
             owners: &[ShufflePeerId],
         ) -> io::Result<bool> {
-            let next = InstalledAssignment::for_process(
+            let mut next = InstalledAssignment::for_process(
                 fence,
                 owners,
                 self.local_id,
@@ -2234,6 +2271,12 @@ mod grpc {
             let mut assignment = self.assignment.write();
             self.process_lease.require_live_io()?;
             if let Some(current) = assignment.as_ref() {
+                next = Arc::new(InstalledAssignment {
+                    fence: next.fence.clone(),
+                    digest: next.digest,
+                    owners: Arc::clone(&next.owners),
+                    topology: current.topology,
+                });
                 if next.fence.assignment_version < current.fence.assignment_version {
                     return Ok(false);
                 }
@@ -2411,7 +2454,7 @@ mod grpc {
         /// Returns `io::Error` when the peer is unregistered/undiscoverable, the
         /// endpoint cannot be built, or the per-peer stream has shut down.
         pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
-            self.send_to_inner(peer, msg, None, None).await
+            self.send_to_inner(peer, msg, None, None, None).await
         }
 
         /// Send only while the sender remains in `expected_assignment_version`.
@@ -2428,7 +2471,7 @@ mod grpc {
             expected_assignment_version: u64,
             msg: &ShuffleMessage,
         ) -> io::Result<()> {
-            self.send_to_inner(peer, msg, Some(expected_assignment_version), None)
+            self.send_to_inner(peer, msg, Some(expected_assignment_version), None, None)
                 .await
         }
 
@@ -2438,6 +2481,7 @@ mod grpc {
             msg: &ShuffleMessage,
             expected_assignment_version: Option<u64>,
             assignment_fence: Option<&CheckpointAssignmentFence>,
+            topology: Option<ShuffleTopologyFence>,
         ) -> io::Result<()> {
             if peer == 0 || peer == self.local_id {
                 return Err(io::Error::new(
@@ -2452,7 +2496,7 @@ mod grpc {
                     "shuffle checkpoint barriers require an admitted assignment certificate",
                 ));
             }
-            let scope = self.current_scope(expected_assignment_version)?;
+            let scope = self.current_scope(expected_assignment_version, topology)?;
             let conn = self.connection_for(peer, &scope).await?;
             let _send_guard = tokio::select! {
                 biased;
@@ -2644,7 +2688,11 @@ mod grpc {
             Ok(assignment)
         }
 
-        fn current_scope(&self, expected: Option<u64>) -> io::Result<ScopeLease> {
+        fn current_scope(
+            &self,
+            expected: Option<u64>,
+            topology: Option<ShuffleTopologyFence>,
+        ) -> io::Result<ScopeLease> {
             let assignment = self.assignment.read();
             let installed = assignment.as_ref().ok_or_else(|| {
                 io::Error::new(
@@ -2659,6 +2707,7 @@ mod grpc {
             if version == 0
                 || version != installed.fence.assignment_version
                 || cancel.is_cancelled()
+                || installed.topology != topology
             {
                 return Err(scope_cancelled_io());
             }
@@ -2725,7 +2774,10 @@ mod grpc {
                     "shuffle mesh does not match the installed assignment certificate",
                 ));
             }
-            let scope = self.current_scope(Some(assignment_fence.assignment_version))?;
+            let scope = self.current_scope(
+                Some(assignment_fence.assignment_version),
+                installed.topology,
+            )?;
             let results = futures::future::join_all(
                 assignment_fence
                     .participants
@@ -2766,8 +2818,23 @@ mod grpc {
             barrier: CheckpointBarrier,
             assignment_fence: &CheckpointAssignmentFence,
         ) -> io::Result<()> {
+            self.fan_out_barrier_for_topology(peers, barrier, assignment_fence, None)
+                .await
+        }
+
+        /// Fan out a barrier under an immutable graph topology binding.
+        /// # Errors
+        /// Rejects a different topology or any ordinary barrier/assignment/peer failure.
+        pub async fn fan_out_barrier_for_topology(
+            &self,
+            peers: &[ShufflePeerId],
+            barrier: CheckpointBarrier,
+            assignment_fence: &CheckpointAssignmentFence,
+            topology: Option<ShuffleTopologyFence>,
+        ) -> io::Result<()> {
             validate_checkpoint_barrier(barrier)?;
             let installed = self.current_assignment()?;
+            self.current_scope(Some(assignment_fence.assignment_version), topology)?;
             let expected_peers: Vec<_> = assignment_fence
                 .participants
                 .iter()
@@ -2806,6 +2873,7 @@ mod grpc {
                             msg,
                             Some(assignment_fence.assignment_version),
                             Some(assignment_fence),
+                            topology,
                         )
                         .await,
                     )
@@ -2874,6 +2942,7 @@ mod grpc {
                     && existing.fence.assignment_version == assignment_version
                     && existing.fence.assignment_certificate_digest == assignment.digest
                     && existing.fence.recovery_gen == recovery_gen
+                    && existing.fence.topology == assignment.topology
                 {
                     return Ok(existing);
                 }
@@ -2898,6 +2967,7 @@ mod grpc {
                     && existing.fence.assignment_version == assignment_version
                     && existing.fence.assignment_certificate_digest == assignment.digest
                     && existing.fence.recovery_gen == recovery_gen
+                    && existing.fence.topology == assignment.topology
                 {
                     return Ok(existing);
                 }
@@ -2945,6 +3015,7 @@ mod grpc {
                     sender_incarnation: self.sender_incarnation,
                     assignment_version,
                     assignment_certificate_digest: assignment.digest,
+                    topology: assignment.topology,
                     expected_receiver_incarnation,
                     recovery_gen,
                     current_assignment: Arc::clone(&self.assignment_version),
@@ -2975,7 +3046,7 @@ mod grpc {
             &self,
             peer: ShufflePeerId,
         ) -> io::Result<OwnedSemaphorePermit> {
-            let scope = self.current_scope(None)?;
+            let scope = self.current_scope(None, self.topology_fence())?;
             let conn = self.connection_for(peer, &scope).await?;
             Arc::clone(&conn.byte_budget)
                 .acquire_many_owned(
@@ -3003,6 +3074,8 @@ mod grpc {
                 assignment_version: call.assignment_version,
                 recovery_gen: call.recovery_gen,
                 assignment_certificate_digest: call.assignment_certificate_digest.to_vec(),
+                topology_version: call.topology.map_or(0, ShuffleTopologyFence::version),
+                topology_manifest_sha256: call.topology.map_or_else(Vec::new, |t| t.manifest_sha256().to_vec()),
             })) => response.map_err(status_io)?.into_inner(),
         };
         let receiver_incarnation = parse_uuid(
@@ -3018,6 +3091,12 @@ mod grpc {
             || response.assignment_certificate_digest.as_slice()
                 != call.assignment_certificate_digest.as_slice()
             || response.recovery_gen != call.recovery_gen
+            || parse_topology_fence(
+                response.topology_version,
+                &response.topology_manifest_sha256,
+            )
+            .map_err(io_err)?
+                != call.topology
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3032,6 +3111,7 @@ mod grpc {
             assignment_version: call.assignment_version,
             assignment_certificate_digest: call.assignment_certificate_digest,
             recovery_gen: call.recovery_gen,
+            topology: call.topology,
         })
     }
 
@@ -3199,6 +3279,7 @@ mod grpc {
         barrier_reconciled: AtomicU64,
         /// Inbound data frames stamped below this are pre-rewind and discarded.
         recovery_gen: Arc<AtomicU64>,
+        topology_version: Arc<AtomicU64>,
         recovery_transition: Mutex<()>,
         assignment: Arc<RwLock<Option<Arc<InstalledAssignment>>>>,
         assignment_version: Arc<AtomicU64>,
@@ -3254,6 +3335,7 @@ mod grpc {
             let work_ready = Arc::new(tokio::sync::Notify::new());
 
             let recovery_gen = Arc::new(AtomicU64::new(0));
+            let topology_version = Arc::new(AtomicU64::new(0));
             let assignment = Arc::new(RwLock::new(None));
             let assignment_version = Arc::new(AtomicU64::new(0));
             let scope_cancel = Arc::new(RwLock::new(cancelled_token()));
@@ -3276,6 +3358,7 @@ mod grpc {
                 tx,
                 work_ready: Arc::clone(&work_ready),
                 recovery_gen: Arc::clone(&recovery_gen),
+                topology_version: Arc::clone(&topology_version),
                 delivery: Arc::clone(&delivery),
                 barrier_arrivals: Arc::clone(&barrier_arrivals),
                 holdover: Arc::clone(&holdover),
@@ -3328,6 +3411,7 @@ mod grpc {
                 barrier_arrivals,
                 barrier_reconciled: AtomicU64::new(0),
                 recovery_gen,
+                topology_version,
                 recovery_transition: Mutex::new(()),
                 assignment,
                 assignment_version,
@@ -3376,7 +3460,7 @@ mod grpc {
             fence: &CheckpointAssignmentFence,
             owners: &[ShufflePeerId],
         ) -> io::Result<bool> {
-            let next = InstalledAssignment::for_process(
+            let mut next = InstalledAssignment::for_process(
                 fence,
                 owners,
                 self.local_id,
@@ -3385,6 +3469,12 @@ mod grpc {
             let mut assignment = self.assignment.write();
             self.process_lease.require_live_io()?;
             if let Some(current) = assignment.as_ref() {
+                next = Arc::new(InstalledAssignment {
+                    fence: next.fence.clone(),
+                    digest: next.digest,
+                    owners: Arc::clone(&next.owners),
+                    topology: current.topology,
+                });
                 if next.fence.assignment_version < current.fence.assignment_version {
                     return Ok(false);
                 }
@@ -3709,6 +3799,7 @@ mod grpc {
             receiver_incarnation: Uuid,
             assignment_version: u64,
             recovery_gen: u64,
+            topology: Option<ShuffleTopologyFence>,
         ) -> bool {
             if self.process_lease.require_live_io().is_err() {
                 return false;
@@ -3726,6 +3817,7 @@ mod grpc {
                 receiver_incarnation,
                 assignment_version,
                 recovery_gen,
+                topology,
             );
             if self.process_lease.require_live_io().is_err() {
                 return false;
@@ -3741,7 +3833,11 @@ mod grpc {
             receiver_incarnation: Uuid,
             assignment_version: u64,
             recovery_gen: u64,
+            topology: Option<ShuffleTopologyFence>,
         ) -> bool {
+            if topology != assignment.topology {
+                return false;
+            }
             let current_recovery = self.recovery_gen.load(Ordering::Acquire);
             if receiver_incarnation != self.receiver_incarnation {
                 self.delivery
@@ -3765,6 +3861,7 @@ mod grpc {
                     receiver_incarnation,
                     assignment_version,
                     recovery_gen,
+                    topology,
                 );
             if !current {
                 self.delivery.note_loss(peer, 1, "queued-stream-scope");
@@ -3786,6 +3883,7 @@ mod grpc {
                     received.receiver_incarnation,
                     received.assignment_version,
                     received.recovery_gen,
+                    received.topology,
                 ),
             }
         }
@@ -3797,6 +3895,7 @@ mod grpc {
                 received.receiver_incarnation,
                 received.assignment_version,
                 received.recovery_gen,
+                received.topology,
             )
         }
 
@@ -3813,6 +3912,7 @@ mod grpc {
                 frontier.receiver_incarnation,
                 frontier.assignment_version,
                 frontier.recovery_gen,
+                frontier.topology,
             ) && self.process_lease.require_live_io().is_ok();
             if current {
                 self.holdover.stage_frontier(cut);
@@ -3947,6 +4047,7 @@ mod grpc {
                     assignment_version,
                     assignment_digest,
                     recovery_gen,
+                    topology,
                     checkpoint_sequence,
                 } = received;
                 match message {
@@ -3965,6 +4066,7 @@ mod grpc {
                             stream_id,
                             assignment_version,
                             recovery_gen,
+                            topology,
                             checkpoint_sequence,
                         });
                     }
@@ -3987,6 +4089,7 @@ mod grpc {
                             assignment_version,
                             assignment_digest,
                             recovery_gen,
+                            topology,
                             checkpoint_sequence,
                         };
                         let preceding = take_frontier_prefix(staged, &stage, &frontier);
@@ -4011,6 +4114,7 @@ mod grpc {
                             assignment_version,
                             assignment_digest,
                             recovery_gen,
+                            topology,
                             checkpoint_sequence,
                         };
                         match self.holdover.stage_barrier(barrier) {
@@ -4173,6 +4277,7 @@ mod grpc {
                             batch.receiver_incarnation,
                             batch.assignment_version,
                             batch.recovery_gen,
+                            batch.topology,
                         );
                         current.then(|| (stage.clone(), batch))
                     })
@@ -4320,9 +4425,28 @@ mod grpc {
         recovered_delivery_loss_incidents: Arc<AtomicU64>,
         pending_recovery: Mutex<Option<(u64, u64)>>,
         completed_recovery_gen: AtomicU64,
+        topology_version: AtomicU64,
     }
 
     impl DeliveryTracker {
+        // The publisher holds peers from the loss-fence audit through scope publication. Late
+        // predecessor admissions therefore cannot race that audit or fault the target domain.
+        fn reset_topology(
+            &self,
+            target: ShuffleTopologyFence,
+            peers: &mut FxHashMap<ShufflePeerId, PeerSeq>,
+        ) {
+            self.topology_version
+                .store(target.version(), Ordering::Release);
+            peers.clear();
+            self.ingress.lock().clear();
+        }
+
+        fn topology_is_current(&self, fence: &StreamFence) -> bool {
+            fence.topology.map_or(0, ShuffleTopologyFence::version)
+                == self.topology_version.load(Ordering::Acquire)
+        }
+
         fn reset_assignment(&self) {
             self.peers.lock().clear();
             self.ingress.lock().clear();
@@ -4383,6 +4507,9 @@ mod grpc {
         /// only after assignment or recovery advances and opens a fresh zero-based domain.
         fn observe_hello(&self, fence: StreamFence) -> Result<(), tonic::Status> {
             let mut peers = self.peers.lock();
+            if !self.topology_is_current(&fence) {
+                return Err(scope_cancelled_status());
+            }
             match peers.entry(fence.sender_node_id) {
                 Entry::Vacant(entry) => {
                     entry.insert(PeerSeq { fence, expected: 0 });
@@ -4395,7 +4522,8 @@ mod grpc {
                         && state.fence.receiver_incarnation == fence.receiver_incarnation
                         && state.fence.assignment_version == fence.assignment_version
                         && state.fence.assignment_certificate_digest
-                            == fence.assignment_certificate_digest;
+                            == fence.assignment_certificate_digest
+                        && state.fence.topology == fence.topology;
                     let expected = if same_process_assignment
                         && state.fence.recovery_gen == fence.recovery_gen
                     {
@@ -4405,6 +4533,10 @@ mod grpc {
                         // The atomic scope check in `admit_stream` proves this is the receiver's
                         // current assignment; retaining the old map entry avoids a clear/add race.
                         0
+                    } else if state.fence.topology != fence.topology {
+                        return Err(tonic::Status::failed_precondition(
+                            "shuffle topology changed without local installation",
+                        ));
                     } else if state.fence.assignment_version == fence.assignment_version
                         && fence.recovery_gen > state.fence.recovery_gen
                     {
@@ -4424,13 +4556,15 @@ mod grpc {
 
         fn validate_stream(&self, fence: &StreamFence) -> Result<(), tonic::Status> {
             let peers = self.peers.lock();
+            if !self.topology_is_current(fence) {
+                return Err(scope_cancelled_status());
+            }
             if peers
                 .get(&fence.sender_node_id)
                 .is_some_and(|state| state.fence == *fence)
             {
                 Ok(())
             } else {
-                drop(peers);
                 self.note_loss(fence.sender_node_id, 1, "stale-stream");
                 Err(tonic::Status::failed_precondition(
                     "shuffle stream identity was superseded",
@@ -4448,12 +4582,14 @@ mod grpc {
             receiver_incarnation: Uuid,
             assignment_version: u64,
             recovery_gen: u64,
+            topology: Option<ShuffleTopologyFence>,
         ) -> bool {
             self.peers.lock().get(&peer).is_some_and(|state| {
                 state.fence.sender_incarnation == sender_incarnation
                     && state.fence.receiver_incarnation == receiver_incarnation
                     && state.fence.assignment_version == assignment_version
                     && state.fence.recovery_gen == recovery_gen
+                    && state.fence.topology == topology
             })
         }
 
@@ -4485,21 +4621,22 @@ mod grpc {
             fence: &StreamFence,
             seq: u64,
         ) -> Result<Option<DataReservation>, tonic::Status> {
+            let peers = self.peers.lock();
+            if !self.topology_is_current(fence) {
+                return Err(scope_cancelled_status());
+            }
             if seq == u64::MAX {
                 return Err(
                     self.reject_protocol(fence.sender_node_id, "shuffle sequence exhausted")
                 );
             }
-            let peers = self.peers.lock();
             let Some(state) = peers.get(&fence.sender_node_id) else {
-                drop(peers);
                 return Err(self.reject_protocol(
                     fence.sender_node_id,
                     "shuffle data arrived before its exact Hello",
                 ));
             };
             if state.fence != *fence {
-                drop(peers);
                 return Err(self.reject_protocol(
                     fence.sender_node_id,
                     "shuffle data stream identity was superseded",
@@ -4517,22 +4654,23 @@ mod grpc {
 
         /// Commit only after every decoded/sliced batch has entered the consumer queue.
         fn commit_data(&self, reservation: DataReservation) -> Result<(), tonic::Status> {
+            let mut peers = self.peers.lock();
+            if !self.topology_is_current(&reservation.fence) {
+                return Err(scope_cancelled_status());
+            }
             let next = reservation.seq.checked_add(1).ok_or_else(|| {
                 self.reject_protocol(
                     reservation.fence.sender_node_id,
                     "shuffle sequence exhausted",
                 )
             })?;
-            let mut peers = self.peers.lock();
             let Some(state) = peers.get_mut(&reservation.fence.sender_node_id) else {
-                drop(peers);
                 return Err(self.reject_protocol(
                     reservation.fence.sender_node_id,
                     "shuffle delivery state disappeared before commit",
                 ));
             };
             if state.fence != reservation.fence || state.expected != reservation.expected {
-                drop(peers);
                 return Err(self.reject_protocol(
                     reservation.fence.sender_node_id,
                     "shuffle delivery scope changed before commit",
@@ -4540,7 +4678,6 @@ mod grpc {
             }
             state.expected = next;
             let missing = reservation.seq - reservation.expected;
-            drop(peers);
             if missing > 0 {
                 self.note_loss(reservation.fence.sender_node_id, missing, "data");
             }
@@ -4551,6 +4688,9 @@ mod grpc {
         /// logical frame prevents its successor from counting the same hole a second time.
         fn abort_data(&self, reservation: DataReservation) {
             let mut peers = self.peers.lock();
+            if !self.topology_is_current(&reservation.fence) {
+                return;
+            }
             let Some(state) = peers.get_mut(&reservation.fence.sender_node_id) else {
                 return;
             };
@@ -4558,7 +4698,6 @@ mod grpc {
                 return;
             }
             let Some(next) = reservation.seq.checked_add(1) else {
-                drop(peers);
                 self.note_loss(
                     reservation.fence.sender_node_id,
                     1,
@@ -4568,7 +4707,6 @@ mod grpc {
             };
             state.expected = next;
             let missing = reservation.seq - reservation.expected + 1;
-            drop(peers);
             self.note_loss(reservation.fence.sender_node_id, missing, "data-admission");
         }
 
@@ -4580,22 +4718,22 @@ mod grpc {
             last_seq: u64,
         ) -> Result<BarrierReservation, tonic::Status> {
             let peers = self.peers.lock();
+            if !self.topology_is_current(fence) {
+                return Err(scope_cancelled_status());
+            }
             let Some(state) = peers.get(&fence.sender_node_id) else {
-                drop(peers);
                 return Err(self.reject_protocol(
                     fence.sender_node_id,
                     "shuffle barrier arrived before its exact Hello",
                 ));
             };
             if state.fence != *fence {
-                drop(peers);
                 return Err(self.reject_protocol(
                     fence.sender_node_id,
                     "shuffle barrier stream identity was superseded",
                 ));
             }
             if last_seq < state.expected {
-                drop(peers);
                 return Err(self.reject_protocol(
                     fence.sender_node_id,
                     "shuffle barrier high-water moved backwards",
@@ -4610,15 +4748,16 @@ mod grpc {
 
         fn commit_barrier(&self, reservation: BarrierReservation) -> Result<(), tonic::Status> {
             let mut peers = self.peers.lock();
+            if !self.topology_is_current(&reservation.fence) {
+                return Err(scope_cancelled_status());
+            }
             let Some(state) = peers.get_mut(&reservation.fence.sender_node_id) else {
-                drop(peers);
                 return Err(self.reject_protocol(
                     reservation.fence.sender_node_id,
                     "shuffle barrier state disappeared before commit",
                 ));
             };
             if state.fence != reservation.fence || state.expected != reservation.expected {
-                drop(peers);
                 return Err(self.reject_protocol(
                     reservation.fence.sender_node_id,
                     "shuffle barrier scope changed before commit",
@@ -4626,7 +4765,6 @@ mod grpc {
             }
             state.expected = reservation.last_seq;
             let missing = reservation.last_seq - reservation.expected;
-            drop(peers);
             if missing > 0 {
                 self.note_loss(reservation.fence.sender_node_id, missing, "barrier");
             }
@@ -4647,6 +4785,7 @@ mod grpc {
         tx: InboundTx,
         work_ready: Arc<tokio::sync::Notify>,
         recovery_gen: Arc<AtomicU64>,
+        topology_version: Arc<AtomicU64>,
         delivery: Arc<DeliveryTracker>,
         barrier_arrivals: Arc<AtomicU64>,
         holdover: Arc<Holdover>,
@@ -4708,6 +4847,16 @@ mod grpc {
                 &self.scope_cancel,
                 &self.process_lease,
             )?;
+            if request.topology_version != self.topology_version.load(Ordering::Acquire)
+                || parse_topology_fence(
+                    request.topology_version,
+                    &request.topology_manifest_sha256,
+                )? != scope.assignment.topology
+            {
+                return Err(tonic::Status::failed_precondition(
+                    "shuffle peers do not share the exact topology",
+                ));
+            }
             if request.recovery_gen != scope.recovery_gen {
                 return Err(tonic::Status::failed_precondition(
                     "shuffle peers do not share a recovery generation",
@@ -4731,6 +4880,7 @@ mod grpc {
                 assignment_version: scope.assignment.fence.assignment_version,
                 assignment_certificate_digest: scope.assignment.digest,
                 recovery_gen: scope.recovery_gen,
+                topology: scope.assignment.topology,
             };
             let now = std::time::Instant::now();
             let mut pending = self.pending_handshakes.0.lock();
@@ -4769,6 +4919,14 @@ mod grpc {
                 assignment_version: scope.assignment.fence.assignment_version,
                 recovery_gen: scope.recovery_gen,
                 assignment_certificate_digest: scope.assignment.digest.to_vec(),
+                topology_version: scope
+                    .assignment
+                    .topology
+                    .map_or(0, ShuffleTopologyFence::version),
+                topology_manifest_sha256: scope
+                    .assignment
+                    .topology
+                    .map_or_else(Vec::new, |t| t.manifest_sha256().to_vec()),
             }))
         }
 
@@ -4914,6 +5072,10 @@ mod grpc {
         fence: &StreamFence,
         reason: &str,
     ) -> tonic::Status {
+        let _peers = delivery.peers.lock();
+        if !delivery.topology_is_current(fence) {
+            return scope_cancelled_status();
+        }
         delivery.reject_protocol(fence.sender_node_id, reason)
     }
 
@@ -5791,6 +5953,7 @@ mod shim {
                         assignment_version,
                         assignment_digest: _,
                         recovery_gen,
+                        topology,
                         checkpoint_sequence,
                     } = received;
                     match message {
@@ -5809,6 +5972,7 @@ mod shim {
                                 stream_id,
                                 assignment_version,
                                 recovery_gen,
+                                topology,
                                 checkpoint_sequence,
                             });
                         }
@@ -5831,6 +5995,7 @@ mod shim {
                                 assignment_version,
                                 assignment_digest: None,
                                 recovery_gen,
+                                topology,
                                 checkpoint_sequence,
                             };
                             let preceding = take_frontier_prefix(staged, &stage, &frontier);
@@ -5851,6 +6016,7 @@ mod shim {
                                 assignment_version,
                                 assignment_digest: None,
                                 recovery_gen,
+                                topology,
                                 checkpoint_sequence,
                             };
                             match self.holdover.stage_barrier(barrier) {

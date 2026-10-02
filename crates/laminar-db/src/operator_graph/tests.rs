@@ -1278,6 +1278,7 @@ async fn alignment_harness() -> AlignmentHarness {
         registry,
         sender: Arc::new(local_sender),
         receiver: Arc::clone(&local_receiver),
+        topology: None,
         self_id: NodeId(1),
     });
     AlignmentHarness {
@@ -1825,6 +1826,7 @@ async fn three_node_alignment_harness() -> ThreeNodeAlignmentHarness {
         registry,
         sender: Arc::new(local_sender),
         receiver: Arc::clone(&local_receiver),
+        topology: None,
         self_id: NodeId(1),
     });
 

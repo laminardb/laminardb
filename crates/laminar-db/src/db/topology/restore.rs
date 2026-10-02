@@ -223,12 +223,31 @@ impl LaminarDB {
                     ).into());
                 }
                 bind_preserved_subscriptions(&candidate, &input)?;
-                let scope = crate::operator::sql_query::ClusterShuffleConfig {
+                let mut scope = crate::operator::sql_query::ClusterShuffleConfig {
                     registry: self.vnode_registry.lock().clone().ok_or(TopologyError::Fenced)?,
                     sender: self.shuffle_sender.lock().clone().ok_or(TopologyError::Fenced)?,
                     receiver: self.shuffle_receiver.lock().clone().ok_or(TopologyError::Fenced)?,
+                    topology: None,
                     self_id: laminar_core::state::NodeId(input.process().participant.node_id),
                 };
+                scope.topology = scope.sender.topology_fence();
+                scope.ensure_topology_current()?;
+                let parent_topology = if input.plan().expected_parent == TopologyVersion::LEGACY_BASELINE {
+                    None
+                } else {
+                    Some(laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
+                        input.plan().expected_parent, &input.plan().parent_manifest,
+                    ).map_err(|error| TopologyError::Invalid(error.to_string()))?)
+                };
+                let target_topology = laminar_core::shuffle::ShuffleTopologyFence::from_manifest(
+                    input.descriptor().target_version, &input.plan().target_manifest,
+                ).map_err(|error| TopologyError::Invalid(error.to_string()))?;
+                if scope.receiver.topology_fence() != scope.topology
+                    || (scope.topology != parent_topology
+                        && !(committed && (scope.topology == Some(target_topology)
+                            || (super::DbState::load(&self.state) == super::DbState::Created && scope.topology.is_none())))) {
+                    return Err(TopologyError::Fenced.into());
+                }
                 let assignment = scope.registry.versioned_snapshot();
                 let owner_ids = assignment.owners().iter().map(|owner| owner.0).collect::<Vec<_>>();
                 if assignment.version() != input.assignment().assignment_version

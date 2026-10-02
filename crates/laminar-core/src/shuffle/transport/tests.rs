@@ -10,6 +10,9 @@ use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier, Checkpoint
 use crate::cluster::control::LeaseDeadline;
 use uuid::Uuid;
 
+#[path = "topology_tests.rs"]
+mod topology_transport;
+
 fn assignment_owners(nodes: &[ShufflePeerId]) -> Vec<ShufflePeerId> {
     let mut participants = nodes.to_vec();
     participants.sort_unstable();
@@ -217,6 +220,8 @@ async fn receiver_process_lease_expiry_rejects_handshake_without_assignment_inva
             stream_id: stream_id.as_bytes().to_vec(),
             assignment_version: fence.assignment_version,
             recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -994,6 +999,7 @@ fn frontier_prefix_does_not_cross_a_reconnected_stream() {
             receiver_incarnation,
             stream_id: Uuid::from_u128(10),
             assignment_version: 1,
+            topology: None,
             recovery_gen: 0,
             checkpoint_sequence: 0,
         }],
@@ -1011,6 +1017,7 @@ fn frontier_prefix_does_not_cross_a_reconnected_stream() {
         stream_id: Uuid::from_u128(11),
         assignment_version: 1,
         assignment_digest: None,
+        topology: None,
         recovery_gen: 0,
         checkpoint_sequence: 1,
     };
@@ -1041,6 +1048,8 @@ async fn inbound_wire_rejects_noncanonical_barrier_before_publication() {
             stream_id: stream_id.as_bytes().to_vec(),
             assignment_version: fence.assignment_version,
             recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -1054,6 +1063,8 @@ async fn inbound_wire_rejects_noncanonical_barrier_before_publication() {
             stream_id: stream_id.as_bytes().to_vec(),
             assignment_version: fence.assignment_version,
             recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         })),
     };
@@ -1111,6 +1122,8 @@ async fn uncertified_network_handshakes_are_rejected_without_reporting_data_loss
             stream_id: stream_id.as_bytes().to_vec(),
             assignment_version: fence.assignment_version,
             recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
             assignment_certificate_digest: fence.digest().to_vec(),
         }))
         .await
@@ -1125,6 +1138,8 @@ async fn uncertified_network_handshakes_are_rejected_without_reporting_data_loss
             stream_id: stream_id.as_bytes().to_vec(),
             assignment_version: fence.assignment_version,
             recovery_gen: 0,
+            topology_version: 0,
+            topology_manifest_sha256: Vec::new(),
             assignment_certificate_digest: [9; 32].to_vec(),
         }))
         .await

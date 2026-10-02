@@ -434,6 +434,30 @@ under the target identity and rejects until target installation/Release is wired
 This internal checkpoint does not provide an operationally complete migration,
 public submission, activated target or automatic full-cluster recovery.
 
+## Prepare committed transport internally
+
+`LaminarDB::prepare_cluster_topology_transport(&mut image)` reobserves parent
+retirement and current complete authority/assignment/adoption, then binds both
+process shuffle endpoints and the private graph to the committed logical version
+and exact catalog digest. It validates sealed cursors without resolving `latest`
+again. A Created DB must have no runtime/connector owners. The total cooperative
+budget is 45 seconds; unresolved actors, delivery loss, process expiry and conflicting
+endpoint identities keep installation held.
+
+Old streams, blocked sends and handshake tokens are cancelled. Old queued/staged
+data and controls cannot enter the target graph. Migrated peers must negotiate the
+same nonzero version/digest pair. Legacy handshakes are accepted only by a legacy
+fabric; mixed binaries cannot open migrated streams. Assignment/recovery changes
+retain the binding. Repeating the same installation preserves delivery sequences.
+
+This method leaves the operation Committed, target image private, catalog/coordinator
+unchanged and source/sink actors unstarted. Intake/cut and the parent's namespace
+stay held. Cancellation after local publication retains the target binding; retry
+the same image or reconstruct from the immutable Commit. No manual gate opening,
+parent restart or output permission follows from success. Runtime installation and
+participant-complete Release, including current installation capability and actual
+receiver/state/sink readiness, remain unfinished. LDB-6043 remains.
+
 ## Errors and recovery
 
 | Code | Meaning and response |
@@ -456,5 +480,5 @@ and recover the original artifacts from the deployment's storage procedures.
 No target cutover-pause duration or migration activation can be certified in
 this increment. See the [engineering checkpoint](cluster-topology-engineering.md)
 and [remaining work](cluster-topology-migrations-progress.md). The
-[Commit evidence](test-evidence/topology-commit-2026-10-02/README.md) records the
-tested internal authority/private reconstruction scope and its limits.
+[transport evidence](test-evidence/topology-transport-2026-10-02/README.md) records
+real loopback gRPC and internal exact-Commit preparation checks and their limits.

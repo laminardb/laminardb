@@ -176,6 +176,7 @@ pub(crate) fn shuffle_send_error(
 #[cfg(feature = "cluster")]
 pub(crate) async fn send_shuffle_plan_retaining(
     sender: &laminar_core::shuffle::ShuffleSender,
+    topology: Option<laminar_core::shuffle::ShuffleTopologyFence>,
     assignment_version: u64,
     outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)>,
     context: &str,
@@ -203,7 +204,7 @@ pub(crate) async fn send_shuffle_plan_retaining(
             let mut messages = messages.into_iter();
             while let Some((index, message)) = messages.next() {
                 match sender
-                    .send_to_for_assignment(peer, assignment_version, &message)
+                    .send_to_for_topology(peer, assignment_version, topology, &message)
                     .await
                 {
                     Ok(()) => admitted_any = true,
@@ -583,7 +584,7 @@ mod shuffle_tests {
             (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(2))),
         ];
         let (result, retry_plan) =
-            send_shuffle_plan_retaining(&sender, 1, outbound.clone(), "test shuffle").await;
+            send_shuffle_plan_retaining(&sender, None, 1, outbound.clone(), "test shuffle").await;
         let error = result.unwrap_err();
 
         assert!(matches!(error, DbError::ShuffleNotReady(_)));
@@ -595,6 +596,7 @@ mod shuffle_tests {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
         let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
+            None,
             1,
             vec![
                 (3, ShuffleMessage::checkpointed("stage".into(), 2, batch(1))),
@@ -614,6 +616,7 @@ mod shuffle_tests {
         let (sender, receiver) = sender_with_reachable_peer_two().await;
         let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
+            None,
             1,
             vec![
                 (3, ShuffleMessage::checkpointed("right".into(), 2, batch(2))),
@@ -652,6 +655,7 @@ mod shuffle_tests {
         let (sender, _receiver) = sender_with_reachable_peer_two().await;
         let (result, retry_plan) = send_shuffle_plan_retaining(
             &sender,
+            None,
             1,
             vec![(1, ShuffleMessage::checkpointed("stage".into(), 0, batch(1)))],
             "test shuffle",

@@ -729,6 +729,7 @@ async fn complete_audited_vnode_revocation(final_owner_exit: bool) {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -1200,6 +1201,7 @@ async fn assignment_acquisition_stages_committed_vnode_for_graph_publication() {
         registry: Arc::clone(&registry),
         sender: Arc::clone(&sender),
         receiver: Arc::clone(&receiver),
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity.clone());
@@ -3738,6 +3740,7 @@ async fn replacement_process_stages_and_publishes_zero_owner_topology() {
         registry,
         sender,
         receiver,
+        topology: None,
         self_id,
     });
     graph.set_pipeline_identity(identity);

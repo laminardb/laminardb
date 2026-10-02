@@ -4,6 +4,9 @@ use super::*;
 use futures::FutureExt;
 use laminar_core::cluster::control::TopologyAdmissionPhase;
 
+#[path = "topology_transport.rs"]
+mod topology_transport;
+
 async fn committed_fixture() -> (
     Fixture,
     laminar_core::cluster::control::TopologyAdmissionStatus,

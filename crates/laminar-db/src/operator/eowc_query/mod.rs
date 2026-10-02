@@ -876,6 +876,7 @@ impl EowcQueryOperator {
                 self.op_name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let sender_digest = config.sender.active_assignment_digest();
         let receiver_digest = config.receiver.active_assignment_digest();
@@ -1548,12 +1549,14 @@ impl EowcQueryOperator {
             .outbound
             .take()
             .expect("idle CoreWindow send plan must retain its outbound cut");
+        let topology = config.topology;
         let sender = Arc::clone(&config.sender);
         let wake = config.receiver.work_ready_notify();
         let context = format!("managed CoreWindow '{}' shuffle", self.op_name);
         pending.send = Some(tokio::spawn(async move {
             let result = crate::operator::send_shuffle_plan_retaining(
                 &sender,
+                topology,
                 assignment_version,
                 outbound,
                 &context,
@@ -2584,6 +2587,7 @@ impl EowcQueryOperator {
                 self.op_name
             ))
         })?;
+        config.ensure_topology_current()?;
         let assignment = config.registry.versioned_snapshot();
         let owners = assignment
             .owners()
@@ -2917,6 +2921,13 @@ impl EowcQueryOperator {
 
 #[async_trait]
 impl GraphOperator for EowcQueryOperator {
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_topology(&mut self, topology: laminar_core::shuffle::ShuffleTopologyFence) {
+        if let Some(scope) = &mut self.cluster_scope {
+            scope.topology = Some(topology);
+        }
+    }
+
     fn cluster_capability(&self) -> OperatorCapability {
         self.capability
     }

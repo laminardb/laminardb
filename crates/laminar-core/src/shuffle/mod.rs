@@ -6,7 +6,10 @@
 
 pub mod message;
 pub mod routing;
+mod topology;
 pub mod transport;
+
+pub use topology::ShuffleTopologyFence;
 
 pub use message::ShuffleMessage;
 pub use routing::{

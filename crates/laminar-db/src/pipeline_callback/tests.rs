@@ -6190,6 +6190,7 @@ async fn install_callback_shuffle(
             registry: Arc::new(VnodeRegistry::single_owner(2, NodeId(7))),
             sender: Arc::clone(&sender),
             receiver: Arc::clone(&receiver),
+            topology: None,
             self_id: NodeId(7),
         });
     (sender, receiver)
