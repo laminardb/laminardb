@@ -2477,8 +2477,17 @@ fn delayed_response_once_at_with_ambiguity(
     blocked_path: OsPath,
     ambiguous: bool,
 ) -> (Arc<BlockingStore>, Arc<LeaderLeaseStore>) {
+    delayed_response_with_inner(ttl_ms, Arc::new(InMemory::new()), blocked_path, ambiguous)
+}
+
+fn delayed_response_with_inner(
+    ttl_ms: i64,
+    inner: Arc<dyn ObjectStore>,
+    blocked_path: OsPath,
+    ambiguous: bool,
+) -> (Arc<BlockingStore>, Arc<LeaderLeaseStore>) {
     let raw = Arc::new(BlockingStore {
-        inner: Arc::new(InMemory::new()),
+        inner,
         ambiguous_path: ambiguous.then(|| blocked_path.clone()),
         blocked_path,
         block_put: true,

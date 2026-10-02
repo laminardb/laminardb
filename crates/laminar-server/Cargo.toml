@@ -142,6 +142,8 @@ mimalloc = { workspace = true, optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
+# Exercise the existing Kafka initialization contract from the real-process soak.
+laminar-connectors = { path = "../laminar-connectors", version = "0.31.0", default-features = false }
 parquet = { workspace = true, features = ["arrow"] }
 tempfile = { workspace = true }
 tokio-postgres = "0.7"

@@ -3,7 +3,7 @@
 use super::{
     ClusterTopologyObjectTransition, ClusterTopologyValidation, TopologyAdmissionPhase,
     TopologyAdmissionPlan, TopologyAdmissionStatus, TopologyCompatibilityRef, TopologyCutCommit,
-    TopologyError, TopologyOperationId, TopologyPlanRef,
+    TopologyError, TopologyOperationId, TopologyPlanRef, TopologySourceInitialization,
 };
 use crate::checkpoint::{
     canonical_json_bytes, checkpoint_manifest_bytes, merge_node_subscription_manifests,
@@ -66,10 +66,14 @@ pub struct TopologyMigrationRoot {
     pub cut: TopologyCutCommit,
     /// Sorted exact identity mappings for every unchanged object.
     pub preserved_objects: Vec<TopologyPreservedObject>,
-    /// Sorted new stateless streams/sinks that only receive post-cut target input.
+    /// Sorted new objects. Streams/sinks receive only target input; sources use their sealed cursors.
     pub future_only_objects: Vec<String>,
     /// Sorted preserved subscription incarnations and publication frontiers.
     pub subscriptions: Vec<TopologySubscriptionRoot>,
+    /// Sorted new-source positions, sealed once for this exact operation and cut.
+    /// Empty format-1 roots retain their original canonical bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_initializations: Vec<TopologySourceInitialization>,
 }
 
 /// Small content reference carried by authority renewals.
@@ -129,11 +133,6 @@ impl TopologyMigrationRoot {
                     });
                 }
                 ClusterTopologyObjectTransition::AddFutureOnly => {
-                    if object.kind == CatalogObjectKind::Source {
-                        return Err(TopologyError::Unsupported(format!(
-                            "new source '{}' requires concrete connector positions persisted once before root staging", object.name
-                        )));
-                    }
                     if object.managed_state_contract.is_some() {
                         return Err(TopologyError::Unsupported(
                             "new managed state has no initialization contract".into(),
@@ -151,6 +150,16 @@ impl TopologyMigrationRoot {
         descriptor: &ClusterTopologyValidation,
         index: &CommittedCheckpointIndex,
         manifests: &[CheckpointManifest],
+    ) -> Result<Self, TopologyError> {
+        Self::build_with_sources(operation, descriptor, index, manifests, Vec::new())
+    }
+
+    pub(crate) fn build_with_sources(
+        operation: &TopologyAdmissionStatus,
+        descriptor: &ClusterTopologyValidation,
+        index: &CommittedCheckpointIndex,
+        manifests: &[CheckpointManifest],
+        source_initializations: Vec<TopologySourceInitialization>,
     ) -> Result<Self, TopologyError> {
         let cut = operation
             .cut
@@ -300,7 +309,11 @@ impl TopologyMigrationRoot {
             });
         }
         let root = Self {
-            format_version: 1,
+            format_version: if source_initializations.is_empty() {
+                1
+            } else {
+                2
+            },
             operation_id: operation.operation_id,
             plan: operation.plan.clone(),
             compatibility: operation
@@ -313,7 +326,9 @@ impl TopologyMigrationRoot {
             preserved_objects,
             future_only_objects,
             subscriptions,
+            source_initializations,
         };
+        root.validate_source_mappings(descriptor)?;
         root.encode_and_reference()?;
         Ok(root)
     }
@@ -324,6 +339,7 @@ impl TopologyMigrationRoot {
         plan: &TopologyAdmissionPlan,
         descriptor: &ClusterTopologyValidation,
     ) -> Result<(), TopologyError> {
+        self.validate_source_mappings(descriptor)?;
         let (preserved, future) = Self::object_mappings(descriptor)?;
         if self.operation_id != operation.operation_id
             || self.plan != operation.plan
@@ -383,6 +399,38 @@ impl TopologyMigrationRoot {
         Ok(())
     }
 
+    fn validate_source_mappings(
+        &self,
+        descriptor: &ClusterTopologyValidation,
+    ) -> Result<(), TopologyError> {
+        let sources = descriptor
+            .objects
+            .iter()
+            .filter(|object| {
+                object.kind == CatalogObjectKind::Source
+                    && object.transition == ClusterTopologyObjectTransition::AddFutureOnly
+            })
+            .collect::<Vec<_>>();
+        if sources.len() != self.source_initializations.len() {
+            return Err(TopologyError::Unsupported(
+                "every new source requires concrete connector positions sealed once at the cut"
+                    .into(),
+            ));
+        }
+        for (object, initialization) in sources.iter().zip(&self.source_initializations) {
+            initialization.validate()?;
+            if initialization.name != object.name
+                || initialization.catalog_generation != object.catalog_generation
+                || initialization.compatibility_sha256 != object.compatibility_sha256
+            {
+                return Err(TopologyError::Invalid(
+                    "source initialization differs from its certified catalog incarnation".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Canonical bounded body for durable storage. This encodes requirements, never authority.
     ///
     /// # Errors
@@ -396,8 +444,10 @@ impl TopologyMigrationRoot {
             .checkpoint
             .validate()
             .map_err(TopologyError::Invalid)?;
-        if self.format_version != 1
-            || self.cut.authority_sequence == 0
+        if !matches!(
+            (self.format_version, self.source_initializations.is_empty()),
+            (1, true) | (2, false)
+        ) || self.cut.authority_sequence == 0
             || self.preserved_objects.len() + self.future_only_objects.len() > 256
             || !self
                 .preserved_objects
@@ -405,6 +455,11 @@ impl TopologyMigrationRoot {
                 .all(|p| p[0].name < p[1].name)
             || !self.future_only_objects.windows(2).all(|p| p[0] < p[1])
             || self.subscriptions.len() > self.preserved_objects.len()
+            || self.source_initializations.len() > self.future_only_objects.len()
+            || !self
+                .source_initializations
+                .windows(2)
+                .all(|p| p[0].name < p[1].name)
             || !self
                 .subscriptions
                 .windows(2)
@@ -413,6 +468,18 @@ impl TopologyMigrationRoot {
             return Err(TopologyError::Invalid(
                 "invalid migration root shape".into(),
             ));
+        }
+        for initialization in &self.source_initializations {
+            initialization.validate()?;
+            if self
+                .future_only_objects
+                .binary_search(&initialization.name)
+                .is_err()
+            {
+                return Err(TopologyError::Invalid(
+                    "source initialization has no future object".into(),
+                ));
+            }
         }
         for subscription in &self.subscriptions {
             let mut expected = subscription.parent_certificate.clone();

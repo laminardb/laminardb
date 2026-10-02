@@ -67,9 +67,9 @@ pub use topology::{
     TopologyCheckpointCut, TopologyCompatibilityRef, TopologyCutCommit, TopologyError,
     TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
     TopologyOperationId, TopologyParticipantCertificate, TopologyPlanRef, TopologyPreparation,
-    TopologyPreservedObject, TopologySubscriptionRoot, TopologyVersion, MAX_TOPOLOGY_OPERATIONS,
-    MAX_TOPOLOGY_ROOT_MANIFEST_BYTES, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
-    TOPOLOGY_PROTOCOL_VERSION,
+    TopologyPreservedObject, TopologySourceInitialization, TopologySubscriptionRoot,
+    TopologyVersion, MAX_TOPOLOGY_OPERATIONS, MAX_TOPOLOGY_ROOT_MANIFEST_BYTES,
+    MAX_TOPOLOGY_SOURCE_CHANNELS, TOPOLOGY_PREPARATION_PROTOCOL_VERSION, TOPOLOGY_PROTOCOL_VERSION,
 };
 
 #[cfg(feature = "cluster")]

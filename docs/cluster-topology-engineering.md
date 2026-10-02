@@ -16,7 +16,8 @@ and every frozen process's application receipt; intake and successor sink epochs
 remain held. It reserves an exact candidate without authorizing candidate actors.
 No record can commit topology 2. Local additive candidate compilation and definition
 compatibility descriptors and durable participant certificates are implemented.
-Exact-cut state/progress root staging is implemented for stateless downstream additions. Target
+Exact-cut state/progress root staging includes stateless downstream additions and sealed
+new-source initialization requirements. Target
 restore, retirement, Committed/Activating/Active and release remain unfinished.
 Runtime DDL stays fenced.
 
@@ -50,6 +51,8 @@ requires an adopted baseline. Encoding 16 binds the canonical candidate descript
 and exact-process preparation certificates; new cuts require preparation protocol 2.
 Encoding 17 pins immutable migration-root requirements after CutPrepared. It preserves
 the same protocol-2 plan, old catalog and checkpoint allocator; it grants no target authority.
+Encoding 18 requires support for source-initialization roots. Root encoding 2 carries
+the new global source cursors; encoding-1 bodies retain their exact canonical bytes.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -281,8 +284,9 @@ recovery protocol.
 configured process/assignment authorities and checkpoint store. The DB must be
 Running with the old cut held, intake closed and recovery/shutdown fences clear.
 The authority requires the admitting leader, unchanged assignment, complete
-current process certificates and `CutPrepared`. New-source additions are rejected
-until concrete connector positions can be resolved once and durably bound.
+current process certificates and `CutPrepared`. New sources require their configured
+connector's read-only initialization contract. Built-in Kafka certifies explicit
+topic inventories with earliest/latest; other connectors fail closed by default.
 
 The root reads only the exact committed index and its checksummed participant
 manifest metadata. It never reads or rewrites node state or Arrow output segments.
@@ -304,13 +308,60 @@ Target installation must consume this explicit mapping instead of recomputing a
 stream generation from the new whole-graph hash. These certificates are staged
 requirements; they do not authorize target replay or output.
 
-The canonical root is create-only and content-addressed. One format-17 authority
+The canonical root is create-only and content-addressed. One format-17 or format-18 authority
 append pins its reference and first sequence while leaving `CutPrepared` and
 catalog T unchanged. Retries return that immutable binding. Status and pruning
 audit its canonical body, exact certified plan/cut and first append. A live root
 retains the existing cut artifact-floor pin. Abort retains its metadata and
 authority evidence; ordinary checkpoint/replay retention then owns old artifacts.
 Target-commit retention remains unfinished.
+
+New-source positions use the existing `ConnectorCheckpoint` encoding, including
+Kafka's numeric next-to-read baselines for empty/never-read partitions. They have
+no checkpoint attempt and no source-assignment version: the complete global
+inventory is an initialization requirement, never evidence of processed input or
+ownership. Name, new catalog generation and compatibility digest must match the
+certified descriptor. The target installer must validate the cursor, adopt only
+assigned channels and fault if retention/inventory changed; that consumption is
+still unfinished. Ordinary Kafka startup continues to reject unsealed `latest`
+with guaranteed delivery.
+
+The DB uses its existing single compiler slot, privately replays the immutable
+target with configured factories, reconciles durable stream generations and rechecks its strict pipeline/environment
+identity, and calls only new-source initialization hooks. The authority invokes
+this resolver after complete current process/assignment checks. A new root is
+sealed create-only at
+`control/topology-source-root-staging/v1/<operation UUID>/<plan SHA-256>.json` before
+content-addressed root publication. This slot is not an authority head or target
+commit. Its first canonical vector wins simultaneous attempts. A retry reads the
+slot before resolving connectors and reconstructs the exact metadata requirements;
+after publication, the authoritative body no longer depends on the slot. Reads
+cancelled before a successful seal grant no boundary. Unknown seal outcomes are
+resolved by read-back; missing/corrupt/noncanonical/oversized evidence fails closed.
+A replacement leader aborts the existing pre-commit operation, preserving the
+parent checkpoint. It cannot use a staging slot to run or commit the target.
+
+Kafka discovers all explicit partitions and their broker low/high watermarks
+without subscribing, assigning, polling records or committing group offsets.
+`earliest` seals each numeric low watermark; `latest` seals each numeric high
+watermark. This is a partition vector, not an atomic cross-partition snapshot or
+a wall-clock activation timestamp. High-watermark initialization explicitly skips
+the prefix before that vector, including transactional records in that prefix;
+it does not change isolation or delivery guarantees of any running source.
+The contract uses the existing
+[rdkafka watermark metadata API](https://docs.rs/rdkafka/0.39.0/rdkafka/consumer/trait.Consumer.html#tymethod.fetch_watermarks).
+Topic patterns, mutable broker group offsets, timestamps and specific-offset modes
+remain uncertified for migration initialization.
+
+Kafka allows 64 explicit topics/4,096 partitions and a 10 second total lookup
+budget, bounded by the authority's existing 15 second deadline. One process-wide
+metadata-client permit remains in the existing tracked native task through final
+drop, so cancelled retries cannot accumulate clients. Native creation/read/drop
+stay off Tokio workers; automatic topic creation and offset commit/storage are
+disabled. Source actors, sink effects and per-record paths are unchanged.
+The root and its staging slot are each at most 1 MiB. Existing cleanup does not
+sweep this control prefix. With the existing 64-request journal bound, source-root
+slots add at most 64 MiB; their eventual cleanup belongs to journal retention.
 
 The DB call has a 30 second total deadline; the authority allows 16 CAS attempts
 within 15 seconds. Root bodies are bounded at 1 MiB and participant metadata at
@@ -323,6 +374,9 @@ scheduler, generic workflow, dependency or per-record work.
 | Missing/changed manifest, divergent progress or state identity | Reject without a root authority append |
 | Unresolved new source or incompatible subscription | Reject with an explicit initialization/compatibility reason |
 | Deadline/cancellation before append | Preserve CutPrepared; an unreferenced content blob grants no authority |
+| Source slot created but response/caller is lost before authority append | Read the same canonical slot; never reevaluate the sealed latest vector |
+| Concurrent different unsealed metadata reads | First create-only vector wins; discarded reads grant no boundary |
+| Source slot is corrupt or exceeds 1 MiB | Reject before connector I/O; do not reset the slot |
 | Append succeeds but response/caller is lost | Exact status/retry resolves the original root binding |
 | Leader/process/assignment changes | Fence staging; coordinated recovery retains the old cut |
 | Root or first authority anchor is damaged | Status and pruning fail closed |
@@ -412,8 +466,8 @@ remains absent.
 2. Drive the implemented exact-process certification path from detached submission;
    explicit local preparation is available, but automatic collection remains unfinished.
 3. Observe superseded actor retirement after the reconciled old checkpoint cut.
-4. Extend staged exact-cut roots with concrete new-source positions, then atomically
-   bind target catalog and root at the logical topology-change Commit.
+4. Consume sealed new-source positions and preserved state/subscription mappings,
+   then atomically bind target catalog and root at the logical topology-change Commit.
 5. Restore/install the target before participant-complete release, with stale
    graph/shuffle/sink completion fences and target-only post-commit recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
@@ -433,5 +487,9 @@ records independently compiled durable receipts on all three running stateful
 processes and the subsequent cut/abort/restart oracle. The
 [root staging evidence](test-evidence/topology-root-2026-10-01/README.md) records
 immutable state/progress requirements from those real checkpoint manifests and
-their retained binding after restart. These results do not certify target migration
+their retained binding after restart. The latest
+[source initialization evidence](test-evidence/topology-sources-2026-10-02/README.md)
+records sealed Kafka earliest/latest cursors, cancellation/concurrency boundaries,
+legacy root bytes and the subsequent three-process cut/abort/full-restart oracle.
+These results do not certify target migration
 or production latency.

@@ -19,6 +19,44 @@ impl ClusterController {
         operation_id: TopologyOperationId,
         expected_plan: &TopologyPlanRef,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        self.stage_topology_migration_root_with_initialization(
+            checkpoint_store,
+            operation_id,
+            expected_plan,
+            |_, _| async {
+                Err(TopologyError::Unsupported(
+                    "new sources require connector initialization".into(),
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Stage connector-owned initial positions under this controller's configured live fences.
+    /// The DB supplies the read-only resolver; no caller-supplied cursor enters the public DB API.
+    /// Existing sealed positions bypass the resolver, including after cancellation before append.
+    ///
+    /// # Errors
+    /// Rejects the same process/assignment/recovery fences as downstream-only root staging.
+    pub async fn stage_topology_migration_root_with_initialization<F, Fut>(
+        &self,
+        checkpoint_store: &dyn crate::checkpoint::CheckpointStore,
+        operation_id: TopologyOperationId,
+        expected_plan: &TopologyPlanRef,
+        initialize: F,
+    ) -> Result<TopologyAdmissionStatus, TopologyError>
+    where
+        F: FnOnce(
+            crate::cluster::control::CatalogManifest,
+            crate::cluster::control::ClusterTopologyValidation,
+        ) -> Fut,
+        Fut: std::future::Future<
+            Output = Result<
+                Vec<crate::cluster::control::TopologySourceInitialization>,
+                TopologyError,
+            >,
+        >,
+    {
         let before = self
             .try_live_local_process_authority_identity()
             .map_err(|_| TopologyError::Fenced)?;
@@ -41,7 +79,7 @@ impl ClusterController {
             return Err(TopologyError::Fenced);
         }
         let status = authority
-            .stage_topology_migration_root(
+            .stage_topology_migration_root_with_initialization(
                 &proof,
                 self.snapshot.as_ref().ok_or_else(|| {
                     TopologyError::Protocol("root has no assignment authority".into())
@@ -52,6 +90,7 @@ impl ClusterController {
                 checkpoint_store,
                 operation_id,
                 expected_plan,
+                initialize,
             )
             .await?;
         if self.is_recovering()

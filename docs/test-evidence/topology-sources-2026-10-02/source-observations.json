@@ -1,0 +1,43 @@
+{
+  "artifact_directory": "C:\\Users\\sujit\\.codex\\worktrees\\9929\\laminardb\\target\\tmp\\soak-139536-1790927027685280300",
+  "root_staging_elapsed_ms": 505.86030000000005,
+  "cut_prepared_elapsed_ms": 5001.7829,
+  "root_encoded_bytes": 51909,
+  "participant_manifest_metadata_bytes": 607444,
+  "preserved_objects": 47,
+  "future_only_objects": [
+    "topology_cut_probe",
+    "topology_source_probe",
+    "topology_source_sink",
+    "topology_source_stream"
+  ],
+  "preserved_subscription_vectors": 9,
+  "source_initialization_calls": 1,
+  "source_initialization_next_offsets": [
+    2,
+    3,
+    0
+  ],
+  "harness_observed_peak_working_set_bytes": 147226624,
+  "root_authority_sequence": 402,
+  "gate_hold_ms": [
+    65055.117,
+    65023.245,
+    64946.751000000004
+  ],
+  "checkpoint_timing_records": 206,
+  "checkpoint_records_by_generation": {
+    "0:1": 54,
+    "0:2": 20,
+    "1:1": 54,
+    "1:2": 20,
+    "2:1": 25,
+    "2:2": 13,
+    "2:3": 20
+  },
+  "max_pipeline_stall_ms": 608.4767,
+  "missing_durable_tail_handoffs": 0,
+  "deadline_exhausted": 0,
+  "max_sampled_combined_working_set_bytes": 896397312,
+  "processes_observed": 7
+}

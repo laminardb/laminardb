@@ -198,6 +198,25 @@ pub trait SourceConnector: Send {
         Ok(())
     }
 
+    /// Resolve a complete, unowned initial cursor without starting or consuming the source.
+    /// The topology control path seals the first successful vector and reuses it on every retry.
+    /// Implementations must bound metadata I/O and task ownership, avoid group joins, external
+    /// acknowledgements and resource creation, and return the existing connector cursor encoding.
+    /// The cursor is not a checkpoint of processed data or an intake permit. Ordinary startup and
+    /// recovery keep their current policy until target installation explicitly consumes this cut.
+    ///
+    /// # Errors
+    /// Rejects configurations without a certified initialization contract. The default fails
+    /// closed; adding a connector requires an implementation and recovery/activation evidence.
+    async fn resolve_initial_position(
+        &mut self,
+        _config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "connector has no sealed topology initialization contract".into(),
+        ))
+    }
+
     /// Arrow schema of records this source produces.
     fn schema(&self) -> SchemaRef;
 

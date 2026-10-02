@@ -7,6 +7,7 @@ use super::{
     LeaderProof, LeaseError, AUTHORITY_RECORD_VERSION, TOPOLOGY_ADMISSION_RECORD_VERSION,
     TOPOLOGY_AUTHORITY_RECORD_VERSION, TOPOLOGY_CUT_RECORD_VERSION,
     TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION, TOPOLOGY_PREPARATION_RECORD_VERSION,
+    TOPOLOGY_SOURCE_ROOT_RECORD_VERSION,
 };
 use crate::cluster::control::topology::{
     LegacyTopologyBaseline, TopologyAdoptionOutcome, TopologyCatalogState, TopologyError,
@@ -30,7 +31,8 @@ impl LeaderAuthorityRecord {
                 | TOPOLOGY_ADMISSION_RECORD_VERSION
                 | TOPOLOGY_CUT_RECORD_VERSION
                 | TOPOLOGY_PREPARATION_RECORD_VERSION
-                | TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION,
+                | TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
+                | TOPOLOGY_SOURCE_ROOT_RECORD_VERSION,
                 Some(baseline),
             ) => {
                 baseline

@@ -1,0 +1,5936 @@
+{
+  "cut_prepared_elapsed_ms": 5001.7829,
+  "participant_manifest_metadata_bytes": 607444,
+  "root": {
+    "compatibility": {
+      "encoded_len": 24058,
+      "sha256": "9721b1484d26489e6821360cf47f7f7c1c1faa729601534fda67a1cf9c035806"
+    },
+    "cut": {
+      "authority_sequence": 393,
+      "checkpoint": {
+        "checkpoint_id": 54,
+        "epoch": 54,
+        "len": 58875,
+        "sha256": "5f6b6ce4f1a365c8ae701115ce01eb334c967797a17d187a52e981a480ce42c6"
+      }
+    },
+    "format_version": 2,
+    "future_only_objects": [
+      "topology_cut_probe",
+      "topology_source_probe",
+      "topology_source_sink",
+      "topology_source_stream"
+    ],
+    "operation_id": "3a4f11cb-8f7e-4844-946a-439b39283b58",
+    "plan": {
+      "encoded_len": 1010,
+      "sha256": "7cf0cc29cbc3754823c95824c4ce14aea73a45dc6c635ecd6d6951c28173e3d6"
+    },
+    "preserved_objects": [
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "43b2ab9281b75b8993f4b52bb4f6d626fc265158ea485be0acdbd19011a1003b",
+        "kind": "source",
+        "name": "join_left",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "86b97460b3c5e800007f9810dd5b12af829c97124b2f42ab9464826c1f0b8477",
+        "kind": "source",
+        "name": "join_right",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "d4448586d0bd38e849d9cdebc043a8a0508abd699f6a98e222dbe5cdcdc12bfd",
+        "kind": "stream",
+        "name": "soak_join",
+        "state_operator_id": "graph:soak_join"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "a27b6863d073c1152586c13baf70c201d12b4dfa87f0bf9e7d997d7471ec0c0f",
+        "kind": "stream",
+        "name": "soak_join_aggregate",
+        "state_operator_id": "graph:soak_join_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "4b83ef39fbe5712a85cd4a6a3863329d817bc6e7d5908b402322eb462b81131e",
+        "kind": "stream",
+        "name": "soak_matrix_full",
+        "state_operator_id": "graph:soak_matrix_full"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "54f66e56e64185a26868e7ac97754becbf9f23a8bc6bff8f561731eb4faede1b",
+        "kind": "stream",
+        "name": "soak_matrix_full_aggregate",
+        "state_operator_id": "graph:soak_matrix_full_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "1450ca1cfbaec6b19b1a6bf56cada551e643c88759880761afc000e2b77804e8",
+        "kind": "sink",
+        "name": "soak_matrix_full_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "c2cc39274d2af85420136a1aadf1fce947111cfec4bc0d7439971a5c52cf4522",
+        "kind": "stream",
+        "name": "soak_matrix_inner",
+        "state_operator_id": "graph:soak_matrix_inner"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "52cc9388897f12eb941cfc59a3ae8e998b5049303aebcd42b29b2ab2d4dede1b",
+        "kind": "stream",
+        "name": "soak_matrix_inner_aggregate",
+        "state_operator_id": "graph:soak_matrix_inner_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "148586b60f861614fd032bbfc9ae2e066da5ef0df08aee3b4134f3a6a1222872",
+        "kind": "sink",
+        "name": "soak_matrix_inner_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "223e0eef7ec287d2c5beed19b3bdfea7a4e4bc09ec3e4a9084709a5db64efed8",
+        "kind": "stream",
+        "name": "soak_matrix_left",
+        "state_operator_id": "graph:soak_matrix_left"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "53bbae31ce43bed8bdfea91a93f06a52a284b5d72d90b354ebc59cd16adb8d12",
+        "kind": "stream",
+        "name": "soak_matrix_left_aggregate",
+        "state_operator_id": "graph:soak_matrix_left_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "57dc32940c5a3f5290eeffe771cbcd53d796bb02a506c08ff987cdcc18aae8d6",
+        "kind": "stream",
+        "name": "soak_matrix_left_anti",
+        "state_operator_id": "graph:soak_matrix_left_anti"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "8fe0173ac0e7509207dc52bb04ec73d129e8358b50f2ab787b5e1ad13f6f6072",
+        "kind": "stream",
+        "name": "soak_matrix_left_anti_aggregate",
+        "state_operator_id": "graph:soak_matrix_left_anti_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "f77dd14580c5336af3bb8e72dfeb9ba7f287914d5eed04bcd611bfc8dea15656",
+        "kind": "sink",
+        "name": "soak_matrix_left_anti_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "b494ca677f0b40f91500ccd8c8cf688507371d211c669a50ccba9c61bffb8af8",
+        "kind": "sink",
+        "name": "soak_matrix_left_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "5ccf3b19a3821134ff713067d68a4c06c443cf585633992d98e21fe925593208",
+        "kind": "stream",
+        "name": "soak_matrix_left_semi",
+        "state_operator_id": "graph:soak_matrix_left_semi"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "2216092f923f02c26fc6ba4d4a323bad2ac1e4100a1c2ca97e3c4c57369024ed",
+        "kind": "stream",
+        "name": "soak_matrix_left_semi_aggregate",
+        "state_operator_id": "graph:soak_matrix_left_semi_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "bc37f30f9f506d6ca771a348b409e1918e26915c8bc23230d162e37488567b50",
+        "kind": "sink",
+        "name": "soak_matrix_left_semi_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "5eed4e2015489e34a433a021e4f460e3479a4ce4b3932d67001314045aafb284",
+        "kind": "source",
+        "name": "soak_matrix_lhs",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "0d619f2a9e04b290a35f99dfb3668e709bbfba70e80febc4a723400bcfeebeb7",
+        "kind": "source",
+        "name": "soak_matrix_rhs",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "409b58a31645a5fa051230665f71fae9ba849b451cd84ea5f0afda89a20c2373",
+        "kind": "stream",
+        "name": "soak_matrix_right",
+        "state_operator_id": "graph:soak_matrix_right"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "acfe294712bcd7237405657e7fda56c19dcf57ebafeb15fbe1f91c87b024b7fe",
+        "kind": "stream",
+        "name": "soak_matrix_right_aggregate",
+        "state_operator_id": "graph:soak_matrix_right_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "5ac54e153d69a98d283136412a759c4e2022dcf9bc0f8cea75d6b350c636d1c0",
+        "kind": "stream",
+        "name": "soak_matrix_right_anti",
+        "state_operator_id": "graph:soak_matrix_right_anti"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "58692abb3482665b2b0b123f1dde447e2ad89115480a0c76da599f3b4f6e8a50",
+        "kind": "stream",
+        "name": "soak_matrix_right_anti_aggregate",
+        "state_operator_id": "graph:soak_matrix_right_anti_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "9fd18332df890085566c10c1af9d3f1bca6e6277d1aa86cc9725bc3f2a9f5f7c",
+        "kind": "sink",
+        "name": "soak_matrix_right_anti_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "f07a9612969735339fb45887a58986d013945f1fa4aef050bff92a1e30044b92",
+        "kind": "sink",
+        "name": "soak_matrix_right_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "b4343ea6b93494ef389477c6911a11e70790584f9db2923608f17899caebfcc8",
+        "kind": "stream",
+        "name": "soak_matrix_right_semi",
+        "state_operator_id": "graph:soak_matrix_right_semi"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "567bd907a62ebd6b936102758e2028cc4634db09d73916dc608742da3c366b7a",
+        "kind": "stream",
+        "name": "soak_matrix_right_semi_aggregate",
+        "state_operator_id": "graph:soak_matrix_right_semi_aggregate"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "5fc28c99c9a9f222162a42f05bfb18ec6b55406f0b2d6db1e21de76a17f020ae",
+        "kind": "sink",
+        "name": "soak_matrix_right_semi_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "759a4ecb29a069131178fddce3413f28776028289421456a79dbf5ec76ed12ef",
+        "kind": "sink",
+        "name": "soak_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "feec5d10a203f13f1d6c6478ed1a2db7547bc097a7f78c29c3a9e195e8b3b7cb",
+        "kind": "stream",
+        "name": "soak_temporal",
+        "state_operator_id": "graph:soak_temporal"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "33cb9cc25d91ec18c8db81a0ab4f10c266cf1a5de2b6bf494117eb6121d7b1c3",
+        "kind": "stream",
+        "name": "soak_temporal_load",
+        "state_operator_id": "graph:soak_temporal_load"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "012d90fe83e3bf396aab02e3c65cc471b0544dd895468174a72fb0266ed1ce01",
+        "kind": "sink",
+        "name": "soak_temporal_load_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "35ade62f5ade2a8227cff0d717faa54f34fe663b94175c45e9910fe6860f72c3",
+        "kind": "sink",
+        "name": "soak_temporal_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "95970e1cb00ba4432ccc6d611259214cc0185b1cb937f89477ad9c55bd438cce",
+        "kind": "stream",
+        "name": "soak_temporal_probe",
+        "state_operator_id": "graph:soak_temporal_probe"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "77dc64d3b03f2f5149dabedd4680f0f68e28dbd2da9aaf0d9df20a5449a46eee",
+        "kind": "sink",
+        "name": "soak_temporal_probe_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "2c229d037f20c6ee82ebc72b982a1f5891195ce8d4acc1c3766b669db75de4bd",
+        "kind": "stream",
+        "name": "soak_window_hop",
+        "state_operator_id": "graph:soak_window_hop"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "f2216a1a6b469299d99a5810ca5e04427cae6b826aab9dd3772e006c9f80435a",
+        "kind": "sink",
+        "name": "soak_window_hop_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "6ab1faa7fc47a0bdc6db1c1189de7a1a523f9fc93a8b7e7f90b10df2a8435feb",
+        "kind": "stream",
+        "name": "soak_window_session",
+        "state_operator_id": "graph:soak_window_session"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "e8f6b618e44d4ab2a8610a1af0ef900c67ce5370f27c3152807912e7c686f526",
+        "kind": "sink",
+        "name": "soak_window_session_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "e3eadc333e5d0b3df7615c3323625d8d80c159e8855e6dd0c59baaf8ca0af9f5",
+        "kind": "stream",
+        "name": "soak_window_tumble",
+        "state_operator_id": "graph:soak_window_tumble"
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "b077cd4a541a502aeb1a6f0d905ab17aa627868f570ca3b693728c61d5a71044",
+        "kind": "sink",
+        "name": "soak_window_tumble_output",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "d24ea1db17176e5bd5e1d1ad2f129f6a89217eaaa406413bc11be0b6f70702b0",
+        "kind": "source",
+        "name": "temporal_left",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "09d3d710fd324dddca4359c4fc5b908f946fe3dd7be2bde30730d0e7bf992fb9",
+        "kind": "source",
+        "name": "temporal_load_left",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "18f7016ed107f457ec1d73516db30f927424d7066bdb757e0fafb9828450b61c",
+        "kind": "source",
+        "name": "temporal_load_right",
+        "state_operator_id": null
+      },
+      {
+        "catalog_generation": 1,
+        "compatibility_sha256": "2e903d6fbff2af9cb8f66d835aba294a6a539aed81fe765a12627eb7c1f1b040",
+        "kind": "source",
+        "name": "temporal_right",
+        "state_operator_id": null
+      }
+    ],
+    "source_initializations": [
+      {
+        "catalog_generation": 1,
+        "checkpoint": {
+          "input_channels": [
+            [
+              0,
+              0,
+              0,
+              21,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              95,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              95,
+              112,
+              114,
+              111,
+              98,
+              101,
+              0,
+              0,
+              0,
+              58,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              45,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              45,
+              112,
+              114,
+              111,
+              98,
+              101,
+              45,
+              100,
+              99,
+              51,
+              49,
+              98,
+              55,
+              98,
+              97,
+              45,
+              102,
+              100,
+              97,
+              48,
+              45,
+              52,
+              99,
+              48,
+              54,
+              45,
+              57,
+              48,
+              56,
+              53,
+              45,
+              48,
+              57,
+              97,
+              102,
+              57,
+              57,
+              50,
+              55,
+              98,
+              56,
+              50,
+              57,
+              0,
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              0,
+              21,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              95,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              95,
+              112,
+              114,
+              111,
+              98,
+              101,
+              0,
+              0,
+              0,
+              58,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              45,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              45,
+              112,
+              114,
+              111,
+              98,
+              101,
+              45,
+              100,
+              99,
+              51,
+              49,
+              98,
+              55,
+              98,
+              97,
+              45,
+              102,
+              100,
+              97,
+              48,
+              45,
+              52,
+              99,
+              48,
+              54,
+              45,
+              57,
+              48,
+              56,
+              53,
+              45,
+              48,
+              57,
+              97,
+              102,
+              57,
+              57,
+              50,
+              55,
+              98,
+              56,
+              50,
+              57,
+              0,
+              0,
+              0,
+              1
+            ],
+            [
+              0,
+              0,
+              0,
+              21,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              95,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              95,
+              112,
+              114,
+              111,
+              98,
+              101,
+              0,
+              0,
+              0,
+              58,
+              116,
+              111,
+              112,
+              111,
+              108,
+              111,
+              103,
+              121,
+              45,
+              115,
+              111,
+              117,
+              114,
+              99,
+              101,
+              45,
+              112,
+              114,
+              111,
+              98,
+              101,
+              45,
+              100,
+              99,
+              51,
+              49,
+              98,
+              55,
+              98,
+              97,
+              45,
+              102,
+              100,
+              97,
+              48,
+              45,
+              52,
+              99,
+              48,
+              54,
+              45,
+              57,
+              48,
+              56,
+              53,
+              45,
+              48,
+              57,
+              97,
+              102,
+              57,
+              57,
+              50,
+              55,
+              98,
+              56,
+              50,
+              57,
+              0,
+              0,
+              0,
+              2
+            ]
+          ],
+          "metadata": {
+            "checkpoint.version": "2",
+            "connector": "kafka"
+          },
+          "offsets": {
+            "@laminar.kafka.next.v1:topology-source-probe-dc31b7ba-fda0-4c06-9085-09af9927b829:0": "2",
+            "@laminar.kafka.next.v1:topology-source-probe-dc31b7ba-fda0-4c06-9085-09af9927b829:1": "3",
+            "@laminar.kafka.next.v1:topology-source-probe-dc31b7ba-fda0-4c06-9085-09af9927b829:2": "0"
+          },
+          "source_assignment_version": null
+        },
+        "compatibility_sha256": "c227c60ac1e46923bac1bc1e33dff3b588f00f561e5656c2cf2ff6809d66bceb",
+        "name": "topology_source_probe"
+      }
+    ],
+    "subscriptions": [
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 1,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 2,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 3,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 4,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 5,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 6,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 7,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 8,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 9,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 10,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 11,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 12,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 13,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 14,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 15,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 16,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 17,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 18,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 19,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 20,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 21,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 22,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 23,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 24,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 25,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 26,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 27,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 28,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 29,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 30,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 31,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 32,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 33,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 34,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 35,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 36,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 37,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 38,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 39,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 40,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 41,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 42,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 43,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 44,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 45,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 46,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 47,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 48,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 49,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 50,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 51,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 52,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 53,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 54,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 55,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 56,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 57,
+            "through_sequence": 5315
+          },
+          {
+            "partition": 58,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 59,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 60,
+            "through_sequence": 11069
+          },
+          {
+            "partition": 61,
+            "through_sequence": 7636
+          },
+          {
+            "partition": 62,
+            "through_sequence": 12524
+          },
+          {
+            "partition": 63,
+            "through_sequence": 11069
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "full_partition_snapshot",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              84,
+              222,
+              78,
+              12,
+              134,
+              92,
+              20,
+              85,
+              252,
+              185,
+              132,
+              180,
+              207,
+              41,
+              2,
+              186,
+              106,
+              216,
+              80,
+              209,
+              199,
+              142,
+              103,
+              244,
+              86,
+              119,
+              13,
+              74,
+              178,
+              97,
+              255,
+              124
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_join_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            211,
+            68,
+            199,
+            83,
+            166,
+            254,
+            215,
+            1,
+            52,
+            237,
+            10,
+            142,
+            210,
+            98,
+            113,
+            157,
+            224,
+            2,
+            185,
+            37,
+            126,
+            128,
+            14,
+            100,
+            245,
+            249,
+            181,
+            138,
+            92,
+            1,
+            107,
+            218
+          ],
+          "schema_fingerprint": [
+            104,
+            190,
+            242,
+            61,
+            237,
+            246,
+            102,
+            226,
+            149,
+            12,
+            129,
+            190,
+            114,
+            56,
+            83,
+            225,
+            84,
+            37,
+            119,
+            70,
+            208,
+            135,
+            30,
+            127,
+            212,
+            229,
+            207,
+            154,
+            11,
+            212,
+            98,
+            47
+          ],
+          "stream_generation": [
+            43,
+            105,
+            169,
+            6,
+            152,
+            18,
+            176,
+            117,
+            219,
+            66,
+            124,
+            36,
+            197,
+            254,
+            203,
+            217,
+            217,
+            122,
+            66,
+            90,
+            16,
+            206,
+            161,
+            223,
+            174,
+            169,
+            60,
+            41,
+            219,
+            124,
+            101,
+            234
+          ],
+          "stream_id": "soak_join_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "full_partition_snapshot",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              84,
+              222,
+              78,
+              12,
+              134,
+              92,
+              20,
+              85,
+              252,
+              185,
+              132,
+              180,
+              207,
+              41,
+              2,
+              186,
+              106,
+              216,
+              80,
+              209,
+              199,
+              142,
+              103,
+              244,
+              86,
+              119,
+              13,
+              74,
+              178,
+              97,
+              255,
+              124
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_join_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            211,
+            68,
+            199,
+            83,
+            166,
+            254,
+            215,
+            1,
+            52,
+            237,
+            10,
+            142,
+            210,
+            98,
+            113,
+            157,
+            224,
+            2,
+            185,
+            37,
+            126,
+            128,
+            14,
+            100,
+            245,
+            249,
+            181,
+            138,
+            92,
+            1,
+            107,
+            218
+          ],
+          "schema_fingerprint": [
+            104,
+            190,
+            242,
+            61,
+            237,
+            246,
+            102,
+            226,
+            149,
+            12,
+            129,
+            190,
+            114,
+            56,
+            83,
+            225,
+            84,
+            37,
+            119,
+            70,
+            208,
+            135,
+            30,
+            127,
+            212,
+            229,
+            207,
+            154,
+            11,
+            212,
+            98,
+            47
+          ],
+          "stream_generation": [
+            43,
+            105,
+            169,
+            6,
+            152,
+            18,
+            176,
+            117,
+            219,
+            66,
+            124,
+            36,
+            197,
+            254,
+            203,
+            217,
+            217,
+            122,
+            66,
+            90,
+            16,
+            206,
+            161,
+            223,
+            174,
+            169,
+            60,
+            41,
+            219,
+            124,
+            101,
+            234
+          ],
+          "stream_id": "soak_join_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 1
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_full_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            13,
+            137,
+            212,
+            11,
+            112,
+            13,
+            76,
+            142,
+            86,
+            226,
+            111,
+            46,
+            173,
+            170,
+            120,
+            112,
+            211,
+            99,
+            10,
+            78,
+            185,
+            118,
+            154,
+            56,
+            42,
+            157,
+            18,
+            48,
+            209,
+            155,
+            51,
+            57
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            54,
+            213,
+            77,
+            220,
+            33,
+            122,
+            249,
+            252,
+            65,
+            162,
+            49,
+            193,
+            153,
+            156,
+            81,
+            195,
+            11,
+            91,
+            153,
+            138,
+            85,
+            194,
+            9,
+            53,
+            210,
+            15,
+            58,
+            152,
+            19,
+            171,
+            244,
+            187
+          ],
+          "stream_id": "soak_matrix_full_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_full_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            13,
+            137,
+            212,
+            11,
+            112,
+            13,
+            76,
+            142,
+            86,
+            226,
+            111,
+            46,
+            173,
+            170,
+            120,
+            112,
+            211,
+            99,
+            10,
+            78,
+            185,
+            118,
+            154,
+            56,
+            42,
+            157,
+            18,
+            48,
+            209,
+            155,
+            51,
+            57
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            54,
+            213,
+            77,
+            220,
+            33,
+            122,
+            249,
+            252,
+            65,
+            162,
+            49,
+            193,
+            153,
+            156,
+            81,
+            195,
+            11,
+            91,
+            153,
+            138,
+            85,
+            194,
+            9,
+            53,
+            210,
+            15,
+            58,
+            152,
+            19,
+            171,
+            244,
+            187
+          ],
+          "stream_id": "soak_matrix_full_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 1
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_inner_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            154,
+            150,
+            164,
+            200,
+            128,
+            16,
+            172,
+            22,
+            156,
+            151,
+            10,
+            240,
+            102,
+            136,
+            209,
+            225,
+            154,
+            118,
+            179,
+            153,
+            184,
+            237,
+            242,
+            110,
+            161,
+            188,
+            41,
+            197,
+            108,
+            117,
+            137,
+            212
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            28,
+            90,
+            212,
+            87,
+            144,
+            92,
+            196,
+            130,
+            127,
+            88,
+            246,
+            63,
+            128,
+            1,
+            75,
+            113,
+            101,
+            189,
+            155,
+            191,
+            15,
+            177,
+            119,
+            235,
+            222,
+            13,
+            170,
+            213,
+            116,
+            112,
+            100,
+            43
+          ],
+          "stream_id": "soak_matrix_inner_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_inner_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            154,
+            150,
+            164,
+            200,
+            128,
+            16,
+            172,
+            22,
+            156,
+            151,
+            10,
+            240,
+            102,
+            136,
+            209,
+            225,
+            154,
+            118,
+            179,
+            153,
+            184,
+            237,
+            242,
+            110,
+            161,
+            188,
+            41,
+            197,
+            108,
+            117,
+            137,
+            212
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            28,
+            90,
+            212,
+            87,
+            144,
+            92,
+            196,
+            130,
+            127,
+            88,
+            246,
+            63,
+            128,
+            1,
+            75,
+            113,
+            101,
+            189,
+            155,
+            191,
+            15,
+            177,
+            119,
+            235,
+            222,
+            13,
+            170,
+            213,
+            116,
+            112,
+            100,
+            43
+          ],
+          "stream_id": "soak_matrix_inner_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 1
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            204,
+            118,
+            111,
+            65,
+            157,
+            9,
+            239,
+            107,
+            152,
+            75,
+            253,
+            221,
+            253,
+            42,
+            50,
+            163,
+            39,
+            174,
+            118,
+            84,
+            131,
+            27,
+            84,
+            53,
+            10,
+            135,
+            10,
+            179,
+            197,
+            106,
+            239,
+            119
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            206,
+            23,
+            165,
+            91,
+            190,
+            23,
+            93,
+            183,
+            133,
+            62,
+            168,
+            233,
+            191,
+            3,
+            81,
+            231,
+            5,
+            211,
+            211,
+            13,
+            195,
+            250,
+            129,
+            175,
+            132,
+            132,
+            216,
+            160,
+            28,
+            237,
+            10,
+            94
+          ],
+          "stream_id": "soak_matrix_left_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            204,
+            118,
+            111,
+            65,
+            157,
+            9,
+            239,
+            107,
+            152,
+            75,
+            253,
+            221,
+            253,
+            42,
+            50,
+            163,
+            39,
+            174,
+            118,
+            84,
+            131,
+            27,
+            84,
+            53,
+            10,
+            135,
+            10,
+            179,
+            197,
+            106,
+            239,
+            119
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            206,
+            23,
+            165,
+            91,
+            190,
+            23,
+            93,
+            183,
+            133,
+            62,
+            168,
+            233,
+            191,
+            3,
+            81,
+            231,
+            5,
+            211,
+            211,
+            13,
+            195,
+            250,
+            129,
+            175,
+            132,
+            132,
+            216,
+            160,
+            28,
+            237,
+            10,
+            94
+          ],
+          "stream_id": "soak_matrix_left_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_anti_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            138,
+            221,
+            93,
+            249,
+            112,
+            87,
+            146,
+            198,
+            168,
+            122,
+            76,
+            251,
+            24,
+            239,
+            38,
+            196,
+            50,
+            247,
+            24,
+            143,
+            175,
+            254,
+            20,
+            97,
+            12,
+            31,
+            29,
+            153,
+            207,
+            92,
+            155,
+            188
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            13,
+            40,
+            23,
+            225,
+            124,
+            84,
+            229,
+            210,
+            254,
+            181,
+            111,
+            240,
+            102,
+            194,
+            128,
+            36,
+            105,
+            43,
+            45,
+            207,
+            222,
+            201,
+            78,
+            60,
+            165,
+            244,
+            176,
+            156,
+            171,
+            126,
+            118,
+            253
+          ],
+          "stream_id": "soak_matrix_left_anti_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_anti_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            138,
+            221,
+            93,
+            249,
+            112,
+            87,
+            146,
+            198,
+            168,
+            122,
+            76,
+            251,
+            24,
+            239,
+            38,
+            196,
+            50,
+            247,
+            24,
+            143,
+            175,
+            254,
+            20,
+            97,
+            12,
+            31,
+            29,
+            153,
+            207,
+            92,
+            155,
+            188
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            13,
+            40,
+            23,
+            225,
+            124,
+            84,
+            229,
+            210,
+            254,
+            181,
+            111,
+            240,
+            102,
+            194,
+            128,
+            36,
+            105,
+            43,
+            45,
+            207,
+            222,
+            201,
+            78,
+            60,
+            165,
+            244,
+            176,
+            156,
+            171,
+            126,
+            118,
+            253
+          ],
+          "stream_id": "soak_matrix_left_anti_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 1
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_semi_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            103,
+            63,
+            243,
+            113,
+            40,
+            163,
+            7,
+            19,
+            47,
+            208,
+            1,
+            25,
+            123,
+            43,
+            164,
+            36,
+            76,
+            207,
+            176,
+            215,
+            140,
+            222,
+            143,
+            225,
+            25,
+            193,
+            129,
+            253,
+            236,
+            16,
+            31,
+            172
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            164,
+            225,
+            170,
+            173,
+            41,
+            2,
+            164,
+            67,
+            21,
+            32,
+            138,
+            130,
+            147,
+            225,
+            94,
+            50,
+            126,
+            147,
+            160,
+            62,
+            124,
+            123,
+            52,
+            144,
+            16,
+            210,
+            85,
+            232,
+            149,
+            212,
+            118,
+            25
+          ],
+          "stream_id": "soak_matrix_left_semi_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_left_semi_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            103,
+            63,
+            243,
+            113,
+            40,
+            163,
+            7,
+            19,
+            47,
+            208,
+            1,
+            25,
+            123,
+            43,
+            164,
+            36,
+            76,
+            207,
+            176,
+            215,
+            140,
+            222,
+            143,
+            225,
+            25,
+            193,
+            129,
+            253,
+            236,
+            16,
+            31,
+            172
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            164,
+            225,
+            170,
+            173,
+            41,
+            2,
+            164,
+            67,
+            21,
+            32,
+            138,
+            130,
+            147,
+            225,
+            94,
+            50,
+            126,
+            147,
+            160,
+            62,
+            124,
+            123,
+            52,
+            144,
+            16,
+            210,
+            85,
+            232,
+            149,
+            212,
+            118,
+            25
+          ],
+          "stream_id": "soak_matrix_left_semi_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 1
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            138,
+            140,
+            211,
+            151,
+            111,
+            42,
+            16,
+            113,
+            39,
+            137,
+            81,
+            106,
+            168,
+            125,
+            47,
+            107,
+            97,
+            242,
+            192,
+            33,
+            219,
+            221,
+            17,
+            106,
+            185,
+            189,
+            182,
+            95,
+            49,
+            146,
+            83,
+            152
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            174,
+            166,
+            210,
+            36,
+            234,
+            223,
+            30,
+            140,
+            142,
+            80,
+            209,
+            36,
+            218,
+            241,
+            107,
+            138,
+            12,
+            182,
+            224,
+            104,
+            125,
+            204,
+            149,
+            162,
+            174,
+            94,
+            253,
+            247,
+            218,
+            223,
+            168,
+            68
+          ],
+          "stream_id": "soak_matrix_right_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            138,
+            140,
+            211,
+            151,
+            111,
+            42,
+            16,
+            113,
+            39,
+            137,
+            81,
+            106,
+            168,
+            125,
+            47,
+            107,
+            97,
+            242,
+            192,
+            33,
+            219,
+            221,
+            17,
+            106,
+            185,
+            189,
+            182,
+            95,
+            49,
+            146,
+            83,
+            152
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            174,
+            166,
+            210,
+            36,
+            234,
+            223,
+            30,
+            140,
+            142,
+            80,
+            209,
+            36,
+            218,
+            241,
+            107,
+            138,
+            12,
+            182,
+            224,
+            104,
+            125,
+            204,
+            149,
+            162,
+            174,
+            94,
+            253,
+            247,
+            218,
+            223,
+            168,
+            68
+          ],
+          "stream_id": "soak_matrix_right_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 0
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_anti_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            127,
+            85,
+            204,
+            232,
+            3,
+            188,
+            100,
+            79,
+            202,
+            229,
+            179,
+            82,
+            208,
+            145,
+            198,
+            237,
+            50,
+            225,
+            57,
+            82,
+            23,
+            121,
+            28,
+            22,
+            4,
+            107,
+            125,
+            66,
+            170,
+            126,
+            104,
+            220
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            14,
+            142,
+            33,
+            22,
+            38,
+            156,
+            233,
+            131,
+            38,
+            38,
+            158,
+            15,
+            219,
+            12,
+            49,
+            87,
+            63,
+            69,
+            207,
+            246,
+            246,
+            37,
+            42,
+            183,
+            211,
+            70,
+            153,
+            105,
+            32,
+            181,
+            189,
+            118
+          ],
+          "stream_id": "soak_matrix_right_anti_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_anti_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            127,
+            85,
+            204,
+            232,
+            3,
+            188,
+            100,
+            79,
+            202,
+            229,
+            179,
+            82,
+            208,
+            145,
+            198,
+            237,
+            50,
+            225,
+            57,
+            82,
+            23,
+            121,
+            28,
+            22,
+            4,
+            107,
+            125,
+            66,
+            170,
+            126,
+            104,
+            220
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            14,
+            142,
+            33,
+            22,
+            38,
+            156,
+            233,
+            131,
+            38,
+            38,
+            158,
+            15,
+            219,
+            12,
+            49,
+            87,
+            63,
+            69,
+            207,
+            246,
+            246,
+            37,
+            42,
+            183,
+            211,
+            70,
+            153,
+            105,
+            32,
+            181,
+            189,
+            118
+          ],
+          "stream_id": "soak_matrix_right_anti_aggregate",
+          "version": 1
+        }
+      },
+      {
+        "frontiers": [
+          {
+            "partition": 0,
+            "through_sequence": 0
+          },
+          {
+            "partition": 1,
+            "through_sequence": 0
+          },
+          {
+            "partition": 2,
+            "through_sequence": 0
+          },
+          {
+            "partition": 3,
+            "through_sequence": 0
+          },
+          {
+            "partition": 4,
+            "through_sequence": 0
+          },
+          {
+            "partition": 5,
+            "through_sequence": 0
+          },
+          {
+            "partition": 6,
+            "through_sequence": 0
+          },
+          {
+            "partition": 7,
+            "through_sequence": 0
+          },
+          {
+            "partition": 8,
+            "through_sequence": 0
+          },
+          {
+            "partition": 9,
+            "through_sequence": 0
+          },
+          {
+            "partition": 10,
+            "through_sequence": 0
+          },
+          {
+            "partition": 11,
+            "through_sequence": 0
+          },
+          {
+            "partition": 12,
+            "through_sequence": 0
+          },
+          {
+            "partition": 13,
+            "through_sequence": 0
+          },
+          {
+            "partition": 14,
+            "through_sequence": 0
+          },
+          {
+            "partition": 15,
+            "through_sequence": 0
+          },
+          {
+            "partition": 16,
+            "through_sequence": 0
+          },
+          {
+            "partition": 17,
+            "through_sequence": 0
+          },
+          {
+            "partition": 18,
+            "through_sequence": 0
+          },
+          {
+            "partition": 19,
+            "through_sequence": 0
+          },
+          {
+            "partition": 20,
+            "through_sequence": 0
+          },
+          {
+            "partition": 21,
+            "through_sequence": 0
+          },
+          {
+            "partition": 22,
+            "through_sequence": 0
+          },
+          {
+            "partition": 23,
+            "through_sequence": 0
+          },
+          {
+            "partition": 24,
+            "through_sequence": 0
+          },
+          {
+            "partition": 25,
+            "through_sequence": 0
+          },
+          {
+            "partition": 26,
+            "through_sequence": 0
+          },
+          {
+            "partition": 27,
+            "through_sequence": 0
+          },
+          {
+            "partition": 28,
+            "through_sequence": 0
+          },
+          {
+            "partition": 29,
+            "through_sequence": 0
+          },
+          {
+            "partition": 30,
+            "through_sequence": 0
+          },
+          {
+            "partition": 31,
+            "through_sequence": 0
+          },
+          {
+            "partition": 32,
+            "through_sequence": 0
+          },
+          {
+            "partition": 33,
+            "through_sequence": 0
+          },
+          {
+            "partition": 34,
+            "through_sequence": 0
+          },
+          {
+            "partition": 35,
+            "through_sequence": 1
+          },
+          {
+            "partition": 36,
+            "through_sequence": 0
+          },
+          {
+            "partition": 37,
+            "through_sequence": 0
+          },
+          {
+            "partition": 38,
+            "through_sequence": 0
+          },
+          {
+            "partition": 39,
+            "through_sequence": 0
+          },
+          {
+            "partition": 40,
+            "through_sequence": 0
+          },
+          {
+            "partition": 41,
+            "through_sequence": 0
+          },
+          {
+            "partition": 42,
+            "through_sequence": 0
+          },
+          {
+            "partition": 43,
+            "through_sequence": 0
+          },
+          {
+            "partition": 44,
+            "through_sequence": 0
+          },
+          {
+            "partition": 45,
+            "through_sequence": 0
+          },
+          {
+            "partition": 46,
+            "through_sequence": 0
+          },
+          {
+            "partition": 47,
+            "through_sequence": 0
+          },
+          {
+            "partition": 48,
+            "through_sequence": 0
+          },
+          {
+            "partition": 49,
+            "through_sequence": 0
+          },
+          {
+            "partition": 50,
+            "through_sequence": 0
+          },
+          {
+            "partition": 51,
+            "through_sequence": 0
+          },
+          {
+            "partition": 52,
+            "through_sequence": 0
+          },
+          {
+            "partition": 53,
+            "through_sequence": 0
+          },
+          {
+            "partition": 54,
+            "through_sequence": 0
+          },
+          {
+            "partition": 55,
+            "through_sequence": 0
+          },
+          {
+            "partition": 56,
+            "through_sequence": 0
+          },
+          {
+            "partition": 57,
+            "through_sequence": 0
+          },
+          {
+            "partition": 58,
+            "through_sequence": 0
+          },
+          {
+            "partition": 59,
+            "through_sequence": 0
+          },
+          {
+            "partition": 60,
+            "through_sequence": 0
+          },
+          {
+            "partition": 61,
+            "through_sequence": 0
+          },
+          {
+            "partition": 62,
+            "through_sequence": 0
+          },
+          {
+            "partition": 63,
+            "through_sequence": 0
+          }
+        ],
+        "parent_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_semi_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            110,
+            19,
+            58,
+            130,
+            165,
+            102,
+            22,
+            9,
+            84,
+            196,
+            183,
+            18,
+            254,
+            43,
+            134,
+            90,
+            86,
+            90,
+            180,
+            234,
+            132,
+            161,
+            203,
+            124,
+            212,
+            192,
+            111,
+            76,
+            138,
+            191,
+            3,
+            70
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            171,
+            79,
+            104,
+            33,
+            202,
+            181,
+            151,
+            156,
+            129,
+            128,
+            223,
+            194,
+            174,
+            174,
+            220,
+            103,
+            36,
+            42,
+            45,
+            60,
+            152,
+            25,
+            212,
+            5,
+            196,
+            223,
+            218,
+            226,
+            150,
+            1,
+            95,
+            227
+          ],
+          "stream_id": "soak_matrix_right_semi_aggregate",
+          "version": 1
+        },
+        "target_certificate": {
+          "catalog_generation": 1,
+          "changelog_mode": "weighted_retract_insert",
+          "distribution": {
+            "key_expressions_fingerprint": [
+              192,
+              50,
+              99,
+              209,
+              238,
+              144,
+              68,
+              238,
+              137,
+              69,
+              145,
+              153,
+              38,
+              247,
+              77,
+              228,
+              152,
+              144,
+              63,
+              5,
+              211,
+              201,
+              113,
+              246,
+              10,
+              165,
+              80,
+              43,
+              223,
+              36,
+              181,
+              103
+            ],
+            "kind": "vnode_partitioned",
+            "partition_abi": 2,
+            "vnode_count": 64
+          },
+          "final_operator_id": "stream:soak_matrix_right_semi_aggregate",
+          "history_retention_bytes": 0,
+          "pipeline_identity": {
+            "canonical_version": 7,
+            "sha256": "008b426f9e95787e282ee820754b3e72fb15d292e9f774080f4137417e06e4c1"
+          },
+          "protocol_version": 1,
+          "query_fingerprint": [
+            110,
+            19,
+            58,
+            130,
+            165,
+            102,
+            22,
+            9,
+            84,
+            196,
+            183,
+            18,
+            254,
+            43,
+            134,
+            90,
+            86,
+            90,
+            180,
+            234,
+            132,
+            161,
+            203,
+            124,
+            212,
+            192,
+            111,
+            76,
+            138,
+            191,
+            3,
+            70
+          ],
+          "schema_fingerprint": [
+            188,
+            192,
+            213,
+            216,
+            184,
+            235,
+            177,
+            3,
+            45,
+            228,
+            138,
+            21,
+            240,
+            83,
+            183,
+            236,
+            237,
+            132,
+            138,
+            222,
+            247,
+            121,
+            162,
+            183,
+            210,
+            213,
+            228,
+            222,
+            20,
+            93,
+            138,
+            145
+          ],
+          "stream_generation": [
+            171,
+            79,
+            104,
+            33,
+            202,
+            181,
+            151,
+            156,
+            129,
+            128,
+            223,
+            194,
+            174,
+            174,
+            220,
+            103,
+            36,
+            42,
+            45,
+            60,
+            152,
+            25,
+            212,
+            5,
+            196,
+            223,
+            218,
+            226,
+            150,
+            1,
+            95,
+            227
+          ],
+          "stream_id": "soak_matrix_right_semi_aggregate",
+          "version": 1
+        }
+      }
+    ]
+  },
+  "root_staging_elapsed_ms": 505.86030000000005,
+  "source_initialization_calls": 1,
+  "source_initialization_next_offsets": [
+    2,
+    3,
+    0
+  ],
+  "status": {
+    "admitted_by": {
+      "fencing_token": 4,
+      "owner": {
+        "boot_id": "5387feb6-0acf-4f1e-b90a-b86a1f236fbf",
+        "node_id": 12632117528189947522,
+        "process_term": 3
+      }
+    },
+    "admitted_sequence": 381,
+    "cut": {
+      "bound_sequence": 390,
+      "committed": {
+        "authority_sequence": 393,
+        "checkpoint": {
+          "checkpoint_id": 54,
+          "epoch": 54,
+          "len": 58875,
+          "sha256": "5f6b6ce4f1a365c8ae701115ce01eb334c967797a17d187a52e981a480ce42c6"
+        }
+      },
+      "completed_participants": [
+        {
+          "boot_incarnation": "5387feb6-0acf-4f1e-b90a-b86a1f236fbf",
+          "node_id": 12632117528189947522
+        },
+        {
+          "boot_incarnation": "19d70b30-1fe7-42c1-8c83-8a92bb8058c4",
+          "node_id": 15506916534570490772
+        },
+        {
+          "boot_incarnation": "dd4e3f91-ec27-40b9-9141-189bc5a39a85",
+          "node_id": 16059159448129433833
+        }
+      ],
+      "inventory": {
+        "assignment_fence": {
+          "assignment_digest": [
+            4,
+            129,
+            37,
+            184,
+            28,
+            193,
+            137,
+            119,
+            42,
+            153,
+            19,
+            91,
+            95,
+            41,
+            14,
+            107,
+            74,
+            116,
+            175,
+            189,
+            101,
+            148,
+            200,
+            56,
+            194,
+            6,
+            158,
+            183,
+            203,
+            130,
+            105,
+            203
+          ],
+          "assignment_version": 3,
+          "participants": [
+            {
+              "boot_incarnation": "5387feb6-0acf-4f1e-b90a-b86a1f236fbf",
+              "node_id": 12632117528189947522
+            },
+            {
+              "boot_incarnation": "19d70b30-1fe7-42c1-8c83-8a92bb8058c4",
+              "node_id": 15506916534570490772
+            },
+            {
+              "boot_incarnation": "dd4e3f91-ec27-40b9-9141-189bc5a39a85",
+              "node_id": 16059159448129433833
+            }
+          ],
+          "partitioning_abi_version": 2,
+          "vnode_count": 64
+        },
+        "attempt": {
+          "checkpoint_id": 54,
+          "epoch": 54
+        },
+        "deployment_id": "01a0fb91-f17e-7021-ad51-10bc6b12ca7c",
+        "pipeline_identity": {
+          "canonical_version": 7,
+          "sha256": "5eb8e33c866c74ffbd4269dc6c72ceeee17a2a2bdae354b286d9da30881c733d"
+        }
+      }
+    },
+    "migration_root": {
+      "authority_sequence": 402,
+      "root": {
+        "encoded_len": 51909,
+        "sha256": "d971796ed884e784359ead9cf2636837a34445d7f21989a436ec99d78985db5d"
+      }
+    },
+    "operation_id": "3a4f11cb-8f7e-4844-946a-439b39283b58",
+    "plan": {
+      "encoded_len": 1010,
+      "sha256": "7cf0cc29cbc3754823c95824c4ce14aea73a45dc6c635ecd6d6951c28173e3d6"
+    },
+    "preparation": {
+      "certificates": [
+        {
+          "authority_sequence": 389,
+          "participant": {
+            "boot_incarnation": "5387feb6-0acf-4f1e-b90a-b86a1f236fbf",
+            "node_id": 12632117528189947522
+          },
+          "process_term": 3,
+          "protocol_version": 2
+        },
+        {
+          "authority_sequence": 388,
+          "participant": {
+            "boot_incarnation": "19d70b30-1fe7-42c1-8c83-8a92bb8058c4",
+            "node_id": 15506916534570490772
+          },
+          "process_term": 1,
+          "protocol_version": 2
+        },
+        {
+          "authority_sequence": 387,
+          "participant": {
+            "boot_incarnation": "dd4e3f91-ec27-40b9-9141-189bc5a39a85",
+            "node_id": 16059159448129433833
+          },
+          "process_term": 1,
+          "protocol_version": 2
+        }
+      ],
+      "compatibility": {
+        "encoded_len": 24058,
+        "sha256": "9721b1484d26489e6821360cf47f7f7c1c1faa729601534fda67a1cf9c035806"
+      },
+      "complete_sequence": 389
+    },
+    "state": {
+      "phase": "cut_prepared"
+    },
+    "status_sequence": 402
+  }
+}

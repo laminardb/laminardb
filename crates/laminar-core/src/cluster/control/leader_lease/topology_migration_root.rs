@@ -5,20 +5,35 @@ use super::topology_admission::{
 };
 use super::{
     read_authority_record, AssignmentSnapshotStore, AuthorityCreateOutcome, LeaderLeaseStore,
-    OsPath, TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION,
+    OsPath, TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION, TOPOLOGY_SOURCE_ROOT_RECORD_VERSION,
 };
 use crate::checkpoint::{CheckpointStore, CommittedCheckpointIndex, LeaderProof};
 use crate::checkpoint_decision::CheckpointDecisionStore;
 use crate::cluster::control::{
-    ProcessLeaseAuthority, TopologyAdmissionPhase, TopologyAdmissionStatus, TopologyError,
-    TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
-    TopologyOperationId, TopologyPlanRef, MAX_TOPOLOGY_ROOT_MANIFEST_BYTES,
+    CatalogManifest, ProcessLeaseAuthority, TopologyAdmissionPhase, TopologyAdmissionStatus,
+    TopologyError, TopologyMigrationRoot, TopologyMigrationRootBinding, TopologyMigrationRootRef,
+    TopologyOperationId, TopologyPlanRef, TopologySourceInitialization,
+    MAX_TOPOLOGY_ROOT_MANIFEST_BYTES,
 };
+use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use std::future::Future;
 
 fn root_path(reference: &TopologyMigrationRootRef) -> OsPath {
     OsPath::from(format!(
         "control/topology-migration-roots/v1/{}.json",
         reference.sha256
+    ))
+}
+
+// Create-only staging, not a second authority head. The first successfully sealed vector survives
+// a disconnect before the shared append. A replacement leader aborts this pre-commit operation;
+// it cannot use the slot to commit or run a target. Existing artifact cleanup never sweeps this
+// control prefix. Root publication retains the content-addressed body independently of the slot.
+fn source_root_slot(operation: &TopologyAdmissionStatus) -> OsPath {
+    OsPath::from(format!(
+        "control/topology-source-root-staging/v1/{}/{}.json",
+        operation.operation_id.get(),
+        operation.plan.sha256,
     ))
 }
 
@@ -28,8 +43,8 @@ impl LeaderLeaseStore {
         checkpoint_store: &dyn CheckpointStore,
         operation: &TopologyAdmissionStatus,
         descriptor: &crate::cluster::control::ClusterTopologyValidation,
+        sources: Vec<TopologySourceInitialization>,
     ) -> Result<TopologyMigrationRoot, TopologyError> {
-        // Reject unresolved source starts before any metadata read or durable root write.
         TopologyMigrationRoot::object_mappings(descriptor)?;
         let reference = &operation
             .cut
@@ -65,7 +80,13 @@ impl LeaderLeaseStore {
                 })?;
             manifests.push(manifest);
         }
-        TopologyMigrationRoot::build(operation, descriptor, &index, &manifests)
+        if sources.is_empty() {
+            TopologyMigrationRoot::build(operation, descriptor, &index, &manifests)
+        } else {
+            TopologyMigrationRoot::build_with_sources(
+                operation, descriptor, &index, &manifests, sources,
+            )
+        }
     }
 
     /// Pin exact-cut restore requirements for certified stateless downstream additions.
@@ -88,9 +109,53 @@ impl LeaderLeaseStore {
         operation_id: TopologyOperationId,
         expected_plan: &TopologyPlanRef,
     ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        self.stage_topology_migration_root_with_initialization(
+            proof,
+            assignments,
+            processes,
+            checkpoint_store,
+            operation_id,
+            expected_plan,
+            |_, _| async {
+                Err(TopologyError::Unsupported(
+                    "new sources require the configured connector initialization path".into(),
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Stage a root with connector-owned new-source cursors resolved by the DB control path.
+    /// The callback runs only on the admitting leader after full preparation/assignment checks,
+    /// only if no sealed source root exists, and at most once in this call. It must not start or
+    /// consume sources or create sink effects. The first create-only sealed vector wins concurrent
+    /// attempts; all callers use that vector. Reads before a successful seal grant no boundary.
+    /// Cancellation after sealing, lost responses and CAS retries never reevaluate that vector.
+    /// No target Commit, restore or output permit is granted by either the slot or the shared append.
+    ///
+    /// # Errors
+    /// Requires the same exact certified held cut as downstream-only staging. Rejects damaged or
+    /// divergent slots, unsupported connector positions, stale authority and exceeded size/deadline
+    /// bounds. Query the same operation after an ambiguous outcome; never invent another identity.
+    #[allow(clippy::too_many_arguments)] // Existing authorities and one connector control callback.
+    pub async fn stage_topology_migration_root_with_initialization<F, Fut>(
+        &self,
+        proof: &LeaderProof,
+        assignments: &AssignmentSnapshotStore,
+        processes: &ProcessLeaseAuthority,
+        checkpoint_store: &dyn CheckpointStore,
+        operation_id: TopologyOperationId,
+        expected_plan: &TopologyPlanRef,
+        initialize: F,
+    ) -> Result<TopologyAdmissionStatus, TopologyError>
+    where
+        F: FnOnce(CatalogManifest, crate::cluster::control::ClusterTopologyValidation) -> Fut,
+        Fut: Future<Output = Result<Vec<TopologySourceInitialization>, TopologyError>>,
+    {
         expected_plan.validate()?;
         tokio::time::timeout(CONTROL_TIMEOUT, async {
             let mut staged = None;
+            let mut initialize = Some(initialize);
             for _ in 0..MAX_ADMISSION_ATTEMPTS {
                 let published = self
                     .load_published_authority_head()
@@ -138,14 +203,39 @@ impl LeaderLeaseStore {
                     return Ok(operation.clone());
                 }
                 if staged.is_none() {
-                    let root = self
-                        .build_topology_root(checkpoint_store, operation, &descriptor)
-                        .await?;
+                    let has_sources = descriptor.objects.iter().any(|object| {
+                        object.kind == crate::cluster::control::CatalogObjectKind::Source
+                            && object.transition == crate::cluster::control::topology::ClusterTopologyObjectTransition::AddFutureOnly
+                    });
+                    let sealed = if has_sources {
+                        self.load_source_root_slot(operation, &plan, &descriptor).await?
+                    } else { None };
+                    let sources = if let Some(root) = &sealed {
+                        root.source_initializations.clone()
+                    } else if has_sources {
+                        let target = self.load_catalog_manifest(&plan.target_manifest).await
+                            .map_err(TopologyError::from)?;
+                        initialize.take().ok_or_else(|| TopologyError::Invalid(
+                            "source initialization callback was already consumed".into(),
+                        ))?(target, descriptor.clone()).await?
+                    } else { Vec::new() };
+                    let root = self.build_topology_root(checkpoint_store, operation, &descriptor, sources).await?;
                     root.validate_binding(operation, &plan, &descriptor)?;
+                    let root = if let Some(sealed) = sealed {
+                        if root != sealed {
+                            return Err(TopologyError::Invalid("sealed source root differs from the exact cut metadata".into()));
+                        }
+                        sealed
+                    } else if has_sources {
+                        self.seal_source_root_slot(operation, &plan, &descriptor, &root).await?
+                    } else { root };
                     let (bytes, reference) = root.encode_and_reference()?;
                     self.stage_admission_blob(&root_path(&reference), &bytes)
                         .await?;
-                    staged = Some(reference);
+                    let record_version = if root.format_version == 2 {
+                        TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
+                    } else { TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION };
+                    staged = Some((reference, record_version));
                 }
                 let mut lease = current.lease.clone();
                 lease.seq = lease
@@ -154,7 +244,9 @@ impl LeaderLeaseStore {
                     .ok_or_else(|| TopologyError::Invalid("authority sequence exhausted".into()))?;
                 let sequence = lease.seq;
                 let mut next = current.preserve_with_lease(lease);
-                next.version = next.version.max(TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION);
+                next.version = next.version.max(staged.as_ref().ok_or_else(|| {
+                    TopologyError::Invalid("root staging lost its content reference".into())
+                })?.1);
                 let operation = &mut next.topology_operations[index];
                 operation.status_sequence = sequence;
                 operation.migration_root = Some(TopologyMigrationRootBinding {
@@ -163,7 +255,7 @@ impl LeaderLeaseStore {
                         .ok_or_else(|| {
                             TopologyError::Invalid("root staging lost its content reference".into())
                         })?
-                        .clone(),
+                        .0.clone(),
                     authority_sequence: sequence,
                 });
                 let result = operation.clone();
@@ -183,6 +275,90 @@ impl LeaderLeaseStore {
         })
         .await
         .map_err(|_| TopologyError::Contended)?
+    }
+
+    async fn load_source_root_slot(
+        &self,
+        operation: &TopologyAdmissionStatus,
+        plan: &crate::cluster::control::TopologyAdmissionPlan,
+        descriptor: &crate::cluster::control::ClusterTopologyValidation,
+    ) -> Result<Option<TopologyMigrationRoot>, TopologyError> {
+        let result = match self.store.get(&source_root_slot(operation)).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(TopologyError::Authority(super::LeaseError::Io(
+                    error.to_string(),
+                )))
+            }
+        };
+        let expected_len = result.meta.size;
+        if expected_len == 0
+            || expected_len > crate::cluster::control::topology::MAX_TOPOLOGY_ROOT_BYTES
+        {
+            return Err(TopologyError::Invalid(
+                "sealed source root exceeds its 1 MiB bound".into(),
+            ));
+        }
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|e| super::LeaseError::Io(e.to_string()))?;
+        let root: TopologyMigrationRoot =
+            serde_json::from_slice(&bytes).map_err(|e| TopologyError::Invalid(e.to_string()))?;
+        let (canonical, _) = root.encode_and_reference()?;
+        if root.format_version != 2
+            || canonical.as_slice() != bytes.as_ref()
+            || bytes.len() as u64 != expected_len
+        {
+            return Err(TopologyError::Invalid(
+                "sealed source root has a noncanonical body".into(),
+            ));
+        }
+        root.validate_binding(operation, plan, descriptor)?;
+        Ok(Some(root))
+    }
+
+    async fn seal_source_root_slot(
+        &self,
+        operation: &TopologyAdmissionStatus,
+        plan: &crate::cluster::control::TopologyAdmissionPlan,
+        descriptor: &crate::cluster::control::ClusterTopologyValidation,
+        proposed: &TopologyMigrationRoot,
+    ) -> Result<TopologyMigrationRoot, TopologyError> {
+        let (bytes, _) = proposed.encode_and_reference()?;
+        let write = self
+            .store
+            .put_opts(
+                &source_root_slot(operation),
+                PutPayload::from(bytes),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await;
+        // An unsuccessful response is not proof of failure. An existing valid slot is the winning
+        // boundary, including when a concurrent caller resolved a later broker high watermark.
+        let winner = self
+            .load_source_root_slot(operation, plan, descriptor)
+            .await?
+            .ok_or_else(|| match write {
+                Err(error) => TopologyError::Authority(super::LeaseError::Io(error.to_string())),
+                Ok(_) => {
+                    TopologyError::Invalid("sealed source root disappeared after creation".into())
+                }
+            })?;
+        let mut expected = proposed.clone();
+        expected
+            .source_initializations
+            .clone_from(&winner.source_initializations);
+        if winner != expected {
+            return Err(TopologyError::Invalid(
+                "source root slot changed preserved cut requirements".into(),
+            ));
+        }
+        Ok(winner)
     }
 
     async fn load_topology_root(
@@ -222,6 +398,11 @@ impl LeaderLeaseStore {
             .ok_or_else(|| {
                 TopologyError::Invalid("migration root authority anchor is missing".into())
             })?;
+        if root.format_version == 2 && record.version < TOPOLOGY_SOURCE_ROOT_RECORD_VERSION {
+            return Err(TopologyError::Protocol(
+                "source initialization roots require authority format 18".into(),
+            ));
+        }
         if record
             .topology_operations
             .iter()

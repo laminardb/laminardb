@@ -1,0 +1,6 @@
+{
+  "command": "cargo build --locked --profile soak -p laminar-server --no-default-features --features cluster,aws,kafka --bin laminardb --test cluster_soak",
+  "started_utc": "2026-10-02T07:09:03.0679580Z",
+  "ended_utc": "2026-10-02T07:38:12.6169617Z",
+  "exit_code": 0
+}

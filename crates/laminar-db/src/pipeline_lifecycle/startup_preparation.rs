@@ -3,7 +3,7 @@ use super::RuntimeMode;
 use super::{DbError, HashMap, LaminarDB};
 
 impl LaminarDB {
-    pub(super) fn build_registered_source_config(
+    pub(crate) fn build_registered_source_config(
         &self,
         source_name: &str,
         registration: &crate::connector_manager::SourceRegistration,

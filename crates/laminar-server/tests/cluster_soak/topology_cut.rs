@@ -6,17 +6,26 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use laminar_core::checkpoint::ObjectStoreCheckpointStore;
+#[cfg(feature = "kafka")]
+use laminar_connectors::{
+    config::ConnectorConfig,
+    connector::SourceConnector,
+    kafka::{KafkaSource, KafkaSourceConfig},
+};
+use laminar_core::checkpoint::{ConnectorCheckpoint, ObjectStoreCheckpointStore};
 use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::cluster::control::{
     AssignmentSnapshotStore, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
     CheckpointAssignmentFence, ClusterTopologyValidation, LeaderLeaseStore, LegacyTopologyBaseline,
     ProcessLeaseAuthority, TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan,
-    TopologyAdmissionStatus, TopologyError, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+    TopologyAdmissionStatus, TopologyError, TopologySourceInitialization,
+    TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
 
+#[cfg(feature = "kafka")]
 pub(super) fn prepare_old_cut(
     checkpoint_url: &str,
+    brokers: &str,
     nodes: &mut [Node],
     baseline: &LegacyTopologyBaseline,
     assignment: &CheckpointAssignmentFence,
@@ -46,6 +55,46 @@ pub(super) fn prepare_old_cut(
         .find(|entry| entry.kind == CatalogObjectKind::Source)
         .unwrap();
     let mut candidate = parent.clone();
+    let probe_id = uuid::Uuid::new_v4();
+    let probe_topic = format!("topology-source-probe-{probe_id}");
+    let probe_output_topic = format!("topology-source-output-{probe_id}");
+    let probe_group = format!("topology-source-group-{probe_id}");
+    super::kafka_create_topic(brokers, &probe_topic, 3);
+    let mut probe_config = ConnectorConfig::new("kafka");
+    for (key, value) in [
+        ("bootstrap.servers", brokers),
+        ("group.id", probe_group.as_str()),
+        ("topic", probe_topic.as_str()),
+        ("startup.mode", "latest"),
+        ("laminar.source.name", "topology_source_probe"),
+    ] {
+        probe_config.set(key, value);
+    }
+    // Explicit fixture input, before any candidate validation. Partition two remains never-read
+    // and empty. No target actor or sink is started in this pre-commit cut/abort scenario.
+    runtime.block_on(async {
+        use rdkafka::producer::{FutureProducer, FutureRecord};
+        let producer: FutureProducer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .unwrap();
+        for (partition, count) in [(0, 2), (1, 3)] {
+            for id in 0..count {
+                let payload = format!(r#"{{"id":{id},"value":{id}}}"#);
+                producer
+                    .send(
+                        FutureRecord::to(&probe_topic)
+                            .partition(partition)
+                            .key("probe")
+                            .payload(&payload),
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    });
     // Validate through the public, authenticated read-only API on every running process. The
     // admission below binds this descriptor; every process independently recompiles to certify it.
     candidate.entries.push(CatalogManifestEntry {
@@ -57,9 +106,22 @@ pub(super) fn prepare_old_cut(
             source.canonical_name.replace('"', "\"\"")
         ),
     });
+    for (name, kind, ddl) in [
+        ("topology_source_probe", CatalogObjectKind::Source, format!(
+            "CREATE SOURCE topology_source_probe (id BIGINT NOT NULL, value BIGINT NOT NULL) FROM kafka ('bootstrap.servers' = '{}', 'group.id' = '{}', 'topic' = '{}', 'startup.mode' = 'latest')",
+            brokers.replace('\'', "''"), probe_group, probe_topic,
+        )),
+        ("topology_source_stream", CatalogObjectKind::Stream, "CREATE STREAM topology_source_stream AS SELECT id, value FROM topology_source_probe".into()),
+        ("topology_source_sink", CatalogObjectKind::Sink, format!(
+            "CREATE SINK topology_source_sink FROM topology_source_stream INTO kafka ('bootstrap.servers' = '{}', 'topic' = '{}')",
+            brokers.replace('\'', "''"), probe_output_topic,
+        )),
+    ] {
+        candidate.entries.push(CatalogManifestEntry { canonical_name: name.into(), kind, catalog_generation: 1, ddl });
+    }
     let request = serde_json::json!({
         "expected_parent_version": baseline.topology_version.get(),
-        "statements": [candidate.entries.last().unwrap().ddl],
+        "statements": candidate.entries[parent.entries.len()..].iter().map(|e| &e.ddl).collect::<Vec<_>>(),
     });
     let mut validations = Vec::new();
     let mut expected_validation = None;
@@ -252,17 +314,50 @@ pub(super) fn prepare_old_cut(
     let prepared = prepared.unwrap();
     let cut_prepared_elapsed = started.elapsed();
     let root_started = Instant::now();
+    let initialization_calls = std::sync::atomic::AtomicUsize::new(0);
+    let initialization_counter = &initialization_calls;
+    let initialization_config = &probe_config;
     let prepared = runtime
         .block_on(async {
             let proof = authority.load().await.unwrap().unwrap().proof();
             authority
-                .stage_topology_migration_root(
+                .stage_topology_migration_root_with_initialization(
                     &proof,
                     &assignments,
                     &processes,
                     &checkpoint_store,
                     prepared.operation_id,
                     &prepared.plan,
+                    |_, descriptor| async move {
+                        initialization_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let object = descriptor
+                            .objects
+                            .iter()
+                            .find(|o| o.name == "topology_source_probe")
+                            .unwrap();
+                        let mut source = KafkaSource::new(
+                            Arc::new(arrow_schema::Schema::empty()),
+                            KafkaSourceConfig::from_config(initialization_config).unwrap(),
+                            None,
+                        );
+                        let checkpoint = source
+                            .resolve_initial_position(initialization_config)
+                            .await
+                            .map_err(|e| TopologyError::Unsupported(e.to_string()))?;
+                        Ok(vec![TopologySourceInitialization {
+                            name: object.name.clone(),
+                            catalog_generation: object.catalog_generation,
+                            compatibility_sha256: object.compatibility_sha256.clone(),
+                            checkpoint: ConnectorCheckpoint {
+                                offsets: checkpoint.durable_offsets(),
+                                metadata: checkpoint.metadata().clone(),
+                                input_channels: checkpoint
+                                    .input_channels()
+                                    .map(<[Vec<u8>]>::to_vec),
+                                source_assignment_version: checkpoint.assignment_version(),
+                            },
+                        }])
+                    },
                 )
                 .await
         })
@@ -281,7 +376,26 @@ pub(super) fn prepare_old_cut(
         .map(|p| p.manifest_len)
         .sum::<u64>();
     assert_eq!(root.preserved_objects.len(), descriptor.objects.iter().filter(|o| o.transition == laminar_core::cluster::control::topology::ClusterTopologyObjectTransition::Preserve).count());
-    assert_eq!(root.future_only_objects, ["topology_cut_probe"]);
+    assert_eq!(
+        root.future_only_objects,
+        [
+            "topology_cut_probe",
+            "topology_source_probe",
+            "topology_source_sink",
+            "topology_source_stream"
+        ]
+    );
+    assert_eq!(root.format_version, 2);
+    assert_eq!(root.source_initializations.len(), 1);
+    let initial = &root.source_initializations[0].checkpoint;
+    for (partition, next) in [(0, 2), (1, 3), (2, 0)] {
+        assert_eq!(
+            initial.offsets[&format!("@laminar.kafka.next.v1:{probe_topic}:{partition}")],
+            next.to_string()
+        );
+    }
+    assert_eq!(initial.input_channels.as_ref().unwrap().len(), 3);
+    assert!(initial.source_assignment_version.is_none());
     assert!(root
         .subscriptions
         .iter()
@@ -305,12 +419,17 @@ pub(super) fn prepare_old_cut(
             .unwrap()
     });
     assert_eq!(retried, prepared);
+    assert_eq!(
+        initialization_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     std::fs::write(
         evidence_dir.join("topology-migration-root.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "cut_prepared_elapsed_ms": cut_prepared_elapsed.as_secs_f64() * 1000.0,
             "participant_manifest_metadata_bytes": manifest_metadata_bytes,
             "root_staging_elapsed_ms": root_elapsed_ms, "root": root, "status": prepared,
+            "source_initialization_calls": 1, "source_initialization_next_offsets": [2, 3, 0],
         }))
         .unwrap(),
     )

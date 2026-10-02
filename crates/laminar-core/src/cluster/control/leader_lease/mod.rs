@@ -65,6 +65,7 @@ const TOPOLOGY_ADMISSION_RECORD_VERSION: u32 = 14;
 const TOPOLOGY_CUT_RECORD_VERSION: u32 = 15;
 const TOPOLOGY_PREPARATION_RECORD_VERSION: u32 = 16;
 const TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION: u32 = 17;
+const TOPOLOGY_SOURCE_ROOT_RECORD_VERSION: u32 = 18;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1335,6 +1336,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_CUT_RECORD_VERSION
             && self.version != TOPOLOGY_PREPARATION_RECORD_VERSION
             && self.version != TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION
+            && self.version != TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",

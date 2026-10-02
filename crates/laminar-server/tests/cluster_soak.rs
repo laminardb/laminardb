@@ -14635,6 +14635,7 @@ fn run_three_node_join_kill9_soak_with_adoption(
         let old_cut = prepare_topology_cut.then(|| {
             topology_cut::prepare_old_cut(
                 &checkpoint_url,
+                &brokers,
                 &mut nodes,
                 baseline,
                 &restart_fence,

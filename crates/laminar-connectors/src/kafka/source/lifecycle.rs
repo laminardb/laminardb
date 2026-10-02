@@ -12,6 +12,13 @@ use super::{
 
 #[async_trait]
 impl SourceConnector for KafkaSource {
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        self.resolve_initial_position_inner(config).await
+    }
+
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.task_tracker.clone())
     }

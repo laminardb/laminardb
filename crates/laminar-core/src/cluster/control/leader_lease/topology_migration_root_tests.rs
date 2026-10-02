@@ -46,6 +46,10 @@ impl Fixture {
 }
 
 async fn fixture(authority: &LeaderLeaseStore) -> Fixture {
+    fixture_with_sources(authority, false).await
+}
+
+async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -> Fixture {
     let incumbent = owner(1, 1, 1);
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&incumbent, 0).await.unwrap()
     else {
@@ -115,6 +119,17 @@ async fn fixture(authority: &LeaderLeaseStore) -> Fixture {
             catalog_generation: 1,
             ddl: "CREATE STREAM later AS SELECT * FROM totals".into(),
         });
+    if add_sources {
+        for (name, kind, ddl) in [
+            ("added_source", CatalogObjectKind::Source, "CREATE SOURCE added_source (id BIGINT) FROM kafka ('topic' = 'new', 'startup.mode' = 'latest')"),
+            ("added_stream", CatalogObjectKind::Stream, "CREATE STREAM added_stream AS SELECT * FROM added_source"),
+            ("added_sink", CatalogObjectKind::Sink, "CREATE SINK added_sink FROM added_stream INTO kafka ('topic' = 'new-output')"),
+        ] {
+            target.entries.push(crate::cluster::control::CatalogManifestEntry {
+                canonical_name: name.into(), kind, catalog_generation: 1, ddl: ddl.into(),
+            });
+        }
+    }
     let mut descriptor = ClusterTopologyValidation {
         validation_format_version: 1,
         scope: TopologyValidationScope::LocalCandidatePlan,
@@ -145,6 +160,8 @@ async fn fixture(authority: &LeaderLeaseStore) -> Fixture {
                 },
                 initialization: if index < parent.entries.len() {
                     TopologyInitialization::PreserveExactCut
+                } else if e.kind == CatalogObjectKind::Source {
+                    TopologyInitialization::ResolveSourcePositionsOnce
                 } else {
                     TopologyInitialization::FutureOnlyAtCut
                 },
@@ -365,6 +382,9 @@ async fn fixture(authority: &LeaderLeaseStore) -> Fixture {
         manifests,
     }
 }
+
+#[path = "topology_source_root_tests.rs"]
+mod source_initialization;
 
 fn checkpoint_store(authority: &LeaderLeaseStore, vnode_count: u32) -> ObjectStoreCheckpointStore {
     ObjectStoreCheckpointStore::new(authority.store.clone(), "")

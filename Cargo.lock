@@ -5389,6 +5389,7 @@ dependencies = [
  "futures",
  "gethostname",
  "humantime-serde",
+ "laminar-connectors",
  "laminar-core",
  "laminar-db",
  "laminar-sql",

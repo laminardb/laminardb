@@ -238,7 +238,7 @@ impl LaminarDB {
         Ok(())
     }
 
-    fn isolated_topology_catalog(&self) -> Result<LaminarDB, DbError> {
+    pub(super) fn isolated_topology_catalog(&self) -> Result<LaminarDB, DbError> {
         let mut candidate = Self::open_with_config_and_vars_and_rules(
             self.config.clone(),
             self.config_vars.as_ref().clone(),
@@ -260,7 +260,9 @@ impl LaminarDB {
         Ok(candidate)
     }
 
-    fn topology_definition_identities(&self) -> Result<PipelineCompatibilityIdentities, DbError> {
+    pub(super) fn topology_definition_identities(
+        &self,
+    ) -> Result<PipelineCompatibilityIdentities, DbError> {
         let vnode_count = self.checkpoint_key_groups().into();
         let manager = self.connector_manager.lock();
         compatibility_identities(&PipelineIdentityContext::new(
@@ -340,7 +342,10 @@ fn parse_one_create(sql: &str) -> Result<StreamingStatement, DbError> {
     Ok(statement)
 }
 
-async fn replay_entry(candidate: &LaminarDB, entry: &CatalogManifestEntry) -> Result<(), DbError> {
+pub(super) async fn replay_entry(
+    candidate: &LaminarDB,
+    entry: &CatalogManifestEntry,
+) -> Result<(), DbError> {
     let statement = parse_one_create(&entry.ddl)?;
     let (name, kind, _) =
         super::super::validate_cluster_catalog_create(candidate, &entry.ddl, &statement)?;

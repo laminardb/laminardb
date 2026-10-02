@@ -48,6 +48,7 @@ mod checkpoint;
 mod debezium;
 mod decoding;
 mod drain;
+mod initialization;
 mod lifecycle;
 mod metadata;
 mod polling;

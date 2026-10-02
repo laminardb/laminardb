@@ -19,7 +19,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::*;
 use crate::{ClusterTopologyObjectTransition, TopologyInitialization, TopologyValidationScope};
 
-struct PlanningSource(Arc<AtomicUsize>);
+struct PlanningSource(Arc<AtomicUsize>, Arc<AtomicUsize>);
 
 fn forbidden_effect(effects: &AtomicUsize) -> ConnectorError {
     effects.fetch_add(1, Ordering::SeqCst);
@@ -28,6 +28,26 @@ fn forbidden_effect(effects: &AtomicUsize) -> ConnectorError {
 
 #[async_trait]
 impl SourceConnector for PlanningSource {
+    async fn resolve_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
+        if config.get("laminar.source.name") != Some("added_source")
+            || config.get("topic") != Some("new")
+            || config.get("start") != Some("latest")
+        {
+            return Err(forbidden_effect(&self.0));
+        }
+        let next = 91 + self.1.fetch_add(1, Ordering::SeqCst);
+        let mut checkpoint = SourceCheckpoint::with_offsets(HashMap::from([(
+            "partition-0-next".into(),
+            next.to_string(),
+        )]));
+        checkpoint.set_metadata("connector", "planning-source");
+        checkpoint.set_input_channels(vec![vec![1]])?;
+        Ok(checkpoint)
+    }
+
     fn schema(&self) -> arrow_schema::SchemaRef {
         crate::temporal_test_source::schema()
     }
@@ -113,6 +133,7 @@ struct Fixture {
     db: Arc<LaminarDB>,
     authority: TestCatalogAuthority,
     effects: Arc<AtomicUsize>,
+    resolutions: Arc<AtomicUsize>,
 }
 
 impl Fixture {
@@ -127,8 +148,52 @@ impl Fixture {
     }
 
     async fn with_authority(authority: TestCatalogAuthority) -> Self {
+        Self::with_authority_and_generation(authority, 1).await
+    }
+
+    async fn with_authority_and_generation(
+        authority: TestCatalogAuthority,
+        stream_generation: u64,
+    ) -> Self {
+        let bootstrap = vec![
+            source_ddl("trades", "'topic' = 'old'"),
+            "CREATE STREAM totals AS SELECT id, SUM(value) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
+            "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into(),
+        ];
+        if stream_generation != 1 {
+            use laminar_core::cluster::control::{
+                CatalogManifest, CatalogManifestEntry, CatalogObjectKind,
+            };
+            let entries = bootstrap
+                .iter()
+                .cloned()
+                .zip([
+                    ("trades", CatalogObjectKind::Source, 1),
+                    ("totals", CatalogObjectKind::Stream, stream_generation),
+                    ("existing_sink", CatalogObjectKind::Sink, 1),
+                ])
+                .map(
+                    |(ddl, (name, kind, catalog_generation))| CatalogManifestEntry {
+                        canonical_name: name.into(),
+                        kind,
+                        catalog_generation,
+                        ddl,
+                    },
+                )
+                .collect();
+            authority
+                .manifest_store
+                .seal(
+                    &CatalogManifest::new(entries).unwrap(),
+                    &authority.lease.proof(),
+                )
+                .await
+                .unwrap();
+        }
         let effects = Arc::new(AtomicUsize::new(0));
         let factory_effects = Arc::clone(&effects);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let factory_resolutions = Arc::clone(&resolutions);
         let process = authority.controller.recovery_incarnation();
         let receiver = Arc::new(
             laminar_core::shuffle::ShuffleReceiver::bind(
@@ -155,6 +220,7 @@ impl Fixture {
             })
             .register_connector(move |registry| {
                 let source_effects = Arc::clone(&factory_effects);
+                let source_resolutions = Arc::clone(&factory_resolutions);
                 registry.register_source(
                     "planning-source",
                     ConnectorInfo {
@@ -165,7 +231,12 @@ impl Fixture {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(move |_| Ok(Box::new(PlanningSource(Arc::clone(&source_effects))))),
+                    Arc::new(move |_| {
+                        Ok(Box::new(PlanningSource(
+                            Arc::clone(&source_effects),
+                            Arc::clone(&source_resolutions),
+                        )))
+                    }),
                 )?;
                 registry.register_sink(
                     "planning-sink",
@@ -183,15 +254,14 @@ impl Fixture {
             .build()
             .await
             .unwrap();
-        db.execute_cluster_bootstrap_batch(&[
-            source_ddl("trades", "'topic' = 'old'"),
-            "CREATE STREAM totals AS SELECT id, SUM(value) AS total FROM trades GROUP BY id EMIT CHANGES WITH ('retain_history' = '4mb')".into(),
-            "CREATE SINK existing_sink FROM totals INTO \"planning-sink\" ('topic' = 'old-output')".into(),
-        ]).await.unwrap();
+        db.execute_cluster_bootstrap_batch(&bootstrap)
+            .await
+            .unwrap();
         Self {
             db,
             authority,
             effects,
+            resolutions,
         }
     }
 
@@ -245,6 +315,15 @@ impl Fixture {
 }
 
 async fn preparation_fixture() -> (
+    Fixture,
+    laminar_core::cluster::control::AssignmentSnapshotStore,
+) {
+    preparation_fixture_with_generation(1).await
+}
+
+async fn preparation_fixture_with_generation(
+    stream_generation: u64,
+) -> (
     Fixture,
     laminar_core::cluster::control::AssignmentSnapshotStore,
 ) {
@@ -327,7 +406,7 @@ async fn preparation_fixture() -> (
         .unwrap();
     authority.controller = controller;
     authority.lease_tx = lease_tx;
-    let fixture = Fixture::with_authority(authority).await;
+    let fixture = Fixture::with_authority_and_generation(authority, stream_generation).await;
     fixture.adopt().await;
     (fixture, AssignmentSnapshotStore::new(objects))
 }
@@ -336,11 +415,28 @@ async fn admit_preparation_candidate(
     fixture: &Fixture,
     assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
 ) -> laminar_core::cluster::control::TopologyAdmissionStatus {
+    admit_preparation_entries(
+        fixture,
+        assignments,
+        vec![laminar_core::cluster::control::CatalogManifestEntry {
+            canonical_name: "future".into(),
+            kind: laminar_core::cluster::control::CatalogObjectKind::Stream,
+            catalog_generation: 1,
+            ddl: "CREATE STREAM future AS SELECT * FROM totals".into(),
+        }],
+    )
+    .await
+}
+
+async fn admit_preparation_entries(
+    fixture: &Fixture,
+    assignments: &laminar_core::cluster::control::AssignmentSnapshotStore,
+    entries: Vec<laminar_core::cluster::control::CatalogManifestEntry>,
+) -> laminar_core::cluster::control::TopologyAdmissionStatus {
     use laminar_core::cluster::control::{
-        CatalogManifestEntry, CatalogObjectKind, TopologyAdmissionPlan,
-        TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
+        TopologyAdmissionPlan, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
     };
-    let statements = vec!["CREATE STREAM future AS SELECT * FROM totals".into()];
+    let statements = entries.iter().map(|e| e.ddl.clone()).collect::<Vec<_>>();
     let descriptor = fixture.validate(&statements).await.unwrap();
     let mut target = fixture
         .authority
@@ -349,12 +445,7 @@ async fn admit_preparation_candidate(
         .await
         .unwrap()
         .unwrap();
-    target.entries.push(CatalogManifestEntry {
-        canonical_name: "future".into(),
-        kind: CatalogObjectKind::Stream,
-        catalog_generation: 1,
-        ddl: statements[0].clone(),
-    });
+    target.entries.extend(entries);
     let compatibility = fixture
         .authority
         .lease_store
@@ -487,6 +578,15 @@ async fn topology_preparation_rejects_changed_local_config_and_nonrunning_parent
 #[tokio::test]
 async fn topology_root_staging_uses_configured_metadata_and_process_authority_without_actor_effects(
 ) {
+    assert_root_staging(false).await;
+}
+
+#[tokio::test]
+async fn topology_initialization_db_uses_configured_factory_once_without_actor_effects() {
+    assert_root_staging(true).await;
+}
+
+async fn assert_root_staging(add_source: bool) {
     use laminar_core::checkpoint::{
         ByteRange, CheckpointAttempt, CheckpointManifest, CheckpointStore,
         CommittedCheckpointIndex, CommittedParticipantRef, ConnectorCheckpoint,
@@ -494,8 +594,39 @@ async fn topology_root_staging_uses_configured_metadata_and_process_authority_wi
     };
     use laminar_core::checkpoint_decision::{CheckpointArtifactInventory, CheckpointVerdict};
     use std::collections::BTreeMap;
-    let (fixture, assignments) = preparation_fixture().await;
-    let admitted = admit_preparation_candidate(&fixture, &assignments).await;
+    // New-source replay must preserve a durable parent incarnation greater than 1.
+    let (fixture, assignments) =
+        preparation_fixture_with_generation(if add_source { 7 } else { 1 }).await;
+    let admitted = if add_source {
+        let entries = independent_pipeline()
+            .into_iter()
+            .zip([
+                (
+                    "added_source",
+                    laminar_core::cluster::control::CatalogObjectKind::Source,
+                ),
+                (
+                    "added_stream",
+                    laminar_core::cluster::control::CatalogObjectKind::Stream,
+                ),
+                (
+                    "added_sink",
+                    laminar_core::cluster::control::CatalogObjectKind::Sink,
+                ),
+            ])
+            .map(
+                |(ddl, (name, kind))| laminar_core::cluster::control::CatalogManifestEntry {
+                    canonical_name: name.into(),
+                    kind,
+                    catalog_generation: 1,
+                    ddl,
+                },
+            )
+            .collect();
+        admit_preparation_entries(&fixture, &assignments, entries).await
+    } else {
+        admit_preparation_candidate(&fixture, &assignments).await
+    };
     fixture
         .db
         .prepare_cluster_topology_operation(admitted.operation_id)
@@ -619,6 +750,32 @@ async fn topology_root_staging_uses_configured_metadata_and_process_authority_wi
         .await
         .unwrap();
     assert!(staged.migration_root.is_some());
+    let root = fixture
+        .authority
+        .lease_store
+        .topology_migration_root(admitted.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    if add_source {
+        assert_eq!(
+            root.preserved_objects
+                .iter()
+                .find(|object| object.name == "totals")
+                .unwrap()
+                .catalog_generation,
+            7,
+        );
+        assert_eq!(root.format_version, 2);
+        assert_eq!(root.source_initializations.len(), 1);
+        let source = &root.source_initializations[0];
+        assert_eq!(source.name, "added_source");
+        assert_eq!(source.checkpoint.offsets["partition-0-next"], "91");
+        assert_eq!(source.checkpoint.input_channels, Some(vec![vec![1]]));
+        assert_eq!(source.checkpoint.source_assignment_version, None);
+    } else {
+        assert!(root.source_initializations.is_empty());
+    }
     assert_eq!(
         fixture
             .db
@@ -631,6 +788,10 @@ async fn topology_root_staging_uses_configured_metadata_and_process_authority_wi
     assert!(fixture.db.source_gate.load(Ordering::Acquire));
     assert_eq!(fixture.db.catalog_manifest_inventory().unwrap(), inventory);
     assert_eq!(fixture.effects.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture.resolutions.load(Ordering::SeqCst),
+        usize::from(add_source)
+    );
     assert!(fixture.db.owned_source_tasks.lock().is_empty());
     assert!(fixture.db.owned_sink_handles.lock().is_empty());
     fixture.db.shutdown.store(true, Ordering::Release);
