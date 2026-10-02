@@ -12,6 +12,10 @@ use super::{
 
 #[async_trait]
 impl SourceConnector for KafkaSource {
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
     async fn resolve_initial_position(
         &mut self,
         config: &ConnectorConfig,

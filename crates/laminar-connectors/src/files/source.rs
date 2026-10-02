@@ -234,6 +234,11 @@ impl SourceConnector for FileSource {
         // manifest would rediscover and duplicate every previously ingested file.
         let (manifest, progress) = match position {
             SourcePosition::Initial => (FileIngestionManifest::new(), None),
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "file source has no sealed topology startup contract".into(),
+                ));
+            }
             SourcePosition::Resume {
                 attempt,
                 checkpoint,

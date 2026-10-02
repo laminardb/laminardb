@@ -11,6 +11,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 
+#[path = "sealed_start_tests.rs"]
+mod sealed_start_tests;
+
 fn test_source_channel(capacity: usize) -> (SourceMsgTx, SourceMsgRx) {
     source_channel::channel(capacity, crate::DEFAULT_SOURCE_QUEUE_MAX_BYTES)
 }
@@ -6821,6 +6824,10 @@ impl laminar_connectors::connector::SourceConnector for BarrierRetrySource {
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SourceConnector for StartupSource {
+    fn supports_initialized_start(&self) -> bool {
+        true
+    }
+
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
         self.cancellation_policy
     }

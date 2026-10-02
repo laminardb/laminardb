@@ -11,7 +11,7 @@ fn config(mode: StartupMode) -> KafkaSourceConfig {
     }
 }
 
-fn sealed_position() -> SourceCheckpoint {
+pub(super) fn sealed_position() -> SourceCheckpoint {
     let inventory = KafkaPartitionSet::from([("events".into(), 0), ("events".into(), 1)]);
     let mut checkpoint = OffsetTracker::new().to_checkpoint_for_partitions(
         inventory

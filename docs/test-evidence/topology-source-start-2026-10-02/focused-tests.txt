@@ -1,0 +1,50 @@
+CARGO_BUILD_JOBS=1
+RUST_MIN_STACK=4194304
+
+cargo test --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --lib --bins topology_start_ -- --nocapture
+exit_code: 0
+
+Finished `test` profile [unoptimized + debuginfo] target(s) in 8m 36s
+     Running unittests src\lib.rs (target\debug\deps\laminar_connectors-d995ef82c5c9bcd6.exe)
+
+running 8 tests
+test kafka::source::initialization::startup_tests::topology_start_kafka_real_broker_sealed_latest_retries_without_history_or_ack ... ignored, requires Kafka/Redpanda at LAMINAR_KAFKA_TEST_BROKERS (default 127.0.0.1:19092)
+test connector::tests::topology_start_initialized_has_no_attempt_and_rejects_assignment_ownership ... ok
+test kafka::source::initialization::startup_tests::topology_start_kafka_shared_validation_deadline_leaves_no_active_reader ... ok
+test kafka::source::initialization::startup_tests::topology_start_kafka_rejects_processed_or_wrong_source_cursors_before_native_work ... ok
+test kafka::source::initialization::startup_tests::topology_start_kafka_cancelled_validation_keeps_exact_request_reusable ... ok
+test kafka::source::initialization::startup_tests::topology_start_kafka_rejects_changed_inventory_and_future_offsets_without_reader ... ok
+test kafka::source::initialization::startup_tests::topology_start_kafka_current_vnode_owners_filter_one_global_sealed_vector ... ok
+sealed Kafka startup: next=[2,3,0], retries=2, post_boundary_ids=[100,101,102], subscribed=false, acknowledged=false
+test kafka::source::initialization::startup_tests::topology_start_kafka_native_retries_preserve_latest_vector_and_no_ack ... ok
+
+test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 915 filtered out; finished in 3.33s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_core-9b1613879a5ff62e.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1078 filtered out; finished in 0.00s
+
+     Running unittests src\lib.rs (target\debug\deps\laminar_db-37560d7655ba525f.exe)
+
+running 5 tests
+test pipeline::streaming_coordinator::tests::sealed_start_tests::topology_start_runtime_initialized_deadline_closes_without_spawning_actors ... ok
+test pipeline::streaming_coordinator::tests::sealed_start_tests::topology_start_runtime_uncertified_custom_source_cannot_ignore_sealed_position ... ok
+test pipeline::streaming_coordinator::tests::sealed_start_tests::topology_start_runtime_owned_initialization_rejects_before_connector_io ... ok
+test pipeline::streaming_coordinator::tests::sealed_start_tests::topology_start_runtime_held_source_does_not_seed_committed_progress_or_ack ... ok
+test db::tests::topology_planning::restore::retirement::topology_commit::topology_transport::topology_start_db_exact_committed_root_produces_distinct_preserved_and_initialized_requests ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2026 filtered out; finished in 0.94s
+
+     Running unittests src\bin\hash_test.rs (target\debug\deps\hash_test-d740050894734938.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src\main.rs (target\debug\deps\laminardb-572646521bf03734.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 356 filtered out; finished in 0.00s

@@ -368,6 +368,11 @@ impl SourceConnector for NatsSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "NATS has no sealed topology startup contract".into(),
+            ));
+        }
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "NATS is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"

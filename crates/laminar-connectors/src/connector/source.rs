@@ -36,6 +36,14 @@ pub enum SourceCheckpointUnavailablePolicy {
 pub enum SourcePosition {
     /// Start from the connector's configured deterministic initial position.
     Initial,
+    /// Install the complete unowned cursor sealed for a new topology source.
+    /// This boundary is not processed history and carries no checkpoint attempt or
+    /// acknowledgement. Only connectors with a certified sealed-start contract accept it.
+    /// The caller must retain intake until the committed topology's coordinated Release.
+    Initialized {
+        /// Exact global cursor, validated and filtered by current source ownership at startup.
+        checkpoint: SourceCheckpoint,
+    },
     /// Resume from an exact durable engine checkpoint.
     Resume {
         /// Checkpoint attempt that owns the connector state.
@@ -53,7 +61,7 @@ pub enum SourcePosition {
 pub struct SourceStart {
     /// Fully resolved connector configuration.
     config: ConnectorConfig,
-    /// Initial or exact recovery position.
+    /// Configured, sealed new-source, or exact recovery position.
     position: SourcePosition,
     /// Pipeline-wide delivery guarantee used for fail-closed cursor policy.
     delivery: DeliveryGuarantee,
@@ -63,7 +71,8 @@ impl SourceStart {
     /// Construct a source startup request before any connector I/O.
     ///
     /// # Errors
-    /// Returns a configuration error when a resume attempt is zero or split across two identities.
+    /// Returns a configuration error for a noncanonical resume, unsupported initialized delivery,
+    /// or an already-owned initialization.
     pub fn new(
         config: ConnectorConfig,
         position: SourcePosition,
@@ -77,6 +86,20 @@ impl SourceStart {
                 "source resume must use one nonzero canonical checkpoint ID".into(),
             ));
         }
+        if matches!(&position, SourcePosition::Initialized { .. })
+            && delivery == DeliveryGuarantee::BestEffort
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "sealed topology initialization requires at-least-once or certified exactly-once source delivery".into(),
+            ));
+        }
+        if matches!(&position, SourcePosition::Initialized { checkpoint }
+            if checkpoint.assignment_version().is_some())
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "sealed source initialization must be an unowned global cursor".into(),
+            ));
+        }
         Ok(Self {
             config,
             position,
@@ -88,6 +111,14 @@ impl SourceStart {
     #[must_use]
     pub fn into_parts(self) -> (ConnectorConfig, SourcePosition, DeliveryGuarantee) {
         (self.config, self.position, self.delivery)
+    }
+
+    #[cfg(feature = "kafka")]
+    pub(crate) fn initialized_checkpoint(&self) -> Option<(&ConnectorConfig, &SourceCheckpoint)> {
+        match &self.position {
+            SourcePosition::Initialized { checkpoint } => Some((&self.config, checkpoint)),
+            SourcePosition::Initial | SourcePosition::Resume { .. } => None,
+        }
     }
 }
 
@@ -167,6 +198,14 @@ pub trait SourceConnector: Send {
     /// Implementations must not emit records or expose an externally active
     /// consumer before the requested position has been applied successfully.
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError>;
+
+    /// Whether atomic `start` validates and installs `SourcePosition::Initialized` without
+    /// resolving its boundary again or acknowledging pre-boundary input. Discovery/validation
+    /// hooks alone do not certify startup. The runtime rejects unrecognized implementations
+    /// before I/O; this capability is neither topology authority nor actor readiness.
+    fn supports_initialized_start(&self) -> bool {
+        false
+    }
 
     /// `Ok(None)` = no data currently available; runtime retries after a delay.
     /// `max_records` is the normal batching target. A source may exceed it only

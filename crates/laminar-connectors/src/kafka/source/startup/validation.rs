@@ -11,7 +11,7 @@ use super::{
 struct PreparedStartPosition {
     offsets: OffsetTracker,
     resume_attempt: Option<laminar_core::checkpoint::CheckpointAttempt>,
-    is_resume: bool,
+    has_saved_position: bool,
     input_channels: Option<Vec<Vec<u8>>>,
     baselines: KafkaPartitionBaselines,
 }
@@ -29,7 +29,7 @@ fn prepare_start_position(
         SourcePosition::Initial => Ok(PreparedStartPosition {
             offsets: OffsetTracker::new(),
             resume_attempt: None,
-            is_resume: false,
+            has_saved_position: false,
             input_channels: None,
             baselines: KafkaPartitionBaselines::new(),
         }),
@@ -43,11 +43,18 @@ fn prepare_start_position(
             Ok(PreparedStartPosition {
                 offsets,
                 resume_attempt: Some(attempt),
-                is_resume: true,
+                has_saved_position: true,
                 input_channels,
                 baselines,
             })
         }
+        SourcePosition::Initialized { checkpoint } => Ok(PreparedStartPosition {
+            offsets: OffsetTracker::try_from_checkpoint(&checkpoint)?,
+            resume_attempt: None,
+            has_saved_position: true,
+            input_channels: checkpoint.input_channels().map(<[Vec<u8>]>::to_vec),
+            baselines: decode_partition_baselines(&checkpoint)?,
+        }),
     }
 }
 
@@ -70,13 +77,14 @@ impl KafkaSource {
         let PreparedStartPosition {
             offsets: installed_offsets,
             resume_attempt,
-            is_resume,
+            has_saved_position,
             input_channels: resume_input_channels,
             baselines: resume_baselines,
         } = prepared_position;
-        self.validate_start_policy(&kafka_config, delivery)?;
+        self.validate_start_policy(&kafka_config, delivery, has_saved_position)?;
 
-        let deterministic_unrecorded = is_resume || delivery != DeliveryGuarantee::BestEffort;
+        let deterministic_unrecorded =
+            has_saved_position || delivery != DeliveryGuarantee::BestEffort;
         let configured_source_name = config.get("laminar.source.name");
         if self.vnode_assignment.is_some() {
             if configured_source_name
@@ -127,7 +135,7 @@ impl KafkaSource {
         Ok(KafkaStartPlan {
             config: kafka_config,
             delivery,
-            is_resume,
+            has_saved_position,
             resume_input_channels,
             resume_baselines,
         })
@@ -137,6 +145,7 @@ impl KafkaSource {
         &self,
         config: &KafkaSourceConfig,
         delivery: DeliveryGuarantee,
+        has_saved_position: bool,
     ) -> Result<(), ConnectorError> {
         if (self.vnode_assignment.is_some() || delivery != DeliveryGuarantee::BestEffort)
             && matches!(&config.subscription, TopicSubscription::Pattern(_))
@@ -186,6 +195,7 @@ impl KafkaSource {
         }
         if delivery != DeliveryGuarantee::BestEffort
             && matches!(&config.startup_mode, StartupMode::Latest)
+            && !has_saved_position
         {
             return Err(ConnectorError::ConfigurationError(
                 "Kafka guaranteed delivery requires a stable unrecorded-partition start; latest \

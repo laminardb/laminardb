@@ -705,6 +705,49 @@ Their direct private codec execution is not a target runtime/output test. The
 validation and limits. Automatic recovery, actors, Release and the real multi-process
 migration/restart/performance oracle remain unfinished; LDB-6043 remains.
 
+## Atomic startup from sealed source positions, 2026-10-02
+
+`SourcePosition::Initialized` carries the complete unowned new-source cursor from
+the migration root. It has no engine checkpoint attempt and does not assert that
+the skipped prefix was processed. `PreparedTopologySourcePosition::startup_position`
+converts preserved positions to their exact `Resume` attempt/cursor and new positions
+to `Initialized`. This control-path conversion supplies no Commit, readiness or
+Release authority; an installer still revalidates the immutable root/current
+ownership and retains intake until participant-complete Release.
+
+Atomic source startup rejects initialized BestEffort requests and assigned cursors
+before I/O. The runtime also requires the connector's explicit sealed-start
+capability; the default rejects, even if a custom source has metadata discovery
+hooks. Kafka implements the capability with its existing bounded/tracked metadata
+validation, complete inventory/channel checks and retained low/high offset bounds.
+The sealed numeric vector is reused verbatim, including empty partitions; `latest`
+is never resolved again. Guaranteed ordinary Initial/latest remains rejected.
+Other built-ins explicitly reject this position before external I/O.
+
+Kafka validates the global unowned cursor before creating an active consumer, then
+installs numeric offsets through the existing manual assignment path. Current vnode
+ownership selects disjoint channel subsets. Metadata validation retains the existing
+10-second total budget, 64-topic/4096-partition bounds and semaphore through native
+client destruction, including caller cancellation. Startup retains the existing
+runtime stage deadline, process lease checks, cleanup and terminal task ownership.
+The reader remains deferred until polling; auto reset cannot replace a lost cursor.
+
+The streaming coordinator seeds committed progress only from durable Resume.
+Initialized starts neither seed committed offsets nor acknowledge pre-boundary
+input. An actual owned source actor test observes control servicing while the
+intake gate stays held, then joins terminal cleanup. Native librdkafka and separate
+real Redpanda fixtures check numeric startup, retries after high watermarks move,
+post-boundary records and absent broker acknowledgements. The fixture's later
+Resume checks the cursor codec with a supplied attempt; it does not certify an
+engine checkpoint or a full topology restart.
+
+There is no new framework, authority format, dependency, registry or per-record
+work. This is an installation prerequisite, not target installation or Release.
+The [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md)
+records validation and its limits. Runtime catalog/coordinator/sink installation,
+current participant readiness and automatic post-Commit recovery remain unfinished;
+LDB-6043 remains.
+
 ## Required next integration
 
 1. Integrate candidate planning with a DB-owned migration worker and its existing
@@ -720,7 +763,8 @@ migration/restart/performance oracle remain unfinished; LDB-6043 remains.
 5. Drive the implemented exact-Commit transport preparation and install the runtime
    catalog/coordinator, source and sink actors before participant-complete Release.
    Certify current installation capabilities/readiness and fence stale sink completions;
-   graph/shuffle generation fences exist. Wire target-only post-Commit runtime recovery.
+   graph/shuffle generation fences and atomic sealed source startup exist. Wire
+   target-only post-Commit runtime recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.
@@ -756,5 +800,7 @@ records the atomic catalog/root decision, retained Commit across failures and
 strict private reconstruction before a target checkpoint.
 The [transport preparation evidence](test-evidence/topology-transport-2026-10-02/README.md)
 records real gRPC generation changes and held exact-Commit DB preparation.
+The [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md)
+records sealed numeric Kafka startup, retry/acknowledgement checks and owned held actors.
 These results do not certify target migration
 or production latency.

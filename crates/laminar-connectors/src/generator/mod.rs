@@ -197,6 +197,11 @@ impl SourceConnector for GeneratorSource {
 
         self.next_seq = match position {
             SourcePosition::Initial => 0,
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "generator has no sealed topology startup contract".into(),
+                ));
+            }
             SourcePosition::Resume {
                 attempt,
                 checkpoint,

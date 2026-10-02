@@ -4,6 +4,57 @@ use super::*;
 use laminar_core::shuffle::ShuffleTopologyFence;
 
 #[tokio::test]
+async fn topology_start_db_exact_committed_root_produces_distinct_preserved_and_initialized_requests(
+) {
+    use laminar_connectors::connector::{DeliveryGuarantee, SourcePosition, SourceStart};
+    let (fixture, committed) = committed_fixture().await;
+    let image = fixture
+        .db
+        .recover_committed_cluster_topology(committed.operation_id)
+        .await
+        .unwrap();
+    let before = fixture.authority.lease_store.load().await.unwrap();
+    for name in ["trades", "added_source"] {
+        let registration = image.candidate.connector_manager.lock().sources()[name].clone();
+        let start = SourceStart::new(
+            image
+                .candidate
+                .build_registered_source_config(name, &registration)
+                .unwrap(),
+            image.source_positions()[name].startup_position(),
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
+        match start.into_parts().1 {
+            SourcePosition::Resume {
+                attempt,
+                checkpoint,
+            } => {
+                assert_eq!(name, "trades");
+                assert_eq!(attempt, CheckpointAttempt::canonical(1));
+                assert_eq!(checkpoint.get_offset("old.cursor"), Some("3"));
+                assert_eq!(checkpoint.assignment_version().unwrap().get(), 1);
+            }
+            SourcePosition::Initialized { checkpoint } => {
+                assert_eq!(name, "added_source");
+                assert_eq!(checkpoint.get_offset("partition-0-next"), Some("91"));
+                assert!(checkpoint.assignment_version().is_none());
+            }
+            SourcePosition::Initial => {
+                panic!("migration root cannot borrow mutable configured startup")
+            }
+        }
+    }
+    assert_eq!(fixture.authority.lease_store.load().await.unwrap(), before);
+    assert_eq!(fixture.resolutions.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.effects.load(Ordering::Acquire), 0);
+    assert!(fixture.db.owned_source_tasks.lock().is_empty());
+    assert!(fixture.db.source_gate.load(Ordering::Acquire));
+    assert!(fixture.db.topology_cut_hold.load(Ordering::Acquire));
+    fixture.db.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn topology_transport_db_binds_exact_commit_preserves_state_and_keeps_runtime_held() {
     let (fixture, committed) = committed_fixture().await;
     let mut image = fixture

@@ -1,0 +1,55 @@
+CARGO_BUILD_JOBS=1
+RUST_MIN_STACK=4194304
+
+cargo clippy --locked -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings
+exit_code: 0
+
+Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 06s
+
+cargo check --locked -p laminar-server --no-default-features
+exit_code: 0
+
+Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.64s
+
+cargo check --locked -p laminar-db --no-default-features --features cluster,ffi
+exit_code: 0
+
+Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.98s
+
+Supplemental dependency compilation prelude omitted; full raw log is retained.
+cargo check --locked -p laminar-connectors --no-default-features --features files,postgres-cdc,mongodb-cdc,nats,otel,websocket,delta-lake,iceberg
+exit_code: 0
+
+Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 11s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+
+cargo fmt --all -- --check
+exit_code: 0
+No formatting errors.
+
+git -c core.excludesFile= diff --check
+exit_code: 0
+No whitespace errors. Normal Git line-ending configuration is retained.
+
+Source identity after final validation:
+27 changed Rust source hashes and Cargo.lock match the frozen pre-validation identity.
+No dependency versions or Cargo metadata changed.
+
+git -c core.excludesFile= diff --cached --check
+exit_code: 0
+No staged whitespace errors.
+
+Final staging identity verification:
+All 37 staged paths belong to this increment.
+All 27 tested Rust source hashes and Cargo.lock remain unchanged.
+Staged Rust blobs match tested bytes after Git line-ending normalization.

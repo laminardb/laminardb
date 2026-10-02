@@ -1,6 +1,6 @@
 # Cluster topology migration implementation checkpoint
 
-Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization, private restore/retirement and atomic target Commit with private post-Commit reconstruction implemented; runtime topology migration
+Status: legacy adoption/status, core admission, durable participant preparation, the old-topology checkpoint cut, local additive candidate validation, exact-cut root staging, sealed new-source initialization/startup, private restore/retirement, atomic target Commit with private post-Commit reconstruction and committed graph/shuffle fences implemented; runtime topology migration
 is incomplete and topology writes remain fenced. The requested definition of
 done has not been met.
 
@@ -734,6 +734,44 @@ selection remain unchanged.
   actors, output or multi-process target restart. No broker or optimized migration
   performance scenario is rerun; the existing harness does not drive this internal method.
 
+## Atomic sealed source startup, 2026-10-02
+
+- Continuation starts clean at `f20cf05ecae70c6a53a7dce8a3ffbe1a52867830`.
+  Runtime installation needs an atomic way to install new-source positions from
+  the immutable root. `SourcePosition::Initialized` now carries that complete
+  unowned cursor without a fabricated checkpoint attempt or processed history.
+  Prepared source positions convert to exact preserved Resume or Initialized.
+- The startup request rejects BestEffort initialized delivery and assigned cursors.
+  The runtime requires explicit sealed-start capability before connector I/O;
+  default custom implementations and unsupported built-ins fail closed. Kafka
+  validates complete source/channel/inventory/retention evidence, reuses numeric
+  offsets through manual assignment and filters the global vector by current owners.
+  Retries never resolve latest again. Guaranteed ordinary Initial/latest remains
+  rejected; existing BestEffort assignment policy is retained. Saved positions
+  disable automatic topic creation.
+- Existing metadata/native task bounds, shared startup deadline, process lease
+  checks, cleanup and task ownership are reused. The source reader stays deferred
+  until polling. The coordinator seeds committed offsets only from durable Resume;
+  Initialized neither seeds processed progress nor acknowledges the skipped prefix.
+  No general framework, registry, authority format, dependency or per-record work
+  is introduced.
+- This is an installation prerequisite. Actual runtime catalog/coordinator and
+  source/sink integration, stale sink completion fencing, current participant
+  capabilities/readiness, Release and automatic post-Commit recovery remain
+  unfinished. LDB-6043 and the bootstrap boundary remain. Native broker/real Redpanda
+  connector cases and an owned held actor fixture do not certify a complete
+  stateful migration or multi-process target restart. Validation is recorded in the
+  [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md).
+- All 12 focused cases and the explicit real Redpanda retry case pass. The selected
+  four-package suite passes 4,385 tests: 1,078 core, 921 connectors, 2,030 DB and
+  356 server, with three ignored cases (the same two existing cases and the new
+  broker case run separately). All-target Clippy with warnings denied, minimal
+  server, cluster/FFI and the affected optional connector builds pass, as do
+  formatting and working/staged diff checks. All 27 changed Rust source hashes
+  and Cargo.lock remain unchanged through final verification and staging. Optional
+  connector runtime suites and optimized multi-process migration/performance
+  scenarios are not rerun. The isolated broker fixture is removed after its test.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -749,7 +787,8 @@ selection remain unchanged.
    drive exact-Commit transport preparation, install the runtime catalog/coordinator
    and source/sink actors, fence stale sink completions, and certify current capabilities
    and actual readiness for participant-complete Release. Graph/shuffle generation
-   fencing exists. Wire automatic post-Commit runtime recovery; ordinary startup stays held.
+   fencing and atomic sealed source startup exist. Wire automatic post-Commit runtime
+   recovery; ordinary startup stays held.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
 5. Removal/replacement contracts, fault matrix and existing soak extensions.
@@ -782,6 +821,8 @@ Atomic Commit/private reconstruction checks are recorded in
 `docs/test-evidence/topology-commit-2026-10-02`.
 Committed transport preparation checks are recorded in
 `docs/test-evidence/topology-transport-2026-10-02`.
+Atomic sealed source startup checks are recorded in
+`docs/test-evidence/topology-source-start-2026-10-02`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

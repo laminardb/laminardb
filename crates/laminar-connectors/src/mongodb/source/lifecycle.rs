@@ -77,6 +77,11 @@ impl SourceConnector for MongoDbCdcSource {
             expected_deployment_identity,
         ) = match position {
             SourcePosition::Initial => (None, false, None, None, None),
+            SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "MongoDB has no sealed topology startup contract".into(),
+                ));
+            }
             SourcePosition::Resume {
                 attempt,
                 checkpoint,

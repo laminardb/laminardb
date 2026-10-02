@@ -32,6 +32,29 @@ pub enum PreparedTopologySourcePosition {
     },
 }
 
+impl PreparedTopologySourcePosition {
+    /// Build the atomic startup position without inventing checkpoint history for a new source.
+    /// The installer must still revalidate Commit, current ownership and sealed availability,
+    /// keep source intake held, and wait for participant-complete target Release.
+    #[must_use]
+    pub fn startup_position(&self) -> laminar_connectors::connector::SourcePosition {
+        match self {
+            Self::Preserved {
+                attempt,
+                checkpoint,
+            } => laminar_connectors::connector::SourcePosition::Resume {
+                attempt: *attempt,
+                checkpoint: checkpoint.clone(),
+            },
+            Self::Initialized { checkpoint } => {
+                laminar_connectors::connector::SourcePosition::Initialized {
+                    checkpoint: checkpoint.clone(),
+                }
+            }
+        }
+    }
+}
+
 /// One unstarted target state image. It owns the existing local compiler slot until dropped.
 /// It has no source/sink actors or installation/output authority. Existing fenced parent transport
 /// handles provide channel decoding context; no receiver or sender is started by preparation.

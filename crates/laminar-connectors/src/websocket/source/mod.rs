@@ -413,6 +413,11 @@ impl SourceConnector for WebSocketSource {
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let (config, position, _) = request.into_parts();
+        if matches!(&position, SourcePosition::Initialized { .. }) {
+            return Err(ConnectorError::ConfigurationError(
+                "WebSocket has no sealed topology startup contract".into(),
+            ));
+        }
         if !matches!(self.state, ConnectorState::Created | ConnectorState::Closed) {
             return Err(ConnectorError::InvalidState {
                 expected: "Created or Closed".into(),

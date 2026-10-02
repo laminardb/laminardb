@@ -117,7 +117,7 @@ impl KafkaSource {
             if sealed_baselines.as_ref().is_some_and(|sealed| {
                 sealed.len() != inventory.len() || inventory.iter().any(|partition| !sealed.contains_key(partition))
             }) {
-                return Err(ConnectorError::ConfigurationError("sealed Kafka initialization inventory changed; abort and prepare a new operation".into()));
+                return Err(ConnectorError::ConfigurationError("sealed Kafka initialization inventory changed; the sealed topology cursor cannot be replaced".into()));
             }
             // The boundary is an explicit vector of broker low/high watermarks. It is not a
             // cross-partition transaction timestamp or a claim that pre-cut input was processed.
@@ -255,5 +255,7 @@ fn initial_next_offset(mode: &StartupMode, low: i64, high: i64) -> Result<i64, C
     }
 }
 
+#[cfg(test)]
+mod startup_tests;
 #[cfg(test)]
 mod tests;

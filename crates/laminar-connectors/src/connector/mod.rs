@@ -422,6 +422,34 @@ mod tests {
     }
 
     #[test]
+    fn topology_start_initialized_has_no_attempt_and_rejects_assignment_ownership() {
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("partition-0-next", "91");
+        let start = SourceStart::new(
+            ConnectorConfig::new("test"),
+            SourcePosition::Initialized {
+                checkpoint: checkpoint.clone(),
+            },
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
+        assert!(
+            matches!(start.into_parts().1, SourcePosition::Initialized { checkpoint }
+            if checkpoint.get_offset("partition-0-next") == Some("91")
+                && checkpoint.assignment_version().is_none())
+        );
+        checkpoint.bind_assignment_version(std::num::NonZeroU64::MIN);
+        assert!(matches!(SourceStart::new(
+            ConnectorConfig::new("test"), SourcePosition::Initialized { checkpoint },
+            DeliveryGuarantee::AtLeastOnce,
+        ), Err(ConnectorError::ConfigurationError(message)) if message.contains("unowned global")));
+        assert!(matches!(SourceStart::new(ConnectorConfig::new("test"),
+            SourcePosition::Initialized { checkpoint: SourceCheckpoint::new() },
+            DeliveryGuarantee::BestEffort), Err(ConnectorError::ConfigurationError(message))
+            if message.contains("requires at-least-once")));
+    }
+
+    #[test]
     fn sink_contract_defaults_fail_closed() {
         let contract = SinkContract::default();
         assert_eq!(contract.consistency, SinkConsistency::Ephemeral);

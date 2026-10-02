@@ -134,6 +134,11 @@ impl SourceConnector for MockSourceConnector {
     ) -> Result<(), ConnectorError> {
         let records = match request.into_parts().1 {
             crate::connector::SourcePosition::Initial => 0,
+            crate::connector::SourcePosition::Initialized { .. } => {
+                return Err(ConnectorError::ConfigurationError(
+                    "mock source has no sealed topology startup contract".into(),
+                ));
+            }
             crate::connector::SourcePosition::Resume { checkpoint, .. } => checkpoint
                 .get_offset("records")
                 .ok_or_else(|| {

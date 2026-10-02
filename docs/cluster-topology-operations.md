@@ -28,6 +28,7 @@ and durable replay. There is no supported migration submission or activation rou
 | Record every participant's target preparation | DB library; durable exact-root restore/retirement observations; target remains uncommitted and inactive |
 | Commit the exact restored target | DB library; complete protocol-4 frozen roster; atomic catalog/root decision; installation and Release remain pending |
 | Reconstruct the committed target before its first checkpoint | DB library; explicit root, strict parent manifest/state checks and current process/adoption; private image only |
+| Atomically start a new source from its sealed cursor | Internal connector/runtime prerequisite; explicit Kafka inventory with guaranteed delivery; intake still requires coordinated Release |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -457,6 +458,25 @@ the same image or reconstruct from the immutable Commit. No manual gate opening,
 parent restart or output permission follows from success. Runtime installation and
 participant-complete Release, including current installation capability and actual
 receiver/state/sink readiness, remain unfinished. LDB-6043 remains.
+
+## Sealed source startup contract
+
+Internal target installation can convert each prepared source position to the
+existing atomic startup request. Preserved sources retain their exact engine
+checkpoint attempt; new Kafka sources use `SourcePosition::Initialized` with the
+root's complete unowned numeric vector. Initialized startup requires guaranteed
+delivery and explicit connector support. It validates the current topic inventory,
+canonical channels and retained range without resolving `latest` again, then
+filters by current vnode owners. Changed inventory or lost offsets fail closed.
+Other built-ins and custom sources without the capability reject before startup.
+
+This boundary is not processed history and does not seed committed progress or
+acknowledge the skipped prefix. Reader polling remains held by the runtime gate.
+The contract is a tested installation prerequisite, not an operational migration
+command, target readiness or permission to open intake. Runtime installation,
+participant-complete Release and automatic target recovery remain unfinished;
+LDB-6043 remains. See the
+[source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md).
 
 ## Errors and recovery
 
