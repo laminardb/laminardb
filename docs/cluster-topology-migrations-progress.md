@@ -500,6 +500,68 @@ selection remain unchanged.
   commands, artifacts and limits are in the
   [source initialization evidence](test-evidence/topology-sources-2026-10-02/README.md).
 
+## Private target restore preparation, 2026-10-02
+
+- Continuation starts clean at `9e525345e95b960315d6305a4ff93c1664de6a8d`.
+  The controller reads an opaque exact operation/root/cut/process input from its
+  configured authorities. Complete current participant certification, the admitting
+  leader and the unchanged assignment fence are required. No new authority format,
+  phase, log append or dependency is introduced.
+- The DB reuses the isolated compiler, strict historical-parent recovery loader,
+  existing graph construction and operator codecs. It checks the complete certified
+  target and environment, rebuilds the root from verified manifests before state
+  reads, decodes local state with the frozen roster and validates preserved
+  subscription generations/exclusive sequences. Ordinary target-fingerprint
+  recovery remains rejected, and historical checkpoint identities stay unchanged.
+- One opaque unstarted image owns the existing local compiler permit until dropped.
+  Its target graph uses existing fenced shuffle handles solely as channel decoding
+  context, without live graph/vnode handles or actors. Error, cancellation and the
+  45-second deadline drop partial state and retain the parent hold. Authority,
+  runtime hold and the parent environment are rechecked before returning it.
+- Existing source cursors retain their actual attempt and assignment origin. New
+  cursors remain the sealed global unowned vector with no fabricated processing
+  attempt. The fail-closed connector hook validates availability without resealing;
+  Kafka checks exact inventory and retention bounds with its existing one-client
+  native-work permit and 10-second budget. It does not assign, subscribe, poll,
+  acknowledge or start a reader. Final installation must validate and filter again.
+- Manifest metadata remains bounded at 16 MiB, roots at 1 MiB, state/payload at the
+  configured graph budget and node reads at the checkpoint limit. Encoded buffers
+  are released after decode, before cursor validation. Held parent state, target
+  state, codec scratch and read buffers overlap transiently; these limits do not
+  establish a total RSS bound or production migration performance.
+- Atomic topology Commit, observed old-actor retirement, target installation,
+  participant-complete Release, detached ownership and public migration submission
+  remain unfinished. LDB-6043 remains. This is the next preparation increment,
+  not the original runtime migration definition of done.
+- All 14 focused tests and the full 4,309-test selected-feature suite pass:
+  1,044 core, 914 connectors, 1,995 DB and 356 server. All-target Clippy passes
+  with warnings denied. The real-broker test passes in 1.34 s, sealing `[2, 3, 0]`
+  in 278.283 ms and validating it unchanged after another append, without starting
+  a reader or acknowledging input. Operator decoding is tested with an actual
+  aggregate that continues from 30 to 45, nine state frames, incarnation 7 and
+  nonzero subscription sequences. Deadline/cancellation, stale authority,
+  missing/corrupt payload, strict target-fingerprint rejection and payload limits
+  all retain the parent hold and release the local preparation slot.
+- Non-default server and cluster/FFI checks, all 414 non-cluster core tests,
+  formatting and diff checks pass. No dependency or Cargo metadata changes.
+- The optimized three-process cut/abort/full-restart scenario passes in 325.65 s.
+  All three processes certify the 51-object target, then core authorization and
+  strict RecoveryManager loading verify 1,608 local frames / 20,336,760 bytes from
+  their actual held checkpoint 63. Per-participant authorization/loading takes
+  299.247..310.187 ms; sealed Kafka availability validation takes 110.653 ms and
+  retains `[2, 3, 0]`. These reads run in the harness; target operator decoding is
+  tested separately in the actorless DB fixture. No target is committed/installed.
+  The 51,859-byte root is bound at authority 451; abort at 453 retains it and the
+  parent cut. Full restart activates unchanged topology 1 in 57.430 s. All expected
+  bounded/temporal outputs are observed across 114,027 logical input IDs, durable
+  through checkpoint 109 with allowed ALO duplicates. Gate hold through deliberate
+  restart/recovery is 61.426..61.503 s. Sampled combined server working set peaks
+  at 745,369,600 bytes; the harness's whole-run observed peak is 144,019,456 bytes.
+  No matched or pause-inclusive migration performance is certified. Source/Cargo
+  and binary hashes match before/after the scenario, all seven servers exit, and
+  only isolated fixtures are removed. Exact commands and limits are in the
+  [private restore evidence](test-evidence/topology-restore-2026-10-02/README.md).
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -507,10 +569,10 @@ selection remain unchanged.
    each local preparation API independently compiles and durably certifies it.
    The manual checkpoint path requires the full frozen roster before a new cut;
    no worker stages or commits a target.
-2. Authorize consumption of the staged state/subscription mappings and sealed
-   new-source positions at target restore, then atomically bind target catalog
-   and migration root at topology Commit. Old checkpoint binding, quiescence,
-   live root pinning and Kafka earliest/latest initialization exist.
+2. Drive the implemented private target restore preparation from owned migration
+   work, then atomically bind target catalog and migration root at topology Commit.
+   Old checkpoint binding, quiescence, root pinning, source initialization and
+   private state/cursor preparation exist.
 3. Observed actor retirement, install/release and post-commit recovery.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
@@ -534,6 +596,8 @@ certification and stateful restart results are in
 `docs/test-evidence/topology-preparation-2026-10-01`; exact-cut root staging results
 are in `docs/test-evidence/topology-root-2026-10-01`; sealed source initialization
 and the latest stateful restart run are in
-`docs/test-evidence/topology-sources-2026-10-02`. This is a resumable checkpoint
+`docs/test-evidence/topology-sources-2026-10-02`. Private target restore preparation
+and its checks are recorded in
+`docs/test-evidence/topology-restore-2026-10-02`. This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

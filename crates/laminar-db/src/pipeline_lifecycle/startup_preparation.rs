@@ -155,7 +155,7 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    async fn bind_subscription_output_certificates(
+    pub(crate) async fn bind_subscription_output_certificates(
         &self,
         stream_regs: &mut HashMap<String, crate::connector_manager::StreamRegistration>,
         pipeline_identity: Option<&laminar_core::checkpoint::PipelineIdentity>,

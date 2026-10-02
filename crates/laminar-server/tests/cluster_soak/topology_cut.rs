@@ -12,7 +12,7 @@ use laminar_connectors::{
     connector::SourceConnector,
     kafka::{KafkaSource, KafkaSourceConfig},
 };
-use laminar_core::checkpoint::{ConnectorCheckpoint, ObjectStoreCheckpointStore};
+use laminar_core::checkpoint::{CheckpointStore, ConnectorCheckpoint, ObjectStoreCheckpointStore};
 use laminar_core::checkpoint_decision::CheckpointDecisionStore;
 use laminar_core::cluster::control::{
     AssignmentSnapshotStore, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
@@ -42,7 +42,7 @@ pub(super) fn prepare_old_cut(
             laminar_core::state::KeyGroupCount::try_from(assignment.vnode_count).unwrap(),
         );
     let decisions = CheckpointDecisionStore::new(Arc::clone(&objects));
-    let assignments = AssignmentSnapshotStore::new(objects);
+    let assignments = AssignmentSnapshotStore::new(Arc::clone(&objects));
     let catalog = CatalogManifestStore::new(Arc::clone(&authority));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -423,6 +423,78 @@ pub(super) fn prepare_old_cut(
         initialization_calls.load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+    // Exercise production root authorization and bounded checksum loading against all three
+    // real held participants. The DB operator-decoding/image ownership path has separate tests;
+    // these harness reads grant no actor installation or target activation.
+    let mut restore_observations = Vec::new();
+    for certificate in &prepared.preparation.as_ref().unwrap().certificates {
+        let started = Instant::now();
+        let input = runtime
+            .block_on(authority.topology_restore_input(
+                &assignments,
+                &processes,
+                prepared.operation_id,
+                laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+                    participant: certificate.participant,
+                    process_term: certificate.process_term,
+                },
+            ))
+            .unwrap();
+        let reader = ObjectStoreCheckpointStore::new(Arc::clone(&objects), "")
+            .with_participant_id(certificate.participant.node_id)
+            .with_key_group_count(checkpoint_store.key_group_count());
+        let recovered = runtime
+            .block_on(
+                laminar_db::RecoveryManager::new(
+                    &reader,
+                    &descriptor.parent_pipeline,
+                    &descriptor.deployment_id,
+                    laminar_core::checkpoint::CheckpointScope::Cluster,
+                )
+                .recover_topology_root(&input, 64 * 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(recovered.committed, index);
+        assert!(recovered
+            .state_frames
+            .iter()
+            .all(|frame| frame.participant_id == certificate.participant.node_id));
+        assert!(!recovered.state_frames.is_empty());
+        let payload_bytes = recovered
+            .state_frames
+            .iter()
+            .map(|frame| frame.payload.len())
+            .sum::<usize>();
+        restore_observations.push(serde_json::json!({ "node": certificate.participant.node_id,
+            "root_read_and_state_verification_ms": started.elapsed().as_secs_f64() * 1000.0,
+            "owned_vnodes": input.owned_vnodes(), "verified_state_frames": recovered.state_frames.len(),
+            "verified_payload_bytes": payload_bytes, "target_installed": false }));
+    }
+    let validation_started = Instant::now();
+    runtime.block_on(async {
+        let mut checkpoint =
+            laminar_connectors::checkpoint::SourceCheckpoint::with_offsets(initial.offsets.clone());
+        for (key, value) in &initial.metadata {
+            checkpoint.set_metadata(key, value);
+        }
+        checkpoint
+            .set_input_channels(initial.input_channels.clone().unwrap())
+            .unwrap();
+        let mut source = KafkaSource::new(
+            Arc::new(arrow_schema::Schema::empty()),
+            KafkaSourceConfig::from_config(&probe_config).unwrap(),
+            None,
+        );
+        source
+            .validate_initial_position(&probe_config, &checkpoint)
+            .await
+            .unwrap();
+    });
+    std::fs::write(evidence_dir.join("topology-restore-observations.json"), serde_json::to_vec_pretty(
+        &serde_json::json!({ "participants": restore_observations, "sealed_cursor_validation_ms": validation_started.elapsed().as_secs_f64() * 1000.0,
+            "new_source_next_offsets": [2, 3, 0], "target_committed": false, "target_installed": false })
+    ).unwrap()).unwrap();
+    eprintln!("soak: all {} held processes' exact local state frames verified through migration-root authorization; sealed Kafka cursor remains [2,3,0]; target remains uncommitted", restore_observations.len());
     std::fs::write(
         evidence_dir.join("topology-migration-root.json"),
         serde_json::to_vec_pretty(&serde_json::json!({

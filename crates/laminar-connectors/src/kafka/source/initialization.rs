@@ -22,6 +22,14 @@ impl KafkaSource {
         &mut self,
         config: &ConnectorConfig,
     ) -> Result<SourceCheckpoint, ConnectorError> {
+        self.inspect_initial_position_inner(config, None).await
+    }
+
+    pub(super) async fn inspect_initial_position_inner(
+        &mut self,
+        config: &ConnectorConfig,
+        sealed: Option<&SourceCheckpoint>,
+    ) -> Result<SourceCheckpoint, ConnectorError> {
         if self.state != ConnectorState::Created {
             return Err(ConnectorError::InvalidState {
                 expected: "Created source without an active reader".into(),
@@ -43,6 +51,9 @@ impl KafkaSource {
                 )
             })?
             .to_owned();
+        let sealed_baselines = sealed
+            .map(|checkpoint| validate_sealed_position(checkpoint, &source_name, &topics))
+            .transpose()?;
         let deadline = tokio::time::Instant::now() + INITIAL_POSITION_BUDGET;
         let permit = tokio::time::timeout_at(deadline, INITIALIZATION_SLOT.acquire())
             .await
@@ -103,6 +114,11 @@ impl KafkaSource {
                 }
             }
             let mut baselines = KafkaPartitionBaselines::with_capacity(inventory.len());
+            if sealed_baselines.as_ref().is_some_and(|sealed| {
+                sealed.len() != inventory.len() || inventory.iter().any(|partition| !sealed.contains_key(partition))
+            }) {
+                return Err(ConnectorError::ConfigurationError("sealed Kafka initialization inventory changed; abort and prepare a new operation".into()));
+            }
             // The boundary is an explicit vector of broker low/high watermarks. It is not a
             // cross-partition transaction timestamp or a claim that pre-cut input was processed.
             for (topic, partition) in &inventory {
@@ -113,7 +129,11 @@ impl KafkaSource {
                             "Kafka initial watermark lookup failed for '{topic}-{partition}': {e}"
                         ))
                     })?;
-                let next = initial_next_offset(&kafka_config.startup_mode, low, high)?;
+                let next = if let Some(sealed) = &sealed_baselines {
+                    let next = sealed[&(topic.clone(), *partition)];
+                    validate_sealed_next_offset(next, low, high)?;
+                    next
+                } else { initial_next_offset(&kafka_config.startup_mode, low, high)? };
                 baselines.insert((topic.clone(), *partition), next);
             }
             let mut checkpoint = OffsetTracker::new().to_checkpoint_for_partitions(
@@ -140,6 +160,51 @@ fn remaining(deadline: std::time::Instant) -> Result<std::time::Duration, Connec
         return Err(ConnectorError::Timeout(10_000));
     }
     Ok(remaining)
+}
+
+fn validate_sealed_position(
+    checkpoint: &SourceCheckpoint,
+    source_name: &str,
+    topics: &[String],
+) -> Result<KafkaPartitionBaselines, ConnectorError> {
+    if checkpoint.offsets().is_empty() || checkpoint.offsets().len() > MAX_INITIAL_PARTITIONS {
+        return Err(ConnectorError::ConfigurationError(
+            "sealed Kafka cursor exceeds its 1..=4096 partition bound".into(),
+        ));
+    }
+    let baselines = super::decode_partition_baselines(checkpoint)?;
+    if checkpoint.assignment_version().is_some()
+        || checkpoint.metadata().get("connector").map(String::as_str) != Some("kafka")
+        || checkpoint
+            .metadata()
+            .get("checkpoint.version")
+            .map(String::as_str)
+            != Some("2")
+        || baselines.is_empty()
+        || baselines.len() > MAX_INITIAL_PARTITIONS
+        || baselines.len() != checkpoint.offsets().len()
+        || baselines
+            .keys()
+            .any(|(topic, _)| topics.binary_search(topic).is_err())
+    {
+        return Err(ConnectorError::ConfigurationError("invalid sealed Kafka initialization cursor/ABI; processed offsets and assignment ownership are not new-source positions".into()));
+    }
+    let inventory = baselines.keys().cloned().collect::<KafkaPartitionSet>();
+    if checkpoint.input_channels() != Some(kafka_input_channels(source_name, &inventory)?.as_ref())
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "sealed Kafka initialization channels differ from the exact source inventory".into(),
+        ));
+    }
+    Ok(baselines)
+}
+
+fn validate_sealed_next_offset(next: i64, low: i64, high: i64) -> Result<(), ConnectorError> {
+    initial_next_offset(&StartupMode::Earliest, low, high)?;
+    if next < low || next > high {
+        return Err(ConnectorError::ConfigurationError(format!("sealed Kafka next position {next} is outside retained range {low}..{high}; never reset the sealed boundary")));
+    }
+    Ok(())
 }
 
 fn validate_initialization_config(

@@ -115,6 +115,33 @@ pub struct TopologyMigrationRootBinding {
 }
 
 impl TopologyMigrationRoot {
+    /// Rebuild the exact requirements from checksummed historical manifests before target restore.
+    /// This does not rewrite their parent identity or grant installation/output authority.
+    ///
+    /// # Errors
+    /// Rejects missing, divergent or reordered state/progress/subscription mappings.
+    pub fn validate_restore_cut(
+        &self,
+        operation: &TopologyAdmissionStatus,
+        descriptor: &ClusterTopologyValidation,
+        index: &CommittedCheckpointIndex,
+        manifests: &[CheckpointManifest],
+    ) -> Result<(), TopologyError> {
+        let rebuilt = Self::build_with_sources(
+            operation,
+            descriptor,
+            index,
+            manifests,
+            self.source_initializations.clone(),
+        )?;
+        if rebuilt != *self {
+            return Err(TopologyError::Invalid(
+                "restore metadata differs from the sealed migration root".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn object_mappings(
         descriptor: &ClusterTopologyValidation,
     ) -> Result<(Vec<TopologyPreservedObject>, Vec<String>), TopologyError> {

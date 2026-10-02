@@ -13,29 +13,27 @@ pub(super) async fn validate_committed_subscription_segments(
     store: &dyn CheckpointStore,
     manifests: &[CheckpointManifest],
 ) -> Result<(), DbError> {
-    let reads = manifests.iter().flat_map(|manifest| {
-        manifest.subscription_output.iter().flat_map(move |node| {
-            node.streams.iter().flat_map(move |stream| {
-                stream
-                    .segments
-                    .iter()
-                    .map(move |segment| (manifest, node, stream, segment))
-            })
-        })
-    });
-    futures::stream::iter(reads)
-        .map(|(manifest, node, stream, segment)| async move {
-            let participant =
-                checkpoint_participant(node, manifest.participant_id).ok_or_else(|| {
-                    DbError::from(ClusterSubscriptionError::ManifestCorrupt {
-                        reason: "segment participant is absent from its assignment certificate"
-                            .into(),
-                    })
-                })?;
-            let payload = store
-                .load_subscription_segment(segment)
-                .await
-                .map_err(|error| match error {
+    let mut reads = Vec::new();
+    for manifest in manifests {
+        let Some(node) = &manifest.subscription_output else {
+            continue;
+        };
+        for stream in &node.streams {
+            for segment in &stream.segments {
+                reads.push(async move {
+                    let participant = checkpoint_participant(node, manifest.participant_id)
+                        .ok_or_else(|| {
+                            DbError::from(ClusterSubscriptionError::ManifestCorrupt {
+                                reason:
+                                    "segment participant is absent from its assignment certificate"
+                                        .into(),
+                            })
+                        })?;
+                    let payload = store
+                        .load_subscription_segment(segment)
+                        .await
+                        .map_err(|error| {
+                            match error {
                     laminar_core::checkpoint::checkpoint_store::CheckpointStoreError::Invalid(
                         _,
                     ) => DbError::from(ClusterSubscriptionError::SegmentCorrupt {
@@ -43,29 +41,34 @@ pub(super) async fn validate_committed_subscription_segments(
                         first: segment.first_sequence,
                     }),
                     _ => DbError::from(ClusterSubscriptionError::BackendUnavailable),
-                })?
-                .ok_or_else(|| {
-                    DbError::from(ClusterSubscriptionError::SegmentMissing {
-                        partition: segment.partition,
-                        first: segment.first_sequence,
-                    })
-                })?;
-            let binding = OutputSegmentBinding {
-                deployment_id: &manifest.deployment_id,
-                stream_id: &stream.distribution_certificate.stream_id,
-                attempt: CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
-                participant,
-                assignment_version: node.assignment_certificate.assignment_version,
-                assignment_digest: node.assignment_certificate.digest(),
-            };
-            decode_bound_output_segment(segment, &payload, &binding).map_err(|_| {
-                DbError::from(ClusterSubscriptionError::SegmentCorrupt {
-                    partition: segment.partition,
-                    first: segment.first_sequence,
-                })
-            })?;
-            Ok::<(), DbError>(())
-        })
+                }
+                        })?
+                        .ok_or_else(|| {
+                            DbError::from(ClusterSubscriptionError::SegmentMissing {
+                                partition: segment.partition,
+                                first: segment.first_sequence,
+                            })
+                        })?;
+                    let binding = OutputSegmentBinding {
+                        deployment_id: &manifest.deployment_id,
+                        stream_id: &stream.distribution_certificate.stream_id,
+                        attempt: CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+                        participant,
+                        assignment_version: node.assignment_certificate.assignment_version,
+                        assignment_digest: node.assignment_certificate.digest(),
+                    };
+                    decode_bound_output_segment(segment, &payload, &binding).map_err(|_| {
+                        DbError::from(ClusterSubscriptionError::SegmentCorrupt {
+                            partition: segment.partition,
+                            first: segment.first_sequence,
+                        })
+                    })?;
+                    Ok::<(), DbError>(())
+                });
+            }
+        }
+    }
+    futures::stream::iter(reads)
         .buffer_unordered(PARALLEL_SUBSCRIPTION_SEGMENT_READS)
         .try_for_each(|()| async { Ok(()) })
         .await

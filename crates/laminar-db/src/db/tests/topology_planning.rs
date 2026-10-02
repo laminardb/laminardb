@@ -19,7 +19,21 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use super::*;
 use crate::{ClusterTopologyObjectTransition, TopologyInitialization, TopologyValidationScope};
 
-struct PlanningSource(Arc<AtomicUsize>, Arc<AtomicUsize>);
+#[derive(Default)]
+struct RestoreValidationControl {
+    block: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+struct PlanningSource(
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<RestoreValidationControl>,
+);
+
+#[path = "topology_restore.rs"]
+mod restore;
 
 fn forbidden_effect(effects: &AtomicUsize) -> ConnectorError {
     effects.fetch_add(1, Ordering::SeqCst);
@@ -28,6 +42,28 @@ fn forbidden_effect(effects: &AtomicUsize) -> ConnectorError {
 
 #[async_trait]
 impl SourceConnector for PlanningSource {
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        if config.get("laminar.source.name") == Some("added_source")
+            && checkpoint
+                .offsets()
+                .get("partition-0-next")
+                .map(String::as_str)
+                == Some("91")
+            && checkpoint.assignment_version().is_none()
+        {
+            self.2.entered.notify_one();
+            if self.2.block.load(Ordering::Acquire) {
+                self.2.release.notified().await;
+            }
+            Ok(())
+        } else {
+            Err(forbidden_effect(&self.0))
+        }
+    }
     async fn resolve_initial_position(
         &mut self,
         config: &ConnectorConfig,
@@ -134,6 +170,7 @@ struct Fixture {
     authority: TestCatalogAuthority,
     effects: Arc<AtomicUsize>,
     resolutions: Arc<AtomicUsize>,
+    restore_validation: Arc<RestoreValidationControl>,
 }
 
 impl Fixture {
@@ -194,6 +231,8 @@ impl Fixture {
         let factory_effects = Arc::clone(&effects);
         let resolutions = Arc::new(AtomicUsize::new(0));
         let factory_resolutions = Arc::clone(&resolutions);
+        let restore_validation = Arc::new(RestoreValidationControl::default());
+        let factory_validation = Arc::clone(&restore_validation);
         let process = authority.controller.recovery_incarnation();
         let receiver = Arc::new(
             laminar_core::shuffle::ShuffleReceiver::bind(
@@ -221,6 +260,7 @@ impl Fixture {
             .register_connector(move |registry| {
                 let source_effects = Arc::clone(&factory_effects);
                 let source_resolutions = Arc::clone(&factory_resolutions);
+                let source_validation = Arc::clone(&factory_validation);
                 registry.register_source(
                     "planning-source",
                     ConnectorInfo {
@@ -235,6 +275,7 @@ impl Fixture {
                         Ok(Box::new(PlanningSource(
                             Arc::clone(&source_effects),
                             Arc::clone(&source_resolutions),
+                            Arc::clone(&source_validation),
                         )))
                     }),
                 )?;
@@ -262,6 +303,7 @@ impl Fixture {
             authority,
             effects,
             resolutions,
+            restore_validation,
         }
     }
 

@@ -17,8 +17,9 @@ remain held. It reserves an exact candidate without authorizing candidate actors
 No record can commit topology 2. Local additive candidate compilation and definition
 compatibility descriptors and durable participant certificates are implemented.
 Exact-cut state/progress root staging includes stateless downstream additions and sealed
-new-source initialization requirements. Target
-restore, retirement, Committed/Activating/Active and release remain unfinished.
+new-source initialization requirements. Private target restore preparation is
+implemented. Actor retirement, topology Commit, install/activation and release
+remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -460,13 +461,57 @@ remains absent.
 
 ## Required next integration
 
+Private restore preparation now connects the staged root to the existing strict
+recovery loader and operator codecs. `TopologyRestoreInput` is opaque and comes
+from the controller's actual configured process/assignment authorities. Its full
+prepared roster, exact admitting leader, assignment and committed old cut are
+checked before loading, and checked again by the DB before returning an image.
+The loader keeps the historical parent identity and reconstructs the complete
+root from verified manifests before reading state. Ordinary recovery remains
+strict; there is no target-fingerprint bypass.
+
+The isolated compiler can retain its unstarted graph using existing frozen
+shuffle context for channel decoding. It installs no live graph/vnode handles or
+actors. Local frames use the same roster checks, checksum reads and state codecs
+as ordinary restore. Subscription generations and next sequences come from the
+root, rather than a fresh target-wide hash. Existing source positions retain their
+real checkpoint origin; initialized positions remain unowned with no processed
+attempt. Kafka checks the sealed inventory and retention bounds without resealing.
+
+An opaque `PreparedTopologyRestore` owns the existing compiler permit. It cannot
+be cloned, constructed or executed by an external caller. Errors, cancellation
+and a 45-second deadline discard partial state while retaining the old hold. No
+new authority encoding, log append, worker, dependency or generic migration
+framework is introduced. Manifest reads remain eight at a time, subscription
+segment reads four at a time, and existing verified chunk read bounds remain.
+Their borrowed work items are materialized before awaiting so the restore future
+can safely move to an owned Tokio task; no payload is cloned for this change.
+
+The target's managed state and verified encoded payload are separately bounded
+by the configured state budget, with configured node-read limits, 16 MiB total
+manifest metadata and a 1 MiB root. Encoded payloads are dropped before cursor
+validation. The held old graph, decoded target, codec scratch and object-store
+read buffers still overlap. Total RSS and migration allocation amplification
+require measurement; no performance certification follows from those limits.
+
+| Private restore failure | Result |
+| --- | --- |
+| Root absent, unknown process/boot/term, incomplete roster or changed assignment | Reject before target state preparation |
+| Root requirements differ from verified parent manifests | Reject before state payload reads |
+| Ordinary recovery attempts the target fingerprint against the parent cut | Retain the existing fingerprint mismatch rejection |
+| Payload/segment missing, corrupt or exceeds configured limits | Drop partial target; keep the exact parent hold |
+| Cursor inventory changes or retention passes a sealed cursor | Reject; never resolve a replacement latest boundary |
+| Source validation blocks or caller cancels after decoding | Deadline/cancellation drops image and releases the compiler permit |
+| Recovery or authority changes after decoding | Reject the late image; no target receipt or activation |
+| Caller retains a successful image | Keep the compiler busy; future install must revalidate its authority |
+
 1. Integrate candidate planning with a DB-owned migration worker and its existing
    manual checkpoint owner. The old-cut binding, capture and hold are implemented;
    detached submission/target-stage ownership remain unfinished.
 2. Drive the implemented exact-process certification path from detached submission;
    explicit local preparation is available, but automatic collection remains unfinished.
 3. Observe superseded actor retirement after the reconciled old checkpoint cut.
-4. Consume sealed new-source positions and preserved state/subscription mappings,
+4. Drive the implemented private restore preparation from owned migration work,
    then atomically bind target catalog and root at the logical topology-change Commit.
 5. Restore/install the target before participant-complete release, with stale
    graph/shuffle/sink completion fences and target-only post-commit recovery.
@@ -491,5 +536,8 @@ their retained binding after restart. The latest
 [source initialization evidence](test-evidence/topology-sources-2026-10-02/README.md)
 records sealed Kafka earliest/latest cursors, cancellation/concurrency boundaries,
 legacy root bytes and the subsequent three-process cut/abort/full-restart oracle.
+The [private restore evidence](test-evidence/topology-restore-2026-10-02/README.md)
+records exact root authorization, operator decoding, cursor availability and
+bounded-image ownership/cancellation checks.
 These results do not certify target migration
 or production latency.

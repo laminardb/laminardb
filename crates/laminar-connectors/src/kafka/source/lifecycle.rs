@@ -19,6 +19,16 @@ impl SourceConnector for KafkaSource {
         self.resolve_initial_position_inner(config).await
     }
 
+    async fn validate_initial_position(
+        &mut self,
+        config: &ConnectorConfig,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        self.inspect_initial_position_inner(config, Some(checkpoint))
+            .await
+            .map(|_| ())
+    }
+
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.task_tracker.clone())
     }

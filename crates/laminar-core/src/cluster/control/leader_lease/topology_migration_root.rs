@@ -361,7 +361,7 @@ impl LeaderLeaseStore {
         Ok(winner)
     }
 
-    async fn load_topology_root(
+    pub(super) async fn load_topology_root(
         &self,
         reference: &TopologyMigrationRootRef,
     ) -> Result<TopologyMigrationRoot, TopologyError> {

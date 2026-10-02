@@ -8,6 +8,58 @@ use crate::cluster::control::topology::{
 };
 
 impl ClusterController {
+    /// Read current private restore input using this controller's exact local process adoption.
+    /// This does not install a graph or authorize source/output work.
+    ///
+    /// # Errors
+    /// Rejects recovery, draining, stale process/assignment adoption and damaged root evidence.
+    pub async fn topology_restore_input(
+        &self,
+        operation_id: TopologyOperationId,
+    ) -> Result<crate::cluster::control::TopologyRestoreInput, TopologyError> {
+        let before = self
+            .try_live_local_process_authority_identity()
+            .map_err(|_| TopologyError::Fenced)?;
+        if self.is_recovering() || self.is_draining() {
+            return Err(TopologyError::Fenced);
+        }
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|e| TopologyError::Protocol(e.to_string()))?;
+        let input = authority
+            .topology_restore_input(
+                self.snapshot.as_ref().ok_or_else(|| {
+                    TopologyError::Protocol("restore has no assignment authority".into())
+                })?,
+                self.process_lease_authority.get().ok_or_else(|| {
+                    TopologyError::Protocol("restore has no process authority".into())
+                })?,
+                operation_id,
+                before,
+            )
+            .await?;
+        let evidence = self
+            .read_local_process_authority_evidence()
+            .await
+            .map_err(|e| TopologyError::Conflict(e.to_string()))?;
+        if self.is_recovering()
+            || self.is_draining()
+            || self.try_live_local_process_authority_identity().ok() != Some(before)
+            || evidence.participant != before.participant
+            || evidence.process_term != before.process_term
+            || !evidence
+                .adopted_assignment
+                .matches_fence(&input.plan().assignment)
+            || self
+                .checkpoint_assignment_fence(input.plan().assignment.assignment_version)
+                .as_ref()
+                != Some(&input.plan().assignment)
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(input)
+    }
+
     /// Pin restore requirements with this controller's actual assignment/process authority.
     /// This leaves the old cut held and grants no target execution or output authority.
     ///

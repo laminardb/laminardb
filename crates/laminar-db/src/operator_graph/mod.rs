@@ -1769,7 +1769,7 @@ impl OperatorGraph {
         Ok(self)
     }
 
-    fn managed_state_accounted_bytes(&self) -> usize {
+    pub(crate) fn managed_state_accounted_bytes(&self) -> usize {
         self.nodes
             .iter()
             .filter(|node| !node.removed)
@@ -5403,6 +5403,54 @@ impl OperatorGraph {
         vnodes: &[(String, u32, bytes::Bytes)],
         vnode_count: u32,
     ) -> Result<(Self, usize), DbError> {
+        #[cfg(feature = "cluster")]
+        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
+        #[cfg(not(feature = "cluster"))]
+        let owned_vnodes = self.local_owned_vnodes_for_managed_state();
+        self.restore_state_frames_inner(
+            whole,
+            vnodes,
+            vnode_count,
+            owned_vnodes.as_deref().unwrap_or(&[]),
+        )
+    }
+
+    /// Restore an isolated graph using the frozen local roster from current migration authority.
+    /// Existing fenced transport handles are decoding context; this grants no execution ownership.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn restore_topology_state_frames(
+        self,
+        whole: &[(String, bytes::Bytes)],
+        vnodes: &[(String, u32, bytes::Bytes)],
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+    ) -> Result<(Self, usize), DbError> {
+        if self.pipeline_identity.as_ref() != Some(&input.descriptor().target_pipeline)
+            || self.cluster_shuffle.as_ref().is_none_or(|scope| {
+                scope.self_id.0 != input.process().participant.node_id
+                    || scope.registry.versioned_snapshot().version()
+                        != input.plan().assignment.assignment_version
+            })
+        {
+            return Err(DbError::Checkpoint(
+                "topology preparation graph differs from its certified target/assignment context"
+                    .into(),
+            ));
+        }
+        self.restore_state_frames_inner(
+            whole,
+            vnodes,
+            input.plan().assignment.vnode_count,
+            input.owned_vnodes(),
+        )
+    }
+
+    fn restore_state_frames_inner(
+        mut self,
+        whole: &[(String, bytes::Bytes)],
+        vnodes: &[(String, u32, bytes::Bytes)],
+        vnode_count: u32,
+        owned_vnodes: &[u32],
+    ) -> Result<(Self, usize), DbError> {
         if !self.whole_restore_open {
             return Err(DbError::Checkpoint(
                 "[LDB-6029] operator graph restore is only valid before the first execution cycle"
@@ -5434,11 +5482,6 @@ impl OperatorGraph {
             }
         }
 
-        #[cfg(feature = "cluster")]
-        let owned_vnodes = self.owned_vnodes_for_managed_state()?;
-        #[cfg(not(feature = "cluster"))]
-        let owned_vnodes = self.local_owned_vnodes_for_managed_state();
-        let owned_vnodes = owned_vnodes.as_deref().unwrap_or(&[]);
         let mut actual_vnodes: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
         for (name, vnode, _) in vnodes {
             let node = self

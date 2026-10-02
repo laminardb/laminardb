@@ -11,6 +11,74 @@ fn config(mode: StartupMode) -> KafkaSourceConfig {
     }
 }
 
+fn sealed_position() -> SourceCheckpoint {
+    let inventory = KafkaPartitionSet::from([("events".into(), 0), ("events".into(), 1)]);
+    let mut checkpoint = OffsetTracker::new().to_checkpoint_for_partitions(
+        inventory
+            .iter()
+            .map(|(topic, partition)| (topic.as_str(), *partition)),
+    );
+    attach_partition_baselines(
+        &mut checkpoint,
+        &KafkaPartitionBaselines::from([(("events".into(), 0), 91), (("events".into(), 1), 0)]),
+        &inventory,
+    );
+    checkpoint
+        .set_input_channels(kafka_input_channels("added_source", &inventory).unwrap())
+        .unwrap();
+    checkpoint
+}
+
+#[test]
+fn topology_restore_kafka_preserves_sealed_offsets_as_the_log_advances() {
+    let checkpoint = sealed_position();
+    let baselines =
+        validate_sealed_position(&checkpoint, "added_source", &["events".into()]).unwrap();
+    assert_eq!(baselines[&("events".into(), 0)], 91);
+    assert_eq!(baselines[&("events".into(), 1)], 0);
+    for (next, low, high) in [(91, 7, 123), (0, 0, 0), (91, 91, 123)] {
+        validate_sealed_next_offset(next, low, high).unwrap();
+    }
+    for (next, low, high) in [(91, 92, 123), (91, 0, 90), (0, -1, 0), (0, 1, 0)] {
+        assert!(validate_sealed_next_offset(next, low, high).is_err());
+    }
+}
+
+#[tokio::test]
+async fn topology_restore_kafka_rejects_malformed_or_owned_cursors_before_native_work() {
+    let mut checkpoints = vec![sealed_position(); 5];
+    checkpoints[0].bind_assignment_version(std::num::NonZeroU64::MIN);
+    checkpoints[1].set_offset("events:0", "90");
+    checkpoints[2].set_metadata("checkpoint.version", "1");
+    checkpoints[3].set_input_channels(vec![vec![1]]).unwrap();
+    checkpoints[4].set_offset(
+        super::super::checkpoint::partition_baseline_key("events", 0),
+        "-1",
+    );
+    let mut source = KafkaSource::new(
+        std::sync::Arc::new(arrow_schema::Schema::empty()),
+        config(StartupMode::Latest),
+        None,
+    );
+    let mut request = ConnectorConfig::new("kafka");
+    request.set("laminar.source.name", "added_source");
+    request.set("bootstrap.servers", "127.0.0.1:1");
+    request.set("group.id", "initialization-test");
+    request.set("topic", "events");
+    request.set("startup.mode", "latest");
+    for checkpoint in checkpoints {
+        assert!(validate_sealed_position(&checkpoint, "added_source", &["events".into()]).is_err());
+        assert!(source
+            .validate_initial_position(&request, &checkpoint)
+            .await
+            .is_err());
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+        assert!(source.reader_handle.is_none());
+        assert!(source.blocking_tasks.is_idle().await);
+    }
+}
+
 #[test]
 fn topology_initialization_offsets_preserve_empty_and_never_read_partitions() {
     assert_eq!(initial_next_offset(&StartupMode::Latest, 0, 0).unwrap(), 0);
@@ -152,6 +220,30 @@ async fn topology_initialization_real_broker_reads_complete_cursors_without_cons
     assert_eq!(source.state(), ConnectorState::Created);
     assert!(source.consumer.is_none());
     assert!(source.reader_handle.is_none());
+    source
+        .validate_initial_position(&request, &latest)
+        .await
+        .unwrap();
+    // The log advances after sealing. Validation preserves the old vector instead of resolving
+    // latest again, and never starts a reader or acknowledges the skipped prefix.
+    producer
+        .send(
+            FutureRecord::to(&topic)
+                .partition(0)
+                .payload("later")
+                .key("later"),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    source
+        .validate_initial_position(&request, &latest)
+        .await
+        .unwrap();
+    assert_eq!(
+        super::super::checkpoint::decode_partition_baselines(&latest).unwrap(),
+        latest_baselines
+    );
     request.set("startup.mode", "earliest");
     let earliest = source.resolve_initial_position(&request).await.unwrap();
     assert!(
@@ -176,7 +268,7 @@ async fn topology_initialization_real_broker_reads_complete_cursors_without_cons
         .elements()
         .iter()
         .all(|e| e.offset() == Offset::Invalid));
-    println!("topology source cursor: latest_lookup_ms={:.3}, channels=3, next=[2,3,0], reader_started=false, acknowledged=false", elapsed.as_secs_f64() * 1000.0);
+    println!("topology source cursor: latest_lookup_ms={:.3}, channels=3, next=[2,3,0], validated_after_append=true, reader_started=false, acknowledged=false", elapsed.as_secs_f64() * 1000.0);
     let results = admin
         .delete_topics(&[topic.as_str()], &AdminOptions::new())
         .await

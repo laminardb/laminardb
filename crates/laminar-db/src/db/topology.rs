@@ -10,10 +10,12 @@ use super::{DbError, DbState, LaminarDB};
 mod migration_root;
 mod planning;
 mod preparation;
+mod restore;
 pub use planning::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
+pub use restore::{PreparedTopologyRestore, PreparedTopologySourcePosition};
 
 /// Durable catalog version and this process's independently observed runtime activation.
 #[derive(Debug, Clone, serde::Serialize)]

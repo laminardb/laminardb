@@ -9,6 +9,7 @@ mod topology_admission;
 mod topology_cut;
 mod topology_migration_root;
 mod topology_preparation;
+mod topology_restore;
 
 pub use attempt_status::ClusterAttemptStatus;
 pub use subscription_replay::{

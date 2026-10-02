@@ -217,6 +217,20 @@ pub trait SourceConnector: Send {
         ))
     }
 
+    /// Read-only validation of a previously sealed global new-source cursor.
+    /// Must preserve its numeric boundary and create no active reader, acknowledgement or sink effect.
+    /// Connectors must reject a changed inventory or expired position rather than silently reset.
+    /// This is preparation only; startup must validate again under final installation authority.
+    async fn validate_initial_position(
+        &mut self,
+        _config: &ConnectorConfig,
+        _checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        Err(ConnectorError::ConfigurationError(
+            "connector has no sealed topology cursor validation contract".into(),
+        ))
+    }
+
     /// Arrow schema of records this source produces.
     fn schema(&self) -> SchemaRef;
 

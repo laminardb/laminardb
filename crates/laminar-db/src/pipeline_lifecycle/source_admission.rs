@@ -212,7 +212,7 @@ pub(super) fn has_only_ordered_interval_consumers(
     consumed
 }
 
-pub(super) fn validate_source_recovery_assignment(
+pub(crate) fn validate_source_recovery_assignment(
     source: &str,
     assignment_scoped: bool,
     checkpoint: Option<&laminar_core::checkpoint::ConnectorCheckpoint>,

@@ -4,7 +4,8 @@ This checkpoint implements explicit legacy catalog adoption, core admission,
 an old-topology checkpoint cut, topology/operation status, local candidate validation
 and durable preparation of already admitted candidates. Exact-cut root staging
 is available through the DB/core library for stateless downstream additions and
-new sources with a supported sealed initialization contract.
+new sources with a supported sealed initialization contract. Private target
+restore preparation is available through the DB library after root publication.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -19,7 +20,8 @@ and durable replay. There is no supported migration submission or activation rou
 | Certify an already admitted candidate on this process | Local preparation API; complete frozen roster required before a new cut |
 | Prepare and hold an exact old-topology cut | Existing manual checkpoint path after participant-complete internal admission/preparation; no target activation |
 | Stage exact-cut state/progress/subscription requirements | DB/core library, held cut and complete current roster; no target restore/output authority |
-| Seal new-source initial positions | Same internal staging call; explicit Kafka topics with earliest/latest; target consumption unfinished |
+| Seal new-source initial positions | Same internal staging call; explicit Kafka topics with earliest/latest |
+| Prepare a private restored target image | DB library; verified parent state and sealed cursors; no target install/Commit/Release |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -274,6 +276,44 @@ in aggregate and the root body at 1 MiB. Retrying the same prepared operation
 returns its original binding; a lost response or cancellation can leave a successful
 append. Query status to resolve uncertainty. Abort preserves the root metadata
 and old checkpoint decision; normal coordinated recovery resumes topology 1.
+
+## Prepare a private restored target internally
+
+After root publication, `LaminarDB::prepare_cluster_topology_restore(operation_id)`
+can return one unstarted target image. There is no HTTP restore or installation
+route. The call requires a Running parent, the held old cut, closed intake, the
+admitting leader, every current process certificate and the unchanged assignment.
+It rechecks these fences after restoring state and validating source cursors.
+
+The existing isolated compiler replays the immutable target and reconciles exact
+catalog incarnations. Recovery verifies the historical parent index/manifests and
+rebuilds every root requirement before state reads. Existing operator codecs decode
+local state with the frozen ownership roster and existing fenced transport handles
+as channel-state context. Preserved subscription generations and exclusive sequence
+frontiers must equal the root. Historical checkpoints retain their parent identity;
+ordinary recovery using the target fingerprint still fails.
+
+Existing sources retain their actual committed attempt/cursor/assignment. New
+sources retain the sealed global unowned cursor without an invented processed
+attempt. Kafka validates its exact topic/partition inventory and current retention
+bounds using read-only metadata; it never resolves `latest` again. A changed
+inventory or expired/beyond-end cursor fails preparation. Final installation must
+validate cursors again and select current owned partitions before source startup.
+Other connectors must explicitly implement this validation contract.
+
+The image retains the single local compiler permit until dropped. A second
+preparation or planning request receives the existing busy error. Cancellation,
+failure or the 45-second deadline drops partial state and frees the permit without
+releasing the parent hold. The root is capped at 1 MiB, aggregate manifests at
+16 MiB, verified local graph payload and decoded state use the configured managed
+state budget, and node reads use the configured checkpoint limit. Encoded buffers
+are released after decoding. The held old graph, target image, codec scratch and
+read buffers coexist transiently; these limits are not a total-process RSS cap.
+
+Success writes no authority receipt, changes no committed catalog/coordinator,
+starts no source/sink actor and permits no target output. A retained image can
+become stale. Observed old-actor retirement, atomic topology Commit, installation
+and participant-complete Release remain required. LDB-6043 stays in place.
 
 ## Errors and recovery
 

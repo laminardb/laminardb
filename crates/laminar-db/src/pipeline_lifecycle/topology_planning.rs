@@ -26,6 +26,34 @@ pub(crate) struct PlannedTopologyGraph {
 
 impl LaminarDB {
     pub(crate) async fn plan_topology_graph(&self) -> Result<PlannedTopologyGraph, DbError> {
+        self.compile_topology_graph()
+            .await
+            .map(|(description, _)| description)
+    }
+
+    /// Reuse the same effect-free compiler, retaining its unstarted graph for private restore.
+    pub(crate) async fn compile_topology_graph(
+        &self,
+    ) -> Result<(PlannedTopologyGraph, crate::operator_graph::OperatorGraph), DbError> {
+        self.compile_topology_graph_inner(None).await
+    }
+
+    pub(crate) async fn compile_topology_restore_graph(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+        scope: crate::operator::sql_query::ClusterShuffleConfig,
+    ) -> Result<(PlannedTopologyGraph, crate::operator_graph::OperatorGraph), DbError> {
+        self.compile_topology_graph_inner(Some((input, scope)))
+            .await
+    }
+
+    async fn compile_topology_graph_inner(
+        &self,
+        restore: Option<(
+            &laminar_core::cluster::control::TopologyRestoreInput,
+            crate::operator::sql_query::ClusterShuffleConfig,
+        )>,
+    ) -> Result<(PlannedTopologyGraph, crate::operator_graph::OperatorGraph), DbError> {
         if DbState::load(&self.state) != DbState::Created
             || self.topology_planning_ownership_scope.is_none()
             || self.cluster_controller.lock().is_some()
@@ -210,13 +238,24 @@ impl LaminarDB {
                 ))?,
             );
         }
-        let mut graph = self.build_connector_operator_graph(
-            &streams,
-            &tables,
-            &resolved.changelog_carrying,
-            &interval.joins,
-            None,
-        )?;
+        let mut graph = if let Some((input, scope)) = restore {
+            self.build_topology_restore_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                &input.descriptor().target_pipeline,
+                scope,
+            )?
+        } else {
+            self.build_connector_operator_graph(
+                &streams,
+                &tables,
+                &resolved.changelog_carrying,
+                &interval.joins,
+                None,
+            )?
+        };
         for (name, schema) in &resolved.schemas {
             graph.register_intermediate_schema(name, schema);
         }
@@ -235,10 +274,13 @@ impl LaminarDB {
         // Only empty managed state is constructed. Historical state stays solely in the active
         // graph and its cut. Drop this graph before compiling the next candidate generation.
         let graph = graph.initialize_managed_state().await?;
-        Ok(PlannedTopologyGraph {
-            operators: graph.topology_operator_contracts()?,
-            schemas,
-            connector_sha256,
-        })
+        Ok((
+            PlannedTopologyGraph {
+                operators: graph.topology_operator_contracts()?,
+                schemas,
+                connector_sha256,
+            },
+            graph,
+        ))
     }
 }

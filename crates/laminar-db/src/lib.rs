@@ -190,8 +190,6 @@ pub use subscription::cluster::benchmark::{
     ClusterSubscriptionGatewayBenchmark, GatewayReplayObservation, SlowReaderFootprint,
 };
 
-#[cfg(feature = "cluster")]
-pub use db::ClusterTopologyStatus;
 /// Cluster assignment lifecycle results.
 #[cfg(feature = "cluster")]
 pub use db::{ClusterStartupDisposition, SnapshotAdoption};
@@ -200,6 +198,8 @@ pub use db::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
 };
+#[cfg(feature = "cluster")]
+pub use db::{ClusterTopologyStatus, PreparedTopologyRestore, PreparedTopologySourcePosition};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

@@ -198,6 +198,42 @@ impl VerifiedStateFramePlan {
 }
 
 impl<'a> RecoveryManager<'a> {
+    /// Load a currently authorized migration cut using the strict parent identity and local roster.
+    /// All historical manifests/segments retain their original identity. The rebuilt root must
+    /// equal the sealed requirements before any state payload is read. This is private target
+    /// preparation, never ordinary target recovery or source/output authorization.
+    ///
+    /// # Errors
+    /// Rejects a reader bound to another participant, pipeline, deployment or scope, divergent
+    /// root metadata, damaged state/output bytes and exceeded configured graph payload limits.
+    #[cfg(feature = "cluster")]
+    pub async fn recover_topology_root(
+        &self,
+        input: &laminar_core::cluster::control::TopologyRestoreInput,
+        max_graph_payload_bytes: usize,
+    ) -> Result<RecoveredState, DbError> {
+        if self.store.participant_id() != input.process().participant.node_id
+            || self.pipeline_identity != input.descriptor().parent_pipeline
+            || self.deployment_id != input.descriptor().deployment_id
+            || self.scope != CheckpointScope::Cluster
+        {
+            return Err(checkpoint_error(
+                "migration restore reader differs from its exact parent/process authority",
+            ));
+        }
+        self.recover_committed_inner(
+            input.outcome(),
+            input.checkpoint(),
+            Some(ClusterRecoveryTarget {
+                assignment: input.plan().assignment.clone(),
+                owned_vnodes: input.owned_vnodes().to_vec(),
+                max_graph_payload_bytes,
+            }),
+            Some(input),
+        )
+        .await
+    }
+
     /// Bind recovery to one runtime topology, deployment, and outcome domain.
     #[must_use]
     pub fn new(
@@ -236,34 +272,52 @@ impl<'a> RecoveryManager<'a> {
         committed: &CommittedCheckpointIndex,
         cluster_target: Option<ClusterRecoveryTarget>,
     ) -> Result<RecoveredState, DbError> {
+        self.recover_committed_inner(outcome, committed, cluster_target, None)
+            .await
+    }
+
+    async fn recover_committed_inner(
+        &self,
+        outcome: &CheckpointOutcome,
+        committed: &CommittedCheckpointIndex,
+        cluster_target: Option<ClusterRecoveryTarget>,
+        #[cfg(feature = "cluster")] topology: Option<
+            &laminar_core::cluster::control::TopologyRestoreInput,
+        >,
+        #[cfg(not(feature = "cluster"))] _topology: Option<()>,
+    ) -> Result<RecoveredState, DbError> {
         self.validate_cut(outcome, committed)?;
 
         let checkpoint_id = committed.checkpoint_id;
-        let reads = committed.participants.iter().map(|participant| {
-            let store = self.store;
-            async move {
-                store
-                    .load_manifest_verified(
-                        participant.participant_id,
-                        checkpoint_id,
-                        participant.manifest_len,
-                        &participant.manifest_sha256,
-                    )
-                    .await
-                    .map_err(|error| {
-                        checkpoint_error(format!(
-                            "participant {} checkpoint {} manifest is unreadable: {error}",
-                            participant.participant_id, checkpoint_id
-                        ))
-                    })?
-                    .ok_or_else(|| {
-                        checkpoint_error(format!(
-                            "participant {} checkpoint {} manifest is missing",
-                            participant.participant_id, checkpoint_id
-                        ))
-                    })
-            }
-        });
+        let reads = committed
+            .participants
+            .iter()
+            .map(|participant| {
+                let store = self.store;
+                async move {
+                    store
+                        .load_manifest_verified(
+                            participant.participant_id,
+                            checkpoint_id,
+                            participant.manifest_len,
+                            &participant.manifest_sha256,
+                        )
+                        .await
+                        .map_err(|error| {
+                            checkpoint_error(format!(
+                                "participant {} checkpoint {} manifest is unreadable: {error}",
+                                participant.participant_id, checkpoint_id
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            checkpoint_error(format!(
+                                "participant {} checkpoint {} manifest is missing",
+                                participant.participant_id, checkpoint_id
+                            ))
+                        })
+                }
+            })
+            .collect::<Vec<_>>();
         let mut manifests = futures::stream::iter(reads)
             .buffer_unordered(PARALLEL_MANIFEST_READS)
             .try_collect::<Vec<_>>()
@@ -271,6 +325,15 @@ impl<'a> RecoveryManager<'a> {
         manifests.sort_unstable_by_key(|manifest| manifest.participant_id);
 
         self.validate_manifests(committed, &manifests)?;
+        #[cfg(feature = "cluster")]
+        if let Some(input) = topology {
+            input.root().validate_restore_cut(
+                input.operation(),
+                input.descriptor(),
+                committed,
+                &manifests,
+            )?;
+        }
         #[cfg(feature = "cluster")]
         subscription_output::validate_committed_subscription_segments(self.store, &manifests)
             .await?;

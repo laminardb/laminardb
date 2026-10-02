@@ -28,7 +28,10 @@ impl Fixture {
     }
 }
 
-fn position(descriptor: &ClusterTopologyValidation, next: u64) -> TopologySourceInitialization {
+pub(super) fn position(
+    descriptor: &ClusterTopologyValidation,
+    next: u64,
+) -> TopologySourceInitialization {
     let source = descriptor
         .objects
         .iter()

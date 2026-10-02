@@ -148,7 +148,7 @@ impl LaminarDB {
         Ok(initialized)
     }
 
-    fn ensure_topology_root_available(&self) -> Result<(), DbError> {
+    pub(super) fn ensure_topology_root_available(&self) -> Result<(), DbError> {
         self.ensure_topology_preparation_available()?;
         if !self.topology_cut_hold.load(Ordering::Acquire)
             || !self.source_gate.load(Ordering::Acquire)

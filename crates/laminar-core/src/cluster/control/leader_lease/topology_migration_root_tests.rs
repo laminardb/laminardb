@@ -383,6 +383,8 @@ async fn fixture_with_sources(authority: &LeaderLeaseStore, add_sources: bool) -
     }
 }
 
+#[path = "topology_restore_tests.rs"]
+mod restore;
 #[path = "topology_source_root_tests.rs"]
 mod source_initialization;
 

@@ -15,6 +15,7 @@ mod admission;
 mod compatibility;
 mod migration_root;
 mod preparation;
+mod restore;
 mod source_initialization;
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
@@ -34,6 +35,7 @@ pub use migration_root::{
 pub use preparation::{
     TopologyParticipantCertificate, TopologyPreparation, TOPOLOGY_PREPARATION_PROTOCOL_VERSION,
 };
+pub use restore::TopologyRestoreInput;
 pub use source_initialization::{TopologySourceInitialization, MAX_TOPOLOGY_SOURCE_CHANNELS};
 
 /// Version of the topology adoption protocol understood by this binary.

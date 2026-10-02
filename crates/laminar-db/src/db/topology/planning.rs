@@ -279,7 +279,7 @@ impl LaminarDB {
         ))
     }
 
-    async fn validate_bound_parent_pipeline(
+    pub(super) async fn validate_bound_parent_pipeline(
         &self,
         expected: &PipelineIdentity,
     ) -> Result<(), DbError> {
@@ -369,7 +369,7 @@ pub(super) async fn replay_entry(
     Ok(())
 }
 
-fn describe_catalog(
+pub(super) fn describe_catalog(
     candidate: &LaminarDB,
     manifest: &CatalogManifest,
     identities: &PipelineCompatibilityIdentities,

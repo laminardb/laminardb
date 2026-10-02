@@ -15,11 +15,13 @@ pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
 };
 #[cfg(feature = "cluster")]
-pub use topology::ClusterTopologyStatus;
-#[cfg(feature = "cluster")]
 pub use topology::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
+};
+#[cfg(feature = "cluster")]
+pub use topology::{
+    ClusterTopologyStatus, PreparedTopologyRestore, PreparedTopologySourcePosition,
 };
 
 use std::collections::HashMap;
@@ -298,7 +300,7 @@ pub struct LaminarDB {
     pub(crate) topology_ddl_lock: tokio::sync::RwLock<()>,
     /// One effect-free candidate compiler at a time; rejected callers do not queue more graphs.
     #[cfg(feature = "cluster")]
-    pub(crate) topology_validation_lock: tokio::sync::Mutex<()>,
+    pub(crate) topology_validation_lock: Arc<tokio::sync::Mutex<()>>,
     // Only a private, unstarted topology catalog carries a resource-availability snapshot.
     // Normal databases check their actual transport and ownership handles during DDL admission.
     #[cfg(feature = "cluster")]
@@ -1800,7 +1802,7 @@ impl LaminarDB {
             startup_attempt: parking_lot::Mutex::new(None),
             topology_ddl_lock: tokio::sync::RwLock::new(()),
             #[cfg(feature = "cluster")]
-            topology_validation_lock: tokio::sync::Mutex::new(()),
+            topology_validation_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(feature = "cluster")]
             topology_planning_ownership_scope: None,
             catalog_namespace: parking_lot::Mutex::new(HashMap::new()),
