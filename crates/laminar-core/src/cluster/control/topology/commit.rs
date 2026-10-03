@@ -52,25 +52,38 @@ impl TopologyCommit {
 
 impl TopologyAdmissionStatus {
     pub(crate) fn has_target_commit(&self) -> bool {
-        self.phase == TopologyAdmissionPhase::Committed
+        self.commit.is_some()
     }
 
     // A committed target reserves execution until a separately certified installation/Release.
     pub(crate) fn blocks_admission(&self) -> bool {
-        self.is_preparing() || self.has_target_commit()
+        self.is_preparing()
+            || (self.has_target_commit() && self.phase != TopologyAdmissionPhase::Active)
     }
 
     pub(crate) fn validate_commit(&self, head: u64) -> Result<(), TopologyError> {
         match (&self.commit, self.phase) {
-            (None, TopologyAdmissionPhase::Committed)
+            (
+                None,
+                TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Activating
+                | TopologyAdmissionPhase::Active,
+            )
             | (Some(_), TopologyAdmissionPhase::Aborted { .. }) => Err(TopologyError::Invalid(
                 "topology phase and Commit disagree".into(),
             )),
             (None, _) => Ok(()),
-            (Some(commit), TopologyAdmissionPhase::Committed) => {
+            (
+                Some(commit),
+                TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Activating
+                | TopologyAdmissionPhase::Active,
+            ) => {
                 commit.validate()?;
                 if commit.operation_id != self.operation_id
-                    || commit.authority_sequence != self.status_sequence
+                    || commit.authority_sequence > self.status_sequence
+                    || (self.phase == TopologyAdmissionPhase::Committed
+                        && commit.authority_sequence != self.status_sequence)
                     || commit.authority_sequence > head
                     || !self.target_preparation_roster_complete()
                     || self.target_preparations.iter().any(|receipt| {
@@ -98,7 +111,13 @@ impl TopologyAdmissionStatus {
     ) -> Result<(), TopologyError> {
         match (&self.commit, &after.commit) {
             (None, None) => Ok(()),
-            (Some(prior), Some(next)) if prior == next && self == after => Ok(()),
+            (Some(prior), Some(next))
+                if prior == next
+                    && self.same_migration_binding(after)
+                    && self.target_preparations == after.target_preparations =>
+            {
+                Ok(())
+            }
             (None, Some(commit))
                 if self.phase == TopologyAdmissionPhase::CutPrepared
                     && after.phase == TopologyAdmissionPhase::Committed

@@ -197,7 +197,10 @@ impl TopologyMigrationRoot {
             })?;
         if !matches!(
             operation.phase,
-            TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Committed
+            TopologyAdmissionPhase::CutPrepared
+                | TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Activating
+                | TopologyAdmissionPhase::Active
         ) || index
             .encode_and_reference()
             .map_err(TopologyError::Invalid)?

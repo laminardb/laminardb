@@ -54,7 +54,7 @@ impl TopologyAdmissionStatus {
     // Only receipt/status progress can change while an image is retained. Every field defining
     // its restore authority remains exact. Destructuring forces future fields to be considered.
     pub(crate) fn same_restore_binding(&self, other: &Self) -> bool {
-        self.phase == other.phase
+        (self.phase == other.phase || (self.has_target_commit() && other.has_target_commit()))
             && self.commit == other.commit
             && self.same_migration_binding(other)
     }
@@ -73,6 +73,7 @@ impl TopologyAdmissionStatus {
             migration_root,
             target_preparations: _,
             commit: _,
+            activation: _,
         } = self;
         *operation_id == other.operation_id
             && *plan == other.plan
@@ -97,6 +98,8 @@ impl TopologyAdmissionStatus {
             self.phase,
             TopologyAdmissionPhase::CutPrepared
                 | TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Activating
+                | TopologyAdmissionPhase::Active
                 | TopologyAdmissionPhase::Aborted { .. }
         ) || self.target_preparations.len() > MAX_CHECKPOINT_PARTICIPANTS
             || !self

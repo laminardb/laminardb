@@ -24,12 +24,15 @@ impl LaminarDB {
     ) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
+        #[cfg(feature = "cluster")]
+        self.installed_topology_runtime.lock().take();
         if self.is_closed() {
             runtime_shutdown.cancel();
             return Err(DbError::Shutdown);
         }
         #[cfg(feature = "cluster")]
         if let Some(input) = topology.as_ref().map(|image| &image.input) {
+            self.ensure_topology_installation_held()?;
             self.validate_topology_installation(input).await?;
             let identities = self.topology_definition_identities()?;
             if self.catalog_manifest_inventory()? != input.target().entries
@@ -145,7 +148,7 @@ impl LaminarDB {
                 has_external,
                 "Starting pipeline"
             );
-            self.start_connector_pipeline(
+            Box::pin(self.start_connector_pipeline(
                 source_regs,
                 sink_regs,
                 stream_regs,
@@ -157,7 +160,7 @@ impl LaminarDB {
                 runtime_shutdown,
                 #[cfg(feature = "cluster")]
                 topology,
-            )
+            ))
             .await?;
         } else {
             tracing::info!(

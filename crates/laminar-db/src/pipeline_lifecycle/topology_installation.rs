@@ -133,7 +133,15 @@ impl LaminarDB {
         })
     }
 
-    pub(super) async fn ensure_topology_runtime_ready(
+    pub(crate) async fn ensure_topology_runtime_ready(
+        &self,
+        input: &TopologyRestoreInput,
+    ) -> Result<(), DbError> {
+        self.ensure_topology_runtime_live(input).await?;
+        self.ensure_topology_runtime_held()
+    }
+
+    pub(crate) async fn ensure_topology_runtime_live(
         &self,
         input: &TopologyRestoreInput,
     ) -> Result<(), DbError> {
@@ -141,7 +149,15 @@ impl LaminarDB {
             let coordinator = self.coordinator.lock().await;
             let coordinator = coordinator.as_ref().ok_or(TopologyError::Fenced)?;
             coordinator.bound_pipeline_identity()? == input.descriptor().target_pipeline
-                && coordinator.last_committed_ref() == input.outcome().committed_checkpoint.as_ref()
+                && (coordinator.last_committed_ref()
+                    == input.outcome().committed_checkpoint.as_ref()
+                    || (input.operation().phase
+                        == laminar_core::cluster::control::TopologyAdmissionPhase::Active
+                        && coordinator
+                            .last_committed_manifest()
+                            .is_some_and(|manifest| {
+                                manifest.pipeline_identity == input.descriptor().target_pipeline
+                            })))
         };
         let graph_matches = self
             .installed_vnode_state
@@ -170,14 +186,15 @@ impl LaminarDB {
             .count();
         let sources_ready = {
             let sources = self.owned_source_tasks.lock();
-            sources.len() == expected_sources && sources.iter().all(|source| !source.is_finished())
+            sources.len() == expected_sources
+                && sources
+                    .iter()
+                    .all(crate::pipeline::streaming_coordinator::SourceTaskLease::is_running)
         };
         let sinks_ready = {
             let sinks = self.owned_sink_handles.lock();
             sinks.len() == expected_sinks
-                && sinks
-                    .iter()
-                    .all(crate::sink_task::SinkTaskHandle::has_unresolved_task)
+                && sinks.iter().all(crate::sink_task::SinkTaskHandle::is_ready)
         };
         if !coordinator_matches
             || !graph_matches
@@ -188,6 +205,6 @@ impl LaminarDB {
         {
             return Err(TopologyError::Fenced.into());
         }
-        self.ensure_topology_installation_held()
+        Ok(())
     }
 }

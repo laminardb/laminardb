@@ -12,7 +12,7 @@ use crate::cluster::control::{CatalogManifest, LocalProcessAuthorityIdentity};
 /// Only the configured controller/authority can construct this input. It permits private restore
 /// preparation, never graph installation, source start, output or intake release. A retained input
 /// can become stale; installation must revalidate authority and require a target Commit/Release.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyRestoreInput {
     pub(crate) operation: TopologyAdmissionStatus,
     pub(crate) plan: TopologyAdmissionPlan,
@@ -29,11 +29,29 @@ pub struct TopologyRestoreInput {
 }
 
 impl TopologyRestoreInput {
+    /// Exact current owner/evidence roster revalidated for committed reconstruction.
+    #[must_use]
+    pub fn processes(&self) -> &[LocalProcessAuthorityIdentity] {
+        &self.restore_processes
+    }
+
+    /// Current committed reconstruction leader, absent for pre-Commit private preparation.
+    #[must_use]
+    pub fn current_leader(&self) -> Option<LeaderProof> {
+        self.committed_leader.clone()
+    }
     /// Compare all restore requirements, allowing only monotonic receipt/status progress.
     /// Both inputs must come from current controller authorization; this comparison never
     /// replaces a fresh read or the authority's receipt, leader, process and assignment audits.
     #[must_use]
     pub fn same_restore_requirements(&self, other: &Self) -> bool {
+        self.same_installed_generation(other) && self.committed_leader == other.committed_leader
+    }
+
+    /// Immutable installed generation, excluding the current leader read. A leader change after
+    /// Commit never changes the restored state; current installation/Release must be audited anew.
+    #[must_use]
+    pub fn same_installed_generation(&self, other: &Self) -> bool {
         self.operation.same_restore_binding(&other.operation)
             && self.plan == other.plan
             && self.target == other.target
@@ -45,7 +63,6 @@ impl TopologyRestoreInput {
             && self.process == other.process
             && self.restore_assignment == other.restore_assignment
             && self.restore_processes == other.restore_processes
-            && self.committed_leader == other.committed_leader
     }
 
     /// Whether a fresh committed authorization retains the prepared image's exact historical

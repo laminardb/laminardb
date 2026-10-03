@@ -101,6 +101,10 @@ pub enum TopologyAdmissionPhase {
     /// Catalog and exact migration root are committed. Target installation/Release remain pending.
     /// Leader changes and recovery faults must preserve this decision; it cannot abort.
     Committed,
+    /// Exact committed runtime installation receipts are being collected with intake held.
+    Activating,
+    /// Participant-complete Release is committed. Local activation remains separately observed.
+    Active,
     /// Definitive pre-target-commit abort; no candidate actors were authorized.
     Aborted {
         /// Durable reason.
@@ -197,6 +201,9 @@ pub struct TopologyAdmissionStatus {
     /// Irreversible target catalog decision; absent throughout preparation and pre-commit abort.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<super::TopologyCommit>,
+    /// Current exact-runtime installation round and immutable participant-complete Release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<super::TopologyActivation>,
 }
 
 impl TopologyAdmissionStatus {
@@ -230,12 +237,15 @@ impl TopologyAdmissionStatus {
         self.validate_preparation(head)?;
         self.validate_target_preparations(head)?;
         self.validate_commit(head)?;
+        self.validate_activation()?;
         if let Some(binding) = &self.migration_root {
             binding.root.validate()?;
             if !matches!(
                 self.phase,
                 TopologyAdmissionPhase::CutPrepared
                     | TopologyAdmissionPhase::Committed
+                    | TopologyAdmissionPhase::Activating
+                    | TopologyAdmissionPhase::Active
                     | TopologyAdmissionPhase::Aborted { .. }
             ) || self
                 .preparation
@@ -270,6 +280,8 @@ impl TopologyAdmissionStatus {
                 TopologyAdmissionPhase::Quiescing
                 | TopologyAdmissionPhase::CutPrepared
                 | TopologyAdmissionPhase::Committed
+                | TopologyAdmissionPhase::Activating
+                | TopologyAdmissionPhase::Active
                 | TopologyAdmissionPhase::Aborted { .. },
             ) => {
                 cut.inventory.validate().map_err(TopologyError::Invalid)?;
@@ -314,7 +326,10 @@ impl TopologyAdmissionStatus {
                 }
                 if matches!(
                     self.phase,
-                    TopologyAdmissionPhase::CutPrepared | TopologyAdmissionPhase::Committed
+                    TopologyAdmissionPhase::CutPrepared
+                        | TopologyAdmissionPhase::Committed
+                        | TopologyAdmissionPhase::Activating
+                        | TopologyAdmissionPhase::Active
                 ) && (cut.committed.is_none()
                     || cut.completed_participants != fence.participants)
                 {
@@ -348,7 +363,7 @@ impl TopologyAdmissionStatus {
             || self.plan != after.plan
             || self.admitted_sequence != after.admitted_sequence
             || self.admitted_by != after.admitted_by
-            || (!self.is_preparing() && self != after)
+            || (!self.is_preparing() && !self.has_target_commit() && self != after)
             || (self != after && (after.is_planned() || after.status_sequence != sequence))
         {
             return Err(TopologyError::Invalid(
@@ -358,6 +373,7 @@ impl TopologyAdmissionStatus {
         self.validate_preparation_successor(after, sequence)?;
         self.validate_target_preparation_successor(after, sequence)?;
         self.validate_commit_successor(after, sequence)?;
+        self.validate_activation_successor(after, sequence)?;
         match (&self.migration_root, &after.migration_root) {
             (None, None) => {}
             (Some(prior), Some(next)) if prior == next => {}

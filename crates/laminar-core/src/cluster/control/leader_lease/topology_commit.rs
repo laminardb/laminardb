@@ -122,11 +122,17 @@ impl LeaderAuthorityRecord {
     pub(super) fn reject_pending_topology_commit(
         &self,
     ) -> Result<(), ClusterCheckpointAuthorityError> {
-        if self
-            .topology_operations
-            .iter()
-            .any(TopologyAdmissionStatus::has_target_commit)
-        {
+        if self.topology_operations.iter().any(|operation| {
+            operation.has_target_commit()
+                && (operation.phase != TopologyAdmissionPhase::Active
+                    || self.commit_head.as_ref().is_none_or(|head| {
+                        operation
+                            .cut
+                            .as_ref()
+                            .and_then(|cut| cut.committed.as_ref())
+                            .is_none_or(|cut| head.sequence <= cut.authority_sequence)
+                    }))
+        }) {
             return Err(DecisionError::Conflict("committed topology requires target installation and Release; parent recovery cannot release intake".into()).into());
         }
         Ok(())
@@ -240,7 +246,14 @@ impl LeaderLeaseStore {
                 .topology_operations
                 .iter()
                 .find(|entry| entry.operation_id == operation.operation_id)
-                != Some(operation)
+                .is_none_or(|anchored| {
+                    anchored.phase != TopologyAdmissionPhase::Committed
+                        || anchored.commit != operation.commit
+                        || !anchored.same_migration_binding(operation)
+                        || anchored.target_preparations != operation.target_preparations
+                        || anchored.activation.is_some()
+                        || anchored.status_sequence != commit.authority_sequence
+                })
         {
             return Err(LeaseError::Invalid(
                 "topology Commit differs from its atomic catalog/root append".into(),

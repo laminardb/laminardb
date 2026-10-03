@@ -36,7 +36,7 @@ impl LaminarDB {
         &self,
         input: &TopologyRestoreInput,
     ) -> Result<(), DbError> {
-        self.ensure_topology_installation_held()?;
+        self.ensure_topology_runtime_held()?;
         let controller = self
             .cluster_controller
             .lock()
@@ -45,7 +45,11 @@ impl LaminarDB {
         let fresh = controller
             .committed_topology_restore_input(input.operation().operation_id)
             .await?;
-        if !fresh.same_restore_requirements(input) {
+        if if DbState::load(&self.state) == DbState::Starting {
+            !fresh.same_restore_requirements(input)
+        } else {
+            !fresh.same_installed_generation(input)
+        } {
             return Err(TopologyError::Fenced.into());
         }
         let target = ShuffleTopologyFence::from_manifest(
@@ -86,15 +90,25 @@ impl LaminarDB {
         {
             return Err(TopologyError::Fenced.into());
         }
-        self.ensure_topology_installation_held()
+        self.ensure_topology_runtime_held()
     }
 
     pub(crate) fn ensure_topology_installation_held(&self) -> Result<(), DbError> {
+        if DbState::load(&self.state) != DbState::Starting {
+            return Err(TopologyError::Fenced.into());
+        }
+        self.ensure_topology_runtime_held()
+    }
+
+    pub(crate) fn ensure_topology_runtime_held(&self) -> Result<(), DbError> {
         if self.is_closed() {
             return Err(DbError::Shutdown);
         }
         if !self.is_cluster_runtime()
-            || DbState::load(&self.state) != DbState::Starting
+            || !matches!(
+                DbState::load(&self.state),
+                DbState::Starting | DbState::Running
+            )
             || !self.source_gate.load(Ordering::Acquire)
             || !self.topology_cut_hold.load(Ordering::Acquire)
             || self.cluster_authority_revoked.load(Ordering::Acquire)

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use super::{CatalogManifestError, CatalogManifestRef, LeaseError};
 use crate::error_codes;
 
+mod activation;
 mod admission;
 mod commit;
 mod compatibility;
@@ -19,6 +20,10 @@ mod preparation;
 mod restore;
 mod source_initialization;
 mod target_preparation;
+pub use activation::{
+    TopologyActivation, TopologyInstallationReceipt, TopologyRelease,
+    TOPOLOGY_INSTALLATION_PROTOCOL_VERSION,
+};
 pub(crate) use admission::MAX_TOPOLOGY_PLAN_BYTES;
 pub use admission::{
     TopologyAbortReason, TopologyAdmissionPhase, TopologyAdmissionPlan, TopologyAdmissionStatus,

@@ -8,6 +8,8 @@ new sources with a supported sealed initialization contract. Private target
 restore preparation and observed parent retirement are available through the DB
 library after root publication. The internal DB/core path now supports irreversible
 target Commit and private reconstruction from its exact root before a target checkpoint.
+Held runtime installation, current process readiness receipts, participant-complete
+Release and local activation are available through the internal library.
 It does **not** implement runtime topology migration. The existing `LDB-6043`
 guard still rejects cluster CREATE/DROP/ALTER requests outside cold bootstrap
 and durable replay. There is no supported migration submission or activation route.
@@ -29,6 +31,8 @@ and durable replay. There is no supported migration submission or activation rou
 | Commit the exact restored target | DB library; complete protocol-4 frozen roster; atomic catalog/root decision; installation and Release remain pending |
 | Reconstruct the committed target before its first checkpoint | DB library; explicit root, strict parent manifest/state checks and current process/adoption; private image only |
 | Atomically start a new source from its sealed cursor | Internal connector/runtime prerequisite; explicit Kafka inventory with guaranteed delivery; intake still requires coordinated Release |
+| Certify an installed held runtime | DB library; live state, actors, sink acknowledgements and exact receiver mesh; protocol 5 |
+| Release the complete installed target | Leader DB library; current full process roster; followers independently apply the same Release |
 | Adopt the identical legacy inventory as topology 1 | Core library primitive; coordinated binary upgrade required |
 | Add an independent pipeline or downstream stream/sink | Local dry-run supported for replayable source/stateless stream/durable sink; activation remains rejected |
 | Remove or replace objects | Rejected; state, sink and subscription contracts unfinished |
@@ -139,7 +143,7 @@ router's status codes.
 
 ## Legacy upgrade and restart
 
-Authority formats 12 through 20 remain readable. A coordinated binary upgrade is
+Authority formats 12 through 21 remain readable. A coordinated binary upgrade is
 required for this build: the first serialized assignment drain writes format 14,
 even before logical catalog adoption. Stop and observe termination of the old
 server processes, then start every required participant with the new binary and
@@ -165,7 +169,8 @@ directory or control namespace. Exact committed inventory replay remains mandato
 After an internal additive Commit, cold replay accepts the complete current inventory
 or the exact complete original adopted bootstrap. It reconstructs the committed
 target in both cases. Arbitrary subsets and changed definitions reject. Ordinary
-start remains fenced while target installation/Release are unfinished.
+start remains fenced before automatic target recovery is integrated. An internal
+Release applies only to its certified runtime and cannot activate a replacement boot.
 
 Adoption appends metadata without rewriting catalog or checkpoint bytes. A lost
 response/cancelled call may already have admitted the baseline. Read authoritative
@@ -183,7 +188,7 @@ returns 404 with `Cache-Control: no-store`. Baseline adoption is reported by the
 catalog-status endpoint, not this migration-request journal.
 
 The implemented `state.phase` values are `planned`, `preparing`, `quiescing`, `cut_prepared`,
-`committed` and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
+`committed`, `activating`, `active` and `aborted`. Aborted includes `state.reason`: `requested`, `leader_changed`,
 `checkpoint_aborted` or `recovery`. A reservation never implies that the
 candidate catalog is committed or locally active. The committed catalog remains
 at its parent version until the atomic target Commit. Committed status includes the
@@ -356,8 +361,8 @@ from its reconciled checkpoint. Do not reset the namespace or checkpoints.
 `image.parent_retirement_observed()` records a local observation. It appends no
 durable readiness receipt and grants no target output permission. The installer
 must revalidate the observation, current authority and transport generation before
-Commit/install/Release. Process-lifetime shuffle handles remain in place; target
-generation fencing and installation are unfinished. This step alone does not
+Commit/install/Release. Process-lifetime shuffle handles remain in place; committed
+transport preparation and installation are separate methods below. This step alone does not
 activate a migration or certify transactional sink migration behavior.
 
 ## Record target preparation internally
@@ -395,7 +400,8 @@ are installed. The current APIs require the retained image for retry; if it is
 lost before Commit, abort and recover the parent through coordinated recovery.
 Commit checks current authority and every required process;
 installation must obtain a valid target image, revalidate sealed cursors and wait
-for participant-complete Release. Installation/Release remain unfinished. LDB-6043 remains.
+for participant-complete Release. The internal installation/Release methods are
+described below; automatic orchestration/recovery remain unfinished. LDB-6043 remains.
 
 ## Commit and reconstruct internally
 
@@ -456,8 +462,9 @@ unchanged and source/sink actors unstarted. Intake/cut and the parent's namespac
 stay held. Cancellation after local publication retains the target binding; retry
 the same image or reconstruct from the immutable Commit. No manual gate opening,
 parent restart or output permission follows from success. Held runtime installation
-is available below. Participant-complete Release, including current installation
-capability and actual receiver/state/sink readiness, remains unfinished. LDB-6043 remains.
+is available below. The internal certification/Release methods check current
+installation capability and actual receiver/state/sink readiness. Automatic
+orchestration/recovery remain unfinished. LDB-6043 remains.
 
 ## Sealed source startup contract
 
@@ -474,7 +481,7 @@ This boundary is not processed history and does not seed committed progress or
 acknowledge the skipped prefix. Reader polling remains held by the runtime gate.
 The contract is a tested installation prerequisite, not an operational migration
 command or permission to open intake. Held installation consumes this contract.
-Participant-complete Release and automatic target recovery remain unfinished;
+Internal participant-complete Release is available; automatic target recovery remains unfinished;
 LDB-6043 remains. See the
 [source startup evidence](test-evidence/topology-source-start-2026-10-02/README.md).
 
@@ -504,11 +511,52 @@ remains Committed and the locally active version remains absent. Public startup,
 manual gate opening and runtime DDL remain fenced until the complete Release path
 exists. Success grants no durable readiness receipt or output permission.
 
-Current participant capability/readiness collection, stale sink completion fencing,
-participant-complete Release, automatic target recovery and public submission
-remain unfinished. LDB-6043 remains. The
+Current readiness collection, sink generation fencing and participant-complete
+Release are available through the internal methods below. Automatic target recovery
+and public submission remain unfinished. LDB-6043 remains. The
 [installation evidence](test-evidence/topology-installation-2026-10-03/README.md)
 records the local held-runtime cases and their limits.
+
+## Certify and release an installed runtime internally
+
+After held installation, `certify_installed_cluster_topology(operation_id)` checks
+live actors, restored state, sink acknowledgements and the exact target receiver
+mesh before recording this process's protocol-5 installation receipt. It keeps
+intake closed. The receipt's runtime UUID belongs to that actual installation;
+historical restore receipts and unresolved children of dead actors do not count.
+The first receipt upgrades authority encoding to 21. Every required participant
+must run the upgraded binary, including evidence participants with no vnodes.
+
+The current leader can invoke `release_installed_cluster_topology(operation_id)`
+when all exact current installations are certified. It atomically publishes
+participant-complete Release, reconciles/admit sink epochs and opens local intake
+last. Followers invoke `apply_cluster_topology_release(operation_id)` for the
+same durable decision and their own exact runtime receipt. Each method uses the
+existing DB control owner and a 45-second cooperative budget; caller disconnect
+does not cancel that owner. There is no HTTP/SQL activation command or automatic
+migration worker yet.
+
+Operation phase `activating` means installation collection with intake held.
+`active` means durable Release, independently of a process's application result.
+`locally_active_version` is populated only for this exact Running runtime after
+Release application with live actors and current authority. Process loss or actor
+death can make it null while the durable operation remains Active. Read the same
+operation after a timeout or lost response and retry the same runtime; never
+rewind Commit or replace a runtime UUID to manufacture readiness.
+
+A leader change before Release requires a fresh complete installation round.
+A harmless leader change after Release preserves the original decision. Replacement
+boots and changed ownership need certified target recovery; they cannot reuse an
+old runtime's receipt. Before the first target checkpoint, ordinary recovery still
+rejects the historical parent checkpoint under the target identity. Keep the
+decision, root and exact artifacts when activation fails.
+
+Released assignment refresh can service target checkpoints before the first target
+checkpoint exists. The checkpoint must belong to the committed target pipeline;
+no parent identity bypass is enabled. Controlled local tests preserve aggregate
+state and future-only additions, but do not certify transactional sink migration,
+automatic recovery, public migration or real multi-process restart. See the
+[activation evidence](test-evidence/topology-activation-2026-10-03/README.md).
 
 ## Errors and recovery
 
@@ -529,8 +577,8 @@ legacy fallback for a damaged adopted deployment. Missing deployment identity
 or missing adoption anchor also blocks catalog startup replay. Keep gates closed
 and recover the original artifacts from the deployment's storage procedures.
 
-No target cutover-pause duration or migration activation can be certified in
-this increment. See the [engineering checkpoint](cluster-topology-engineering.md)
+No real multi-process migration, cutover-pause duration or production latency is
+certified by this increment. See the [engineering checkpoint](cluster-topology-engineering.md)
 and [remaining work](cluster-topology-migrations-progress.md). The
 [transport evidence](test-evidence/topology-transport-2026-10-02/README.md) records
 real loopback gRPC and internal exact-Commit preparation checks and their limits.

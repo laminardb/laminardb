@@ -18,6 +18,7 @@ use super::protocol::SINK_CLOSE_TIMEOUT;
 pub(super) enum ConnectorOperationOutcome<T> {
     Completed(T),
     Deadline,
+    GenerationRetired,
     #[cfg(feature = "cluster")]
     ProcessAuthorityLost,
 }
@@ -67,6 +68,7 @@ pub(super) async fn await_connector_operation_fenced<T>(
 #[cfg(feature = "cluster")]
 pub(super) async fn await_connector_operation<T, F, Fut>(
     deadline: Instant,
+    generation: &tokio_util::sync::CancellationToken,
     process_authority: Option<Arc<ClusterController>>,
     make_future: F,
 ) -> ConnectorOperationOutcome<T>
@@ -74,25 +76,48 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    let Some(controller) = process_authority else {
-        return await_connector_operation_local(deadline, make_future()).await;
-    };
-    if !controller.process_lease_is_live() {
-        return ConnectorOperationOutcome::ProcessAuthorityLost;
+    if generation.is_cancelled() {
+        return ConnectorOperationOutcome::GenerationRetired;
     }
-    await_connector_operation_fenced(controller.as_ref(), deadline, make_future()).await
+    let operation = async {
+        let Some(controller) = process_authority else {
+            return await_connector_operation_local(deadline, make_future()).await;
+        };
+        if !controller.process_lease_is_live() {
+            return ConnectorOperationOutcome::ProcessAuthorityLost;
+        }
+        await_connector_operation_fenced(controller.as_ref(), deadline, make_future()).await
+    };
+    tokio::select! {
+        biased;
+        () = generation.cancelled() => ConnectorOperationOutcome::GenerationRetired,
+        result = operation => {
+            // A connector can finish in the same poll that another owner revokes this actor.
+            if generation.is_cancelled() { ConnectorOperationOutcome::GenerationRetired } else { result }
+        }
+    }
 }
 
 #[cfg(not(feature = "cluster"))]
 pub(super) async fn await_connector_operation<T, F, Fut>(
     deadline: Instant,
+    generation: &tokio_util::sync::CancellationToken,
     make_future: F,
 ) -> ConnectorOperationOutcome<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    await_connector_operation_local(deadline, make_future()).await
+    if generation.is_cancelled() {
+        return ConnectorOperationOutcome::GenerationRetired;
+    }
+    tokio::select! {
+        biased;
+        () = generation.cancelled() => ConnectorOperationOutcome::GenerationRetired,
+        result = await_connector_operation_local(deadline, make_future()) => {
+            if generation.is_cancelled() { ConnectorOperationOutcome::GenerationRetired } else { result }
+        }
+    }
 }
 
 pub(super) async fn bounded_connector_operation<T, F, Fut>(
@@ -100,6 +125,7 @@ pub(super) async fn bounded_connector_operation<T, F, Fut>(
     operation: &str,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    generation: &tokio_util::sync::CancellationToken,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
     make_future: F,
 ) -> (Result<T, ConnectorError>, bool)
@@ -109,6 +135,7 @@ where
 {
     match await_connector_operation(
         deadline,
+        generation,
         #[cfg(feature = "cluster")]
         process_authority,
         make_future,
@@ -126,10 +153,20 @@ where
             Err(protocol_deadline_error(sink_name, operation)),
             cancellation_policy == ConnectorCancellationPolicy::RetireConnector,
         ),
+        ConnectorOperationOutcome::GenerationRetired => {
+            (Err(generation_retired_error(sink_name, operation)), true)
+        }
         #[cfg(feature = "cluster")]
         ConnectorOperationOutcome::ProcessAuthorityLost => {
             (Err(process_authority_error(sink_name, operation)), true)
         }
+    }
+}
+
+pub(super) fn generation_retired_error(sink_name: &str, operation: &str) -> ConnectorError {
+    ConnectorError::InvalidState {
+        expected: "current sink actor generation".into(),
+        actual: format!("sink '{sink_name}' generation retired before {operation} completion; reconcile any unknown external outcome"),
     }
 }
 

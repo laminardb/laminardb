@@ -7,7 +7,9 @@ use std::sync::atomic::Ordering;
 
 use super::{DbError, DbState, LaminarDB};
 
+mod activation;
 mod commit;
+pub(crate) use activation::InstalledTopologyRuntime;
 mod installation;
 mod migration_root;
 mod planning;
@@ -75,14 +77,47 @@ impl LaminarDB {
         let committed_version = catalog.committed_version();
         let replayed_version = *self.replayed_topology_version.lock();
         let controller = self.cluster_controller.lock().clone();
-        let locally_active_version = if DbState::load(&self.state) == DbState::Running
-            && !matches!(
-                &catalog,
-                TopologyCatalogState::Versioned {
-                    committed: Some(_),
-                    ..
+        let release_observed = match &catalog {
+            TopologyCatalogState::Versioned {
+                committed: Some(commit),
+                ..
+            } => {
+                let binding = self.installed_topology_runtime.lock().clone();
+                match binding.filter(|binding| {
+                    binding.input.operation().commit.as_ref() == Some(commit)
+                        && !binding.shutdown.is_cancelled()
+                        && self.owned_source_tasks.lock().iter().all(
+                            crate::pipeline::streaming_coordinator::SourceTaskLease::is_running,
+                        )
+                        && self
+                            .owned_sink_handles
+                            .lock()
+                            .iter()
+                            .all(crate::sink_task::SinkTaskHandle::is_ready)
+                }) {
+                    Some(binding) => store
+                        .operation_status(commit.operation_id)
+                        .await?
+                        .is_some_and(|status| {
+                            status.phase
+                                == laminar_core::cluster::control::TopologyAdmissionPhase::Active
+                                && status.activation.as_ref().is_some_and(|round| {
+                                    round.release.as_ref().is_some_and(|release| {
+                                        Some(release.authority_sequence)
+                                            == binding.released_sequence
+                                    }) && round.installations.iter().any(|receipt| {
+                                        receipt.runtime_id == binding.runtime_id
+                                            && receipt.process == binding.input.process()
+                                    })
+                                })
+                        }),
+                    None => false,
                 }
-            )
+            }
+            _ => true,
+        };
+        let locally_active_version = if DbState::load(&self.state) == DbState::Running
+            && release_observed
             && !self.source_gate.load(Ordering::Acquire)
             && !self.topology_cut_hold.load(Ordering::Acquire)
             && !self.cluster_authority_revoked.load(Ordering::Acquire)

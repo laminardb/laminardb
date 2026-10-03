@@ -65,6 +65,12 @@ impl LeaderAuthorityRecord {
                 ));
             }
             previous = operation.admitted_sequence;
+            if operation.activation.is_some() && self.version < TOPOLOGY_INSTALLATION_RECORD_VERSION
+            {
+                return Err(LeaseError::Invalid(
+                    "topology installation/Release requires authority format 21".into(),
+                ));
+            }
             if (operation.commit.is_some()
                 || operation.target_preparations.iter().any(|receipt| {
                     receipt.protocol_version
@@ -229,6 +235,16 @@ impl LeaderAuthorityRecord {
             prior
                 .validate_successor(after, next.lease.seq)
                 .map_err(|error| LeaseError::Invalid(error.to_string()))?;
+            if after.activation != prior.activation
+                && after
+                    .activation
+                    .as_ref()
+                    .is_none_or(|round| !next.lease.matches_proof(&round.leader))
+            {
+                return Err(LeaseError::Invalid(
+                    "installation/Release append requires its exact current leader".into(),
+                ));
+            }
             if let Some(cut) = &after.cut {
                 let prior_commit = prior.cut.as_ref().and_then(|cut| cut.committed.as_ref());
                 if prior_commit.is_none() {
@@ -462,7 +478,8 @@ impl LeaderLeaseStore {
             .await
             .map_err(topology_lease_error)?;
         self.audit_topology_target_preparations(operation).await?;
-        self.audit_topology_commit(operation, &plan).await
+        self.audit_topology_commit(operation, &plan).await?;
+        self.audit_topology_activation(operation).await
     }
 
     /// Read the definitive, payload-bound pre-cut request status without allocating identities.
@@ -667,6 +684,7 @@ impl LeaderLeaseStore {
                 migration_root: None,
                 target_preparations: Vec::new(),
                 commit: None,
+                activation: None,
                 preparation: plan.compatibility.clone().map(|compatibility| {
                     crate::cluster::control::topology::TopologyPreparation {
                         compatibility,

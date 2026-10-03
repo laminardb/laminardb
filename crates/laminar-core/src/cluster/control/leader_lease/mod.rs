@@ -5,6 +5,7 @@ mod assignment_drain;
 mod attempt_status;
 mod subscription_replay;
 mod topology;
+mod topology_activation;
 mod topology_admission;
 mod topology_commit;
 mod topology_committed_restore;
@@ -72,6 +73,7 @@ const TOPOLOGY_MIGRATION_ROOT_RECORD_VERSION: u32 = 17;
 const TOPOLOGY_SOURCE_ROOT_RECORD_VERSION: u32 = 18;
 const TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION: u32 = 19;
 const TOPOLOGY_COMMIT_RECORD_VERSION: u32 = 20;
+const TOPOLOGY_INSTALLATION_RECORD_VERSION: u32 = 21;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
 const MAX_AUTHORITY_HEAD_BYTES: u64 = 128;
@@ -1345,6 +1347,7 @@ impl LeaderAuthorityRecord {
             && self.version != TOPOLOGY_SOURCE_ROOT_RECORD_VERSION
             && self.version != TOPOLOGY_TARGET_PREPARATION_RECORD_VERSION
             && self.version != TOPOLOGY_COMMIT_RECORD_VERSION
+            && self.version != TOPOLOGY_INSTALLATION_RECORD_VERSION
         {
             return Err(LeaseError::Invalid(format!(
                 "authority record version {} is unsupported",
@@ -2703,6 +2706,18 @@ impl LeaderLeaseStore {
             );
             if let Some(commit) = &operation.commit {
                 retained.insert(commit.authority_sequence);
+            }
+            if let Some(activation) = &operation.activation {
+                retained.insert(activation.authority_sequence);
+                retained.extend(
+                    activation
+                        .installations
+                        .iter()
+                        .map(|receipt| receipt.authority_sequence),
+                );
+                if let Some(release) = &activation.release {
+                    retained.insert(release.authority_sequence);
+                }
             }
             if let Some(root) = &operation.migration_root {
                 retained.insert(root.authority_sequence);
@@ -4538,6 +4553,8 @@ impl LeaderLeaseStore {
             self.reject_consumed_checkpoint_assignment(current, assignment_fence)
                 .await?;
             current.validate_topology_checkpoint_inventory(&inventory)?;
+            self.validate_committed_topology_checkpoint_inventory(current, &inventory)
+                .await?;
             if let Some(active) = current.active_checkpoint_artifacts.as_ref() {
                 if active == &inventory
                     && current.active_checkpoint_artifact_leader_proof.as_ref() == Some(proof)

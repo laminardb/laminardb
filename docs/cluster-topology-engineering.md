@@ -25,8 +25,9 @@ owners while retaining the runtime and namespace fences. Exact-process target
 preparation receipts now record those observations in the same authority log.
 Explicit private reconstruction after Commit is implemented, including before the
 first target checkpoint. Exact-Commit transport preparation and local runtime
-installation with intake held are implemented. Participant-complete activation,
-Release and automatic target runtime recovery remain unfinished.
+installation with intake held are implemented. Current installation receipts,
+participant-complete durable Release and local application are now implemented.
+Automatic migration ownership and target runtime recovery remain unfinished.
 Runtime DDL stays fenced.
 
 The existing append-only `LeaderLeaseStore` is the serialization point. Each
@@ -72,6 +73,11 @@ Commit. Protocol-3 receipts remain readable but cannot authorize Commit or be
 rewritten as protocol 4; abort and admit a new operation after coordinated upgrade.
 The protocol-2 plan and root encodings remain unchanged. Earlier statuses omit
 the absent Commit field. All participants must certify protocol 4 before Commit.
+Encoding 21 adds protocol-5 exact-runtime installation receipts and Release. Earlier
+statuses omit the absent activation field. A receipt requires actual held actor,
+state and transport readiness. Every current owner/evidence process must certify
+protocol 5 before Release. Encoding 20 readers reject the upgrade; capability
+advertisements do not replace coordinated binary upgrade or actor retirement.
 Every later lease, checkpoint,
 assignment, retention, fault and release append preserves the encoding and baseline.
 Successor validation rejects downgrade or baseline replacement. Old binaries
@@ -125,7 +131,7 @@ checkpoint/assignment admission is rejected throughout preparation except for th
 exact atomically bound old cut. Renewal preserves it;
 a new leader term or recovery fault atomically aborts it and retains recovery
 evidence. This policy applies only before target Commit. A committed operation
-remains Committed under leader replacement or a recovery fault and rejects abort.
+retains its Commit under leader replacement or a recovery fault and rejects abort.
 
 Plan payloads are capped at 32 KiB and the retained request journal at 64 identities.
 Both admission and explicit abort allow 16 CAS attempts within 15 seconds. Reads
@@ -809,6 +815,84 @@ I/O. Participant-complete capabilities/readiness, stale sink completion fencing,
 automatic recovery and the real multi-process migration/performance oracle remain
 unfinished. LDB-6043 remains.
 
+## Installed runtime certification and Release, 2026-10-03
+
+`Committed -> Activating -> Active` now uses the same authority append as the
+catalog, checkpoint, assignment and recovery decisions. `TopologyActivation`
+freezes the current complete assignment and process roster, including zero-vnode
+evidence processes. Each installation receipt binds its exact boot/process term,
+protocol 5, unique local runtime UUID and immutable append sequence. It cannot
+stand in for the historical private-restore/parent-retirement receipt.
+
+The existing DB control executor owns `certify_installed_cluster_topology`,
+`release_installed_cluster_topology` and `apply_cluster_topology_release`. One
+existing compiler slot bounds local control work; its strong DB owner and shared
+45-second cooperative deadline survive caller cancellation. Lock order is compiler
+slot, topology, lifecycle, then assignment. No synchronous lock spans an await.
+State remains in the installed graph; certification copies only bounded metadata.
+
+Certification checks the target coordinator and vnode binding, live compute
+watcher, exact source/sink actor counts, sealed-source actors, sink control
+acknowledgements and current target receiver mesh. Source actor liveness is
+separate from terminal connector-child ownership. A dead actor with a retained
+child continues blocking succession but cannot certify readiness. Successful
+certification keeps intake held and admits no initial target sink epoch.
+
+Each sink actor owns a revocation token shared with handles and connector-operation
+waits. Abort revokes it synchronously before cancelling the actor. A revoked
+operation cannot invoke a connector, accept a same-poll late completion or report
+a buffered successful acknowledgement. A same-name successor owns a distinct
+token. Connector-child tracking still governs terminal observation; rejecting a
+late success does not undo an external effect or settle an unknown sink outcome.
+Graceful retirement still reconciles and closes the old connector before revocation.
+
+The current leader rechecks every process and publishes Release only after the
+exact current roster is complete. An unreleased round can be superseded on a
+leader change only by recollecting all runtime observations. Published Release
+and Commit are immutable. A harmless later leader change can authorize the same
+Release, but another process, runtime UUID or assignment cannot reuse it.
+Status/catalog reads audit exact retained receipt/Release appends; pruning pins
+all their sequences. Protocol, phase, duplicate sequence and evidence rewrites
+fail closed.
+Release does not consume the migration root. Its parent checkpoint artifact pin
+remains after Active until explicit root retirement accounts for recovery/replay
+references. This conservative bound can stop artifact-floor advancement; root
+consumption and journal reclamation remain required before public migration.
+
+Every participant applies Release separately. It reaudits current authority,
+reconciles any sink-open witness, admits target sink epochs through the existing
+coordinator, reaudits actor/process/assignment liveness and opens intake last.
+`Active` means a durable full-roster Release; `locally_active_version` additionally
+requires this process's exact live runtime and applied Release. A dead actor makes
+that local field absent without rewriting the durable decision.
+
+Held assignment refresh retains the exact controller/transport certificate while
+keeping intake closed. Released refresh uses the certified Release until the first
+target checkpoint. A checkpoint admitted in that interval must bind the committed
+target pipeline/deployment; parent checkpoints cannot be relabelled. Refresh can
+coexist with that exact target checkpoint. Ordinary recovery still rejects the
+historical parent cut before a target checkpoint; root-backed automatic recovery
+requires its own integration and cannot borrow the original runtime's receipt.
+
+| Boundary | Required result |
+| --- | --- |
+| Missing/dead actor or incomplete receiver mesh | No installation receipt; keep intake held |
+| Incomplete/mixed/stale roster | No Release; retain Commit and available receipts |
+| Successful write with a lost response | Resolve the same operation/round from shared authority |
+| Caller disconnect after local control claim | Existing bounded DB owner continues |
+| Leader changes before Release | Recollect the complete current installation roster |
+| Leader changes after Release | Retain the original Release and revalidate current authority |
+| Process/assignment/fault fence or actor failure during application | Keep the durable target and close/retain local intake |
+| Apply fails after sink epoch admission | Retain the coordinator's witness and reconcile on retry |
+| Original runtime dies after Release | Durable Active stays visible; locally active becomes absent |
+
+The [activation evidence](test-evidence/topology-activation-2026-10-03/README.md)
+uses exact multi-process authority fixtures and actual local restored aggregate,
+callback and owned actors with controlled at-least-once connectors. It does not
+certify transactional target installation, automatic root recovery, public
+submission, or a real multi-process migration/restart/performance oracle. LDB-6043
+remains until those paths are complete.
+
 ## Required next integration
 
 1. Integrate candidate planning with a DB-owned migration worker and its existing
@@ -821,11 +905,10 @@ unfinished. LDB-6043 remains.
    exact process/assignment roster; receipts alone cannot grant target output.
 4. Drive the implemented atomic target Commit and private post-Commit root
    reconstruction from owned migration work; both remain internal library paths.
-5. Drive the implemented exact-Commit transport and held runtime installation
-   before participant-complete Release.
-   Certify current installation capabilities/readiness and fence stale sink completions;
-   graph/shuffle generation fences and atomic sealed source startup exist. Wire
-   target-only post-Commit runtime recovery.
+5. Drive the implemented exact-Commit transport, held runtime installation,
+   current readiness receipts and participant-complete Release from owned migration
+   work. Sink generation fencing and local Release application are implemented.
+   Wire target-only post-Commit runtime recovery.
 6. Wire public SQL and atomic multi-object submission, expected parent,
    payload-bound idempotency and detached durable ownership. Local dry run exists;
    it does not advance admission. Do not reuse bootstrap.

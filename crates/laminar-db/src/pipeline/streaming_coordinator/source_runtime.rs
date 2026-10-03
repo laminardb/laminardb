@@ -482,6 +482,13 @@ impl SourceTaskLease {
                 .is_none_or(ConnectorTaskTracker::is_terminated)
     }
 
+    #[cfg(feature = "cluster")]
+    pub(crate) fn is_running(&self) -> bool {
+        !self.state.actor_terminal.is_finished()
+            && !self.state.abort.is_finished()
+            && !self.state.expected_shutdown.load(Ordering::Acquire)
+    }
+
     pub(crate) fn request_shutdown(&self) {
         self.mark_expected_shutdown();
         self.notify_shutdown();

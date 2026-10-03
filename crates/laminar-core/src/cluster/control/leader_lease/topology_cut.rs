@@ -75,13 +75,46 @@ impl LeaderAuthorityRecord {
     pub(super) fn topology_cut_blocks_cleanup(&self, protected: &CommittedCheckpointRef) -> bool {
         self.topology_operations
             .iter()
-            .filter(|operation| operation.blocks_admission())
+            // Release is not retirement of the migration root. Its parent state can still be
+            // needed before a target checkpoint and by recovery/replay references afterward.
+            // Keep this pin until an explicit root-consumption/retirement protocol exists.
+            .filter(|operation| operation.blocks_admission() || operation.has_target_commit())
             .filter_map(|operation| operation.cut.as_ref()?.committed.as_ref())
             .any(|commit| protected.epoch > commit.checkpoint.epoch)
     }
 }
 
 impl LeaderLeaseStore {
+    pub(super) async fn validate_committed_topology_checkpoint_inventory(
+        &self,
+        current: &LeaderAuthorityRecord,
+        inventory: &CheckpointArtifactInventory,
+    ) -> Result<(), ClusterCheckpointAuthorityError> {
+        let Some(operation) = current.committed_topology_operation() else {
+            return Ok(());
+        };
+        let plan = self
+            .load_topology_plan(&operation.plan)
+            .await
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let descriptor = self
+            .audit_topology_compatibility(&plan)
+            .await
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?
+            .ok_or_else(|| {
+                DecisionError::Conflict("committed topology has no state descriptor".into())
+            })?;
+        if inventory.pipeline_identity != descriptor.target_pipeline
+            || inventory.deployment_id != descriptor.deployment_id
+        {
+            return Err(DecisionError::Conflict(
+                "checkpoint does not belong to the committed target topology".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Read the reserved old-graph cut owner for checkpoint control, under the exact leader proof.
     /// This never validates candidate compatibility or grants target execution.
     ///

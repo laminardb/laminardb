@@ -8,6 +8,113 @@ use crate::cluster::control::topology::{
 };
 
 impl ClusterController {
+    /// Audit permission to open this exact installed runtime under a durable topology Release.
+    ///
+    /// # Errors
+    /// Rejects recovery, draining, stale local adoption/process or unavailable authority.
+    pub async fn authorize_topology_release(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+        runtime_id: uuid::Uuid,
+    ) -> Result<bool, TopologyError> {
+        if self.is_recovering()
+            || self.is_draining()
+            || self.try_live_local_process_authority_identity().ok() != Some(input.process())
+        {
+            return Ok(false);
+        }
+        let allowed = self
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?
+            .authorize_topology_release(
+                self.snapshot.as_ref().ok_or(TopologyError::Fenced)?,
+                self.process_lease_authority
+                    .get()
+                    .ok_or(TopologyError::Fenced)?,
+                input,
+                runtime_id,
+            )
+            .await?;
+        Ok(allowed
+            && !self.is_recovering()
+            && !self.is_draining()
+            && self.try_live_local_process_authority_identity().ok() == Some(input.process())
+            && self
+                .checkpoint_assignment_fence(input.assignment().assignment_version)
+                .as_ref()
+                == Some(input.assignment()))
+    }
+
+    /// Certify a held installed runtime after its DB owner has observed source/sink/graph readiness.
+    ///
+    /// # Errors
+    /// Rejects stale local process/adoption, recovery/draining, or conflicting durable evidence.
+    pub async fn certify_topology_installation(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+        runtime_id: uuid::Uuid,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let before = self
+            .committed_topology_restore_input(input.operation().operation_id)
+            .await?;
+        if !before.same_restore_requirements(input) || self.is_recovering() || self.is_draining() {
+            return Err(TopologyError::Fenced);
+        }
+        self.checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?
+            .certify_topology_installation(
+                self.snapshot.as_ref().ok_or(TopologyError::Fenced)?,
+                self.process_lease_authority
+                    .get()
+                    .ok_or(TopologyError::Fenced)?,
+                input,
+                runtime_id,
+                crate::cluster::control::TOPOLOGY_INSTALLATION_PROTOCOL_VERSION,
+            )
+            .await?;
+        let after = self
+            .committed_topology_restore_input(input.operation().operation_id)
+            .await?;
+        if !after.same_restore_requirements(input) || self.is_recovering() || self.is_draining() {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(after.operation().clone())
+    }
+
+    /// Commit participant-complete Release for the current installation round.
+    ///
+    /// # Errors
+    /// Rejects a follower, stale local adoption, recovery, incomplete roster or uncertain authority.
+    pub async fn release_topology_target(
+        &self,
+        input: &crate::cluster::control::TopologyRestoreInput,
+    ) -> Result<TopologyAdmissionStatus, TopologyError> {
+        let proof = self.capture_leader_proof().ok_or(TopologyError::Fenced)?;
+        if self.is_recovering() || self.is_draining() {
+            return Err(TopologyError::Fenced);
+        }
+        let status = self
+            .checkpoint_authority()
+            .map_err(|error| TopologyError::Protocol(error.to_string()))?
+            .release_topology_target(
+                &proof,
+                self.snapshot.as_ref().ok_or(TopologyError::Fenced)?,
+                self.process_lease_authority
+                    .get()
+                    .ok_or(TopologyError::Fenced)?,
+                input,
+            )
+            .await?;
+        if self.capture_leader_proof().as_ref() != Some(&proof)
+            || self.is_recovering()
+            || self.is_draining()
+            || self.try_live_local_process_authority_identity().ok() != Some(input.process())
+        {
+            return Err(TopologyError::Fenced);
+        }
+        Ok(status)
+    }
+
     /// Record this process's exact-root private restore and observed parent retirement.
     /// The caller must observe termination through runtime-owned actor/connector handles.
     /// A receipt records historical preparation, never installation or output authorization.

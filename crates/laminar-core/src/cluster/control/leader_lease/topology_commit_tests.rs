@@ -5,6 +5,9 @@ use crate::cluster::control::{
     LocalProcessAuthorityIdentity, TopologyRestoreInput, TOPOLOGY_COMMIT_PROTOCOL_VERSION,
 };
 
+#[path = "topology_activation_tests.rs"]
+mod activation;
+
 async fn prepared(authority: &LeaderLeaseStore) -> (Fixture, TopologyRestoreInput) {
     let fixture = fixture(authority).await;
     fixture.stage(authority).await.unwrap();

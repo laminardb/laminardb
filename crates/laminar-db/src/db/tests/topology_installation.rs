@@ -3,6 +3,9 @@
 use super::*;
 use laminar_connectors::connector::SourcePosition;
 
+#[path = "topology_activation.rs"]
+mod activation;
+
 fn enable_runtime(fixture: &Fixture) -> Arc<runtime_probe::InstallationProbe> {
     let probe = Arc::new(runtime_probe::InstallationProbe::default());
     *fixture.restore_validation.runtime.lock() = Some(Arc::clone(&probe));

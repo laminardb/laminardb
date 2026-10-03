@@ -15,8 +15,6 @@ pub(crate) use assignment_authority::{
     audited_stopped_recovery_successor_round, audited_stopped_terminal_round,
 };
 #[cfg(feature = "cluster")]
-pub(crate) use topology::TopologyRuntimeMetadata;
-#[cfg(feature = "cluster")]
 pub use topology::{
     ClusterTopologyObjectPlan, ClusterTopologyObjectTransition, ClusterTopologyValidation,
     TopologyActivationRequirement, TopologyInitialization, TopologyValidationScope,
@@ -25,6 +23,8 @@ pub use topology::{
 pub use topology::{
     ClusterTopologyStatus, PreparedTopologyRestore, PreparedTopologySourcePosition,
 };
+#[cfg(feature = "cluster")]
+pub(crate) use topology::{InstalledTopologyRuntime, TopologyRuntimeMetadata};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -417,9 +417,13 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) source_gate: Arc<std::sync::atomic::AtomicBool>,
     /// A terminal topology cut is held independently of assignment readiness. Only an
-    /// authorized coordinated recovery release may clear it after the old runtime retires.
+    /// authorized recovery or topology Release may clear it after retirement and readiness.
     #[cfg(feature = "cluster")]
     pub(crate) topology_cut_hold: Arc<std::sync::atomic::AtomicBool>,
+    /// Exact runtime that installed a committed topology; cancellation invalidates its receipts.
+    #[cfg(feature = "cluster")]
+    pub(crate) installed_topology_runtime:
+        parking_lot::Mutex<Option<topology::InstalledTopologyRuntime>>,
     /// One-way local data-plane fence after stable process-lease loss.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_authority_revoked: std::sync::atomic::AtomicBool,
@@ -1864,6 +1868,8 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             topology_cut_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
+            installed_topology_runtime: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
             cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "cluster")]
             cluster_authority_transition: Arc::new(parking_lot::Mutex::new(())),
@@ -2362,6 +2368,34 @@ impl LaminarDB {
         let intake_open = false;
         let preserve_predecessor_execution = source_drain_active && !intake_was_closed;
         if !controller.is_recovering() && (!source_drain_active || preserve_predecessor_execution) {
+            // The exact installed certificate remains useful during a held topology cut, but
+            // ordinary recovery admission cannot authorize its target or clear that hold.
+            if self
+                .topology_cut_hold
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Ok(AssignmentAuthorityActivation {
+                    installed: true,
+                    intake_open: false,
+                    revision: expected_revision,
+                });
+            }
+            match self
+                .refresh_released_topology_assignment(
+                    &controller,
+                    fence,
+                    expected_revision,
+                    deadline,
+                )
+                .await
+            {
+                Ok(Some(activation)) => return Ok(activation),
+                Ok(None) => {}
+                Err(error) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(error);
+                }
+            }
             // Recovery authority and active faults must come from one durable view. Reading them
             // independently can pair an old terminal with the empty fault set created by a newer
             // committed Release.

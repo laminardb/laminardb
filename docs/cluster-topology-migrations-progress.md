@@ -813,6 +813,44 @@ selection remain unchanged.
   scenario is rerun; the current harness does not drive held runtime installation
   and Release.
 
+## Installed runtime certification and Release, 2026-10-03
+
+- Continuation starts clean at `1b2fcf26b0308e4b5ed8d957d37edb575c501316`.
+  Authority format 21 and installation protocol 5 implement
+  `Committed -> Activating -> Active`. Exact current owner/evidence processes
+  certify their actual held runtime UUID, state/transport binding, live source/sink
+  actors, sink acknowledgements and receiver mesh. The complete roster, including
+  zero-vnode evidence processes, is required for durable Release.
+- The existing DB control executor owns certification, leader Release and follower
+  application with one existing compiler slot and a 45-second cooperative deadline.
+  Caller cancellation leaves the bounded owner running. Sink witnesses/epoch
+  admission precede the final authority audit and local intake opening. Commit and
+  published Release remain immutable; unreleased leader replacement recollects all
+  receipts. A new process/runtime cannot borrow an old runtime's Release.
+- Every sink actor now shares a unique revocation token with its operations and
+  handles. Revocation precedes actor abort, rejects connector admission, same-poll
+  late completion and buffered success, and retires the connector even if its usual
+  cancellation policy allows reuse. Existing native-child tracking still governs
+  termination and unknown external outcomes. Dead source/sink actors cannot certify
+  readiness merely because their connector children remain owned.
+- Held assignment refresh preserves the exact installed certificate. Released
+  refresh uses the certified Release before the first target checkpoint and can
+  coexist with exact target checkpoint work. Artifact admission rejects a parent
+  pipeline checkpoint after Commit; generic recovery still cannot relabel the
+  historical parent cut. Local status requires the exact applied, live runtime.
+- No scheduler, general framework, dependency, state-copy or per-record topology
+  work is introduced. This completes the explicit installation/Release library
+  path, while owned orchestration, automatic target recovery and public SQL/API
+  remain unfinished. LDB-6043 and startup guards remain. Validation and its local
+  controlled-connector limits are recorded in the
+  [activation evidence](test-evidence/topology-activation-2026-10-03/README.md).
+- All 20 new focused cases pass. The final selected four-package suite passes
+  4,413 tests: 1,087 core, 921 connectors, 2,049 DB and 356 server, with the same
+  three ignored cases. All-target Clippy with warnings denied, minimal server,
+  cluster/FFI, formatting and working/staged diff checks pass. All 34 changed Rust
+  source hashes and Cargo.lock are frozen through final verification and staging.
+  No broker, real migration/restart, soak or comparative performance run is repeated.
+
 ## Remaining work
 
 1. Integrate the implemented participant certification path with detached submission
@@ -825,10 +863,10 @@ selection remain unchanged.
    Old checkpoint binding, quiescence, root pinning, source initialization and
    private state/cursor preparation exist.
 3. Drive implemented atomic Commit/private reconstruction from owned migration work;
-   drive implemented exact-Commit transport and held runtime installation, fence
-   stale sink completions, and certify current capabilities and actual readiness
-   for participant-complete Release. Graph/shuffle generation fencing, root-backed
-   runtime state and atomic sealed source startup exist. Wire automatic post-Commit runtime
+   drive implemented exact-Commit transport, held runtime installation, readiness
+   receipts and participant-complete Release. Stale sink completion fencing, local
+   Release application, graph/shuffle fencing, root-backed runtime state and atomic
+   sealed source startup exist. Wire automatic post-Commit runtime
    recovery; ordinary startup stays held.
 4. Public SQL/atomic API, detached ownership and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
@@ -866,6 +904,8 @@ Atomic sealed source startup checks are recorded in
 `docs/test-evidence/topology-source-start-2026-10-02`.
 Held committed runtime installation checks are recorded in
 `docs/test-evidence/topology-installation-2026-10-03`.
+Current runtime certification, sink generation and Release checks are recorded in
+`docs/test-evidence/topology-activation-2026-10-03`.
 This is a resumable checkpoint
 on `feature/cluster-topology-migrations`; the final handoff identifies its exact
 commit SHA. No changes were pushed and no pull request was created.

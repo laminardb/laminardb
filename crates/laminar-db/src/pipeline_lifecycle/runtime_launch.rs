@@ -763,9 +763,15 @@ impl LaminarDB {
         });
         launch?;
         #[cfg(feature = "cluster")]
-        if let Some(metadata) = topology_metadata.as_ref() {
+        if let Some(metadata) = topology_metadata {
             self.validate_topology_installation(&metadata.input).await?;
             self.ensure_topology_runtime_ready(&metadata.input).await?;
+            *self.installed_topology_runtime.lock() = Some(crate::db::InstalledTopologyRuntime {
+                input: metadata.input,
+                runtime_id: uuid::Uuid::new_v4(),
+                shutdown: self.runtime_shutdown.read().clone(),
+                released_sequence: None,
+            });
         }
         #[cfg(feature = "cluster")]
         if let Some(guard) = vnode_transition_launch.as_mut() {
