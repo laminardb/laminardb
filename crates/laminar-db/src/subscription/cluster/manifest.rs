@@ -8,6 +8,7 @@ use laminar_core::checkpoint::{
     CommittedCheckpointIndex, CommittedCheckpointRef, NodePartitionRange, NodeSubscriptionManifest,
     OutputDistributionCertificate, OutputSegmentRef, SubscriptionCheckpointManifest,
 };
+use laminar_core::cluster::control::{ClusterCheckpointAuthorityError, LeaderLeaseStore};
 use laminar_core::state::KeyGroupCount;
 
 use super::OutputSegmentBinding;
@@ -57,6 +58,7 @@ pub(super) struct LoadedStreamCut {
 
 /// Load and cross-check every participant manifest named by one authoritative index.
 pub(super) async fn load_checkpoint(
+    authority: &LeaderLeaseStore,
     store: &Arc<dyn CheckpointStore>,
     index: CommittedCheckpointIndex,
     certificate: &OutputDistributionCertificate,
@@ -76,7 +78,7 @@ pub(super) async fn load_checkpoint(
     index
         .validate_participant_manifests(&borrowed)
         .map_err(manifest_error)?;
-    let stream = select_stream_cut(&index, &manifests, certificate)?;
+    let stream = select_stream_cut(authority, &index, &manifests, certificate).await?;
     Ok(LoadedCheckpoint {
         reference,
         index,
@@ -120,7 +122,8 @@ async fn load_participant_manifests(
     Ok(manifests)
 }
 
-fn select_stream_cut(
+async fn select_stream_cut(
+    authority: &LeaderLeaseStore,
     index: &CommittedCheckpointIndex,
     manifests: &[CheckpointManifest],
     certificate: &OutputDistributionCertificate,
@@ -145,8 +148,22 @@ fn select_stream_cut(
     else {
         return Ok(None);
     };
-    validate_certificate(certificate, &selected.manifest.distribution_certificate)?;
-    let segments = bound_segments(index, manifests, certificate)?;
+    let actual = &selected.manifest.distribution_certificate;
+    if certificate.stream_generation != actual.stream_generation {
+        return Err(ClusterSubscriptionError::GenerationMismatch.into());
+    }
+    if certificate.schema_fingerprint != actual.schema_fingerprint {
+        return Err(ClusterSubscriptionError::SchemaMismatch.into());
+    }
+    Box::pin(authority.validate_cluster_subscription_certificate(index, certificate, actual))
+        .await
+        .map_err(|error| match error {
+            ClusterCheckpointAuthorityError::Decision(error) => manifest_error(error.to_string()),
+            _ => ClusterSubscriptionError::BackendUnavailable.into(),
+        })?;
+    // Bind every segment to its original participant/attempt and historical certificate.
+    // Only the expected reader certificate crosses the audited topology mapping.
+    let segments = bound_segments(index, manifests, actual)?;
     if segments
         .iter()
         .map(|segment| &segment.reference)

@@ -36,6 +36,7 @@ const DEPLOYMENT: &str = "11111111-1111-4111-8111-111111111111";
 struct HistoryFixture {
     store: ObjectStoreCheckpointStore,
     decisions: CheckpointDecisionStore,
+    authority: laminar_core::cluster::control::LeaderLeaseStore,
     latest: CommittedCheckpointIndex,
 }
 
@@ -256,6 +257,7 @@ async fn history(retention_bytes: u64) -> HistoryFixture {
     let objects = Arc::new(InMemory::new());
     let store = ObjectStoreCheckpointStore::new(objects.clone(), "history")
         .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let authority = laminar_core::cluster::control::LeaderLeaseStore::new(objects.clone(), 30_000);
     let decisions = CheckpointDecisionStore::new(objects);
     let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
     let mut predecessor = None;
@@ -278,6 +280,7 @@ async fn history(retention_bytes: u64) -> HistoryFixture {
     HistoryFixture {
         store,
         decisions,
+        authority,
         latest: latest.unwrap(),
     }
 }
@@ -286,6 +289,7 @@ async fn mixed_retention_history(retention_bytes: u64) -> HistoryFixture {
     let objects = Arc::new(InMemory::new());
     let store = ObjectStoreCheckpointStore::new(objects.clone(), "mixed-history")
         .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap());
+    let authority = laminar_core::cluster::control::LeaderLeaseStore::new(objects.clone(), 30_000);
     let decisions = CheckpointDecisionStore::new(objects);
     let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
     let mut predecessor = None;
@@ -308,6 +312,7 @@ async fn mixed_retention_history(retention_bytes: u64) -> HistoryFixture {
     HistoryFixture {
         store,
         decisions,
+        authority,
         latest: latest.unwrap(),
     }
 }
@@ -318,6 +323,7 @@ async fn byte_cap_selects_the_oldest_replayable_checkpoint_boundary() {
     let horizon = cluster_subscription_retention_horizon(
         &fixture.store,
         &fixture.decisions,
+        &fixture.authority,
         &fixture.latest,
         0,
     )
@@ -332,6 +338,7 @@ async fn prior_authoritative_floor_is_never_crossed() {
     let horizon = cluster_subscription_retention_horizon(
         &fixture.store,
         &fixture.decisions,
+        &fixture.authority,
         &fixture.latest,
         3,
     )
@@ -346,6 +353,7 @@ async fn zero_history_cap_keeps_only_the_current_tail_boundary() {
     let horizon = cluster_subscription_retention_horizon(
         &fixture.store,
         &fixture.decisions,
+        &fixture.authority,
         &fixture.latest,
         0,
     )
@@ -360,6 +368,7 @@ async fn tail_only_stream_does_not_disable_another_streams_retained_history() {
     let horizon = cluster_subscription_retention_horizon(
         &fixture.store,
         &fixture.decisions,
+        &fixture.authority,
         &fixture.latest,
         0,
     )

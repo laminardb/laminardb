@@ -6,10 +6,25 @@ use crate::subscription::cluster::{ClusterSubscriptionOutputState, OutputWriterA
 use laminar_core::checkpoint::{ChannelProgress, CheckpointScope};
 use laminar_core::cluster::control::TopologyRecoveryCut;
 
+#[path = "topology_subscription_replay.rs"]
+mod subscriptions;
+
 pub(super) async fn checkpointed() -> (
     Fixture,
     laminar_core::cluster::control::TopologyOperationId,
     CheckpointManifest,
+) {
+    let (fixture, operation, manifest, _) = Box::pin(checkpointed_with_reader(false)).await;
+    (fixture, operation, manifest)
+}
+
+pub(super) async fn checkpointed_with_reader(
+    attach_reader: bool,
+) -> (
+    Fixture,
+    laminar_core::cluster::control::TopologyOperationId,
+    CheckpointManifest,
+    Option<crate::subscription::cluster::ClusterSubscriptionReader>,
 ) {
     let (fixture, committed) = committed_fixture().await;
     let mut image = fixture
@@ -28,6 +43,33 @@ pub(super) async fn checkpointed() -> (
         .await
         .unwrap();
     controller.release_topology_target(&fresh).await.unwrap();
+    let reader = if attach_reader {
+        let certificate = input
+            .root()
+            .subscriptions
+            .iter()
+            .find(|mapping| mapping.parent_certificate.stream_id == "totals")
+            .unwrap();
+        Some(
+            crate::subscription::cluster::ClusterSubscriptionReader::open(
+                Arc::clone(&fixture.authority.lease_store),
+                Arc::new(
+                    ObjectStoreCheckpointStore::new(
+                        Arc::clone(&fixture.authority.checkpoint_store),
+                        "",
+                    )
+                    .with_key_group_count(fixture.db.checkpoint_key_groups()),
+                ),
+                Arc::new(certificate.parent_certificate.clone()),
+                crate::subscription::SubscribeStart::Tail,
+                None,
+            )
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
     let before = image.graph.capture_subscription_frontiers().unwrap();
     let output = image
         .graph
@@ -227,7 +269,7 @@ pub(super) async fn checkpointed() -> (
         .await
         .unwrap();
     drop(image);
-    (fixture, committed.operation_id, manifest)
+    (fixture, committed.operation_id, manifest, reader)
 }
 
 #[tokio::test]

@@ -1032,8 +1032,14 @@ both kinds of cut. They verify new runtime UUIDs, source positions, publication
 frontiers and aggregate progress from 30 to 45 to 60. Six authority cases cover
 complete replacement receipts, leader/process/assignment and stale-round fences.
 These controlled-connector tests do not certify broker delivery, a multi-process
-migration or comparative performance. Subscription readers and retention still
-need the explicit audited transition across historical pipeline identities.
+migration or comparative performance. Subscription readers and retention now
+cross historical pipeline identities through exact released roots. Every unchanged
+incarnation/schema/query/distribution/changelog/retention binding remains strict.
+Historical segment bindings and stored manifests are never rewritten. Reader
+audits occur at checkpoint boundaries and cache the selected certificate within
+each pipeline. Cleanup validates the complete horizon reference and fails before
+deletion when a root is missing. Root consumption and journal reclamation remain
+subsequent work. See the [replay evidence](test-evidence/topology-replay-2026-10-03/README.md).
 
 The [progress file](cluster-topology-migrations-progress.md) records commands,
 results and unfinished certification. The [cut validation evidence](test-evidence/topology-cut-2026-10-01/README.md)

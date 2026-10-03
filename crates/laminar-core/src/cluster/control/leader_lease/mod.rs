@@ -16,6 +16,7 @@ mod topology_preparation;
 mod topology_recovery;
 mod topology_recovery_round;
 mod topology_restore;
+mod topology_subscription;
 mod topology_target_preparation;
 
 pub use attempt_status::ClusterAttemptStatus;

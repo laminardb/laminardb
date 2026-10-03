@@ -1,0 +1,23 @@
+CARGO_BUILD_JOBS=1; --locked.
+Clippy: cargo clippy -p laminar-core -p laminar-connectors -p laminar-db -p laminar-server --no-default-features --features cluster,aws,kafka --all-targets -- -D warnings
+Minimal server: cargo check -p laminar-server --no-default-features
+Cluster/FFI: cargo check -p laminar-db --no-default-features --features cluster,ffi
+Format: cargo +nightly fmt --all -- --check
+Diff: git diff --check
+
+clippy: exit 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.25s
+minimal-server: exit 0
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Checking laminar-server v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-server)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.09s
+cluster-ffi: exit 0
+    Checking laminar-core v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-core)
+    Checking laminar-sql v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-sql)
+    Checking laminar-connectors v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-connectors)
+    Checking laminar-db v0.31.0 (C:\Users\sujit\.codex\worktrees\9929\laminardb\crates\laminar-db)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.92s
+format: exit 0
+VERIFIED_SOURCES=11; MODE=verify; CARGO_LOCK_UNCHANGED=true

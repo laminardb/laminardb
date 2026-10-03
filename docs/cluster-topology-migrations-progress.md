@@ -966,14 +966,31 @@ authority format, scheduler or record-path work is added.
   check across the pipeline transition. It fails closed and pauses cleanup;
   readers and retention must use exact audited roots before public submission.
 
+## Subscription replay and retention, 2026-10-03
+
+- Continued from `79c7a7a88650d1ee1d8a9eeaac7d7b21b3881a41` without dependency
+  changes. Readers cross historical pipeline identities only through exact
+  released roots; generation, schema and all other output contracts remain strict.
+  Stored manifests, hashes and segment authority bindings are unchanged.
+- Retention uses the same audited predecessor edges and historical certificate
+  roster. A changed horizon reference or missing root stops cleanup before deletion.
+  Existing migration-root/state pins remain protected.
+- Four new real stored-segment tests pass: old reader and target reconnect output
+  identity equality, changed incarnation/schema/contracts, exact horizon cleanup,
+  and missing-root failure without output deletion. Original installation/Release
+  remains authority fixture evidence; no broker or multi-process claim is made.
+- The standalone DB suite passes 2,019 tests with eight threads and 4 MiB stacks.
+  Four-package all-target Clippy, minimal server, cluster/FFI and frozen source
+  checks are recorded in the [replay evidence](test-evidence/topology-replay-2026-10-03/README.md).
+  This suite has a different feature union from the prior 4,446-test run.
+
 ## Remaining work
 
-1. Subscription replay/retention across exact audited migration boundaries.
-2. Public SQL/atomic API, detached submission and leader routing. Topology/operation
+1. Public SQL/atomic API, detached submission and leader routing. Topology/operation
    status and local dry-run validation are implemented; activation/write routes are not.
-3. Removal/replacement contracts, reference-aware root retirement and bounded journal
+2. Removal/replacement contracts, reference-aware root retirement and bounded journal
    reclamation, fault matrix and existing soak extensions.
-4. Real multi-process stateful migration/restart oracle and comparative resource,
+3. Real multi-process stateful migration/restart oracle and comparative resource,
    steady-state and pause-inclusive performance measurements.
 
 Do not remove LDB-6043 or route runtime DDL through bootstrap while these runtime

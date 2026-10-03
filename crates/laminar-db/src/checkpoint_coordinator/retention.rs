@@ -557,7 +557,7 @@ async fn run_cluster_gc_request(
     run_cluster_gc_protocol(
         Arc::clone(&store),
         request,
-        authority,
+        Arc::clone(&authority),
         proof,
         requested.clone(),
     )
@@ -578,6 +578,7 @@ async fn run_cluster_gc_request(
     let cleanup = subscription_output::cleanup_subscription_orphans(
         store.as_ref(),
         request.decision_store.as_ref(),
+        authority.as_ref(),
         latest,
         horizon,
         grace_before_ms,
